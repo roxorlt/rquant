@@ -27,12 +27,19 @@ const second: Schemas["ResearchJobItem"] = {
   updated_at: "2026-09-24T07:29:00Z",
 };
 
+function firstResearchJob(): Schemas["ResearchJobItem"] {
+  const row = tasksEnvelope().data.items[0];
+  if (row === undefined) throw new Error("synthetic research job is missing");
+  return row;
+}
+
 function overviewEnvelope(
   overrides: Partial<Overview> = {},
 ): Schemas["Envelope_TaskOverviewData_"] {
   return {
     serving: tasksEnvelope().serving,
     data: {
+      can_control_research_jobs: false,
       can_view_research_logs: false,
       scheduled: {
         source_state: "ready",
@@ -318,6 +325,166 @@ describe("任务与运行状态总览", () => {
     expect(await screen.findByText("任务总览暂时无法加载")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "重试" })).toBeInTheDocument();
     expect(screen.queryByRole("table", { name: "研究任务队列" })).toBeNull();
+  });
+});
+
+describe("研究任务控制", () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+    server.use(
+      overviewHandler(
+        overviewEnvelope({
+          can_control_research_jobs: true,
+          research: {
+            ...tasksEnvelope().data,
+            items: [
+              {
+                ...firstResearchJob(),
+                job_version: 7,
+                available_actions: ["pause", "cancel"],
+              },
+            ],
+          },
+        }),
+      ),
+      http.get("*/api/v1/tasks/jobs/control-capabilities", () =>
+        HttpResponse.json({ can_control: true }),
+      ),
+    );
+  });
+
+  it("keeps the original command after an uncertain reply and retries the identical request", async () => {
+    const user = userEvent.setup();
+    const bodies: Schemas["LabControlRequest"][] = [];
+    server.use(
+      http.post("*/api/v1/tasks/jobs/commands", async ({ request }) => {
+        bodies.push((await request.json()) as Schemas["LabControlRequest"]);
+        return bodies.length === 1
+          ? HttpResponse.json({ detail: "提交状态待确认" }, { status: 503 })
+          : HttpResponse.json({
+              command_id: bodies[0]?.command_id,
+              status: "submitted",
+              message: "已提交，等待状态更新。",
+            });
+      }),
+    );
+    const { unmount } = renderApp("/tasks");
+    await user.click(await screen.findByRole("button", { name: "暂停动量参数搜索" }));
+    expect(await screen.findByText("提交状态待确认，请查询或重试原请求。")).toBeInTheDocument();
+    expect(bodies).toHaveLength(1);
+    unmount();
+    renderApp("/tasks");
+    await user.click(await screen.findByRole("button", { name: "查询或重试动量参数搜索" }));
+    await screen.findByText("已提交，等待状态更新。");
+    expect(bodies).toHaveLength(2);
+    expect(bodies[1]).toEqual(bodies[0]);
+    expect(bodies[0]?.action).toBe("pause");
+    expect(bodies[0]?.expected_version).toBe(7);
+    expect(findJargon(document.body.textContent ?? "")).toEqual([]);
+  });
+
+  it("keeps the original request available after the published task version changes", async () => {
+    const user = userEvent.setup();
+    let version = 7;
+    const bodies: Schemas["LabControlRequest"][] = [];
+    server.use(
+      http.get("*/api/v1/tasks/overview", () =>
+        HttpResponse.json(
+          overviewEnvelope({
+            can_control_research_jobs: true,
+            research: {
+              ...tasksEnvelope().data,
+              items: [
+                {
+                  ...firstResearchJob(),
+                  job_version: version,
+                  available_actions: ["pause", "cancel"],
+                },
+              ],
+            },
+          }),
+        ),
+      ),
+      http.post("*/api/v1/tasks/jobs/commands", async ({ request }) => {
+        bodies.push((await request.json()) as Schemas["LabControlRequest"]);
+        return HttpResponse.json({ detail: "提交状态待确认" }, { status: 503 });
+      }),
+    );
+    renderApp("/tasks");
+    await user.click(await screen.findByRole("button", { name: "暂停动量参数搜索" }));
+    await screen.findByText("提交状态待确认，请查询或重试原请求。");
+    version = 8;
+    await user.click(screen.getByRole("button", { name: "刷新" }));
+    await screen.findByText("任务状态已更新，请核对结果。");
+    await user.click(screen.getByRole("button", { name: "查询或重试动量参数搜索" }));
+    await waitFor(() => expect(bodies).toHaveLength(2));
+    expect(bodies[1]).toEqual(bodies[0]);
+  });
+
+  it("confirms cancellation before posting", async () => {
+    const user = userEvent.setup();
+    const posts: unknown[] = [];
+    server.use(
+      http.post("*/api/v1/tasks/jobs/commands", async ({ request }) => {
+        posts.push(await request.json());
+        return HttpResponse.json({ detail: "待确认" }, { status: 503 });
+      }),
+    );
+    renderApp("/tasks");
+    await user.click(await screen.findByRole("button", { name: "取消动量参数搜索" }));
+    expect(posts).toHaveLength(0);
+    expect(screen.getByRole("dialog")).toHaveTextContent("取消后无法继续当前任务");
+    await user.click(screen.getByRole("button", { name: "确认取消" }));
+    await waitFor(() => expect(posts).toHaveLength(1));
+  });
+
+  it("keeps old generations read only even for an operator", async () => {
+    server.use(
+      overviewHandler(
+        overviewEnvelope({
+          can_control_research_jobs: true,
+          research: {
+            ...tasksEnvelope().data,
+            items: [firstResearchJob()],
+          },
+        }),
+      ),
+    );
+    renderApp("/tasks");
+    await screen.findByRole("table", { name: "研究任务队列" });
+    expect(screen.queryByRole("button", { name: /暂停动量参数搜索|取消动量参数搜索/ })).toBeNull();
+  });
+
+  it("removes controls when the independent live grant is revoked", async () => {
+    let granted = true;
+    server.use(
+      http.get("*/api/v1/tasks/jobs/control-capabilities", () =>
+        HttpResponse.json({ can_control: granted }),
+      ),
+    );
+    const { queryClient } = renderApp("/tasks");
+    expect(await screen.findByRole("button", { name: "暂停动量参数搜索" })).toBeInTheDocument();
+    granted = false;
+    await queryClient.invalidateQueries({ queryKey: ["tasks", "lab-control-capabilities"] });
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "暂停动量参数搜索" })).toBeNull(),
+    );
+  });
+
+  it("hides controls if the live grant cannot be refreshed", async () => {
+    let reachable = true;
+    server.use(
+      http.get("*/api/v1/tasks/jobs/control-capabilities", () =>
+        reachable ? HttpResponse.json({ can_control: true }) : HttpResponse.error(),
+      ),
+    );
+    const { queryClient } = renderApp("/tasks");
+    expect(await screen.findByRole("button", { name: "暂停动量参数搜索" })).toBeInTheDocument();
+    reachable = false;
+    await queryClient.invalidateQueries({ queryKey: ["tasks", "lab-control-capabilities"] });
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "暂停动量参数搜索" })).toBeNull(),
+    );
   });
 });
 

@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ApiError } from "@/api/client";
 import {
   type ResearchJobItem,
   type ResearchJobsData,
   useInvalidateServiceLogCapabilities,
+  useLabControlCapabilities,
   useServiceLogCapabilities,
   useTaskOverview,
 } from "@/api/endpoints";
@@ -23,6 +24,7 @@ import {
   StatusBadge,
   Tip,
 } from "@/ui";
+import { LabJobControls } from "./LabJobControls";
 import { OverviewSections } from "./OverviewSections";
 import { type SelectedServiceLog, ServiceLogDrawer } from "./ServiceLogDrawer";
 import { type SelectedTask, TaskProgressDrawer } from "./TaskProgressDrawer";
@@ -71,9 +73,11 @@ function Eta({ row }: { row: ResearchJobItem }) {
 function TaskName({
   row,
   onProgress,
+  controls,
 }: {
   row: ResearchJobItem;
   onProgress?: (row: ResearchJobItem, trigger: HTMLButtonElement) => void;
+  controls?: ReactNode;
 }) {
   return (
     <div className="tasks-name-cell">
@@ -96,6 +100,7 @@ function TaskName({
       <span className="tasks-meta">
         {row.job_type_label} · {row.resource_label}
       </span>
+      {controls}
       <span className="tasks-mobile-status">
         <StatusBadge state={row.status.state} label={row.status.label} reason={row.status.reason} />
         <RelativeTime at={row.updated_at} />
@@ -199,6 +204,9 @@ export default function TasksPage() {
   const currentGeneration = meta.data?.data.generation?.generation_id;
   const snapshot = result.data;
   const data = snapshot?.overview;
+  const labCapabilities = useLabControlCapabilities(
+    data?.can_control_research_jobs === true ? trustedViewer : null,
+  );
   const generationId = result.serving?.generation_id ?? null;
   const outdated = currentGeneration !== undefined && currentGeneration !== generationId;
   const changed = result.error instanceof ApiError && result.error.status === 409;
@@ -211,6 +219,15 @@ export default function TasksPage() {
     data?.can_view_research_logs === true &&
     data.research.source_state === "ready" &&
     data.research.items.length > 0;
+  const canControlJobs =
+    !outdated &&
+    trustedViewer !== null &&
+    result.error === null &&
+    generationId !== null &&
+    data?.can_control_research_jobs === true &&
+    !labCapabilities.isError &&
+    labCapabilities.data?.can_control === true &&
+    data.research.source_state === "ready";
   const staleSelection =
     selected !== null &&
     (selected.generationId !== generationId ||
@@ -279,17 +296,36 @@ export default function TasksPage() {
   );
   const columns = useMemo(
     () =>
-      canViewProgress
-        ? COLUMNS.map((column) =>
-            column.id === "task"
-              ? {
-                  ...column,
-                  cell: (row: ResearchJobItem) => <TaskName row={row} onProgress={openProgress} />,
-                }
-              : column,
-          )
-        : COLUMNS,
-    [canViewProgress, openProgress],
+      COLUMNS.map((column) =>
+        column.id === "task"
+          ? {
+              ...column,
+              cell: (row: ResearchJobItem) => (
+                <TaskName
+                  row={row}
+                  onProgress={canViewProgress ? openProgress : undefined}
+                  controls={
+                    canControlJobs &&
+                    trustedViewer !== null &&
+                    row.job_version != null &&
+                    row.available_actions != null ? (
+                      <LabJobControls
+                        row={row}
+                        viewer={trustedViewer}
+                        onRefresh={() => {
+                          setCursors([null]);
+                          setRefreshKey((value) => value + 1);
+                        }}
+                        onRevoked={() => void labCapabilities.refetch()}
+                      />
+                    ) : undefined
+                  }
+                />
+              ),
+            }
+          : column,
+      ),
+    [canViewProgress, openProgress, canControlJobs, trustedViewer, labCapabilities.refetch],
   );
   const closeProgress = useCallback(() => setSelected(null), []);
   const openLog = useCallback(

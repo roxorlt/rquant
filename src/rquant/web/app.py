@@ -40,6 +40,7 @@ from rquant.web.formula_market_command_gateway import (
     FormulaMarketCommandGateway,
     FormulaMarketCommandTransport,
 )
+from rquant.web.lab_control_gateway import LabControlGateway, LabControlTransport
 from rquant.web.nl_parser import OpenAiScreenPlanParser, ScreenPlanParser
 from rquant.web.pool_editor_gateway import PoolCommandGateway, PoolCommandTransport
 from rquant.web.pool_nl_preview import PoolNlRateLimiter
@@ -71,6 +72,7 @@ from rquant.web.routes import (
     service_logs,
     stocks,
     tasks,
+    tasks_controls,
 )
 from rquant.web.screen_service import ScreenApplicationService
 from rquant.web.security import require_current_user
@@ -96,6 +98,7 @@ _WRITE_BODY_LIMITS = {
     "/api/v1/data/audit-report/commands": data_audit_report_commands.MAX_REQUEST_BYTES,
     "/api/v1/screen/tdx/market/commands": formula_market_commands.MAX_REQUEST_BYTES,
     "/api/v1/pools/formula/commands": formula_pool_save_commands.MAX_REQUEST_BYTES,
+    "/api/v1/tasks/jobs/commands": tasks_controls.MAX_REQUEST_BYTES,
 }
 
 
@@ -125,6 +128,7 @@ class WebContext:
     backfill_plan_commands: BackfillPlanCommandGateway
     audit_report_commands: AuditReportCommandGateway
     formula_market_commands: FormulaMarketCommandGateway
+    lab_controls: LabControlGateway
 
 
 def create_app(
@@ -143,6 +147,7 @@ def create_app(
     backfill_plan_command_transport: BackfillPlanCommandTransport | None = None,
     audit_report_command_transport: AuditReportCommandTransport | None = None,
     formula_market_command_transport: FormulaMarketCommandTransport | None = None,
+    lab_control_command_transport: LabControlTransport | None = None,
 ) -> FastAPI:
     """Build the app. Nothing is opened until the first request or startup."""
 
@@ -272,6 +277,10 @@ def create_app(
             endpoint=settings.page_control_url,
             transport=formula_market_command_transport,
         ),
+        lab_controls=LabControlGateway(
+            endpoint=settings.page_control_url,
+            transport=lab_control_command_transport,
+        ),
     )
     app.add_middleware(GZipMiddleware, minimum_size=1024)
 
@@ -343,6 +352,10 @@ def create_app(
             return JSONResponse(
                 status_code=422, content={"detail": "保存信息有误，请检查名称和任务。"}
             )
+        if request.url.path == "/api/v1/tasks/jobs/commands":
+            return JSONResponse(
+                status_code=422, content={"detail": "任务操作请求有误，请刷新后重试。"}
+            )
         if request.url.path.startswith("/api/v1/watchlist/"):
             return JSONResponse(status_code=422, content={"detail": "股票代码有误，请检查后重试。"})
         return await request_validation_exception_handler(request, error)
@@ -356,6 +369,9 @@ def create_app(
     app.include_router(monitor.router, prefix="/api/v1", tags=["monitor"], dependencies=private)
     app.include_router(manual_watchlist.router, prefix="/api/v1", tags=["watchlist"])
     app.include_router(tasks.router, prefix="/api/v1", tags=["tasks"], dependencies=private)
+    app.include_router(
+        tasks_controls.router, prefix="/api/v1", tags=["tasks"], dependencies=private
+    )
     app.include_router(service_logs.router, prefix="/api/v1", tags=["tasks"])
     app.include_router(backtests.router, prefix="/api/v1", tags=["backtests"], dependencies=private)
     app.include_router(health.router, prefix="/api/v1", tags=["health"])

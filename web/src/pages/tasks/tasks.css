@@ -40,6 +40,37 @@
   font-size: 12px;
 }
 
+.tasks-job-controls {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.tasks-control-actions,
+.tasks-control-pending {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+}
+
+.tasks-control-actions {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  min-width: 0;
+}
+
+.tasks-control-actions .btn,
+.tasks-control-pending .btn {
+  min-height: 32px;
+}
+
+.tasks-control-pending {
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .tasks-progress-cell {
   min-width: 100px;
 }

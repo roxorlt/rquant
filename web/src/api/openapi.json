@@ -5988,6 +5988,98 @@
         "type": "object"
       },
       "JsonValue": {},
+      "LabControlCapabilities": {
+        "additionalProperties": false,
+        "properties": {
+          "can_control": {
+            "title": "Can Control",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "can_control"
+        ],
+        "title": "LabControlCapabilities",
+        "type": "object"
+      },
+      "LabControlReceipt": {
+        "additionalProperties": false,
+        "properties": {
+          "command_id": {
+            "format": "uuid",
+            "title": "Command Id",
+            "type": "string"
+          },
+          "message": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Message",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "submitted",
+              "pending",
+              "processing",
+              "unknown",
+              "conflict"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "command_id",
+          "status",
+          "message"
+        ],
+        "title": "LabControlReceipt",
+        "type": "object"
+      },
+      "LabControlRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "enum": [
+              "pause",
+              "resume",
+              "cancel",
+              "retry"
+            ],
+            "title": "Action",
+            "type": "string"
+          },
+          "command_id": {
+            "format": "uuid",
+            "title": "Command Id",
+            "type": "string"
+          },
+          "expected_version": {
+            "minimum": 0.0,
+            "title": "Expected Version",
+            "type": "integer"
+          },
+          "job_id": {
+            "format": "uuid",
+            "title": "Job Id",
+            "type": "string"
+          },
+          "requested_at": {
+            "format": "date-time",
+            "title": "Requested At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "command_id",
+          "requested_at",
+          "job_id",
+          "action",
+          "expected_version"
+        ],
+        "title": "LabControlRequest",
+        "type": "object"
+      },
       "LocalExpr": {
         "additionalProperties": false,
         "properties": {
@@ -9369,6 +9461,26 @@
       },
       "ResearchJobItem": {
         "properties": {
+          "available_actions": {
+            "anyOf": [
+              {
+                "items": {
+                  "enum": [
+                    "pause",
+                    "resume",
+                    "cancel",
+                    "retry"
+                  ],
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Available Actions"
+          },
           "eta_at": {
             "anyOf": [
               {
@@ -9416,6 +9528,18 @@
           "job_type_label": {
             "title": "Job Type Label",
             "type": "string"
+          },
+          "job_version": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Job Version"
           },
           "progress_fraction": {
             "maximum": 1.0,
@@ -11853,6 +11977,11 @@
       },
       "TaskOverviewData": {
         "properties": {
+          "can_control_research_jobs": {
+            "default": false,
+            "title": "Can Control Research Jobs",
+            "type": "boolean"
+          },
           "can_view_research_logs": {
             "default": false,
             "title": "Can View Research Logs",
@@ -14419,6 +14548,78 @@
           }
         },
         "summary": "研究任务队列",
+        "tags": [
+          "tasks"
+        ]
+      }
+    },
+    "/api/v1/tasks/jobs/commands": {
+      "post": {
+        "operationId": "submit_lab_control_api_v1_tasks_jobs_commands_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LabControlRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LabControlReceipt"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LabControlReceipt"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "控制研究任务",
+        "tags": [
+          "tasks"
+        ]
+      }
+    },
+    "/api/v1/tasks/jobs/control-capabilities": {
+      "get": {
+        "operationId": "control_capabilities_api_v1_tasks_jobs_control_capabilities_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LabControlCapabilities"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "研究任务操作权限",
         "tags": [
           "tasks"
         ]

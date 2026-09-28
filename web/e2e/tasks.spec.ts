@@ -53,6 +53,7 @@ const JOBS_ENVELOPE: components["schemas"]["Envelope_ResearchJobsData_"] = {
 const OVERVIEW_ENVELOPE: components["schemas"]["Envelope_TaskOverviewData_"] = {
   serving: JOBS_ENVELOPE.serving,
   data: {
+    can_control_research_jobs: false,
     can_view_research_logs: false,
     scheduled: {
       source_state: "ready",
@@ -123,6 +124,85 @@ for (const viewport of [
 ] as const) {
   test.describe(`${viewport.name} ${viewport.width}×${viewport.height}`, () => {
     test.use({ viewport: { width: viewport.width, height: viewport.height } });
+
+    test("research controls retain uncertain requests and confirm cancellation", async ({
+      page,
+    }, testInfo) => {
+      const watcher = watch(page);
+      const first = OVERVIEW_ENVELOPE.data.research.items[0];
+      if (first === undefined) throw new Error("synthetic research job is missing");
+      const overview: typeof OVERVIEW_ENVELOPE = {
+        ...OVERVIEW_ENVELOPE,
+        data: {
+          ...OVERVIEW_ENVELOPE.data,
+          can_control_research_jobs: true,
+          research: {
+            ...OVERVIEW_ENVELOPE.data.research,
+            items: [{ ...first, job_version: 7, available_actions: ["pause", "cancel"] }],
+          },
+        },
+      };
+      const posts: components["schemas"]["LabControlRequest"][] = [];
+      await page.route("**/api/v1/meta", async (route) => {
+        const response = await route.fetch();
+        const payload = await response.json();
+        payload.data.generation.generation_id = overview.serving.generation_id;
+        await route.fulfill({ json: payload });
+      });
+      await page.route("**/api/v1/tasks/overview**", async (route) => {
+        await route.fulfill({ json: overview });
+      });
+      await page.route("**/api/v1/tasks/jobs/control-capabilities", async (route) => {
+        await route.fulfill({ json: { can_control: true } });
+      });
+      await page.route("**/api/v1/tasks/jobs/commands", async (route) => {
+        posts.push(route.request().postDataJSON());
+        if (posts.length === 1) {
+          await route.fulfill({ status: 503, json: { detail: "提交状态待确认" } });
+        } else {
+          await route.fulfill({
+            json: {
+              command_id: posts.at(-1)?.command_id,
+              status: "submitted",
+              message: "已提交，等待状态更新。",
+            },
+          });
+        }
+      });
+      await page.goto("./#/tasks");
+      await expect(page.getByRole("button", { name: "暂停动量参数搜索" })).toBeVisible();
+      await page.screenshot({
+        path: testInfo.outputPath(`research-controls-${viewport.name}.png`),
+        fullPage: true,
+      });
+      await page.getByRole("button", { name: "暂停动量参数搜索" }).click();
+      await expect(page.getByText("提交状态待确认，请查询或重试原请求。")).toBeVisible();
+      await page.reload();
+      await page.getByRole("button", { name: "查询或重试动量参数搜索" }).click();
+      await expect(page.getByText("已提交，等待状态更新。")).toBeVisible();
+      expect(posts).toHaveLength(2);
+      expect(posts[1]).toEqual(posts[0]);
+      overview.data.research.items[0] = { ...first, job_version: 8, available_actions: ["cancel"] };
+      await page.getByRole("button", { name: "刷新" }).click();
+      await page.getByRole("button", { name: "已核对" }).click();
+      await page.getByRole("button", { name: "取消动量参数搜索" }).click();
+      await expect(page.getByRole("dialog")).toContainText("取消后无法继续当前任务");
+      await page.keyboard.press("Escape");
+      await expect(page.getByRole("dialog")).toBeHidden();
+      await expectNoHorizontalOverflow(page, "research controls");
+      expect(findJargon(await page.locator("main").innerText())).toEqual([]);
+      expect(
+        watcher.problems.filter(
+          (problem) =>
+            !(
+              (problem.startsWith("HTTP 503: ") &&
+                problem.endsWith("/api/v1/tasks/jobs/commands")) ||
+              problem ===
+                "console error: Failed to load resource: the server responded with a status of 503 (Service Unavailable)"
+            ),
+        ),
+      ).toEqual([]);
+    });
 
     test("real published empty queue explains why there are no rows", async ({ page }) => {
       const watcher = watch(page);
