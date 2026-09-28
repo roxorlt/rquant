@@ -144,7 +144,7 @@ describe("选股器", () => {
     await user.type(within(dialog).getByRole("textbox", { name: "通达信公式" }), "CLOSE>0");
     await user.type(within(dialog).getByRole("textbox", { name: "股票代码" }), "600001.SH");
     await user.click(within(dialog).getByRole("button", { name: "检查公式" }));
-    await within(dialog).findByText("公式可以预览这只股票。");
+    await within(dialog).findByText("公式检查通过，可预览或批量运行。");
     await user.click(within(dialog).getByRole("button", { name: "预览这只股票" }));
     expect(await within(dialog).findByRole("status")).toHaveTextContent(label);
     if (reason) expect(within(dialog).getByRole("status")).toHaveTextContent(reason);
@@ -219,7 +219,7 @@ describe("选股器", () => {
     await user.type(within(dialog).getByRole("textbox", { name: "股票代码" }), "600001.SH");
     expect(within(dialog).getByRole("button", { name: "预览这只股票" })).toBeDisabled();
     await user.click(within(dialog).getByRole("button", { name: "检查公式" }));
-    expect(await within(dialog).findByText("公式可以预览这只股票。")).toBeInTheDocument();
+    expect(await within(dialog).findByText("公式检查通过，可预览或批量运行。")).toBeInTheDocument();
     await user.click(within(dialog).getByRole("button", { name: "预览这只股票" }));
     expect(await within(dialog).findByText("符合")).toBeInTheDocument();
     expect(previews).toMatchObject([

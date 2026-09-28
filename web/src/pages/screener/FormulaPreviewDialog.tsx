@@ -8,6 +8,7 @@ import {
   useTdxPreviewSource,
 } from "@/api/screen";
 import { Button, RelativeTime, SideDrawer, Tip } from "@/ui";
+import { FormulaMarketPanel } from "./FormulaMarketPanel";
 
 type Check = { source: string; data: TdxParseData };
 type Preview = { key: string; sourceIdentity: string; data: TdxPreviewData };
@@ -68,10 +69,10 @@ export function FormulaPreviewDialog({ onClose }: FormulaPreviewDialogProps) {
       "公式暂无法预览，请修改后重试。";
     tone = "warn";
   } else if (!sourceReady) {
-    status = catalog.isLoading ? "正在读取预览数据…" : "公式预览数据暂不可用，请稍后刷新。";
+    status = catalog.isLoading ? "正在读取单股数据…" : "单股预览数据暂不可用，请稍后刷新。";
     tone = "warn";
   } else if (checked?.status === "parsed") {
-    status = "公式可以预览这只股票。";
+    status = "公式检查通过，可预览或批量运行。";
     tone = "ok";
   }
 
@@ -216,6 +217,7 @@ export function FormulaPreviewDialog({ onClose }: FormulaPreviewDialogProps) {
             ) : null}
           </div>
         ) : null}
+        <FormulaMarketPanel formula={formula} checked={checked?.status === "parsed"} />
       </div>
     </SideDrawer>
   );

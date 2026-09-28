@@ -26,13 +26,14 @@ export interface ServingQueryResult<T> {
 export function useServingQuery<T>(
   key: QueryKey,
   fetcher: () => Promise<ServingEnvelope<T>>,
-  options: { enabled?: boolean; staleTime?: number } = {},
+  options: { enabled?: boolean; staleTime?: number; refetchInterval?: number | false } = {},
 ): ServingQueryResult<T> {
   const query = useQuery({
     queryKey: key,
     queryFn: fetcher,
     enabled: options.enabled ?? true,
     staleTime: options.staleTime,
+    refetchInterval: options.refetchInterval,
   });
   return {
     data: query.data?.data,
