@@ -366,6 +366,23 @@ class UnitLogClient:
         self.web_group_gid = web_group_gid
         self.peer_uid = peer_uid or _kernel_peer_uid
 
+    def preflight(self) -> bool:
+        """Check current private socket identity without connecting or reading journal."""
+        try:
+            _private_directory(
+                self.socket_path,
+                owner_uid=self.service_uid,
+                web_group_gid=self.web_group_gid,
+            )
+            _socket_identity(
+                self.socket_path,
+                owner_uid=self.service_uid,
+                web_group_gid=self.web_group_gid,
+            )
+        except (OSError, ValueError, UnitLogServiceError):
+            return False
+        return True
+
     def read(
         self,
         *,

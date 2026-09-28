@@ -174,3 +174,80 @@ for (const viewport of [
     });
   });
 }
+
+test("390px service logs use the live capability and keep the drawer operable", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  const watcher = watch(page);
+  const firstTask = OVERVIEW_ENVELOPE.data.scheduled.items[0];
+  if (firstTask === undefined) throw new Error("synthetic scheduled task is missing");
+  const overview: typeof OVERVIEW_ENVELOPE = {
+    ...OVERVIEW_ENVELOPE,
+    data: {
+      ...OVERVIEW_ENVELOPE.data,
+      scheduled: {
+        ...OVERVIEW_ENVELOPE.data.scheduled,
+        items: [
+          {
+            ...firstTask,
+            name: "日线更新",
+            timer_unit: "rquant-daily.timer",
+            service_unit: "rquant-daily.service",
+          },
+        ],
+      },
+    },
+  };
+  await page.route("**/api/v1/meta", async (route) => {
+    const response = await route.fetch();
+    const payload = await response.json();
+    payload.data.generation.generation_id = overview.serving.generation_id;
+    await route.fulfill({ json: payload });
+  });
+  await page.route("**/api/v1/tasks/overview**", async (route) => {
+    await route.fulfill({ json: overview });
+  });
+  await page.route("**/api/v1/tasks/services/log-capabilities", async (route) => {
+    await route.fulfill({ json: { units: ["rquant-daily.service"] } });
+  });
+  await page.route("**/api/v1/tasks/services/rquant-daily.service/logs**", async (route) => {
+    const more = new URL(route.request().url()).searchParams.has("cursor");
+    await route.fulfill({
+      json: {
+        service_label: "每日任务",
+        scope: "本机本次开机以来的服务日志（含手动运行）",
+        entries: [
+          {
+            at: API_NOW,
+            level: "信息",
+            text: more ? "任务已完成" : "任务已开始",
+          },
+        ],
+        next_cursor: more ? null : "signed-cursor",
+      },
+    });
+  });
+  await page.goto("./#/tasks");
+  const trigger = page.getByRole("button", { name: "查看日线更新的运行日志" });
+  await expect(trigger).toBeVisible();
+  await trigger.click();
+  const drawer = page.getByRole("dialog", { name: /本机本次开机以来的服务日志/ });
+  await expect(drawer).toContainText("任务已开始");
+  await expect(drawer).toContainText("2026-09-24 15:36:00");
+  await drawer.getByRole("button", { name: "加载更早记录" }).click();
+  await expect(drawer).toContainText("任务已完成");
+  await drawer.getByRole("combobox", { name: "日志级别" }).selectOption("warning");
+  await expect(drawer).not.toContainText("任务已完成");
+  await expectNoHorizontalOverflow(page, "service log drawer");
+  expect(await drawer.evaluate((element) => element.scrollWidth <= element.clientWidth + 1)).toBe(
+    true,
+  );
+  await page.keyboard.press("Escape");
+  await expect(drawer).toBeHidden();
+  await expect
+    .poll(async () => page.evaluate(() => document.activeElement?.textContent?.trim()))
+    .toMatch(/运行日志|刷新/);
+  expect(findJargon(await page.locator("main").innerText())).toEqual([]);
+  expect(watcher.problems).toEqual([]);
+});

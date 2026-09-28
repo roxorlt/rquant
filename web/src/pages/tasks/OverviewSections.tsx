@@ -1,3 +1,4 @@
+import { useMemo } from "react";
 import type {
   ResourceGroupItem,
   RuntimeServiceItem,
@@ -7,7 +8,16 @@ import type {
 import { EMPTY, formatNumber, formatPercent } from "@/format/number";
 import { formatShanghaiDateTime } from "@/format/time";
 import { type DataColumn, DataTable } from "@/table/DataTable";
-import { EmptyState, type Kpi, KpiStrip, Panel, RelativeTime, StatusBadge, Tip } from "@/ui";
+import {
+  Button,
+  EmptyState,
+  type Kpi,
+  KpiStrip,
+  Panel,
+  RelativeTime,
+  StatusBadge,
+  Tip,
+} from "@/ui";
 
 function Timestamp({ at }: { at: string | null }) {
   if (at === null) return <span className="muted">{EMPTY}</span>;
@@ -25,12 +35,31 @@ function Duration({ seconds }: { seconds: number | null }) {
   return <span className="num">{seconds === null ? EMPTY : `${formatNumber(seconds, 1)} 秒`}</span>;
 }
 
-function TimerName({ row }: { row: ScheduledTaskItem }) {
+type OpenLog = (unit: string, name: string, trigger: HTMLButtonElement) => void;
+
+function LogButton({ unit, name, onLog }: { unit: string; name: string; onLog: OpenLog }) {
+  return (
+    <Button
+      size="sm"
+      variant="ghost"
+      className="tasks-progress-link"
+      aria-label={`查看${name}的运行日志`}
+      onClick={(event) => onLog(unit, name, event.currentTarget)}
+    >
+      运行日志
+    </Button>
+  );
+}
+
+function TimerName({ row, onLog }: { row: ScheduledTaskItem; onLog?: OpenLog }) {
   return (
     <div className="tasks-name-cell">
-      <Tip content={`${row.timer_unit} · ${row.service_unit}`}>
-        <strong className="tasks-name">{row.name}</strong>
-      </Tip>
+      <div className="tasks-name-head">
+        <Tip content={`${row.timer_unit} · ${row.service_unit}`}>
+          <strong className="tasks-name">{row.name}</strong>
+        </Tip>
+        {onLog ? <LogButton unit={row.service_unit} name={row.name} onLog={onLog} /> : null}
+      </div>
       <div className="tasks-mobile-timer">
         <StatusBadge state={row.status.state} label={row.status.label} reason={row.status.reason} />
         <span className="tasks-timer-times">
@@ -95,12 +124,15 @@ const TIMER_COLUMNS: DataColumn<ScheduledTaskItem>[] = [
   },
 ];
 
-function ServiceName({ row }: { row: RuntimeServiceItem }) {
+function ServiceName({ row, onLog }: { row: RuntimeServiceItem; onLog?: OpenLog }) {
   return (
     <div className="tasks-name-cell">
-      <Tip content={row.service_id}>
-        <strong className="tasks-name">{row.name}</strong>
-      </Tip>
+      <div className="tasks-name-head">
+        <Tip content={row.service_id}>
+          <strong className="tasks-name">{row.name}</strong>
+        </Tip>
+        {onLog ? <LogButton unit={row.service_id} name={row.name} onLog={onLog} /> : null}
+      </div>
       <span className="tasks-meta">{row.plane_label}</span>
       <span className="tasks-mobile-status">
         <StatusBadge state={row.status.state} label={row.status.label} reason={row.status.reason} />
@@ -194,12 +226,44 @@ export function OverviewSections({
   data,
   scheduledFresh,
   resourcesFresh,
+  logUnits,
+  onLog,
 }: {
   data: TaskOverviewData;
   scheduledFresh: boolean;
   resourcesFresh: boolean;
+  logUnits: ReadonlySet<string>;
+  onLog: OpenLog;
 }) {
   const { scheduled, services, resources } = data;
+  const timerColumns = useMemo(
+    () =>
+      TIMER_COLUMNS.map((column) =>
+        column.id === "task"
+          ? {
+              ...column,
+              cell: (row: ScheduledTaskItem) => (
+                <TimerName row={row} onLog={logUnits.has(row.service_unit) ? onLog : undefined} />
+              ),
+            }
+          : column,
+      ),
+    [logUnits, onLog],
+  );
+  const serviceColumns = useMemo(
+    () =>
+      SERVICE_COLUMNS.map((column) =>
+        column.id === "service"
+          ? {
+              ...column,
+              cell: (row: RuntimeServiceItem) => (
+                <ServiceName row={row} onLog={logUnits.has(row.service_id) ? onLog : undefined} />
+              ),
+            }
+          : column,
+      ),
+    [logUnits, onLog],
+  );
   const memoryKpis: Kpi[] = [
     { key: "host-total", label: "主机内存", value: memory(resources.host_memory_total_bytes) },
     { key: "host-free", label: "主机可用", value: memory(resources.host_memory_available_bytes) },
@@ -229,7 +293,7 @@ export function OverviewSections({
             <SourceNote note={scheduled.source_note} />
             <DataTable
               rows={scheduled.items.slice(0, 32)}
-              columns={TIMER_COLUMNS}
+              columns={timerColumns}
               rowKey={(row) => row.timer_unit}
               label="定时任务"
               emptyText={<EmptyState title="当前没有定时任务" hint="请稍后刷新。" />}
@@ -249,7 +313,7 @@ export function OverviewSections({
             <SourceNote note={services.source_note} />
             <DataTable
               rows={services.items.slice(0, 32)}
-              columns={SERVICE_COLUMNS}
+              columns={serviceColumns}
               rowKey={(row) => row.service_id}
               label="运行服务"
               emptyText={<EmptyState title="还没有服务心跳" hint="服务启动后会显示。" />}

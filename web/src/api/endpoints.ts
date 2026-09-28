@@ -1,6 +1,7 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useRef } from "react";
+import { useCallback, useRef } from "react";
 import { ApiError, apiClient, type Schemas } from "./client";
+import type { paths } from "./schema";
 import { type ServingQueryResult, useServingQuery } from "./useServingQuery";
 
 export type OverviewEnvelope = Schemas["Envelope_OverviewData_"];
@@ -22,6 +23,10 @@ export type ResearchTaskEventsData = Schemas["ResearchTaskEventsData"];
 export type TaskOverviewData = Schemas["TaskOverviewData"];
 export type ScheduledTaskItem = Schemas["ScheduledTaskItem"];
 export type RuntimeServiceItem = Schemas["RuntimeServiceItem"];
+export type JournalPage = Schemas["JournalPage"];
+export type LogLevel = NonNullable<
+  paths["/api/v1/tasks/services/{unit}/logs"]["get"]["parameters"]["query"]["level"]
+>;
 export type ResourceGroupItem = Schemas["ResourceGroupItem"];
 export type TimedTaskOverview = {
   overview: TaskOverviewData;
@@ -122,6 +127,54 @@ export function useResearchTaskEvents(jobId: string | null, generationId: string
       return unwrap(data, response);
     },
   });
+}
+
+/** Independent live authority; never use Serving or health state as a log grant. */
+export function useServiceLogCapabilities(viewer: string | null) {
+  return useQuery({
+    queryKey: ["tasks", "service-log-capabilities", viewer],
+    enabled: viewer !== null,
+    gcTime: 0,
+    staleTime: 0,
+    retry: false,
+    refetchInterval: 15_000,
+    refetchIntervalInBackground: false,
+    refetchOnWindowFocus: "always",
+    queryFn: async (): Promise<Schemas["LogCapabilities"]> => {
+      const { data, response } = await apiClient().GET("/api/v1/tasks/services/log-capabilities");
+      return unwrap(data, response);
+    },
+  });
+}
+
+export function useInvalidateServiceLogCapabilities() {
+  const queryClient = useQueryClient();
+  return useCallback(
+    () => queryClient.invalidateQueries({ queryKey: ["tasks", "service-log-capabilities"] }),
+    [queryClient],
+  );
+}
+
+export async function fetchServiceLogPage(
+  unit: string,
+  since: string,
+  level: LogLevel | null,
+  cursor: string | null,
+  signal: AbortSignal,
+): Promise<JournalPage> {
+  const { data, response } = await apiClient().GET("/api/v1/tasks/services/{unit}/logs", {
+    params: {
+      path: { unit },
+      query: {
+        since,
+        page_size: 100,
+        ...(level ? { level } : {}),
+        ...(cursor ? { cursor } : {}),
+      },
+    },
+    signal,
+  });
+  return unwrap(data, response);
 }
 
 export function deadlineFromRemaining(
