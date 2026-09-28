@@ -1022,6 +1022,72 @@ PAGE_PROJECTION_CONTRACTS: Mapping[str, ServingProjectionContract] = MappingProx
             max_bytes=16 * 1024,
             event_time_columns=("occurred_at",),
         ),
+        "formula_market_job_state": _contract(
+            "lab_jobs",
+            (
+                ("status_key", "string"),
+                ("availability", "string"),
+                ("total_task_count", "int"),
+                ("retained_task_count", "int"),
+                ("has_older_tasks", "bool"),
+            ),
+            ("status_key",),
+            max_rows=1,
+            max_bytes=2048,
+        ),
+        "formula_market_job": _contract(
+            "lab_jobs",
+            (
+                ("rank", "int"),
+                ("task_id", "string"),
+                ("status", "string"),
+                ("attempts", "int"),
+                ("created_at", "timestamp"),
+                ("updated_at", "timestamp"),
+                ("error_code", "string"),
+                ("result_sha256", "string"),
+                ("request_sha256", "string"),
+                ("formula_sha256", "string"),
+                ("formula", "string"),
+                ("trade_date", "date"),
+                ("decision_at", "timestamp"),
+                ("universe_identity", "string"),
+                ("projection_identity", "string"),
+            ),
+            ("rank",),
+            max_rows=100,
+            max_bytes=2 * 1024 * 1024,
+            event_date_columns=("trade_date",),
+            event_time_columns=("created_at", "updated_at"),
+        ),
+        "research_artifact_index": _contract(
+            "lab_jobs",
+            (
+                ("artifact_type", "string"),
+                ("artifact_version", "int"),
+                ("rank", "int"),
+                ("task_id", "string"),
+                ("relative_path", "string"),
+                ("content_sha256", "string"),
+                ("byte_count", "int"),
+                ("request_sha256", "string"),
+                ("formula_sha256", "string"),
+                ("universe_identity", "string"),
+                ("projection_identity", "string"),
+                ("trade_date", "date"),
+                ("decision_at", "timestamp"),
+                ("market_total", "int"),
+                ("listed_count", "int"),
+                ("paused_count", "int"),
+                ("match_count", "int"),
+                ("no_match_count", "int"),
+                ("unknown_count", "int"),
+            ),
+            ("rank",),
+            max_rows=100,
+            max_bytes=256 * 1024,
+            event_date_columns=("trade_date",),
+        ),
         "backfill_plan_catalog": _contract(
             "lab_jobs",
             (
@@ -1543,6 +1609,17 @@ class ServingReadModelInput(RuntimeContractModel):
             raise ValueError(
                 "serving owner projections exceed their authority byte budget: "
                 + ", ".join(oversized_owners)
+            )
+
+        if any(
+            projection.table_name
+            in {"formula_market_job_state", "formula_market_job", "research_artifact_index"}
+            for projection in self.projections
+        ):
+            from rquant.formula_market_job_projection import validate_formula_market_projections
+
+            validate_formula_market_projections(
+                {projection.table_name: projection for projection in self.projections}
             )
 
         signal_ids = {record.signal.signal_id for record in self.signals}
