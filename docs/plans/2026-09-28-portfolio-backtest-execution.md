@@ -38,3 +38,7 @@
 首个回测交易日之前的**上一 SSE 交易日 close** 定义基准净值 1.0；每日日收益为当日 close / 前一 SSE 交易日 close − 1，归一净值为当日 close / 基准 close。来源摘要包含 `source_mode=retrospective_daily_bar`、表名、指数代码、日历来源身份、前日日期与收盘价，以及对实际查询行计算的 `source_identity`；序列还绑定回测结果 `content_hash`。必须逐日覆盖回测结果中连续的 SSE 交易日，缺前日基准、缺任一日、重复日、意外日期、非正或非有限 close 均拒绝；不补值、不以 `pre_close` 猜值。
 
 比较层要求回测账本结果完整、日期完全一致，使用其由账户净值产生的 `daily_return`，调用已有 `performance_summary` 和 `relative_metrics`。它不从 `strategy_trade` 的单笔收益推导组合净值。`index_daily_bar` 的 close 是事后日线事实；摘要不包含或暗示历史当时的采集时刻。该序列只能用于本地离线回顾比较，**绝不可作为 09:25 盘前决策输入**。本片尚未接 Lab 任务、封存产物索引或页面。
+
+## C7.3 离线 HTML 报告首片
+
+`render_backtest_html` 只接受完整且逐日净值、收益相互一致的 `BacktestResult`，以及可选的同结果绑定 `BenchmarkSeries`。它调用既有绩效与基准比较函数，生成含内联静态 SVG、逐日账本、成交和期末持仓摘要的单份 HTML；报告字节与 SHA-256 可重复生成，超过固定 4 MiB 上限即拒绝。无基准时明确显示「基准尚未提供」，不补造相对指标。报告保留模拟开盘撮合与事后指数日线来源说明。本片只提供纯产物生成函数，**尚未接入 Lab、封存产物、Serving、页面或下载入口**。
