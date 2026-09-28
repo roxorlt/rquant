@@ -171,6 +171,8 @@ class FormulaPoolBatchItem(RuntimeContractModel):
 
 
 class FormulaPoolBatchResult(RuntimeContractModel):
+    """One invocation's page; counts never aggregate earlier invocations."""
+
     trade_date: date
     catalog_identity: str = Field(pattern=r"^[0-9a-f]{64}$")
     total_count: int = Field(ge=0)
@@ -179,9 +181,13 @@ class FormulaPoolBatchResult(RuntimeContractModel):
     completed_count: int = Field(ge=0)
     waiting_count: int = Field(ge=0)
     failed_count: int = Field(ge=0)
-    unprocessed_count: int = Field(ge=0)
+    unprocessed_count: int = Field(
+        ge=0, description="Catalog entries outside this invocation, including previous pages"
+    )
     next_cursor: str | None = None
-    all_complete: bool
+    all_complete: bool = Field(
+        description="True only when this invocation verified every catalog entry"
+    )
 
     @model_validator(mode="after")
     def require_honest_summary(self) -> FormulaPoolBatchResult:

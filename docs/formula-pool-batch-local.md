@@ -15,6 +15,6 @@ PYTHONPATH=src python -m rquant.formula_pool_batch --config /absolute/private/ba
 PYTHONPATH=src python -m rquant.formula_market_worker_entry --config /absolute/private/market.json
 ```
 
-第一条命令输出带交易日、目录身份、各池状态与精确计数的 JSON。`next_cursor` 非空时，将其作为下一次 `--cursor` 参数继续当前页之后的池；游标绑定目录版本及目标日两份来源，来源或目录变化后须从第一页重启。分页结果的 `unprocessed_count` 包含本次未触及的池（前页和后页），`all_complete` 仅可能在单次覆盖全部池、且每池逐日结果均已重读核验时为 `true`。池状态 `waiting` 表示排队、运行中或共享任务占用；`failed` 带安全错误类别，不能按成功处理。逐日结果的具体成员仍保存在私有结果目录，批次 JSON 只返回摘要和证据摘要。
+第一条命令输出带交易日、目录身份、各池状态与精确计数的 JSON。`next_cursor` 非空时，将其作为下一次 `--cursor` 参数继续当前页之后的池；游标绑定目录版本及目标日两份来源，来源或目录变化后须从第一页重启。分页结果的 `unprocessed_count` 是**本次调用未覆盖**的池数，包含前页和后页；其他状态计数也仅覆盖本页。分页走完之后，应从第一页重新逐页核对全部池，或用同一目录及来源身份聚合每页证据；不能只看最后一页宣称全日完成。`all_complete` 仅可能在单次覆盖全部池、且每池逐日结果均已重读核验时为 `true`。池状态 `waiting` 表示排队、运行中或共享任务占用；`failed` 带安全错误类别，不能按成功处理。逐日结果的具体成员仍保存在私有结果目录，批次 JSON 只返回摘要和证据摘要。
 
 此入口没有定时器或线上默认配置；接入生产调度、目录权限与容量验收须另行处理。
