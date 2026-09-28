@@ -18,16 +18,31 @@ from rquant.factor.expression import (
     parse_factor_expression,
 )
 from rquant.factor.summary import FactorICSummary, ICSeriesSummary, summarize_factor_ic
+from rquant.factor.time_series import (
+    DecisionTime,
+    FactorTimeSeriesError,
+    FactorTimeSeriesInput,
+    FactorTimeSeriesResult,
+    FactorTimeSeriesValue,
+    FeatureObservation,
+    evaluate_factor_time_series,
+)
 
 __all__ = [
     "CorrelationResult",
     "DailyFactorResult",
+    "DecisionTime",
     "FactorDefinition",
     "FactorEvaluation",
     "FactorEvaluationInput",
     "FactorSample",
+    "FactorTimeSeriesError",
+    "FactorTimeSeriesInput",
+    "FactorTimeSeriesResult",
+    "FactorTimeSeriesValue",
     "FactorExpressionError",
     "FeatureCatalog",
+    "FeatureObservation",
     "FactorICSummary",
     "GroupReturn",
     "GroupingResult",
@@ -35,6 +50,7 @@ __all__ = [
     "ParsedFactorExpression",
     "build_factor_definition",
     "evaluate_factor",
+    "evaluate_factor_time_series",
     "parse_factor_expression",
     "summarize_factor_ic",
 ]
