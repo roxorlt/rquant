@@ -274,8 +274,12 @@ def test_manual_read_failure_revokes_rows_with_configured_formula_pools(
 
 
 @pytest.mark.parametrize("failure", ("missing_at_entry", "invalid_on_exit"))
-def test_shared_audit_failure_revokes_manual_and_formula_pools(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+@pytest.mark.parametrize("formula_pool_configured", (True, False))
+def test_shared_audit_failure_blocks_formula_pools_or_revokes_manual_without_them(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+    formula_pool_configured: bool,
 ) -> None:
     service, admission, _definitions, data_dir = _setup(tmp_path)
     (data_dir / "formula_pools").mkdir(mode=0o700, parents=True)
@@ -290,18 +294,20 @@ def test_shared_audit_failure_revokes_manual_and_formula_pools(
     source = DuckDBSignalPageProjectionSource(
         database,
         page_control_outbox=outbox,
-        formula_pool_config=_config(admission, data_dir),
+        formula_pool_config=_config(admission, data_dir) if formula_pool_configured else None,
     )
     store = NotificationStateStore(tmp_path / "notification.sqlite3")
     producer = SignalPageProjectionProducer(source=source, store=store)
     observed = datetime.now(UTC) + timedelta(minutes=2)
     producer.publish(observed)
-    initial = _by_name(
-        store.serving_snapshot(observed_at=observed, history_limit=1).payload.projections
-    )
+    first = store.serving_snapshot(observed_at=observed, history_limit=1)
+    initial = _by_name(first.payload.projections)
     assert initial["manual_watchlist_state"].rows[0]["state"] == "ready"
     assert len(initial["manual_watchlist"].rows) == 1
-    assert initial["formula_pool_state"].rows[0]["availability"] == "empty"
+    if formula_pool_configured:
+        assert initial["formula_pool_state"].rows[0]["availability"] == "empty"
+    else:
+        assert "formula_pool_state" not in initial
 
     if failure == "missing_at_entry":
         outbox.path.rename(tmp_path / "moved-control.sqlite3")
@@ -317,6 +323,16 @@ def test_shared_audit_failure_revokes_manual_and_formula_pools(
 
         monkeypatch.setattr(source.page_control_outbox, "snapshot", fail_on_exit)
     later = observed + timedelta(seconds=2)
+    if formula_pool_configured:
+        with pytest.raises(PageProjectionSourceIntegrityError, match="PageControl"):
+            producer.publish(later)
+        unchanged = store.serving_snapshot(observed_at=later, history_limit=1)
+        assert unchanged.projection_generation_id == first.projection_generation_id
+        assert _by_name(unchanged.payload.projections)["manual_watchlist_state"].rows[0][
+            "state"
+        ] == "ready"
+        return
+
     producer.publish(later)
     revoked = _by_name(
         store.serving_snapshot(observed_at=later, history_limit=1).payload.projections
@@ -324,6 +340,6 @@ def test_shared_audit_failure_revokes_manual_and_formula_pools(
     assert revoked["manual_watchlist_state"].rows[0]["state"] == "unavailable"
     assert "manual_watchlist" not in revoked
     assert "pool_definition" not in revoked
+    assert revoked["alert_ack_state"].rows[0]["state"] == "unavailable"
+    assert revoked["price_alert_rule_state"].rows[0]["state"] == "unavailable"
     assert "formula_pool_state" not in revoked
-    assert "formula_pool_definition" not in revoked
-    assert "formula_pool_latest_result" not in revoked
