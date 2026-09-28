@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import math
 import re
+from dataclasses import dataclass
 from datetime import date, datetime, time
 from typing import Literal, TypeAlias
 from zoneinfo import ZoneInfo
@@ -27,6 +28,7 @@ from rquant.screen.tdx.ast import (
     FormulaAst,
     LocalExpr,
     NumberExpr,
+    ParseResult,
     UnaryExpr,
 )
 from rquant.screen.tdx.validate import parse_formula
@@ -113,6 +115,22 @@ class EvaluationRejectedError(ValueError):
     def __init__(self, code: Literal["formula", "shape", "limit", "time"], message: str) -> None:
         super().__init__(message)
         self.code = code
+
+
+@dataclass(frozen=True, slots=True)
+class CompiledFormula:
+    source: str
+    parsed: ParseResult
+
+
+def compile_formula(source: str) -> CompiledFormula:
+    if not isinstance(source, str):
+        raise EvaluationRejectedError("shape", "公式文本格式不正确。")
+    parsed = parse_formula(source)
+    if parsed.status != "parsed" or parsed.ast is None or parsed.translation is None:
+        issue = parsed.issues[0].message if parsed.issues else parsed.unsupported[0].message
+        raise EvaluationRejectedError("formula", issue)
+    return CompiledFormula(source=source, parsed=parsed)
 
 
 def _known(value: float | bool) -> Atom:
@@ -450,12 +468,19 @@ class _StockEvaluator:
 def evaluate_formula(request: FormulaEvaluationInput) -> FormulaEvaluationResult:
     if not isinstance(request, FormulaEvaluationInput):
         raise EvaluationRejectedError("shape", "求值输入格式不正确。")
-    if not isinstance(request.formula, str):
-        raise EvaluationRejectedError("shape", "公式文本格式不正确。")
-    parsed = parse_formula(request.formula)
+    return evaluate_compiled_formula(request, compile_formula(request.formula))
+
+
+def evaluate_compiled_formula(
+    request: FormulaEvaluationInput, compiled: CompiledFormula,
+) -> FormulaEvaluationResult:
+    if not isinstance(request, FormulaEvaluationInput):
+        raise EvaluationRejectedError("shape", "求值输入格式不正确。")
+    if not isinstance(compiled, CompiledFormula) or request.formula != compiled.source:
+        raise EvaluationRejectedError("shape", "公式文本与已检查版本不一致。")
+    parsed = compiled.parsed
     if parsed.status != "parsed" or parsed.ast is None or parsed.translation is None:
-        issue = parsed.issues[0].message if parsed.issues else parsed.unsupported[0].message
-        raise EvaluationRejectedError("formula", issue)
+        raise EvaluationRejectedError("formula", "公式尚未通过检查。")
     if type(request.decision_date) is not date or not isinstance(request.decision_at, datetime):
         raise EvaluationRejectedError("time", "决策日期或时点格式不正确。")
     if request.decision_at.tzinfo is None or request.decision_at.utcoffset() is None:
