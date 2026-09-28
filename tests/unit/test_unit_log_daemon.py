@@ -309,7 +309,7 @@ def test_public_key_replacement_during_read_is_rejected(
 
     monkeypatch.setattr(daemon.os, "read", replace_after_read)
     with pytest.raises(ValueError):
-        daemon._read_stable_file(public, max_bytes=8192, kind="public")
+        daemon._read_stable_file(public, max_bytes=8192, kind="public", web_uid=os.geteuid() + 1)
 
 
 @pytest.mark.parametrize("kind", ["public", "key"])
@@ -319,7 +319,7 @@ def test_trust_file_replacement_after_manifest_check_is_rejected(
     daemon = _daemon()
     args, root = installed
     target = root / ("public.pem" if kind == "public" else "cursor.key")
-    original = daemon.load_signed_ops_manifest
+    original = daemon.verify_ops_manifest
 
     def replace_after_verify(*call_args: object, **call_kwargs: object) -> object:
         result = original(*call_args, **call_kwargs)
@@ -329,7 +329,7 @@ def test_trust_file_replacement_after_manifest_check_is_rejected(
         replacement.replace(target)
         return result
 
-    monkeypatch.setattr(daemon, "load_signed_ops_manifest", replace_after_verify)
+    monkeypatch.setattr(daemon, "verify_ops_manifest", replace_after_verify)
     assert daemon.main([*args, "--self-check"]) != 0
 
 
@@ -349,4 +349,128 @@ def test_key_file_is_service_owned_regular_file(
 
     monkeypatch.setattr(daemon.os, "fstat", wrong_owner)
     with pytest.raises(ValueError):
-        daemon._read_stable_file(key, max_bytes=4096, kind="key")
+        daemon._read_stable_file(key, max_bytes=4096, kind="key", web_uid=os.geteuid() + 1)
+
+
+def test_public_key_must_be_owned_by_root_or_service(installed: tuple[list[str], Path]) -> None:
+    daemon = _daemon()
+    _args, root = installed
+    state = root.joinpath("public.pem").lstat()
+    values = list(state)
+    values[stat.ST_UID] = os.geteuid() + 1
+    with pytest.raises(ValueError):
+        daemon._validate_material(os.stat_result(values), max_bytes=8192, kind="public")
+
+
+def test_group_writable_ancestor_is_rejected_before_preflight(
+    installed: tuple[list[str], Path],
+) -> None:
+    daemon = _daemon()
+    args, root = installed
+    root.chmod(0o770)
+    assert daemon.main([*args, "--self-check"]) != 0
+
+
+def test_web_owned_ancestor_is_rejected_even_if_mode_is_private(
+    installed: tuple[list[str], Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    daemon = _daemon()
+    args, root = installed
+    original = os.fstat
+    root_identity = (root.lstat().st_dev, root.lstat().st_ino)
+
+    def web_owned(fd: int) -> os.stat_result:
+        state = original(fd)
+        if (state.st_dev, state.st_ino) != root_identity:
+            return state
+        values = list(state)
+        values[stat.ST_UID] = os.geteuid() + 1
+        return os.stat_result(values)
+
+    monkeypatch.setattr(daemon.os, "fstat", web_owned)
+    assert daemon.main([*args, "--self-check"]) != 0
+
+
+@pytest.mark.parametrize("kind", ["key", "public"])
+def test_ancestor_swap_to_symlink_cannot_redirect_trust_file_read(
+    installed: tuple[list[str], Path], monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    daemon = _daemon()
+    _args, root = installed
+    trusted = root / "trusted"
+    alternate = root / "alternate"
+    parked = root / "parked"
+    trusted.mkdir()
+    alternate.mkdir()
+    leaf = "cursor.key" if kind == "key" else "public.pem"
+    trusted.joinpath(leaf).write_bytes(b"s" * 64)
+    alternate.joinpath(leaf).write_bytes(b"a" * 64)
+    if kind == "key":
+        trusted.joinpath(leaf).chmod(0o600)
+        alternate.joinpath(leaf).chmod(0o600)
+    original_lstat = Path.lstat
+    original_stat = os.stat
+    swapped = False
+
+    def swap_after_check() -> None:
+        nonlocal swapped
+        if not swapped:
+            trusted.rename(parked)
+            trusted.symlink_to(alternate, target_is_directory=True)
+            swapped = True
+
+    def raced_lstat(path: Path) -> os.stat_result:
+        result = original_lstat(path)
+        if path == trusted:
+            swap_after_check()
+        return result
+
+    def raced_stat(path: object, *call_args: object, **call_kwargs: object) -> os.stat_result:
+        result = original_stat(path, *call_args, **call_kwargs)
+        if path == "trusted" and call_kwargs.get("dir_fd") is not None:
+            swap_after_check()
+        return result
+
+    monkeypatch.setattr(Path, "lstat", raced_lstat)
+    monkeypatch.setattr(daemon.os, "stat", raced_stat)
+    try:
+        with pytest.raises((OSError, ValueError)):
+            daemon._read_stable_file(
+                trusted / leaf, max_bytes=4096, kind=kind, web_uid=os.geteuid() + 1
+            )
+    finally:
+        if swapped:
+            trusted.unlink()
+            parked.rename(trusted)
+
+
+def test_socket_ancestor_replacement_during_serve_fails_closed(
+    installed: tuple[list[str], Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    daemon = _daemon()
+    args, root = installed
+    trusted = root / "socket-trusted"
+    alternate = root / "socket-alternate"
+    parked = root / "socket-parked"
+    for directory in (trusted, alternate):
+        private = directory / "private"
+        private.mkdir(parents=True)
+        os.chown(private, -1, os.getegid())
+        private.chmod(0o710)
+    args = _replace_arg(args, "--socket-path", str(trusted / "private" / "logs.sock"))
+
+    class SwappingService:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def serve(self, *, stop: threading.Event) -> None:
+            trusted.rename(parked)
+            trusted.symlink_to(alternate, target_is_directory=True)
+            stop.set()
+
+    monkeypatch.setattr(daemon, "UnitLogService", SwappingService)
+    try:
+        assert daemon.main(args) != 0
+    finally:
+        trusted.unlink()
+        parked.rename(trusted)
