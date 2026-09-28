@@ -288,13 +288,10 @@ def test_invalid_arithmetic_returns_stable_missing_reason(
         "close + industry_neutralize(volume)",
     ],
 )
-def test_neutralization_operators_reject_entire_evaluation(expression: str) -> None:
-    from rquant.factor.time_series import FactorTimeSeriesError
-
+def test_neutralization_without_context_is_explicitly_unavailable(expression: str) -> None:
     data = _input(expression, (_DAYS[0],), _base_observations()[:2])
-    with pytest.raises(FactorTimeSeriesError) as error:
-        _run(data)
-    assert error.value.reason == "unsupported_operator"
+    result = _run(data)
+    assert _point(result, _DAYS[0], _A).missing_reason == "missing_context"
 
 
 def test_observation_after_its_decision_time_is_rejected() -> None:

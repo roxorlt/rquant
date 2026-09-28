@@ -25,6 +25,8 @@ from rquant.factor.time_series import (
     FactorTimeSeriesResult,
     FactorTimeSeriesValue,
     FeatureObservation,
+    IndustryObservation,
+    MarketCapObservation,
     evaluate_factor_time_series,
 )
 
@@ -43,6 +45,8 @@ __all__ = [
     "FactorExpressionError",
     "FeatureCatalog",
     "FeatureObservation",
+    "IndustryObservation",
+    "MarketCapObservation",
     "FactorICSummary",
     "GroupReturn",
     "GroupingResult",
