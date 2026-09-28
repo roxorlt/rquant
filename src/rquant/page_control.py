@@ -25,8 +25,17 @@ from typing import Annotated, Literal, Protocol
 from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID, uuid4
 
-from pydantic import Field, JsonValue, TypeAdapter, field_validator, model_validator
+from pydantic import (
+    Field,
+    JsonValue,
+    StrictBool,
+    StrictInt,
+    TypeAdapter,
+    field_validator,
+    model_validator,
+)
 
+from rquant.alert_price_rule import PriceAlertRule
 from rquant.canvas_publication_receipt import (
     CanvasPublicationCatalogRecord,
     CanvasPublicationCommand,
@@ -44,8 +53,20 @@ from rquant.manual_watchlist import (
     ManualWatchlistKey,
     ManualWatchlistRepository,
     ManualWatchlistUpsert,
+    OwnerId,
+    TsCode,
     WatchlistCapacityError,
     WatchlistVersionConflictError,
+)
+from rquant.price_alert_rule_store import (
+    PriceAlertRuleCapacityError,
+    PriceAlertRuleDelete,
+    PriceAlertRuleKey,
+    PriceAlertRuleRepository,
+    PriceAlertRuleScopeError,
+    PriceAlertRuleUpsert,
+    PriceAlertRuleVersionConflictError,
+    RuleId,
 )
 from rquant.runtime_contracts import (
     AwareUtcDatetime,
@@ -69,6 +90,11 @@ _SAFE_EFFECT_JOURNAL_VERSION = 2
 _MANUAL_WATCHLIST_MARKER = "manual-watchlist/v1"
 _MANUAL_WATCHLIST_VERSION = 1
 _MANUAL_WATCHLIST_KINDS = frozenset({"add_watchlist_item", "remove_watchlist_item"})
+_PRICE_RULE_MARKER = "price-alert-rule/v1"
+_PRICE_RULE_VERSION = 1
+_PRICE_RULE_KINDS = frozenset(
+    {"save_price_alert_rule", "set_price_alert_rule_enabled", "delete_price_alert_rule"}
+)
 _LOCAL_FILESYSTEM_FENCE_SCHEMA_VERSION = 1
 _CANVAS_HEAD_CONTRACT = "canvas-current-head/v1"
 _CANVAS_HEAD_SOURCE = "canvas_current_head"
@@ -104,6 +130,61 @@ class AddWatchlistItem(PageControlCommand):
 class RemoveWatchlistItem(PageControlCommand):
     kind: Literal["remove_watchlist_item"] = "remove_watchlist_item"
     item: ManualWatchlistDelete
+
+
+class SavePriceAlertRule(PageControlCommand):
+    kind: Literal["save_price_alert_rule"] = "save_price_alert_rule"
+    ts_code: TsCode
+    membership_version: StrictInt = Field(ge=1)
+    expected_version: StrictInt | None = Field(default=None, ge=1)
+    rule: PriceAlertRule
+
+
+class SetPriceAlertRuleEnabled(PageControlCommand):
+    kind: Literal["set_price_alert_rule_enabled"] = "set_price_alert_rule_enabled"
+    rule_id: RuleId
+    expected_version: StrictInt = Field(ge=1)
+    enabled: StrictBool
+
+
+class DeletePriceAlertRule(PageControlCommand):
+    kind: Literal["delete_price_alert_rule"] = "delete_price_alert_rule"
+    rule_id: RuleId
+    expected_version: StrictInt = Field(ge=1)
+
+
+class _OwnedSavePriceAlertRule(SavePriceAlertRule):
+    owner_id: OwnerId
+
+
+class _OwnedSetPriceAlertRuleEnabled(SetPriceAlertRuleEnabled):
+    owner_id: OwnerId
+
+
+class _OwnedDeletePriceAlertRule(DeletePriceAlertRule):
+    owner_id: OwnerId
+
+
+PriceAlertRuleRequestValue = SavePriceAlertRule | SetPriceAlertRuleEnabled | DeletePriceAlertRule
+_OwnedPriceAlertRuleValue = (
+    _OwnedSavePriceAlertRule | _OwnedSetPriceAlertRuleEnabled | _OwnedDeletePriceAlertRule
+)
+
+
+def _owned_price_rule_command(
+    command: PriceAlertRuleRequestValue, *, authenticated_owner_id: str
+) -> _OwnedPriceAlertRuleValue:
+    if type(command) is SavePriceAlertRule:
+        model = _OwnedSavePriceAlertRule
+    elif type(command) is SetPriceAlertRuleEnabled:
+        model = _OwnedSetPriceAlertRuleEnabled
+    elif type(command) is DeletePriceAlertRule:
+        model = _OwnedDeletePriceAlertRule
+    else:
+        raise TypeError("trusted price rule submission requires an ownerless request")
+    return model.model_validate(
+        {**command.model_dump(mode="python"), "owner_id": authenticated_owner_id}
+    )
 
 
 class SaveCanvas(PageControlCommand):
@@ -399,6 +480,9 @@ PageControlCommandValue = Annotated[
     AckAlert
     | AddWatchlistItem
     | RemoveWatchlistItem
+    | _OwnedSavePriceAlertRule
+    | _OwnedSetPriceAlertRuleEnabled
+    | _OwnedDeletePriceAlertRule
     | SaveCanvas
     | CreateCanvas
     | DeleteCanvas
@@ -858,6 +942,10 @@ class PageControlOutbox:
             raise ValueError("ack_alert requires verified Serving eligibility")
         if isinstance(command, (AddWatchlistItem, RemoveWatchlistItem)):
             raise ValueError("watchlist commands require trusted submission")
+        if isinstance(
+            command, (SavePriceAlertRule, SetPriceAlertRuleEnabled, DeletePriceAlertRule)
+        ):
+            raise ValueError("price rule commands require trusted submission")
         return self._enqueue(command)
 
     def enqueue_verified_ack(self, command: AckAlert) -> PageControlReceipt:
@@ -873,14 +961,37 @@ class PageControlOutbox:
             raise TypeError("trusted watchlist submission requires a watchlist command")
         return self._enqueue(command, require_watchlist_activation=True)
 
+    def enqueue_trusted_price_rule(self, command: _OwnedPriceAlertRuleValue) -> PageControlReceipt:
+        if not isinstance(
+            command,
+            (_OwnedSavePriceAlertRule, _OwnedSetPriceAlertRuleEnabled, _OwnedDeletePriceAlertRule),
+        ):
+            raise TypeError("trusted price rule submission requires an owned command")
+        return self._enqueue(command, require_price_rule_activation=True)
+
     def _enqueue(
-        self, command: PageControlCommandValue, *, require_watchlist_activation: bool = False
+        self,
+        command: PageControlCommandValue,
+        *,
+        require_watchlist_activation: bool = False,
+        require_price_rule_activation: bool = False,
     ) -> PageControlReceipt:
         if (
             isinstance(command, (AddWatchlistItem, RemoveWatchlistItem))
             != require_watchlist_activation
         ):
             raise ValueError("watchlist commands require trusted submission")
+        is_price_rule = isinstance(
+            command, (SavePriceAlertRule, SetPriceAlertRuleEnabled, DeletePriceAlertRule)
+        )
+        is_owned_price_rule = isinstance(
+            command,
+            (_OwnedSavePriceAlertRule, _OwnedSetPriceAlertRuleEnabled, _OwnedDeletePriceAlertRule),
+        )
+        if is_price_rule != require_price_rule_activation or (
+            require_price_rule_activation and not is_owned_price_rule
+        ):
+            raise ValueError("price rule commands require trusted submission")
         payload = command.model_dump_json()
         command_hash = _command_hash(command)
         enqueued_at = command.requested_at.isoformat(timespec="microseconds")
@@ -888,6 +999,16 @@ class PageControlOutbox:
             connection.execute("BEGIN IMMEDIATE")
             if require_watchlist_activation and not self._manual_watchlist_activated(connection):
                 raise ValueError("manual watchlist is not activated")
+            if require_price_rule_activation:
+                assert isinstance(
+                    command,
+                    (
+                        _OwnedSavePriceAlertRule,
+                        _OwnedSetPriceAlertRuleEnabled,
+                        _OwnedDeletePriceAlertRule,
+                    ),
+                )
+                self._require_price_rule_activation(connection, command.owner_id)
             existing = connection.execute(
                 "SELECT * FROM page_control_command WHERE command_id = ?",
                 (command.command_id,),
@@ -897,6 +1018,16 @@ class PageControlOutbox:
                     raise PageControlCommandConflictError(
                         "command_id already exists with different payload"
                     )
+                if require_price_rule_activation:
+                    stored = _COMMAND_ADAPTER.validate_json(existing["payload_json"])
+                    if (
+                        stored != command
+                        or existing["command_kind"] != command.kind
+                        or _command_hash(stored) != command_hash
+                    ):
+                        raise PageControlCommandConflictError(
+                            "command_id already exists with different payload"
+                        )
                 return self._receipt(existing)
             connection.execute(
                 """
@@ -925,6 +1056,66 @@ class PageControlOutbox:
             (_MANUAL_WATCHLIST_MARKER,),
         ).fetchone()
         return marker is not None and marker["protocol_version"] == _MANUAL_WATCHLIST_VERSION
+
+    @staticmethod
+    def _require_price_rule_activation(connection: sqlite3.Connection, owner_id: str) -> None:
+        marker = connection.execute(
+            "SELECT protocol_version, activated_at FROM page_control_protocol_activation "
+            "WHERE marker_name = ?",
+            (_PRICE_RULE_MARKER,),
+        ).fetchone()
+        if marker is None or marker["protocol_version"] != _PRICE_RULE_VERSION:
+            raise ValueError("price rule protocol is not activated")
+        raw_time = marker["activated_at"]
+        if not isinstance(raw_time, str):
+            raise ValueError("price rule activation marker is malformed")
+        try:
+            canonical_time = _normalize_utc(datetime.fromisoformat(raw_time)).isoformat(
+                timespec="microseconds"
+            )
+        except ValueError as exc:
+            raise ValueError("price rule activation marker is malformed") from exc
+        if canonical_time != raw_time:
+            raise ValueError("price rule activation marker is malformed")
+        PriceAlertRuleRepository(connection).list_current(owner_id)
+
+    def activate_price_alert_rules(self, activated_at: datetime) -> datetime:
+        frozen = _normalize_utc(activated_at).isoformat(timespec="microseconds")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT protocol_version, activated_at FROM page_control_protocol_activation "
+                "WHERE marker_name = ?",
+                (_PRICE_RULE_MARKER,),
+            ).fetchone()
+            if existing is None:
+                PriceAlertRuleRepository(connection).install_schema()
+                connection.execute(
+                    "INSERT INTO page_control_protocol_activation "
+                    "(marker_name, protocol_version, activated_at) VALUES (?, ?, ?)",
+                    (_PRICE_RULE_MARKER, _PRICE_RULE_VERSION, frozen),
+                )
+            elif (
+                existing["protocol_version"] != _PRICE_RULE_VERSION
+                or existing["activated_at"] != frozen
+            ):
+                raise ValueError("price rule protocol was already activated differently")
+            else:
+                self._require_price_rule_activation(connection, "__price_rule_schema_probe__")
+        return datetime.fromisoformat(frozen)
+
+    def price_alert_rules_activated_at(self) -> datetime | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT protocol_version, activated_at FROM page_control_protocol_activation "
+                "WHERE marker_name = ?",
+                (_PRICE_RULE_MARKER,),
+            ).fetchone()
+        if row is None:
+            return None
+        if row["protocol_version"] != _PRICE_RULE_VERSION:
+            raise RuntimeError("price rule protocol version is unsupported")
+        return datetime.fromisoformat(row["activated_at"])
 
     def activate_manual_watchlist(self, activated_at: datetime) -> datetime:
         frozen = _normalize_utc(activated_at).isoformat(timespec="microseconds")
@@ -1009,6 +1200,33 @@ class PageControlOutbox:
         stored = _COMMAND_ADAPTER.validate_json(row["payload_json"])
         if not isinstance(stored, AckAlert) or _command_hash(stored) != row["command_hash"]:
             raise ValueError("stored acknowledgment command conflicts with its hash")
+        return self._receipt(row)
+
+    def lookup_price_rule_command(
+        self, command: _OwnedPriceAlertRuleValue
+    ) -> PageControlReceipt | None:
+        """Read-only lookup of one exact persisted owner-bound rule request."""
+        if not isinstance(
+            command,
+            (_OwnedSavePriceAlertRule, _OwnedSetPriceAlertRuleEnabled, _OwnedDeletePriceAlertRule),
+        ):
+            raise TypeError("price rule lookup requires an owned command")
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM page_control_command WHERE command_id = ?",
+                (command.command_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        if row["command_kind"] != command.kind or row["command_hash"] != _command_hash(command):
+            raise PageControlCommandConflictError(
+                "command_id already exists with different payload"
+            )
+        stored = _COMMAND_ADAPTER.validate_json(row["payload_json"])
+        if stored != command or _command_hash(stored) != row["command_hash"]:
+            raise PageControlCommandConflictError(
+                "stored price rule command conflicts with its hash"
+            )
         return self._receipt(row)
 
     def acknowledgment(self, alert_id: str) -> AlertAcknowledgment | None:
@@ -1254,6 +1472,182 @@ class PageControlOutbox:
             assert completed is not None
         return self._receipt(completed)
 
+    def complete_price_rule(self, claim: PageControlClaim, *, now: datetime) -> PageControlReceipt:
+        """Commit rule CAS, effect, and terminal receipt in one SQLite transaction."""
+        command = claim.command
+        if not isinstance(
+            command,
+            (_OwnedSavePriceAlertRule, _OwnedSetPriceAlertRuleEnabled, _OwnedDeletePriceAlertRule),
+        ):
+            raise TypeError("complete_price_rule requires an owned price rule claim")
+        observed = _normalize_utc(now)
+        completed_at = observed.isoformat(timespec="microseconds")
+        command_hash = _command_hash(command)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM page_control_command WHERE command_id = ?",
+                (command.command_id,),
+            ).fetchone()
+            if (
+                row is None
+                or row["command_kind"] != command.kind
+                or row["command_hash"] != command_hash
+            ):
+                raise ValueError("price rule command content changed")
+            stored = _COMMAND_ADAPTER.validate_json(row["payload_json"])
+            if stored != command or _command_hash(stored) != command_hash:
+                raise ValueError("stored price rule command conflicts with its hash")
+            if (
+                row["status"] != PageControlStatus.PROCESSING.value
+                or row["processing_owner"] != claim.owner_id
+                or row["claim_token"] != claim.claim_token
+                or row["lease_expires_at"] is None
+                or row["lease_expires_at"] <= completed_at
+            ):
+                raise RuntimeError("stale or expired price rule claim cannot complete")
+            self._require_price_rule_activation(connection, command.owner_id)
+
+            action = (
+                "save"
+                if isinstance(command, _OwnedSavePriceAlertRule)
+                else "set_enabled"
+                if isinstance(command, _OwnedSetPriceAlertRuleEnabled)
+                else "delete"
+            )
+            rule_id = (
+                command.rule.rule_id
+                if isinstance(command, _OwnedSavePriceAlertRule)
+                else command.rule_id
+            )
+            error: str | None = None
+            status = PageControlStatus.SUCCEEDED
+            if command.requested_at > observed + _MAX_REQUEST_FUTURE_SKEW:
+                status = PageControlStatus.FAILED
+                error = "price rule command requested_at exceeds allowed future clock skew"
+                result: JsonValue = {"rule_id": rule_id, "action": action, "code": "future_request"}
+            else:
+                repository = PriceAlertRuleRepository(connection)
+                try:
+                    if isinstance(command, _OwnedSavePriceAlertRule):
+                        entry = repository.upsert(
+                            PriceAlertRuleUpsert(
+                                owner_id=command.owner_id,
+                                ts_code=command.ts_code,
+                                membership_version=command.membership_version,
+                                expected_version=command.expected_version,
+                                rule=command.rule,
+                            ),
+                            now=observed,
+                        )
+                    elif isinstance(command, _OwnedSetPriceAlertRuleEnabled):
+                        current = repository.get(
+                            PriceAlertRuleKey(owner_id=command.owner_id, rule_id=command.rule_id)
+                        )
+                        if (
+                            current is None
+                            or current.deleted
+                            or current.version != command.expected_version
+                        ):
+                            raise PriceAlertRuleVersionConflictError(
+                                "price rule version does not match"
+                            )
+                        assert current.rule is not None
+                        assert current.ts_code is not None
+                        assert current.membership_version is not None
+                        entry = repository.upsert(
+                            PriceAlertRuleUpsert(
+                                owner_id=command.owner_id,
+                                ts_code=current.ts_code,
+                                membership_version=current.membership_version,
+                                expected_version=command.expected_version,
+                                rule=current.rule.model_copy(update={"enabled": command.enabled}),
+                            ),
+                            now=observed,
+                        )
+                    else:
+                        entry = repository.delete(
+                            PriceAlertRuleDelete(
+                                owner_id=command.owner_id,
+                                rule_id=command.rule_id,
+                                expected_version=command.expected_version,
+                            ),
+                            now=observed,
+                        )
+                except PriceAlertRuleVersionConflictError:
+                    status = PageControlStatus.FAILED
+                    error = "price rule version conflict"
+                    result = {"rule_id": rule_id, "action": action, "code": "version_conflict"}
+                except PriceAlertRuleScopeError:
+                    status = PageControlStatus.FAILED
+                    error = "price rule scope is invalid"
+                    result = {"rule_id": rule_id, "action": action, "code": "scope_invalid"}
+                except PriceAlertRuleCapacityError:
+                    status = PageControlStatus.FAILED
+                    error = "price rule capacity exceeded"
+                    result = {"rule_id": rule_id, "action": action, "code": "capacity_exceeded"}
+                else:
+                    result = {
+                        "rule_id": entry.rule_id,
+                        "action": action,
+                        "version": entry.version,
+                        "deleted": entry.deleted,
+                        "enabled": None if entry.rule is None else entry.rule.enabled,
+                    }
+            result_json = json.dumps(result, ensure_ascii=True)
+            connection.execute(
+                """
+                INSERT INTO page_control_effect(
+                    command_id, command_hash, effect_kind, status,
+                    owner_id, claim_token, started_at, completed_at, result_json, error
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    command.command_id,
+                    command_hash,
+                    command.kind,
+                    (
+                        PageControlEffectStatus.SUCCEEDED.value
+                        if status is PageControlStatus.SUCCEEDED
+                        else PageControlEffectStatus.FAILED.value
+                    ),
+                    claim.owner_id,
+                    claim.claim_token,
+                    completed_at,
+                    completed_at,
+                    result_json,
+                    error,
+                ),
+            )
+            changed = connection.execute(
+                """
+                UPDATE page_control_command
+                SET status = ?, completed_at = ?, result_json = ?, error = ?,
+                    processing_owner = NULL, lease_expires_at = NULL, claim_token = NULL
+                WHERE command_id = ? AND status = ? AND processing_owner = ?
+                  AND claim_token = ? AND lease_expires_at > ?
+                """,
+                (
+                    status.value,
+                    completed_at,
+                    result_json,
+                    error,
+                    command.command_id,
+                    PageControlStatus.PROCESSING.value,
+                    claim.owner_id,
+                    claim.claim_token,
+                    completed_at,
+                ),
+            ).rowcount
+            if changed != 1:
+                raise RuntimeError("price rule claim changed during completion")
+            completed = connection.execute(
+                "SELECT * FROM page_control_command WHERE command_id = ?",
+                (command.command_id,),
+            ).fetchone()
+            assert completed is not None
+        return self._receipt(completed)
+
     @staticmethod
     def _acknowledgment(row: sqlite3.Row) -> AlertAcknowledgment:
         return AlertAcknowledgment(
@@ -1289,6 +1683,7 @@ class PageControlOutbox:
         owner_id: str = "page-control-consumer",
         lease_seconds: int = _DEFAULT_LEASE_SECONDS,
         now: datetime | None = None,
+        target_command_id: str | None = None,
     ) -> tuple[PageControlClaim, ...]:
         if not 1 <= limit <= 100:
             raise ValueError("limit must be between 1 and 100")
@@ -1305,23 +1700,58 @@ class PageControlOutbox:
             connection.execute("BEGIN IMMEDIATE")
             rows = connection.execute(
                 """
-                SELECT command_id, payload_json
+                SELECT command_id, command_kind, command_hash, payload_json
                 FROM page_control_command
-                WHERE status = ?
-                   OR (status = ? AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?)
+                WHERE (status = ?
+                   OR (status = ? AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?))
+                  AND (? IS NULL OR command_id = ?)
                 ORDER BY CASE status WHEN ? THEN 0 ELSE 1 END, enqueued_at, rowid
-                LIMIT ?
                 """,
                 (
                     PageControlStatus.PENDING.value,
                     PageControlStatus.PROCESSING.value,
                     observed_at,
+                    target_command_id,
+                    target_command_id,
                     PageControlStatus.PENDING.value,
-                    limit,
                 ),
-            ).fetchall()
+            )
+            eligible: list[sqlite3.Row] = []
+            try:
+                for row in rows:
+                    try:
+                        parsed_command = _COMMAND_ADAPTER.validate_json(row["payload_json"])
+                    except ValueError:
+                        if row["command_kind"] in _PRICE_RULE_KINDS:
+                            continue
+                        raise
+                    if isinstance(
+                        parsed_command,
+                        (
+                            _OwnedSavePriceAlertRule,
+                            _OwnedSetPriceAlertRuleEnabled,
+                            _OwnedDeletePriceAlertRule,
+                        ),
+                    ):
+                        try:
+                            if (
+                                parsed_command.kind != row["command_kind"]
+                                or parsed_command.command_id != row["command_id"]
+                                or _command_hash(parsed_command) != row["command_hash"]
+                            ):
+                                continue
+                            self._require_price_rule_activation(connection, parsed_command.owner_id)
+                        except (ValueError, RuntimeError, sqlite3.Error):
+                            continue
+                    elif row["command_kind"] in _PRICE_RULE_KINDS:
+                        continue
+                    eligible.append(row)
+                    if len(eligible) == limit:
+                        break
+            finally:
+                rows.close()
             claims: list[PageControlClaim] = []
-            for row in rows:
+            for row in eligible:
                 claim_token = uuid4().hex
                 changed = connection.execute(
                     """
@@ -1390,6 +1820,8 @@ class PageControlOutbox:
             ).fetchone()
             if kind is not None and kind["command_kind"] in _MANUAL_WATCHLIST_KINDS:
                 raise ValueError("watchlist command requires atomic completion")
+            if kind is not None and kind["command_kind"] in _PRICE_RULE_KINDS:
+                raise ValueError("price rule command requires atomic completion")
             changed = connection.execute(
                 f"""
                 UPDATE page_control_command
@@ -1473,6 +1905,10 @@ class PageControlOutbox:
     ) -> tuple[PageControlEffectRecord, bool]:
         if isinstance(command, (AddWatchlistItem, RemoveWatchlistItem)):
             raise ValueError("watchlist command requires atomic completion")
+        if isinstance(
+            command, (SavePriceAlertRule, SetPriceAlertRuleEnabled, DeletePriceAlertRule)
+        ):
+            raise ValueError("price rule command requires atomic completion")
         command_hash = _command_hash(command)
         observed_at = _normalize_utc(now or datetime.now(UTC)).isoformat(timespec="microseconds")
         with self._connect() as connection:
@@ -1759,6 +2195,26 @@ class PageControlConsumer:
                 return ()
             return self._drain_locked(limit=limit)
 
+    def drain_price_rule_command(
+        self, command: _OwnedPriceAlertRuleValue
+    ) -> tuple[PageControlReceipt, ...]:
+        with _PageControlExecutionMutex(self._consumer_mutex_path()) as acquired:
+            if not acquired:
+                return ()
+            claims = self.outbox.claim_records(
+                limit=1,
+                owner_id=self.consumer_id,
+                lease_seconds=self.lease_seconds,
+                now=self.clock(),
+                target_command_id=command.command_id,
+            )
+            if not claims:
+                return ()
+            claim = claims[0]
+            if claim.command != command:
+                raise PageControlCommandConflictError("price rule command changed before claim")
+            return (self.outbox.complete_price_rule(claim, now=self.clock()),)
+
     def _drain_locked(self, *, limit: int) -> tuple[PageControlReceipt, ...]:
         receipts: list[PageControlReceipt] = []
         for claim in self.outbox.claim_records(
@@ -1769,6 +2225,16 @@ class PageControlConsumer:
         ):
             if isinstance(claim.command, (AddWatchlistItem, RemoveWatchlistItem)):
                 receipts.append(self.outbox.complete_watchlist(claim, now=self.clock()))
+                continue
+            if isinstance(
+                claim.command,
+                (
+                    _OwnedSavePriceAlertRule,
+                    _OwnedSetPriceAlertRuleEnabled,
+                    _OwnedDeletePriceAlertRule,
+                ),
+            ):
+                receipts.append(self.outbox.complete_price_rule(claim, now=self.clock()))
                 continue
             if isinstance(claim.command, AckAlert):
                 try:
@@ -2645,9 +3111,10 @@ class PageControlConsumer:
         identity = command if identity_command is None else identity_command
         self._assert_no_formula_pool_name(command.base_name)
         path = self._user_pool_path(command.base_name)
-        if self._managed_json_exists(path) and self._read_json(path).get(
-            "schema_version"
-        ) in (2, 3):
+        if self._managed_json_exists(path) and self._read_json(path).get("schema_version") in (
+            2,
+            3,
+        ):
             raise ValueError("versioned pool definition requires matching save command")
         payload = {
             "name": command.base_name,
@@ -2759,8 +3226,7 @@ class PageControlConsumer:
             fundamentals = set(FUNDAMENTAL_COLS_MAP.values())
             unsupported = any(column.split("[", 1)[0] in fundamentals for column in columns)
             dynamic_rsi = any(
-                period not in (6, 14)
-                for period, _offset in requested_dynamic_rsi(columns).values()
+                period not in (6, 14) for period, _offset in requested_dynamic_rsi(columns).values()
             )
             dynamic_ma = bool(requested_dynamic_ma(columns))
         except ValueError as error:
@@ -2883,11 +3349,10 @@ class PageControlConsumer:
         if not self._managed_json_exists(path):
             raise ValueError("pool definition is unavailable")
         current = self._read_json(path)
-        versioned_source = (
-            (current.get("schema_version"), current.get("source"))
-            in {(2, "page_control_v2"), (3, "page_control_v3")}
-            and (current.get("schema_version") != 3 or "ranking" in current)
-        )
+        versioned_source = (current.get("schema_version"), current.get("source")) in {
+            (2, "page_control_v2"),
+            (3, "page_control_v3"),
+        } and (current.get("schema_version") != 3 or "ranking" in current)
         if (
             not versioned_source
             or current.get("name") != base_name
@@ -3493,6 +3958,10 @@ class PageControlService:
     def submit(self, command: PageControlCommandValue) -> PageControlReceipt:
         if isinstance(command, (AddWatchlistItem, RemoveWatchlistItem)):
             raise ValueError("watchlist commands require trusted submission")
+        if isinstance(
+            command, (SavePriceAlertRule, SetPriceAlertRuleEnabled, DeletePriceAlertRule)
+        ):
+            raise ValueError("price rule commands require trusted submission")
         if isinstance(command, AckAlert):
             receipt = self.lookup_ack_command(command)
             if receipt is None:
@@ -3522,13 +3991,44 @@ class PageControlService:
             raise ValueError("authenticated owner does not match watchlist command owner")
         return self._settle(command, self.outbox.enqueue_trusted_watchlist(command))
 
+    def _submit_trusted_price_rule(
+        self, command: PriceAlertRuleRequestValue, *, authenticated_owner_id: str
+    ) -> PageControlReceipt:
+        owned = _owned_price_rule_command(command, authenticated_owner_id=authenticated_owner_id)
+        return self._settle(
+            owned, self.outbox.enqueue_trusted_price_rule(owned), price_rule_command=owned
+        )
+
+    def _lookup_trusted_price_rule(
+        self, command: PriceAlertRuleRequestValue, *, authenticated_owner_id: str
+    ) -> PageControlReceipt | None:
+        owned = _owned_price_rule_command(command, authenticated_owner_id=authenticated_owner_id)
+        return self.outbox.lookup_price_rule_command(owned)
+
+    def _resume_trusted_price_rule(
+        self, command: PriceAlertRuleRequestValue, *, authenticated_owner_id: str
+    ) -> PageControlReceipt:
+        owned = _owned_price_rule_command(command, authenticated_owner_id=authenticated_owner_id)
+        receipt = self.outbox.lookup_price_rule_command(owned)
+        if receipt is None:
+            raise KeyError("price rule command not found")
+        return self._settle(owned, receipt, price_rule_command=owned)
+
     def _settle(
-        self, command: PageControlCommandValue, receipt: PageControlReceipt
+        self,
+        command: PageControlCommandValue,
+        receipt: PageControlReceipt,
+        *,
+        price_rule_command: _OwnedPriceAlertRuleValue | None = None,
     ) -> PageControlReceipt:
         for _ in range(100):
             if receipt.status in _PAGE_CONTROL_TERMINAL_STATUSES:
                 return receipt
-            drained = self.consumer.drain(limit=100)
+            drained = (
+                self.consumer.drain(limit=100)
+                if price_rule_command is None
+                else self.consumer.drain_price_rule_command(price_rule_command)
+            )
             observed = self.outbox.receipt(command.command_id)
             if observed is None:
                 raise RuntimeError("page control command disappeared")
@@ -3572,6 +4072,10 @@ class PageControlClient:
     def submit(self, command: PageControlCommandValue) -> PageControlReceipt:
         if isinstance(command, (AddWatchlistItem, RemoveWatchlistItem)):
             raise ValueError("watchlist commands require trusted submission")
+        if isinstance(
+            command, (SavePriceAlertRule, SetPriceAlertRuleEnabled, DeletePriceAlertRule)
+        ):
+            raise ValueError("price rule commands require trusted submission")
         try:
             response = self.transport(command.model_dump(mode="json"))
         except (OSError, TimeoutError, urllib.error.URLError) as exc:
@@ -4187,6 +4691,10 @@ def _fsync_descriptor(descriptor: int) -> None:
 
 
 def parse_page_control_command(payload: object) -> PageControlCommandValue:
+    if isinstance(payload, Mapping):
+        kind = payload.get("kind")
+        if isinstance(kind, str) and kind in _PRICE_RULE_KINDS:
+            raise ValueError("price rule commands require trusted submission")
     return _COMMAND_ADAPTER.validate_python(payload)
 
 
@@ -4199,6 +4707,7 @@ __all__ = [
     "CreateCanvas",
     "DEFAULT_PAGE_CONTROL_SERVICE_ID",
     "DeleteCanvas",
+    "DeletePriceAlertRule",
     "DeleteUserPool",
     "DiscardLabArtifactZip",
     "ExportLabArtifactZip",
@@ -4222,12 +4731,14 @@ __all__ = [
     "parse_page_control_command",
     "RemoveWatchlistItem",
     "SaveCanvas",
+    "SavePriceAlertRule",
     "SaveFormulaPoolV1",
     "SaveNlPreset",
     "SaveUserPool",
     "SaveUserPoolV2",
     "SaveUserPoolV3",
     "SetCanvasPoolRefs",
+    "SetPriceAlertRuleEnabled",
     "SubmitLabCommand",
     "SubmitBackfillPlan",
     "SubmitDataAuditReport",
