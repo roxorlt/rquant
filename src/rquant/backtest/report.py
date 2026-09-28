@@ -202,6 +202,10 @@ def _chart(
           </g>
           {benchmark_markup}
         </svg>
+        <div class="chart-scale" aria-label="图表刻度">
+          <span>上限 {_safe(top_label)}</span><span>下限 {_safe(bottom_label)}</span>
+          <span>{_safe(_date(dates[0]))}</span><span>{_safe(_date(dates[-1]))}</span>
+        </div>
         <div class="legend">
           <span><i class="swatch strategy-swatch"></i>组合账本</span>{benchmark_legend}
         </div>
@@ -302,9 +306,8 @@ def _benchmark_section(
         <div class="section-head"><h2 id="benchmark-title">指数基准</h2>
           <span class="section-tag">{_safe(benchmark.ts_code)}</span></div>
         <dl class="metrics compact">{metrics}</dl>
-        <p class="source-note">该指数基准来自 retrospective_daily_bar / index_daily_bar
-        的事后日线收盘价，
-        仅供离线回顾比较；不代表历史盘前已取得，也不得作为 09:25 决策输入。</p>
+        <p class="source-note">指数基准使用事后指数收盘价，仅供离线回顾比较；
+        不代表历史盘前已取得，也不得作为 09:25 决策输入。</p>
       </section>"""
 
 
@@ -318,6 +321,11 @@ def _provenance(result: BacktestResult, benchmark: BenchmarkSeries | None) -> st
         ("代码提交", result.producer_commit),
         ("指数来源 SHA-256", None if benchmark is None else benchmark.source_identity),
     )
+    if benchmark is not None:
+        values += (
+            ("基准来源模式", benchmark.source_mode),
+            ("基准来源表", benchmark.source_table),
+        )
     return (
         '<details class="provenance"><summary>技术标识与来源</summary><dl>'
         + "".join(
@@ -377,6 +385,7 @@ _STYLE = """
   .legend{display:flex;flex-wrap:wrap;gap:15px;color:var(--muted);font-size:11px;
     overflow-wrap:anywhere}
   .chart-data{font-size:12px;color:var(--ink);margin-top:8px;font-variant-numeric:tabular-nums}
+  .chart-scale{display:none}
   .swatch{display:inline-block;width:14px;height:2px;vertical-align:middle;margin-right:5px;
     background:var(--teal)}.benchmark-swatch{background:var(--sand)}
   .source-note,.empty-note{color:var(--muted);font-size:12px;line-height:1.7;margin-top:15px}
@@ -404,6 +413,11 @@ _STYLE = """
     .section{padding:25px 0 29px}.section-head h2{font-size:22px}.metric{padding:12px}
     .metric dd{font-size:17px}.compact .metric dd{font-size:15px}.chart-card{padding:12px 8px}
     .chart-card figcaption{padding:0 8px}.chart-card figcaption span{font-size:10px}
+    .chart-card .axis{display:none}
+    .chart-scale{display:grid;grid-template-columns:1fr 1fr;gap:2px 8px;
+      font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums}
+    .chart-scale span{min-width:0;overflow-wrap:anywhere}
+    .chart-scale span:nth-child(even){text-align:right}
     table,tbody,tr,td{display:block;width:100%}thead{display:none}tr{padding:9px 12px;
       border:1px solid var(--line);margin:0 0 10px;background:#fff}td,
     td:first-child{text-align:right;
@@ -478,7 +492,7 @@ def render_backtest_html(
 <title>组合回测研究报告 · rQuant</title><style>{_STYLE}</style></head>
 <body><main>
   <header class="masthead">
-    <p class="kicker">rQuant / Portfolio research</p>
+    <p class="kicker">rQuant / 组合研究</p>
     <h1>组合回测研究报告</h1>
     <p class="deck">逐日账户账本的离线视图。收益与曲线来自收盘估值；指标仅作研究参考。</p>
     <p class="period">{_safe(_date(dates[0]))} — {_safe(_date(dates[-1]))}
@@ -498,7 +512,7 @@ def render_backtest_html(
     {_metrics(summary)}</section>
   <section class="section" aria-labelledby="curves-title">
     <div class="section-head"><h2 id="curves-title">资金曲线</h2>
-      <span class="section-tag">静态图 · 无脚本</span></div>
+      <span class="section-tag">按交易日观察</span></div>
     <div class="charts">{nav_chart}{drawdown_chart}</div></section>
   {_benchmark_section(benchmark, comparison)}
   <section class="section" aria-labelledby="ledger-title">
