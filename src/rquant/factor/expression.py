@@ -201,8 +201,8 @@ def parse_factor_expression(
         raise FactorExpressionError("expression_too_long")
     try:
         tree = ast.parse(expression.strip(), mode="eval")
-    except SyntaxError as error:
-        raise FactorExpressionError("invalid_syntax") from error
+    except (SyntaxError, UnicodeEncodeError):
+        raise FactorExpressionError("invalid_syntax") from None
     except RecursionError as error:
         raise FactorExpressionError("expression_too_complex") from error
     _check_budget(tree)

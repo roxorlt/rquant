@@ -152,6 +152,13 @@ def test_expression_rejects_unsafe_or_invalid_syntax_with_stable_reason(
     assert error.value.reason == reason
 
 
+def test_expression_maps_unpaired_surrogate_to_domain_reason() -> None:
+    with pytest.raises(FactorExpressionError) as error:
+        parse_factor_expression("close\ud800", FeatureCatalog(columns=("close",)))
+    assert error.value.reason == "invalid_syntax"
+    assert error.value.__cause__ is None
+
+
 def test_expression_rejects_input_budgets_before_normalization() -> None:
     expressions = (
         ("x" * (MAX_EXPRESSION_LENGTH + 1), "expression_too_long"),
