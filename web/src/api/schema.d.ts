@@ -497,6 +497,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/pools/formula": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 公式池列表 */
+        get: operations["list_formula_pools_api_v1_pools_formula_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/pools/formula/commands": {
         parameters: {
             query?: never;
@@ -508,6 +525,23 @@ export interface paths {
         put?: never;
         /** 保存公式池 */
         post: operations["submit_formula_pool_save_command_api_v1_pools_formula_commands_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/pools/formula/{base_name}/members": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 公式池命中代码 */
+        get: operations["get_formula_pool_members_api_v1_pools_formula__base_name__members_get"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -2180,6 +2214,16 @@ export interface components {
             data: components["schemas"]["FormulaMarketMatchesData"];
             serving: components["schemas"]["ServingMeta"];
         };
+        /** Envelope[FormulaPoolListData] */
+        Envelope_FormulaPoolListData_: {
+            data: components["schemas"]["FormulaPoolListData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[FormulaPoolMembersData] */
+        Envelope_FormulaPoolMembersData_: {
+            data: components["schemas"]["FormulaPoolMembersData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
         /** Envelope[HealthData] */
         Envelope_HealthData_: {
             data: components["schemas"]["HealthData"];
@@ -2472,6 +2516,75 @@ export interface components {
             /** Reason */
             reason: string;
         };
+        /** FormulaPoolItem */
+        FormulaPoolItem: {
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /** Display Name */
+            display_name: string;
+            /** Formula */
+            formula: string;
+            latest_result: components["schemas"]["FormulaPoolLatestResult"] | null;
+            /** Pool Name */
+            pool_name: string;
+            /** Status Label */
+            status_label: string;
+            /** Syntax Version */
+            syntax_version: string;
+        };
+        /** FormulaPoolLatestResult */
+        FormulaPoolLatestResult: {
+            /** Market Total */
+            market_total: number;
+            /** Match Count */
+            match_count: number;
+            /** No Match Count */
+            no_match_count: number;
+            /**
+             * Trade Date
+             * Format: date
+             */
+            trade_date: string;
+            /** Unknown Count */
+            unknown_count: number;
+            /** Unknown Reasons */
+            unknown_reasons: components["schemas"]["FormulaPoolUnknownReason"][];
+        };
+        /** FormulaPoolListData */
+        FormulaPoolListData: {
+            /**
+             * Availability
+             * @enum {string}
+             */
+            availability: "unavailable" | "not_published" | "empty" | "ready";
+            /** Available At */
+            available_at: string | null;
+            /** Message */
+            message: string;
+            /** Pools */
+            pools: components["schemas"]["FormulaPoolItem"][];
+        };
+        /** FormulaPoolMembersData */
+        FormulaPoolMembersData: {
+            /** Match Codes */
+            match_codes: string[];
+            /** Next Cursor */
+            next_cursor: string | null;
+            /** Offset */
+            offset: number;
+            /** Pool Name */
+            pool_name: string;
+            /** Total */
+            total: number;
+            /**
+             * Trade Date
+             * Format: date
+             */
+            trade_date: string;
+        };
         /** FormulaPoolSaveCommandReceipt */
         FormulaPoolSaveCommandReceipt: {
             /** Command Id */
@@ -2505,6 +2618,15 @@ export interface components {
             requested_at: string;
             /** Task Id */
             task_id: string;
+        };
+        /** FormulaPoolUnknownReason */
+        FormulaPoolUnknownReason: {
+            /** Count */
+            count: number;
+            /** Label */
+            label: string;
+            /** Reason */
+            reason: string;
         };
         /** FreshnessItem */
         FreshnessItem: {
@@ -5204,6 +5326,26 @@ export interface operations {
             };
         };
     };
+    list_formula_pools_api_v1_pools_formula_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_FormulaPoolListData_"];
+                };
+            };
+        };
+    };
     submit_formula_pool_save_command_api_v1_pools_formula_commands_post: {
         parameters: {
             query?: never;
@@ -5233,6 +5375,40 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["FormulaPoolSaveCommandReceipt"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_formula_pool_members_api_v1_pools_formula__base_name__members_get: {
+        parameters: {
+            query?: {
+                page_size?: number;
+                cursor?: string | null;
+            };
+            header?: never;
+            path: {
+                base_name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_FormulaPoolMembersData_"];
                 };
             };
             /** @description Validation Error */
