@@ -12,6 +12,98 @@
 .screen-date {
   min-width: 160px;
 }
+.screen-nl {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+.screen-nl-compose {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 10px;
+}
+.screen-nl-compose .field,
+.screen-nl-compose .inp {
+  min-width: 0;
+  width: 100%;
+}
+.screen-nl-compose textarea {
+  min-height: 68px;
+  resize: vertical;
+  line-height: 1.5;
+}
+.screen-nl-note {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+.screen-nl-preview {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  background: var(--sunken);
+}
+.screen-nl-preview-head,
+.screen-nl-preview-actions,
+.screen-nl-applied {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.screen-nl-preview-head strong {
+  font-size: 13px;
+}
+.screen-nl-preview-head span,
+.screen-nl-help {
+  color: var(--muted);
+  font-size: 12px;
+}
+.screen-nl-help {
+  cursor: help;
+}
+.screen-nl-preview ol {
+  display: grid;
+  gap: 7px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.screen-nl-preview li {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  font-size: 13px;
+}
+.screen-nl-preview li > span:last-child {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.screen-nl-parameter-list {
+  display: block;
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.screen-nl-index {
+  flex: none;
+  min-width: 16px;
+  color: var(--faint);
+  font-size: 12px;
+}
+.screen-nl-applied {
+  padding: 10px 12px;
+  border-radius: 7px;
+  background: var(--accent-bg);
+  color: var(--accent-t);
+  font-size: 12px;
+}
 .screen-conditions {
   display: grid;
   gap: 8px;
@@ -640,6 +732,12 @@
   text-align: center;
 }
 @media (max-width: 760px) {
+  .screen-nl-compose {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .screen-nl-compose .btn {
+    justify-self: stretch;
+  }
   .screen-date {
     width: 100%;
   }

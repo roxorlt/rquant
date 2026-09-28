@@ -40,7 +40,7 @@ const blocks: Schemas["ScreenBlock"][] = [
   },
 ];
 
-function catalog(available = true) {
+function catalog(available = true, nlAvailable = false) {
   server.use(
     http.get("*/api/v1/screen/tdx/preview/source", () =>
       HttpResponse.json({
@@ -63,6 +63,7 @@ function catalog(available = true) {
             : [],
           source: available ? source : null,
           source_kind: "replica",
+          nl_generate_available: nlAvailable,
         },
         serving,
       }),
@@ -85,6 +86,448 @@ function stockDrawer() {
 }
 
 describe("选股器", () => {
+  it("一句话建议先预览，应用后旧结果过期，手改并运行才出现新命中", async () => {
+    catalog(true, true);
+    const previews: unknown[] = [];
+    const runs: Schemas["ScreenRunRequest"][] = [];
+    server.use(
+      http.post("*/api/v1/screen/nl-preview", async ({ request }) => {
+        expect(request.headers.get("X-Rquant-Csrf")).toBe("1");
+        previews.push(await request.json());
+        return HttpResponse.json({
+          source_kind: "replica",
+          source_identity: source.identity,
+          trade_date: "2026-09-24",
+          conditions: [
+            { key: "not_st", args: {} },
+            { key: "circ_mv_lt", args: { threshold_yi: 80 } },
+          ],
+        });
+      }),
+      http.post("*/api/v1/screen/run", async ({ request }) => {
+        const body = (await request.json()) as Schemas["ScreenRunRequest"];
+        runs.push(body);
+        return HttpResponse.json({
+          data: {
+            trade_date: body.trade_date,
+            status: "ready",
+            base_count: 30,
+            total: runs.length === 1 ? 27 : 18,
+            steps: [{ label: "排除 ST", count: runs.length === 1 ? 27 : 18 }],
+            rows: [{ ts_code: "600001.SH", name: "样本01", close: 11, pct_chg: 1 }],
+            next_cursor: null,
+            source,
+          },
+          serving,
+        });
+      }),
+    );
+    const user = userEvent.setup();
+    renderApp("/screener");
+    await user.click(await screen.findByRole("button", { name: "运行筛选" }));
+    expect(await screen.findByText("命中 27 只")).toBeInTheDocument();
+    await user.type(screen.getByRole("textbox", { name: "选股描述" }), "排除 ST，市值低于 80 亿");
+    await user.click(screen.getByRole("button", { name: "生成条件" }));
+    const preview = await screen.findByRole("region", { name: "建议条件" });
+    expect(preview).toHaveTextContent("排除 ST");
+    expect(preview).toHaveTextContent("流通市值低于");
+    expect(preview).toHaveTextContent("市值上限（亿元） 80");
+    expect(screen.queryByRole("spinbutton", { name: "市值上限（亿元）" })).toBeNull();
+    expect(runs).toHaveLength(1);
+    expect(previews).toEqual([
+      {
+        source_kind: "replica",
+        source_identity: source.identity,
+        trade_date: "2026-09-24",
+        instruction: "排除 ST，市值低于 80 亿",
+      },
+    ]);
+    await user.click(within(preview).getByRole("button", { name: "应用到条件" }));
+    expect(screen.getByRole("spinbutton", { name: "市值上限（亿元）" })).toHaveValue(80);
+    expect(screen.getByText(/条件已改，请重新运行/)).toBeInTheDocument();
+    expect(runs).toHaveLength(1);
+    const amount = screen.getByRole("spinbutton", { name: "市值上限（亿元）" });
+    await user.clear(amount);
+    await user.type(amount, "90");
+    await user.click(screen.getByRole("button", { name: "运行筛选" }));
+    await waitFor(() => expect(runs).toHaveLength(2));
+    expect(runs[1]).toMatchObject({
+      source_identity: source.identity,
+      trade_date: "2026-09-24",
+      conditions: [
+        { key: "not_st", args: {} },
+        { key: "circ_mv_lt", args: { threshold_yi: 90 } },
+      ],
+    });
+    expect(await screen.findByText("命中 18 只")).toBeInTheDocument();
+    expect(findJargon(document.body.textContent ?? "")).toEqual([]);
+  });
+
+  it("未启用生成时保留手工条件编辑", async () => {
+    catalog();
+    renderApp("/screener");
+    expect(await screen.findByText("暂不能生成，仍可手动添加条件")).toBeInTheDocument();
+    expect(screen.queryByRole("textbox", { name: "选股描述" })).toBeNull();
+    expect(screen.getByRole("button", { name: "添加条件" })).toBeEnabled();
+  });
+
+  it("应用建议后可以撤销，恢复原条件和仍有效的旧结果", async () => {
+    catalog(true, true);
+    server.use(
+      http.post("*/api/v1/screen/nl-preview", () =>
+        HttpResponse.json({
+          source_kind: "replica",
+          source_identity: source.identity,
+          trade_date: "2026-09-24",
+          conditions: [{ key: "circ_mv_lt", args: { threshold_yi: 80 } }],
+        }),
+      ),
+      http.post("*/api/v1/screen/run", () =>
+        HttpResponse.json({
+          data: {
+            trade_date: "2026-09-24",
+            status: "ready",
+            base_count: 30,
+            total: 27,
+            steps: [{ label: "排除 ST", count: 27 }],
+            rows: [{ ts_code: "600001.SH", name: "样本01", close: 11, pct_chg: 1 }],
+            next_cursor: null,
+            source,
+          },
+          serving,
+        }),
+      ),
+    );
+    const user = userEvent.setup();
+    renderApp("/screener");
+    await user.click(await screen.findByRole("button", { name: "运行筛选" }));
+    expect(await screen.findByText("命中 27 只")).toBeInTheDocument();
+    await user.type(screen.getByRole("textbox", { name: "选股描述" }), "市值低于 80 亿");
+    await user.click(screen.getByRole("button", { name: "生成条件" }));
+    await user.click(await screen.findByRole("button", { name: "应用到条件" }));
+    expect(screen.getByRole("spinbutton", { name: "市值上限（亿元）" })).toHaveValue(80);
+    expect(screen.getByText(/条件已改，请重新运行/)).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "撤销应用" }));
+    expect(screen.queryByRole("spinbutton", { name: "市值上限（亿元）" })).toBeNull();
+    expect(screen.queryByText(/条件已改，请重新运行/)).toBeNull();
+    expect(screen.getByText("命中 27 只")).toBeInTheDocument();
+  });
+
+  it("运行中的旧请求晚于建议应用返回时仍标记结果过期", async () => {
+    catalog(true, true);
+    let release: (() => void) | undefined;
+    const pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    server.use(
+      http.post("*/api/v1/screen/nl-preview", () =>
+        HttpResponse.json({
+          source_kind: "replica",
+          source_identity: source.identity,
+          trade_date: "2026-09-24",
+          conditions: [{ key: "not_st", args: {} }],
+        }),
+      ),
+      http.post("*/api/v1/screen/run", async () => {
+        await pending;
+        return HttpResponse.json({
+          data: {
+            trade_date: "2026-09-24",
+            status: "ready",
+            base_count: 30,
+            total: 27,
+            steps: [{ label: "排除 ST", count: 27 }],
+            rows: [],
+            next_cursor: null,
+            source,
+          },
+          serving,
+        });
+      }),
+    );
+    const user = userEvent.setup();
+    renderApp("/screener");
+    await user.click(await screen.findByRole("button", { name: "运行筛选" }));
+    await user.type(screen.getByRole("textbox", { name: "选股描述" }), "排除 ST");
+    await user.click(screen.getByRole("button", { name: "生成条件" }));
+    await user.click(await screen.findByRole("button", { name: "应用到条件" }));
+    release?.();
+    expect(await screen.findByText("命中 27 只")).toBeInTheDocument();
+    expect(screen.getByText(/条件已改，请重新运行/)).toBeInTheDocument();
+  });
+
+  it("首次应用不误报数据更新，运行成功后可继续生成并撤销到本次条件", async () => {
+    catalog(true, true);
+    let previews = 0;
+    let runs = 0;
+    server.use(
+      http.post("*/api/v1/screen/nl-preview", () => {
+        previews += 1;
+        return HttpResponse.json({
+          source_kind: "replica",
+          source_identity: source.identity,
+          trade_date: "2026-09-24",
+          conditions: [{ key: "circ_mv_lt", args: { threshold_yi: previews === 1 ? 80 : 60 } }],
+        });
+      }),
+      http.post("*/api/v1/screen/run", () => {
+        runs += 1;
+        return HttpResponse.json({
+          data: {
+            trade_date: "2026-09-24",
+            status: "ready",
+            base_count: 30,
+            total: 12,
+            steps: [{ label: "流通市值低于", count: 12 }],
+            rows: [],
+            next_cursor: null,
+            source,
+          },
+          serving,
+        });
+      }),
+    );
+    const user = userEvent.setup();
+    renderApp("/screener");
+    const description = await screen.findByRole("textbox", { name: "选股描述" });
+    await user.type(description, "市值低于 80 亿");
+    await user.click(screen.getByRole("button", { name: "生成条件" }));
+    await user.click(await screen.findByRole("button", { name: "应用到条件" }));
+    expect(screen.getByText("已加入条件，请核对后运行筛选。")).toBeInTheDocument();
+    expect(screen.queryByText(/选股数据已更新，请重新筛选/)).toBeNull();
+    await user.click(screen.getByRole("button", { name: "运行筛选" }));
+    expect(await screen.findByText("命中 12 只")).toBeInTheDocument();
+    expect(screen.getByRole("spinbutton", { name: "市值上限（亿元）" })).toHaveValue(80);
+    expect(screen.queryByRole("button", { name: "撤销应用" })).toBeNull();
+    await user.clear(description);
+    await user.type(description, "市值低于 60 亿");
+    await user.click(screen.getByRole("button", { name: "生成条件" }));
+    expect(await screen.findByRole("region", { name: "建议条件" })).toHaveTextContent(
+      "市值上限（亿元） 60",
+    );
+    await user.click(screen.getByRole("button", { name: "应用到条件" }));
+    expect(screen.getByRole("spinbutton", { name: "市值上限（亿元）" })).toHaveValue(60);
+    expect(runs).toBe(1);
+    await user.click(screen.getByRole("button", { name: "撤销应用" }));
+    expect(screen.getByRole("spinbutton", { name: "市值上限（亿元）" })).toHaveValue(80);
+    expect(screen.getByText("命中 12 只")).toBeInTheDocument();
+  });
+
+  it("手改条件会废弃迟到的生成结果，含糊描述不会改掉当前草稿", async () => {
+    catalog(true, true);
+    let release: (() => void) | undefined;
+    const pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let calls = 0;
+    server.use(
+      http.post("*/api/v1/screen/nl-preview", async () => {
+        calls += 1;
+        if (calls === 1) {
+          await pending;
+          return HttpResponse.json({
+            source_kind: "replica",
+            source_identity: source.identity,
+            trade_date: "2026-09-24",
+            conditions: [{ key: "circ_mv_lt", args: { threshold_yi: 80 } }],
+          });
+        }
+        return HttpResponse.json({ detail: "内部解析细节不应展示" }, { status: 422 });
+      }),
+    );
+    const user = userEvent.setup();
+    renderApp("/screener");
+    await user.type(await screen.findByRole("textbox", { name: "选股描述" }), "找一些股票");
+    await user.click(screen.getByRole("button", { name: "生成条件" }));
+    expect(await screen.findByText("正在生成条件…")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "添加条件" }));
+    release?.();
+    await waitFor(() => expect(screen.queryByText("正在生成条件…")).toBeNull());
+    expect(screen.queryByRole("region", { name: "建议条件" })).toBeNull();
+    expect(screen.getAllByText("排除 ST").length).toBeGreaterThanOrEqual(1);
+    await user.click(screen.getByRole("button", { name: "生成条件" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "没能确定条件，请说清筛选范围和数值。",
+    );
+    expect(screen.getAllByRole("button", { name: /删除第/ })).toHaveLength(2);
+    expect(document.body).not.toHaveTextContent("内部解析细节不应展示");
+  });
+
+  it("生成建议要求换日期时给出明确下一步且保留手工条件", async () => {
+    catalog(true, true);
+    server.use(
+      http.post("*/api/v1/screen/nl-preview", () =>
+        HttpResponse.json({ detail: "请先选择想筛选的日期。" }, { status: 422 }),
+      ),
+    );
+    const user = userEvent.setup();
+    renderApp("/screener");
+    await user.type(await screen.findByRole("textbox", { name: "选股描述" }), "筛上周的股票");
+    await user.click(screen.getByRole("button", { name: "生成条件" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("请先选择想筛选的日期。");
+    expect(screen.queryByRole("region", { name: "建议条件" })).toBeNull();
+    expect(screen.getAllByRole("button", { name: /删除第/ })).toHaveLength(1);
+  });
+
+  it("Serving 筛选传目录身份，响应身份或日期不符便清旧结果并刷新目录", async () => {
+    let catalogReads = 0;
+    server.use(
+      http.get("*/api/v1/screen/blocks", () => {
+        catalogReads += 1;
+        return HttpResponse.json({
+          data: {
+            blocks,
+            dates: ["2026-09-24"],
+            available: true,
+            ranking_metrics: [],
+            source,
+            source_kind: "serving",
+            nl_generate_available: false,
+          },
+          serving,
+        });
+      }),
+      http.post("*/api/v1/screen/run", async ({ request }) => {
+        const body = (await request.json()) as Schemas["ScreenRunRequest"];
+        expect(body.source_identity).toBe(source.identity);
+        return HttpResponse.json({
+          data: {
+            trade_date: "2026-09-23",
+            status: "ready",
+            base_count: 30,
+            total: 27,
+            steps: [{ label: "排除 ST", count: 27 }],
+            rows: [],
+            next_cursor: null,
+            source,
+          },
+          serving,
+        });
+      }),
+    );
+    const user = userEvent.setup();
+    renderApp("/screener");
+    await user.click(await screen.findByRole("button", { name: "运行筛选" }));
+    expect(await screen.findByRole("status")).toHaveTextContent("选股数据已更新，请重新筛选。");
+    expect(screen.queryByText("命中 27 只")).toBeNull();
+    await waitFor(() => expect(catalogReads).toBeGreaterThanOrEqual(2));
+  });
+
+  it("建议在日期或来源变化后失效", async () => {
+    let identity = source.identity;
+    server.use(
+      http.get("*/api/v1/screen/blocks", () =>
+        HttpResponse.json({
+          data: {
+            blocks,
+            dates: ["2026-09-24", "2026-09-23"],
+            available: true,
+            ranking_metrics: [],
+            source: { ...source, identity },
+            source_kind: "replica",
+            nl_generate_available: true,
+          },
+          serving,
+        }),
+      ),
+      http.post("*/api/v1/screen/nl-preview", async ({ request }) => {
+        const body = (await request.json()) as Schemas["ScreenNlPreviewRequest"];
+        return HttpResponse.json({
+          source_kind: body.source_kind,
+          source_identity: body.source_identity,
+          trade_date: body.trade_date,
+          conditions: [{ key: "circ_mv_lt", args: { threshold_yi: 80 } }],
+        });
+      }),
+    );
+    const user = userEvent.setup();
+    renderApp("/screener");
+    await user.type(await screen.findByRole("textbox", { name: "选股描述" }), "市值低于 80 亿");
+    await user.click(screen.getByRole("button", { name: "生成条件" }));
+    expect(await screen.findByRole("region", { name: "建议条件" })).toBeInTheDocument();
+    await user.selectOptions(screen.getByRole("combobox", { name: "数据日期" }), "2026-09-23");
+    expect(screen.queryByRole("region", { name: "建议条件" })).toBeNull();
+    await user.click(screen.getByRole("button", { name: "生成条件" }));
+    expect(await screen.findByRole("region", { name: "建议条件" })).toBeInTheDocument();
+    identity = "b".repeat(64);
+    await user.click(screen.getByRole("button", { name: "刷新选股数据" }));
+    await waitFor(() => expect(screen.queryByRole("region", { name: "建议条件" })).toBeNull());
+    expect(screen.getByRole("button", { name: "运行筛选" })).toBeEnabled();
+  });
+
+  it("同一来源的条件目录能力改变后不能应用旧建议", async () => {
+    let customRsi = true;
+    const rsiBlock: Schemas["ScreenBlock"] = {
+      key: "rsi_oversold",
+      label: "RSI 超卖",
+      hint: "筛选 RSI 较低的股票",
+      category: "indicator",
+      category_label: "技术指标",
+      parameters: [
+        {
+          key: "period",
+          label: "RSI 周期（日）",
+          input: "integer",
+          initial: 14,
+          required: true,
+          minimum: 2,
+          maximum: 60,
+          scale: 1,
+          custom_ma: false,
+        },
+      ],
+    };
+    server.use(
+      http.get("*/api/v1/screen/blocks", () =>
+        HttpResponse.json({
+          data: {
+            blocks: [
+              ...blocks,
+              {
+                ...rsiBlock,
+                parameters: customRsi
+                  ? rsiBlock.parameters
+                  : [
+                      {
+                        ...rsiBlock.parameters[0],
+                        input: "choice",
+                        options: [{ value: "14", label: "14 日" }],
+                      },
+                    ],
+              },
+            ],
+            dates: ["2026-09-24"],
+            available: true,
+            ranking_metrics: [],
+            source,
+            source_kind: "replica",
+            nl_generate_available: true,
+          },
+          serving,
+        }),
+      ),
+      http.post("*/api/v1/screen/nl-preview", () =>
+        HttpResponse.json({
+          source_kind: "replica",
+          source_identity: source.identity,
+          trade_date: "2026-09-24",
+          conditions: [{ key: "rsi_oversold", args: { period: 7 } }],
+        }),
+      ),
+    );
+    const user = userEvent.setup();
+    renderApp("/screener");
+    await user.type(await screen.findByRole("textbox", { name: "选股描述" }), "RSI 7 日低位");
+    await user.click(screen.getByRole("button", { name: "生成条件" }));
+    expect(await screen.findByRole("region", { name: "建议条件" })).toHaveTextContent(
+      "RSI 周期（日） 7",
+    );
+    customRsi = false;
+    await user.click(screen.getByRole("button", { name: "刷新选股数据" }));
+    await waitFor(() => expect(screen.queryByRole("region", { name: "建议条件" })).toBeNull());
+    expect(screen.queryByRole("button", { name: "应用到条件" })).toBeNull();
+    expect(screen.getAllByRole("button", { name: /删除第/ })).toHaveLength(1);
+  });
   it("历史数据未发布时禁用预览，手动刷新后读取独立日期", async () => {
     catalog();
     let ready = false;

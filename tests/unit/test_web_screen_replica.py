@@ -99,6 +99,54 @@ def _client(root: Path, primary: Path, replica: Path) -> TestClient:
     )
 
 
+def test_replica_nl_preview_stays_available_without_serving(tmp_path: Path) -> None:
+    class FakeParser:
+        def parse_new(self, instruction: str, trade_date: str) -> dict[str, object]:
+            assert instruction == "排除 ST"
+            assert trade_date == "2026-04-15"
+            return {
+                "trade_date": trade_date,
+                "stages": [{"label": "条件", "rules": [{"name": "not_st", "args": {}}]}],
+            }
+
+    primary, replica, _ = _replica_world(tmp_path)
+    app = create_app(
+        WebSettings(
+            serving_root=tmp_path / "absent",
+            screen_primary_path=primary,
+            screen_replica_path=replica,
+        ),
+        background=False,
+        nl_parser=FakeParser(),
+    )
+    with TestClient(app) as client:
+        catalog = client.get("/api/v1/screen/blocks").json()
+        source = catalog["data"]["source"]
+        response = client.post(
+            "/api/v1/screen/nl-preview",
+            json={
+                "source_kind": "replica",
+                "source_identity": source["identity"],
+                "trade_date": "2026-04-15",
+                "instruction": "排除 ST",
+            },
+            headers={
+                "x-rquant-user": "researcher",
+                "x-rquant-csrf": "1",
+                "origin": "http://testserver",
+            },
+        )
+    assert catalog["serving"]["generation_id"] is None
+    assert catalog["data"]["nl_generate_available"] is True
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "source_kind": "replica",
+        "source_identity": source["identity"],
+        "trade_date": "2026-04-15",
+        "conditions": [{"key": "not_st", "args": {}}],
+    }
+
+
 def _run(client: TestClient, *, conditions: list[dict] | None = None,
          cursor: str | None = None, page_size: int = 2, ranking: dict | None = None):
     return client.post(

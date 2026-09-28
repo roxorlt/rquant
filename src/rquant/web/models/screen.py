@@ -60,6 +60,7 @@ class ScreenCatalogData(BaseModel):
     available: bool
     ranking_metrics: list[ScreenOption]
     source: ScreenSourceInfo | None
+    nl_generate_available: bool = False
 
 
 class ScreenCondition(BaseModel):
@@ -67,6 +68,30 @@ class ScreenCondition(BaseModel):
 
     key: str = Field(min_length=1, max_length=64)
     args: dict[str, Any] = Field(default_factory=dict)
+
+
+class ScreenNlPreviewRequest(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    source_kind: Literal["serving", "replica"]
+    source_identity: str = Field(pattern=r"^[0-9a-f]{64}$")
+    trade_date: date
+    instruction: str = Field(min_length=1, max_length=500)
+
+    @model_validator(mode="after")
+    def validate_instruction(self) -> ScreenNlPreviewRequest:
+        if not self.instruction.strip():
+            raise ValueError("instruction must not be blank")
+        return self
+
+
+class ScreenNlPreviewData(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    source_kind: Literal["serving", "replica"]
+    source_identity: str
+    trade_date: date
+    conditions: list[ScreenCondition]
 
 
 class ScreenRankingCondition(BaseModel):

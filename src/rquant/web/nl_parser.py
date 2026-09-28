@@ -13,7 +13,7 @@ from typing import Protocol
 from openai import OpenAI
 from pydantic import SecretStr
 
-from rquant.llm.prompts import build_edit_system_prompt
+from rquant.llm.prompts import build_edit_system_prompt, build_system_prompt
 from rquant.llm.schema_export import to_openai_tools
 
 
@@ -38,6 +38,8 @@ class ScreenPlanParser(Protocol):
         self, instruction: str, current_rules: Sequence[RuleContext]
     ) -> Mapping[str, object]: ...
 
+    def parse_new(self, instruction: str, trade_date: str) -> Mapping[str, object]: ...
+
 
 class OpenAiScreenPlanParser:
     """The only network-capable implementation; fixed official endpoint and bounded call."""
@@ -54,17 +56,28 @@ class OpenAiScreenPlanParser:
     def parse_edit(
         self, instruction: str, current_rules: Sequence[RuleContext]
     ) -> Mapping[str, object]:
+        system = (
+            build_edit_system_prompt(list(current_rules))
+            + "\n只修改选股条件；不要输出展示列、池子名称、父池或画布。"
+        )
+        return self._request(instruction, system)
+
+    def parse_new(self, instruction: str, trade_date: str) -> Mapping[str, object]:
+        system = (
+            build_system_prompt()
+            + f"\n当前页面选择的日期是 {trade_date}；只生成条件。"
+            + "不要输出展示列、排名、池子名称或执行指令。"
+        )
+        return self._request(instruction, system)
+
+    def _request(self, instruction: str, system: str) -> Mapping[str, object]:
         try:
             tools = to_openai_tools()
             tools[0]["function"]["parameters"]["properties"].pop("include_columns")
             response = self._client.chat.completions.create(
                 model=self._model,
                 messages=[
-                    {
-                        "role": "system",
-                        "content": build_edit_system_prompt(list(current_rules))
-                        + "\n只修改选股条件；不要输出展示列、池子名称、父池或画布。",
-                    },
+                    {"role": "system", "content": system},
                     {"role": "user", "content": instruction},
                 ],
                 tools=tools,

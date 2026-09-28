@@ -13,6 +13,7 @@ const VERSION = "a".repeat(64);
 const NEXT_VERSION = "b".repeat(64);
 const catalog: Schemas["ScreenCatalogData"] = {
   source_kind: "serving",
+  nl_generate_available: false,
   blocks: [
     {
       key: "not_st",

@@ -83,6 +83,7 @@ API_TITLE = "rQuant Web API"
 #: release that does not touch the API leaves the OpenAPI snapshot unchanged.
 API_VERSION = "1"
 _WRITE_BODY_LIMITS = {
+    "/api/v1/screen/nl-preview": screen.MAX_NL_REQUEST_BYTES,
     "/api/v1/pools/editor/commands": pool_editor.MAX_REQUEST_BYTES,
     "/api/v1/pools/editor/nl-preview": pool_editor.MAX_NL_REQUEST_BYTES,
     "/api/v1/monitor/ack": monitor.MAX_ACK_REQUEST_BYTES,
@@ -297,6 +298,8 @@ def create_app(
                 status_code=422,
                 content={"detail": "公式输入有误，请只填写文本公式。"},
             )
+        if request.url.path == "/api/v1/screen/nl-preview":
+            return JSONResponse(status_code=422, content={"detail": "条件描述有误，请检查后重试。"})
         if request.url.path == "/api/v1/pools/editor/commands":
             return JSONResponse(status_code=422, content={"detail": "编辑内容有误，请检查后重试。"})
         if request.url.path == "/api/v1/pools/editor/nl-preview":

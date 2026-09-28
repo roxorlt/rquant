@@ -31,6 +31,7 @@ def test_every_api_path_is_versioned_and_only_defined_mutations_use_post() -> No
             if path
             in {
                 "/api/v1/screen/run",
+                "/api/v1/screen/nl-preview",
                 "/api/v1/screen/tdx/parse",
                 "/api/v1/screen/tdx/preview",
                 "/api/v1/pools/editor/commands",

@@ -12,6 +12,7 @@ const VERSION = "b".repeat(64);
 const CANVAS = "晨盘观察";
 const BLOCKS: Schemas["ScreenCatalogData"] = {
   source_kind: "serving",
+  nl_generate_available: false,
   blocks: [
     {
       key: "not_st",

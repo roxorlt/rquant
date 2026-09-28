@@ -118,6 +118,83 @@ test("中文条件筛选、翻页和个股详情在桌面与手机宽度可用",
   expect(watcher.problems).toEqual([]);
 });
 
+test("一句话建议经键盘预览和人工应用，手机手改后才运行真实筛选", async ({ page }, testInfo) => {
+  const watcher = watch(page);
+  const previews: Schemas["ScreenNlPreviewRequest"][] = [];
+  const runs: Schemas["ScreenRunRequest"][] = [];
+  let sourceIdentity: string | null = null;
+  await page.route("**/api/v1/screen/blocks", async (route) => {
+    const response = await route.fetch();
+    const body = (await response.json()) as Schemas["Envelope_ScreenCatalogData_"];
+    body.data.nl_generate_available = true;
+    sourceIdentity = body.data.source?.identity ?? null;
+    await route.fulfill({ response, json: body });
+  });
+  await page.route("**/api/v1/screen/nl-preview", async (route) => {
+    const request = route.request().postDataJSON() as Schemas["ScreenNlPreviewRequest"];
+    expect(route.request().headers()["x-rquant-csrf"]).toBe("1");
+    expect(request.source_identity).toBe(sourceIdentity);
+    previews.push(request);
+    await route.fulfill({
+      status: 200,
+      json: {
+        source_kind: request.source_kind,
+        source_identity: request.source_identity,
+        trade_date: request.trade_date,
+        conditions: [
+          { key: "not_st", args: {} },
+          { key: "circ_mv_lt", args: { threshold_yi: 80 } },
+        ],
+      } satisfies Schemas["ScreenNlPreviewData"],
+    });
+  });
+  await page.route("**/api/v1/screen/run", async (route) => {
+    const request = route.request().postDataJSON() as Schemas["ScreenRunRequest"];
+    expect(request.source_identity).toBe(sourceIdentity);
+    runs.push(request);
+    await route.continue();
+  });
+
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto("./#/screener");
+  await page.getByRole("button", { name: "运行筛选" }).click();
+  await expect(page.getByText("命中 27 只")).toBeVisible();
+  const description = page.getByRole("textbox", { name: "选股描述" });
+  await expect(description).toHaveAttribute("maxlength", "500");
+  await description.focus();
+  await page.keyboard.type("排除 ST，流通市值低于 80 亿");
+  await page.keyboard.press("Tab");
+  await expect(page.getByRole("button", { name: "生成条件" })).toBeFocused();
+  await page.keyboard.press("Enter");
+  const preview = page.getByRole("region", { name: "建议条件" });
+  await expect(preview).toContainText("排除 ST");
+  await expect(preview).toContainText("市值上限（亿元） 80");
+  await expect(preview).not.toContainText("命中");
+  expect(previews).toHaveLength(1);
+  expect(runs).toHaveLength(1);
+  await expectNoHorizontalOverflow(page, "screen suggestion desktop");
+  await page.screenshot({ path: testInfo.outputPath("screen-suggestion-desktop.png") });
+
+  await preview.getByRole("button", { name: "应用到条件" }).click();
+  await expect(page.getByRole("spinbutton", { name: "市值上限（亿元）" })).toHaveValue("80");
+  await expect(page.getByText(/条件已改，请重新运行/)).toBeVisible();
+  expect(runs).toHaveLength(1);
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expectNoHorizontalOverflow(page, "screen suggestion applied phone");
+  await page.screenshot({ path: testInfo.outputPath("screen-suggestion-phone.png") });
+  await page.getByRole("spinbutton", { name: "市值上限（亿元）" }).fill("90");
+  await expect(page.getByRole("button", { name: "撤销应用" })).toHaveCount(0);
+  await page.getByRole("button", { name: "运行筛选" }).click();
+  await expect.poll(() => runs.length).toBe(2);
+  expect(runs[1]?.conditions).toEqual([
+    { key: "not_st", args: {} },
+    { key: "circ_mv_lt", args: { threshold_yi: 90, offset: 0 } },
+  ]);
+  await expect(page.getByText(/条件已改，请重新运行/)).toHaveCount(0);
+  expect(findJargon(await page.locator("main").innerText())).toEqual([]);
+  expect(watcher.problems).toEqual([]);
+});
+
 test("自定义 RSI 周期和偏移在桌面与手机可输入并提交", async ({ page }) => {
   const watcher = watch(page);
   const requests: Schemas["ScreenRunRequest"][] = [];
@@ -144,7 +221,11 @@ test("自定义 RSI 周期和偏移在桌面与手机可输入并提交", async 
     const request = route.request().postDataJSON() as Schemas["ScreenRunRequest"];
     requests.push(request);
     const response = await route.fetch({
-      postData: JSON.stringify({ ...request, conditions: [{ key: "not_st", args: {} }] }),
+      postData: JSON.stringify({
+        ...request,
+        source_identity: null,
+        conditions: [{ key: "not_st", args: {} }],
+      }),
     });
     const body = (await response.json()) as Schemas["Envelope_ScreenRunData_"];
     body.data.source = source;
@@ -256,7 +337,11 @@ test("选股来源独立换代后保留条件，失效时桌面与手机都要�
     await route.fulfill({ response, json: body });
   });
   await page.route("**/api/v1/screen/run", async (route) => {
-    const response = await route.fetch();
+    const request = route.request().postDataJSON() as Schemas["ScreenRunRequest"];
+    expect(request.source_identity).toBe(identity);
+    const response = await route.fetch({
+      postData: JSON.stringify({ ...request, source_identity: null }),
+    });
     const body = (await response.json()) as Schemas["Envelope_ScreenRunData_"];
     body.data.source = { identity, updated_at: "2026-09-24T07:31:00Z" };
     await route.fulfill({ response, json: body });
@@ -410,7 +495,11 @@ test("默认 Serving 换代重取选股目录，并要求旧结果重新筛选",
     await route.fulfill({ response, json: body });
   });
   await page.route("**/api/v1/screen/run", async (route) => {
-    const response = await route.fetch();
+    const request = route.request().postDataJSON() as Schemas["ScreenRunRequest"];
+    expect(request.source_identity).toBe(generationId);
+    const response = await route.fetch({
+      postData: JSON.stringify({ ...request, source_identity: null }),
+    });
     const body = (await response.json()) as Schemas["Envelope_ScreenRunData_"];
     body.data.source = { identity: generationId, updated_at: "2026-09-24T07:31:00Z" };
     await route.fulfill({ response, json: body });

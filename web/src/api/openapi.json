@@ -9669,6 +9669,11 @@
             "title": "Dates",
             "type": "array"
           },
+          "nl_generate_available": {
+            "default": false,
+            "title": "Nl Generate Available",
+            "type": "boolean"
+          },
           "ranking_metrics": {
             "items": {
               "$ref": "#/components/schemas/ScreenOption"
@@ -9724,6 +9729,79 @@
           "key"
         ],
         "title": "ScreenCondition",
+        "type": "object"
+      },
+      "ScreenNlPreviewData": {
+        "properties": {
+          "conditions": {
+            "items": {
+              "$ref": "#/components/schemas/ScreenCondition"
+            },
+            "title": "Conditions",
+            "type": "array"
+          },
+          "source_identity": {
+            "title": "Source Identity",
+            "type": "string"
+          },
+          "source_kind": {
+            "enum": [
+              "serving",
+              "replica"
+            ],
+            "title": "Source Kind",
+            "type": "string"
+          },
+          "trade_date": {
+            "format": "date",
+            "title": "Trade Date",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_kind",
+          "source_identity",
+          "trade_date",
+          "conditions"
+        ],
+        "title": "ScreenNlPreviewData",
+        "type": "object"
+      },
+      "ScreenNlPreviewRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "instruction": {
+            "maxLength": 500,
+            "minLength": 1,
+            "title": "Instruction",
+            "type": "string"
+          },
+          "source_identity": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Source Identity",
+            "type": "string"
+          },
+          "source_kind": {
+            "enum": [
+              "serving",
+              "replica"
+            ],
+            "title": "Source Kind",
+            "type": "string"
+          },
+          "trade_date": {
+            "format": "date",
+            "title": "Trade Date",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_kind",
+          "source_identity",
+          "trade_date",
+          "instruction"
+        ],
+        "title": "ScreenNlPreviewRequest",
         "type": "object"
       },
       "ScreenOption": {
@@ -13020,6 +13098,47 @@
           }
         },
         "summary": "选股条件目录",
+        "tags": [
+          "screen"
+        ]
+      }
+    },
+    "/api/v1/screen/nl-preview": {
+      "post": {
+        "operationId": "preview_screen_natural_language_api_v1_screen_nl_preview_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ScreenNlPreviewRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScreenNlPreviewData"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "预览一句话选股条件",
         "tags": [
           "screen"
         ]

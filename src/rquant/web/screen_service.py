@@ -335,6 +335,12 @@ class ScreenApplicationService:
         borrowed: BorrowedGeneration | None,
         serving_unavailable: bool,
     ) -> ScreenRunData:
+        if (
+            self.replica is None
+            and body.source_identity is not None
+            and (borrowed is None or body.source_identity != borrowed.manifest.generation_id)
+        ):
+            raise ScreenApplicationError(409, "选股数据已更新，请刷新条件后重试。")
         requested_fundamental = {
             value
             for condition in body.conditions

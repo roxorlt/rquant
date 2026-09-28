@@ -582,6 +582,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/screen/nl-preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 预览一句话选股条件 */
+        post: operations["preview_screen_natural_language_api_v1_screen_nl_preview_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/screen/run": {
         parameters: {
             query?: never;
@@ -3942,6 +3959,11 @@ export interface components {
             blocks: components["schemas"]["ScreenBlock"][];
             /** Dates */
             dates: string[];
+            /**
+             * Nl Generate Available
+             * @default false
+             */
+            nl_generate_available: boolean;
             /** Ranking Metrics */
             ranking_metrics: components["schemas"]["ScreenOption"][];
             source: components["schemas"]["ScreenSourceInfo"] | null;
@@ -3959,6 +3981,40 @@ export interface components {
             };
             /** Key */
             key: string;
+        };
+        /** ScreenNlPreviewData */
+        ScreenNlPreviewData: {
+            /** Conditions */
+            conditions: components["schemas"]["ScreenCondition"][];
+            /** Source Identity */
+            source_identity: string;
+            /**
+             * Source Kind
+             * @enum {string}
+             */
+            source_kind: "serving" | "replica";
+            /**
+             * Trade Date
+             * Format: date
+             */
+            trade_date: string;
+        };
+        /** ScreenNlPreviewRequest */
+        ScreenNlPreviewRequest: {
+            /** Instruction */
+            instruction: string;
+            /** Source Identity */
+            source_identity: string;
+            /**
+             * Source Kind
+             * @enum {string}
+             */
+            source_kind: "serving" | "replica";
+            /**
+             * Trade Date
+             * Format: date
+             */
+            trade_date: string;
         };
         /** ScreenOption */
         ScreenOption: {
@@ -5533,6 +5589,39 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_ScreenCatalogData_"];
+                };
+            };
+        };
+    };
+    preview_screen_natural_language_api_v1_screen_nl_preview_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ScreenNlPreviewRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ScreenNlPreviewData"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };

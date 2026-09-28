@@ -8,6 +8,8 @@ export type ScreenParameter = Schemas["ScreenParameter"];
 export type ScreenOption = Schemas["ScreenOption"];
 export type ScreenRunRequest = Schemas["ScreenRunRequest"];
 export type ScreenRunData = Schemas["ScreenRunData"];
+export type ScreenNlPreviewRequest = Schemas["ScreenNlPreviewRequest"];
+export type ScreenNlPreviewData = Schemas["ScreenNlPreviewData"];
 export type ScreenRow = Schemas["ScreenRow"];
 export type TdxParseRequest = Schemas["TdxParseRequest"];
 export type TdxParseData = Schemas["TdxParseData"];
@@ -81,6 +83,30 @@ export async function fetchScreenRun(body: ScreenRunRequest) {
     throw new ApiError(
       response.status,
       typeof detail === "string" ? detail : "筛选暂时无法完成，请稍后重试。",
+    );
+  }
+  return data;
+}
+
+export async function fetchScreenNlPreview(
+  body: ScreenNlPreviewRequest,
+  signal: AbortSignal,
+): Promise<ScreenNlPreviewData> {
+  const { data, error, response } = await apiClient()
+    .POST("/api/v1/screen/nl-preview", {
+      body,
+      headers: { "X-Rquant-Csrf": "1" },
+      signal,
+    })
+    .catch(() => {
+      throw new ApiError(503, "暂无法生成，请稍后重试。");
+    });
+  if (data === undefined) {
+    const detail =
+      typeof error === "object" && error !== null && "detail" in error ? error.detail : null;
+    throw new ApiError(
+      response.status,
+      typeof detail === "string" ? detail : "暂无法生成，请稍后重试。",
     );
   }
   return data;

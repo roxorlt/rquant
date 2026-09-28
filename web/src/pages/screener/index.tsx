@@ -23,6 +23,7 @@ import {
 import { CustomMaParamControl } from "./CustomMaParamControl";
 import { FormulaPreviewDialog } from "./FormulaPreviewDialog";
 import { type RankingDraft, RankingEditor } from "./RankingEditor";
+import { type EditableScreenCondition, ScreenNaturalLanguage } from "./ScreenNaturalLanguage";
 import { ScreenResults } from "./ScreenResults";
 import "./screener.css";
 
@@ -70,15 +71,19 @@ export default function ScreenerPage() {
   const [addKey, setAddKey] = useState("");
   const [initialized, setInitialized] = useState(false);
   const nextId = useRef(1);
+  const undoDraft = useRef<Draft[] | null>(null);
+  const [conditionRevision, setConditionRevision] = useState(0);
   const nextRankId = useRef(1);
   const lastSourceIdentity = useRef<string | null | undefined>(undefined);
   const sourceEpoch = useRef(0);
+  const draftEpoch = useRef(0);
   const [rankDraft, setRankDraft] = useState<RankingDraft[]>([]);
   const [topN, setTopN] = useState("20");
   const [result, setResult] = useState<ScreenRunData | null>(null);
   const [applied, setApplied] = useState<ScreenRunRequest | null>(null);
   const [appliedKey, setAppliedKey] = useState<string | null>(null);
-  const [forceStale, setForceStale] = useState(false);
+  const [successfulRunRevision, setSuccessfulRunRevision] = useState(0);
+  const [forcedStaleReason, setForcedStaleReason] = useState<"source" | "condition" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
   const [pageIndex, setPageIndex] = useState(0);
@@ -112,7 +117,8 @@ export default function ScreenerPage() {
     setAppliedKey(null);
     setCursors([null]);
     setPageIndex(0);
-    setForceStale(true);
+    setForcedStaleReason("source");
+    undoDraft.current = null;
     setError(null);
     setDraft((current) =>
       current.filter((condition) => {
@@ -200,15 +206,20 @@ export default function ScreenerPage() {
     ranking: rankDraft.map(({ metric, ascending, weight }) => ({ metric, ascending, weight })),
     topN: rankDraft.length > 0 ? topN : null,
   });
+  const currentSnapshotKey = useRef(snapshotKey);
+  useEffect(() => {
+    currentSnapshotKey.current = snapshotKey;
+  }, [snapshotKey]);
   const stale =
-    forceStale ||
+    forcedStaleReason === "source" ||
     (result !== null &&
-      (snapshotKey !== appliedKey ||
+      (forcedStaleReason === "condition" ||
+        snapshotKey !== appliedKey ||
         (result.source?.identity ?? null) !== (catalog.data?.source?.identity ?? null)));
   const staleText =
     result === null
       ? "选股数据已更新，请重新筛选。"
-      : forceStale || result.source?.identity !== catalog.data?.source?.identity
+      : forcedStaleReason === "source" || result.source?.identity !== catalog.data?.source?.identity
         ? "选股数据已更新，请重新筛选。旧结果仅供参考。"
         : "条件已改，请重新运行。旧结果仅供参考。";
   const canRun =
@@ -216,10 +227,17 @@ export default function ScreenerPage() {
     dates.length > 0 &&
     tradeDate !== null &&
     draft.length > 0 &&
-    (catalog.data?.source_kind !== "replica" || catalog.data.source !== null) &&
+    catalog.data?.source?.identity != null &&
     rankingError === null;
 
+  function markManualConditionEdit() {
+    draftEpoch.current += 1;
+    undoDraft.current = null;
+    setConditionRevision((current) => current + 1);
+  }
+
   function updateArg(id: number, key: string, value: ParameterValue) {
+    markManualConditionEdit();
     setDraft((current) =>
       current.map((condition) =>
         condition.id === id
@@ -232,7 +250,46 @@ export default function ScreenerPage() {
   function addCondition() {
     const block = byKey.get(addKey);
     if (!block || draft.length >= 26) return;
+    markManualConditionEdit();
     setDraft((current) => [...current, makeDraft(block, nextId.current++)]);
+  }
+
+  function removeCondition(id: number) {
+    markManualConditionEdit();
+    setDraft((current) => current.filter((item) => item.id !== id));
+  }
+
+  function applySuggestion(conditions: EditableScreenCondition[]) {
+    draftEpoch.current += 1;
+    undoDraft.current = draft;
+    setDraft(
+      conditions.map((condition) => ({
+        id: nextId.current++,
+        key: condition.key,
+        args: condition.args,
+      })),
+    );
+    setForcedStaleReason("condition");
+  }
+
+  function undoSuggestion() {
+    if (undoDraft.current === null) return;
+    draftEpoch.current += 1;
+    setDraft(undoDraft.current);
+    undoDraft.current = null;
+    setForcedStaleReason(null);
+  }
+
+  function invalidateSource() {
+    sourceEpoch.current += 1;
+    setResult(null);
+    setApplied(null);
+    setAppliedKey(null);
+    setCursors([null]);
+    setPageIndex(0);
+    setForcedStaleReason("source");
+    setError(null);
+    catalog.refetch();
   }
 
   function addRanking() {
@@ -260,16 +317,26 @@ export default function ScreenerPage() {
     setRunning(true);
     setError(null);
     const startedAtEpoch = sourceEpoch.current;
+    const startedAtDraftEpoch = draftEpoch.current;
     try {
       const envelope = await fetchScreenRun(body);
       if (
         startedAtEpoch !== sourceEpoch.current ||
-        (body.source_identity && envelope.data.source?.identity !== body.source_identity)
+        envelope.data.source?.identity !== body.source_identity ||
+        envelope.data.trade_date !== body.trade_date
       ) {
         throw new ApiError(409, "选股数据已更新，请重新筛选。");
       }
       setResult(envelope.data);
-      setForceStale(false);
+      setForcedStaleReason(startedAtDraftEpoch === draftEpoch.current ? null : "condition");
+      if (
+        nextIndex === 0 &&
+        startedAtDraftEpoch === draftEpoch.current &&
+        key === currentSnapshotKey.current
+      ) {
+        undoDraft.current = null;
+        setSuccessfulRunRevision((current) => current + 1);
+      }
       if (nextIndex === 0) {
         setApplied({ ...body, cursor: null });
         setAppliedKey(key);
@@ -283,14 +350,20 @@ export default function ScreenerPage() {
       }
       setPageIndex(nextIndex);
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "筛选暂时无法完成，请稍后重试。");
+      setError(
+        caught instanceof ApiError && caught.status === 409
+          ? null
+          : caught instanceof Error
+            ? caught.message
+            : "筛选暂时无法完成，请稍后重试。",
+      );
       if (caught instanceof ApiError && (caught.status === 409 || caught.status === 503)) {
         setResult(null);
         setApplied(null);
         setAppliedKey(null);
         setCursors([null]);
         setPageIndex(0);
-        setForceStale(caught.status === 409);
+        setForcedStaleReason(caught.status === 409 ? "source" : null);
         if (caught.status === 409) catalog.refetch();
       }
     } finally {
@@ -305,8 +378,7 @@ export default function ScreenerPage() {
       conditions: draft.map(({ key, args }) => ({ key, args })),
       page_size: PAGE_SIZE,
       cursor: null,
-      source_identity:
-        catalog.data?.source_kind === "replica" ? (catalog.data.source?.identity ?? null) : null,
+      source_identity: catalog.data?.source?.identity ?? null,
       ranking:
         rankDraft.length > 0
           ? {
@@ -356,6 +428,18 @@ export default function ScreenerPage() {
         </Panel>
       ) : (
         <>
+          <ScreenNaturalLanguage
+            available={catalog.data?.nl_generate_available === true}
+            sourceKind={catalog.data?.source_kind ?? null}
+            sourceIdentity={catalog.data?.source?.identity ?? null}
+            tradeDate={tradeDate}
+            conditionRevision={conditionRevision}
+            successfulRunRevision={successfulRunRevision}
+            blocks={blocks}
+            onApply={applySuggestion}
+            onUndo={undoSuggestion}
+            onConflict={invalidateSource}
+          />
           <Panel
             title="条件"
             sub="全部满足才保留"
@@ -396,9 +480,7 @@ export default function ScreenerPage() {
                         size="sm"
                         variant="ghost"
                         aria-label={`删除第 ${index + 1} 条条件`}
-                        onClick={() =>
-                          setDraft((current) => current.filter((item) => item.id !== condition.id))
-                        }
+                        onClick={() => removeCondition(condition.id)}
                       >
                         删除
                       </Button>

@@ -101,6 +101,7 @@ it("creates a blank canvas from the keyboard, waits for matching publication, th
       HttpResponse.json({
         data: {
           source_kind: "serving",
+          nl_generate_available: false,
           blocks: [
             {
               key: "not_st",
