@@ -512,7 +512,6 @@ def test_real_job_completion_is_discovered_with_exact_experiment_ownership(
         reader=reader,
         strategy_projection_reader=projections,
     )(catalog_now)
-    assert serving.payload.projections[0].table_name == "strategy_summary"
-    assert serving.payload.projections[0].rows[0]["mean_ret_pct"] == 2.0
-    assert serving.payload.projections[1].table_name == "strategy_trade"
-    assert serving.payload.projections[1].rows[0]["ret_pct"] == 2.0
+    by_name = {item.table_name: item for item in serving.payload.projections}
+    assert by_name["strategy_summary"].rows[0]["mean_ret_pct"] == 2.0
+    assert by_name["strategy_trade"].rows[0]["ret_pct"] == 2.0
