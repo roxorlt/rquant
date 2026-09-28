@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Protocol
 from pydantic import Field, StrictBool, StrictInt, field_validator, model_validator
 
 from rquant.delivery_contracts import DeliveryChannel, OutboxStatus
+from rquant.formula_pool_serving_projection import FormulaPoolServingConfig
 from rquant.notification_state import NotificationServingSnapshot, NotificationStateStore
 from rquant.notification_worker import (
     NotificationProvider,
@@ -269,6 +270,7 @@ class NotifierSettings(RuntimeContractModel):
     page_projection_user_presets_root: Path | None = None
     page_projection_canvas_receipt_root: Path | None = None
     page_projection_page_control_outbox_path: Path | None = None
+    page_projection_formula_pool_config: FormulaPoolServingConfig | None = None
     page_projection_canvas_active_key_id: str | None = Field(
         default=None,
         pattern=r"^[a-z0-9][a-z0-9_.-]{0,127}$",
@@ -355,6 +357,15 @@ class NotifierSettings(RuntimeContractModel):
             or self.page_projection_page_control_outbox_path is None
         ):
             raise ValueError("pool projection requires a database and PageControl audit")
+        if self.page_projection_formula_pool_config is not None and (
+            self.page_projection_database_path is None
+            or self.serving_authority_root is None
+            or self.page_projection_page_control_outbox_path is None
+        ):
+            raise ValueError(
+                "formula pool projection requires a database, signals authority "
+                "and PageControl audit"
+            )
         canvas_authority = (
             self.page_projection_canvas_receipt_root,
             self.page_projection_canvas_active_key_id,
@@ -373,6 +384,7 @@ class NotifierSettings(RuntimeContractModel):
             self.page_projection_page_control_outbox_path is not None
             and self.page_projection_canvas_catalog_root is None
             and self.page_projection_user_presets_root is None
+            and self.page_projection_formula_pool_config is None
         ):
             raise ValueError("PageControl audit requires a canvas or pool projection")
         if (
@@ -1106,6 +1118,7 @@ def notifier_builder(
                         #: generation it reads with an open descriptor and writes nothing
                         #: anywhere, so this role needs no scratch directory of its own.
                         page_control_outbox=(settings.page_projection_page_control_outbox_path),
+                        formula_pool_config=settings.page_projection_formula_pool_config,
                         #: #255: the DuckDB build on the production host refuses
                         #: `/proc/self/fd/<n>` as well, and the branch that used to run
                         #: instead hard-linked beside the database -- `EROFS`, every

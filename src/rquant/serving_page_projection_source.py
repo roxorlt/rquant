@@ -89,6 +89,7 @@ from rquant.formula_market_job_projection import (
 )
 from rquant.formula_pool_serving_projection import (
     FormulaPoolServingConfig,
+    FormulaPoolSourceWatch,
     read_formula_pool_projections,
     validate_formula_pool_projections,
 )
@@ -908,11 +909,30 @@ class _ReadonlyPageControlAuditReader:
     #: silent mix of two generations -- and the revalidation below reports the rotation
     #: from the identity comparison rather than from that open, so the wording names the
     #: generation that moved. (DuckDB re-opens the inode, so its reader does pin.)
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, reject_sidecars: bool = False) -> None:
         self.path = Path(os.path.abspath(path))
         self._snapshot_connection: sqlite3.Connection | None = None
+        self._reject_sidecars = reject_sidecars
+        self._require_no_sidecars()
         validated = self._validate_schema()
+        self._require_no_sidecars()
         self._validated_node_identity = (validated.st_dev, validated.st_ino)
+
+    def _require_no_sidecars(self) -> None:
+        if not self._reject_sidecars:
+            return
+        for suffix in ("-wal", "-shm"):
+            try:
+                os.lstat(Path(f"{self.path}{suffix}"))
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise PageProjectionSourceIntegrityError(
+                    "PageControl audit sidecar cannot be checked"
+                ) from exc
+            raise PageProjectionSourceIntegrityError(
+                "PageControl audit sidecar is not allowed for formula pools"
+            )
 
     def _connect(self, path: Path | str | None = None) -> sqlite3.Connection:
         database_path = self.path if path is None else Path(path)
@@ -942,6 +962,7 @@ class _ReadonlyPageControlAuditReader:
     def snapshot(self) -> Iterator[None]:
         if self._snapshot_connection is not None:
             raise RuntimeError("PageControl audit snapshot is already active")
+        self._require_no_sidecars()
         before = os.lstat(self.path)
         if (
             stat.S_ISLNK(before.st_mode)
@@ -976,6 +997,7 @@ class _ReadonlyPageControlAuditReader:
                 raise PageProjectionSourceIntegrityError(
                     "PageControl audit rotated while binding its exact generation"
                 )
+            self._require_no_sidecars()
             connection = self._connect(bound_path)
             self._validate_schema_connection(connection)
             connection.execute("BEGIN")
@@ -984,6 +1006,7 @@ class _ReadonlyPageControlAuditReader:
             self._snapshot_connection = connection
             self.assert_quiescent()
             yield
+            self._require_no_sidecars()
             after_data_version = int(connection.execute("PRAGMA data_version").fetchone()[0])
         except BaseException:
             self._snapshot_connection = None
@@ -999,6 +1022,7 @@ class _ReadonlyPageControlAuditReader:
             connection.close()
         integrity_error: PageProjectionSourceIntegrityError | None = None
         try:
+            self._require_no_sidecars()
             after = os.lstat(self.path)
             bound_after = os.fstat(descriptor)
             if _file_identity(after) != _file_identity(before):
@@ -1028,6 +1052,7 @@ class _ReadonlyPageControlAuditReader:
                 integrity_error = PageProjectionSourceIntegrityError(
                     "PageControl audit generation changed or entered in-flight state"
                 )
+            self._require_no_sidecars()
         except PageProjectionSourceIntegrityError as exc:
             integrity_error = exc
         except (OSError, sqlite3.Error) as exc:
@@ -2263,6 +2288,11 @@ class DuckDBSignalPageProjectionSource:
         self.notification_log_path = (
             None if notification_log_path is None else Path(os.path.abspath(notification_log_path))
         )
+        self.formula_pool_config = (
+            None
+            if formula_pool_config is None
+            else FormulaPoolServingConfig.model_validate(formula_pool_config)
+        )
         if page_control_outbox is None:
             self.page_control_outbox = None
         else:
@@ -2271,7 +2301,9 @@ class DuckDBSignalPageProjectionSource:
                 if isinstance(page_control_outbox, PageControlOutbox)
                 else Path(page_control_outbox)
             )
-            self.page_control_outbox = _ReadonlyPageControlAuditReader(audit_path)
+            self.page_control_outbox = _ReadonlyPageControlAuditReader(
+                audit_path, reject_sidecars=self.formula_pool_config is not None
+            )
 
         if self.canvas_catalog_root is not None and self.page_control_outbox is None:
             raise PageProjectionSourceIntegrityError(
@@ -2281,15 +2313,13 @@ class DuckDBSignalPageProjectionSource:
             raise PageProjectionSourceIntegrityError(
                 "configured user pools require readonly PageControl audit authority"
             )
-        self.formula_pool_config = (
-            None
-            if formula_pool_config is None
-            else FormulaPoolServingConfig.model_validate(formula_pool_config)
-        )
         if self.formula_pool_config is not None and self.page_control_outbox is None:
             raise PageProjectionSourceIntegrityError(
                 "configured formula pools require readonly PageControl audit authority"
             )
+        self._formula_pool_watch: FormulaPoolSourceWatch | None = None
+        self._formula_pool_identity: tuple[tuple[int, ...] | None, ...] | None = None
+        self._cached_formula_pool_projections: tuple[ServingProjectionPayload, ...] | None = None
         if self.canvas_catalog_root is not None and (
             self.canvas_receipt_root is None or self.canvas_publication_keyring is None
         ):
@@ -2335,6 +2365,52 @@ class DuckDBSignalPageProjectionSource:
             return self._build_snapshot(observed_at)
         with self.page_control_outbox.snapshot():
             return self._build_snapshot(observed_at)
+
+    def _read_formula_pool_projections(
+        self, observed: datetime
+    ) -> tuple[ServingProjectionPayload, ...]:
+        config = self.formula_pool_config
+        if config is None:
+            return ()
+        assert self.page_control_outbox is not None
+        watch = self._formula_pool_watch
+        cached = self._cached_formula_pool_projections
+        if watch is not None and cached is not None:
+            current = watch.identity()
+            if current == self._formula_pool_identity:
+                if watch.identity() != current:
+                    raise PageProjectionSourceIntegrityError(
+                        "formula pool authority changed while reusing verified projection"
+                    )
+                if cached[0].available_at > observed:
+                    raise PageProjectionSourceIntegrityError(
+                        "formula pool authority is newer than observation"
+                    )
+                return cached
+        catalog_before = FormulaPoolSourceWatch.catalog_identity(
+            config, self.page_control_outbox.path
+        )
+        projections = read_formula_pool_projections(
+            config,
+            self.page_control_outbox.formula_pool_saves(),
+            observed_at=observed,
+        )
+        watch = FormulaPoolSourceWatch.from_projections(
+            config, self.page_control_outbox.path, projections
+        )
+        identity = watch.identity()
+        if (
+            FormulaPoolSourceWatch.catalog_identity(config, self.page_control_outbox.path)
+            != catalog_before
+            or watch.identity() != identity
+        ):
+            raise PageProjectionSourceIntegrityError(
+                "formula pool authority changed while binding verified projection"
+            )
+        self._formula_pool_watch = watch
+        self._formula_pool_identity = identity
+        self._cached_formula_pool_projections = projections
+        return projections
 
     def _build_snapshot(self, observed_at: datetime) -> SignalPageProjectionSnapshot:
         observed = normalize_aware_utc(observed_at)
@@ -2437,13 +2513,8 @@ class DuckDBSignalPageProjectionSource:
         )
         formula_pool_projections: tuple[ServingProjectionPayload, ...] = ()
         if self.formula_pool_config is not None:
-            assert self.page_control_outbox is not None
             try:
-                formula_pool_projections = read_formula_pool_projections(
-                    self.formula_pool_config,
-                    self.page_control_outbox.formula_pool_saves(),
-                    observed_at=observed,
-                )
+                formula_pool_projections = self._read_formula_pool_projections(observed)
             except (OSError, sqlite3.Error, KeyError, ValueError) as exc:
                 raise PageProjectionSourceIntegrityError(
                     "configured formula pool authority is invalid"
@@ -3792,6 +3863,8 @@ class SignalPageProjectionProducer:
         try:
             snapshot = self.source(observed)
         except (PageProjectionSourceIntegrityError, OSError, duckdb.Error, ValueError) as error:
+            if self.source.formula_pool_config is not None:
+                raise
             previous = self.store.serving_snapshot(observed_at=observed, history_limit=1)
             if previous.projection_generation_id is None:
                 raise
