@@ -276,6 +276,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/monitor/channels": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 推送通道提交状态 */
+        get: operations["get_channels_api_v1_monitor_channels_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/monitor/timeline": {
         parameters: {
             query?: never;
@@ -2286,6 +2303,11 @@ export interface components {
             data: components["schemas"]["MetaData"];
             serving: components["schemas"]["ServingMeta"];
         };
+        /** Envelope[MonitorChannelsData] */
+        Envelope_MonitorChannelsData_: {
+            data: components["schemas"]["MonitorChannelsData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
         /** Envelope[MonitorTimelineData] */
         Envelope_MonitorTimelineData_: {
             data: components["schemas"]["MonitorTimelineData"];
@@ -2955,6 +2977,36 @@ export interface components {
             t: string;
             /** Volume */
             volume: number | null;
+        };
+        /** MonitorChannelSubmission */
+        MonitorChannelSubmission: {
+            /**
+             * Channel
+             * @enum {string}
+             */
+            channel: "pushdeer" | "pushplus";
+            /** Channel Label */
+            channel_label: string;
+            /** Last Success At */
+            last_success_at: string | null;
+            /** Seven Day Attempts */
+            seven_day_attempts: number;
+            /** Seven Day Submitted */
+            seven_day_submitted: number;
+            /** Seven Day Success Pct */
+            seven_day_success_pct: number | null;
+            /** Today Submitted */
+            today_submitted: number;
+        };
+        /** MonitorChannelsData */
+        MonitorChannelsData: {
+            /** Channels */
+            channels: components["schemas"]["MonitorChannelSubmission"][];
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "ready" | "unavailable";
         };
         /** MonitorNotification */
         MonitorNotification: {
@@ -5166,6 +5218,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_channels_api_v1_monitor_channels_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_MonitorChannelsData_"];
                 };
             };
         };

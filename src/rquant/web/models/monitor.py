@@ -7,11 +7,31 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from rquant.runtime_contracts import AwareUtcDatetime
 from rquant.web.models.alert_ack import AlertAcknowledgmentView, UnacknowledgedSummary
 from rquant.web.models.overview import DeliveryMode, DeliveryState
 
 SignalSourceState = Literal["unavailable", "not_published", "empty", "ready"]
 ReceiptSourceState = Literal["not_published", "no_receipts", "has_receipts", "truncated"]
+
+
+class MonitorChannelSubmission(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    channel: Literal["pushdeer", "pushplus"]
+    channel_label: str
+    today_submitted: int = Field(ge=0)
+    seven_day_attempts: int = Field(ge=0)
+    seven_day_submitted: int = Field(ge=0)
+    seven_day_success_pct: float | None = Field(ge=0, le=100)
+    last_success_at: AwareUtcDatetime | None
+
+
+class MonitorChannelsData(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    state: Literal["ready", "unavailable"]
+    channels: list[MonitorChannelSubmission]
 
 
 class MonitorReceipt(BaseModel):

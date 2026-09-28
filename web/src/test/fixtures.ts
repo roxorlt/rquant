@@ -153,6 +153,15 @@ export function monitorEnvelope(
   };
 }
 
+export function channelsEnvelope(
+  overrides: Partial<Schemas["MonitorChannelsData"]> = {},
+): Schemas["Envelope_MonitorChannelsData_"] {
+  return {
+    serving: { ...SERVING },
+    data: { state: "unavailable", channels: [], ...overrides },
+  };
+}
+
 export function tasksEnvelope(
   overrides: Partial<Schemas["ResearchJobsData"]> = {},
 ): Schemas["Envelope_ResearchJobsData_"] {

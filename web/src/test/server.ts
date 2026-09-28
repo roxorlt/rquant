@@ -1,6 +1,7 @@
 import { HttpResponse, http } from "msw";
 import { setupServer } from "msw/node";
 import {
+  channelsEnvelope,
   healthEnvelope,
   metaEnvelope,
   monitorEnvelope,
@@ -20,6 +21,9 @@ export const healthHandler = (envelope = healthEnvelope()) =>
 
 export const monitorHandler = (envelope = monitorEnvelope()) =>
   http.get("*/api/v1/monitor/timeline", () => HttpResponse.json(envelope));
+
+export const channelsHandler = (envelope = channelsEnvelope()) =>
+  http.get("*/api/v1/monitor/channels", () => HttpResponse.json(envelope));
 
 export const tasksHandler = (envelope = tasksEnvelope()) =>
   http.get("*/api/v1/tasks/jobs", () => HttpResponse.json(envelope));
@@ -67,6 +71,7 @@ export const server = setupServer(
   overviewHandler(),
   healthHandler(),
   monitorHandler(),
+  channelsHandler(),
   tasksHandler(),
   logCapabilitiesHandler(),
   paperHandler(),

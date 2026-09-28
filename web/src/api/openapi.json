@@ -4251,6 +4251,22 @@
         "title": "Envelope[MetaData]",
         "type": "object"
       },
+      "Envelope_MonitorChannelsData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/MonitorChannelsData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[MonitorChannelsData]",
+        "type": "object"
+      },
       "Envelope_MonitorTimelineData_": {
         "properties": {
           "data": {
@@ -6310,6 +6326,98 @@
           "direction"
         ],
         "title": "MinuteBar",
+        "type": "object"
+      },
+      "MonitorChannelSubmission": {
+        "properties": {
+          "channel": {
+            "enum": [
+              "pushdeer",
+              "pushplus"
+            ],
+            "title": "Channel",
+            "type": "string"
+          },
+          "channel_label": {
+            "title": "Channel Label",
+            "type": "string"
+          },
+          "last_success_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Success At"
+          },
+          "seven_day_attempts": {
+            "minimum": 0.0,
+            "title": "Seven Day Attempts",
+            "type": "integer"
+          },
+          "seven_day_submitted": {
+            "minimum": 0.0,
+            "title": "Seven Day Submitted",
+            "type": "integer"
+          },
+          "seven_day_success_pct": {
+            "anyOf": [
+              {
+                "maximum": 100.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Seven Day Success Pct"
+          },
+          "today_submitted": {
+            "minimum": 0.0,
+            "title": "Today Submitted",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "channel",
+          "channel_label",
+          "today_submitted",
+          "seven_day_attempts",
+          "seven_day_submitted",
+          "seven_day_success_pct",
+          "last_success_at"
+        ],
+        "title": "MonitorChannelSubmission",
+        "type": "object"
+      },
+      "MonitorChannelsData": {
+        "properties": {
+          "channels": {
+            "items": {
+              "$ref": "#/components/schemas/MonitorChannelSubmission"
+            },
+            "title": "Channels",
+            "type": "array"
+          },
+          "state": {
+            "enum": [
+              "ready",
+              "unavailable"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state",
+          "channels"
+        ],
+        "title": "MonitorChannelsData",
         "type": "object"
       },
       "MonitorNotification": {
@@ -12602,6 +12710,27 @@
           }
         },
         "summary": "确认一条告警",
+        "tags": [
+          "monitor"
+        ]
+      }
+    },
+    "/api/v1/monitor/channels": {
+      "get": {
+        "operationId": "get_channels_api_v1_monitor_channels_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_MonitorChannelsData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "推送通道提交状态",
         "tags": [
           "monitor"
         ]

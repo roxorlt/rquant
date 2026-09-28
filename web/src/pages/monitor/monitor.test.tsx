@@ -1,12 +1,93 @@
-import { screen, within } from "@testing-library/react";
+import { act, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { HttpResponse, http } from "msw";
-import { monitorEnvelope } from "@/test/fixtures";
+import { channelsEnvelope, metaEnvelope, monitorEnvelope } from "@/test/fixtures";
 import { findJargon } from "@/test/jargon";
 import { renderApp } from "@/test/render";
-import { monitorHandler, server } from "@/test/server";
+import { channelsHandler, metaHandler, monitorHandler, server } from "@/test/server";
+
+const publishedChannels = channelsEnvelope({
+  state: "ready",
+  channels: [
+    {
+      channel: "pushdeer",
+      channel_label: "PushDeer",
+      today_submitted: 2,
+      seven_day_attempts: 3,
+      seven_day_submitted: 2,
+      seven_day_success_pct: 66.7,
+      last_success_at: "2026-09-24T07:30:00Z",
+    },
+    {
+      channel: "pushplus",
+      channel_label: "PushPlus",
+      today_submitted: 0,
+      seven_day_attempts: 0,
+      seven_day_submitted: 0,
+      seven_day_success_pct: null,
+      last_success_at: null,
+    },
+  ],
+});
 
 describe("盯盘与告警", () => {
+  it("shows only verified submission facts, honest zero, and a delivery caveat", async () => {
+    server.use(channelsHandler(publishedChannels));
+    const user = userEvent.setup();
+    renderApp("/monitor");
+    const section = await screen.findByRole("region", { name: "推送通道状态" });
+    expect(within(section).getByRole("heading", { name: "通道提交记录" })).toBeInTheDocument();
+    const deer = await within(section).findByRole("article", { name: "PushDeer" });
+    const plus = within(section).getByRole("article", { name: "PushPlus" });
+    expect(deer).toHaveTextContent("66.7%");
+    expect(deer).toHaveTextContent("今日成功提交");
+    expect(deer).toHaveTextContent("2");
+    expect(plus).toHaveTextContent("近 7 日无提交记录");
+    expect(plus).toHaveTextContent("0");
+    expect(plus).not.toHaveTextContent("100%");
+    await user.hover(within(deer).getByText("近 7 日提交成功率"));
+    expect(await screen.findByRole("tooltip")).toHaveTextContent("不代表手机送达");
+    expect(await screen.findByRole("tooltip")).toHaveTextContent("新信号通知");
+    expect(findJargon(document.body.textContent ?? "")).toEqual([]);
+  });
+
+  it("shows an independent retry when channel records cannot be verified", async () => {
+    const user = userEvent.setup();
+    renderApp("/monitor");
+    const section = await screen.findByRole("region", { name: "推送通道状态" });
+    expect(await within(section).findByText("推送记录暂无法核对")).toBeInTheDocument();
+    expect(within(section).queryByRole("article")).toBeNull();
+    server.use(channelsHandler(publishedChannels));
+    await user.click(within(section).getByRole("button", { name: "重试" }));
+    expect(await within(section).findByRole("article", { name: "PushDeer" })).toBeInTheDocument();
+  });
+
+  it("clears old counts when the data generation changes", async () => {
+    server.use(channelsHandler(publishedChannels));
+    const view = renderApp("/monitor");
+    const section = await screen.findByRole("region", { name: "推送通道状态" });
+    expect(await within(section).findByText("66.7%")).toBeInTheDocument();
+    server.use(metaHandler(metaEnvelope({ generationId: "b".repeat(64) })));
+    act(() => {
+      view.queryClient.setQueryData(["meta"], metaEnvelope({ generationId: "b".repeat(64) }));
+    });
+    await waitFor(() => expect(within(section).queryByText("66.7%")).toBeNull());
+  });
+
+  it("clears old counts after a failed refresh", async () => {
+    server.use(channelsHandler(publishedChannels));
+    const user = userEvent.setup();
+    renderApp("/monitor");
+    const freshSection = await screen.findByRole("region", { name: "推送通道状态" });
+    expect(await within(freshSection).findByText("66.7%")).toBeInTheDocument();
+    server.use(
+      http.get("*/api/v1/monitor/channels", () => new HttpResponse(null, { status: 503 })),
+    );
+    await user.click(screen.getByRole("button", { name: "刷新" }));
+    expect(await within(freshSection).findByText("推送记录暂无法核对")).toBeInTheDocument();
+    expect(within(freshSection).queryByText("66.7%")).toBeNull();
+  });
+
   it.each([
     ["has_receipts", "有回执", "通知回执已更新"],
     ["truncated", "仅部分", "回执较多，仅显示部分，状态未确认"],

@@ -45,6 +45,8 @@ from rquant.web.models.alert_ack import (
     UnacknowledgedSummary,
 )
 from rquant.web.models.monitor import (
+    MonitorChannelsData,
+    MonitorChannelSubmission,
     MonitorNotification,
     MonitorReceipt,
     MonitorSignal,
@@ -115,6 +117,8 @@ _TRIGGER_LABELS = {
 }
 _SURGE_STATUS = {"confirmed": "已确认", "unbuyable": "临近涨停"}
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
+_CHANNELS = (("pushdeer", CHANNEL_LABELS["pushdeer"]), ("pushplus", CHANNEL_LABELS["pushplus"]))
+_MAX_LEGACY_NOTIFICATIONS = 10_000
 MAX_ACK_REQUEST_BYTES = 4096
 
 
@@ -197,6 +201,88 @@ def _source_published(borrowed: BorrowedGeneration) -> bool:
     return any(
         mark.dataset_id == "signals" and mark.status is not FreshnessStatus.UNAVAILABLE
         for mark in borrowed.manifest.watermarks
+    )
+
+
+def _channels_unavailable() -> MonitorChannelsData:
+    return MonitorChannelsData(state="unavailable", channels=[])
+
+
+def _channels(borrowed: BorrowedGeneration, *, now: datetime) -> MonitorChannelsData:
+    cursor = borrowed.cursor
+    states = readers.table_states(cursor)
+    if any(
+        states.get(name) is None or not states[name].available
+        for name in ("legacy_notification", "legacy_notification_status")
+    ):
+        return _channels_unavailable()
+    status_rows = cursor.execute(
+        "SELECT snapshot_key, state, skipped FROM legacy_notification_status LIMIT 2"
+    ).fetchall()
+    if status_rows != [("current", "complete", 0)]:
+        return _channels_unavailable()
+    rows = cursor.execute(
+        "SELECT sent_at, channel_label, submitted FROM legacy_notification LIMIT ?",
+        (_MAX_LEGACY_NOTIFICATIONS + 1,),
+    ).fetchall()
+    if len(rows) > _MAX_LEGACY_NOTIFICATIONS:
+        return _channels_unavailable()
+
+    now = now.astimezone(UTC)
+    today = now.astimezone(_SHANGHAI).date()
+    today_start = datetime.combine(today, time.min, tzinfo=_SHANGHAI).astimezone(UTC)
+    seven_day_start = datetime.combine(
+        today - timedelta(days=6), time.min, tzinfo=_SHANGHAI
+    ).astimezone(UTC)
+    history_start = datetime.combine(
+        today - timedelta(days=29), time.min, tzinfo=_SHANGHAI
+    ).astimezone(UTC)
+    counts: dict[str, dict[str, Any]] = {
+        name: {"today": 0, "attempts": 0, "submitted": 0, "last": None} for name, _ in _CHANNELS
+    }
+    by_label = {label: name for name, label in _CHANNELS}
+    for sent_at, label, submitted in rows:
+        if (
+            not isinstance(sent_at, datetime)
+            or sent_at.tzinfo is None
+            or sent_at.utcoffset() is None
+            or label not in by_label
+            or type(submitted) is not bool
+        ):
+            return _channels_unavailable()
+        event_at = sent_at.astimezone(UTC)
+        if event_at > now:
+            return _channels_unavailable()
+        current = counts[by_label[label]]
+        if event_at >= seven_day_start:
+            current["attempts"] += 1
+            if submitted:
+                current["submitted"] += 1
+        if submitted:
+            if event_at >= today_start:
+                current["today"] += 1
+            if event_at >= history_start and (
+                current["last"] is None or event_at > current["last"]
+            ):
+                current["last"] = event_at
+    return MonitorChannelsData(
+        state="ready",
+        channels=[
+            MonitorChannelSubmission(
+                channel=name,
+                channel_label=label,
+                today_submitted=counts[name]["today"],
+                seven_day_attempts=counts[name]["attempts"],
+                seven_day_submitted=counts[name]["submitted"],
+                seven_day_success_pct=(
+                    round(100 * counts[name]["submitted"] / counts[name]["attempts"], 1)
+                    if counts[name]["attempts"]
+                    else None
+                ),
+                last_success_at=counts[name]["last"],
+            )
+            for name, label in _CHANNELS
+        ],
     )
 
 
@@ -613,6 +699,31 @@ def _page(
         market_note=_market_note(cursor, now),
         unacknowledged=alerts.summary,
     )
+
+
+@router.get("/channels", response_model=Envelope[MonitorChannelsData], summary="推送通道提交状态")
+def get_channels(
+    request: Request,
+    response: Response,
+    _viewer: Annotated[str | None, Depends(current_user)],
+) -> Envelope[MonitorChannelsData]:
+    web = request.app.state.web
+    now = web.clock()
+    with web.tracker.borrow() as borrowed:
+        meta = serving_meta(
+            borrowed, now=now, stale_after=web.settings.stale_after, failure=web.tracker.failure
+        )
+        if meta.generation_id is not None:
+            response.headers["X-Rquant-Generation"] = meta.generation_id
+        if borrowed is None or meta.state == "unavailable":
+            data = _channels_unavailable()
+        else:
+            try:
+                data = _channels(borrowed, now=now)
+            except Exception:
+                # A corrupt or unreadable published projection cannot become a precise zero.
+                data = _channels_unavailable()
+    return Envelope[MonitorChannelsData](data=data, serving=meta)
 
 
 @router.get("/timeline", response_model=Envelope[MonitorTimelineData], summary="告警时间线")

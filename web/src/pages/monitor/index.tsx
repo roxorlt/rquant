@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import { submitAlertAckCommand } from "@/api/alertAckCommand";
 import { ApiError } from "@/api/client";
-import { type MonitorTimelineItem, useMonitorTimeline } from "@/api/endpoints";
+import { type MonitorTimelineItem, useMonitorChannels, useMonitorTimeline } from "@/api/endpoints";
 import { useCurrentMeta } from "@/api/useMeta";
 import { StockDrawer } from "@/app/StockDrawer";
 import { formatCount, formatPrice } from "@/format/number";
@@ -23,6 +23,7 @@ import {
 import { AlertAcknowledgment, unacknowledgedKpi } from "../shared/AlertAcknowledgment";
 import { StockCell } from "../shared/StockCell";
 import { type AckCommandSnapshot, AlertAckCommandSession } from "./alertAckCommandSession";
+import { ChannelStatus } from "./ChannelStatus";
 import "./monitor.css";
 
 const ALERT_ID = /^[0-9a-f]{64}$/;
@@ -286,6 +287,7 @@ export default function MonitorPage() {
   const [selectedStock, setSelectedStock] = useState<string | null>(null);
   const pageIndex = cursors.length - 1;
   const result = useMonitorTimeline(cursors[pageIndex] ?? null, refreshKey);
+  const channelResult = useMonitorChannels(refreshKey);
   const meta = useCurrentMeta();
   useEffect(() => {
     void meta.refetch();
@@ -321,6 +323,16 @@ export default function MonitorPage() {
   }, [commandSession, viewer, meta.isError]);
   const oldGeneration =
     currentGeneration !== undefined && result.serving?.generation_id !== currentGeneration;
+  const oldChannelGeneration =
+    currentGeneration !== undefined && channelResult.serving?.generation_id !== currentGeneration;
+  const channelLoading = channelResult.isLoading || (!meta.isFetchedAfterMount && !meta.isError);
+  const channelData =
+    meta.isError ||
+    oldChannelGeneration ||
+    channelResult.error ||
+    channelResult.serving?.state === "unavailable"
+      ? undefined
+      : channelResult.data;
   const data = oldGeneration || result.error ? undefined : result.data;
   const changed = result.error instanceof ApiError && result.error.status === 409;
   const pageFresh =
@@ -384,6 +396,7 @@ export default function MonitorPage() {
           </Button>
         }
       />
+      <ChannelStatus data={channelData} loading={channelLoading} retry={channelResult.refetch} />
       {result.isLoading || (oldGeneration && !result.error) ? (
         <PageSkeleton label="告警时间线加载中" />
       ) : result.error ? (

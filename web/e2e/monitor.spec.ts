@@ -1,4 +1,6 @@
 import { expect, test } from "@playwright/test";
+import type { MetaEnvelope } from "../src/api/client.ts";
+import type { MonitorChannelsData } from "../src/api/endpoints.ts";
 import { findJargon } from "../src/test/jargon.ts";
 import { expectNoHorizontalOverflow, watch } from "./watch.ts";
 
@@ -10,6 +12,11 @@ for (const width of [1440, 390]) {
       const watcher = watch(page);
       await page.goto("./#/monitor");
       await expect(page.getByRole("heading", { level: 1, name: "盯盘与告警" })).toBeVisible();
+      if (!process.env.RQ_E2E_REPLAY_ROOT) {
+        await expect(page.getByRole("region", { name: "推送通道状态" })).toContainText(
+          "推送记录暂无法核对",
+        );
+      }
       const timeline = page.getByRole("list", { name: "告警时间线" });
       await expect(timeline).toBeVisible();
       const entries = timeline.locator(":scope > li");
@@ -77,6 +84,62 @@ for (const width of [1440, 390]) {
       await expect(page.getByRole("dialog")).toBeVisible();
       await expectNoHorizontalOverflow(page, "monitor stock detail");
       expect(watcher.problems).toEqual([]);
+    });
+
+    test("keeps both verified channel cards readable and explains submission by keyboard", async ({
+      page,
+    }) => {
+      const metaResponse = await page.request.get("api/v1/meta");
+      expect(metaResponse.ok()).toBe(true);
+      const meta = (await metaResponse.json()) as MetaEnvelope;
+      const channels = {
+        state: "ready",
+        channels: [
+          {
+            channel: "pushdeer",
+            channel_label: "PushDeer",
+            today_submitted: 14,
+            seven_day_attempts: 20,
+            seven_day_submitted: 19,
+            seven_day_success_pct: 95,
+            last_success_at: "2026-09-24T07:30:00Z",
+          },
+          {
+            channel: "pushplus",
+            channel_label: "PushPlus",
+            today_submitted: 0,
+            seven_day_attempts: 0,
+            seven_day_submitted: 0,
+            seven_day_success_pct: null,
+            last_success_at: null,
+          },
+        ],
+      } satisfies MonitorChannelsData;
+      await page.route("**/api/v1/monitor/channels", (route) =>
+        route.fulfill({ json: { serving: meta.serving, data: channels } }),
+      );
+      await page.goto("./#/monitor");
+      const section = page.getByRole("region", { name: "推送通道状态" });
+      const deer = section.getByRole("article", { name: "PushDeer" });
+      const plus = section.getByRole("article", { name: "PushPlus" });
+      await expect(deer).toContainText("95.0%");
+      await expect(plus).toContainText("近 7 日无提交记录");
+      await deer.locator(".monitor-channel-main .tip-anchor").focus();
+      await expect(page.getByRole("tooltip")).toContainText("不代表手机送达");
+      await expectNoHorizontalOverflow(page, "channel status");
+      for (const card of [deer, plus]) {
+        expect(
+          await card.evaluate((element) => element.scrollWidth - element.clientWidth),
+        ).toBeLessThanOrEqual(0);
+      }
+      const captureDir = process.env.RQ_E2E_CAPTURE_DIR;
+      await test.info().attach(`channels-${width}px`, {
+        body: await page.screenshot({
+          fullPage: true,
+          path: captureDir ? `${captureDir}/channels-${width}.png` : undefined,
+        }),
+        contentType: "image/png",
+      });
     });
   });
 }
