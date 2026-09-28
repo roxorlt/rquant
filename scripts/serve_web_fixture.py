@@ -14,6 +14,8 @@ clock.
 from __future__ import annotations
 
 import argparse
+import os
+import secrets
 import sys
 import time
 from collections.abc import Callable, Sequence
@@ -43,6 +45,22 @@ def _instant(value: str) -> datetime:
     return parsed.astimezone(UTC)
 
 
+def _prepare_proxy_proof(path: Path) -> None:
+    """Give the local browser proxy and API one fresh, private synthetic proof."""
+
+    if not path.is_absolute() or ".." in path.parts:
+        raise ValueError("fixture proxy proof path must be absolute and canonical")
+    path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o400)
+    try:
+        with os.fdopen(descriptor, "w", encoding="ascii") as output:
+            output.write(secrets.token_hex(32))
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
     parser.add_argument("--root", required=True, type=Path, help="Serving root to read")
@@ -53,6 +71,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--private-fixture",
         action="store_true",
         help="simulate private ingress for local browser tests only",
+    )
+    parser.add_argument(
+        "--proxy-proof-file",
+        type=Path,
+        help="private synthetic proxy proof shared with the local browser test proxy",
     )
     args = parser.parse_args(argv)
 
@@ -65,10 +88,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.private_fixture:
         if args.now is None or not args.bind.startswith("127.0.0.1:"):
             parser.error("--private-fixture requires a pinned clock and IPv4 loopback bind")
+        if args.proxy_proof_file is None:
+            parser.error("--private-fixture requires --proxy-proof-file")
         # The test server is HTTP on loopback; this marker enables the private API's
         # ingress guard while the browser proxy supplies the synthetic test identity.
         values["bind"] = DEFAULT_BIND
         values["ingress_socket_path"] = args.root.resolve().parent / "web-private-fixture.sock"
+        _prepare_proxy_proof(args.proxy_proof_file)
+        values["proxy_proof_file"] = args.proxy_proof_file
+    elif args.proxy_proof_file is not None:
+        parser.error("--proxy-proof-file requires --private-fixture")
     if args.stale_after is not None:
         values["stale_after_seconds"] = args.stale_after
     settings = WebSettings.model_validate(values)

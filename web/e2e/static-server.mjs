@@ -5,7 +5,7 @@
 // /app/api/ proxied to the web API with the /app prefix stripped.
 //
 //   node e2e/static-server.mjs --port 4173 --api http://127.0.0.1:8768
-import { createReadStream, existsSync, statSync } from "node:fs";
+import { createReadStream, existsSync, readFileSync, statSync } from "node:fs";
 import { createServer, request } from "node:http";
 import { extname, join, normalize, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -16,6 +16,7 @@ const { values } = parseArgs({
     port: { type: "string", default: "4173" },
     api: { type: "string", default: "http://127.0.0.1:8768" },
     user: { type: "string", default: "e2e" },
+    "proof-file": { type: "string" },
   },
 });
 const root = fileURLToPath(new URL("../dist/", import.meta.url));
@@ -41,17 +42,27 @@ function send(response, status, headers, body = "") {
 }
 
 function proxy(clientRequest, clientResponse, path) {
+  const headers = { ...clientRequest.headers };
+  delete headers["x-rquant-user"];
+  delete headers["x-rquant-proxy-proof"];
+  headers.host = clientRequest.headers.host ?? api.host;
+  headers["x-rquant-user"] = values.user;
+  if (values["proof-file"]) {
+    try {
+      const proof = readFileSync(values["proof-file"], "ascii").trim();
+      if (!/^[0-9a-f]{64}$/.test(proof)) throw new Error("invalid fixture proxy proof");
+      headers["x-rquant-proxy-proof"] = proof;
+    } catch {
+      return send(clientResponse, 502, { "content-type": "text/plain" }, "bad gateway");
+    }
+  }
   const upstream = request(
     {
       hostname: api.hostname,
       port: api.port,
       path,
       method: clientRequest.method,
-      headers: {
-        ...clientRequest.headers,
-        host: clientRequest.headers.host ?? api.host,
-        "x-rquant-user": values.user,
-      },
+      headers,
     },
     (upstreamResponse) => {
       clientResponse.writeHead(upstreamResponse.statusCode ?? 502, upstreamResponse.headers);
