@@ -3792,6 +3792,8 @@ class SignalPageProjectionProducer:
         try:
             snapshot = self.source(observed)
         except (PageProjectionSourceIntegrityError, OSError, duckdb.Error, ValueError) as error:
+            if self.source.formula_pool_config is not None:
+                raise
             previous = self.store.serving_snapshot(observed_at=observed, history_limit=1)
             if previous.projection_generation_id is None:
                 raise
