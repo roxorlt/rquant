@@ -209,6 +209,34 @@ class VerifiedFormulaHistoryProjection:
             dates=generation.manifest.dates,
         )
 
+    def require_open_day(
+        self, trade_date: date, *, expected_identity: str,
+    ) -> FormulaProjectionCatalog:
+        """Check a historical SSE date in the pinned index without scanning listings or bars."""
+        if type(trade_date) is not date:
+            raise FormulaProjectionDateError("date is invalid")
+        connection, descriptor, generation = self._open()
+        try:
+            if generation.identity != expected_identity:
+                raise FormulaProjectionChangedError("history changed")
+            row = connection.execute(
+                "SELECT is_open FROM calendar WHERE exchange='SSE' AND cal_date=?",
+                (trade_date.isoformat(),),
+            ).fetchone()
+            if row is None or row[0] != 1:
+                raise FormulaProjectionDateError("date is not an open SSE day")
+            self._finish(descriptor, generation)
+            return FormulaProjectionCatalog(
+                identity=generation.identity,
+                updated_at=generation.manifest.source_updated_at,
+                dates=generation.manifest.dates,
+            )
+        except sqlite3.Error as error:
+            raise FormulaProjectionUnavailableError("history calendar query failed") from error
+        finally:
+            connection.close()
+            os.close(descriptor)
+
     def _open(self) -> tuple[sqlite3.Connection, int, _PinnedGeneration]:
         before = self._verify()
         path = self.root / before.manifest.file_name

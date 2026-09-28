@@ -25,6 +25,10 @@ from rquant.canvas_publication_receipt import (
     Ed25519CanvasPublicationSigner,
     SecureCanvasPublicationSigningClient,
 )
+from rquant.formula_market_page_backend import (
+    FormulaMarketPageBackend,
+    load_private_formula_market_config,
+)
 from rquant.job_center_authority import resolve_current_job_center_authority_binding
 from rquant.lab_daemon import load_lab_job_center_authority_manifest
 from rquant.lab_page_control import build_lab_page_control_writer
@@ -33,7 +37,9 @@ from rquant.page_control import (
     AckAlert,
     BackfillPlanPageControlBackend,
     DataAuditReportPageControlBackend,
+    FormulaMarketPageControlBackend,
     LabPageControlBackend,
+    PageControlCommandConflictError,
     PageControlConsumer,
     PageControlOutbox,
     PageControlService,
@@ -130,6 +136,7 @@ def build_page_control_service(
     lab_backend: LabPageControlBackend | None = None,
     backfill_plan_backend: BackfillPlanPageControlBackend | None = None,
     data_audit_report_backend: DataAuditReportPageControlBackend | None = None,
+    formula_market_backend: FormulaMarketPageControlBackend | None = None,
     load_default_lab_backend: bool = True,
     clock: Callable[[], datetime] | None = None,
     lease_seconds: int = 30,
@@ -146,6 +153,7 @@ def build_page_control_service(
         lab_backend=lab_backend,
         backfill_plan_backend=backfill_plan_backend,
         data_audit_report_backend=data_audit_report_backend,
+        formula_market_backend=formula_market_backend,
         load_default_lab_backend=load_default_lab_backend,
         clock=clock,
         lease_seconds=lease_seconds,
@@ -165,6 +173,7 @@ def build_page_control_service_with_dependencies(
     lab_backend: LabPageControlBackend | None = None,
     backfill_plan_backend: BackfillPlanPageControlBackend | None = None,
     data_audit_report_backend: DataAuditReportPageControlBackend | None = None,
+    formula_market_backend: FormulaMarketPageControlBackend | None = None,
     load_default_lab_backend: bool = True,
     clock: Callable[[], datetime] | None = None,
     lease_seconds: int = 30,
@@ -207,6 +216,7 @@ def build_page_control_service_with_dependencies(
             ),
             backfill_plan_backend=backfill_plan_backend,
             data_audit_report_backend=data_audit_report_backend,
+            formula_market_backend=formula_market_backend,
             clock=clock,
             lease_seconds=lease_seconds,
             consumer_id=consumer_instance_id,
@@ -255,6 +265,9 @@ def handler_for(service: PageControlService) -> type[BaseHTTPRequestHandler]:
             else:
                 try:
                     response = service.submit(command).model_dump(mode="json")
+                except PageControlCommandConflictError:
+                    self._write_json(409, {"error": "command conflict"})
+                    return
                 except Exception as exc:
                     self._write_json(400, {"error": f"{type(exc).__name__}: {exc}"})
                     return
@@ -290,6 +303,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--control-root", required=True, type=Path)
     parser.add_argument("--expected-commit", required=True)
     parser.add_argument("--expected-generation", required=True)
+    parser.add_argument(
+        "--formula-market-config",
+        type=Path,
+        help="owner-private local formula admission config; absent means disabled",
+    )
     return parser
 
 
@@ -300,17 +318,22 @@ def main(
     expected_commit: str | None = None,
     ack_socket_path: Path | None = None,
     ack_serving_root: Path | None = None,
+    formula_market_config_path: Path | None = None,
 ) -> None:
     """Entry point. `argv` is what the runtime wrapper derived; keywords are for tests."""
 
     if argv is not None:
         arguments = build_parser().parse_args(list(argv))
         expected_commit = expected_commit or arguments.expected_commit
+        if formula_market_config_path is not None and arguments.formula_market_config is not None:
+            raise ValueError("formula market config was supplied twice")
+        formula_market_config_path = formula_market_config_path or arguments.formula_market_config
     return _serve(
         runtime_root=runtime_root,
         expected_commit=expected_commit,
         ack_socket_path=ack_socket_path,
         ack_serving_root=ack_serving_root,
+        formula_market_config_path=formula_market_config_path,
     )
 
 
@@ -320,6 +343,7 @@ def _serve(
     expected_commit: str | None = None,
     ack_socket_path: Path | None = None,
     ack_serving_root: Path | None = None,
+    formula_market_config_path: Path | None = None,
 ) -> None:
     from rquant.runtime_deployment_profile import (
         LINUX_PRODUCTION_RUNTIME_ROOT,
@@ -402,11 +426,17 @@ def _serve(
         or port <= 0
     ):
         raise ValueError("page control endpoint must be an explicit loopback command URL")
+    formula_market_backend = None
+    if formula_market_config_path is not None:
+        formula_market_backend = FormulaMarketPageBackend(
+            load_private_formula_market_config(formula_market_config_path)
+        )
     service = build_page_control_service(
         outbox_path=page_profile.outbox_path,
         data_dir=page_profile.data_dir,
         log_dir=page_profile.log_dir,
         allowed_lab_export_roots=(page_profile.data_dir / "exports",),
+        formula_market_backend=formula_market_backend,
         load_default_lab_backend=False,
         consumer_service_id=canvas_profile.consumer_service_id,
         consumer_instance_id=canvas_profile.consumer_instance_id,

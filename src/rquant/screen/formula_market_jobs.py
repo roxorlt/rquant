@@ -71,6 +71,10 @@ class FormulaMarketArtifactUnavailableError(RuntimeError):
     """A stored success has no authentic, complete and bound result."""
 
 
+class FormulaMarketJobActiveError(ValueError):
+    """A different formula market task still owns the single active slot."""
+
+
 class FormulaMarketJobRequest(RuntimeContractModel):
     """Trusted caller input; roots and source identities never come from the browser."""
 
@@ -421,7 +425,7 @@ class FormulaMarketJobStore:
                     ).fetchone()
                     is not None
                 ):
-                    raise ValueError("another formula task is active")
+                    raise FormulaMarketJobActiveError("another formula task is active")
                 task_id = uuid4().hex
                 connection.execute(
                     """INSERT INTO formula_market_job
@@ -430,6 +434,25 @@ class FormulaMarketJobStore:
                     (task_id, request.idempotency_key, payload.decode(), digest, now, now),
                 )
         return self.status(task_id)
+
+    def admission_by_key(
+        self, idempotency_key: str,
+    ) -> tuple[FormulaMarketJobRequest, str] | None:
+        """Recover an admitted task without needing its eventual result artifact."""
+        if _KEY.fullmatch(idempotency_key) is None:
+            raise ValueError("invalid formula task idempotency key")
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT * FROM formula_market_job WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+        if row is None:
+            return None
+        request = self._request_from_row(row)
+        task_id = row["task_id"]
+        if _TASK_ID.fullmatch(task_id) is None:
+            raise ValueError("stored formula task id is invalid")
+        return request, task_id
 
     def _row(self, task_id: str) -> sqlite3.Row:
         if _TASK_ID.fullmatch(task_id) is None:

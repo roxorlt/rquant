@@ -36,6 +36,10 @@ from rquant.web.data_audit_report_command_gateway import (
     AuditReportCommandGateway,
     AuditReportCommandTransport,
 )
+from rquant.web.formula_market_command_gateway import (
+    FormulaMarketCommandGateway,
+    FormulaMarketCommandTransport,
+)
 from rquant.web.pool_editor_gateway import PoolCommandGateway, PoolCommandTransport
 from rquant.web.routes import (
     backfill_plan_commands,
@@ -46,6 +50,7 @@ from rquant.web.routes import (
     data_audit_report,
     data_audit_report_calendar,
     data_audit_report_commands,
+    formula_market_commands,
     fundamentals,
     health,
     meta,
@@ -77,6 +82,7 @@ _WRITE_BODY_LIMITS = {
     "/api/v1/monitor/ack": monitor.MAX_ACK_REQUEST_BYTES,
     "/api/v1/data/backfill-plans/commands": backfill_plan_commands.MAX_REQUEST_BYTES,
     "/api/v1/data/audit-report/commands": data_audit_report_commands.MAX_REQUEST_BYTES,
+    "/api/v1/screen/tdx/market/commands": formula_market_commands.MAX_REQUEST_BYTES,
 }
 
 
@@ -100,6 +106,7 @@ class WebContext:
     unit_log_gate: threading.BoundedSemaphore
     backfill_plan_commands: BackfillPlanCommandGateway
     audit_report_commands: AuditReportCommandGateway
+    formula_market_commands: FormulaMarketCommandGateway
 
 
 def create_app(
@@ -115,6 +122,7 @@ def create_app(
     unit_log_access_audit: ServiceLogAccessAudit | None = None,
     backfill_plan_command_transport: BackfillPlanCommandTransport | None = None,
     audit_report_command_transport: AuditReportCommandTransport | None = None,
+    formula_market_command_transport: FormulaMarketCommandTransport | None = None,
 ) -> FastAPI:
     """Build the app. Nothing is opened until the first request or startup."""
 
@@ -215,6 +223,10 @@ def create_app(
             endpoint=settings.page_control_url,
             transport=audit_report_command_transport,
         ),
+        formula_market_commands=FormulaMarketCommandGateway(
+            endpoint=settings.page_control_url,
+            transport=formula_market_command_transport,
+        ),
     )
     app.add_middleware(GZipMiddleware, minimum_size=1024)
 
@@ -272,6 +284,10 @@ def create_app(
             return JSONResponse(status_code=422, content={"detail": "计划日期有误，请检查后重试。"})
         if request.url.path == "/api/v1/data/audit-report/commands":
             return JSONResponse(status_code=422, content={"detail": "审计日期有误，请检查后重试。"})
+        if request.url.path == "/api/v1/screen/tdx/market/commands":
+            return JSONResponse(
+                status_code=422, content={"detail": "选股输入有误，请检查日期和公式。"}
+            )
         return await request_validation_exception_handler(request, error)
 
     app.include_router(meta.router, prefix="/api/v1", tags=["meta"])
@@ -286,6 +302,7 @@ def create_app(
     app.include_router(health.router, prefix="/api/v1", tags=["health"])
     app.include_router(panorama.router, prefix="/api/v1", tags=["panorama"])
     app.include_router(screen.router, prefix="/api/v1", tags=["screen"])
+    app.include_router(formula_market_commands.router, prefix="/api/v1", tags=["screen"])
     app.include_router(stocks.router, prefix="/api/v1", tags=["stocks"])
     app.include_router(catalog.router, prefix="/api/v1", tags=["catalog"])
     app.include_router(data_audit.router, prefix="/api/v1", tags=["data-audit"])

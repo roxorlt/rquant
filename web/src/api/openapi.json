@@ -4612,6 +4612,84 @@
         "title": "FormulaAst",
         "type": "object"
       },
+      "FormulaMarketCommandReceipt": {
+        "additionalProperties": false,
+        "properties": {
+          "command_id": {
+            "title": "Command Id",
+            "type": "string"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "queued",
+              "pending",
+              "processing",
+              "failed",
+              "ambiguous",
+              "conflict"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "task_id": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{32}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Task Id"
+          }
+        },
+        "required": [
+          "command_id",
+          "status",
+          "message"
+        ],
+        "title": "FormulaMarketCommandReceipt",
+        "type": "object"
+      },
+      "FormulaMarketCommandRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "command_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Command Id",
+            "type": "string"
+          },
+          "formula": {
+            "minLength": 1,
+            "title": "Formula",
+            "type": "string"
+          },
+          "requested_at": {
+            "format": "date-time",
+            "title": "Requested At",
+            "type": "string"
+          },
+          "trade_date": {
+            "format": "date",
+            "title": "Trade Date",
+            "type": "string"
+          }
+        },
+        "required": [
+          "command_id",
+          "requested_at",
+          "formula",
+          "trade_date"
+        ],
+        "title": "FormulaMarketCommandRequest",
+        "type": "object"
+      },
       "FreshnessItem": {
         "properties": {
           "key": {
@@ -11976,6 +12054,57 @@
           }
         },
         "summary": "运行选股条件",
+        "tags": [
+          "screen"
+        ]
+      }
+    },
+    "/api/v1/screen/tdx/market/commands": {
+      "post": {
+        "operationId": "submit_formula_market_command_api_v1_screen_tdx_market_commands_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FormulaMarketCommandRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FormulaMarketCommandReceipt"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FormulaMarketCommandReceipt"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "提交全市场公式选股",
         "tags": [
           "screen"
         ]

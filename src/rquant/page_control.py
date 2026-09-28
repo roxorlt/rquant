@@ -275,6 +275,13 @@ class SubmitDataAuditReport(PageControlCommand):
         return self
 
 
+class SubmitFormulaMarketRun(PageControlCommand):
+    kind: Literal["submit_formula_market_run"] = "submit_formula_market_run"
+    actor_id: str = Field(min_length=1, max_length=256)
+    formula: str = Field(min_length=1, max_length=4096)
+    trade_date: date
+
+
 class ExportLabArtifactZip(PageControlCommand):
     kind: Literal["export_lab_artifact_zip"] = "export_lab_artifact_zip"
     job_id: UUID
@@ -322,6 +329,12 @@ class DataAuditReportPageControlBackend(Protocol):
     def recover(self, command: SubmitDataAuditReport) -> JsonValue | None: ...
 
 
+class FormulaMarketPageControlBackend(Protocol):
+    def submit(self, command: SubmitFormulaMarketRun) -> JsonValue: ...
+
+    def recover(self, command: SubmitFormulaMarketRun) -> JsonValue | None: ...
+
+
 PageControlCommandValue = Annotated[
     AckAlert
     | SaveCanvas
@@ -339,6 +352,7 @@ PageControlCommandValue = Annotated[
     | SubmitLabCommand
     | SubmitBackfillPlan
     | SubmitDataAuditReport
+    | SubmitFormulaMarketRun
     | ExportLabArtifactZip
     | DiscardLabArtifactZip,
     Field(discriminator="kind"),
@@ -352,6 +366,10 @@ class PageControlStatus(StrEnum):
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     AMBIGUOUS = "ambiguous"
+
+
+class PageControlCommandConflictError(ValueError):
+    """A command ID already binds a different durable command payload."""
 
 
 class PageControlEffectStatus(StrEnum):
@@ -794,7 +812,9 @@ class PageControlOutbox:
             ).fetchone()
             if existing is not None:
                 if existing["command_hash"] != command_hash:
-                    raise ValueError("command_id already exists with different payload")
+                    raise PageControlCommandConflictError(
+                        "command_id already exists with different payload"
+                    )
                 return self._receipt(existing)
             connection.execute(
                 """
@@ -1430,6 +1450,7 @@ class PageControlConsumer:
         lab_backend: LabPageControlBackend | None = None,
         backfill_plan_backend: BackfillPlanPageControlBackend | None = None,
         data_audit_report_backend: DataAuditReportPageControlBackend | None = None,
+        formula_market_backend: FormulaMarketPageControlBackend | None = None,
         clock: Callable[[], datetime] | None = None,
         lease_seconds: int = _DEFAULT_LEASE_SECONDS,
         consumer_id: str | None = None,
@@ -1446,6 +1467,7 @@ class PageControlConsumer:
         self.lab_backend = lab_backend
         self.backfill_plan_backend = backfill_plan_backend
         self.data_audit_report_backend = data_audit_report_backend
+        self.formula_market_backend = formula_market_backend
         self.clock = clock or (lambda: datetime.now(UTC))
         self.lease_seconds = lease_seconds
         self.consumer_service_id = consumer_service_id
@@ -1766,6 +1788,8 @@ class PageControlConsumer:
             # A started command may have queued a task before its receipt was lost.
             # A first attempt without a configured backend cannot have done so.
             return not created or self.data_audit_report_backend is not None
+        if isinstance(command, SubmitFormulaMarketRun):
+            return not created or self.formula_market_backend is not None
         return self._has_committed_local_mutation(command)
 
     def _has_committed_local_mutation(self, command: PageControlCommandValue) -> bool:
@@ -1883,6 +1907,8 @@ class PageControlConsumer:
             return self._backfill_plan_backend().submit(command)
         if isinstance(command, SubmitDataAuditReport):
             return self._data_audit_report_backend().submit(command)
+        if isinstance(command, SubmitFormulaMarketRun):
+            return self._formula_market_backend().submit(command)
         if isinstance(command, ExportLabArtifactZip):
             return self._lab_backend().export_zip(command.job_id)
         if isinstance(command, DiscardLabArtifactZip):
@@ -1903,6 +1929,11 @@ class PageControlConsumer:
         if self.data_audit_report_backend is None:
             raise RuntimeError("data audit report backend is unavailable")
         return self.data_audit_report_backend
+
+    def _formula_market_backend(self) -> FormulaMarketPageControlBackend:
+        if self.formula_market_backend is None:
+            raise RuntimeError("formula market backend is unavailable")
+        return self.formula_market_backend
 
     def _local_effect_fence_targets(
         self,
@@ -2116,6 +2147,8 @@ class PageControlConsumer:
             return self._backfill_plan_backend().recover(command)
         if isinstance(command, SubmitDataAuditReport):
             return self._data_audit_report_backend().recover(command)
+        if isinstance(command, SubmitFormulaMarketRun):
+            return self._formula_market_backend().recover(command)
         if isinstance(command, CreateCanvas):
             return self._recover_create_canvas_result(command)
         if isinstance(command, SaveCanvas):
@@ -3750,8 +3783,10 @@ __all__ = [
     "LabPageControlBackend",
     "BackfillPlanPageControlBackend",
     "DataAuditReportPageControlBackend",
+    "FormulaMarketPageControlBackend",
     "PageControlCommandValue",
     "PageControlClient",
+    "PageControlCommandConflictError",
     "PageControlConsumer",
     "PageControlOutbox",
     "PageControlReceipt",
@@ -3767,4 +3802,5 @@ __all__ = [
     "SubmitLabCommand",
     "SubmitBackfillPlan",
     "SubmitDataAuditReport",
+    "SubmitFormulaMarketRun",
 ]
