@@ -6,11 +6,11 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
-from fastapi.testclient import TestClient
 
-from rquant.web.app import create_app
 from rquant.web.settings import WebSettings
 from tests.support.monitor_timeline_replay import build_monitor_timeline_replay
+from tests.support.web_proxy_identity import ResearcherTestClient as TestClient
+from tests.support.web_proxy_identity import create_private_test_app as create_app
 from tests.support.web_serving_fixture import FIXTURE_BUILT_AT
 
 
