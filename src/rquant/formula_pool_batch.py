@@ -15,7 +15,11 @@ from typing import Literal
 from pydantic import Field, field_validator, model_validator
 
 from rquant.formula_market_private_config import FormulaMarketPrivateConfig
-from rquant.formula_pool_daily import FormulaPoolDailyRecalculator, FormulaPoolDailyResultV1
+from rquant.formula_pool_daily import (
+    FormulaPoolDailyRecalculator,
+    FormulaPoolDailyResultV1,
+    _run_identity,
+)
 from rquant.formula_pool_definition import (
     FormulaPoolDefinitionStore,
     FormulaPoolDefinitionV1,
@@ -175,6 +179,8 @@ class FormulaPoolBatchResult(RuntimeContractModel):
 
     trade_date: date
     catalog_identity: str = Field(pattern=r"^[0-9a-f]{64}$")
+    universe_identity: str = Field(pattern=r"^[0-9a-f]{64}$")
+    projection_identity: str = Field(pattern=r"^[0-9a-f]{64}$")
     total_count: int = Field(ge=0)
     page_start: int = Field(ge=0)
     pools: tuple[FormulaPoolBatchItem, ...]
@@ -203,6 +209,15 @@ class FormulaPoolBatchResult(RuntimeContractModel):
             or self.page_start + len(self.pools) > self.total_count
             or self.all_complete
             != (self.page_start == 0 and self.completed_count == self.total_count)
+            or any(
+                item.daily is not None
+                and (
+                    item.daily.trade_date != self.trade_date
+                    or item.daily.universe_identity != self.universe_identity
+                    or item.daily.projection_identity != self.projection_identity
+                )
+                for item in self.pools
+            )
         ):
             raise ValueError("formula batch summary is inconsistent")
         return self
@@ -347,6 +362,19 @@ class FormulaPoolBatchCoordinator:
             for item in results
         ):
             raise ValueError("formula batch sources changed during reconciliation")
+        for definition, item in zip(catalog[start:end], results, strict=True):
+            if item.task_id is None:
+                continue
+            run_identity = _run_identity(
+                definition.pool_name,
+                definition.version,
+                trade_date,
+                universe,
+                projection,
+            )
+            admitted = self.runner.task_store.admission_by_key(run_identity)
+            if admitted is None or admitted[1] != item.task_id:
+                raise ValueError("formula batch admission sources changed during reconciliation")
         next_cursor = f"{cursor_identity}:{end}" if end < len(catalog) else None
         completed = sum(item.status == "completed" for item in results)
         waiting = sum(item.status == "waiting" for item in results)
@@ -354,6 +382,8 @@ class FormulaPoolBatchCoordinator:
         return FormulaPoolBatchResult(
             trade_date=trade_date,
             catalog_identity=catalog_identity,
+            universe_identity=universe,
+            projection_identity=projection,
             total_count=len(catalog),
             page_start=start,
             pools=results,
@@ -373,6 +403,8 @@ class FormulaPoolBatchCoordinator:
         cursor: str | None = None
         while True:
             page = self.run(trade_date, limit=_MAX_PAGE, cursor=cursor)
+            if (page.universe_identity, page.projection_identity) != (universe, projection):
+                raise ValueError("formula batch sources changed during day sweep")
             expected = catalog[len(pools) : len(pools) + _MAX_PAGE]
             if (
                 page.catalog_identity != catalog_identity

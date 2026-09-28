@@ -18,6 +18,7 @@ from rquant.formula_pool_batch import (
     load_private_formula_pool_batch_config,
     main,
 )
+from rquant.formula_pool_daily import _run_identity
 from rquant.formula_pool_definition import FormulaPoolDefinitionV1
 from rquant.page_control import PageControlStatus
 from rquant.screen.formula_market_jobs import FormulaMarketJobWorker
@@ -132,12 +133,64 @@ def test_day_sweep_empty_catalog_is_complete_only_with_trusted_sources(tmp_path:
     batch, admission, _ = _fixture(tmp_path)
     for path in batch.config.definition_root.iterdir():
         path.unlink()
+    page = batch.run(DAY)
+    expected_sources = batch.runner._sources(DAY)[:2]
+    assert (page.universe_identity, page.projection_identity) == expected_sources
     result = batch.run_day(DAY)
     assert result.total_count == result.completed_count == result.waiting_count == 0
     assert result.pools == () and result.all_complete
     assert admission.store.latest().status == "succeeded"
     with pytest.raises(ValueError, match="closed"):
         batch.run_day(date(2026, 4, 18))
+
+
+def test_day_sweep_rejects_transient_admission_source_even_when_sources_return(
+    tmp_path: Path,
+) -> None:
+    batch, admission, _ = _fixture(tmp_path)
+    original = batch.runner._sources
+    calls = 0
+
+    def sources(trade_date: date) -> tuple[str, str, datetime]:
+        nonlocal calls
+        calls += 1
+        universe, projection, checked_at = original(trade_date)
+        if calls == 3:  # First pool admission uses B; day and page boundaries use A.
+            return "b" * 64, "c" * 64, checked_at
+        return universe, projection, checked_at
+
+    batch.runner._sources = sources  # type: ignore[method-assign]
+    with pytest.raises(ValueError, match="sources|admission"):
+        batch.run_day(DAY)
+    assert calls == 5
+    definition = batch.definitions.read("alpha")
+    admitted = admission.store.admission_by_key(
+        _run_identity(definition.pool_name, definition.version, DAY, "b" * 64, "c" * 64)
+    )
+    assert admitted is not None and admission.store.status(admitted[1]).status == "queued"
+
+
+def test_day_sweep_rejects_page_source_shift_for_empty_catalog(
+    tmp_path: Path,
+) -> None:
+    batch, _, _ = _fixture(tmp_path)
+    for path in batch.config.definition_root.iterdir():
+        path.unlink()
+    original = batch.runner._sources
+    calls = 0
+
+    def sources(trade_date: date) -> tuple[str, str, datetime]:
+        nonlocal calls
+        calls += 1
+        universe, projection, checked_at = original(trade_date)
+        if calls in (2, 3):  # The page sees B, while the day pre/post checks see A.
+            return "b" * 64, "c" * 64, checked_at
+        return universe, projection, checked_at
+
+    batch.runner._sources = sources  # type: ignore[method-assign]
+    with pytest.raises(ValueError, match="sources"):
+        batch.run_day(DAY)
+    assert calls == 3
 
 
 @pytest.mark.parametrize("change", ["catalog", "definition", "universe", "projection"])
@@ -293,6 +346,7 @@ def test_page_cursor_advances_past_waiting_and_cannot_claim_full_day(tmp_path: P
     batch, admission, _ = _fixture(tmp_path)
     first = batch.run(DAY, limit=1)
     assert first.page_start == 0
+    assert (first.universe_identity, first.projection_identity) == batch.runner._sources(DAY)[:2]
     assert first.waiting_count == first.unprocessed_count == 1
     assert first.next_cursor is not None and not first.all_complete
     second = batch.run(DAY, limit=1, cursor=first.next_cursor)
