@@ -323,6 +323,8 @@ def test_lab_jobs_builder_auto_projects_research_gate_metadata(tmp_path: Path) -
     )(NOW)
 
     assert tuple(item.table_name for item in loaded.payload.projections) == (
+        "lab_job_event_window",
+        "lab_job_event",
         "data_audit_issue",
         "data_audit_status",
         "research_gate_metadata",
