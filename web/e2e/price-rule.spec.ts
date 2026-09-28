@@ -166,3 +166,110 @@ for (const width of [1440, 390]) {
     });
   });
 }
+
+test("确定未保存后可在同代重新尝试，390px", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  const initial = metaEnvelope();
+  const generation = initial.serving.generation_id as string;
+  const now = Date.now();
+  const built = new Date(now - 10_000).toISOString();
+  const expiresAt = new Date(now + 60 * 60_000).toISOString();
+  const meta = () => {
+    const value = metaEnvelope();
+    value.data.server_time = new Date(now).toISOString();
+    if (value.data.generation) value.data.generation.built_at = built;
+    value.serving.built_at = built;
+    return value;
+  };
+  const sent: Save[] = [];
+  await page.route("**/api/v1/meta", (route) => route.fulfill({ json: meta() }));
+  await page.route("**/api/v1/monitor/rules", (route) =>
+    route.fulfill({
+      json: {
+        serving: meta().serving,
+        data: {
+          availability: "ready",
+          available_at: built,
+          evaluation_running: false,
+          message: "",
+          items: [],
+        },
+      } satisfies RuleEnvelope,
+    }),
+  );
+  await page.route("**/api/v1/watchlist", (route) =>
+    route.fulfill({
+      json: {
+        serving: meta().serving,
+        data: {
+          availability: "ready",
+          available_at: built,
+          message: "",
+          items: [
+            {
+              ts_code: "600001.SH",
+              version: 2,
+              source: "detail",
+              price_levels: [],
+              expires_at: expiresAt,
+              updated_at: built,
+            },
+          ],
+        },
+      } satisfies ListEnvelope,
+    }),
+  );
+  await page.route("**/api/v1/watchlist/600001.SH", (route) =>
+    route.fulfill({
+      json: {
+        serving: meta().serving,
+        data: {
+          availability: "ready",
+          available_at: built,
+          ts_code: "600001.SH",
+          status: "active",
+          version: 2,
+          source: "detail",
+          message: "",
+          price_levels: [],
+          expires_at: expiresAt,
+          updated_at: built,
+        },
+      } satisfies ExactEnvelope,
+    }),
+  );
+  await page.route("**/api/v1/monitor/rules/commands", (route) => {
+    const body = route.request().postDataJSON() as Save;
+    sent.push(body);
+    return route.fulfill({
+      json: {
+        command_id: body.command_id,
+        kind: body.kind,
+        rule_id: body.rule.rule_id,
+        status: sent.length === 1 ? "failed" : "saved_syncing",
+        version: sent.length === 1 ? null : 1,
+        reason: null,
+        message: sent.length === 1 ? "未保存" : "已保存，正在同步。",
+      },
+    });
+  });
+
+  await page.goto("./#/monitor");
+  const panel = page.getByRole("region", { name: "价格提醒规则" });
+  await expect(panel.getByRole("button", { name: "新建规则" })).toBeEnabled();
+  await panel.getByRole("button", { name: "新建规则" }).click();
+  await panel.getByLabel("名称").fill("失败后重试");
+  await panel.getByLabel("价格").fill("12.50");
+  await panel.getByRole("button", { name: "保存规则" }).click();
+  const recovery = panel.getByRole("listitem", { name: "失败后重试" });
+  await expect(recovery.getByText("未保存，可重试")).toBeVisible();
+  await page.reload();
+  await expect(recovery.getByRole("button", { name: "重新尝试" })).toBeEnabled();
+  await recovery.getByRole("button", { name: "重新尝试" }).click();
+  await expect(recovery.getByText("已保存，正在同步")).toBeVisible();
+  expect(sent).toHaveLength(2);
+  expect(sent[1]?.command_id).not.toBe(sent[0]?.command_id);
+  expect(sent[1]?.generation_id).toBe(generation);
+  await expect(panel.getByText("价格提醒尚未运行")).toBeVisible();
+  await expectNoHorizontalOverflow(page, "failed price rule retry 390px");
+});

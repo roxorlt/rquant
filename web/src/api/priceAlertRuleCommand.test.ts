@@ -48,6 +48,7 @@ function session(post: (body: Body) => Promise<Receipt>, viewer = "tester") {
     nextId: () => `web-command-${++sequence}`,
     now: () => AT,
     withLock: async (_key, task) => task(),
+    isCurrent: () => true,
   });
 }
 
@@ -151,6 +152,29 @@ it("resolves a lost first response through the original command before allowing 
   await reopened.start({ ...SAVE, generation_id: NEXT_GENERATION });
   expect(sent[2]?.generation_id).toBe(NEXT_GENERATION);
   expect(sent[2]?.command_id).not.toBe(sent[0]?.command_id);
+});
+
+it("allows a fresh command in the same generation only after a durable failed receipt", async () => {
+  const sent: Body[] = [];
+  const post = async (body: Body): Promise<Receipt> => {
+    sent.push(body);
+    return {
+      command_id: body.command_id,
+      kind: body.kind,
+      rule_id: RULE_ID,
+      status: sent.length === 1 ? "failed" : "saved_syncing",
+      version: sent.length === 1 ? null : 1,
+      reason: null,
+      message: sent.length === 1 ? "未保存" : "已保存，正在同步",
+    };
+  };
+  await session(post).start(SAVE);
+  const reopened = session(post);
+  expect(reopened.snapshot().entries[RULE_ID]?.status).toBe("failed");
+  await reopened.start(SAVE);
+  expect(sent).toHaveLength(2);
+  expect(sent[1]?.generation_id).toBe(GENERATION);
+  expect(sent[1]?.command_id).not.toBe(sent[0]?.command_id);
 });
 
 it("reads a different tab's durable original before starting, and never reads another viewer's journal", async () => {

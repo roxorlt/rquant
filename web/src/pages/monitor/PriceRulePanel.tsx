@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import type { Schemas } from "@/api/client";
 import { useManualWatchlist } from "@/api/manualWatchlist";
 import {
@@ -22,6 +22,7 @@ type Priority = Schemas["PriceAlertRule"]["priority"];
 type Comparison = Schemas["PriceAlertRule"]["comparison"];
 
 interface Editor {
+  scope: object;
   generationId: string;
   ruleId: string;
   expectedVersion: number | null;
@@ -44,7 +45,7 @@ async function browserLock(name: string, task: () => Promise<void>): Promise<voi
   await navigator.locks.request(name, { mode: "exclusive" }, task);
 }
 
-function editorFor(item: PriceRuleItem, generationId: string): Editor | null {
+function editorFor(item: PriceRuleItem, generationId: string, scope: object): Editor | null {
   if (
     item.deleted ||
     item.ts_code === null ||
@@ -58,6 +59,7 @@ function editorFor(item: PriceRuleItem, generationId: string): Editor | null {
   )
     return null;
   return {
+    scope,
     generationId,
     ruleId: item.rule_id,
     expectedVersion: item.version,
@@ -80,7 +82,7 @@ function operation(
     return { label: "已保存，正在同步", terminal: false };
   if (priceRuleProvedNoEffect(entry))
     return { label: entry.status === "capacity" ? "规则数量已满" : "数据已变化", terminal: true };
-  if (entry.status === "failed") return { label: "未保存", terminal: true };
+  if (entry.status === "failed") return { label: "未保存，可重试", terminal: true };
   if (entry.status === "pending" || entry.status === "processing")
     return { label: "正在处理", terminal: false };
   return { label: "状态待核对", terminal: false };
@@ -231,11 +233,15 @@ export function PriceRulePanel({
   const rules = usePriceAlertRules(viewer, generationId, fresh);
   const watchlist = useManualWatchlist();
   const [editor, setEditor] = useState<Editor | null>(null);
-  const [submitting, setSubmitting] = useState(false);
-  const [deleting, setDeleting] = useState<PriceRuleItem | null>(null);
-  const session = useMemo(
-    () =>
-      new PriceRuleCommandSession({
+  const [submittingScope, setSubmittingScope] = useState<object | null>(null);
+  const [deleting, setDeleting] = useState<{ scope: object; item: PriceRuleItem } | null>(null);
+  const activeScope = useRef<object | null>(null);
+  const scopeKey = JSON.stringify([viewer, generationId]);
+  const scoped = useMemo(() => {
+    const token = { scopeKey };
+    return {
+      token,
+      session: new PriceRuleCommandSession({
         storage: (() => {
           try {
             return typeof navigator.locks?.request === "function" ? window.localStorage : null;
@@ -252,9 +258,23 @@ export function PriceRulePanel({
         nextId,
         now: () => new Date().toISOString(),
         withLock: browserLock,
+        isCurrent: () => activeScope.current === token,
       }),
-    [viewer],
-  );
+    };
+  }, [viewer, scopeKey]);
+  activeScope.current = scoped.token;
+  const session = scoped.session;
+  const activeEditor = editor?.scope === scoped.token ? editor : null;
+  const activeDeleting = deleting?.scope === scoped.token ? deleting.item : null;
+  const submitting = submittingScope === scoped.token;
+  useEffect(() => {
+    activeScope.current = scoped.token;
+    setEditor(null);
+    setDeleting(null);
+    return () => {
+      if (activeScope.current === scoped.token) activeScope.current = null;
+    };
+  }, [scoped]);
   const command = useSyncExternalStore(session.subscribe, session.snapshot, session.snapshot);
   useEffect(() => {
     if (viewer !== null) void session.resumePending();
@@ -291,37 +311,44 @@ export function PriceRulePanel({
   }
 
   function startSave(): void {
-    if (!editor || submitting || !canWrite || !stockReady || generationId !== editor.generationId)
+    if (
+      !activeEditor ||
+      submitting ||
+      !canWrite ||
+      !stockReady ||
+      generationId !== activeEditor.generationId
+    )
       return;
-    const stock = stocks.find((item) => item.ts_code === editor.tsCode);
+    const stock = stocks.find((item) => item.ts_code === activeEditor.tsCode);
     if (!stock) return;
     const draft: PriceRuleCommandDraft = {
       kind: "save_price_alert_rule",
       generation_id: generationId,
       ts_code: stock.ts_code,
       membership_version: stock.version,
-      expected_version: editor.expectedVersion,
+      expected_version: activeEditor.expectedVersion,
       rule: {
-        rule_id: editor.ruleId,
-        name: editor.name.trim(),
-        priority: editor.priority,
-        enabled: editor.enabled,
-        comparison: editor.comparison,
-        threshold: editor.threshold,
-        valid_from: `${editor.validFrom}:00`,
-        valid_until: `${editor.validUntil}:00`,
+        rule_id: activeEditor.ruleId,
+        name: activeEditor.name.trim(),
+        priority: activeEditor.priority,
+        enabled: activeEditor.enabled,
+        comparison: activeEditor.comparison,
+        threshold: activeEditor.threshold,
+        valid_from: `${activeEditor.validFrom}:00`,
+        valid_until: `${activeEditor.validUntil}:00`,
       },
     };
-    const priorCommandId = session.snapshot().entries[editor.ruleId]?.body.command_id;
-    setSubmitting(true);
+    const priorCommandId = session.snapshot().entries[activeEditor.ruleId]?.body.command_id;
+    setSubmittingScope(scoped.token);
     void session
       .start(draft)
       .then(() => {
-        const currentCommandId = session.snapshot().entries[editor.ruleId]?.body.command_id;
+        if (activeScope.current !== scoped.token) return;
+        const currentCommandId = session.snapshot().entries[activeEditor.ruleId]?.body.command_id;
         if (currentCommandId && currentCommandId !== priorCommandId)
-          setEditor((current) => (current?.ruleId === editor.ruleId ? null : current));
+          setEditor((current) => (current === activeEditor ? null : current));
       })
-      .finally(() => setSubmitting(false));
+      .finally(() => setSubmittingScope((current) => (current === scoped.token ? null : current)));
   }
 
   function startToggle(item: PriceRuleItem, enabled: boolean): void {
@@ -336,14 +363,26 @@ export function PriceRulePanel({
   }
 
   function confirmDelete(): void {
-    if (!deleting || !canWrite || generationId === null) return;
+    if (!activeDeleting || !canWrite || generationId === null) return;
     void session.start({
       kind: "delete_price_alert_rule",
       generation_id: generationId,
-      rule_id: deleting.rule_id,
-      expected_version: deleting.version,
+      rule_id: activeDeleting.rule_id,
+      expected_version: activeDeleting.version,
     });
     setDeleting(null);
+  }
+
+  function retryFailed(entry: PriceRuleCommandEntry): void {
+    if (
+      entry.status !== "failed" ||
+      !canWrite ||
+      entry.body.generation_id !== generationId ||
+      (entry.body.kind === "save_price_alert_rule" && !stockReady)
+    )
+      return;
+    const { command_id: _commandId, requested_at: _requestedAt, ...draft } = entry.body;
+    void session.start(draft);
   }
 
   return (
@@ -369,6 +408,7 @@ export function PriceRulePanel({
             onClick={() => {
               if (generationId && stocks[0])
                 setEditor({
+                  scope: scoped.token,
                   generationId,
                   ruleId: nextId(),
                   expectedVersion: null,
@@ -402,9 +442,9 @@ export function PriceRulePanel({
           </p>
         ) : null}
       </div>
-      {editor ? (
+      {activeEditor ? (
         <RuleForm
-          editor={editor}
+          editor={activeEditor}
           stocks={stocks}
           generationId={generationId}
           submitting={submitting}
@@ -453,13 +493,16 @@ export function PriceRulePanel({
             const entry = command.entries[item.rule_id];
             const op = operation(entry);
             const busy = command.busyRuleIds.includes(item.rule_id);
-            const blocked = !!entry && (!op?.terminal || entry.body.generation_id === generationId);
+            const blocked =
+              !!entry &&
+              entry.status !== "failed" &&
+              (!op?.terminal || entry.body.generation_id === generationId);
             const validScope = item.scope_status === "valid";
             const name = item.name ?? item.ts_code ?? "未命名规则";
             const complete =
               item.version >= 1 &&
               item.membership_version !== null &&
-              editorFor(item, generationId ?? "") !== null;
+              editorFor(item, generationId ?? "", scoped.token) !== null;
             const editable =
               complete &&
               validScope &&
@@ -504,7 +547,9 @@ export function PriceRulePanel({
                       label={op.label}
                       reason={
                         op.terminal
-                          ? "刷新后可按最新数据重试。"
+                          ? entry?.status === "failed"
+                            ? "可重新尝试，提交前会核对最新数据。"
+                            : "刷新后可按最新数据重试。"
                           : "规则操作正在核对，显示的仍是已发布配置。"
                       }
                     />
@@ -523,7 +568,21 @@ export function PriceRulePanel({
                   )}
                 </div>
                 <div className="price-rule-actions">
-                  {entry && !op?.terminal ? (
+                  {entry?.status === "failed" ? (
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      disabled={
+                        !canWrite ||
+                        busy ||
+                        entry.body.generation_id !== generationId ||
+                        (entry.body.kind === "save_price_alert_rule" && !stockReady)
+                      }
+                      onClick={() => retryFailed(entry)}
+                    >
+                      重新尝试
+                    </Button>
+                  ) : entry && !op?.terminal ? (
                     <Button
                       size="sm"
                       variant="ghost"
@@ -542,7 +601,7 @@ export function PriceRulePanel({
                     disabled={!canWrite || !editable || blocked || busy}
                     aria-label={`编辑${name}`}
                     onClick={() => {
-                      const next = editorFor(item, generationId ?? "");
+                      const next = editorFor(item, generationId ?? "", scoped.token);
                       if (next) setEditor(next);
                     }}
                   >
@@ -553,7 +612,7 @@ export function PriceRulePanel({
                     variant="ghost"
                     disabled={!canWrite || !complete || blocked || busy}
                     aria-label={`删除${name}`}
-                    onClick={() => setDeleting(item)}
+                    onClick={() => setDeleting({ scope: scoped.token, item })}
                   >
                     删除
                   </Button>
@@ -582,7 +641,21 @@ export function PriceRulePanel({
                     label={op?.label ?? "状态待核对"}
                   />
                 </div>
-                {!op?.terminal ? (
+                {entry.status === "failed" ? (
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    disabled={
+                      !canWrite ||
+                      command.busyRuleIds.includes(id) ||
+                      entry.body.generation_id !== generationId ||
+                      (entry.body.kind === "save_price_alert_rule" && !stockReady)
+                    }
+                    onClick={() => retryFailed(entry)}
+                  >
+                    重新尝试
+                  </Button>
+                ) : !op?.terminal ? (
                   <Button
                     size="sm"
                     variant="ghost"
@@ -605,10 +678,11 @@ export function PriceRulePanel({
         </ul>
       ) : null}
       <ConfirmDialog
-        open={deleting !== null}
+        key={scopeKey}
+        open={activeDeleting !== null}
         level="heavy"
         title="删除价格规则"
-        description={`删除「${deleting?.name ?? "这条规则"}」后，已发布的配置需等待页面数据更新。`}
+        description={`删除「${activeDeleting?.name ?? "这条规则"}」后，已发布的配置需等待页面数据更新。`}
         confirmLabel="删除规则"
         onConfirm={confirmDelete}
         onCancel={() => setDeleting(null)}

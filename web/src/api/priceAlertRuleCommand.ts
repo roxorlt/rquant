@@ -198,6 +198,7 @@ export interface PriceRuleCommandOptions {
   nextId: () => string;
   now: () => string;
   withLock: (name: string, task: () => Promise<void>) => Promise<void>;
+  isCurrent: () => boolean;
 }
 
 export function priceRuleProvedNoEffect(entry: PriceRuleCommandEntry): boolean {
@@ -357,15 +358,16 @@ export class PriceRuleCommandSession {
   async start(draft: PriceRuleCommandDraft): Promise<void> {
     const id = ruleId(draft);
     await this.locked(id, async () => {
-      if (!this.refresh()) return;
+      if (!this.options.isCurrent() || !this.refresh()) return;
       const previous = this.records[id];
       if (
         previous &&
-        ((!priceRuleProvedNoEffect(previous) && previous.status !== "failed") ||
-          previous.body.generation_id === draft.generation_id)
+        previous.status !== "failed" &&
+        (!priceRuleProvedNoEffect(previous) || previous.body.generation_id === draft.generation_id)
       )
         return;
       const verification = await this.options.verifyNew(draft).catch(() => "unavailable" as const);
+      if (!this.options.isCurrent()) return;
       if (verification !== "ready") {
         this.emit({
           message:
@@ -375,7 +377,9 @@ export class PriceRuleCommandSession {
         });
         return;
       }
-      if (!(await this.options.verifyOwner().catch(() => false))) {
+      const ownerVerified = await this.options.verifyOwner().catch(() => false);
+      if (!this.options.isCurrent()) return;
+      if (!ownerVerified) {
         this.emit({ message: "登录身份已变化，请切回原账户核对。" });
         return;
       }
@@ -411,7 +415,7 @@ export class PriceRuleCommandSession {
 
   async advance(id: string): Promise<void> {
     await this.locked(id, async () => {
-      if (!this.refresh()) return;
+      if (!this.options.isCurrent() || !this.refresh()) return;
       const entry = this.records[id];
       if (
         !entry ||
@@ -420,7 +424,9 @@ export class PriceRuleCommandSession {
         priceRuleProvedNoEffect(entry)
       )
         return;
-      if (!(await this.options.verifyOwner().catch(() => false))) {
+      const ownerVerified = await this.options.verifyOwner().catch(() => false);
+      if (!this.options.isCurrent()) return;
+      if (!ownerVerified) {
         this.emit({ message: "登录身份已变化，请切回原账户核对。" });
         return;
       }

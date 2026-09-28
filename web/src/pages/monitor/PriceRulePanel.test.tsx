@@ -1,10 +1,14 @@
-import { fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { HttpResponse, http } from "msw";
 import type { Schemas } from "@/api/client";
 import { PRICE_RULE_JOURNAL_KEY } from "@/api/priceAlertRuleCommand";
+import { META_QUERY_KEY } from "@/api/useMeta";
+import { AppProviders } from "@/app/App";
 import { metaEnvelope } from "@/test/fixtures";
+import { testQueryClient } from "@/test/queryClient";
 import { renderApp } from "@/test/render";
 import { server } from "@/test/server";
+import { PriceRulePanel } from "./PriceRulePanel";
 
 const GENERATION = metaEnvelope().serving.generation_id as string;
 type Rule = Schemas["PriceAlertRuleItemData"];
@@ -89,6 +93,145 @@ beforeEach(() => {
   });
 });
 
+function renderScopedPanel(viewer: string, generationId = GENERATION) {
+  const client = testQueryClient();
+  const ui = (owner: string, generation: string) => (
+    <AppProviders queryClient={client}>
+      <PriceRulePanel
+        viewer={owner}
+        generationId={generation}
+        fresh={true}
+        refreshMeta={() => undefined}
+      />
+    </AppProviders>
+  );
+  const view = render(ui(viewer, generationId));
+  return {
+    ...view,
+    changeScope(owner: string, generation: string) {
+      act(() => {
+        client.setQueryData(
+          META_QUERY_KEY,
+          metaEnvelope({ viewer: owner, generationId: generation }),
+        );
+        view.rerender(ui(owner, generation));
+      });
+    },
+  };
+}
+
+it("drops an Alice draft before Bob can save it, and drops it on a generation change", async () => {
+  prepare();
+  const post = vi.fn();
+  server.use(http.post("*/api/v1/monitor/rules/commands", post));
+  const view = renderScopedPanel("tester");
+  const panel = await screen.findByRole("region", { name: "价格提醒规则" });
+  await waitFor(() =>
+    expect(within(panel).getByRole("button", { name: "新建规则" })).toBeEnabled(),
+  );
+  fireEvent.click(within(panel).getByRole("button", { name: "新建规则" }));
+  fireEvent.change(within(panel).getByLabelText("名称"), { target: { value: "Alice 的草稿" } });
+  fireEvent.change(within(panel).getByLabelText("价格"), { target: { value: "12.50" } });
+  view.changeScope("bob", GENERATION);
+  expect(within(panel).queryByLabelText("名称")).toBeNull();
+  view.changeScope("tester", GENERATION);
+  expect(within(panel).queryByLabelText("名称")).toBeNull();
+  fireEvent.click(within(panel).getByRole("button", { name: "新建规则" }));
+  view.changeScope("tester", "b".repeat(64));
+  expect(within(panel).queryByLabelText("名称")).toBeNull();
+  expect(post).not.toHaveBeenCalled();
+});
+
+it("closes a pending delete confirmation across viewer and generation boundaries", async () => {
+  prepare([row]);
+  const post = vi.fn();
+  server.use(http.post("*/api/v1/monitor/rules/commands", post));
+  const view = renderScopedPanel("tester");
+  const panel = await screen.findByRole("region", { name: "价格提醒规则" });
+  const rule = await within(panel).findByRole("listitem", { name: "上破提醒" });
+  fireEvent.click(within(rule).getByRole("button", { name: "删除上破提醒" }));
+  expect(screen.getByRole("button", { name: "删除规则" })).toBeInTheDocument();
+  view.changeScope("bob", GENERATION);
+  await waitFor(() => expect(screen.queryByRole("button", { name: "删除规则" })).toBeNull());
+  view.changeScope("tester", GENERATION);
+  fireEvent.click(within(rule).getByRole("button", { name: "删除上破提醒" }));
+  view.changeScope("tester", "b".repeat(64));
+  await waitFor(() => expect(screen.queryByRole("button", { name: "删除规则" })).toBeNull());
+  expect(post).not.toHaveBeenCalled();
+});
+
+it.each([
+  ["viewer", "bob", GENERATION],
+  ["generation", "tester", "b".repeat(64)],
+])(
+  "does not post an in-flight save after its %s changes",
+  async (_boundary, nextViewer, nextGeneration) => {
+    prepare();
+    let entered: () => void = () => undefined;
+    const requested = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let completed: () => void = () => undefined;
+    const requestFinished = new Promise<void>((resolve) => {
+      completed = resolve;
+    });
+    Object.defineProperty(navigator, "locks", {
+      configurable: true,
+      value: {
+        request: async (_name: string, _options: unknown, task: () => Promise<void>) => {
+          await task();
+          completed();
+        },
+      },
+    });
+    server.use(
+      http.get("*/api/v1/watchlist/600001.SH", async () => {
+        entered();
+        await gate;
+        return HttpResponse.json({
+          serving: metaEnvelope().serving,
+          data: {
+            availability: "ready",
+            available_at: "2026-09-24T07:31:00Z",
+            ts_code: "600001.SH",
+            status: "active",
+            version: 2,
+            source: "detail",
+            price_levels: [],
+            expires_at: "2026-09-24T08:00:00Z",
+            updated_at: "2026-09-24T07:30:00Z",
+            message: "",
+          },
+        });
+      }),
+    );
+    const post = vi.fn();
+    server.use(http.post("*/api/v1/monitor/rules/commands", post));
+    const view = renderScopedPanel("tester");
+    const panel = await screen.findByRole("region", { name: "价格提醒规则" });
+    await waitFor(() =>
+      expect(within(panel).getByRole("button", { name: "新建规则" })).toBeEnabled(),
+    );
+    fireEvent.click(within(panel).getByRole("button", { name: "新建规则" }));
+    fireEvent.change(within(panel).getByLabelText("名称"), { target: { value: "旧身份草稿" } });
+    fireEvent.change(within(panel).getByLabelText("价格"), { target: { value: "12.50" } });
+    fireEvent.click(within(panel).getByRole("button", { name: "保存规则" }));
+    await requested;
+    view.changeScope(nextViewer, nextGeneration);
+    release();
+    await requestFinished;
+    expect(within(panel).queryByLabelText("名称")).toBeNull();
+    expect(post).not.toHaveBeenCalled();
+    expect(
+      Object.keys(window.localStorage).filter((key) => key.startsWith(PRICE_RULE_JOURNAL_KEY)),
+    ).toEqual([]);
+  },
+);
+
 it("creates a single-stock price rule, persists the request, and never claims alerts are running", async () => {
   prepare();
   const requests: Array<Record<string, unknown>> = [];
@@ -127,6 +270,42 @@ it("creates a single-stock price rule, persists the request, and never claims al
     expected_version: null,
   });
   expect(await within(panel).findByText("已保存，正在同步")).toBeInTheDocument();
+  expect(within(panel).queryByText("正在提醒")).toBeNull();
+});
+
+it("offers a new command after a durable failed create without claiming the rule is live", async () => {
+  prepare();
+  const sent: Array<Record<string, unknown>> = [];
+  server.use(
+    http.post("*/api/v1/monitor/rules/commands", async ({ request }) => {
+      const body = (await request.json()) as Record<string, unknown>;
+      sent.push(body);
+      return HttpResponse.json({
+        command_id: body.command_id,
+        kind: body.kind,
+        rule_id: (body.rule as { rule_id: string }).rule_id,
+        status: sent.length === 1 ? "failed" : "saved_syncing",
+        version: sent.length === 1 ? null : 1,
+        reason: null,
+        message: sent.length === 1 ? "未保存" : "已保存，正在同步。",
+      });
+    }),
+  );
+  renderApp("/monitor");
+  const panel = await screen.findByRole("region", { name: "价格提醒规则" });
+  await waitFor(() =>
+    expect(within(panel).getByRole("button", { name: "新建规则" })).toBeEnabled(),
+  );
+  fireEvent.click(within(panel).getByRole("button", { name: "新建规则" }));
+  fireEvent.change(within(panel).getByLabelText("名称"), { target: { value: "失败后重试" } });
+  fireEvent.change(within(panel).getByLabelText("价格"), { target: { value: "12.50" } });
+  fireEvent.click(within(panel).getByRole("button", { name: "保存规则" }));
+  const recovery = await within(panel).findByRole("listitem", { name: "失败后重试" });
+  expect(within(recovery).getByText("未保存，可重试")).toBeInTheDocument();
+  fireEvent.click(within(recovery).getByRole("button", { name: "重新尝试" }));
+  await waitFor(() => expect(sent).toHaveLength(2));
+  expect(sent[1]).toMatchObject({ generation_id: GENERATION, expected_version: null });
+  expect(sent[1]?.command_id).not.toBe(sent[0]?.command_id);
   expect(within(panel).queryByText("正在提醒")).toBeNull();
 });
 
