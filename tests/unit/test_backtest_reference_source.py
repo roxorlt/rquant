@@ -19,6 +19,7 @@ from rquant.reference_data_registry import (
     ReadonlyReferenceRegistry,
     ReferenceAsOfSnapshot,
     ReferenceDataset,
+    ReferenceGenerationManifest,
     ReferenceRecord,
     ReferenceRegistry,
 )
@@ -66,7 +67,12 @@ def _frozen(
     future_available: ReferenceDataset | None = None,
     future_effective: ReferenceDataset | None = None,
     available_at: datetime | None = None,
-) -> tuple[ReferenceAsOfSnapshot, dict[tuple[str, ReferenceDataset], ReferenceRecord]]:
+    published_at: datetime | None = None,
+) -> tuple[
+    ReferenceAsOfSnapshot,
+    ReferenceGenerationManifest,
+    dict[tuple[str, ReferenceDataset], ReferenceRecord],
+]:
     root.mkdir(parents=True, exist_ok=True)
     registry = ReferenceRegistry(root / "reference.sqlite3")
     written: dict[tuple[str, ReferenceDataset], ReferenceRecord] = {}
@@ -93,7 +99,8 @@ def _frozen(
             registry.append(record)
             written[(code, dataset)] = record
     generation = registry.publish(
-        published_at=(
+        published_at=published_at
+        or (
             DECISION + timedelta(minutes=2)
             if future_available is not None
             else DECISION
@@ -107,17 +114,19 @@ def _frozen(
         keys=codes,
         generation_id=generation.generation_id,
     )
-    return snapshot, written
+    return snapshot, generation, written
 
 
 def _select(
     snapshot: ReferenceAsOfSnapshot,
+    generation: ReferenceGenerationManifest,
     *,
     ts_codes: tuple[str, ...] = (CODE,),
     decision_time: datetime = DECISION,
 ) -> BacktestReferenceSnapshot:
     return select_backtest_reference_facts(
         snapshot,
+        generation_manifest=generation,
         trade_date=DAY,
         decision_time=decision_time,
         ts_codes=ts_codes,
@@ -125,12 +134,22 @@ def _select(
 
 
 def test_frozen_registry_selects_complete_typed_reference_and_stable_digest(tmp_path: Path) -> None:
-    snapshot, written = _frozen(tmp_path, codes=(CODE, OTHER_CODE))
-    result = _select(snapshot, ts_codes=(OTHER_CODE, CODE))
-    again = _select(snapshot, ts_codes=(CODE, OTHER_CODE), decision_time=DECISION.astimezone(UTC))
+    snapshot, generation, written = _frozen(tmp_path, codes=(CODE, OTHER_CODE))
+    result = _select(snapshot, generation, ts_codes=(OTHER_CODE, CODE))
+    again = _select(
+        snapshot, generation, ts_codes=(CODE, OTHER_CODE), decision_time=DECISION.astimezone(UTC)
+    )
 
     assert result.source_identity == again.source_identity
     assert result.generation_id == snapshot.generation_id
+    assert result.generation_published_at == generation.published_at
+    assert result.generation_manifest_sha256 == generation.manifest_sha256
+    assert (
+        result.source_identity
+        != BacktestReferenceSnapshot.model_validate(
+            {**result.model_dump(), "generation_manifest_sha256": "0" * 64}
+        ).source_identity
+    )
     assert result.decision_time == DECISION.astimezone(UTC)
     assert tuple(item.ts_code for item in result.facts) == (OTHER_CODE, CODE)
     fact = result.facts[1]
@@ -164,31 +183,83 @@ def test_frozen_registry_selects_complete_typed_reference_and_stable_digest(tmp_
 
 
 def test_record_first_available_at_exactly_0925_is_preserved(tmp_path: Path) -> None:
-    snapshot, _ = _frozen(tmp_path, available_at=DECISION)
-    fact = _select(snapshot).facts[0]
+    snapshot, generation, _ = _frozen(tmp_path, available_at=DECISION)
+    fact = _select(snapshot, generation).facts[0]
     assert fact.listing.first_available_at == DECISION.astimezone(UTC)
     assert fact.last_reference_available_at == DECISION.astimezone(UTC)
 
 
 def test_source_identity_changes_with_a_selected_record(tmp_path: Path) -> None:
-    ordinary, _ = _frozen(tmp_path / "ordinary")
-    st, _ = _frozen(tmp_path / "st", replacements={ReferenceDataset.ST_STATUS: {"is_st": True}})
-    assert _select(ordinary).source_identity != _select(st).source_identity
+    ordinary, ordinary_generation, _ = _frozen(tmp_path / "ordinary")
+    st, st_generation, _ = _frozen(
+        tmp_path / "st", replacements={ReferenceDataset.ST_STATUS: {"is_st": True}}
+    )
+    assert (
+        _select(ordinary, ordinary_generation).source_identity
+        != _select(st, st_generation).source_identity
+    )
+
+
+def test_generation_published_after_decision_is_rejected_even_when_records_are_early(
+    tmp_path: Path,
+) -> None:
+    snapshot, generation, _ = _frozen(tmp_path, published_at=DECISION + timedelta(minutes=1))
+    assert all(
+        snapshot.as_of(
+            dataset_id=dataset,
+            key=CODE,
+            event_time=DECISION,
+            decision_time=DECISION,
+        ).record.first_available_at
+        <= DECISION
+        for dataset in DOMAINS
+    )
+    with pytest.raises(BacktestReferenceSourceError, match="generation.*published"):
+        _select(snapshot, generation)
+
+
+def test_manifest_must_match_frozen_snapshot_generation(tmp_path: Path) -> None:
+    snapshot, _, _ = _frozen(tmp_path / "selected")
+    _, unrelated_generation, _ = _frozen(
+        tmp_path / "unrelated", replacements={ReferenceDataset.ST_STATUS: {"is_st": True}}
+    )
+    with pytest.raises(BacktestReferenceSourceError, match="generation.*match"):
+        _select(snapshot, unrelated_generation)
+
+
+def test_unvalidated_manifest_copy_cannot_move_late_publication_before_cutoff(
+    tmp_path: Path,
+) -> None:
+    snapshot, late_generation, _ = _frozen(tmp_path, published_at=DECISION + timedelta(minutes=1))
+    forged = late_generation.model_copy(update={"published_at": EARLY})
+    with pytest.raises(BacktestReferenceSourceError, match="validated.*manifest"):
+        _select(snapshot, forged)
+
+
+def test_typed_result_rejects_publication_after_its_decision(tmp_path: Path) -> None:
+    snapshot, generation, _ = _frozen(tmp_path)
+    selected = _select(snapshot, generation)
+    with pytest.raises(ValidationError, match="published after the decision"):
+        BacktestReferenceSnapshot.model_validate(
+            {**selected.model_dump(), "generation_published_at": DECISION + timedelta(minutes=1)}
+        )
 
 
 @pytest.mark.parametrize("dataset", DOMAINS)
 def test_missing_or_not_yet_visible_reference_fails_closed(
     tmp_path: Path, dataset: ReferenceDataset
 ) -> None:
-    missing, _ = _frozen(tmp_path / "missing", missing=dataset)
+    missing, missing_generation, _ = _frozen(tmp_path / "missing", missing=dataset)
     with pytest.raises(BacktestReferenceSourceError, match="reference evidence"):
-        _select(missing)
-    future, _ = _frozen(tmp_path / "future", future_available=dataset)
+        _select(missing, missing_generation)
+    future, future_generation, _ = _frozen(tmp_path / "future", future_available=dataset)
+    with pytest.raises(BacktestReferenceSourceError, match="generation.*published"):
+        _select(future, future_generation)
+    ineffective, ineffective_generation, _ = _frozen(
+        tmp_path / "ineffective", future_effective=dataset
+    )
     with pytest.raises(BacktestReferenceSourceError, match="reference evidence"):
-        _select(future)
-    ineffective, _ = _frozen(tmp_path / "ineffective", future_effective=dataset)
-    with pytest.raises(BacktestReferenceSourceError, match="reference evidence"):
-        _select(ineffective)
+        _select(ineffective, ineffective_generation)
 
 
 @pytest.mark.parametrize(
@@ -226,20 +297,20 @@ def test_missing_or_not_yet_visible_reference_fails_closed(
 def test_malformed_or_non_a_share_reference_fails_closed(
     tmp_path: Path, dataset: ReferenceDataset, payload: dict[str, object]
 ) -> None:
-    snapshot, _ = _frozen(tmp_path, replacements={dataset: payload})
+    snapshot, generation, _ = _frozen(tmp_path, replacements={dataset: payload})
     with pytest.raises(BacktestReferenceSourceError):
-        _select(snapshot)
+        _select(snapshot, generation)
 
 
 def test_batch_rejects_duplicate_unbounded_or_missing_prepared_codes(tmp_path: Path) -> None:
-    snapshot, _ = _frozen(tmp_path)
+    snapshot, generation, _ = _frozen(tmp_path)
     with pytest.raises(BacktestReferenceSourceError, match="duplicate"):
-        _select(snapshot, ts_codes=(CODE, CODE))
+        _select(snapshot, generation, ts_codes=(CODE, CODE))
     too_many = tuple(f"{index:06d}.SH" for index in range(MAX_REFERENCE_CODES + 1))
     with pytest.raises(BacktestReferenceSourceError, match="maximum"):
-        _select(snapshot, ts_codes=too_many)
+        _select(snapshot, generation, ts_codes=too_many)
     with pytest.raises(BacktestReferenceSourceError, match="snapshot"):
-        _select(snapshot, ts_codes=(OTHER_CODE,))
+        _select(snapshot, generation, ts_codes=(OTHER_CODE,))
 
 
 @pytest.mark.parametrize(
@@ -252,6 +323,6 @@ def test_batch_rejects_duplicate_unbounded_or_missing_prepared_codes(tmp_path: P
     ),
 )
 def test_decision_time_must_be_exact_local_0925(tmp_path: Path, decision_time: datetime) -> None:
-    snapshot, _ = _frozen(tmp_path)
+    snapshot, generation, _ = _frozen(tmp_path)
     with pytest.raises(BacktestReferenceSourceError, match="09:25"):
-        _select(snapshot, decision_time=decision_time)
+        _select(snapshot, generation, decision_time=decision_time)
