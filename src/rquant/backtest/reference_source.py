@@ -1,9 +1,9 @@
 """Select a frozen 09:25 reference fact slice for historical portfolio research.
 
-The caller owns the validated `ReferenceAsOfSnapshot` and its generation. Registry
-`as_of` proves each selected record's first visibility and effective interval; this
-slice does not prove when the generation itself was published or switched current.
-It contains no opening quote or locked-limit execution conclusion.
+The caller supplies the validated `ReferenceAsOfSnapshot` and its manifest from the
+same frozen registry. Registry `as_of` proves record visibility and effective
+interval; the manifest proves generation publication by the decision cutoff. Neither
+proves the historical current pointer or opening tradability.
 """
 
 from __future__ import annotations
@@ -14,13 +14,14 @@ from decimal import Decimal, InvalidOperation
 from typing import Annotated, Literal, Self
 from zoneinfo import ZoneInfo
 
-from pydantic import Field, StrictBool, model_validator
+from pydantic import Field, StrictBool, ValidationError, model_validator
 
 from rquant.reference_data_registry import (
     ReferenceAsOfSnapshot,
     ReferenceDataIntegrityError,
     ReferenceDataset,
     ReferenceDataUnavailableError,
+    ReferenceGenerationManifest,
     ReferenceLookup,
 )
 from rquant.research_run_spec import InstrumentClassificationProvenance, InstrumentContext
@@ -109,12 +110,14 @@ class BacktestReferenceFact(RuntimeContractModel):
 
 
 class BacktestReferenceSnapshot(RuntimeContractModel):
-    """A deterministic, immutable batch from one caller-frozen reference generation."""
+    """A batch tied to one generation and its attested publication time."""
 
     source_mode: Literal["reference_as_of_snapshot"] = "reference_as_of_snapshot"
     trade_date: date
     decision_time: AwareUtcDatetime
     generation_id: Sha256
+    generation_published_at: AwareUtcDatetime
+    generation_manifest_sha256: Sha256
     facts: tuple[BacktestReferenceFact, ...] = Field(min_length=1, max_length=MAX_REFERENCE_CODES)
 
     @model_validator(mode="after")
@@ -122,6 +125,8 @@ class BacktestReferenceSnapshot(RuntimeContractModel):
         local = self.decision_time.astimezone(_SHANGHAI)
         if local.date() != self.trade_date or local.time() != time(9, 25):
             raise ValueError("reference decision must be exactly 09:25 Asia/Shanghai")
+        if self.generation_published_at > self.decision_time:
+            raise ValueError("reference generation was published after the decision")
         codes = tuple(fact.ts_code for fact in self.facts)
         if codes != tuple(sorted(set(codes))):
             raise ValueError("reference facts must be ordered and unique")
@@ -135,11 +140,13 @@ class BacktestReferenceSnapshot(RuntimeContractModel):
     def source_identity(self) -> str:
         return canonical_sha256(
             {
-                "contract": "backtest-reference-snapshot/v1",
+                "contract": "backtest-reference-snapshot/v2",
                 "source_mode": self.source_mode,
                 "trade_date": self.trade_date,
                 "decision_time": self.decision_time,
                 "generation_id": self.generation_id,
+                "generation_published_at": self.generation_published_at,
+                "generation_manifest_sha256": self.generation_manifest_sha256,
                 "fact_identities": tuple(fact.source_identity for fact in self.facts),
             }
         )
@@ -208,14 +215,16 @@ def _context(listing: ReferenceLookup) -> InstrumentContext:
 def select_backtest_reference_facts(
     snapshot: ReferenceAsOfSnapshot,
     *,
+    generation_manifest: ReferenceGenerationManifest,
     trade_date: date,
     decision_time: datetime,
     ts_codes: tuple[str, ...],
 ) -> BacktestReferenceSnapshot:
     """Select four reference domains at exactly 09:25 from an existing frozen snapshot.
 
-    The caller must separately prove the generation was published by the decision time.
-    No reference value is substituted from daily OHLCV or an unfrozen live pointer.
+    The caller must read the manifest from the same frozen reference registry. Matching
+    generation and publication time do not prove which generation was current at a
+    historical decision, nor whether an opening order could have filled.
     """
 
     if not isinstance(snapshot, ReferenceAsOfSnapshot):
@@ -229,6 +238,18 @@ def select_backtest_reference_facts(
     local = decision_time.astimezone(_SHANGHAI)
     if local.date() != trade_date or local.time() != time(9, 25):
         raise BacktestReferenceSourceError("decision must be exactly 09:25 Asia/Shanghai")
+    if not isinstance(generation_manifest, ReferenceGenerationManifest):
+        raise BacktestReferenceSourceError("a validated reference generation manifest is required")
+    try:
+        generation_manifest = ReferenceGenerationManifest.model_validate(generation_manifest)
+    except ValidationError as exc:
+        raise BacktestReferenceSourceError(
+            "a validated reference generation manifest is required"
+        ) from exc
+    if generation_manifest.generation_id != snapshot.generation_id:
+        raise BacktestReferenceSourceError("reference generation and snapshot do not match")
+    if generation_manifest.published_at > decision_time:
+        raise BacktestReferenceSourceError("reference generation was published after the decision")
     if not isinstance(ts_codes, tuple) or not ts_codes:
         raise BacktestReferenceSourceError("a nonempty tuple of reference codes is required")
     if len(ts_codes) > MAX_REFERENCE_CODES:
@@ -284,5 +305,7 @@ def select_backtest_reference_facts(
         trade_date=trade_date,
         decision_time=decision_time,
         generation_id=snapshot.generation_id,
+        generation_published_at=generation_manifest.published_at,
+        generation_manifest_sha256=generation_manifest.manifest_sha256,
         facts=tuple(facts),
     )
