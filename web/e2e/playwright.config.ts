@@ -12,7 +12,7 @@ import {
 
 const serve = (root: string) =>
   `${UV_RUN} python scripts/serve_web_fixture.py --root "${root}" --now ${API_NOW}` +
-  ` --bind 127.0.0.1:${API_PORT}`;
+  ` --bind 127.0.0.1:${API_PORT} --private-fixture`;
 const buildFixture =
   `${UV_RUN} python scripts/build_web_fixture.py --out "${SERVING_ROOT}" --scenario panorama` +
   " --replace";

@@ -49,22 +49,35 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--now", type=_instant, help="start the clock here (ISO 8601 with zone)")
     parser.add_argument("--bind", default="127.0.0.1:18768", help="loopback host:port")
     parser.add_argument("--stale-after", type=float, default=None, help="freshness budget (s)")
+    parser.add_argument(
+        "--private-fixture",
+        action="store_true",
+        help="simulate private ingress for local browser tests only",
+    )
     args = parser.parse_args(argv)
 
     import uvicorn
 
     from rquant.web.app import create_app
-    from rquant.web.settings import WebSettings
+    from rquant.web.settings import DEFAULT_BIND, WebSettings
 
     values: dict[str, object] = {"serving_root": args.root, "bind": args.bind}
+    if args.private_fixture:
+        if args.now is None or not args.bind.startswith("127.0.0.1:"):
+            parser.error("--private-fixture requires a pinned clock and IPv4 loopback bind")
+        # The test server is HTTP on loopback; this marker enables the private API's
+        # ingress guard while the browser proxy supplies the synthetic test identity.
+        values["bind"] = DEFAULT_BIND
+        values["ingress_socket_path"] = args.root.resolve().parent / "web-private-fixture.sock"
     if args.stale_after is not None:
         values["stale_after_seconds"] = args.stale_after
     settings = WebSettings.model_validate(values)
     clock = running_clock(args.now) if args.now is not None else (lambda: datetime.now(UTC))
+    bind_host, bind_port = args.bind.rsplit(":", 1)
     uvicorn.run(
         create_app(settings, clock=clock),
-        host=settings.bind_host,
-        port=settings.bind_port,
+        host=bind_host,
+        port=int(bind_port),
         workers=1,
         proxy_headers=False,
         server_header=False,
