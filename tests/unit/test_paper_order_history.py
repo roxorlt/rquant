@@ -184,6 +184,70 @@ def test_order_creation_time_must_match_initial_receipt(tmp_path: Path) -> None:
         store.recent_order_history(as_of=BUY_TIME + timedelta(minutes=1))
 
 
+def test_rejected_order_reason_must_match_immutable_receipt(tmp_path: Path) -> None:
+    path = tmp_path / "paper.sqlite3"
+    store = _store(path, paper_cost_policy())
+    rejected = store.submit_intent(
+        _intent(),
+        decision_time=BUY_TIME,
+        trade_date=BUY_DATE,
+        quote=_quote("10.00", suspended=True),
+    )
+    assert rejected.reject_reason is PaperRejectReason.SUSPENDED
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "UPDATE paper_order SET reject_reason = ? WHERE order_id = ?",
+            (PaperRejectReason.RISK_REJECTED.value, rejected.order_id),
+        )
+
+    with pytest.raises(PaperBrokerReconciliationError, match="final execution receipt mismatch"):
+        store.recent_order_history(as_of=BUY_TIME + timedelta(minutes=1))
+
+
+@pytest.mark.parametrize(
+    ("status", "minutes"),
+    [(PaperOrderStatus.CANCELLED, 1), (PaperOrderStatus.EXPIRED, 6)],
+)
+def test_closed_order_without_immutable_close_evidence_is_not_published(
+    tmp_path: Path, status: PaperOrderStatus, minutes: int
+) -> None:
+    store = _store(tmp_path / "paper.sqlite3", paper_cost_policy())
+    accepted = store.submit_intent(
+        _intent(order_type=PaperOrderType.LIMIT, limit_price=Decimal("9.90")),
+        decision_time=BUY_TIME,
+        trade_date=BUY_DATE,
+        quote=_quote("10.00"),
+    )
+    store.close_open_order(
+        accepted.order_id,
+        status=status,
+        decided_at=BUY_TIME + timedelta(minutes=minutes),
+    )
+
+    with pytest.raises(PaperBrokerReconciliationError, match="unverifiable close status"):
+        store.recent_order_history(as_of=BUY_TIME + timedelta(minutes=minutes + 1))
+
+
+def test_forged_close_raises_same_fail_closed_error(tmp_path: Path) -> None:
+    path = tmp_path / "paper.sqlite3"
+    store = _store(path, paper_cost_policy())
+    accepted = store.submit_intent(
+        _intent(order_type=PaperOrderType.LIMIT, limit_price=Decimal("9.90")),
+        decision_time=BUY_TIME,
+        trade_date=BUY_DATE,
+        quote=_quote("10.00"),
+    )
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "UPDATE paper_order SET status = ? WHERE order_id = ?",
+            (PaperOrderStatus.CANCELLED.value, accepted.order_id),
+        )
+
+    with pytest.raises(PaperBrokerReconciliationError, match="unverifiable close status") as error:
+        store.recent_order_history(as_of=BUY_TIME + timedelta(minutes=1))
+    assert type(error.value) is PaperBrokerReconciliationError
+
+
 def test_writer_commit_during_history_read_does_not_split_count_and_rows(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
