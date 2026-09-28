@@ -34,6 +34,7 @@ from rquant.pool_result_receipt import (
     ScreenRunReceipt,
     ScreenRunReceiptDraft,
     member_price_digest,
+    member_rank_digest,
     member_set_digest,
 )
 from rquant.price_adjustment import resolve_price_factor_basis
@@ -2541,7 +2542,14 @@ class DuckDBStore:
             or not (df["preset_name"] == preset_name).all()
         ):
             raise ValueError("screen result replacement contains another preset or date")
-        self._conn.register("screen_result_replace_tmp", df)
+        rank_columns = {"rank_position", "ranking_score"}
+        if rank_columns & set(df.columns) and not rank_columns <= set(df.columns):
+            raise ValueError("screen result has incomplete ranking columns")
+        replacement = df.copy()
+        if not rank_columns <= set(replacement.columns):
+            replacement["rank_position"] = pd.Series([None] * len(df), dtype="Int64")
+            replacement["ranking_score"] = pd.Series([None] * len(df), dtype="Float64")
+        self._conn.register("screen_result_replace_tmp", replacement)
         try:
             self._conn.execute(
                 """
@@ -2554,11 +2562,15 @@ class DuckDBStore:
                     name = source.name,
                     close = source.close,
                     pct_chg = source.pct_chg,
-                    extra = source.extra
+                    extra = source.extra,
+                    rank_position = source.rank_position,
+                    ranking_score = source.ranking_score
                 WHEN NOT MATCHED THEN INSERT
-                    (trade_date, preset_name, ts_code, name, close, pct_chg, extra)
+                    (trade_date, preset_name, ts_code, name, close, pct_chg, extra,
+                     rank_position, ranking_score)
                     VALUES (source.trade_date, source.preset_name, source.ts_code,
-                            source.name, source.close, source.pct_chg, source.extra)
+                            source.name, source.close, source.pct_chg, source.extra,
+                            source.rank_position, source.ranking_score)
                 WHEN NOT MATCHED BY SOURCE
                  AND target.trade_date = ? AND target.preset_name = ?
                 THEN DELETE
@@ -2584,9 +2596,9 @@ class DuckDBStore:
             receipt = ScreenRunReceiptDraft.model_validate(receipt)
         else:
             receipt = ScreenRunReceipt.model_validate(receipt)
-            if receipt.contract == "screen-run-receipt/v2":
+            if receipt.contract in {"screen-run-receipt/v2", "screen-run-receipt/v3"}:
                 raise ValueError(
-                    "v2 price receipt requires an unsealed draft and persisted readback"
+                    "v2/v3 proof receipt requires an unsealed draft and persisted readback"
                 )
         codes = [] if df.empty else df["ts_code"].tolist()
         if (
@@ -2596,6 +2608,21 @@ class DuckDBStore:
             or receipt.member_digest != member_set_digest(codes)
         ):
             raise ValueError("screen run receipt does not describe replacement members")
+        if (
+            isinstance(receipt, ScreenRunReceiptDraft)
+            and receipt.contract == "screen-run-receipt/v3"
+        ):
+            if not df.empty and not {"rank_position", "ranking_score"} <= set(df.columns):
+                raise ValueError("ranked screen result requires positions and scores")
+            ranks = [] if df.empty else list(
+                zip(df["ts_code"].tolist(), df["rank_position"].tolist(),
+                    df["ranking_score"].tolist(), strict=True)
+            )
+            if receipt.rank_digest != member_rank_digest(ranks):
+                raise ValueError("ranked screen result differs from receipt draft")
+        elif {"rank_position", "ranking_score"} <= set(df.columns) and not df.empty:
+            if df[["rank_position", "ranking_score"]].notna().any().any():
+                raise ValueError("unranked screen result cannot contain ranking facts")
         started = False
         try:
             if manage_transaction:
@@ -2605,24 +2632,35 @@ class DuckDBStore:
             if isinstance(receipt, ScreenRunReceiptDraft):
                 persisted = self._conn.execute(
                     """
-                    SELECT ts_code, close FROM screen_result
+                    SELECT ts_code, close, rank_position, ranking_score FROM screen_result
                     WHERE trade_date = ? AND preset_name = ?
                     ORDER BY ts_code
                     """,
                     [trade_date, preset_name],
                 ).fetchall()
-                persisted_codes = [code for code, _ in persisted]
+                persisted_codes = [code for code, _, _, _ in persisted]
                 if (
                     receipt.hit_count != len(persisted_codes)
                     or receipt.member_digest != member_set_digest(persisted_codes)
                 ):
                     raise ValueError("persisted screen members differ from receipt draft")
-                sealed = ScreenRunReceipt.model_validate(
-                    {
-                        **receipt.model_dump(mode="python"),
-                        "price_digest": member_price_digest(persisted),
-                    }
-                )
+                rank_digest = None
+                if receipt.contract == "screen-run-receipt/v3":
+                    rank_digest = member_rank_digest(
+                        [(code, position, score) for code, _, position, score in persisted]
+                    )
+                    if rank_digest != receipt.rank_digest:
+                        raise ValueError("persisted screen ranks differ from receipt draft")
+                elif any(position is not None or score is not None
+                         for _, _, position, score in persisted):
+                    raise ValueError("unranked screen result contains ranking facts")
+                sealed = ScreenRunReceipt.model_validate({
+                    **receipt.model_dump(mode="python"),
+                    "price_digest": member_price_digest(
+                        [(code, close) for code, close, _, _ in persisted]
+                    ),
+                    "rank_digest": rank_digest,
+                })
             else:
                 sealed = receipt
             self._upsert_screen_run_receipt(sealed)
@@ -2641,8 +2679,8 @@ class DuckDBStore:
             INSERT INTO screen_run_receipt (
                 trade_date, preset_name, definition_version, parent_trade_date,
                 parent_result_version, hit_count, member_digest, lineage_complete,
-                completed_at, result_version, contract, price_digest
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                completed_at, result_version, contract, price_digest, rank_digest
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (trade_date, preset_name) DO UPDATE SET
                 definition_version = excluded.definition_version,
                 parent_trade_date = excluded.parent_trade_date,
@@ -2653,7 +2691,8 @@ class DuckDBStore:
                 completed_at = excluded.completed_at,
                 result_version = excluded.result_version,
                 contract = excluded.contract,
-                price_digest = excluded.price_digest
+                price_digest = excluded.price_digest,
+                rank_digest = excluded.rank_digest
             """,
             [
                 receipt.trade_date,
@@ -2668,6 +2707,7 @@ class DuckDBStore:
                 receipt.result_version,
                 receipt.contract,
                 receipt.price_digest,
+                receipt.rank_digest,
             ],
         )
 
@@ -2682,6 +2722,8 @@ class DuckDBStore:
         if columns & price_columns and not price_columns <= columns:
             raise ValueError("screen run receipt has incomplete price proof columns")
         extra_select = ", contract, price_digest" if price_columns <= columns else ""
+        if "rank_digest" in columns:
+            extra_select += ", rank_digest"
         row = self._conn.execute(
             f"""
             SELECT trade_date, preset_name, definition_version, parent_trade_date,
@@ -2701,6 +2743,8 @@ class DuckDBStore:
         )
         if price_columns <= columns:
             fields += ("contract", "price_digest")
+        if "rank_digest" in columns:
+            fields += ("rank_digest",)
         return ScreenRunReceipt.model_validate(dict(zip(fields, row, strict=True)))
 
     def query_screen_result(

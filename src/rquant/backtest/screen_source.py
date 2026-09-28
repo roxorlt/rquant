@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 from datetime import date, datetime, time
 from pathlib import Path
 from typing import Literal
@@ -11,7 +12,12 @@ from zoneinfo import ZoneInfo
 import duckdb
 from pydantic import Field, ValidationError
 
-from rquant.pool_result_receipt import ScreenRunReceipt, member_price_digest, member_set_digest
+from rquant.pool_result_receipt import (
+    ScreenRunReceipt,
+    member_price_digest,
+    member_rank_digest,
+    member_set_digest,
+)
 from rquant.runtime_contracts import RuntimeContractModel
 
 MAX_SCREEN_CANDIDATES = 10_000
@@ -59,8 +65,35 @@ class VerifiedScreenCandidateSnapshot(RuntimeContractModel):
         return self.receipt.completed_at
 
 
+class VerifiedRankedScreenCandidate(VerifiedScreenCandidate):
+    rank_position: int = Field(ge=1, strict=True)
+    ranking_score: float = Field(ge=0, le=100, allow_inf_nan=False)
+
+
+class VerifiedRankedScreenCandidateSnapshot(RuntimeContractModel):
+    source_mode: Literal["captured_receipt"] = "captured_receipt"
+    source_trade_date: date
+    decision_trade_date: date
+    preset_name: str = Field(min_length=1)
+    receipt: ScreenRunReceipt
+    candidates: tuple[VerifiedRankedScreenCandidate, ...]
+
+    @property
+    def result_version(self) -> str:
+        assert self.receipt.result_version is not None
+        return self.receipt.result_version
+
+    @property
+    def completed_at(self) -> datetime:
+        return self.receipt.completed_at
+
+
 def _read_receipt(
-    connection: duckdb.DuckDBPyConnection, source_trade_date: date, preset_name: str
+    connection: duckdb.DuckDBPyConnection,
+    source_trade_date: date,
+    preset_name: str,
+    *,
+    ranked: bool = False,
 ) -> ScreenRunReceipt:
     columns = {
         str(row[1])
@@ -70,19 +103,23 @@ def _read_receipt(
         raise ScreenCandidateSourceError("screen receipt v2 price proof columns are missing")
     if not set(_RECEIPT_COLUMNS) <= columns:
         raise ScreenCandidateSourceError("screen receipt columns are missing")
+    if ranked and "rank_digest" not in columns:
+        raise ScreenCandidateSourceError("screen receipt v3 rank proof column is missing")
+    selected = _RECEIPT_COLUMNS + (("rank_digest",) if "rank_digest" in columns else ())
     rows = connection.execute(
-        f"SELECT {', '.join(_RECEIPT_COLUMNS)} FROM screen_run_receipt "
+        f"SELECT {', '.join(selected)} FROM screen_run_receipt "
         "WHERE trade_date = ? AND preset_name = ? LIMIT 2",
         [source_trade_date, preset_name],
     ).fetchall()
     if len(rows) != 1:
         raise ScreenCandidateSourceError("expected exactly one screen receipt")
     try:
-        receipt = ScreenRunReceipt.model_validate(dict(zip(_RECEIPT_COLUMNS, rows[0], strict=True)))
+        receipt = ScreenRunReceipt.model_validate(dict(zip(selected, rows[0], strict=True)))
     except ValidationError as exc:
         raise ScreenCandidateSourceError("invalid screen receipt or result version") from exc
-    if receipt.contract != "screen-run-receipt/v2" or receipt.price_digest is None:
-        raise ScreenCandidateSourceError("screen receipt v2 price proof is required")
+    expected_contract = "screen-run-receipt/v3" if ranked else "screen-run-receipt/v2"
+    if receipt.contract != expected_contract or receipt.price_digest is None:
+        raise ScreenCandidateSourceError(f"screen receipt {expected_contract} proof is required")
     return receipt
 
 
@@ -188,3 +225,108 @@ def verify_screen_candidates(
         )
     except duckdb.Error as exc:
         raise ScreenCandidateSourceError("frozen screen tables are unavailable") from exc
+
+
+def _assert_expected_definition(expected_definition_version: str | None) -> str:
+    if (
+        not isinstance(expected_definition_version, str)
+        or re.fullmatch(r"[0-9a-f]{64}", expected_definition_version) is None
+    ):
+        raise ScreenCandidateSourceError("a trusted expected definition version is required")
+    return expected_definition_version
+
+
+def verify_ranked_screen_candidates(
+    connection: duckdb.DuckDBPyConnection,
+    source_trade_date: date,
+    decision_trade_date: date,
+    preset_name: str,
+    *,
+    expected_definition_version: str | None = None,
+) -> VerifiedRankedScreenCandidateSnapshot:
+    """Verify ranked facts in the caller's one frozen read-only transaction."""
+    expected = _assert_expected_definition(expected_definition_version)
+    if source_trade_date >= decision_trade_date:
+        raise ScreenCandidateSourceError("decision date must follow the source date")
+    if not preset_name.strip():
+        raise ScreenCandidateSourceError("a screen preset is required")
+    try:
+        receipt = _read_receipt(connection, source_trade_date, preset_name, ranked=True)
+        if receipt.definition_version != expected:
+            raise ScreenCandidateSourceError(
+                "screen receipt differs from expected definition version"
+            )
+        base = _verify_snapshot(
+            connection, receipt, source_trade_date, decision_trade_date, preset_name
+        )
+        columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info('screen_result')").fetchall()
+        }
+        if not {"rank_position", "ranking_score"} <= columns:
+            raise ScreenCandidateSourceError("screen result ranking columns are missing")
+        rows = connection.execute(
+            "SELECT ts_code, rank_position, ranking_score FROM screen_result "
+            "WHERE trade_date = ? AND preset_name = ? ORDER BY ts_code LIMIT ?",
+            [source_trade_date, preset_name, MAX_SCREEN_CANDIDATES + 1],
+        ).fetchall()
+        prices = {item.ts_code: item.previous_close for item in base.candidates}
+        if len(rows) != len(prices) or {code for code, _, _ in rows} != set(prices):
+            raise ScreenCandidateSourceError("screen ranking members differ from price proof")
+        try:
+            digest = member_rank_digest(rows)
+        except ValueError as exc:
+            raise ScreenCandidateSourceError("invalid screen ranking rows") from exc
+        if digest != receipt.rank_digest:
+            raise ScreenCandidateSourceError("screen ranking digest differs from receipt")
+        return VerifiedRankedScreenCandidateSnapshot(
+            source_trade_date=source_trade_date,
+            decision_trade_date=decision_trade_date,
+            preset_name=preset_name,
+            receipt=receipt,
+            candidates=tuple(
+                VerifiedRankedScreenCandidate(
+                    ts_code=code,
+                    previous_close=prices[code],
+                    rank_position=position,
+                    ranking_score=score,
+                )
+                for code, position, score in sorted(rows, key=lambda row: row[1])
+            ),
+        )
+    except duckdb.Error as exc:
+        raise ScreenCandidateSourceError("frozen screen tables are unavailable") from exc
+
+
+def load_verified_ranked_screen_candidates(
+    frozen_path: Path,
+    source_trade_date: date,
+    decision_trade_date: date,
+    preset_name: str,
+    *,
+    expected_definition_version: str | None = None,
+) -> VerifiedRankedScreenCandidateSnapshot:
+    """Read a v3 ranked result from one existing frozen DuckDB file and transaction."""
+    _assert_expected_definition(expected_definition_version)
+    if not frozen_path.is_file():
+        raise ScreenCandidateSourceError("an existing frozen DuckDB file is required")
+    try:
+        connection = duckdb.connect(str(frozen_path), read_only=True)
+    except duckdb.Error as exc:
+        raise ScreenCandidateSourceError("frozen DuckDB cannot be opened read-only") from exc
+    try:
+        connection.execute("BEGIN TRANSACTION")
+        try:
+            snapshot = verify_ranked_screen_candidates(
+                connection, source_trade_date, decision_trade_date, preset_name,
+                expected_definition_version=expected_definition_version,
+            )
+        except Exception:
+            connection.execute("ROLLBACK")
+            raise
+        connection.execute("COMMIT")
+        return snapshot
+    except duckdb.Error as exc:
+        raise ScreenCandidateSourceError("frozen screen tables are unavailable") from exc
+    finally:
+        connection.close()

@@ -12,7 +12,12 @@ from loguru import logger
 from pydantic import Field
 
 from rquant.builtin_presets import builtin_definition_version
-from rquant.pool_result_receipt import ScreenRunReceipt, ScreenRunReceiptDraft, member_set_digest
+from rquant.pool_result_receipt import (
+    ScreenRunReceipt,
+    ScreenRunReceiptDraft,
+    member_rank_digest,
+    member_set_digest,
+)
 from rquant.presets import PRESET_SCREENS, ScreenPreset, load_user_presets
 from rquant.risk.blacklist import load_active_blacklist
 from rquant.runtime_contracts import RuntimeContractModel
@@ -139,19 +144,16 @@ def _to_screen_result_df(
 ) -> pd.DataFrame:
     """将 screen() 返回的 DataFrame 转为 screen_result 表格式。"""
     if screen_df.empty:
+        columns = [
+            "trade_date", "preset_name", "ts_code", "name", "close", "pct_chg", "extra",
+        ]
+        if {"rank_position", "ranking_score"} <= set(screen_df.columns):
+            columns.extend(("rank_position", "ranking_score"))
         return pd.DataFrame(
-            columns=[
-                "trade_date",
-                "preset_name",
-                "ts_code",
-                "name",
-                "close",
-                "pct_chg",
-                "extra",
-            ]
+            columns=columns
         )
 
-    base = {"ts_code", "name", "CLOSE[0]", "PCT_CHG[0]"}
+    base = {"ts_code", "name", "CLOSE[0]", "PCT_CHG[0]", "rank_position", "ranking_score"}
     extra_cols = [c for c in screen_df.columns if c not in base]
 
     result = pd.DataFrame(
@@ -164,6 +166,9 @@ def _to_screen_result_df(
             "pct_chg": screen_df.get("PCT_CHG[0]"),
         }
     )
+    if {"rank_position", "ranking_score"} <= set(screen_df.columns):
+        result["rank_position"] = screen_df["rank_position"].values
+        result["ranking_score"] = screen_df["ranking_score"].values
 
     if extra_cols:
         result["extra"] = screen_df[extra_cols].apply(
@@ -362,6 +367,10 @@ def run_daily_screen_stage(
                     )
                     empty = _to_screen_result_df(pd.DataFrame(), trade_date, name)
                     receipt = ScreenRunReceiptDraft(
+                        contract=(
+                            "screen-run-receipt/v3"
+                            if preset.ranking is not None else "screen-run-receipt/v2"
+                        ),
                         trade_date=date.fromisoformat(trade_date),
                         preset_name=name,
                         definition_version=_definition_version(preset),
@@ -369,6 +378,9 @@ def run_daily_screen_stage(
                         parent_result_version=parent_result_version,
                         hit_count=0,
                         member_digest=member_set_digest([]),
+                        rank_digest=(
+                            member_rank_digest([]) if preset.ranking is not None else None
+                        ),
                         lineage_complete=lineage_complete,
                         completed_at=datetime.now(UTC),
                     )
@@ -427,10 +439,14 @@ def run_daily_screen_stage(
                     ],
                     top_n=preset.ranking.top_n,
                 )
+                ranked["rank_position"] = range(1, len(ranked) + 1)
                 visible_columns = [
                     column
                     for column in ranked.columns
-                    if column in {"ts_code", "name", "CLOSE[0]", "PCT_CHG[0]"}
+                    if column in {
+                        "ts_code", "name", "CLOSE[0]", "PCT_CHG[0]",
+                        "rank_position", "ranking_score",
+                    }
                     or column in preset.include_columns
                 ]
                 result_df = ranked[visible_columns]
@@ -442,6 +458,10 @@ def run_daily_screen_stage(
                     sr_df = sr_df.loc[~hit_mask].reset_index(drop=True)
                     logger.warning(f"  {name}: 黑名单过滤剔除 {len(removed)} 只 → {removed}")
             receipt = ScreenRunReceiptDraft(
+                contract=(
+                    "screen-run-receipt/v3"
+                    if preset.ranking is not None else "screen-run-receipt/v2"
+                ),
                 trade_date=date.fromisoformat(trade_date),
                 preset_name=name,
                 definition_version=_definition_version(preset),
@@ -449,6 +469,12 @@ def run_daily_screen_stage(
                 parent_result_version=parent_result_version,
                 hit_count=len(sr_df),
                 member_digest=member_set_digest(sr_df["ts_code"].tolist()),
+                rank_digest=(
+                    member_rank_digest(list(zip(
+                        sr_df["ts_code"].tolist(), sr_df["rank_position"].tolist(),
+                        sr_df["ranking_score"].tolist(), strict=True,
+                    ))) if preset.ranking is not None else None
+                ),
                 lineage_complete=lineage_complete,
                 completed_at=datetime.now(UTC),
             )
