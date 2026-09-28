@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import timedelta
+from collections.abc import Callable
+from datetime import datetime, timedelta
 from pathlib import Path
 from uuid import NAMESPACE_URL, UUID, uuid5
 
@@ -55,14 +56,14 @@ def _job_with_actions():
     )
 
 
-def _client_app(root: Path, **kwargs: object):
+def _client_app(root: Path, *, clock: Callable[[], datetime] | None = None, **kwargs: object):
     return create_private_test_app(
         WebSettings(
             serving_root=root,
             ingress_socket_path=root.parent / "private-web.sock",
             lab_control_users=frozenset({"researcher"}),
         ),
-        clock=lambda: FIXTURE_BUILT_AT + timedelta(seconds=30),
+        clock=clock or (lambda: FIXTURE_BUILT_AT + timedelta(seconds=30)),
         background=False,
         **kwargs,
     )
@@ -415,12 +416,20 @@ def test_verified_terminal_failure_is_distinct_from_unknown(
     assert "Lab backend" not in response.text
 
 
-def test_future_browser_clock_is_rejected_before_page_control(tmp_path: Path) -> None:
+def test_future_first_submission_uses_page_control_clock_failure(tmp_path: Path) -> None:
     calls: list[dict[str, object]] = []
 
     def transport(payload: dict[str, object]) -> dict[str, object]:
         calls.append(payload)
-        raise AssertionError("future request must not reach PageControl")
+        return {
+            "command_id": COMMAND_ID,
+            "status": "failed",
+            "enqueued_at": "2026-09-24T07:40:00Z",
+            "completed_at": "2026-09-24T07:40:00Z",
+            "error": (
+                "ValueError: page control command requested_at exceeds allowed future clock skew"
+            ),
+        }
 
     with TestClient(
         _client_app(tmp_path / "serving", lab_control_command_transport=transport),
@@ -437,4 +446,66 @@ def test_future_browser_clock_is_rejected_before_page_control(tmp_path: Path) ->
         "status": "failed",
         "message": "设备时间可能不准，请校准后刷新任务。",
     }
-    assert calls == []
+    assert len(calls) == 1
+    assert calls[0]["command_id"] == COMMAND_ID
+    assert calls[0]["requested_at"] == "2026-09-24T07:40:00Z"
+
+
+def test_clock_rollback_queries_original_page_control_command(tmp_path: Path) -> None:
+    now = [FIXTURE_BUILT_AT + timedelta(seconds=30)]
+    calls: list[dict[str, object]] = []
+
+    def transport(payload: dict[str, object]) -> dict[str, object]:
+        calls.append(payload)
+        return {
+            "command_id": COMMAND_ID,
+            "status": "pending",
+            "enqueued_at": REQUESTED_AT,
+        }
+
+    with TestClient(
+        _client_app(
+            tmp_path / "serving",
+            clock=lambda: now[0],
+            lab_control_command_transport=transport,
+        ),
+        headers=PROXY_HEADERS,
+    ) as client:
+        headers = {"x-rquant-user": "researcher", "x-rquant-csrf": "1"}
+        first = client.post("/api/v1/tasks/jobs/commands", json=_body(), headers=headers)
+        now[0] -= timedelta(minutes=10)
+        retry = client.post("/api/v1/tasks/jobs/commands", json=_body(), headers=headers)
+    assert first.status_code == retry.status_code == 200
+    assert first.json()["status"] == retry.json()["status"] == "pending"
+    assert retry.json()["command_id"] == COMMAND_ID
+    assert len(calls) == 2
+    assert calls[1] == calls[0]
+
+
+def test_clock_rollback_with_unavailable_page_control_stays_unknown(tmp_path: Path) -> None:
+    now = [FIXTURE_BUILT_AT + timedelta(seconds=30)]
+    calls: list[dict[str, object]] = []
+
+    def transport(payload: dict[str, object]) -> dict[str, object]:
+        calls.append(payload)
+        if len(calls) == 2:
+            raise OSError("PageControl unavailable")
+        return {"command_id": COMMAND_ID, "status": "pending", "enqueued_at": REQUESTED_AT}
+
+    with TestClient(
+        _client_app(
+            tmp_path / "serving",
+            clock=lambda: now[0],
+            lab_control_command_transport=transport,
+        ),
+        headers=PROXY_HEADERS,
+    ) as client:
+        headers = {"x-rquant-user": "researcher", "x-rquant-csrf": "1"}
+        first = client.post("/api/v1/tasks/jobs/commands", json=_body(), headers=headers)
+        now[0] -= timedelta(minutes=10)
+        retry = client.post("/api/v1/tasks/jobs/commands", json=_body(), headers=headers)
+    assert first.json()["status"] == "pending"
+    assert retry.status_code == 503
+    assert retry.json().get("status") != "failed"
+    assert len(calls) == 2
+    assert calls[1] == calls[0]

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from datetime import timedelta
 from typing import Annotated
 from uuid import NAMESPACE_URL, uuid5
 
@@ -36,7 +35,6 @@ from rquant.web.security import current_user, require_csrf
 router = APIRouter(prefix="/tasks/jobs")
 MAX_REQUEST_BYTES = 1024
 _RESULT = TypeAdapter(CommandSubmissionResult)
-_MAX_FUTURE_SKEW = timedelta(minutes=5)
 _CLOCK_SKEW_ERROR = (
     "ValueError: page control command requested_at exceeds allowed future clock skew"
 )
@@ -162,12 +160,8 @@ async def submit_lab_control(
         raise HTTPException(status_code=403, detail="当前账号不能操作研究任务。")
     if len(await request.body()) > MAX_REQUEST_BYTES:
         raise HTTPException(status_code=413, detail="请求内容过长，请重试。")
-    if body.requested_at > web.clock() + _MAX_FUTURE_SKEW:
-        return LabControlReceipt(
-            command_id=body.command_id,
-            status="failed",
-            message=_CLOCK_SKEW_MESSAGE,
-        )
+    # PageControl checks its durable command ID before its own clock check. A Web clock
+    # rollback must not turn an existing command's recovery into a fresh failure.
     interaction_key = _interaction_key(viewer, body)
     command = _COMMANDS[body.action](
         job_id=body.job_id,
