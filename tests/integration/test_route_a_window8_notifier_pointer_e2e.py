@@ -32,6 +32,7 @@ now summarizes the gate exactly as a successful one does (package Q MF-1, SF-7).
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -132,16 +133,18 @@ def test_the_notifier_carries_the_previous_generations_signals_pointer(
     root, previous_commit = write_first_generation_signals_pointer(cold_chain)
     notifier = manifests_of(cold_chain, RuntimeServiceKind.NOTIFIER)[0]
     assert previous_commit != notifier.producer_commit
-    assert previous_commit in (root / "current.json").read_text(encoding="utf-8")
+    previous_pointer = json.loads((root / "current.json").read_text(encoding="utf-8"))
+    assert previous_pointer["producer_commit"] == previous_commit
 
     run = run_notifier(cold_chain, credentials_root)
 
     assert run.entered, run
     assert REFUSAL not in (run.last_error or ""), run
     assert run.violations == [], run.violations
-    #: the pointer is still the one generation 6 wrote -- this role carries it and
-    #: replaces it on its own next publish, it does not rewrite somebody's past
-    assert previous_commit in (root / "current.json").read_text(encoding="utf-8")
+    # The role consumed the prior commit and linked its own publication to it.
+    current_pointer = json.loads((root / "current.json").read_text(encoding="utf-8"))
+    assert current_pointer["producer_commit"] == notifier.producer_commit
+    assert current_pointer["previous_publication_id"] == previous_pointer["publication_id"]
 
 
 def test_the_carried_iteration_reports_what_it_did_with_the_replica(
