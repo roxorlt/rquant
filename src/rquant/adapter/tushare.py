@@ -850,7 +850,7 @@ class TushareAdapter:
         logger.info(f"Tushare daily_basic 返回 {len(df)} 行")
         return df
 
-    def stock_basic(self, list_status: str = "L") -> pd.DataFrame:
+    def stock_basic(self, list_status: str = "L", exchange: str = "") -> pd.DataFrame:
         """股票基础信息（代码 / 名称 / 行业 / 上市日期 / 退市日期等）。
 
         list_status: L=上市, D=退市, P=暂停上市
@@ -861,11 +861,11 @@ class TushareAdapter:
         `stock_basic source is missing columns: delist_date` 失败、一次都没发布过。
         空结果也保持列齐全（#277 同一类）：零行但没有列的表会被校验当成「缺列」整批拒。
         """
-        logger.info(f"Tushare stock_basic 请求：list_status={list_status}")
+        logger.info(f"Tushare stock_basic 请求：exchange={exchange} list_status={list_status}")
         df = self._call_with_backoff(
             "stock_basic",
             lambda: self._pro.stock_basic(
-                exchange="",
+                exchange=exchange,
                 list_status=list_status,
                 fields=",".join(STOCK_BASIC_COLUMNS),
             ),
