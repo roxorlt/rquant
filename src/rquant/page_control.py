@@ -191,6 +191,7 @@ class SaveFormulaPoolV1(PageControlCommand):
     base_name: str = Field(min_length=1, max_length=80)
     display_name: str = Field(min_length=1, max_length=80)
     task_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    actor_id: str = Field(min_length=1, max_length=256)
     expected_version: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
     @field_validator("base_name")

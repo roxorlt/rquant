@@ -52,6 +52,7 @@ from rquant.web.routes import (
     data_audit_report_commands,
     formula_market_commands,
     formula_market_read,
+    formula_pool_save_commands,
     fundamentals,
     health,
     meta,
@@ -84,6 +85,7 @@ _WRITE_BODY_LIMITS = {
     "/api/v1/data/backfill-plans/commands": backfill_plan_commands.MAX_REQUEST_BYTES,
     "/api/v1/data/audit-report/commands": data_audit_report_commands.MAX_REQUEST_BYTES,
     "/api/v1/screen/tdx/market/commands": formula_market_commands.MAX_REQUEST_BYTES,
+    "/api/v1/pools/formula/commands": formula_pool_save_commands.MAX_REQUEST_BYTES,
 }
 
 
@@ -289,6 +291,10 @@ def create_app(
             return JSONResponse(
                 status_code=422, content={"detail": "选股输入有误，请检查日期和公式。"}
             )
+        if request.url.path == "/api/v1/pools/formula/commands":
+            return JSONResponse(
+                status_code=422, content={"detail": "保存信息有误，请检查名称和任务。"}
+            )
         return await request_validation_exception_handler(request, error)
 
     app.include_router(meta.router, prefix="/api/v1", tags=["meta"])
@@ -305,6 +311,7 @@ def create_app(
     app.include_router(screen.router, prefix="/api/v1", tags=["screen"])
     app.include_router(formula_market_commands.router, prefix="/api/v1", tags=["screen"])
     app.include_router(formula_market_read.router, prefix="/api/v1", tags=["screen"])
+    app.include_router(formula_pool_save_commands.router, prefix="/api/v1", tags=["pools"])
     app.include_router(stocks.router, prefix="/api/v1", tags=["stocks"])
     app.include_router(catalog.router, prefix="/api/v1", tags=["catalog"])
     app.include_router(data_audit.router, prefix="/api/v1", tags=["data-audit"])
