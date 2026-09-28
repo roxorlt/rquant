@@ -25,10 +25,8 @@ from rquant.canvas_publication_receipt import (
     Ed25519CanvasPublicationSigner,
     SecureCanvasPublicationSigningClient,
 )
-from rquant.formula_market_page_backend import (
-    FormulaMarketPageBackend,
-    load_private_formula_market_config,
-)
+from rquant.formula_market_page_backend import FormulaMarketPageBackend
+from rquant.formula_market_private_config import load_private_formula_market_config
 from rquant.job_center_authority import resolve_current_job_center_authority_binding
 from rquant.lab_daemon import load_lab_job_center_authority_manifest
 from rquant.lab_page_control import build_lab_page_control_writer

@@ -75,6 +75,10 @@ class FormulaMarketJobActiveError(ValueError):
     """A different formula market task still owns the single active slot."""
 
 
+class _FormulaMarketSourceRootMismatchError(ValueError):
+    """The claimed request names sources outside this worker's trusted configuration."""
+
+
 class FormulaMarketJobRequest(RuntimeContractModel):
     """Trusted caller input; roots and source identities never come from the browser."""
 
@@ -436,7 +440,8 @@ class FormulaMarketJobStore:
         return self.status(task_id)
 
     def admission_by_key(
-        self, idempotency_key: str,
+        self,
+        idempotency_key: str,
     ) -> tuple[FormulaMarketJobRequest, str] | None:
         """Recover an admitted task without needing its eventual result artifact."""
         if _KEY.fullmatch(idempotency_key) is None:
@@ -731,7 +736,15 @@ def _error_code(exc: Exception) -> JobErrorCode:
         return "capacity"
     if isinstance(exc, EvaluationRejectedError):
         return "formula_rejected" if exc.code == "formula" else "source_changed"
-    if isinstance(exc, (FormulaMarketUniverseError, FormulaProjectionUnavailableError, OSError)):
+    if isinstance(
+        exc,
+        (
+            _FormulaMarketSourceRootMismatchError,
+            FormulaMarketUniverseError,
+            FormulaProjectionUnavailableError,
+            OSError,
+        ),
+    ):
         return "source_changed"
     if isinstance(exc, FormulaMarketArtifactUnavailableError):
         return "artifact_invalid"
@@ -741,8 +754,14 @@ def _error_code(exc: Exception) -> JobErrorCode:
 class FormulaMarketJobWorker:
     """One bounded claim with a renewable lease and fenced completion."""
 
-    def __init__(self, store: FormulaMarketJobStore) -> None:
+    def __init__(
+        self,
+        store: FormulaMarketJobStore,
+        *,
+        trusted_source_roots: tuple[Path, Path] | None = None,
+    ) -> None:
         self.store = store
+        self.trusted_source_roots = trusted_source_roots
 
     def run_one(self) -> FormulaMarketJobReceipt | None:
         claim = self.store._claim()
@@ -766,6 +785,15 @@ class FormulaMarketJobWorker:
         try:
             try:
                 request = claim.request
+                if (
+                    self.trusted_source_roots is not None
+                    and (
+                        request.universe_root,
+                        request.projection_root,
+                    )
+                    != self.trusted_source_roots
+                ):
+                    raise _FormulaMarketSourceRootMismatchError("formula task source roots changed")
                 self.store._discard_previous_stage(claim)
                 summary = run_formula_market(
                     request.universe_root,
