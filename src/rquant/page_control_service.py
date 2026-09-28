@@ -317,6 +317,21 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="owner-private local watchlist admission socket; absent means disabled",
     )
+    parser.add_argument(
+        "--price-rule-socket",
+        type=Path,
+        help="separate-UID private price rule socket; absent means disabled",
+    )
+    parser.add_argument(
+        "--price-rule-web-uid",
+        type=int,
+        help="dedicated trusted Web UID for price rule admission",
+    )
+    parser.add_argument(
+        "--price-rule-shared-gid",
+        type=int,
+        help="shared private socket GID for price rule admission",
+    )
     return parser
 
 
@@ -328,6 +343,9 @@ def main(
     ack_socket_path: Path | None = None,
     ack_serving_root: Path | None = None,
     watchlist_socket_path: Path | None = None,
+    price_rule_socket_path: Path | None = None,
+    price_rule_web_uid: int | None = None,
+    price_rule_shared_gid: int | None = None,
     formula_market_config_path: Path | None = None,
 ) -> None:
     """Entry point. `argv` is what the runtime wrapper derived; keywords are for tests."""
@@ -341,12 +359,30 @@ def main(
         if watchlist_socket_path is not None and arguments.watchlist_socket is not None:
             raise ValueError("watchlist socket was supplied twice")
         watchlist_socket_path = watchlist_socket_path or arguments.watchlist_socket
+        if price_rule_socket_path is not None and arguments.price_rule_socket is not None:
+            raise ValueError("price rule socket was supplied twice")
+        if price_rule_web_uid is not None and arguments.price_rule_web_uid is not None:
+            raise ValueError("price rule Web UID was supplied twice")
+        if price_rule_shared_gid is not None and arguments.price_rule_shared_gid is not None:
+            raise ValueError("price rule shared GID was supplied twice")
+        price_rule_socket_path = price_rule_socket_path or arguments.price_rule_socket
+        price_rule_web_uid = (
+            price_rule_web_uid if price_rule_web_uid is not None else arguments.price_rule_web_uid
+        )
+        price_rule_shared_gid = (
+            price_rule_shared_gid
+            if price_rule_shared_gid is not None
+            else arguments.price_rule_shared_gid
+        )
     return _serve(
         runtime_root=runtime_root,
         expected_commit=expected_commit,
         ack_socket_path=ack_socket_path,
         ack_serving_root=ack_serving_root,
         watchlist_socket_path=watchlist_socket_path,
+        price_rule_socket_path=price_rule_socket_path,
+        price_rule_web_uid=price_rule_web_uid,
+        price_rule_shared_gid=price_rule_shared_gid,
         formula_market_config_path=formula_market_config_path,
     )
 
@@ -358,6 +394,9 @@ def _serve(
     ack_socket_path: Path | None = None,
     ack_serving_root: Path | None = None,
     watchlist_socket_path: Path | None = None,
+    price_rule_socket_path: Path | None = None,
+    price_rule_web_uid: int | None = None,
+    price_rule_shared_gid: int | None = None,
     formula_market_config_path: Path | None = None,
 ) -> None:
     from rquant.runtime_deployment_profile import (
@@ -496,6 +535,25 @@ def _serve(
             )
         except Exception:
             logger.exception("Watchlist admission listener disabled during startup")
+    price_rule_server = None
+    if any(
+        value is not None
+        for value in (price_rule_socket_path, price_rule_web_uid, price_rule_shared_gid)
+    ):
+        try:
+            from rquant.price_alert_admission import (
+                PriceAlertAdmission,
+                build_price_alert_admission_server,
+            )
+
+            price_rule_server = build_price_alert_admission_server(
+                PriceAlertAdmission(service),
+                socket_path=price_rule_socket_path,
+                trusted_web_uid=price_rule_web_uid,
+                shared_gid=price_rule_shared_gid,
+            )
+        except Exception:
+            logger.exception("Price rule admission listener disabled during startup")
     server_class = _server_class_for_host(host)
     try:
         server = server_class((host, port), handler_for(service))
@@ -504,11 +562,15 @@ def _serve(
             ack_server.server_close()
         if watchlist_server is not None:
             watchlist_server.server_close()
+        if price_rule_server is not None:
+            price_rule_server.server_close()
         raise
     ack_thread = None
     ack_started = False
     watchlist_thread = None
     watchlist_started = False
+    price_rule_thread = None
+    price_rule_started = False
     try:
         if ack_server is not None:
             ack_thread = threading.Thread(target=ack_server.serve_forever, daemon=True)
@@ -518,6 +580,12 @@ def _serve(
             watchlist_thread = threading.Thread(target=watchlist_server.serve_forever, daemon=True)
             watchlist_thread.start()
             watchlist_started = True
+        if price_rule_server is not None:
+            price_rule_thread = threading.Thread(
+                target=price_rule_server.serve_forever, daemon=True
+            )
+            price_rule_thread.start()
+            price_rule_started = True
         server.serve_forever()
     finally:
         server.server_close()
@@ -531,6 +599,11 @@ def _serve(
                 watchlist_server.shutdown()
                 watchlist_thread.join()
             watchlist_server.server_close()
+        if price_rule_server is not None:
+            if price_rule_started and price_rule_thread is not None:
+                price_rule_server.shutdown()
+                price_rule_thread.join()
+            price_rule_server.server_close()
 
 
 if __name__ == "__main__":

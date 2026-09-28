@@ -506,3 +506,125 @@ def test_optional_ack_socket_refusal_preserves_tcp_page_control(
         socket_directory.cleanup()
     assert not worker.is_alive()
     assert errors == []
+
+
+@pytest.mark.parametrize(
+    "price_setup", ["disabled", "same_uid", "missing_gid", "occupied", "valid"]
+)
+def test_optional_price_rule_socket_isolated_from_existing_tcp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, price_setup: str
+) -> None:
+    authority = create_canvas_ed25519_test_authority(tmp_path / "keys")
+    public_key = (tmp_path / "keys" / "canvas-test-v1.public.pem").read_text()
+    runtime_root = tmp_path / "runtime"
+    _install_page_control_profile(
+        runtime_root,
+        PageControlRuntimeProfile.model_validate(
+            {
+                "endpoint": "http://127.0.0.1:8767/v1/commands",
+                "outbox_path": runtime_root / "control" / "page-control.sqlite3",
+                "data_dir": runtime_root / "serving" / "page-control",
+                "log_dir": runtime_root / "control" / "page-control-logs",
+                "page_projection_canvas_catalog_root": (
+                    runtime_root / "serving" / "page-control" / "canvases"
+                ),
+                "canvas_publication": {
+                    "active_key_id": authority.keyring.active_key_id,
+                    "active_public_key_pem": public_key,
+                    "signer_command": ("/test/signer",),
+                    "consumer_service_id": "page-control.test.v1",
+                    "consumer_instance_id": "page-control-test",
+                },
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        page_control_service.SecureCanvasPublicationSigningClient,
+        "sign",
+        lambda _client, *, namespace, payload: OpenSslCanvasSigningClient(
+            tmp_path / "keys" / "canvas-test-v1.private.pem"
+        ).sign(namespace=namespace, payload=payload),
+    )
+    socket_directory = TemporaryDirectory(
+        prefix="rqp-", dir="/private/tmp" if Path("/private/tmp").is_dir() else "/tmp"
+    )
+    socket_path = Path(socket_directory.name) / "private" / "price.sock"
+    if price_setup == "occupied":
+        socket_path.parent.mkdir(mode=0o710)
+        os.chmod(socket_path.parent, 0o710)
+        socket_path.write_text("occupied")
+    ready = threading.Event()
+    servers: list[ThreadingHTTPServer] = []
+
+    class ObservedHTTPServer(ThreadingHTTPServer):
+        def __init__(self, _address: tuple[str, int], handler: type) -> None:
+            super().__init__(("127.0.0.1", 0), handler)
+            servers.append(self)
+
+        def serve_forever(self, poll_interval: float = 0.5) -> None:
+            ready.set()
+            super().serve_forever(poll_interval)
+
+    monkeypatch.setattr(
+        page_control_service, "_server_class_for_host", lambda _host: ObservedHTTPServer
+    )
+    errors: list[Exception] = []
+
+    def run_service() -> None:
+        try:
+            page_control_service.main(
+                runtime_root=runtime_root,
+                expected_commit=COMMIT,
+                price_rule_socket_path=(None if price_setup == "disabled" else socket_path),
+                price_rule_web_uid=(
+                    None
+                    if price_setup == "disabled"
+                    else os.geteuid()
+                    if price_setup == "same_uid"
+                    else os.geteuid() + 1
+                ),
+                price_rule_shared_gid=(
+                    None if price_setup in {"disabled", "missing_gid"} else os.getegid()
+                ),
+            )
+        except Exception as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=run_service, daemon=True)
+    worker.start()
+    try:
+        assert ready.wait(timeout=3), f"existing TCP did not start: {errors!r}"
+        if price_setup == "valid":
+            assert socket_path.is_socket()
+            assert socket_path.stat().st_mode & 0o777 == 0o660
+        elif price_setup == "occupied":
+            assert socket_path.read_text() == "occupied"
+        else:
+            assert not socket_path.exists()
+        command = AckAlert(
+            command_id=f"lookup-price-{price_setup}",
+            requested_at=NOW,
+            generation_id="a" * 64,
+            alert_id="b" * 64,
+            actor_id="researcher",
+        )
+        connection = http.client.HTTPConnection("127.0.0.1", servers[0].server_port, timeout=2)
+        connection.request(
+            "POST",
+            "/v1/commands/lookup",
+            body=command.model_dump_json(),
+            headers={"Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        assert response.status == 200
+        assert json.loads(response.read()) == {"found": False}
+        connection.close()
+    finally:
+        if ready.is_set():
+            servers[0].shutdown()
+        worker.join(timeout=3)
+        if price_setup == "valid":
+            assert not socket_path.exists()
+        socket_directory.cleanup()
+    assert not worker.is_alive()
+    assert errors == []
