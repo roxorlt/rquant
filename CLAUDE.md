@@ -11,6 +11,7 @@ rQuant 是一个**个人自用**的 A 股**投研平台（不含下单）**：
 
 - 线上旧 Streamlit 页面资源负担高，页面体验也不是 owner 期望的目标；不再给旧 Streamlit 页面开发新功能、打磨界面或扩容。过渡期仅做维持现有服务所必需的故障与安全修复。
 - 新网页采用 `web/` 中的 React + TypeScript + Vite，以 CC 可点击原型的完整交互体验为最终目标；页面按 `web/CLAUDE.md` 的界面与文案原则实现，不能把内部实现细节直接摆给用户。
+- 前后端按第一性原理和高内聚、低耦合划分：从用户操作、权威数据及失败恢复确定边界；同一领域事实由单一模块负责，跨层只传有类型合同，不在页面、API 和 worker 重复计算口径。细则见平台方向决定。
 - 每完成一项原型功能，先接通真实能力并验证功能、数据与体验，再迁移对应入口和使用场景；逐项停用被替代的 Streamlit 单元，直到原型全部功能和按钮可用。差距表中的所有「部分」「缺」都须补齐，M4、M12 虽标「已有」但列出的未完部分也须完成；M11 实盘交易仍排除。
 - 代码完成不等于线上已切换或旧服务可停。生产切流、停服及相关基础设施变更依本文件的生产规则单独取得明确授权。决策与验收细节见 `docs/plans/2026-09-26-react-platform-decision.md`。
 
@@ -28,11 +29,9 @@ rQuant 是一个**个人自用**的 A 股**投研平台（不含下单）**：
 ```bash
 uv sync                                  # 安装/同步依赖（含 dev 组）
 uv sync --python 3.11   # worktree 无 .python-version，裸 uv sync 会选 3.13；R07 policy 生成拒绝 3.13+
-uv run pytest -q                         # 全量测试（约 13.4k 用例，本机单进程约 60 分钟；CI 按 tests/manifests/full-suite-v1 分 4 片跑，本地改哪块测哪块）
-uv run pytest tests/unit/test_xxx.py -q  # 改哪块测哪块（秒级）
+uv run pytest tests/unit/test_xxx.py -q  # 改哪块测哪块；全量测试仅在仓库门禁或影响面需要时运行
 uv run ruff check <改动的文件>            # lint 只查改动文件——全库存量约 980 个历史告警，全量跑会误判为本次改动引入
 uv run rquant --help                     # CLI 入口（serve / run-daily / monitor / notify-test 等 40+ 子命令）
-uv run streamlit run src/rquant/dashboard/app.py   # 本地启动 dashboard（逐步停用）
 pnpm -C web install --frozen-lockfile    # 前端依赖（Node 22.22.2 + pnpm 10，版本见 web/.nvmrc 与 package.json）
 pnpm -C web check                        # Biome + tsc + Vitest
 pnpm -C web build                        # 编译到 web/dist（要提交）；pnpm -C web verify:dist 核对提交的是最新编译结果
@@ -60,7 +59,7 @@ uv run rquant web-serve --bind 127.0.0.1:8768      # 只读网页 API（读 RQUA
 
 - **类型注解必写**：函数签名全部 type hint
 - **Pydantic 模型**：所有跨层数据结构用 Pydantic，不要裸 dict 传递
-- **不写过度抽象**：MVP 阶段是函数式脚本 + 简单 class，不要设计"框架"
+- **不写过度抽象**：按实际领域边界组织函数和简单 class，不为未来假设设计框架
 - **不写注释写啥**：只在有非显式约束/坑时写注释
 
 ## DuckDB 并发约束（强制）
@@ -103,20 +102,6 @@ store = DuckDBStore(settings.duckdb_path, read_only=True)   # 直连主库，盘
 本身只读不写主库，但同一时刻只能一个写者）按 systemd timer 约定串行，watchdog 和 timer
 错开。新增 Streamlit / FastAPI / 临时脚本时，code review 必查这一条。
 
-## 历史 MVP 路径（非当前实施计划）
-
-以下是项目早期按周迭代的历史记录，不能用于指导当前前端交付与 Streamlit 投入。当前实施方向以上述「前端交付方向」和新前端计划 v2 为准。
-
-1. Week 1：数据接入 + DuckDB 存储 → **能跑再下一步**
-2. Week 2：指标计算
-3. Week 3a：派生字段层（daily_state）
-4. Week 3b：筛选规则（Python 函数积木，命名对齐通达信/MyTT 风格）
-5. Week 4：调度（APScheduler）+ 筛选结果落库
-6. Week 5：盘中监控（Ashare 轮询）
-7. Week 6：通知（PushDeer）
-8. Week 7：Streamlit UI + 自然语言输入（LLM → 积木调用）
-9. Week 8：通达信选股公式支持（解析器 → MyTT/积木）
-
 ## 验证规范
 
 - **改动可运行代码必须实际运行验证**，不只凭代码逻辑判断
@@ -151,15 +136,8 @@ owner 多次纠正（2026-09-24「别等17点了」、「盘中能做的都改�
 
 ### 分支命名规范
 
-```
-feat/weekN-xxx       # MVP 周迭代，如 feat/week1-data-ingestion
-feat/xxx             # MVP 后的新功能，如 feat/multi-factor-scoring
-fix/xxx              # bug 修复
-refactor/xxx         # 重构
-docs/xxx             # 文档
-chore/xxx            # 配置/工具链
-deploy/xxx           # 部署脚本/配置
-```
+Codex 新分支按全局规范使用 `cdx/{会话主题}-{简短目的}`；旧 `feat/`、`fix/`、
+`docs/` 等前缀仅用于识别已有分支，不再指导新建分支。
 
 ### Commit 规范（Conventional Commits）
 
