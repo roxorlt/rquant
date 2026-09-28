@@ -207,6 +207,17 @@ export function paperEnvelope(
       source_updated_at: "2026-09-24T07:30:20Z",
       source_note: null,
       valuation_note: "持仓按最近成交价估值，不是实时价",
+      history: {
+        source_state: "not_published",
+        source_updated_at: null,
+        source_note: "指令记录尚未发布。",
+        account_id: null,
+        total_orders: null,
+        has_more: false,
+        newest_updated_at: null,
+        oldest_updated_at: null,
+        orders: [],
+      },
       accounts: [
         {
           account_id: "shadow-main",

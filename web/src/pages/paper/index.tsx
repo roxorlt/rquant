@@ -27,6 +27,7 @@ import {
   Tip,
 } from "@/ui";
 import { StockCell } from "../shared/StockCell";
+import { PaperHistory } from "./PaperHistory";
 import "./paper.css";
 
 function accountMetrics(account: PaperAccountItem, valuationNote: string | null): Kpi[] {
@@ -156,7 +157,7 @@ export default function PaperPage() {
       <PageHeader
         eyebrow="跟踪与告警"
         title="模拟盘"
-        note="账户资产与持仓"
+        note="账户、持仓与指令"
         actions={
           <Button size="sm" variant="ghost" onClick={result.refetch} disabled={result.isFetching}>
             刷新
@@ -216,6 +217,11 @@ export default function PaperPage() {
             </p>
           ) : null}
           <KpiStrip items={accountMetrics(account, data.valuation_note)} label="账户资产" />
+          <PaperHistory
+            key={`${account.account_id}:${result.serving?.generation_id ?? ""}`}
+            accountId={account.account_id}
+            history={data.history}
+          />
           <Panel title="持仓明细" sub={`${formatCount(account.holdings.length)} 只`}>
             {account.holdings.length ? (
               <DataTable
