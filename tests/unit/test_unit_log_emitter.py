@@ -143,8 +143,9 @@ def test_failed_journal_send_never_masks_daily_exception() -> None:
 def test_emitter_uses_local_journal_datagram_boundary(monkeypatch: pytest.MonkeyPatch) -> None:
     import rquant.unit_log_emitter as module
 
-    # macOS AF_UNIX rejects pytest's deep default tmp path.
-    with TemporaryDirectory(prefix="rquant-journal-", dir="/private/tmp") as directory:
+    # AF_UNIX rejects pytest's deep default tmp path; Linux has no /private/tmp.
+    short_tmp = "/private/tmp" if Path("/private/tmp").is_dir() else "/tmp"
+    with TemporaryDirectory(prefix="rquant-journal-", dir=short_tmp) as directory:
         destination = Path(directory) / "journal.sock"
         with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as receiver:
             receiver.bind(str(destination))
