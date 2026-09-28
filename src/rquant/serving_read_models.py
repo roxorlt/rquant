@@ -1276,6 +1276,65 @@ PAGE_PROJECTION_CONTRACTS: Mapping[str, ServingProjectionContract] = MappingProx
             max_rows=512,
             max_bytes=2 * 1024 * 1024,
         ),
+        "formula_pool_state": _contract(
+            "signals",
+            (
+                ("status_key", "string"),
+                ("availability", "string"),
+                ("pool_count", "int"),
+                ("run_count", "int"),
+            ),
+            ("status_key",),
+            max_rows=1,
+            max_bytes=2048,
+        ),
+        "formula_pool_definition": _contract(
+            "signals",
+            (
+                ("pool_name", "string"),
+                ("display_name", "string"),
+                ("formula", "string"),
+                ("syntax_version", "string"),
+                ("version", "string"),
+                ("command_id", "string"),
+                ("command_hash", "string"),
+                ("created_at", "timestamp"),
+                ("creation_task_id", "string"),
+                ("creation_result_sha256", "string"),
+                ("creation_trade_date", "date"),
+            ),
+            ("pool_name",),
+            max_rows=512,
+            max_bytes=3 * 1024 * 1024,
+            event_date_columns=("creation_trade_date",),
+            event_time_columns=("created_at",),
+        ),
+        "formula_pool_latest_result": _contract(
+            "signals",
+            (
+                ("pool_name", "string"),
+                ("definition_version", "string"),
+                ("trade_date", "date"),
+                ("task_id", "string"),
+                ("request_sha256", "string"),
+                ("result_sha256", "string"),
+                ("universe_identity", "string"),
+                ("projection_identity", "string"),
+                ("market_total", "int"),
+                ("match_count", "int"),
+                ("no_match_count", "int"),
+                ("unknown_count", "int"),
+                ("unknown_reasons_json", "string"),
+                ("member_sha256", "string"),
+                ("relative_path", "string"),
+                ("content_sha256", "string"),
+                ("byte_count", "int"),
+            ),
+            ("pool_name",),
+            max_rows=512,
+            max_bytes=512 * 1024,
+            event_date_columns=("trade_date",),
+        ),
         "screen_run_receipt": _contract(
             "signals",
             (
@@ -1619,6 +1678,15 @@ class ServingReadModelInput(RuntimeContractModel):
             from rquant.formula_market_job_projection import validate_formula_market_projections
 
             validate_formula_market_projections(
+                {projection.table_name: projection for projection in self.projections}
+            )
+
+        if any(
+            projection.table_name.startswith("formula_pool_") for projection in self.projections
+        ):
+            from rquant.formula_pool_serving_projection import validate_formula_pool_projections
+
+            validate_formula_pool_projections(
                 {projection.table_name: projection for projection in self.projections}
             )
 

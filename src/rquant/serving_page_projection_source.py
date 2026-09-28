@@ -87,6 +87,11 @@ from rquant.formula_market_job_projection import (
     read_formula_market_job_snapshot,
     validate_formula_market_projections,
 )
+from rquant.formula_pool_serving_projection import (
+    FormulaPoolServingConfig,
+    read_formula_pool_projections,
+    validate_formula_pool_projections,
+)
 from rquant.notification_state import (
     NotificationProjectionAuthoritySnapshot,
     NotificationProjectionPublication,
@@ -1305,6 +1310,43 @@ class _ReadonlyPageControlAuditReader:
             )
             return self._pool_mutations_from_rows(rows)
 
+    def formula_pool_saves(self) -> Mapping[str, PoolMutation]:
+        """Successful formula saves from the same pinned, read-only audit generation."""
+        if self._snapshot_connection is None:
+            raise RuntimeError("formula pool audit requires an active snapshot")
+        with self._read_connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT c.command_id, c.command_kind, c.command_hash,
+                       CASE WHEN length(c.payload_json) <= ?
+                            THEN c.payload_json ELSE NULL END AS payload_json,
+                       c.status,
+                       CASE WHEN length(c.result_json) <= ?
+                            THEN c.result_json ELSE NULL END AS result_json,
+                       e.command_id AS effect_command_id,
+                       e.command_hash AS effect_command_hash,
+                       e.effect_kind, e.status AS effect_status,
+                       CASE WHEN length(e.result_json) <= ?
+                            THEN e.result_json ELSE NULL END AS effect_result_json
+                FROM page_control_command AS c
+                LEFT JOIN page_control_effect AS e USING (command_id)
+                WHERE c.status = ? AND c.command_kind = ?
+                ORDER BY c.rowid DESC LIMIT ?
+                """,
+                (
+                    _MAX_POOL_AUDIT_CELL_CHARS,
+                    _MAX_POOL_AUDIT_CELL_CHARS,
+                    _MAX_POOL_AUDIT_CELL_CHARS,
+                    PageControlStatus.SUCCEEDED.value,
+                    "save_formula_pool_v1",
+                    _MAX_POOL_MUTATIONS + 1,
+                ),
+            ).fetchall()
+        saves = self._pool_mutations_from_rows(rows)
+        if len(saves) != len(rows):
+            raise PageProjectionSourceIntegrityError("formula pool has repeated save authority")
+        return saves
+
     @classmethod
     def _pool_mutations_from_rows(cls, rows: Iterable[sqlite3.Row]) -> Mapping[str, PoolMutation]:
         latest: dict[str, PoolMutation] = {}
@@ -2189,6 +2231,7 @@ class DuckDBSignalPageProjectionSource:
         canvas_receipt_root: Path | None = None,
         canvas_publication_keyring: CanvasPublicationKeyring | None = None,
         page_control_outbox: PageControlOutbox | Path | None = None,
+        formula_pool_config: FormulaPoolServingConfig | None = None,
         user_presets_root: Path | None = None,
         surge_live_root: Path | None = None,
         notification_log_path: Path | None = None,
@@ -2237,6 +2280,15 @@ class DuckDBSignalPageProjectionSource:
         if self.user_presets_root is not None and self.page_control_outbox is None:
             raise PageProjectionSourceIntegrityError(
                 "configured user pools require readonly PageControl audit authority"
+            )
+        self.formula_pool_config = (
+            None
+            if formula_pool_config is None
+            else FormulaPoolServingConfig.model_validate(formula_pool_config)
+        )
+        if self.formula_pool_config is not None and self.page_control_outbox is None:
+            raise PageProjectionSourceIntegrityError(
+                "configured formula pools require readonly PageControl audit authority"
             )
         if self.canvas_catalog_root is not None and (
             self.canvas_receipt_root is None or self.canvas_publication_keyring is None
@@ -2383,6 +2435,19 @@ class DuckDBSignalPageProjectionSource:
             else self.page_control_outbox.alert_ack_snapshot(),
             observed_at=observed,
         )
+        formula_pool_projections: tuple[ServingProjectionPayload, ...] = ()
+        if self.formula_pool_config is not None:
+            assert self.page_control_outbox is not None
+            try:
+                formula_pool_projections = read_formula_pool_projections(
+                    self.formula_pool_config,
+                    self.page_control_outbox.formula_pool_saves(),
+                    observed_at=observed,
+                )
+            except (OSError, sqlite3.Error, KeyError, ValueError) as exc:
+                raise PageProjectionSourceIntegrityError(
+                    "configured formula pool authority is invalid"
+                ) from exc
         if canvas_definitions:
             available = max(
                 available,
@@ -2401,6 +2466,13 @@ class DuckDBSignalPageProjectionSource:
             canvas_hits=hits,
             canvas_definitions=canvas_definitions,
             pool_definition=pool_definition,
+            formula_pool_state=(formula_pool_projections[0] if formula_pool_projections else None),
+            formula_pool_definition=(
+                formula_pool_projections[1] if formula_pool_projections else None
+            ),
+            formula_pool_latest_result=(
+                formula_pool_projections[2] if formula_pool_projections else None
+            ),
             screen_run_receipt=run_receipt_projection,
             pool_membership=pool_membership,
             pool_member_return=pool_member_return,
@@ -4672,6 +4744,9 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
         }
         optional_names = {
             "pool_definition",
+            "formula_pool_state",
+            "formula_pool_definition",
+            "formula_pool_latest_result",
             "screen_run_receipt",
             "pool_membership",
             "pool_member_return",
@@ -4690,6 +4765,7 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
             required_names | optional_names
         ):
             raise ValueError("signal page projection snapshot is incomplete")
+        validate_formula_pool_projections({item.table_name: item for item in self.projections})
         expected = canonical_sha256(self.model_dump(mode="python", exclude={"content_sha256"}))
         if self.content_sha256 != expected:
             raise ValueError("signal page projection snapshot hash mismatch")
@@ -4707,6 +4783,9 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
         canvas_hits: tuple[CanvasHitProjectionRow, ...] = (),
         canvas_definitions: tuple[CanvasDefinitionProjectionRow, ...] = (),
         pool_definition: ServingProjectionPayload | None = None,
+        formula_pool_state: ServingProjectionPayload | None = None,
+        formula_pool_definition: ServingProjectionPayload | None = None,
+        formula_pool_latest_result: ServingProjectionPayload | None = None,
         screen_run_receipt: ServingProjectionPayload | None = None,
         pool_membership: ServingProjectionPayload | None = None,
         pool_member_return: ServingProjectionPayload | None = None,
@@ -4773,6 +4852,9 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
             )
         for table_name, projection in (
             ("pool_definition", pool_definition),
+            ("formula_pool_state", formula_pool_state),
+            ("formula_pool_definition", formula_pool_definition),
+            ("formula_pool_latest_result", formula_pool_latest_result),
             ("screen_run_receipt", screen_run_receipt),
             ("pool_membership", pool_membership),
             ("pool_member_return", pool_member_return),

@@ -145,6 +145,13 @@ class _Task:
     request_sha256: str
 
 
+@dataclass(frozen=True)
+class FormulaMarketVerifiedTask:
+    receipt: FormulaMarketJobReceipt
+    request: FormulaMarketJobRequest
+    result: FormulaMarketJobResult
+
+
 def _validate_rows(
     state: FormulaMarketJobStateRow,
     jobs: tuple[FormulaMarketJobRow, ...],
@@ -584,3 +591,82 @@ def read_formula_market_job_snapshot(
         artifacts=artifacts,
         available_at=available_at,
     )
+
+
+def read_formula_market_tasks_exact(
+    state_path: Path,
+    artifact_root: Path,
+    task_ids: set[str],
+    *,
+    observed_at: datetime,
+) -> dict[str, FormulaMarketVerifiedTask]:
+    """Verify named successes in one read-only SQLite generation, beyond the recent window."""
+    observed = normalize_aware_utc(observed_at)
+    if len(task_ids) > 1024:
+        raise ValueError("formula task exact read exceeds bound")
+    if not state_path.is_absolute() or state_path != state_path.resolve(strict=False):
+        raise ValueError("formula task state path must be absolute and canonical")
+    before = os.lstat(state_path)
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_uid != os.geteuid()
+        or stat.S_IMODE(before.st_mode) != 0o600
+        or before.st_nlink != 1
+        or before.st_size > _MAX_STATE_BYTES
+    ):
+        raise ValueError("formula task state file is unsafe")
+    sidecars = _sidecars(state_path)
+    connection: sqlite3.Connection | None = None
+    verified: dict[str, FormulaMarketVerifiedTask] = {}
+    try:
+        uri = f"{state_path.as_uri()}?mode=ro"
+        if sidecars[:2] == (None, None):
+            uri += "&immutable=1"
+        connection = sqlite3.connect(uri, uri=True, timeout=5)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA query_only = ON")
+        connection.execute("BEGIN")
+        for task_id in sorted(task_ids):
+            if len(task_id) != 32 or any(char not in "0123456789abcdef" for char in task_id):
+                raise ValueError("formula task id is invalid")
+            row = connection.execute(
+                "SELECT * FROM formula_market_job WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError("formula task is missing")
+            task = _read_task(row)
+            receipt, request = task.receipt, task.request
+            if (
+                receipt.status != "succeeded"
+                or receipt.result_sha256 is None
+                or receipt.created_at > receipt.updated_at
+                or receipt.updated_at > observed
+            ):
+                raise ValueError("formula task is not a completed available success")
+            result, _, published_at = _parse_result(
+                artifact_root,
+                task_id=task_id,
+                digest=receipt.result_sha256,
+                request_sha256=task.request_sha256,
+                formula_sha256=hashlib.sha256(request.formula.encode("utf-8")).hexdigest(),
+                universe_identity=request.expected_universe_sha256,
+                projection_identity=request.expected_projection_identity,
+                trade_date=request.trade_date,
+                decision_at=request.decision_at,
+            )
+            if published_at > observed:
+                raise ValueError("formula task artifact is newer than observation")
+            verified[task_id] = FormulaMarketVerifiedTask(receipt, request, result)
+        connection.rollback()
+    finally:
+        if connection is not None:
+            connection.close()
+    after = os.lstat(state_path)
+    if (
+        _identity(before)[:2] != _identity(after)[:2]
+        or _sidecars(state_path)[:2] != sidecars[:2]
+        or (sidecars[:2] == (None, None) and before.st_ctime_ns != after.st_ctime_ns)
+        or datetime.fromtimestamp(max(before.st_ctime_ns, sidecars[2]) / 1e9, tz=UTC) > observed
+    ):
+        raise ValueError("formula task state rotated or is newer than observation")
+    return verified
