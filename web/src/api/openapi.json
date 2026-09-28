@@ -5168,6 +5168,20 @@
         "title": "LocalExpr",
         "type": "object"
       },
+      "LogCapabilities": {
+        "properties": {
+          "units": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Units",
+            "type": "array"
+          }
+        },
+        "title": "LogCapabilities",
+        "type": "object"
+      },
       "MarketInfo": {
         "properties": {
           "is_trading_day": {
@@ -11977,6 +11991,27 @@
           }
         },
         "summary": "任务与运行状态",
+        "tags": [
+          "tasks"
+        ]
+      }
+    },
+    "/api/v1/tasks/services/log-capabilities": {
+      "get": {
+        "operationId": "get_log_capabilities_api_v1_tasks_services_log_capabilities_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LogCapabilities"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "可查看的服务日志",
         "tags": [
           "tasks"
         ]

@@ -320,6 +320,194 @@ describe("任务与运行状态总览", () => {
   });
 });
 
+describe("服务运行日志", () => {
+  beforeEach(() => server.use(overviewHandler()));
+
+  it("keeps every entry hidden until an independent capability names the exact unit", async () => {
+    renderApp("/tasks");
+    await screen.findByRole("table", { name: "定时任务" });
+    expect(screen.queryByRole("button", { name: /运行日志/ })).toBeNull();
+  });
+
+  it("opens only matching timer and service rows, paginates, filters, and restores focus", async () => {
+    const requests: URL[] = [];
+    server.use(
+      overviewHandler(
+        overviewEnvelope({
+          services: {
+            ...overviewEnvelope().data.services,
+            items: [
+              {
+                name: "备份服务",
+                plane_label: "维护",
+                status: { state: "ok", label: "正常", reason: "正常" },
+                heartbeat_at: "2026-09-24T07:30:45Z",
+                service_id: "rquant-backup.service",
+              },
+            ],
+          },
+        }),
+      ),
+      http.get("*/api/v1/tasks/services/log-capabilities", () =>
+        HttpResponse.json({ units: ["rquant-daily.service", "rquant-backup.service"] }),
+      ),
+      http.get("*/api/v1/tasks/services/:unit/logs", ({ request }) => {
+        requests.push(new URL(request.url));
+        const cursor = new URL(request.url).searchParams.get("cursor");
+        return HttpResponse.json({
+          service_label: "每日任务",
+          scope: "本机本次开机以来的服务日志（含手动运行）",
+          entries: [
+            {
+              at: "2026-09-28T04:00:00Z",
+              level: "信息",
+              text: cursor ? "任务已完成" : "任务已开始",
+            },
+          ],
+          next_cursor: cursor ? null : "signed-page-cursor",
+          raw_message: "Bearer private token",
+        });
+      }),
+    );
+    const user = userEvent.setup();
+    renderApp("/tasks");
+    const timerButton = await screen.findByRole("button", { name: "查看日线更新的运行日志" });
+    expect(screen.getByRole("button", { name: "查看备份服务的运行日志" })).toBeInTheDocument();
+    await user.click(timerButton);
+    const dialog = await screen.findByRole("dialog", { name: /本机本次开机以来的服务日志/ });
+    expect(within(dialog).getByText("任务已开始")).toBeInTheDocument();
+    expect(within(dialog).getByText("2026-09-28 12:00:00")).toBeInTheDocument();
+    expect(
+      within(within(dialog).getByRole("list", { name: "服务日志" })).getByText("信息"),
+    ).toBeInTheDocument();
+    expect(dialog).not.toHaveTextContent("rquant-daily.service");
+    expect(dialog).not.toHaveTextContent("Bearer private token");
+    await user.click(within(dialog).getByRole("button", { name: "加载更早记录" }));
+    expect(await within(dialog).findByText("任务已完成")).toBeInTheDocument();
+    expect(requests[1]?.searchParams.get("cursor")).toBe("signed-page-cursor");
+    await user.selectOptions(within(dialog).getByRole("combobox", { name: "日志级别" }), "warning");
+    await waitFor(() => expect(within(dialog).queryByText("任务已完成")).toBeNull());
+    expect(requests.at(-1)?.searchParams.get("level")).toBe("warning");
+    expect(requests.at(-1)?.searchParams.get("cursor")).toBeNull();
+    await user.selectOptions(within(dialog).getByRole("combobox", { name: "时间范围" }), "hour");
+    expect(requests.at(-1)?.searchParams.has("since")).toBe(true);
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(timerButton).toHaveFocus());
+  });
+
+  it("clears old pages on 409 and revokes an open drawer on permission loss", async () => {
+    let status = 200;
+    let units = ["rquant-daily.service"];
+    server.use(
+      http.get("*/api/v1/tasks/services/log-capabilities", () => HttpResponse.json({ units })),
+      http.get("*/api/v1/tasks/services/:unit/logs", () =>
+        status === 200
+          ? HttpResponse.json({
+              service_label: "每日任务",
+              scope: "本机本次开机以来的服务日志（含手动运行）",
+              entries: [{ at: "2026-09-28T04:00:00Z", level: "信息", text: "任务已完成" }],
+              next_cursor: "signed-page-cursor",
+            })
+          : HttpResponse.json({ detail: "private-journal-message" }, { status }),
+      ),
+    );
+    const user = userEvent.setup();
+    const { queryClient } = renderApp("/tasks");
+    const button = await screen.findByRole("button", { name: "查看日线更新的运行日志" });
+    await user.click(button);
+    expect(await screen.findByText("任务已完成")).toBeInTheDocument();
+    status = 409;
+    await user.click(screen.getByRole("button", { name: "加载更早记录" }));
+    expect(await screen.findByText("日志已更新，请重新查看。")).toBeInTheDocument();
+    expect(screen.queryByText("任务已完成")).toBeNull();
+    expect(document.body).not.toHaveTextContent("private-journal-message");
+    units = [];
+    await queryClient.invalidateQueries({ queryKey: ["tasks", "service-log-capabilities"] });
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: /服务日志/ })).toBeNull());
+    expect(screen.queryByRole("button", { name: "查看日线更新的运行日志" })).toBeNull();
+    await waitFor(() => expect(screen.getByRole("button", { name: "刷新" })).toHaveFocus());
+  });
+
+  it("shows a safe 429 state and retry without displaying transport detail", async () => {
+    let busy = true;
+    server.use(
+      http.get("*/api/v1/tasks/services/log-capabilities", () =>
+        HttpResponse.json({ units: ["rquant-daily.service"] }),
+      ),
+      http.get("*/api/v1/tasks/services/:unit/logs", () =>
+        busy
+          ? HttpResponse.json({ detail: "Bearer private" }, { status: 429 })
+          : HttpResponse.json({
+              service_label: "每日任务",
+              scope: "本机本次开机以来的服务日志（含手动运行）",
+              entries: [],
+              next_cursor: null,
+            }),
+      ),
+    );
+    const user = userEvent.setup();
+    renderApp("/tasks");
+    await user.click(await screen.findByRole("button", { name: "查看日线更新的运行日志" }));
+    expect(await screen.findByText("请求较多，请稍后重试。")).toBeInTheDocument();
+    expect(document.body).not.toHaveTextContent("Bearer private");
+    busy = false;
+    await user.click(screen.getByRole("button", { name: "重试" }));
+    expect(await screen.findByText("所选范围还没有可显示的日志。")).toBeInTheDocument();
+  });
+
+  it("never prints an unexpected message or level from a malformed response", async () => {
+    server.use(
+      http.get("*/api/v1/tasks/services/log-capabilities", () =>
+        HttpResponse.json({ units: ["rquant-daily.service"] }),
+      ),
+      http.get("*/api/v1/tasks/services/:unit/logs", () =>
+        HttpResponse.json({
+          service_label: "每日任务",
+          scope: "本机本次开机以来的服务日志（含手动运行）",
+          entries: [
+            {
+              at: "2026-09-28T04:00:00Z",
+              level: "internal-state",
+              text: "Bearer private journal MESSAGE",
+            },
+          ],
+          next_cursor: null,
+        }),
+      ),
+    );
+    const user = userEvent.setup();
+    renderApp("/tasks");
+    await user.click(await screen.findByRole("button", { name: "查看日线更新的运行日志" }));
+    expect(await screen.findByText("该条内容暂不可显示")).toBeInTheDocument();
+    expect(document.body).not.toHaveTextContent("Bearer private journal MESSAGE");
+    expect(document.body).not.toHaveTextContent("internal-state");
+  });
+
+  it("drops the open log page as soon as the confirmed viewer changes", async () => {
+    server.use(
+      http.get("*/api/v1/tasks/services/log-capabilities", () =>
+        HttpResponse.json({ units: ["rquant-daily.service"] }),
+      ),
+      http.get("*/api/v1/tasks/services/:unit/logs", () =>
+        HttpResponse.json({
+          service_label: "每日任务",
+          scope: "本机本次开机以来的服务日志（含手动运行）",
+          entries: [{ at: "2026-09-28T04:00:00Z", level: "信息", text: "任务已完成" }],
+          next_cursor: null,
+        }),
+      ),
+    );
+    const user = userEvent.setup();
+    const { queryClient } = renderApp("/tasks");
+    await user.click(await screen.findByRole("button", { name: "查看日线更新的运行日志" }));
+    expect(await screen.findByText("任务已完成")).toBeInTheDocument();
+    queryClient.setQueryData(["meta"], metaEnvelope({ viewer: "other" }));
+    await waitFor(() => expect(screen.queryByText("任务已完成")).toBeNull());
+    expect(screen.queryByRole("button", { name: "查看日线更新的运行日志" })).toBeNull();
+    expect(screen.getByText("当前身份已变化，运行日志已关闭。")).toBeInTheDocument();
+  });
+});
+
 describe("研究任务进展", () => {
   beforeEach(() => server.use(overviewHandler()));
 

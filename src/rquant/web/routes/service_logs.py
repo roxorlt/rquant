@@ -37,6 +37,12 @@ _INVALID = "日志筛选条件有误，请检查后重试。"
 LogLevel = Literal["emerg", "alert", "crit", "err", "warning", "notice", "info", "debug"]
 
 
+class LogCapabilities(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    units: tuple[str, ...] = ()
+
+
 class _LogQuery(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -90,7 +96,7 @@ def _read_public_key(path: Path) -> bytes:
         os.close(descriptor)
 
 
-def _installed_unit(request: Request, unit: str) -> bool:
+def _installed_units(request: Request) -> frozenset[str]:
     settings = request.app.state.web.settings
     assert settings.unit_log_manifest_path is not None
     assert settings.unit_log_public_key_path is not None
@@ -106,7 +112,63 @@ def _installed_unit(request: Request, unit: str) -> bool:
         )
     except Exception:
         raise HTTPException(status_code=503, detail=_UNAVAILABLE) from None
-    return any(item.service == unit for item in manifest.units)
+    return frozenset(item.service for item in manifest.units)
+
+
+def _private_ingress_ready(path: Path) -> bool:
+    try:
+        directory = path.parent.lstat()
+        current = path.lstat()
+        return (
+            path.is_absolute()
+            and stat.S_ISDIR(directory.st_mode)
+            and directory.st_uid == os.geteuid()
+            and stat.S_IMODE(directory.st_mode) == 0o710
+            and stat.S_ISSOCK(current.st_mode)
+            and current.st_uid == os.geteuid()
+            and current.st_gid == directory.st_gid
+            and stat.S_IMODE(current.st_mode) == 0o660
+        )
+    except OSError:
+        return False
+
+
+def _runtime_ready(request: Request) -> bool:
+    web = request.app.state.web
+    settings = web.settings
+    if (
+        settings.ingress_socket_path is None
+        or not settings.log_admin_users
+        or settings.unit_log_socket_path is None
+        or web.unit_log_client is None
+        or web.unit_log_access_audit is None
+        or not settings.unit_log_verified_units
+        or not _private_ingress_ready(settings.ingress_socket_path)
+    ):
+        return False
+    try:
+        return web.unit_log_client.preflight() is True
+    except Exception:
+        return False
+
+
+@router.get(
+    "/services/log-capabilities",
+    response_model=LogCapabilities,
+    summary="可查看的服务日志",
+)
+def get_log_capabilities(
+    request: Request,
+    viewer: Annotated[str | None, Depends(current_user)],
+) -> LogCapabilities:
+    settings = request.app.state.web.settings
+    if viewer is None or viewer not in settings.log_admin_users or not _runtime_ready(request):
+        return LogCapabilities()
+    try:
+        installed = _installed_units(request)
+    except HTTPException:
+        return LogCapabilities()
+    return LogCapabilities(units=tuple(sorted(installed & settings.unit_log_verified_units)))
 
 
 @contextmanager
@@ -166,14 +228,7 @@ def get_service_logs(
 ) -> JournalPage:
     web = request.app.state.web
     settings = web.settings
-    if (
-        settings.ingress_socket_path is None
-        or not settings.log_admin_users
-        or settings.unit_log_socket_path is None
-        or web.unit_log_client is None
-        or web.unit_log_access_audit is None
-        or not settings.unit_log_verified_units
-    ):
+    if not _runtime_ready(request):
         raise HTTPException(status_code=503, detail="运行日志尚未开放。")
     if viewer is None:
         raise HTTPException(status_code=401, detail="请先登录。")
@@ -184,7 +239,7 @@ def get_service_logs(
     now = web.clock()
     query = _parse_query(request, now=now)
     with _admitted(web.unit_log_gate):
-        if not _installed_unit(request, unit):
+        if unit not in _installed_units(request):
             raise HTTPException(status_code=403, detail="当前服务的运行日志尚未开放。")
         try:
             recorded = web.unit_log_access_audit.record(

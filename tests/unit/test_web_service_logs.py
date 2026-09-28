@@ -9,6 +9,7 @@ import threading
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -43,6 +44,7 @@ class FakeClient:
     def __init__(self) -> None:
         self.calls: list[dict[str, object]] = []
         self.error: Exception | None = None
+        self.available = True
 
     def read(self, **kwargs: object) -> JournalPage:
         self.calls.append(kwargs)
@@ -53,6 +55,9 @@ class FakeClient:
             entries=(JournalEntry(at=NOW, level="信息", text="任务已完成"),),
             next_cursor=None,
         )
+
+    def preflight(self) -> bool:
+        return self.available
 
 
 class FakeAudit:
@@ -74,9 +79,23 @@ def _configured(tmp_path: Path, *, accepted: frozenset[str] = frozenset({UNIT}))
     public_path = tmp_path / "public.pem"
     manifest_path.write_bytes(signed.canonical_bytes())
     public_path.write_bytes(public)
+    ingress_dir = tmp_path / "ingress"
+    ingress_dir.mkdir(mode=0o710, exist_ok=True)
+    ingress_dir.chmod(0o710)
+    ingress_path = ingress_dir / "web.sock"
+    if ingress_path.exists():
+        ingress_path.unlink()
+    original_directory = Path.cwd()
+    try:
+        os.chdir(tmp_path)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+            listener.bind("ingress/web.sock")
+    finally:
+        os.chdir(original_directory)
+    ingress_path.chmod(0o660)
     return WebSettings(
         serving_root=tmp_path / "serving",
-        ingress_socket_path=tmp_path / "ingress" / "web.sock",
+        ingress_socket_path=ingress_path,
         log_admin_users=frozenset({"liutong"}),
         unit_log_socket_path=tmp_path / "ops" / "unit-logs.sock",
         unit_log_service_uid=os.geteuid() + 1,
@@ -86,6 +105,89 @@ def _configured(tmp_path: Path, *, accepted: frozenset[str] = frozenset({UNIT}))
         unit_log_expected_host=socket.gethostname(),
         unit_log_verified_units=accepted,
     )
+
+
+def test_capability_only_lists_currently_admitted_exact_units_without_side_effects(
+    tmp_path: Path,
+) -> None:
+    fake = FakeClient()
+    audit = FakeAudit()
+    settings = _configured(tmp_path)
+    app = create_app(
+        settings,
+        clock=lambda: NOW,
+        background=False,
+        unit_log_client=fake,
+        unit_log_access_audit=audit,
+    )
+    capability_url = "/api/v1/tasks/services/log-capabilities"
+    with TestClient(app) as client:
+        available = client.get(capability_url, headers=ADMIN)
+        anonymous = client.get(capability_url)
+        other = client.get(capability_url, headers={"X-Rquant-User": "other"})
+        assert available.status_code == 200
+        assert available.json() == {"units": [UNIT]}
+        assert anonymous.json() == {"units": []}
+        assert other.json() == {"units": []}
+        assert app.state.web.unit_log_gate.acquire(blocking=False)
+        app.state.web.unit_log_gate.release()
+        assert fake.calls == []
+        assert audit.records == []
+
+        assert settings.ingress_socket_path is not None
+        settings.ingress_socket_path.chmod(0o666)
+        assert client.get(capability_url, headers=ADMIN).json() == {"units": []}
+        assert (
+            client.get(URL, headers=ADMIN, params={"since": SINCE.isoformat()}).status_code == 503
+        )
+        settings.ingress_socket_path.chmod(0o660)
+        fake.available = False
+        assert client.get(capability_url, headers=ADMIN).json() == {"units": []}
+        assert (
+            client.get(URL, headers=ADMIN, params={"since": SINCE.isoformat()}).status_code == 503
+        )
+        assert fake.calls == []
+        fake.available = True
+        app.state.web = replace(
+            app.state.web,
+            settings=settings.model_copy(update={"unit_log_verified_units": frozenset()}),
+        )
+        assert client.get(capability_url, headers=ADMIN).json() == {"units": []}
+
+
+def test_capability_fails_closed_on_missing_client_audit_and_manifest(tmp_path: Path) -> None:
+    capability_url = "/api/v1/tasks/services/log-capabilities"
+    settings = _configured(tmp_path)
+    fake = FakeClient()
+    for missing in ("audit", "client"):
+        app = create_app(
+            settings,
+            clock=lambda: NOW,
+            background=False,
+            unit_log_client=fake,
+            unit_log_access_audit=FakeAudit(),
+        )
+        if missing == "audit":
+            app.state.web = replace(app.state.web, unit_log_access_audit=None)
+        else:
+            app.state.web = replace(app.state.web, unit_log_client=None)
+        with TestClient(app) as client:
+            assert client.get(capability_url, headers=ADMIN).json() == {"units": []}
+    assert settings.unit_log_manifest_path is not None
+    settings.unit_log_manifest_path.write_bytes(b"invalid manifest")
+    app = create_app(
+        settings,
+        clock=lambda: NOW,
+        background=False,
+        unit_log_client=fake,
+        unit_log_access_audit=FakeAudit(),
+    )
+    with TestClient(app) as client:
+        assert client.get(capability_url, headers=ADMIN).json() == {"units": []}
+
+    disabled = create_app(WebSettings(serving_root=tmp_path), background=False)
+    with TestClient(disabled) as client:
+        assert client.get(capability_url, headers=ADMIN).json() == {"units": []}
 
 
 def test_admin_reads_only_a_typed_bounded_service_page(tmp_path: Path) -> None:
@@ -468,9 +570,7 @@ def test_web_serve_alone_injects_real_audit_when_configured(
     assert capsys.readouterr().out == "{}"
 
     disabled = WebSettings(serving_root=tmp_path)
-    monkeypatch.setattr(
-        WebSettings, "from_env", classmethod(lambda _cls, *, bind=None: disabled)
-    )
+    monkeypatch.setattr(WebSettings, "from_env", classmethod(lambda _cls, *, bind=None: disabled))
     assert web_cli.main(["web-serve"]) == 0
     assert observed.pop() is None
 

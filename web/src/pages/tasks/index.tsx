@@ -1,6 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ApiError } from "@/api/client";
-import { type ResearchJobItem, type ResearchJobsData, useTaskOverview } from "@/api/endpoints";
+import {
+  type ResearchJobItem,
+  type ResearchJobsData,
+  useInvalidateServiceLogCapabilities,
+  useServiceLogCapabilities,
+  useTaskOverview,
+} from "@/api/endpoints";
 import { useCurrentMeta } from "@/api/useMeta";
 import { formatCount, formatPercent } from "@/format/number";
 import { formatShanghaiDateTime, formatShanghaiTime } from "@/format/time";
@@ -18,6 +24,7 @@ import {
   Tip,
 } from "@/ui";
 import { OverviewSections } from "./OverviewSections";
+import { type SelectedServiceLog, ServiceLogDrawer } from "./ServiceLogDrawer";
 import { type SelectedTask, TaskProgressDrawer } from "./TaskProgressDrawer";
 import "./tasks.css";
 
@@ -164,15 +171,25 @@ export default function TasksPage() {
   const [refreshKey, setRefreshKey] = useState(0);
   const [, setClockPulse] = useState(0);
   const [selected, setSelected] = useState<SelectedTask | null>(null);
+  const [selectedLog, setSelectedLog] = useState<SelectedServiceLog | null>(null);
+  const [logNotice, setLogNotice] = useState<string | null>(null);
+  const [blockedLogUnit, setBlockedLogUnit] = useState<{
+    unit: string;
+    viewer: string;
+    generationId: string;
+  } | null>(null);
   const [progressNotice, setProgressNotice] = useState<string | null>(null);
   const [blockedGeneration, setBlockedGeneration] = useState<string | null>(null);
   const returnFocus = useRef<HTMLButtonElement | null>(null);
+  const logReturnFocus = useRef<HTMLButtonElement | null>(null);
   const refreshAction = useRef<HTMLSpanElement | null>(null);
+  const invalidateLogCapabilities = useInvalidateServiceLogCapabilities();
   const meta = useCurrentMeta();
   const viewer = meta.isError ? null : (meta.data?.data.viewer ?? null);
   const [identity, setIdentity] = useState({ viewer, failed: meta.isError });
   const identityChanged = identity.viewer !== viewer || identity.failed !== meta.isError;
   const trustedViewer = !identityChanged && !meta.isError ? viewer : null;
+  const capabilities = useServiceLogCapabilities(trustedViewer);
   const pageIndex = cursors.length - 1;
   const result = useTaskOverview(
     cursors[pageIndex] ?? null,
@@ -215,6 +232,36 @@ export default function TasksPage() {
     data?.resources.source_state === "ready" &&
     resourcesDeadline !== null &&
     resourcesDeadline > now;
+  const logUnits = useMemo(() => {
+    if (trustedViewer === null || capabilities.isError || outdated || result.error !== null) {
+      return new Set<string>();
+    }
+    return new Set(capabilities.data?.units ?? []);
+  }, [trustedViewer, capabilities.data, capabilities.isError, outdated, result.error]);
+  const allowedLogUnits = useMemo(() => {
+    if (
+      blockedLogUnit === null ||
+      blockedLogUnit.viewer !== trustedViewer ||
+      blockedLogUnit.generationId !== generationId
+    ) {
+      return logUnits;
+    }
+    const allowed = new Set(logUnits);
+    allowed.delete(blockedLogUnit.unit);
+    return allowed;
+  }, [logUnits, blockedLogUnit, trustedViewer, generationId]);
+  const staleLogSelection =
+    selectedLog !== null &&
+    (selectedLog.viewer !== trustedViewer ||
+      selectedLog.generationId !== generationId ||
+      outdated ||
+      result.error !== null ||
+      !allowedLogUnits.has(selectedLog.unit) ||
+      !(
+        data?.scheduled.items.some((row) => row.service_unit === selectedLog.unit) ||
+        data?.services.items.some((row) => row.service_id === selectedLog.unit)
+      ));
+  const activeLogSelection = staleLogSelection ? null : selectedLog;
 
   const openProgress = useCallback(
     (row: ResearchJobItem, trigger: HTMLButtonElement) => {
@@ -245,6 +292,28 @@ export default function TasksPage() {
     [canViewProgress, openProgress],
   );
   const closeProgress = useCallback(() => setSelected(null), []);
+  const openLog = useCallback(
+    (unit: string, name: string, trigger: HTMLButtonElement) => {
+      if (trustedViewer === null || generationId === null || !allowedLogUnits.has(unit)) return;
+      logReturnFocus.current = trigger;
+      setLogNotice(null);
+      setSelectedLog({ unit, name, viewer: trustedViewer, generationId, openedAt: Date.now() });
+    },
+    [trustedViewer, generationId, allowedLogUnits],
+  );
+  const closeLog = useCallback(() => setSelectedLog(null), []);
+  const revokeLog = useCallback(() => {
+    if (selectedLog !== null) {
+      setBlockedLogUnit({
+        unit: selectedLog.unit,
+        viewer: selectedLog.viewer,
+        generationId: selectedLog.generationId,
+      });
+    }
+    setSelectedLog(null);
+    setLogNotice("当前账号无法查看运行日志。");
+    void invalidateLogCapabilities();
+  }, [selectedLog, invalidateLogCapabilities]);
   const invalidateProgress = useCallback(() => {
     if (selected !== null) setBlockedGeneration(selected.generationId);
     setSelected(null);
@@ -264,7 +333,11 @@ export default function TasksPage() {
         meta.isError ? "当前身份暂无法确认，任务进展已关闭。" : "当前身份已变化，任务进展已关闭。",
       );
     }
-  }, [identityChanged, viewer, meta.isError, selected]);
+    if (selectedLog !== null) {
+      setSelectedLog(null);
+      setLogNotice("当前身份已变化，运行日志已关闭。");
+    }
+  }, [identityChanged, viewer, meta.isError, selected, selectedLog]);
 
   useEffect(() => {
     if (!staleSelection || identityChanged || selected?.viewer !== viewer || meta.isError) return;
@@ -300,6 +373,28 @@ export default function TasksPage() {
     });
     return () => window.cancelAnimationFrame(frame);
   }, [selected]);
+
+  useEffect(() => {
+    if (!staleLogSelection || identityChanged || selectedLog?.viewer !== viewer || meta.isError)
+      return;
+    setSelectedLog(null);
+    setLogNotice("运行日志权限或数据已变化，请刷新后重新查看。");
+  }, [staleLogSelection, identityChanged, selectedLog, viewer, meta.isError]);
+
+  useEffect(() => {
+    if (selectedLog !== null || logReturnFocus.current === null) return;
+    const trigger = logReturnFocus.current;
+    logReturnFocus.current = null;
+    const frame = window.requestAnimationFrame(() => {
+      if (trigger.isConnected && !trigger.disabled) trigger.focus();
+      else {
+        const refresh = refreshAction.current?.querySelector("button");
+        if (refresh && !refresh.disabled) refresh.focus();
+        else refreshAction.current?.focus();
+      }
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [selectedLog]);
 
   useEffect(() => {
     if (!changed || pageIndex === 0) return;
@@ -344,6 +439,7 @@ export default function TasksPage() {
     if (meta.isError || meta.data === undefined) void meta.refetch();
     setCursors([null]);
     setRefreshKey((value) => value + 1);
+    if (trustedViewer !== null) void capabilities.refetch();
   }
 
   return (
@@ -364,6 +460,11 @@ export default function TasksPage() {
       {progressNotice ? (
         <p className="tasks-notice tasks-progress-notice" role="status">
           {progressNotice}
+        </p>
+      ) : null}
+      {logNotice ? (
+        <p className="tasks-notice tasks-progress-notice" role="status">
+          {logNotice}
         </p>
       ) : null}
       {meta.isError ? (
@@ -392,6 +493,8 @@ export default function TasksPage() {
             data={data}
             scheduledFresh={scheduledFresh}
             resourcesFresh={resourcesFresh}
+            logUnits={allowedLogUnits}
+            onLog={openLog}
           />
           {data.research.counts ? (
             <KpiStrip items={metrics(data.research)} label="任务状态概况" compact />
@@ -459,6 +562,7 @@ export default function TasksPage() {
         onClose={closeProgress}
         onInvalidated={invalidateProgress}
       />
+      <ServiceLogDrawer selected={activeLogSelection} onClose={closeLog} onRevoked={revokeLog} />
     </>
   );
 }

@@ -24,6 +24,9 @@ export const monitorHandler = (envelope = monitorEnvelope()) =>
 export const tasksHandler = (envelope = tasksEnvelope()) =>
   http.get("*/api/v1/tasks/jobs", () => HttpResponse.json(envelope));
 
+export const logCapabilitiesHandler = () =>
+  http.get("*/api/v1/tasks/services/log-capabilities", () => HttpResponse.json({ units: [] }));
+
 export const paperHandler = (envelope = paperEnvelope()) =>
   http.get("*/api/v1/paper/accounts", () => HttpResponse.json(envelope));
 
@@ -42,6 +45,7 @@ export const server = setupServer(
   healthHandler(),
   monitorHandler(),
   tasksHandler(),
+  logCapabilitiesHandler(),
   paperHandler(),
   poolEditorHandler(),
 );
