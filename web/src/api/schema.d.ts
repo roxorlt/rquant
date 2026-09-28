@@ -548,6 +548,57 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/screen/tdx/market/jobs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 公式选股任务 */
+        get: operations["list_formula_market_jobs_api_v1_screen_tdx_market_jobs_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/screen/tdx/market/jobs/{task_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 公式选股任务详情 */
+        get: operations["get_formula_market_job_api_v1_screen_tdx_market_jobs__task_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/screen/tdx/market/jobs/{task_id}/matches": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 公式选股命中代码 */
+        get: operations["get_formula_market_matches_api_v1_screen_tdx_market_jobs__task_id__matches_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/screen/tdx/parse": {
         parameters: {
             query?: never;
@@ -2097,6 +2148,21 @@ export interface components {
             data: components["schemas"]["DataAuditReportData"];
             serving: components["schemas"]["ServingMeta"];
         };
+        /** Envelope[FormulaMarketJobDetailData] */
+        Envelope_FormulaMarketJobDetailData_: {
+            data: components["schemas"]["FormulaMarketJobDetailData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[FormulaMarketJobListData] */
+        Envelope_FormulaMarketJobListData_: {
+            data: components["schemas"]["FormulaMarketJobListData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[FormulaMarketMatchesData] */
+        Envelope_FormulaMarketMatchesData_: {
+            data: components["schemas"]["FormulaMarketMatchesData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
         /** Envelope[HealthData] */
         Envelope_HealthData_: {
             data: components["schemas"]["HealthData"];
@@ -2293,6 +2359,101 @@ export interface components {
              * Format: date
              */
             trade_date: string;
+        };
+        /** FormulaMarketJobDetailData */
+        FormulaMarketJobDetailData: {
+            job: components["schemas"]["FormulaMarketJobItem"];
+            summary: components["schemas"]["FormulaMarketResultSummary"] | null;
+        };
+        /** FormulaMarketJobItem */
+        FormulaMarketJobItem: {
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /** Formula */
+            formula: string;
+            /** Hint */
+            hint: string;
+            /** Result Available */
+            result_available: boolean;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "queued" | "running" | "succeeded" | "failed";
+            /** Status Label */
+            status_label: string;
+            /** Task Id */
+            task_id: string;
+            /**
+             * Trade Date
+             * Format: date
+             */
+            trade_date: string;
+            /**
+             * Updated At
+             * Format: date-time
+             */
+            updated_at: string;
+        };
+        /** FormulaMarketJobListData */
+        FormulaMarketJobListData: {
+            /**
+             * Availability
+             * @enum {string}
+             */
+            availability: "unavailable" | "not_published" | "empty" | "ready";
+            /** Available At */
+            available_at: string | null;
+            /** Has Older Tasks */
+            has_older_tasks: boolean;
+            /** Jobs */
+            jobs: components["schemas"]["FormulaMarketJobItem"][];
+            /** Message */
+            message: string;
+            /** Total Task Count */
+            total_task_count: number;
+        };
+        /** FormulaMarketMatchesData */
+        FormulaMarketMatchesData: {
+            /** Match Codes */
+            match_codes: string[];
+            /** Next Cursor */
+            next_cursor: string | null;
+            /** Offset */
+            offset: number;
+            /** Task Id */
+            task_id: string;
+            /** Total */
+            total: number;
+        };
+        /** FormulaMarketResultSummary */
+        FormulaMarketResultSummary: {
+            /** Listed Count */
+            listed_count: number;
+            /** Market Total */
+            market_total: number;
+            /** Match Count */
+            match_count: number;
+            /** No Match Count */
+            no_match_count: number;
+            /** Paused Count */
+            paused_count: number;
+            /** Unknown Count */
+            unknown_count: number;
+            /** Unknown Reasons */
+            unknown_reasons: components["schemas"]["FormulaMarketUnknownReason"][];
+        };
+        /** FormulaMarketUnknownReason */
+        FormulaMarketUnknownReason: {
+            /** Count */
+            count: number;
+            /** Label */
+            label: string;
+            /** Reason */
+            reason: string;
         };
         /** FreshnessItem */
         FreshnessItem: {
@@ -5074,6 +5235,91 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["FormulaMarketCommandReceipt"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_formula_market_jobs_api_v1_screen_tdx_market_jobs_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_FormulaMarketJobListData_"];
+                };
+            };
+        };
+    };
+    get_formula_market_job_api_v1_screen_tdx_market_jobs__task_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                task_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_FormulaMarketJobDetailData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_formula_market_matches_api_v1_screen_tdx_market_jobs__task_id__matches_get: {
+        parameters: {
+            query?: {
+                page_size?: number;
+                cursor?: string | null;
+            };
+            header?: never;
+            path: {
+                task_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_FormulaMarketMatchesData_"];
                 };
             };
             /** @description Validation Error */

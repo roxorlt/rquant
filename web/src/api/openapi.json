@@ -4078,6 +4078,54 @@
         "title": "Envelope[DataAuditReportData]",
         "type": "object"
       },
+      "Envelope_FormulaMarketJobDetailData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/FormulaMarketJobDetailData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[FormulaMarketJobDetailData]",
+        "type": "object"
+      },
+      "Envelope_FormulaMarketJobListData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/FormulaMarketJobListData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[FormulaMarketJobListData]",
+        "type": "object"
+      },
+      "Envelope_FormulaMarketMatchesData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/FormulaMarketMatchesData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[FormulaMarketMatchesData]",
+        "type": "object"
+      },
       "Envelope_HealthData_": {
         "properties": {
           "data": {
@@ -4688,6 +4736,278 @@
           "trade_date"
         ],
         "title": "FormulaMarketCommandRequest",
+        "type": "object"
+      },
+      "FormulaMarketJobDetailData": {
+        "additionalProperties": false,
+        "properties": {
+          "job": {
+            "$ref": "#/components/schemas/FormulaMarketJobItem"
+          },
+          "summary": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FormulaMarketResultSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "job",
+          "summary"
+        ],
+        "title": "FormulaMarketJobDetailData",
+        "type": "object"
+      },
+      "FormulaMarketJobItem": {
+        "additionalProperties": false,
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "formula": {
+            "title": "Formula",
+            "type": "string"
+          },
+          "hint": {
+            "title": "Hint",
+            "type": "string"
+          },
+          "result_available": {
+            "title": "Result Available",
+            "type": "boolean"
+          },
+          "status": {
+            "enum": [
+              "queued",
+              "running",
+              "succeeded",
+              "failed"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "status_label": {
+            "title": "Status Label",
+            "type": "string"
+          },
+          "task_id": {
+            "pattern": "^[0-9a-f]{32}$",
+            "title": "Task Id",
+            "type": "string"
+          },
+          "trade_date": {
+            "format": "date",
+            "title": "Trade Date",
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "task_id",
+          "status",
+          "status_label",
+          "hint",
+          "formula",
+          "trade_date",
+          "created_at",
+          "updated_at",
+          "result_available"
+        ],
+        "title": "FormulaMarketJobItem",
+        "type": "object"
+      },
+      "FormulaMarketJobListData": {
+        "additionalProperties": false,
+        "properties": {
+          "availability": {
+            "enum": [
+              "unavailable",
+              "not_published",
+              "empty",
+              "ready"
+            ],
+            "title": "Availability",
+            "type": "string"
+          },
+          "available_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Available At"
+          },
+          "has_older_tasks": {
+            "title": "Has Older Tasks",
+            "type": "boolean"
+          },
+          "jobs": {
+            "items": {
+              "$ref": "#/components/schemas/FormulaMarketJobItem"
+            },
+            "maxItems": 100,
+            "title": "Jobs",
+            "type": "array"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "total_task_count": {
+            "minimum": 0.0,
+            "title": "Total Task Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "availability",
+          "message",
+          "available_at",
+          "total_task_count",
+          "has_older_tasks",
+          "jobs"
+        ],
+        "title": "FormulaMarketJobListData",
+        "type": "object"
+      },
+      "FormulaMarketMatchesData": {
+        "additionalProperties": false,
+        "properties": {
+          "match_codes": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 100,
+            "title": "Match Codes",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          },
+          "offset": {
+            "minimum": 0.0,
+            "title": "Offset",
+            "type": "integer"
+          },
+          "task_id": {
+            "pattern": "^[0-9a-f]{32}$",
+            "title": "Task Id",
+            "type": "string"
+          },
+          "total": {
+            "minimum": 0.0,
+            "title": "Total",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "task_id",
+          "total",
+          "offset",
+          "match_codes",
+          "next_cursor"
+        ],
+        "title": "FormulaMarketMatchesData",
+        "type": "object"
+      },
+      "FormulaMarketResultSummary": {
+        "additionalProperties": false,
+        "properties": {
+          "listed_count": {
+            "minimum": 0.0,
+            "title": "Listed Count",
+            "type": "integer"
+          },
+          "market_total": {
+            "minimum": 0.0,
+            "title": "Market Total",
+            "type": "integer"
+          },
+          "match_count": {
+            "minimum": 0.0,
+            "title": "Match Count",
+            "type": "integer"
+          },
+          "no_match_count": {
+            "minimum": 0.0,
+            "title": "No Match Count",
+            "type": "integer"
+          },
+          "paused_count": {
+            "minimum": 0.0,
+            "title": "Paused Count",
+            "type": "integer"
+          },
+          "unknown_count": {
+            "minimum": 0.0,
+            "title": "Unknown Count",
+            "type": "integer"
+          },
+          "unknown_reasons": {
+            "items": {
+              "$ref": "#/components/schemas/FormulaMarketUnknownReason"
+            },
+            "title": "Unknown Reasons",
+            "type": "array"
+          }
+        },
+        "required": [
+          "market_total",
+          "listed_count",
+          "paused_count",
+          "match_count",
+          "no_match_count",
+          "unknown_count",
+          "unknown_reasons"
+        ],
+        "title": "FormulaMarketResultSummary",
+        "type": "object"
+      },
+      "FormulaMarketUnknownReason": {
+        "additionalProperties": false,
+        "properties": {
+          "count": {
+            "minimum": 1.0,
+            "title": "Count",
+            "type": "integer"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          }
+        },
+        "required": [
+          "reason",
+          "label",
+          "count"
+        ],
+        "title": "FormulaMarketUnknownReason",
         "type": "object"
       },
       "FreshnessItem": {
@@ -12105,6 +12425,143 @@
           }
         },
         "summary": "提交全市场公式选股",
+        "tags": [
+          "screen"
+        ]
+      }
+    },
+    "/api/v1/screen/tdx/market/jobs": {
+      "get": {
+        "operationId": "list_formula_market_jobs_api_v1_screen_tdx_market_jobs_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_FormulaMarketJobListData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "公式选股任务",
+        "tags": [
+          "screen"
+        ]
+      }
+    },
+    "/api/v1/screen/tdx/market/jobs/{task_id}": {
+      "get": {
+        "operationId": "get_formula_market_job_api_v1_screen_tdx_market_jobs__task_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "pattern": "^[0-9a-f]{32}$",
+              "title": "Task Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_FormulaMarketJobDetailData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "公式选股任务详情",
+        "tags": [
+          "screen"
+        ]
+      }
+    },
+    "/api/v1/screen/tdx/market/jobs/{task_id}/matches": {
+      "get": {
+        "operationId": "get_formula_market_matches_api_v1_screen_tdx_market_jobs__task_id__matches_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "pattern": "^[0-9a-f]{32}$",
+              "title": "Task Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Page Size",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 512,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_FormulaMarketMatchesData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "公式选股命中代码",
         "tags": [
           "screen"
         ]
