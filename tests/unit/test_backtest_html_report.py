@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from html.parser import HTMLParser
@@ -138,6 +139,42 @@ def test_hand_calculated_ledger_and_benchmark_render_as_offline_report() -> None
     assert "基准尚未提供" not in html
     assert html.count("<svg") == 2
     assert "<script" not in html and "http://" not in html and "https://" not in html
+
+
+def test_source_wording_stays_reader_facing_and_technical_provenance_is_folded() -> None:
+    result = _result()
+    html = render_backtest_html(result, _benchmark(result)).html_bytes.decode("utf-8")
+    body_before_details = html.split('<details class="provenance">', maxsplit=1)[0]
+
+    assert "事后指数收盘价" in body_before_details
+    assert "retrospective_daily_bar" not in body_before_details
+    assert "index_daily_bar" not in body_before_details
+    assert "retrospective_daily_bar" in html.split('<details class="provenance">', maxsplit=1)[1]
+    assert "静态图 · 无脚本" not in body_before_details
+    assert "Portfolio research" not in body_before_details
+    assert "rQuant / 组合研究" in body_before_details
+
+
+def test_390px_chart_has_readable_equivalent_date_and_value_ticks() -> None:
+    result = _result()
+    html = render_backtest_html(result, _benchmark(result)).html_bytes.decode("utf-8")
+    mobile_css = html.split("@media(max-width:640px)", maxsplit=1)[1].split(
+        "@media print", maxsplit=1
+    )[0]
+
+    # At 390px: 18px page gutters + 8px card padding and 1px borders per side.
+    chart_width = 390 - 2 * (18 + 8 + 1)
+    assert 11 * chart_width / 760 < 5  # Existing SVG axis text is too small.
+    assert 12 * len("2026年8月11日") < (chart_width - 8) / 2
+    assert ".chart-scale{display:grid" in mobile_css
+    assert (
+        "font-size:12px"
+        in mobile_css.split(".chart-scale{", maxsplit=1)[1].split("}", maxsplit=1)[0]
+    )
+    scales = re.findall(r'<div class="chart-scale"[^>]*>(.*?)</div>', html, flags=re.S)
+    assert len(scales) == 2
+    assert "上限 1.1099" in scales[0] and "下限 0.9801" in scales[0]
+    assert all("2026年8月10日" in scale and "2026年8月11日" in scale for scale in scales)
 
 
 def test_missing_benchmark_is_explicit_and_optional_metrics_are_not_zero_filled() -> None:
