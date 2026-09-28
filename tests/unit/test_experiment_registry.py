@@ -948,6 +948,219 @@ def test_readonly_reader_does_not_initialize_missing_database_or_mutate_registry
     assert after == before
 
 
+def test_readonly_attempt_page_orders_equal_times_and_filters_exact_family(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "experiments.sqlite3"
+    registry = ExperimentRegistry(path, managed_trust_root=tmp_path)
+    alpha = [_spec(family="alpha", seed=seed) for seed in (1, 2, 3)]
+    beta = [_spec(family="beta", seed=seed) for seed in (4, 5)]
+    _register_family(registry, alpha)
+    _register_family(registry, beta)
+    registrations = (
+        (alpha[0], 0),
+        (alpha[1], 1),
+        (beta[0], 1),
+        (alpha[2], 1),
+        (beta[1], 3),
+    )
+    for spec, minute in registrations:
+        registry.register_attempt(spec, registered_at=_NOW + timedelta(minutes=minute))
+    outcome = _outcome(alpha[0], attempted=3, rank=1, raw_p="0.01")
+    _succeed(registry, alpha[0], outcome)
+
+    reader = ExperimentRegistryReadonlyReader(path, managed_trust_root=tmp_path)
+    visible_at = _NOW + timedelta(minutes=2)
+    expected = sorted(
+        (spec for spec, minute in registrations if minute <= 2),
+        key=lambda spec: (
+            next(minute for candidate, minute in registrations if candidate == spec),
+            spec.experiment_id,
+        ),
+        reverse=True,
+    )
+    page = reader.list_attempts_page(as_of=visible_at, page_size=2)
+    assert [item.spec.experiment_id for item in page.items] == [
+        spec.experiment_id for spec in expected[:2]
+    ]
+    assert page.as_of == visible_at
+    assert page.hypothesis_family is None
+    assert page.has_more
+    assert page.next_cursor is not None
+    second = reader.list_attempts_page(
+        as_of=visible_at,
+        page_size=2,
+        cursor=page.next_cursor,
+    )
+    assert [item.spec.experiment_id for item in second.items] == [
+        spec.experiment_id for spec in expected[2:]
+    ]
+    assert not second.has_more
+    assert second.next_cursor is None
+
+    filtered = reader.list_attempts_page(
+        as_of=visible_at,
+        hypothesis_family="alpha",
+        page_size=10,
+    )
+    assert {item.spec.experiment_id for item in filtered.items} == {
+        spec.experiment_id for spec in alpha
+    }
+    assert filtered.hypothesis_family == "alpha"
+    completed = next(
+        item for item in filtered.items if item.spec.experiment_id == alpha[0].experiment_id
+    )
+    assert completed.status is ExperimentStatus.SUCCEEDED
+    assert completed.outcome == outcome
+
+
+def test_readonly_attempt_cursor_preserves_scope_and_rejects_invalid_inputs(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "experiments.sqlite3"
+    registry = ExperimentRegistry(path, managed_trust_root=tmp_path)
+    specs = [_spec(family="alpha", seed=seed) for seed in (1, 2)]
+    _register_family(registry, specs)
+    for index, spec in enumerate(specs):
+        registry.register_attempt(spec, registered_at=_NOW + timedelta(minutes=index))
+    reader = ExperimentRegistryReadonlyReader(path, managed_trust_root=tmp_path)
+    as_of = _NOW + timedelta(minutes=2)
+    cursor = reader.list_attempts_page(
+        as_of=as_of, hypothesis_family="alpha", page_size=1
+    ).next_cursor
+    assert cursor is not None
+
+    with pytest.raises(ValueError, match="cursor does not match"):
+        reader.list_attempts_page(as_of=as_of, cursor=cursor)
+    with pytest.raises(ValueError, match="cursor does not match"):
+        reader.list_attempts_page(
+            as_of=as_of + timedelta(minutes=1), hypothesis_family="alpha", cursor=cursor
+        )
+    with pytest.raises(ValueError, match="cursor"):
+        reader.list_attempts_page(
+            as_of=as_of,
+            hypothesis_family="alpha",
+            cursor=cursor.model_copy(update={"registered_at": as_of + timedelta(minutes=1)}),
+        )
+    with pytest.raises(ValueError):
+        reader.list_attempts_page(as_of=as_of, cursor="not a cursor")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="hypothesis_family"):
+        reader.list_attempts_page(as_of=as_of, hypothesis_family="")
+    with pytest.raises(ValueError, match="hypothesis_family"):
+        reader.list_attempts_page(as_of=as_of, hypothesis_family=7)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="timezone-aware"):
+        reader.list_attempts_page(as_of=as_of.replace(tzinfo=None))
+    for invalid_size in (0, 101, True):
+        with pytest.raises(ValueError, match="page_size"):
+            reader.list_attempts_page(as_of=as_of, page_size=invalid_size)
+
+
+def test_readonly_attempt_cursor_excludes_later_backdated_registration_but_reads_status_update(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "experiments.sqlite3"
+    registry = ExperimentRegistry(path, managed_trust_root=tmp_path)
+    newest, old, later = (_spec(seed=seed) for seed in (1, 2, 3))
+    _register_family(registry, [newest, old, later])
+    registry.register_attempt(newest, registered_at=_NOW + timedelta(minutes=2))
+    registry.register_attempt(old, registered_at=_NOW)
+    reader = ExperimentRegistryReadonlyReader(path, managed_trust_root=tmp_path)
+    as_of = _NOW + timedelta(minutes=3)
+    first = reader.list_attempts_page(as_of=as_of, page_size=1)
+    assert [item.spec.experiment_id for item in first.items] == [newest.experiment_id]
+    assert first.next_cursor is not None
+
+    registry.register_attempt(later, registered_at=_NOW + timedelta(minutes=1))
+    registry.start_attempt(old.experiment_id, started_at=_NOW + timedelta(minutes=4))
+    reader = ExperimentRegistryReadonlyReader(path, managed_trust_root=tmp_path)
+    second = reader.list_attempts_page(as_of=as_of, page_size=1, cursor=first.next_cursor)
+    assert [item.spec.experiment_id for item in second.items] == [old.experiment_id]
+    assert second.items[0].status is ExperimentStatus.RUNNING
+    assert second.next_cursor is None
+    fresh = reader.list_attempts_page(as_of=as_of, page_size=10)
+    assert later.experiment_id in {item.spec.experiment_id for item in fresh.items}
+
+
+@pytest.mark.parametrize(
+    ("column", "corrupt_value"),
+    [
+        ("experiment_id", "9" * 64),
+        ("hypothesis_family", "other-family"),
+        ("spec_json", "{bad-json"),
+        ("status", "unknown"),
+        ("registered_at", "1000-invalid"),
+    ],
+)
+def test_readonly_attempt_page_fails_whole_read_for_corrupt_lookahead(
+    tmp_path: Path,
+    column: str,
+    corrupt_value: str,
+) -> None:
+    path = tmp_path / "experiments.sqlite3"
+    registry = ExperimentRegistry(path, managed_trust_root=tmp_path)
+    newest, old = (_spec(seed=seed) for seed in (1, 2))
+    _register_family(registry, [newest, old])
+    registry.register_attempt(newest, registered_at=_NOW + timedelta(minutes=1))
+    registry.register_attempt(old, registered_at=_NOW)
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            f"UPDATE experiment_attempt SET {column} = ? WHERE experiment_id = ?",
+            (corrupt_value, old.experiment_id),
+        )
+    reader = ExperimentRegistryReadonlyReader(path, managed_trust_root=tmp_path)
+
+    with pytest.raises(ExperimentRegistryError, match="attempt evidence is invalid"):
+        reader.list_attempts_page(as_of=_NOW + timedelta(minutes=2), page_size=1)
+
+
+def test_readonly_attempt_page_rejects_outcome_bound_to_another_experiment(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "experiments.sqlite3"
+    registry = ExperimentRegistry(path, managed_trust_root=tmp_path)
+    spec = _spec()
+    _register_family(registry, [spec])
+    outcome = _outcome(spec, attempted=1, rank=1, raw_p="0.01")
+    _succeed(registry, spec, outcome)
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "UPDATE experiment_outcome SET outcome_json = ? WHERE experiment_id = ?",
+            (
+                registry_module._json_payload(
+                    outcome.model_copy(update={"experiment_id": "9" * 64})
+                ),
+                spec.experiment_id,
+            ),
+        )
+
+    with pytest.raises(ExperimentRegistryError, match="attempt evidence is invalid"):
+        ExperimentRegistryReadonlyReader(path, managed_trust_root=tmp_path).list_attempts_page(
+            as_of=_NOW + timedelta(minutes=3)
+        )
+
+
+def test_readonly_attempt_page_does_not_create_or_modify_registry(tmp_path: Path) -> None:
+    path = tmp_path / "experiments.sqlite3"
+    reader = ExperimentRegistryReadonlyReader(path, managed_trust_root=tmp_path)
+    with pytest.raises(ExperimentRegistryError, match="does not exist"):
+        reader.list_attempts_page(as_of=_NOW)
+    assert not path.exists()
+
+    ExperimentRegistry(path, managed_trust_root=tmp_path)
+    before = {
+        item.name: (item.stat().st_size, item.stat().st_mtime_ns) for item in tmp_path.iterdir()
+    }
+    page = ExperimentRegistryReadonlyReader(path, managed_trust_root=tmp_path).list_attempts_page(
+        as_of=_NOW
+    )
+    after = {
+        item.name: (item.stat().st_size, item.stat().st_mtime_ns) for item in tmp_path.iterdir()
+    }
+    assert page.items == ()
+    assert page.next_cursor is None
+    assert after == before
+
+
 def test_readonly_reader_requires_explicit_managed_trust_root(tmp_path: Path) -> None:
     path = tmp_path / "experiments.sqlite3"
     ExperimentRegistry(path, managed_trust_root=tmp_path)

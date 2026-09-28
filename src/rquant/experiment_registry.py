@@ -36,6 +36,7 @@ CommitSha = Annotated[str, Field(pattern=r"^[0-9a-f]{40}$")]
 Probability = Annotated[Decimal, Field(ge=0, le=1, allow_inf_nan=False)]
 FiniteDecimal = Annotated[Decimal, Field(allow_inf_nan=False)]
 SHANGHAI = ZoneInfo("Asia/Shanghai")
+EXPERIMENT_ATTEMPT_PAGE_SIZE_MAX = 100
 
 
 class ExperimentStatus(StrEnum):
@@ -295,6 +296,39 @@ class ExperimentAttempt(RuntimeContractModel):
             if self.completed_at is None or not self.first_error or self.outcome is not None:
                 raise ValueError("failed or cancelled attempt requires first_error and completion")
         return self
+
+
+class ExperimentAttemptPageCursor(RuntimeContractModel):
+    """Immutable attempt order boundary bound to one registration view."""
+
+    schema_version: Literal[1] = 1
+    as_of: AwareUtcDatetime
+    hypothesis_family: str | None = None
+    registration_high_water: int = Field(ge=0)
+    registered_at: AwareUtcDatetime
+    experiment_id: Sha256
+
+    @model_validator(mode="after")
+    def validate_boundary(self) -> Self:
+        if self.registered_at > self.as_of:
+            raise ValueError("attempt cursor cannot be newer than its as_of cutoff")
+        if self.hypothesis_family == "":
+            raise ValueError("attempt cursor family cannot be empty")
+        return self
+
+
+class ExperimentAttemptPage(RuntimeContractModel):
+    """Bounded registration view; mutable attempt status is current at each read."""
+
+    items: tuple[ExperimentAttempt, ...]
+    as_of: AwareUtcDatetime
+    hypothesis_family: str | None = None
+    registration_high_water: int = Field(ge=0)
+    next_cursor: ExperimentAttemptPageCursor | None = None
+
+    @property
+    def has_more(self) -> bool:
+        return self.next_cursor is not None
 
 
 class ExperimentSubmissionIntent(RuntimeContractModel):
@@ -644,6 +678,106 @@ class ExperimentRegistryReadonlyReader:
             row = ExperimentRegistry._required_attempt_row(connection, experiment_id)
             return ExperimentRegistry._attempt_from_row(connection, row)
 
+    def list_attempts_page(
+        self,
+        *,
+        as_of: datetime,
+        hypothesis_family: str | None = None,
+        page_size: int = 50,
+        cursor: ExperimentAttemptPageCursor | None = None,
+    ) -> ExperimentAttemptPage:
+        """List a bounded keyset page of attempts visible at the registration cutoff."""
+
+        visible_at = normalize_aware_utc(as_of)
+        if (
+            isinstance(page_size, bool)
+            or not isinstance(page_size, int)
+            or not 1 <= page_size <= EXPERIMENT_ATTEMPT_PAGE_SIZE_MAX
+        ):
+            raise ValueError("attempt page_size must be from 1 through 100")
+        if hypothesis_family is not None and (
+            not isinstance(hypothesis_family, str) or not hypothesis_family
+        ):
+            raise ValueError("attempt hypothesis_family must be a nonempty string")
+        selected_cursor = (
+            ExperimentAttemptPageCursor.model_validate(cursor) if cursor is not None else None
+        )
+        if selected_cursor is not None and (
+            selected_cursor.as_of != visible_at
+            or selected_cursor.hypothesis_family != hypothesis_family
+        ):
+            raise ValueError("attempt cursor does not match the requested family or as_of")
+
+        with self._read_snapshot() as connection:
+            registration_high_water = (
+                selected_cursor.registration_high_water
+                if selected_cursor is not None
+                else int(
+                    connection.execute(
+                        "SELECT COALESCE(MAX(rowid), 0) FROM experiment_attempt"
+                    ).fetchone()[0]
+                )
+            )
+            index = (
+                "experiment_attempt_registered_keyset_idx"
+                if hypothesis_family is None
+                else "experiment_attempt_family_registered_keyset_idx"
+            )
+            clauses = ["registered_at <= ?", "rowid <= ?"]
+            parameters: list[str | int] = [_utc_iso(visible_at), registration_high_water]
+            if hypothesis_family is not None:
+                clauses.insert(0, "hypothesis_family = ?")
+                parameters.insert(0, hypothesis_family)
+            if selected_cursor is not None:
+                clauses.append("(registered_at, experiment_id) < (?, ?)")
+                parameters.extend(
+                    (_utc_iso(selected_cursor.registered_at), selected_cursor.experiment_id)
+                )
+            rows = connection.execute(
+                f"SELECT * FROM experiment_attempt INDEXED BY {index} "
+                f"WHERE {' AND '.join(clauses)} "
+                "ORDER BY registered_at DESC, experiment_id DESC LIMIT ?",
+                (*parameters, page_size + 1),
+            ).fetchall()
+            attempts: list[ExperimentAttempt] = []
+            for row in rows:
+                try:
+                    attempt = ExperimentRegistry._attempt_from_row(connection, row)
+                    if (
+                        attempt.spec.experiment_id != row["experiment_id"]
+                        or attempt.spec.hypothesis_family != row["hypothesis_family"]
+                        or _utc_iso(attempt.registered_at) != row["registered_at"]
+                        or attempt.registered_at > visible_at
+                        or (
+                            attempt.outcome is not None
+                            and attempt.outcome.experiment_id != attempt.spec.experiment_id
+                        )
+                    ):
+                        raise ValueError("attempt payload does not match indexed evidence")
+                except (TypeError, ValueError, IndexError) as exc:
+                    raise ExperimentRegistryError("experiment attempt evidence is invalid") from exc
+                attempts.append(attempt)
+
+        visible = tuple(attempts[:page_size])
+        next_cursor = (
+            ExperimentAttemptPageCursor(
+                as_of=visible_at,
+                hypothesis_family=hypothesis_family,
+                registration_high_water=registration_high_water,
+                registered_at=visible[-1].registered_at,
+                experiment_id=visible[-1].spec.experiment_id,
+            )
+            if len(attempts) > page_size
+            else None
+        )
+        return ExperimentAttemptPage(
+            items=visible,
+            as_of=visible_at,
+            hypothesis_family=hypothesis_family,
+            registration_high_water=registration_high_water,
+            next_cursor=next_cursor,
+        )
+
     def resolve_formal_plan(
         self,
         *,
@@ -969,6 +1103,12 @@ class ExperimentRegistry:
                 );
                 CREATE INDEX IF NOT EXISTS experiment_attempt_family_idx
                     ON experiment_attempt(hypothesis_family, experiment_id);
+                CREATE INDEX IF NOT EXISTS experiment_attempt_registered_keyset_idx
+                    ON experiment_attempt(registered_at DESC, experiment_id DESC);
+                CREATE INDEX IF NOT EXISTS experiment_attempt_family_registered_keyset_idx
+                    ON experiment_attempt(
+                        hypothesis_family, registered_at DESC, experiment_id DESC
+                    );
 
                 CREATE TABLE IF NOT EXISTS hypothesis_family_manifest (
                     hypothesis_family TEXT PRIMARY KEY,
