@@ -27,6 +27,7 @@ def _save(
     *,
     command_id: str = "save-formula-pool-1",
     base_name: str = "research",
+    actor_id: str = "researcher",
     expected_version: str | None = None,
 ) -> object:
     return parse_page_control_command(
@@ -37,6 +38,7 @@ def _save(
             "base_name": base_name,
             "display_name": "研究池",
             "task_id": task_id,
+            "actor_id": actor_id,
             "expected_version": expected_version,
         }
     )
@@ -91,6 +93,30 @@ def test_save_command_rejects_browser_formula_codes_and_paths() -> None:
             parse_page_control_command(command.model_dump(mode="json") | {forbidden: value})
     with pytest.raises(ValidationError):
         parse_page_control_command(command.model_dump(mode="json") | {"base_name": "x" * 81})
+
+
+def test_save_command_requires_actor_identity() -> None:
+    payload = _save("a" * 32).model_dump(mode="json")
+    payload.pop("actor_id")
+    with pytest.raises(ValidationError):
+        parse_page_control_command(payload)
+    command = parse_page_control_command(payload | {"actor_id": "researcher"})
+    assert command.actor_id == "researcher"
+
+
+def test_original_save_command_id_cannot_be_retried_as_another_actor(tmp_path: Path) -> None:
+    from rquant.page_control import PageControlCommandConflictError
+
+    service, admission, _definitions, _data_dir = _setup(tmp_path)
+    task_id = _queued(service)
+    assert FormulaMarketJobWorker(admission.store).run_one().status == "succeeded"
+    original = _save(task_id)
+    assert service.submit(original).status is PageControlStatus.SUCCEEDED
+    changed_actor = parse_page_control_command(
+        original.model_dump(mode="json") | {"actor_id": "another-user"}
+    )
+    with pytest.raises(PageControlCommandConflictError):
+        service.submit(changed_actor)
 
 
 def test_page_control_queues_worker_completes_then_saves_replayable_definition(

@@ -5010,6 +5010,110 @@
         "title": "FormulaMarketUnknownReason",
         "type": "object"
       },
+      "FormulaPoolSaveCommandReceipt": {
+        "additionalProperties": false,
+        "properties": {
+          "command_id": {
+            "title": "Command Id",
+            "type": "string"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "pool_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pool Name"
+          },
+          "status": {
+            "enum": [
+              "succeeded",
+              "pending",
+              "processing",
+              "failed",
+              "ambiguous",
+              "conflict"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "version": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Version"
+          }
+        },
+        "required": [
+          "command_id",
+          "status",
+          "message"
+        ],
+        "title": "FormulaPoolSaveCommandReceipt",
+        "type": "object"
+      },
+      "FormulaPoolSaveCommandRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "base_name": {
+            "maxLength": 80,
+            "minLength": 1,
+            "pattern": "^[\\w\\u4e00-\\u9fff-]+$",
+            "title": "Base Name",
+            "type": "string"
+          },
+          "command_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9._-]+$",
+            "title": "Command Id",
+            "type": "string"
+          },
+          "display_name": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Display Name",
+            "type": "string"
+          },
+          "expected_version": {
+            "title": "Expected Version",
+            "type": "null"
+          },
+          "requested_at": {
+            "format": "date-time",
+            "title": "Requested At",
+            "type": "string"
+          },
+          "task_id": {
+            "pattern": "^[0-9a-f]{32}$",
+            "title": "Task Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "command_id",
+          "requested_at",
+          "base_name",
+          "display_name",
+          "task_id",
+          "expected_version"
+        ],
+        "title": "FormulaPoolSaveCommandRequest",
+        "type": "object"
+      },
       "FreshnessItem": {
         "properties": {
           "key": {
@@ -12312,6 +12416,57 @@
           }
         },
         "summary": "保存池子或管理画布",
+        "tags": [
+          "pools"
+        ]
+      }
+    },
+    "/api/v1/pools/formula/commands": {
+      "post": {
+        "operationId": "submit_formula_pool_save_command_api_v1_pools_formula_commands_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FormulaPoolSaveCommandRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FormulaPoolSaveCommandReceipt"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FormulaPoolSaveCommandReceipt"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "保存公式池",
         "tags": [
           "pools"
         ]

@@ -497,6 +497,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/pools/formula/commands": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 保存公式池 */
+        post: operations["submit_formula_pool_save_command_api_v1_pools_formula_commands_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/screen/blocks": {
         parameters: {
             query?: never;
@@ -2454,6 +2471,40 @@ export interface components {
             label: string;
             /** Reason */
             reason: string;
+        };
+        /** FormulaPoolSaveCommandReceipt */
+        FormulaPoolSaveCommandReceipt: {
+            /** Command Id */
+            command_id: string;
+            /** Message */
+            message: string;
+            /** Pool Name */
+            pool_name?: string | null;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "succeeded" | "pending" | "processing" | "failed" | "ambiguous" | "conflict";
+            /** Version */
+            version?: string | null;
+        };
+        /** FormulaPoolSaveCommandRequest */
+        FormulaPoolSaveCommandRequest: {
+            /** Base Name */
+            base_name: string;
+            /** Command Id */
+            command_id: string;
+            /** Display Name */
+            display_name: string;
+            /** Expected Version */
+            expected_version: null;
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+            /** Task Id */
+            task_id: string;
         };
         /** FreshnessItem */
         FreshnessItem: {
@@ -5140,6 +5191,48 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["PoolEditorReceipt"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    submit_formula_pool_save_command_api_v1_pools_formula_commands_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["FormulaPoolSaveCommandRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FormulaPoolSaveCommandReceipt"];
+                };
+            };
+            /** @description Conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FormulaPoolSaveCommandReceipt"];
                 };
             };
             /** @description Validation Error */
