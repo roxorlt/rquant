@@ -136,7 +136,7 @@ describe("全市场公式选股", () => {
       ),
     );
     const user = userEvent.setup();
-    renderPreview();
+    renderPreview(true);
     const drawer = await checkAndChooseDate(user);
     await user.click(within(drawer).getByRole("button", { name: "运行全市场" }));
     expect(submitted).toHaveLength(0);
