@@ -78,6 +78,76 @@ jobs:
       - name: SourceBroker V2 frozen boundary
         run: uv run python scripts/source_broker_v2_frozen.py
 
+  price-rule-private-linux:
+    name: Price rule private UDS Linux identities
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # actions/checkout@v4
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Create private synthetic test root
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          root="$(mktemp -d "${RUNNER_TEMP}/rquant-price-private.XXXXXXXX")"
+          mkdir -p "${root}/data" "${root}/parquet" "${root}/logs"
+          chmod 700 "${root}" "${root}/data" "${root}/parquet" "${root}/logs"
+          {
+            printf 'RQUANT_PRICE_PRIVATE_CI_ROOT=%s\n' "${root}"
+            printf 'DATA_DIR=%s/data\n' "${root}"
+            printf 'DUCKDB_PATH=%s/data/test.duckdb\n' "${root}"
+            printf 'PARQUET_DIR=%s/parquet\n' "${root}"
+            printf 'LOG_DIR=%s/logs\n' "${root}"
+          } >> "${GITHUB_ENV}"
+
+      - name: Install uv
+        run: python -m pip install uv==0.10.11
+
+      - name: Install locked dependencies
+        run: uv sync --frozen
+
+      - name: Exercise real distinct UID and peer credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p test-results
+          sudo -n env \
+            RQUANT_DISABLE_DOTENV=1 \
+            TUSHARE_TOKEN_MAIN=00000000000000000000000000000000 \
+            NOTIFY_ENABLED=false \
+            DATA_DIR="${DATA_DIR}" \
+            DUCKDB_PATH="${DUCKDB_PATH}" \
+            PARQUET_DIR="${PARQUET_DIR}" \
+            LOG_DIR="${LOG_DIR}" \
+            PYTHONPATH="${GITHUB_WORKSPACE}/src" \
+            PYTHONDONTWRITEBYTECODE=1 \
+            "${GITHUB_WORKSPACE}/.venv/bin/python" -m pytest \
+              -o addopts='' --strict-markers -m linux_exact -q -rA \
+              --basetemp="${RQUANT_PRICE_PRIVATE_CI_ROOT}/pytest" \
+              --junitxml=test-results/price-rule-private-linux.xml \
+              tests/integration/test_price_alert_private_linux.py
+
+      - name: Verify all three exact cases ran without skips
+        if: always()
+        run: >-
+          .venv/bin/python tests/support/assert_junit_contract.py
+          --path test-results/price-rule-private-linux.xml
+          --suites 1 --tests 3 --failures 0 --errors 0 --skipped 0 --cases 3
+
+      - name: Upload price rule private Linux evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # actions/upload-artifact@v4
+        with:
+          name: price-rule-private-linux-py311
+          path: test-results/price-rule-private-linux.xml
+          if-no-files-found: error
+
   full-suite-shard:
     name: Full suite shard (${{ matrix.python-version }}, ${{ matrix.shard }})
     runs-on: ubuntu-24.04
