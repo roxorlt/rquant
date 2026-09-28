@@ -64,6 +64,17 @@ def test_missing_generation_is_not_a_zero_balance(tmp_path: Path) -> None:
         "source_note": None,
         "valuation_note": None,
         "accounts": [],
+        "history": {
+            "source_state": "unavailable",
+            "source_updated_at": None,
+            "source_note": None,
+            "account_id": None,
+            "total_orders": None,
+            "has_more": False,
+            "newest_updated_at": None,
+            "oldest_updated_at": None,
+            "orders": [],
+        },
     }
 
 

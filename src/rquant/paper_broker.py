@@ -9,7 +9,7 @@ from collections.abc import Mapping
 from datetime import UTC, date, datetime
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Literal, Self
 from zoneinfo import ZoneInfo
 
 from pydantic import Field, model_validator
@@ -50,6 +50,8 @@ NonNegativeDecimal = Annotated[Decimal, Field(ge=0, allow_inf_nan=False)]
 PositiveDecimal = Annotated[Decimal, Field(gt=0, allow_inf_nan=False)]
 _PRICE_TICK = Decimal("0.0001")
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
+_MAX_HISTORY_ORDERS = 200
+_MAX_HISTORY_FILLS = 1_000
 _LEDGER_UNKNOWN_COLUMNS = (
     "unknown_fill_availability_count",
     "unknown_lot_availability_count",
@@ -178,6 +180,43 @@ class PaperLedgerQuarantinedError(PaperBrokerReconciliationError):
 
 class NoExecutableSellQuantityError(ValueError):
     """A nonterminal sell tranche has no legal 100-share quantity."""
+
+
+class PaperHistoryFill(PaperFill):
+    persisted_at: AwareUtcDatetime
+
+    @model_validator(mode="after")
+    def validate_availability(self) -> Self:
+        if self.persisted_at < self.executed_at:
+            raise ValueError("paper history fill availability precedes execution")
+        return self
+
+
+class PaperOrderHistorySnapshot(RuntimeContractModel):
+    """One trusted order window, with every fill for each retained order."""
+
+    account_id: str = Field(min_length=1)
+    as_of: AwareUtcDatetime
+    ledger_revision: int = Field(ge=1)
+    total_orders: int = Field(ge=0)
+    has_more: bool
+    orders: tuple[PaperOrder, ...]
+    fills: tuple[PaperHistoryFill, ...]
+
+    @model_validator(mode="after")
+    def validate_window(self) -> Self:
+        if self.total_orders < len(self.orders) or self.has_more != (
+            self.total_orders > len(self.orders)
+        ):
+            raise ValueError("paper history window count is inconsistent")
+        if any(order.account_id != self.account_id for order in self.orders):
+            raise ValueError("paper history order account is inconsistent")
+        order_ids = {order.order_id for order in self.orders}
+        if len(order_ids) != len(self.orders) or any(
+            fill.order_id not in order_ids for fill in self.fills
+        ):
+            raise ValueError("paper history contains duplicate or orphan identities")
+        return self
 
 
 class BrokerCostPolicy(RuntimeContractModel):
@@ -4039,6 +4078,106 @@ class PaperBrokerStore:
                 (self.account_id, order_id),
             ).fetchone()
             return self._order_from_row(row) if row is not None else None
+
+    def recent_order_history(self, *, as_of: AwareUtcDatetime) -> PaperOrderHistorySnapshot:
+        """Read one trusted, bounded account window without mixing writer commits."""
+
+        if as_of.tzinfo is None or as_of.utcoffset() is None:
+            raise ValueError("paper history cutoff must be timezone-aware")
+        cutoff = as_of.astimezone(UTC)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN")
+            self._require_trusted_ledger(connection)
+            head = connection.execute(
+                "SELECT revision FROM paper_ledger_head_marker ORDER BY revision DESC LIMIT 1"
+            ).fetchone()
+            if head is None:
+                raise PaperBrokerReconciliationError("paper history trusted head is missing")
+            ledger_revision = int(head["revision"])
+            total_row = connection.execute(
+                "SELECT count(*) FROM paper_order WHERE account_id = ?", (self.account_id,)
+            ).fetchone()
+            assert total_row is not None
+            total_orders = int(total_row[0])
+            rows = connection.execute(
+                "SELECT * FROM paper_order WHERE account_id = ? "
+                "ORDER BY updated_at DESC, order_id DESC LIMIT ?",
+                (self.account_id, _MAX_HISTORY_ORDERS + 1),
+            ).fetchall()
+            retained = rows[:_MAX_HISTORY_ORDERS]
+            if len(retained) != min(total_orders, _MAX_HISTORY_ORDERS):
+                raise PaperBrokerReconciliationError("paper history order count changed")
+            orders = tuple(self._order_from_row(row) for row in retained)
+            if any(order.created_at > cutoff or order.updated_at > cutoff for order in orders):
+                raise PaperBrokerReconciliationError("paper history order is later than cutoff")
+            order_ids = tuple(order.order_id for order in orders)
+            fill_rows: list[sqlite3.Row] = []
+            if order_ids:
+                placeholders = ", ".join("?" for _ in order_ids)
+                fill_rows = connection.execute(
+                    "SELECT f.* FROM paper_fill AS f "
+                    "JOIN paper_order AS o ON o.order_id = f.order_id "
+                    f"WHERE o.account_id = ? AND f.order_id IN ({placeholders}) "
+                    "ORDER BY f.order_id, f.sequence, f.fill_id LIMIT ?",
+                    (self.account_id, *order_ids, _MAX_HISTORY_FILLS + 1),
+                ).fetchall()
+            if len(fill_rows) > _MAX_HISTORY_FILLS:
+                raise PaperBrokerReconciliationError("paper history fill capacity exceeded")
+            fills = tuple(
+                PaperHistoryFill(
+                    **self._fill_from_row(row).model_dump(mode="python"),
+                    persisted_at=row["persisted_at"],
+                )
+                for row in fill_rows
+            )
+            by_order: dict[str, list[PaperHistoryFill]] = {
+                str(order_id): [] for order_id in order_ids
+            }
+            for fill in fills:
+                if fill.order_id not in by_order:
+                    raise PaperBrokerReconciliationError("paper history fill order is missing")
+                if fill.persisted_at > cutoff or fill.executed_at > cutoff:
+                    raise PaperBrokerReconciliationError("paper history fill time is inconsistent")
+                by_order[fill.order_id].append(fill)
+            for order in orders:
+                parts = by_order[str(order.order_id)]
+                if [fill.sequence for fill in parts] != list(range(1, len(parts) + 1)):
+                    raise PaperBrokerReconciliationError(
+                        "paper history fill sequence is incomplete"
+                    )
+                quantity = sum(fill.quantity for fill in parts)
+                if quantity != order.filled_quantity:
+                    raise PaperBrokerReconciliationError(
+                        "paper history filled quantity is inconsistent"
+                    )
+                average = (
+                    (
+                        sum((fill.price * fill.quantity for fill in parts), Decimal("0")) / quantity
+                    ).quantize(self._execution_price_tick, rounding=ROUND_HALF_UP)
+                    if quantity
+                    else None
+                )
+                if average != order.average_fill_price or any(
+                    fill.executed_at > order.updated_at for fill in parts
+                ):
+                    raise PaperBrokerReconciliationError(
+                        "paper history fill summary is inconsistent"
+                    )
+            return PaperOrderHistorySnapshot(
+                account_id=self.account_id,
+                as_of=cutoff,
+                ledger_revision=ledger_revision,
+                total_orders=total_orders,
+                has_more=total_orders > len(orders),
+                orders=orders,
+                fills=fills,
+            )
+        except (sqlite3.DatabaseError, ValueError, TypeError) as exc:
+            raise PaperBrokerReconciliationError("paper history cannot be reconciled") from exc
+        finally:
+            connection.rollback()
+            connection.close()
 
     def order_for_intent(self, intent_id: str) -> PaperOrder | None:
         with self._connect() as connection:
