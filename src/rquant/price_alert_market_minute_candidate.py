@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 from pydantic import Field, StrictInt, TypeAdapter, ValidationError
 
@@ -29,6 +30,7 @@ _SHANGHAI = ZoneInfo("Asia/Shanghai")
 _CODES = TypeAdapter(tuple[TsCode, ...])
 _MAX_REQUEST_CODES = 1000
 _MAX_PAYLOAD_BYTES = 8 * 1024 * 1024
+_MAX_UNCOMPRESSED_BYTES = 8 * 1024 * 1024
 _MAX_BATCH_ROWS = 10_000
 
 
@@ -39,6 +41,9 @@ class MarketMinuteQuoteCandidateError(ValueError):
 class MarketMinuteQuoteCandidateConfig(RuntimeContractModel):
     expected_producer_commit: CommitSha
     max_payload_bytes: StrictInt = Field(default=_MAX_PAYLOAD_BYTES, ge=1, le=_MAX_PAYLOAD_BYTES)
+    max_uncompressed_bytes: StrictInt = Field(
+        default=_MAX_UNCOMPRESSED_BYTES, ge=1, le=_MAX_UNCOMPRESSED_BYTES
+    )
     max_rows: StrictInt = Field(default=_MAX_BATCH_ROWS, ge=1, le=_MAX_BATCH_ROWS)
 
 
@@ -80,6 +85,36 @@ def _decode_bounded_payload(
         not pa.types.is_float64(schema.field(column).type) for column in MARKET_MINUTE_COLUMNS[2:]
     ):
         raise MarketMinuteQuoteCandidateError("market-minute parquet numeric schema differs")
+    # Bound column pages before reading, then inspect dictionary values before row expansion.
+    uncompressed = 0
+    for group_index in range(parquet.metadata.num_row_groups):
+        group = parquet.metadata.row_group(group_index)
+        if group.num_columns != len(MARKET_MINUTE_COLUMNS):
+            raise MarketMinuteQuoteCandidateError("market-minute parquet column count differs")
+        for column_index in range(group.num_columns):
+            size = group.column(column_index).total_uncompressed_size
+            if size < 0 or size > config.max_uncompressed_bytes - uncompressed:
+                raise MarketMinuteQuoteCandidateError(
+                    "market-minute uncompressed bytes exceed bound"
+                )
+            uncompressed += size
+
+    try:
+        code_reader = pq.ParquetFile(BytesIO(payload), read_dictionary=["ts_code"])
+        code_column = code_reader.read(columns=["ts_code"], use_threads=False).column(0)
+        if len(code_column) != envelope.row_count or code_column.null_count:
+            raise MarketMinuteQuoteCandidateError("market-minute code column differs")
+        for chunk in code_column.chunks:
+            values = chunk.dictionary if pa.types.is_dictionary(chunk.type) else chunk
+            maximum = pc.max(pc.utf8_length(values)).as_py()
+            if maximum is not None and maximum > 9:
+                raise MarketMinuteQuoteCandidateError("market-minute code length exceeds bound")
+    except MarketMinuteQuoteCandidateError:
+        raise
+    except Exception as exc:
+        raise MarketMinuteQuoteCandidateError(
+            "market-minute code column cannot be decoded"
+        ) from exc
     try:
         frame = parquet.read(columns=list(MARKET_MINUTE_COLUMNS), use_threads=False).to_pandas()
     except Exception as exc:

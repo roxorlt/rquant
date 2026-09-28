@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import hashlib
 from datetime import UTC, date, datetime, timedelta
+from io import BytesIO
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from rquant.alert_price_rule import MarketDayEvidence
@@ -137,9 +140,9 @@ def test_gateway_normalized_payload_shape_is_accepted_without_fetch_or_spool() -
     assert _convert(envelope, payload)[0].quote.observed_at == _at(9, 59)
 
 
-def test_full_market_batch_over_one_thousand_rows_still_reuses_last_requested_quote() -> None:
-    last_code = "001000.SH"
-    frame = _frame(*[(f"{number:06d}.SH", _at(9, 59), 10.5) for number in range(1001)])
+def test_six_thousand_row_batch_still_reuses_last_requested_quote() -> None:
+    last_code = "005999.SH"
+    frame = _frame(*[(f"{number:06d}.SH", _at(9, 59), 10.5) for number in range(6000)])
     envelope, payload = _batch(frame)
     quotes = _convert(envelope, payload, requested_codes=(last_code,))
     assert [item.quote.ts_code for item in quotes] == [last_code]
@@ -243,6 +246,69 @@ def test_bytes_and_rows_are_bounded_before_accepting_batch() -> None:
             payload,
             config=MarketMinuteQuoteCandidateConfig(expected_producer_commit=COMMIT, max_rows=1),
         )
+
+
+def test_small_compressed_payload_with_oversized_column_is_rejected_before_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    oversized_code = "6" * 16_777_268
+    envelope, payload = _batch(_frame((oversized_code, _at(9, 59), 10.5)))
+    assert len(payload) < 8 * 1024 * 1024
+    parquet = pq.ParquetFile(BytesIO(payload))
+    assert parquet.metadata.row_group(0).column(0).total_uncompressed_size > 8 * 1024 * 1024
+    reads: list[object] = []
+
+    def forbidden_read(*args: object, **kwargs: object) -> pa.Table:
+        reads.append((args, kwargs))
+        raise AssertionError("oversized column reached Parquet.read")
+
+    monkeypatch.setattr(pq.ParquetFile, "read", forbidden_read)
+    with pytest.raises(MarketMinuteQuoteCandidateError, match="uncompressed"):
+        _convert(envelope, payload)
+    assert reads == []
+
+
+def test_dictionary_repeated_long_code_is_rejected_before_full_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repeated_code = "6" * 100_000
+    rows = 1000
+    table = pa.Table.from_arrays(
+        [
+            pa.array([repeated_code] * rows),
+            pa.array([_at(9, 59)] * rows),
+            *[pa.array([10.0] * rows) for _ in range(6)],
+        ],
+        names=["ts_code", "trade_time", "open", "high", "low", "close", "vol", "amount"],
+    )
+    output = BytesIO()
+    pq.write_table(table, output, compression="zstd", use_dictionary=True)
+    payload = output.getvalue()
+    parquet = pq.ParquetFile(BytesIO(payload))
+    total_uncompressed = sum(
+        parquet.metadata.row_group(group).column(column).total_uncompressed_size
+        for group in range(parquet.metadata.num_row_groups)
+        for column in range(parquet.metadata.row_group(group).num_columns)
+    )
+    assert total_uncompressed < 8 * 1024 * 1024
+    assert "RLE_DICTIONARY" in parquet.metadata.row_group(0).column(0).encodings
+    seed, _ = _batch(_frame((CODE, _at(9, 59), 10.5)))
+    envelope = _changed(seed, row_count=rows, content_sha256=hashlib.sha256(payload).hexdigest())
+    original_read = pq.ParquetFile.read
+    full_reads: list[object] = []
+
+    def guarded_read(
+        self: pq.ParquetFile, columns: list[str] | None = None, **kwargs: object
+    ) -> pa.Table:
+        if columns != ["ts_code"]:
+            full_reads.append(columns)
+            raise AssertionError("long dictionary code reached full Parquet.read")
+        return original_read(self, columns=columns, **kwargs)
+
+    monkeypatch.setattr(pq.ParquetFile, "read", guarded_read)
+    with pytest.raises(MarketMinuteQuoteCandidateError, match="code length"):
+        _convert(envelope, payload)
+    assert full_reads == []
 
 
 def test_missing_required_column_or_nonfinite_numeric_rejects_even_extra_stock() -> None:
