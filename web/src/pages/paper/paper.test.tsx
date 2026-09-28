@@ -203,8 +203,14 @@ describe("模拟盘", () => {
     row.focus();
     await user.keyboard("{Enter}");
     const detail = await screen.findByRole("dialog", { name: /样本05.*指令详情/ });
-    expect(detail).toHaveTextContent("12.3456");
-    expect(detail).toHaveTextContent("1.3345");
+    expect(detail).toHaveTextContent("12.35");
+    expect(detail).toHaveTextContent("1.33");
+    expect(detail).not.toHaveTextContent("12.3456");
+    expect(detail).not.toHaveTextContent("1.3345");
+    const roundedPrice = within(detail).getAllByText("12.35")[0];
+    if (!roundedPrice) throw new Error("rounded price is missing");
+    await user.hover(roundedPrice);
+    expect(await screen.findByRole("tooltip")).toHaveTextContent("12.3456");
     expect(detail).toHaveTextContent("09:32");
     expect(detail).toHaveTextContent("已成交 100 / 300");
     expect(screen.getByRole("main")).not.toHaveTextContent("order-fixture-current");
