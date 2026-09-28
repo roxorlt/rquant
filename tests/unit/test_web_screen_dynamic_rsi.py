@@ -6,13 +6,12 @@ import json
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
-from fastapi.testclient import TestClient
-
 from rquant.screen.dynamic_rsi import publish_dynamic_rsi_projection
 from rquant.screen.replica_source import VerifiedReplicaScreenSource
 from rquant.storage.duckdb import DuckDBStore
-from rquant.web.app import create_app
 from rquant.web.settings import WebSettings
+from tests.support.web_proxy_identity import ResearcherTestClient as TestClient
+from tests.support.web_proxy_identity import create_private_test_app as create_app
 from tests.unit.test_web_screen_replica import _publish, _replica_world, _run
 
 
