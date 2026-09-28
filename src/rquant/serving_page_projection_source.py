@@ -81,6 +81,12 @@ from rquant.data_audit_report_job_projection import (
 )
 from rquant.data_audit_report_jobs import DataAuditReportJobEvent
 from rquant.data_audit_report_projection import project_data_audit_report
+from rquant.formula_market_job_projection import (
+    FORMULA_MARKET_PROJECTION_TABLES,
+    project_formula_market_job,
+    read_formula_market_job_snapshot,
+    validate_formula_market_projections,
+)
 from rquant.notification_state import (
     NotificationProjectionAuthoritySnapshot,
     NotificationProjectionPublication,
@@ -3215,6 +3221,8 @@ class DuckDBLabPageProjectionSource:
         audit_report_path: Path | None = None,
         audit_report_job_state_path: Path | None = None,
         audit_report_job_directory: Path | None = None,
+        formula_market_job_state_path: Path | None = None,
+        formula_market_job_directory: Path | None = None,
         backfill_plan_directory: Path | None = None,
         backfill_plan_job_state_path: Path | None = None,
     ) -> None:
@@ -3237,6 +3245,15 @@ class DuckDBLabPageProjectionSource:
         self.audit_report_path = audit_report_path
         self.audit_report_job_state_path = audit_report_job_state_path
         self.audit_report_job_directory = audit_report_job_directory
+        if (formula_market_job_state_path is None) != (formula_market_job_directory is None):
+            raise ValueError("formula market job state and result directory require paired paths")
+        if formula_market_job_state_path is not None and (
+            not formula_market_job_state_path.is_absolute()
+            or not formula_market_job_directory.is_absolute()
+        ):
+            raise ValueError("formula market job paths must be absolute")
+        self.formula_market_job_state_path = formula_market_job_state_path
+        self.formula_market_job_directory = formula_market_job_directory
         if backfill_plan_directory is not None and not backfill_plan_directory.is_absolute():
             raise ValueError("backfill plan directory must be absolute")
         self.backfill_plan_directory = backfill_plan_directory
@@ -3427,6 +3444,23 @@ class DuckDBLabPageProjectionSource:
                 f"audit report job state invalid: {exc}"
             ) from exc
 
+    def _formula_market_projections(
+        self, observed: datetime
+    ) -> tuple[ServingProjectionPayload, ...]:
+        if self.formula_market_job_state_path is None:
+            return ()
+        try:
+            snapshot = read_formula_market_job_snapshot(
+                self.formula_market_job_state_path,
+                self.formula_market_job_directory,
+                observed_at=observed,
+            )
+            return project_formula_market_job(snapshot)
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            raise PageProjectionSourceIntegrityError(
+                f"formula market job source invalid: {exc}"
+            ) from exc
+
     def __call__(self, observed_at: datetime, /) -> LabPageProjectionSnapshot:
         observed = normalize_aware_utc(observed_at)
         stable = _StableReadonlyDuckDB(self.database_path, control_root=self.control_root)
@@ -3547,6 +3581,7 @@ class DuckDBLabPageProjectionSource:
             audit_report_projections=audit_report,
             audit_job_projections=audit_job,
             backfill_plan_projections=self._backfill_plan_projections(observed),
+            formula_market_projections=self._formula_market_projections(observed),
         )
 
     @staticmethod
@@ -4771,6 +4806,7 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
             REPORT_PROJECTION_TABLES,
             REPORT_JOB_PROJECTION_TABLES,
             BACKFILL_PLAN_PROJECTION_TABLES,
+            FORMULA_MARKET_PROJECTION_TABLES,
         )
         if (
             not required.issubset(names)
@@ -4781,6 +4817,8 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
         ):
             raise ValueError("lab page projection snapshot is incomplete")
         projections = {item.table_name: item for item in self.projections}
+        if names >= FORMULA_MARKET_PROJECTION_TABLES:
+            validate_formula_market_projections(projections)
         status = projections["data_audit_status"].rows
         issues = projections["data_audit_issue"].rows
         if len(status) != 1 or len(issues) != status[0]["finding_count"]:
@@ -4950,6 +4988,7 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
         audit_report_projections: tuple[ServingProjectionPayload, ...] = (),
         audit_job_projections: tuple[ServingProjectionPayload, ...] = (),
         backfill_plan_projections: tuple[ServingProjectionPayload, ...] = (),
+        formula_market_projections: tuple[ServingProjectionPayload, ...] = (),
     ) -> LabPageProjectionSnapshot:
         available = normalize_aware_utc(available_at)
         status = audit_status or DataAuditStatusProjectionRow(
@@ -4988,6 +5027,12 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
             != BACKFILL_PLAN_PROJECTION_TABLES
         ):
             raise ValueError("backfill plan projections must be complete")
+        if (
+            formula_market_projections
+            and {item.table_name for item in formula_market_projections}
+            != FORMULA_MARKET_PROJECTION_TABLES
+        ):
+            raise ValueError("formula market projections must be complete")
         projections = tuple(
             sorted(
                 (
@@ -4995,6 +5040,7 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
                     *audit_report_projections,
                     *audit_job_projections,
                     *backfill_plan_projections,
+                    *formula_market_projections,
                 ),
                 key=lambda item: item.table_name,
             )
