@@ -52,6 +52,7 @@ from rquant.web.routes import (
     data_audit_report_commands,
     formula_market_commands,
     formula_market_read,
+    formula_pool_read,
     formula_pool_save_commands,
     fundamentals,
     health,
@@ -311,6 +312,7 @@ def create_app(
     app.include_router(screen.router, prefix="/api/v1", tags=["screen"])
     app.include_router(formula_market_commands.router, prefix="/api/v1", tags=["screen"])
     app.include_router(formula_market_read.router, prefix="/api/v1", tags=["screen"])
+    app.include_router(formula_pool_read.router, prefix="/api/v1", tags=["pools"])
     app.include_router(formula_pool_save_commands.router, prefix="/api/v1", tags=["pools"])
     app.include_router(stocks.router, prefix="/api/v1", tags=["stocks"])
     app.include_router(catalog.router, prefix="/api/v1", tags=["catalog"])

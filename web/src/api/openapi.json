@@ -4126,6 +4126,38 @@
         "title": "Envelope[FormulaMarketMatchesData]",
         "type": "object"
       },
+      "Envelope_FormulaPoolListData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/FormulaPoolListData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[FormulaPoolListData]",
+        "type": "object"
+      },
+      "Envelope_FormulaPoolMembersData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/FormulaPoolMembersData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[FormulaPoolMembersData]",
+        "type": "object"
+      },
       "Envelope_HealthData_": {
         "properties": {
           "data": {
@@ -5010,6 +5042,210 @@
         "title": "FormulaMarketUnknownReason",
         "type": "object"
       },
+      "FormulaPoolItem": {
+        "additionalProperties": false,
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "display_name": {
+            "title": "Display Name",
+            "type": "string"
+          },
+          "formula": {
+            "title": "Formula",
+            "type": "string"
+          },
+          "latest_result": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FormulaPoolLatestResult"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "pool_name": {
+            "title": "Pool Name",
+            "type": "string"
+          },
+          "status_label": {
+            "title": "Status Label",
+            "type": "string"
+          },
+          "syntax_version": {
+            "title": "Syntax Version",
+            "type": "string"
+          },
+          "version": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "pool_name",
+          "display_name",
+          "formula",
+          "syntax_version",
+          "version",
+          "created_at",
+          "status_label",
+          "latest_result"
+        ],
+        "title": "FormulaPoolItem",
+        "type": "object"
+      },
+      "FormulaPoolLatestResult": {
+        "additionalProperties": false,
+        "properties": {
+          "market_total": {
+            "minimum": 0.0,
+            "title": "Market Total",
+            "type": "integer"
+          },
+          "match_count": {
+            "minimum": 0.0,
+            "title": "Match Count",
+            "type": "integer"
+          },
+          "no_match_count": {
+            "minimum": 0.0,
+            "title": "No Match Count",
+            "type": "integer"
+          },
+          "trade_date": {
+            "format": "date",
+            "title": "Trade Date",
+            "type": "string"
+          },
+          "unknown_count": {
+            "minimum": 0.0,
+            "title": "Unknown Count",
+            "type": "integer"
+          },
+          "unknown_reasons": {
+            "items": {
+              "$ref": "#/components/schemas/FormulaPoolUnknownReason"
+            },
+            "title": "Unknown Reasons",
+            "type": "array"
+          }
+        },
+        "required": [
+          "trade_date",
+          "market_total",
+          "match_count",
+          "no_match_count",
+          "unknown_count",
+          "unknown_reasons"
+        ],
+        "title": "FormulaPoolLatestResult",
+        "type": "object"
+      },
+      "FormulaPoolListData": {
+        "additionalProperties": false,
+        "properties": {
+          "availability": {
+            "enum": [
+              "unavailable",
+              "not_published",
+              "empty",
+              "ready"
+            ],
+            "title": "Availability",
+            "type": "string"
+          },
+          "available_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Available At"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "pools": {
+            "items": {
+              "$ref": "#/components/schemas/FormulaPoolItem"
+            },
+            "maxItems": 512,
+            "title": "Pools",
+            "type": "array"
+          }
+        },
+        "required": [
+          "availability",
+          "message",
+          "available_at",
+          "pools"
+        ],
+        "title": "FormulaPoolListData",
+        "type": "object"
+      },
+      "FormulaPoolMembersData": {
+        "additionalProperties": false,
+        "properties": {
+          "match_codes": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 100,
+            "title": "Match Codes",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          },
+          "offset": {
+            "minimum": 0.0,
+            "title": "Offset",
+            "type": "integer"
+          },
+          "pool_name": {
+            "title": "Pool Name",
+            "type": "string"
+          },
+          "total": {
+            "minimum": 0.0,
+            "title": "Total",
+            "type": "integer"
+          },
+          "trade_date": {
+            "format": "date",
+            "title": "Trade Date",
+            "type": "string"
+          }
+        },
+        "required": [
+          "pool_name",
+          "trade_date",
+          "total",
+          "offset",
+          "match_codes",
+          "next_cursor"
+        ],
+        "title": "FormulaPoolMembersData",
+        "type": "object"
+      },
       "FormulaPoolSaveCommandReceipt": {
         "additionalProperties": false,
         "properties": {
@@ -5112,6 +5348,31 @@
           "expected_version"
         ],
         "title": "FormulaPoolSaveCommandRequest",
+        "type": "object"
+      },
+      "FormulaPoolUnknownReason": {
+        "additionalProperties": false,
+        "properties": {
+          "count": {
+            "minimum": 1.0,
+            "title": "Count",
+            "type": "integer"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          }
+        },
+        "required": [
+          "reason",
+          "label",
+          "count"
+        ],
+        "title": "FormulaPoolUnknownReason",
         "type": "object"
       },
       "FreshnessItem": {
@@ -12421,6 +12682,27 @@
         ]
       }
     },
+    "/api/v1/pools/formula": {
+      "get": {
+        "operationId": "list_formula_pools_api_v1_pools_formula_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_FormulaPoolListData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "公式池列表",
+        "tags": [
+          "pools"
+        ]
+      }
+    },
     "/api/v1/pools/formula/commands": {
       "post": {
         "operationId": "submit_formula_pool_save_command_api_v1_pools_formula_commands_post",
@@ -12467,6 +12749,81 @@
           }
         },
         "summary": "保存公式池",
+        "tags": [
+          "pools"
+        ]
+      }
+    },
+    "/api/v1/pools/formula/{base_name}/members": {
+      "get": {
+        "operationId": "get_formula_pool_members_api_v1_pools_formula__base_name__members_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "base_name",
+            "required": true,
+            "schema": {
+              "maxLength": 80,
+              "minLength": 1,
+              "pattern": "^[\\w\\u4e00-\\u9fff-]+$",
+              "title": "Base Name",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Page Size",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 2048,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_FormulaPoolMembersData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "公式池命中代码",
         "tags": [
           "pools"
         ]

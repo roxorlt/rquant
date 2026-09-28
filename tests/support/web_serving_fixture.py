@@ -1137,6 +1137,7 @@ def build_web_fixture(
     lab_page_projections: tuple[ServingProjectionPayload, ...] | None = None,
     audit_report_projections: tuple[ServingProjectionPayload, ...] = (),
     formula_market_projections: tuple[ServingProjectionPayload, ...] = (),
+    formula_pool_projections: tuple[ServingProjectionPayload, ...] = (),
     backfill_plan_projections: tuple[ServingProjectionPayload, ...] = (),
     audit: bool = False,
     signal_projections: tuple[ServingProjectionPayload, ...] = (),
@@ -1246,6 +1247,14 @@ def build_web_fixture(
             for name, item in replacements.items()
             if name not in {existing.table_name for existing in projections}
         )
+    projections += tuple(
+        ServingProjectionInput.bind(
+            item,
+            owner_dataset_id="signals",
+            owner_generation_id=generations["signals"],
+        )
+        for item in formula_pool_projections
+    )
     if lab_page_projections is not None:
         if {item.table_name for item in lab_page_projections} != {
             "data_audit_issue",

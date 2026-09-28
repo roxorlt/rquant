@@ -27,6 +27,7 @@ SCREEN_REPLICA_ENV_VAR = "RQUANT_WEB_SCREEN_REPLICA_PATH"
 SCREEN_HISTORY_ENV_VAR = "RQUANT_WEB_SCREEN_HISTORY_ROOT"
 SCREEN_RSI_ENV_VAR = "RQUANT_WEB_SCREEN_RSI_ROOT"
 FORMULA_MARKET_RESULT_ENV_VAR = "RQUANT_WEB_FORMULA_MARKET_RESULT_ROOT"
+FORMULA_POOL_DAILY_RESULT_ENV_VAR = "RQUANT_WEB_FORMULA_POOL_DAILY_RESULT_ROOT"
 CATALOG_SAMPLES_ENV_VAR = "RQUANT_WEB_CATALOG_SAMPLES_FILE"
 ACK_ADMISSION_SOCKET_ENV_VAR = "RQUANT_WEB_ACK_ADMISSION_SOCKET"
 INGRESS_SOCKET_ENV_VAR = "RQUANT_WEB_INGRESS_SOCKET"
@@ -91,6 +92,7 @@ class WebSettings(BaseModel):
     screen_history_root: Path | None = None
     screen_rsi_root: Path | None = None
     formula_market_result_root: Path | None = None
+    formula_pool_daily_result_root: Path | None = None
     catalog_samples_file: Path | None = None
     ack_admission_socket_path: Path | None = None
     ingress_socket_path: Path | None = None
@@ -185,11 +187,11 @@ class WebSettings(BaseModel):
             raise ValueError("log admins must be a bounded list of exact user names")
         return value
 
-    @field_validator("formula_market_result_root")
+    @field_validator("formula_market_result_root", "formula_pool_daily_result_root")
     @classmethod
-    def validate_formula_market_result_root(cls, value: Path | None) -> Path | None:
+    def validate_readonly_result_root(cls, value: Path | None) -> Path | None:
         if value is not None and (not value.is_absolute() or ".." in value.parts):
-            raise ValueError("formula market result root must be absolute and canonical")
+            raise ValueError("read-only result root must be absolute and canonical")
         return value
 
     @field_validator("unit_log_socket_path", "unit_log_manifest_path", "unit_log_public_key_path")
@@ -267,6 +269,9 @@ class WebSettings(BaseModel):
         formula_market_result = source.get(FORMULA_MARKET_RESULT_ENV_VAR, "").strip()
         if formula_market_result:
             values["formula_market_result_root"] = Path(formula_market_result)
+        formula_pool_daily_result = source.get(FORMULA_POOL_DAILY_RESULT_ENV_VAR, "").strip()
+        if formula_pool_daily_result:
+            values["formula_pool_daily_result_root"] = Path(formula_pool_daily_result)
         samples = source.get(CATALOG_SAMPLES_ENV_VAR, "").strip()
         if samples:
             values["catalog_samples_file"] = Path(samples)
