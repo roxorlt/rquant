@@ -51,6 +51,7 @@ from rquant.web.routes import (
     data_audit_report_calendar,
     data_audit_report_commands,
     formula_market_commands,
+    formula_market_read,
     fundamentals,
     health,
     meta,
@@ -303,6 +304,7 @@ def create_app(
     app.include_router(panorama.router, prefix="/api/v1", tags=["panorama"])
     app.include_router(screen.router, prefix="/api/v1", tags=["screen"])
     app.include_router(formula_market_commands.router, prefix="/api/v1", tags=["screen"])
+    app.include_router(formula_market_read.router, prefix="/api/v1", tags=["screen"])
     app.include_router(stocks.router, prefix="/api/v1", tags=["stocks"])
     app.include_router(catalog.router, prefix="/api/v1", tags=["catalog"])
     app.include_router(data_audit.router, prefix="/api/v1", tags=["data-audit"])
