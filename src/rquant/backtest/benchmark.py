@@ -141,6 +141,11 @@ def load_benchmark_series(
     ts_code: str = "000300.SH",
 ) -> BenchmarkSeries:
     """Load exact close facts from one frozen read-only snapshot; no historical timing claim."""
+    if result.status != "complete" or any(
+        day.account is None or day.daily_return is None or day.normalized_nav is None
+        for day in result.days
+    ):
+        raise BenchmarkSourceError("incomplete backtest result cannot form a benchmark series")
     if ts_code not in SUPPORTED_BENCHMARK_CODES:
         raise BenchmarkSourceError(f"unsupported benchmark index: {ts_code}")
     required_dates = _required_dates(calendar, result)

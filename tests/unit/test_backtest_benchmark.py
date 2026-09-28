@@ -235,3 +235,42 @@ def test_derived_returns_cannot_change_without_changing_index_closes(tmp_path: P
     altered["days"][0]["daily_return"] += 5e-11
     with pytest.raises(ValidationError, match="daily return"):
         BenchmarkSeries.model_validate(altered)
+
+
+def _incomplete_result() -> BacktestResult:
+    data = _result().model_dump(mode="python", exclude={"content_hash"})
+    data["status"] = "incomplete"
+    final = data["days"][-1]
+    final["account"] = None
+    final["market_value"] = None
+    final["daily_return"] = None
+    final["normalized_nav"] = None
+    final["incomplete_reason"] = "missing_held_close"
+    return BacktestResult.model_validate(data)
+
+
+@pytest.mark.parametrize("frozen_exists", [True, False])
+def test_loader_rejects_legitimate_incomplete_last_day_before_reading_frozen_db(
+    tmp_path: Path, frozen_exists: bool
+) -> None:
+    result = _incomplete_result()
+    assert result.status == "incomplete"
+    assert result.days[-1].account is None
+    path = tmp_path / "incomplete.duckdb"
+    if frozen_exists:
+        _frozen_db(path, _rows())
+    with pytest.raises(BenchmarkSourceError, match="incomplete backtest result"):
+        load_benchmark_series(path, _calendar(), result)
+
+
+@pytest.mark.parametrize("missing_field", ["daily_return", "normalized_nav"])
+def test_loader_rejects_complete_status_with_missing_last_day_return_evidence(
+    tmp_path: Path, missing_field: str
+) -> None:
+    data = _result().model_dump(mode="python", exclude={"content_hash"})
+    data["days"][-1][missing_field] = None
+    result = BacktestResult.model_validate(data)
+    assert result.status == "complete"
+    path = _frozen_db(tmp_path / "missing-return.duckdb", _rows())
+    with pytest.raises(BenchmarkSourceError, match="incomplete backtest result"):
+        load_benchmark_series(path, _calendar(), result)
