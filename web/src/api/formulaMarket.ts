@@ -47,10 +47,11 @@ export function useFormulaMarketJobs(polling: boolean) {
 export function useFormulaMarketJob(
   taskId: string | null,
   revision: string | null,
+  readEpoch: number,
   polling: boolean,
 ) {
   return useServingQuery<FormulaMarketJobDetailData>(
-    ["formula-market", "job", taskId, revision],
+    ["formula-market", "job", taskId, revision, readEpoch],
     async () => {
       if (taskId === null) throw new Error("未选择选股任务");
       const { data, error, response } = await apiClient().GET(
@@ -70,10 +71,11 @@ export function useFormulaMarketMatches(
   taskId: string | null,
   cursor: string | null,
   generation: string | null | undefined,
+  readEpoch: number,
   enabled: boolean,
 ) {
   return useServingQuery<FormulaMarketMatchesData>(
-    ["formula-market", "matches", taskId, cursor, generation],
+    ["formula-market", "matches", taskId, cursor, generation, readEpoch],
     async () => {
       if (taskId === null) throw new Error("未选择选股任务");
       const { data, error, response } = await apiClient().GET(

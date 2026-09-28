@@ -97,6 +97,7 @@ export function FormulaMarketPanel({ formula, checked }: { formula: string; chec
   const [notice, setNotice] = useState<string | null>(null);
   const [pollJobs, setPollJobs] = useState(journal !== null);
   const [page, setPage] = useState<PageState>({ key: "", index: 0, cursors: [null] });
+  const [readEpoch, setReadEpoch] = useState(0);
   const [stockCode, setStockCode] = useState<string | null>(null);
   const now = useNow();
   const generation = useCurrentGeneration();
@@ -104,10 +105,16 @@ export function FormulaMarketPanel({ formula, checked }: { formula: string; chec
   const jobList =
     generation === undefined || jobs.serving?.generation_id === generation ? jobs.data : undefined;
   const selectedListJob = jobList?.jobs.find((job) => job.task_id === selectedId);
-  const detailTaskId = selectedListJob?.task_id ?? null;
+  const unreadableTaskId =
+    selectedListJob?.status === "succeeded" && !selectedListJob.result_available
+      ? selectedListJob.task_id
+      : null;
+  const resultUnavailable = unreadableTaskId !== null;
+  const detailTaskId = resultUnavailable ? null : (selectedListJob?.task_id ?? null);
   const detail = useFormulaMarketJob(
     detailTaskId,
     selectedListJob?.updated_at ?? null,
+    readEpoch,
     selectedListJob?.status === "queued" || selectedListJob?.status === "running",
   );
   const currentDetail =
@@ -121,8 +128,17 @@ export function FormulaMarketPanel({ formula, checked }: { formula: string; chec
   const currentPage = page.key === pageKey ? page : { key: pageKey, index: 0, cursors: [null] };
   const cursor = currentPage.cursors[currentPage.index] ?? null;
   const canReadMatches =
-    job?.status === "succeeded" && job.result_available && currentDetail?.summary !== null;
-  const matches = useFormulaMarketMatches(selectedId, cursor, generation, canReadMatches === true);
+    !resultUnavailable &&
+    job?.status === "succeeded" &&
+    job.result_available &&
+    currentDetail?.summary !== null;
+  const matches = useFormulaMarketMatches(
+    selectedId,
+    cursor,
+    generation,
+    readEpoch,
+    canReadMatches === true,
+  );
   const resultReady =
     canReadMatches &&
     !matches.error &&
@@ -145,6 +161,10 @@ export function FormulaMarketPanel({ formula, checked }: { formula: string; chec
     setJournal(null);
     saveJournal(null);
   }, [journal, jobList]);
+
+  useEffect(() => {
+    if (unreadableTaskId !== null) setReadEpoch((value) => value + 1);
+  }, [unreadableTaskId]);
 
   function remember(value: Journal | null): void {
     setJournal(value);
@@ -206,6 +226,12 @@ export function FormulaMarketPanel({ formula, checked }: { formula: string; chec
   function selectJob(taskId: string): void {
     setSelectedId(taskId);
     setPage({ key: "", index: 0, cursors: [null] });
+  }
+
+  function restartMatches(): void {
+    setReadEpoch((value) => value + 1);
+    setPage({ key: pageKey, index: 0, cursors: [null] });
+    jobs.refetch();
   }
 
   return (
@@ -329,13 +355,15 @@ export function FormulaMarketPanel({ formula, checked }: { formula: string; chec
             <Button
               size="sm"
               variant="ghost"
-              onClick={() => detail.refetch()}
-              disabled={detail.isFetching}
+              onClick={() => (resultUnavailable ? jobs.refetch() : detail.refetch())}
+              disabled={resultUnavailable ? jobs.isFetching : detail.isFetching}
             >
               刷新
             </Button>
           </div>
-          {detail.error ? (
+          {resultUnavailable ? (
+            <EmptyState title="结果暂时无法读取" hint="稍后刷新再试。" />
+          ) : detail.error ? (
             <EmptyState
               title={journal?.taskId === selectedId ? "已提交，等待任务出现" : "任务暂时无法读取"}
               hint="稍后刷新再试。"
@@ -381,7 +409,25 @@ export function FormulaMarketPanel({ formula, checked }: { formula: string; chec
               ) : !job.result_available || currentDetail?.summary == null ? (
                 <EmptyState title="结果暂时无法读取" hint="稍后刷新再试。" />
               ) : matches.error ? (
-                <EmptyState title="结果暂时无法读取" hint="刷新详情或从第一页重新查看。" />
+                <div className="formula-market-result-recovery">
+                  <EmptyState
+                    title={
+                      matches.error instanceof ApiError && matches.error.status === 409
+                        ? "结果已更新"
+                        : "结果暂时无法读取"
+                    }
+                    hint={
+                      matches.error instanceof ApiError && matches.error.status === 409
+                        ? "请从第一页重新查看。"
+                        : "稍后刷新详情再试。"
+                    }
+                  />
+                  {matches.error instanceof ApiError && matches.error.status === 409 ? (
+                    <Button size="sm" onClick={restartMatches}>
+                      从第一页重看
+                    </Button>
+                  ) : null}
+                </div>
               ) : !resultReady ? (
                 <p className="hint" role="status">
                   正在读取结果…

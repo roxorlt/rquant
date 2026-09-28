@@ -258,4 +258,124 @@ describe("全市场公式选股", () => {
     expect(submitted[0]).toMatchObject({ formula, trade_date: tradeDate });
     expect(submitted[0]?.command_id).not.toBe(taskId);
   });
+
+  it("任务回读改为结果不可用时立即遮住旧摘要和命中，恢复后重新读取", async () => {
+    setupSource();
+    let readable = true;
+    let nextResult = false;
+    const detailReads: number[] = [];
+    const matchReads: number[] = [];
+    server.use(
+      http.get("*/api/v1/screen/tdx/market/jobs", () =>
+        HttpResponse.json({
+          data: {
+            availability: "ready",
+            available_at: "2026-09-24T07:32:00Z",
+            has_older_tasks: false,
+            jobs: [{ ...job, result_available: readable }],
+            message: "",
+            total_task_count: 1,
+          },
+          serving,
+        }),
+      ),
+      http.get(`*/api/v1/screen/tdx/market/jobs/${taskId}`, () => {
+        detailReads.push(1);
+        return HttpResponse.json({
+          data: {
+            job,
+            summary: { ...summary, match_count: nextResult ? 1 : 51 },
+          },
+          serving,
+        });
+      }),
+      http.get(`*/api/v1/screen/tdx/market/jobs/${taskId}/matches`, () => {
+        matchReads.push(1);
+        return HttpResponse.json({
+          data: {
+            task_id: taskId,
+            total: 1,
+            offset: 0,
+            match_codes: [nextResult ? "600002.SH" : "600001.SH"],
+            next_cursor: null,
+          },
+          serving,
+        });
+      }),
+    );
+    const user = userEvent.setup();
+    renderPreview();
+    const drawer = await screen.findByRole("dialog", { name: "公式预览" });
+    await user.click(await within(drawer).findByRole("button", { name: /CLOSE>MA/ }));
+    expect(await within(drawer).findByRole("button", { name: /600001.SH/ })).toBeVisible();
+    expect(within(drawer).getByRole("region", { name: "市场结果" })).toHaveTextContent("51");
+
+    readable = false;
+    await user.click(within(drawer).getAllByRole("button", { name: "刷新" })[0] as HTMLElement);
+    expect(await within(drawer).findByText("结果暂时无法读取")).toBeVisible();
+    expect(within(drawer).queryByRole("region", { name: "市场结果" })).toBeNull();
+    expect(within(drawer).queryByRole("button", { name: /600001.SH/ })).toBeNull();
+
+    nextResult = true;
+    readable = true;
+    await user.click(within(drawer).getAllByRole("button", { name: "刷新" })[1] as HTMLElement);
+    expect(await within(drawer).findByRole("button", { name: /600002.SH/ })).toBeVisible();
+    expect(within(drawer).getByRole("region", { name: "市场结果" })).toHaveTextContent("1");
+    expect(within(drawer).queryByRole("button", { name: /600001.SH/ })).toBeNull();
+    expect(detailReads).toHaveLength(2);
+    expect(matchReads).toHaveLength(2);
+  });
+
+  it("命中游标失效后可从第一页重看，并实际重新取第一页", async () => {
+    setupSource();
+    let firstPageReads = 0;
+    const cursors: (string | null)[] = [];
+    server.use(
+      http.get("*/api/v1/screen/tdx/market/jobs", () =>
+        HttpResponse.json({
+          data: {
+            availability: "ready",
+            available_at: "2026-09-24T07:32:00Z",
+            has_older_tasks: false,
+            jobs: [job],
+            message: "",
+            total_task_count: 1,
+          },
+          serving,
+        }),
+      ),
+      http.get(`*/api/v1/screen/tdx/market/jobs/${taskId}`, () =>
+        HttpResponse.json({ data: { job, summary }, serving }),
+      ),
+      http.get(`*/api/v1/screen/tdx/market/jobs/${taskId}/matches`, ({ request }) => {
+        const cursor = new URL(request.url).searchParams.get("cursor");
+        cursors.push(cursor);
+        if (cursor !== null) {
+          return HttpResponse.json({ detail: "选股结果已更新，请重新打开查看。" }, { status: 409 });
+        }
+        firstPageReads += 1;
+        return HttpResponse.json({
+          data: {
+            task_id: taskId,
+            total: 51,
+            offset: 0,
+            match_codes: [firstPageReads === 1 ? "600001.SH" : "600002.SH"],
+            next_cursor: "page-2",
+          },
+          serving,
+        });
+      }),
+    );
+    const user = userEvent.setup();
+    renderPreview();
+    const drawer = await screen.findByRole("dialog", { name: "公式预览" });
+    await user.click(await within(drawer).findByRole("button", { name: /CLOSE>MA/ }));
+    expect(await within(drawer).findByRole("button", { name: /600001.SH/ })).toBeVisible();
+    await user.click(within(drawer).getByRole("button", { name: "下一页" }));
+    expect(await within(drawer).findByText("结果已更新")).toBeVisible();
+    await user.click(within(drawer).getByRole("button", { name: "从第一页重看" }));
+    expect(await within(drawer).findByRole("button", { name: /600002.SH/ })).toBeVisible();
+    expect(within(drawer).getByText("第 1 页")).toBeVisible();
+    expect(cursors).toEqual([null, "page-2", null]);
+  });
 });

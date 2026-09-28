@@ -382,6 +382,11 @@
 .formula-market-detail-state.warn {
   background: var(--warn-weak);
 }
+.formula-market-result-recovery {
+  display: grid;
+  justify-items: start;
+  gap: 8px;
+}
 .formula-market-summary {
   display: grid;
   gap: 10px;
