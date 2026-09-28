@@ -11,7 +11,6 @@ from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
-from fastapi.testclient import TestClient
 
 from rquant.formula_market_job_projection import (
     FormulaMarketArtifactIndexRow,
@@ -23,9 +22,10 @@ from rquant.formula_market_job_projection import (
 from rquant.screen.formula_market_jobs import FormulaMarketJobResult
 from rquant.screen.formula_market_run import FormulaMarketRunSummary
 from rquant.strict_json import canonical_json_bytes
-from rquant.web.app import create_app
 from rquant.web.serving import BorrowedGeneration
 from rquant.web.settings import WebSettings
+from tests.support.web_proxy_identity import ProofTestClient as TestClient
+from tests.support.web_proxy_identity import create_private_test_app as create_app
 from tests.support.web_serving_fixture import FIXTURE_BUILT_AT, build_web_fixture
 
 PATH = "/api/v1/screen/tdx/market/jobs"

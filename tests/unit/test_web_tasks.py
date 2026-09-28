@@ -10,15 +10,15 @@ from uuid import UUID
 
 import duckdb
 import pytest
-from fastapi.testclient import TestClient
 
 from rquant.lab_eta import LabEtaEstimate, LabEtaFinishWindow
 from rquant.lab_jobs import CommandAvailability, JobStatus, LabJobProgress, LabJobSummary
 from rquant.research_run_spec import ResearchJobType, ResourceClass
 from rquant.serving_contracts import FreshnessStatus
 from rquant.serving_read_models import ServingLabJobRecord
-from rquant.web.app import create_app
 from rquant.web.settings import WebSettings
+from tests.support.web_proxy_identity import ResearcherTestClient as TestClient
+from tests.support.web_proxy_identity import create_private_test_app as create_app
 from tests.support.web_serving_fixture import FIXTURE_BUILT_AT, build_web_fixture
 
 

@@ -8,7 +8,6 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from rquant.lab_jobs import JobStatus
@@ -26,12 +25,13 @@ from rquant.runtime_service_control import (
 )
 from rquant.serving_contracts import FreshnessStatus
 from rquant.serving_read_models import ServingProjectionInput
-from rquant.web.app import create_app
 from rquant.web.market import MarketPhase
 from rquant.web.models.tasks import ResourcesData, ScheduledTasksData
 from rquant.web.settings import WebSettings
 from rquant.web.task_overview import _timer_status
 from tests.support import web_serving_fixture as fixture
+from tests.support.web_proxy_identity import ResearcherTestClient as TestClient
+from tests.support.web_proxy_identity import create_private_test_app as create_app
 from tests.unit.test_web_tasks import _job
 
 _BASE_DATASETS = fixture._DATASETS

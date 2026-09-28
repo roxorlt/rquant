@@ -9,10 +9,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
-from rquant.web.app import create_app
 from rquant.web.models.screen import ScreenCatalogData, ScreenSourceInfo
 from rquant.web.nl_parser import (
     NlClarificationNeededError,
@@ -26,6 +24,8 @@ from rquant.web.screen_nl_preview import (
     validate_screen_draft,
 )
 from rquant.web.settings import WebSettings
+from tests.support.web_proxy_identity import ProofTestClient as TestClient
+from tests.support.web_proxy_identity import create_private_test_app as create_app
 from tests.support.web_serving_fixture import FIXTURE_BUILT_AT, build_web_fixture
 
 NOW = FIXTURE_BUILT_AT + timedelta(seconds=90)
@@ -112,7 +112,7 @@ def test_preview_apply_then_serving_rotation_requires_fresh_run(tmp_path: Path) 
             "conditions": data["conditions"],
         }
         first = client.post(
-            "/api/v1/screen/run", json=run_body, headers={"x-rquant-csrf": "1"}
+            "/api/v1/screen/run", json=run_body, headers=HEADERS
         )
         assert first.status_code == 200, first.text
         assert first.json()["data"]["status"] == "ready"
@@ -121,13 +121,13 @@ def test_preview_apply_then_serving_rotation_requires_fresh_run(tmp_path: Path) 
         build_web_fixture(root, "baseline", sequence=1)
         app.state.web.tracker.refresh()
         stale = client.post(
-            "/api/v1/screen/run", json=run_body, headers={"x-rquant-csrf": "1"}
+            "/api/v1/screen/run", json=run_body, headers=HEADERS
         )
         fresh_catalog = client.get("/api/v1/screen/blocks").json()["data"]
         fresh = client.post(
             "/api/v1/screen/run",
             json={**run_body, "source_identity": fresh_catalog["source"]["identity"]},
-            headers={"x-rquant-csrf": "1"},
+            headers=HEADERS,
         )
     assert stale.status_code == 409
     assert fresh.status_code == 200

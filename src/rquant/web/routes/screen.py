@@ -32,7 +32,7 @@ from rquant.web.screen_nl_preview import (
     validate_screen_draft,
 )
 from rquant.web.screen_service import ScreenApplicationError
-from rquant.web.security import current_user, require_csrf
+from rquant.web.security import current_user, require_csrf, require_current_user
 from rquant.web.serving import serving_meta
 
 router = APIRouter(prefix="/screen")
@@ -54,7 +54,7 @@ def _catalog_matches(body: ScreenNlPreviewRequest, catalog: ScreenCatalogData, s
 @router.post("/tdx/parse", response_model=TdxParseData, summary="检查通达信公式")
 def parse_tdx_formula(
     body: TdxParseRequest,
-    _viewer: Annotated[str | None, Depends(current_user)],
+    _viewer: Annotated[str, Depends(require_current_user)],
     _same_site: Annotated[None, Depends(require_csrf)],
 ) -> TdxParseData:
     if len(body.source) > MAX_SOURCE_BYTES:
@@ -72,7 +72,7 @@ def parse_tdx_formula(
 def preview_tdx_formula(
     request: Request,
     body: TdxPreviewRequest,
-    _viewer: Annotated[str | None, Depends(current_user)],
+    _viewer: Annotated[str, Depends(require_current_user)],
     _same_site: Annotated[None, Depends(require_csrf)],
 ) -> TdxPreviewData:
     try:
@@ -219,7 +219,7 @@ def run_screen(
     request: Request,
     response: Response,
     body: ScreenRunRequest,
-    _viewer: Annotated[str | None, Depends(current_user)],
+    _viewer: Annotated[str, Depends(require_current_user)],
     _same_site: Annotated[None, Depends(require_csrf)],
 ) -> Envelope[ScreenRunData]:
     web = request.app.state.web

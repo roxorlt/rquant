@@ -9,13 +9,13 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
-from fastapi.testclient import TestClient
 
 from rquant.paper_broker import PaperHistoryFill, PaperOrderHistorySnapshot
 from rquant.paper_contracts import PaperOrder, PaperOrderStatus, PaperSide
 from rquant.paper_history_serving import paper_history_projections
-from rquant.web.app import create_app
 from rquant.web.settings import WebSettings
+from tests.support.web_proxy_identity import ResearcherTestClient as TestClient
+from tests.support.web_proxy_identity import create_private_test_app as create_app
 from tests.support.web_serving_fixture import FIXTURE_BUILT_AT, build_web_fixture
 
 AT = FIXTURE_BUILT_AT - timedelta(seconds=30)

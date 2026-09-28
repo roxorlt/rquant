@@ -9,7 +9,6 @@ from pathlib import Path
 
 import duckdb
 import pytest
-from fastapi.testclient import TestClient
 
 from rquant.formula_pool_daily import FormulaPoolDailyResultV1, _run_identity
 from rquant.formula_pool_serving_projection import (
@@ -20,10 +19,11 @@ from rquant.formula_pool_serving_projection import (
 from rquant.runtime_contracts import canonical_sha256
 from rquant.serving_read_models import ServingProjectionPayload
 from rquant.strict_json import canonical_json_bytes
-from rquant.web.app import create_app
 from rquant.web.formula_pool_read import read_formula_pool_snapshot
 from rquant.web.serving import GenerationTracker
 from rquant.web.settings import WebSettings
+from tests.support.web_proxy_identity import ProofTestClient as TestClient
+from tests.support.web_proxy_identity import create_private_test_app as create_app
 from tests.support.web_serving_fixture import FIXTURE_BUILT_AT, build_web_fixture
 
 PATH = "/api/v1/pools/formula"

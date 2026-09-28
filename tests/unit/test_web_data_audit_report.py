@@ -11,7 +11,6 @@ from typing import Any
 import duckdb
 import pytest
 from fastapi import FastAPI, HTTPException
-from fastapi.testclient import TestClient
 
 from rquant.data_audit_evidence import DailyBarNullFieldSpec
 from rquant.data_audit_report import AuditReportSource, build_data_audit_report
@@ -20,10 +19,11 @@ from rquant.data_audit_report_jobs import DataAuditReportJobEvent
 from rquant.data_audit_report_projection import project_data_audit_report
 from rquant.serving_read_models import ServingProjectionPayload
 from rquant.storage.schema import DAILY_BAR_DDL, TRADE_CALENDAR_DDL
-from rquant.web.app import create_app
 from rquant.web.routes.data_audit_report import _snapshot
 from rquant.web.serving import GenerationTracker
 from rquant.web.settings import WebSettings
+from tests.support.web_proxy_identity import ResearcherTestClient as TestClient
+from tests.support.web_proxy_identity import create_private_test_app as create_app
 from tests.support.web_serving_fixture import FIXTURE_BUILT_AT, build_web_fixture
 
 

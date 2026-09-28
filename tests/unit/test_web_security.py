@@ -1,4 +1,4 @@
-"""Loopback-only bind, the nginx user header, and the write-endpoint cross-site guard."""
+"""Loopback-only bind and the write-endpoint cross-site guard."""
 
 from __future__ import annotations
 
@@ -110,7 +110,7 @@ def test_a_same_site_json_write_with_the_csrf_header_passes() -> None:
     with TestClient(_app()) as client:
         response = client.post("/write", headers=_GOOD, content="{}")
     assert response.status_code == 200
-    assert response.json() == {"user": "liutong"}
+    assert response.json() == {"user": None}
 
 
 @pytest.mark.parametrize(

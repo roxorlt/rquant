@@ -7,12 +7,12 @@ from pathlib import Path
 from uuid import UUID
 
 import pytest
-from fastapi.testclient import TestClient
 
 from rquant.lab_jobs import JobStatus
 from rquant.serving_read_models import ServingProjectionPayload
-from rquant.web.app import create_app
 from rquant.web.settings import WebSettings
+from tests.support.web_proxy_identity import ProofTestClient as TestClient
+from tests.support.web_proxy_identity import create_proof_test_app as create_app
 from tests.support.web_serving_fixture import FIXTURE_BUILT_AT, build_web_fixture
 from tests.unit.test_web_tasks import _job
 
@@ -98,7 +98,7 @@ def _publish(
 @pytest.mark.parametrize(
     ("private", "admins", "headers", "status"),
     (
-        (False, frozenset({"liutong"}), ADMIN, 503),
+        (False, frozenset({"liutong"}), ADMIN, 401),
         (True, frozenset(), ADMIN, 503),
         (True, frozenset({"liutong"}), {}, 401),
         (True, frozenset({"liutong"}), {"X-Rquant-User": "other"}, 403),
@@ -142,8 +142,8 @@ def test_overview_exposes_only_server_computed_log_capability(tmp_path: Path) ->
     with TestClient(_app(root, private=False)) as client:
         public = client.get("/api/v1/tasks/overview", headers=ADMIN)
     assert admin.json()["data"]["can_view_research_logs"] is True
-    for response in (other, anonymous, public):
-        assert response.json()["data"]["can_view_research_logs"] is False
+    assert other.json()["data"]["can_view_research_logs"] is False
+    assert anonymous.status_code == public.status_code == 401
 
 
 def test_published_events_return_only_safe_fields(tmp_path: Path) -> None:

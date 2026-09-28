@@ -7,16 +7,16 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
-from fastapi.testclient import TestClient
 
 from rquant.page_control import SubmitBackfillPlan, parse_page_control_command
-from rquant.web.app import create_app
 from rquant.web.backfill_plan_command_gateway import (
     BackfillPlanCommandConflictError,
     BackfillPlanCommandGateway,
     BackfillPlanCommandUnavailableError,
 )
 from rquant.web.settings import WebSettings
+from tests.support.web_proxy_identity import ProofTestClient as TestClient
+from tests.support.web_proxy_identity import create_private_test_app as create_app
 
 NOW = datetime(2026, 9, 27, 5, 0, tzinfo=UTC)
 HEADERS = {

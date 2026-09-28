@@ -8,7 +8,6 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import pytest
-from fastapi.testclient import TestClient
 
 from rquant.alert_ack import (
     alert_event_at,
@@ -29,9 +28,10 @@ from rquant.runtime_contracts import canonical_sha256
 from rquant.serving_alert_projection import AlertAckAuthoritySnapshot
 from rquant.serving_read_models import ServingProjectionPayload
 from rquant.web.alert_ack_read import AlertReadModel, _Event
-from rquant.web.app import create_app
 from rquant.web.models.alert_ack import UnacknowledgedSummary
 from rquant.web.settings import WebSettings
+from tests.support.web_proxy_identity import ResearcherTestClient as TestClient
+from tests.support.web_proxy_identity import create_proof_test_app as create_app
 from tests.support.web_serving_fixture import (
     FIXTURE_BUILT_AT,
     _generation_ids,
@@ -65,9 +65,7 @@ def _app(root: Path, *, lookup=None, admission=None):
             ack_admission_socket_path=(root.parent / "private" / "ack.sock")
             if admission is not None
             else None,
-            ingress_socket_path=(root.parent / "web-private" / "web.sock")
-            if admission is not None
-            else None,
+            ingress_socket_path=root.parent / "web-private" / "web.sock",
         ),
         clock=lambda: NOW,
         background=False,
@@ -437,7 +435,7 @@ def test_ack_write_requires_identity_and_same_site(tmp_path: Path) -> None:
         no_user = client.post(
             "/api/v1/monitor/ack",
             json=_body(),
-            headers={"x-rquant-csrf": "1", "origin": "http://testserver"},
+            headers={"x-rquant-user": "", "x-rquant-csrf": "1", "origin": "http://testserver"},
         )
         cross_site = client.post(
             "/api/v1/monitor/ack",

@@ -1,20 +1,22 @@
-"""Request identity and the cross-site guard for write endpoints.
+"""Verified proxy identity and the cross-site guard for write endpoints.
 
-Identity: nginx basic auth writes the authenticated user into ``X-Rquant-User``
-(``proxy_set_header X-Rquant-User $remote_user``), overwriting anything the browser sent.
+nginx overwrites both the user and proxy-proof headers after Basic Auth. An unproved
+user header never creates an authenticated owner, including on loopback connections.
 
 Cross-site guard (``require_csrf``): a write must be JSON, carry ``X-Rquant-Csrf: 1`` and
 come from the same site. The custom header forces a CORS preflight that this API never
-answers, so another site cannot send it. M0 has no write endpoint; the dependency is here
-so the first one (M2) cannot be added without it.
+answers, so another site cannot send it. This guard does not grant identity.
 """
 
 from __future__ import annotations
 
 import re
+from typing import Annotated
 from urllib.parse import urlsplit
 
-from fastapi import HTTPException, Request, status
+from fastapi import Depends, HTTPException, Request, status
+
+from rquant.web.proxy_identity import PROXY_PROOF_HEADER, ProxyIdentityVerifier
 
 USER_HEADER = "x-rquant-user"
 CSRF_HEADER = "x-rquant-csrf"
@@ -22,10 +24,30 @@ _USER_PATTERN = re.compile(r"^[A-Za-z0-9._@-]{1,64}$")
 
 
 def current_user(request: Request) -> str | None:
-    value = request.headers.get(USER_HEADER)
-    if value is None or not _USER_PATTERN.fullmatch(value):
+    context = getattr(request.app.state, "web", None)
+    if context is None or context.settings.ingress_socket_path is None:
+        return None
+    verifier = context.proxy_identity
+    if not isinstance(verifier, ProxyIdentityVerifier):
+        return None
+    headers = request.scope.get("headers", ())
+    users = [value for key, value in headers if key.lower() == USER_HEADER.encode("ascii")]
+    proofs = [value for key, value in headers if key.lower() == PROXY_PROOF_HEADER]
+    if len(users) != 1 or len(proofs) != 1 or len(users[0]) > 64:
+        return None
+    try:
+        value = users[0].decode("ascii")
+    except UnicodeDecodeError:
+        return None
+    if _USER_PATTERN.fullmatch(value) is None or not verifier.verify(proofs[0]):
         return None
     return value
+
+
+def require_current_user(viewer: Annotated[str | None, Depends(current_user)]) -> str:
+    if viewer is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="请先登录")
+    return viewer
 
 
 _DEFAULT_PORTS = {"http": 80, "https": 443}

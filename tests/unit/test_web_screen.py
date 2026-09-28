@@ -6,12 +6,12 @@ from datetime import timedelta
 from pathlib import Path
 
 import pytest
-from fastapi.testclient import TestClient
 
 from rquant.llm.registry import REGISTRY
-from rquant.web.app import create_app
 from rquant.web.settings import WebSettings
 from tests.support import web_serving_fixture as fixture
+from tests.support.web_proxy_identity import ResearcherTestClient as TestClient
+from tests.support.web_proxy_identity import create_private_test_app as create_app
 from tests.support.web_serving_fixture import FIXTURE_BUILT_AT, build_web_fixture
 
 

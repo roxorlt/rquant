@@ -10,12 +10,10 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
 from rquant.pool_definition_projection import build_pool_definition_rows
 from rquant.serving_read_models import ServingProjectionPayload
-from rquant.web.app import create_app
 from rquant.web.models.pool_editor import EditablePool, EditorRuleCall
 from rquant.web.nl_parser import (
     NlClarificationNeededError,
@@ -28,6 +26,8 @@ from rquant.web.pool_nl_preview import (
     validate_pool_draft,
 )
 from rquant.web.settings import WebSettings
+from tests.support.web_proxy_identity import ProofTestClient as TestClient
+from tests.support.web_proxy_identity import create_private_test_app as create_app
 from tests.support.web_serving_fixture import FIXTURE_BUILT_AT, build_web_fixture
 
 NOW = FIXTURE_BUILT_AT + timedelta(seconds=30)
@@ -133,7 +133,7 @@ def test_api_returns_complete_preview_without_saving(tmp_path: Path) -> None:
     )
     app = _app(tmp_path / "serving", parser)
     with TestClient(app) as client:
-        editor = client.get("/api/v1/pools/editor").json()
+        editor = client.get("/api/v1/pools/editor", headers=HEADERS).json()
         response = client.post(
             "/api/v1/pools/editor/nl-preview",
             json=_body(editor["serving"]["generation_id"]),
@@ -165,7 +165,7 @@ def test_api_admission_rejects_auth_csrf_stale_builtin_and_rate(tmp_path: Path) 
     parser = FakeParser(_raw({"name": "not_st", "args": {}}, {"name": "not_bj", "args": {}}))
     app = _app(tmp_path / "serving", parser)
     with TestClient(app) as client:
-        editor = client.get("/api/v1/pools/editor").json()
+        editor = client.get("/api/v1/pools/editor", headers=HEADERS).json()
         generation = editor["serving"]["generation_id"]
         body = _body(generation)
         assert client.post(
@@ -212,7 +212,7 @@ def test_api_admission_rejects_auth_csrf_stale_builtin_and_rate(tmp_path: Path) 
 def test_unconfigured_and_parser_failures_do_not_expose_internal_error(tmp_path: Path) -> None:
     unavailable = _app(tmp_path / "none", None)
     with TestClient(unavailable) as client:
-        editor = client.get("/api/v1/pools/editor").json()
+        editor = client.get("/api/v1/pools/editor", headers=HEADERS).json()
         assert editor["data"]["nl_preview_available"] is False
         response = client.post(
             "/api/v1/pools/editor/nl-preview",
@@ -228,7 +228,8 @@ def test_unconfigured_and_parser_failures_do_not_expose_internal_error(tmp_path:
         parser = FakeParser(error)
         app = _app(tmp_path / f"failure-{index}", parser)
         with TestClient(app) as client:
-            generation = client.get("/api/v1/pools/editor").json()["serving"]["generation_id"]
+            editor = client.get("/api/v1/pools/editor", headers=HEADERS).json()
+            generation = editor["serving"]["generation_id"]
             response = client.post(
                 "/api/v1/pools/editor/nl-preview", json=_body(generation), headers=HEADERS
             )
@@ -242,7 +243,8 @@ def test_preview_rechecks_serving_after_parser_and_rejects_busy_gate(tmp_path: P
     root = tmp_path / "serving"
     app = _app(root, parser)
     with TestClient(app) as client:
-        generation = client.get("/api/v1/pools/editor").json()["serving"]["generation_id"]
+        editor = client.get("/api/v1/pools/editor", headers=HEADERS).json()
+        generation = editor["serving"]["generation_id"]
         assert app.state.web.nl_gate.acquire(blocking=False)
         try:
             busy = client.post(
@@ -269,7 +271,8 @@ def test_preview_refuses_legacy_unpublished_pool_columns_before_model(tmp_path: 
     parser = FakeParser(_raw({"name": "not_st", "args": {}}, {"name": "not_bj", "args": {}}))
     app = _app(tmp_path / "serving", parser, include_columns=["PE_TTM[0]"])
     with TestClient(app) as client:
-        generation = client.get("/api/v1/pools/editor").json()["serving"]["generation_id"]
+        editor = client.get("/api/v1/pools/editor", headers=HEADERS).json()
+        generation = editor["serving"]["generation_id"]
         response = client.post(
             "/api/v1/pools/editor/nl-preview", json=_body(generation), headers=HEADERS
         )

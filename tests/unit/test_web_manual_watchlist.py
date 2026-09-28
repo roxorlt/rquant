@@ -7,7 +7,6 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import pytest
-from fastapi.testclient import TestClient
 
 from rquant.page_control import (
     AddWatchlistItem,
@@ -30,10 +29,11 @@ from rquant.watchlist_admission import (
     WatchlistAdmissionUnavailableError,
     build_watchlist_admission_server,
 )
-from rquant.web.app import create_app
 from rquant.web.manual_watchlist_read import read_manual_watchlist, read_manual_watchlist_item
 from rquant.web.serving import BorrowedGeneration, GenerationTracker
 from rquant.web.settings import WebSettings
+from tests.support.web_proxy_identity import ProofTestClient as TestClient
+from tests.support.web_proxy_identity import create_proof_test_app as create_app
 from tests.support.web_serving_fixture import FIXTURE_BUILT_AT, build_web_fixture
 
 PATH = "/api/v1/watchlist"

@@ -207,7 +207,7 @@ def test_viewer_comes_from_the_nginx_user_header_and_is_validated(tmp_path: Path
     build_web_fixture(root, "baseline")
     now = FIXTURE_BUILT_AT + timedelta(seconds=30)
 
-    assert _meta(root, now, **{"X-Rquant-User": "liutong"})["data"]["viewer"] == "liutong"
+    assert _meta(root, now, **{"X-Rquant-User": "liutong"})["data"]["viewer"] is None
     assert _meta(root, now, **{"X-Rquant-User": "bad user;"})["data"]["viewer"] is None
 
 

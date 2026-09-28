@@ -17,7 +17,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 import anyio.to_thread
-from fastapi import FastAPI, Request, Response
+from fastapi import Depends, FastAPI, Request, Response
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.gzip import GZipMiddleware
@@ -43,6 +43,7 @@ from rquant.web.formula_market_command_gateway import (
 from rquant.web.nl_parser import OpenAiScreenPlanParser, ScreenPlanParser
 from rquant.web.pool_editor_gateway import PoolCommandGateway, PoolCommandTransport
 from rquant.web.pool_nl_preview import PoolNlRateLimiter
+from rquant.web.proxy_identity import ProxyIdentityVerifier
 from rquant.web.routes import (
     backfill_plan_commands,
     backfill_plans,
@@ -72,6 +73,7 @@ from rquant.web.routes import (
     tasks,
 )
 from rquant.web.screen_service import ScreenApplicationService
+from rquant.web.security import require_current_user
 from rquant.web.service_log_access_audit import ServiceLogAccessAudit
 from rquant.web.serving import GenerationTracker
 from rquant.web.settings import WebSettings
@@ -104,6 +106,7 @@ def _utc_now() -> datetime:
 @dataclass(frozen=True)
 class WebContext:
     settings: WebSettings
+    proxy_identity: ProxyIdentityVerifier | None
     tracker: GenerationTracker
     clock: Callable[[], datetime]
     cursor_key: bytes
@@ -226,6 +229,11 @@ def create_app(
         )
     app.state.web = WebContext(
         settings=settings,
+        proxy_identity=(
+            None
+            if settings.proxy_proof_file is None
+            else ProxyIdentityVerifier.load(settings.proxy_proof_file)
+        ),
         tracker=generation_tracker,
         clock=clock,
         cursor_key=cursor_key,
@@ -342,29 +350,57 @@ def create_app(
     app.include_router(meta.router, prefix="/api/v1", tags=["meta"])
     app.include_router(overview.router, prefix="/api/v1", tags=["overview"])
     app.include_router(pools.router, prefix="/api/v1", tags=["pools"])
-    app.include_router(pool_editor.router, prefix="/api/v1", tags=["pools"])
-    app.include_router(paper.router, prefix="/api/v1", tags=["paper"])
-    app.include_router(monitor.router, prefix="/api/v1", tags=["monitor"])
+    private = [Depends(require_current_user)]
+    app.include_router(pool_editor.router, prefix="/api/v1", tags=["pools"], dependencies=private)
+    app.include_router(paper.router, prefix="/api/v1", tags=["paper"], dependencies=private)
+    app.include_router(monitor.router, prefix="/api/v1", tags=["monitor"], dependencies=private)
     app.include_router(manual_watchlist.router, prefix="/api/v1", tags=["watchlist"])
-    app.include_router(tasks.router, prefix="/api/v1", tags=["tasks"])
+    app.include_router(tasks.router, prefix="/api/v1", tags=["tasks"], dependencies=private)
     app.include_router(service_logs.router, prefix="/api/v1", tags=["tasks"])
-    app.include_router(backtests.router, prefix="/api/v1", tags=["backtests"])
+    app.include_router(backtests.router, prefix="/api/v1", tags=["backtests"], dependencies=private)
     app.include_router(health.router, prefix="/api/v1", tags=["health"])
     app.include_router(panorama.router, prefix="/api/v1", tags=["panorama"])
     app.include_router(screen.router, prefix="/api/v1", tags=["screen"])
-    app.include_router(formula_market_commands.router, prefix="/api/v1", tags=["screen"])
-    app.include_router(formula_market_read.router, prefix="/api/v1", tags=["screen"])
-    app.include_router(formula_pool_read.router, prefix="/api/v1", tags=["pools"])
-    app.include_router(formula_pool_save_commands.router, prefix="/api/v1", tags=["pools"])
+    app.include_router(
+        formula_market_commands.router, prefix="/api/v1", tags=["screen"], dependencies=private
+    )
+    app.include_router(
+        formula_market_read.router, prefix="/api/v1", tags=["screen"], dependencies=private
+    )
+    app.include_router(
+        formula_pool_read.router, prefix="/api/v1", tags=["pools"], dependencies=private
+    )
+    app.include_router(
+        formula_pool_save_commands.router, prefix="/api/v1", tags=["pools"], dependencies=private
+    )
     app.include_router(stocks.router, prefix="/api/v1", tags=["stocks"])
     app.include_router(catalog.router, prefix="/api/v1", tags=["catalog"])
     app.include_router(data_audit.router, prefix="/api/v1", tags=["data-audit"])
-    app.include_router(data_audit_report.router, prefix="/api/v1", tags=["data-audit"])
-    app.include_router(data_audit_report_calendar.router, prefix="/api/v1", tags=["data-audit"])
-    app.include_router(data_audit_report_commands.router, prefix="/api/v1", tags=["data-audit"])
+    app.include_router(
+        data_audit_report.router, prefix="/api/v1", tags=["data-audit"], dependencies=private
+    )
+    app.include_router(
+        data_audit_report_calendar.router,
+        prefix="/api/v1",
+        tags=["data-audit"],
+        dependencies=private,
+    )
+    app.include_router(
+        data_audit_report_commands.router,
+        prefix="/api/v1",
+        tags=["data-audit"],
+        dependencies=private,
+    )
     app.include_router(fundamentals.router, prefix="/api/v1", tags=["data-center"])
-    app.include_router(backfill_plans.router, prefix="/api/v1", tags=["data-audit"])
-    app.include_router(backfill_plan_commands.router, prefix="/api/v1", tags=["data-audit"])
+    app.include_router(
+        backfill_plans.router, prefix="/api/v1", tags=["data-audit"], dependencies=private
+    )
+    app.include_router(
+        backfill_plan_commands.router,
+        prefix="/api/v1",
+        tags=["data-audit"],
+        dependencies=private,
+    )
     return app
 
 

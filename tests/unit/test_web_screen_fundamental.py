@@ -4,11 +4,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from fastapi.testclient import TestClient
-
 from rquant.storage.duckdb import DuckDBStore
-from rquant.web.app import create_app
 from rquant.web.settings import WebSettings
+from tests.support.web_proxy_identity import ResearcherTestClient as TestClient
+from tests.support.web_proxy_identity import create_private_test_app as create_app
 from tests.support.web_serving_fixture import build_web_fixture
 from tests.unit.test_screen_fundamental_projection import _insert_version, _version
 from tests.unit.test_web_screen_replica import _publish, _replica_world

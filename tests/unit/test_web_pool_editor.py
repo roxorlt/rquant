@@ -8,7 +8,6 @@ from pathlib import Path
 
 import duckdb
 import pytest
-from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from rquant.page_control import (
@@ -21,7 +20,6 @@ from rquant.page_control import (
 )
 from rquant.pool_definition_projection import build_pool_definition_rows
 from rquant.serving_read_models import ServingProjectionPayload
-from rquant.web.app import create_app
 from rquant.web.models.pool_editor import SavePoolCommand, SaveRankedPoolCommand
 from rquant.web.pool_editor_gateway import PoolCommandGateway, PoolCommandUnavailableError
 from rquant.web.pool_editor_read import read_pool_editor
@@ -29,6 +27,8 @@ from rquant.web.routes.pool_editor import _failed_message
 from rquant.web.serving import BorrowedGeneration
 from rquant.web.settings import WebSettings
 from tests.canvas_ed25519_support import create_canvas_ed25519_test_authority
+from tests.support.web_proxy_identity import ProofTestClient as TestClient
+from tests.support.web_proxy_identity import create_private_test_app as create_app
 from tests.support.web_serving_fixture import FIXTURE_BUILT_AT, build_web_fixture
 
 NOW = FIXTURE_BUILT_AT + timedelta(seconds=30)
@@ -198,7 +198,7 @@ def test_editor_reads_registered_user_rules_and_verified_canvas_from_one_generat
 ) -> None:
     app = _app(tmp_path / "serving", user_rows=[_user_row()])
     with TestClient(app) as client:
-        response = client.get("/api/v1/pools/editor")
+        response = client.get("/api/v1/pools/editor", headers=HEADERS)
     assert response.status_code == 200
     data = response.json()["data"]
     assert data["state"] == "ready"
@@ -251,7 +251,7 @@ def test_ranked_pool_readback_keeps_plan_and_rejects_v2_overwrite(tmp_path: Path
         transport=transport,
     )
     with TestClient(app) as client:
-        data = client.get("/api/v1/pools/editor").json()["data"]
+        data = client.get("/api/v1/pools/editor", headers=HEADERS).json()["data"]
         refused = client.post(
             "/api/v1/pools/editor/commands",
             json=_save_body("erase-ranking", expected_version="a" * 64),
@@ -280,7 +280,7 @@ def test_unranked_v3_readback_keeps_v3_edit_command_and_explicit_null(tmp_path: 
 
     app = _app(tmp_path / "serving", user_rows=[row], transport=transport)
     with TestClient(app) as client:
-        pool = client.get("/api/v1/pools/editor").json()["data"]["pools"][0]
+        pool = client.get("/api/v1/pools/editor", headers=HEADERS).json()["data"]["pools"][0]
         legacy_update = client.post(
             "/api/v1/pools/editor/commands",
             json=_save_body("legacy-update", expected_version="a" * 64),
@@ -363,7 +363,7 @@ def test_invalid_published_ranking_is_not_editable(tmp_path: Path) -> None:
         transport=lambda _body: pytest.fail("invalid pool must not be edited"),
     )
     with TestClient(app) as client:
-        data = client.get("/api/v1/pools/editor").json()["data"]
+        data = client.get("/api/v1/pools/editor", headers=HEADERS).json()["data"]
         refused = client.post(
             "/api/v1/pools/editor/commands",
             json=_ranked_save_body("bad-ranking", expected_version="a" * 64),
@@ -472,7 +472,7 @@ def test_create_canvas_lost_response_keeps_identity_and_waits_for_serving(tmp_pa
     body = _create_body("create-new")
     with TestClient(app) as client:
         first = client.post("/api/v1/pools/editor/commands", json=body, headers=HEADERS)
-        pending = client.get("/api/v1/pools/editor").json()["data"]
+        pending = client.get("/api/v1/pools/editor", headers=HEADERS).json()["data"]
         resumed = client.post("/api/v1/pools/editor/commands", json=body, headers=HEADERS)
     assert first.status_code == 503
     assert pending["canvases"] == []
@@ -532,7 +532,7 @@ def test_create_canvas_requires_current_canvas_projection(tmp_path: Path) -> Non
         pool_command_transport=lambda _body: pytest.fail("must not submit"),
     )
     with TestClient(app) as client:
-        data = client.get("/api/v1/pools/editor").json()["data"]
+        data = client.get("/api/v1/pools/editor", headers=HEADERS).json()["data"]
         denied = client.post(
             "/api/v1/pools/editor/commands", json=_create_body("create-old"), headers=HEADERS
         )
@@ -561,7 +561,7 @@ def test_editor_exposes_bounded_builtin_copy_sources_with_original_semantics(
 ) -> None:
     app = _app(tmp_path / "serving")
     with TestClient(app) as client:
-        response = client.get("/api/v1/pools/editor")
+        response = client.get("/api/v1/pools/editor", headers=HEADERS)
     assert response.status_code == 200
     sources = {source["key"]: source for source in response.json()["data"]["copy_sources"]}
     assert set(sources) == {"n-shape-pool1", "n-shape-pool2"}
@@ -598,7 +598,7 @@ def test_editor_copy_source_uses_published_rules_and_hides_invalid_registered_ar
     changed["rules_json"] = json.dumps([{"name": "circ_mv_lt", "args": {"threshold_yi": 42}}])
     app = _app(tmp_path / "published", builtin_rows=rows)
     with TestClient(app) as client:
-        data = client.get("/api/v1/pools/editor").json()["data"]
+        data = client.get("/api/v1/pools/editor", headers=HEADERS).json()["data"]
     first = next(source for source in data["copy_sources"] if source["key"] == "n-shape-pool1")
     assert first["version"] == "c" * 64
     assert first["rule_calls"] == [{"name": "circ_mv_lt", "args": {"threshold_yi": 42}}]
@@ -606,7 +606,7 @@ def test_editor_copy_source_uses_published_rules_and_hides_invalid_registered_ar
     changed["rules_json"] = json.dumps([{"name": "circ_mv_lt", "args": {"unknown": 42}}])
     invalid_app = _app(tmp_path / "invalid", builtin_rows=rows)
     with TestClient(invalid_app) as client:
-        data = client.get("/api/v1/pools/editor").json()["data"]
+        data = client.get("/api/v1/pools/editor", headers=HEADERS).json()["data"]
     assert [source["key"] for source in data["copy_sources"]] == ["n-shape-pool2"]
 
 
@@ -620,7 +620,7 @@ def test_editor_empty_builtin_rules_cannot_be_copied_or_saved_directly(tmp_path:
         transport=lambda _body: pytest.fail("builtin must not reach PageControl"),
     )
     with TestClient(app) as client:
-        data = client.get("/api/v1/pools/editor").json()["data"]
+        data = client.get("/api/v1/pools/editor", headers=HEADERS).json()["data"]
         denied = client.post(
             "/api/v1/pools/editor/commands",
             json={**_save_body("builtin-direct"), "base_name": "n-shape-pool1"},
@@ -637,7 +637,7 @@ def test_old_generation_has_no_copy_sources(tmp_path: Path) -> None:
     build_web_fixture(root, "baseline")
     app = create_app(WebSettings(serving_root=root), clock=lambda: NOW, background=False)
     with TestClient(app) as client:
-        data = client.get("/api/v1/pools/editor").json()["data"]
+        data = client.get("/api/v1/pools/editor", headers=HEADERS).json()["data"]
     assert data["state"] == "unavailable"
     assert data["copy_sources"] == []
 
@@ -649,7 +649,7 @@ def test_editor_keeps_canvas_visible_through_authoritative_ref_limit(
     refs = [f"user/pool-{index:03d}" for index in range(count)]
     app = _app(tmp_path / "serving", canvas_rows=[_canvas_row(refs)])
     with TestClient(app) as client:
-        response = client.get("/api/v1/pools/editor")
+        response = client.get("/api/v1/pools/editor", headers=HEADERS)
     assert response.status_code == 200
     assert response.json()["data"]["canvases"][0]["pool_refs"] == refs
 
@@ -664,7 +664,7 @@ def test_editor_hides_noneditable_or_corrupt_rows_and_old_generation_cannot_writ
         transport=lambda _body: pytest.fail("must not reach PageControl"),
     )
     with TestClient(app) as client:
-        data = client.get("/api/v1/pools/editor").json()["data"]
+        data = client.get("/api/v1/pools/editor", headers=HEADERS).json()["data"]
         assert data["pools"] == []
         assert data["canvases"] == []
         assert data["canvas_create_available"] is False
@@ -694,7 +694,7 @@ def test_editor_does_not_offer_rule_with_unregistered_parameters(tmp_path: Path)
     row["rules_json"] = json.dumps([{"name": "not_st", "args": {"unexpected": 1}}])
     app = _app(tmp_path / "serving", user_rows=[row])
     with TestClient(app) as client:
-        data = client.get("/api/v1/pools/editor").json()["data"]
+        data = client.get("/api/v1/pools/editor", headers=HEADERS).json()["data"]
     assert data["pools"] == []
 
 

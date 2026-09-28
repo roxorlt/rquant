@@ -10,7 +10,6 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from fastapi.testclient import TestClient
 
 from rquant.replica_generation import (
     capture_database_watermark,
@@ -23,8 +22,9 @@ from rquant.screen.formula_history_projection import (
 )
 from rquant.screen.replica_source import VerifiedReplicaScreenSource
 from rquant.storage.duckdb import DuckDBStore
-from rquant.web.app import create_app
 from rquant.web.settings import WebSettings
+from tests.support.web_proxy_identity import ResearcherTestClient as TestClient
+from tests.support.web_proxy_identity import create_private_test_app as create_app
 from tests.support.web_serving_fixture import build_web_fixture
 
 DAY = date(2026, 4, 15)

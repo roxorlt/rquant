@@ -8,13 +8,13 @@ from types import SimpleNamespace
 
 import duckdb
 import pytest
-from fastapi.testclient import TestClient
 
 from rquant.serving_read_models import ServingProjectionPayload
-from rquant.web.app import create_app
 from rquant.web.routes.data_audit_report_calendar import _snapshot
 from rquant.web.serving import BorrowedGeneration
 from rquant.web.settings import WebSettings
+from tests.support.web_proxy_identity import ResearcherTestClient as TestClient
+from tests.support.web_proxy_identity import create_private_test_app as create_app
 from tests.support.web_serving_fixture import FIXTURE_BUILT_AT, _trade_calendar, build_web_fixture
 
 

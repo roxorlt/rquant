@@ -2,7 +2,8 @@
 
 ``rquant.config`` is deliberately not used: constructing it reads ``.env``, and the web
 process must not see the secrets file at all (its systemd unit hides it). The default
-listener is loopback TCP; protected commands and logs require a private Web UDS.
+listener is loopback TCP; authenticated identity requires a private Web UDS and a
+separate read-only proxy-proof file.
 """
 
 from __future__ import annotations
@@ -42,6 +43,7 @@ NL_OPENAI_MODEL_ENV_VAR = "RQUANT_WEB_NL_OPENAI_MODEL"
 ACK_ADMISSION_SOCKET_ENV_VAR = "RQUANT_WEB_ACK_ADMISSION_SOCKET"
 WATCHLIST_ADMISSION_SOCKET_ENV_VAR = "RQUANT_WEB_WATCHLIST_ADMISSION_SOCKET"
 INGRESS_SOCKET_ENV_VAR = "RQUANT_WEB_INGRESS_SOCKET"
+PROXY_PROOF_FILE_ENV_VAR = "RQUANT_WEB_PROXY_PROOF_FILE"
 LOG_ADMIN_USERS_ENV_VAR = "RQUANT_WEB_LOG_ADMIN_USERS"
 UNIT_LOG_SOCKET_ENV_VAR = "RQUANT_WEB_UNIT_LOG_SOCKET"
 UNIT_LOG_SERVICE_UID_ENV_VAR = "RQUANT_WEB_UNIT_LOG_SERVICE_UID"
@@ -64,8 +66,8 @@ DEFAULT_STALE_AFTER_SECONDS = 600.0
 def parse_bind(value: str) -> tuple[str, int]:
     """Split ``host:port`` and refuse anything but a loopback address.
 
-    The API has no authentication of its own; nginx basic auth in front of it is the
-    only gate, so it must never listen on an address nginx does not front.
+    The default TCP listener serves public reads; private identity is only available
+    through the explicitly configured Unix ingress and proxy proof.
     """
 
     host, separator, port_text = value.strip().rpartition(":")
@@ -110,6 +112,7 @@ class WebSettings(BaseModel):
     ack_admission_socket_path: Path | None = None
     watchlist_admission_socket_path: Path | None = None
     ingress_socket_path: Path | None = None
+    proxy_proof_file: Path | None = None
     log_admin_users: frozenset[str] = frozenset()
     unit_log_socket_path: Path | None = None
     unit_log_service_uid: StrictInt | None = None
@@ -130,6 +133,8 @@ class WebSettings(BaseModel):
             raise ValueError("screen primary and replica paths must be configured together")
         if self.ingress_socket_path is not None and self.bind != DEFAULT_BIND:
             raise ValueError("private Web ingress cannot also configure a TCP bind")
+        if self.proxy_proof_file is not None and self.ingress_socket_path is None:
+            raise ValueError("proxy proof requires private Web ingress")
         if self.ack_admission_socket_path is not None:
             if self.ingress_socket_path is None:
                 raise ValueError("ack admission requires private Web ingress")
@@ -206,6 +211,13 @@ class WebSettings(BaseModel):
     def validate_ingress_socket_path(cls, value: Path | None) -> Path | None:
         if value is not None and not value.is_absolute():
             raise ValueError("private Web ingress socket path must be absolute")
+        return value
+
+    @field_validator("proxy_proof_file")
+    @classmethod
+    def validate_proxy_proof_file(cls, value: Path | None) -> Path | None:
+        if value is not None and (not value.is_absolute() or ".." in value.parts):
+            raise ValueError("proxy proof file path must be absolute and canonical")
         return value
 
     @field_validator("log_admin_users")
@@ -320,6 +332,9 @@ class WebSettings(BaseModel):
             if bind is not None or source.get(BIND_ENV_VAR, "").strip():
                 raise ValueError("private Web ingress cannot also configure a TCP bind")
             values["ingress_socket_path"] = Path(ingress_socket)
+        proof_file = source.get(PROXY_PROOF_FILE_ENV_VAR, "").strip()
+        if proof_file:
+            values["proxy_proof_file"] = Path(proof_file)
         admins = source.get(LOG_ADMIN_USERS_ENV_VAR, "").strip()
         if admins:
             names = tuple(user.strip() for user in admins.split(","))

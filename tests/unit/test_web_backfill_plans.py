@@ -8,7 +8,6 @@ from pathlib import Path
 
 import pytest
 from fastapi import FastAPI
-from fastapi.testclient import TestClient
 
 from rquant.backfill_plan_artifact import load_daily_bar_backfill_plan
 from rquant.backfill_plan_job_projection import (
@@ -18,8 +17,9 @@ from rquant.backfill_plan_job_projection import (
 )
 from rquant.backfill_plan_projection import project_backfill_plans
 from rquant.serving_read_models import ServingProjectionPayload
-from rquant.web.app import create_app
 from rquant.web.settings import WebSettings
+from tests.support.web_proxy_identity import ResearcherTestClient as TestClient
+from tests.support.web_proxy_identity import create_private_test_app as create_app
 from tests.support.web_serving_fixture import FIXTURE_BUILT_AT, build_web_fixture
 from tests.unit.test_backfill_plan_artifact import _publish, _snapshot
 
