@@ -30,6 +30,7 @@ from rquant.runtime_contracts import (
 )
 from rquant.serving_contracts import FreshnessStatus
 from rquant.signal_bus import (
+    SignalBusIntegrityError,
     SignalBusRoutedRecord,
     SignalBusSourceDescriptor,
     SignalBusStore,
@@ -41,6 +42,12 @@ from rquant.signal_bus import (
 )
 from rquant.signal_contracts import SignalEnvelopeFamily
 from rquant.signal_observed_prefix import SignalObservedPrefixReceipt, signal_window_digest
+from rquant.signal_route_spool import (
+    ReadonlySignalRouteSpool,
+    SignalBusSpoolPrefixReceipt,
+    SignalRouteSpoolIntegrityError,
+    _routed_prefix_digest,
+)
 
 if TYPE_CHECKING:
     from rquant.runtime_serving_snapshot import SignalDeliveryReadPayload
@@ -121,6 +128,24 @@ class NotificationReplicationSummary(RuntimeContractModel):
     started_after_sequence: int = Field(ge=0)
     ended_at_sequence: int = Field(ge=0)
     replicated_count: int = Field(ge=0)
+
+
+class NotificationBusSpoolPrefixVerification(RuntimeContractModel):
+    """Historical three-copy prefix agreement without upstream completeness."""
+
+    link: SignalBusSpoolPrefixReceipt
+    notification_source_inspected_at: AwareUtcDatetime
+    notification_state_revision: int = Field(ge=0)
+    notification_routed_rows_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    upstream_complete: Literal[False] = False
+
+    @model_validator(mode="after")
+    def validate_agreement(self) -> Self:
+        if self.notification_source_inspected_at < self.link.bus_prefix.source_inspected_at:
+            raise ValueError("notification observation predates bus prefix")
+        if self.notification_routed_rows_sha256 != self.link.routed_rows_sha256:
+            raise ValueError("notification and spool route digests differ")
+        return self
 
 
 class NotificationAuthorityHandoff(RuntimeContractModel):
@@ -787,6 +812,140 @@ class NotificationStateStore(SignalBusStore):
         if row is None:
             return NotificationReplicationCursor()
         return self._cursor_from_row(row)
+
+    def verified_bus_spool_prefix(
+        self,
+        spool: ReadonlySignalRouteSpool,
+        *,
+        observed_at: datetime,
+    ) -> NotificationBusSpoolPrefixVerification | None:
+        """Read one notifier snapshot against a verified historical bus/spool link."""
+        if not isinstance(spool, ReadonlySignalRouteSpool):
+            raise TypeError("spool must be a ReadonlySignalRouteSpool")
+        observed = normalize_aware_utc(observed_at)
+        try:
+            link = spool.bus_prefix_link()
+        except SignalRouteSpoolIntegrityError:
+            return None
+        if link is None:
+            return None
+        prefix = link.bus_prefix
+        high = prefix.source_high_watermark
+        if high > _MAX_SIGNAL_COVERAGE_PREFIX or prefix.source_inspected_at > observed:
+            return None
+
+        try:
+            with self._read_snapshot() as connection:
+                revision_row = connection.execute(
+                    "SELECT revision FROM notification_state_revision WHERE singleton = 1"
+                ).fetchone()
+                cursor_row = connection.execute(
+                    "SELECT * FROM notification_replication_source WHERE singleton = 1"
+                ).fetchone()
+                observation = connection.execute(
+                    "SELECT * FROM notification_source_observation WHERE singleton = 1"
+                ).fetchone()
+                if revision_row is None or cursor_row is None or observation is None:
+                    return None
+                cursor = self._cursor_from_row(cursor_row)
+                inspected_at = normalize_aware_utc(
+                    datetime.fromisoformat(str(observation["inspected_at"]))
+                )
+                if (
+                    cursor.source_id != self.replication_source_id
+                    or observation["source_id"] != self.replication_source_id
+                    or cursor.source_generation_id != prefix.source_generation_id
+                    or observation["source_generation_id"] != prefix.source_generation_id
+                    or cursor.first_global_sequence != prefix.first_global_sequence
+                    or observation["first_global_sequence"] != prefix.first_global_sequence
+                    or cursor.observed_high_watermark != high
+                    or observation["source_high_watermark"] != high
+                    or cursor.last_global_sequence != high
+                    or cursor.updated_at is None
+                    or cursor.updated_at > observed
+                    or inspected_at < prefix.source_inspected_at
+                    or inspected_at > observed
+                    or _require_consistent_high_watermark(connection) != high
+                ):
+                    return None
+                rows = connection.execute(
+                    """
+                    SELECT signal.global_sequence, signal.signal_id, signal.payload_hash,
+                           signal.payload_json,
+                           length(CAST(signal.payload_json AS BLOB)) AS payload_size,
+                           signal.received_at,
+                           receipt.signal_id AS receipt_signal_id, receipt.receipt_hash,
+                           receipt.receipt_json
+                    FROM signal_envelope AS signal
+                    LEFT JOIN notification_source_route_receipt AS receipt
+                      ON receipt.global_sequence = signal.global_sequence
+                    WHERE signal.global_sequence <= ?
+                    ORDER BY signal.global_sequence
+                    LIMIT ?
+                    """,
+                    (high, _MAX_SIGNAL_COVERAGE_PREFIX + 1),
+                ).fetchall()
+                if len(rows) != high:
+                    return None
+                records: list[SignalBusRoutedRecord] = []
+                for expected, row in enumerate(rows, start=1):
+                    if (
+                        row["global_sequence"] != expected
+                        or row["receipt_signal_id"] != row["signal_id"]
+                        or not isinstance(row["receipt_hash"], str)
+                        or not isinstance(row["receipt_json"], str)
+                    ):
+                        return None
+                    payload_json = str(row["payload_json"])
+                    signal = parse_stored_signal(
+                        signal_id=str(row["signal_id"]),
+                        payload_hash=str(row["payload_hash"]),
+                        payload_json=payload_json,
+                        payload_size=int(row["payload_size"]),
+                    )
+                    receipt_bytes = row["receipt_json"].encode("utf-8")
+                    if hashlib.sha256(receipt_bytes).hexdigest() != row["receipt_hash"]:
+                        return None
+                    receipt = SignalRouteReceipt.model_validate_json(receipt_bytes)
+                    records.append(
+                        SignalBusRoutedRecord(
+                            global_sequence=expected,
+                            signal_id=str(row["signal_id"]),
+                            payload_hash=str(row["payload_hash"]),
+                            payload_json=payload_json,
+                            signal=signal,
+                            received_at=datetime.fromisoformat(str(row["received_at"])),
+                            receipt=receipt,
+                        )
+                    )
+                descriptor = SignalBusSourceDescriptor(
+                    generation_id=prefix.source_generation_id,
+                    first_global_sequence=prefix.first_global_sequence,
+                    high_watermark=high,
+                )
+                routed = tuple(records)
+                if cursor.last_signal_id != (routed[-1].signal_id if routed else None):
+                    return None
+                route_digest = _routed_prefix_digest(routed)
+                if (
+                    not prefix.matches_routed_prefix(descriptor, routed)
+                    or route_digest != link.routed_rows_sha256
+                ):
+                    return None
+                return NotificationBusSpoolPrefixVerification(
+                    link=link,
+                    notification_source_inspected_at=inspected_at,
+                    notification_state_revision=int(revision_row["revision"]),
+                    notification_routed_rows_sha256=route_digest,
+                )
+        except (
+            sqlite3.DatabaseError,
+            SignalBusIntegrityError,
+            SignalBusWatermarkError,
+            TypeError,
+            ValueError,
+        ):
+            return None
 
     def replicate(
         self,
