@@ -88,6 +88,57 @@ function stockDrawer() {
 }
 
 describe("选股器", () => {
+  it("批量操作只称本页两只，不把总命中数当成本页范围", async () => {
+    Object.defineProperty(navigator, "locks", {
+      configurable: true,
+      value: {
+        request: async (_name: string, _options: unknown, task: () => Promise<void>) => task(),
+      },
+    });
+    catalog();
+    server.use(
+      http.post("*/api/v1/screen/run", () =>
+        HttpResponse.json({
+          data: {
+            trade_date: "2026-09-24",
+            status: "ready",
+            base_count: 80,
+            total: 43,
+            steps: [{ label: "排除 ST", count: 43 }],
+            rows: [
+              { ts_code: "600001.SH", name: "样本01", close: 11, pct_chg: 1 },
+              { ts_code: "600002.SH", name: "样本02", close: 12, pct_chg: 2 },
+            ],
+            next_cursor: "next-page",
+            source,
+          },
+          serving,
+        }),
+      ),
+      http.get("*/api/v1/watchlist", () =>
+        HttpResponse.json({
+          data: {
+            availability: "ready",
+            available_at: "2026-09-24T07:31:00Z",
+            message: "",
+            items: [],
+          },
+          serving,
+        }),
+      ),
+    );
+    const user = userEvent.setup();
+    renderApp("/screener");
+    await user.click(await screen.findByRole("button", { name: "运行筛选" }));
+    const add = await screen.findByRole("button", { name: "加入本页 2 只" });
+    await waitFor(() => expect(add).toBeEnabled());
+    await user.click(add);
+    const dialog = screen.getByRole("dialog", { name: "加入本页 2 只" });
+    expect(dialog).toHaveTextContent("2026-09-24");
+    expect(dialog).toHaveTextContent("第 1 页");
+    expect(dialog).not.toHaveTextContent("43 只");
+  });
+
   it("最近描述只记校验成功的预览，去重置顶并保留最近五条", async () => {
     catalog(true, true);
     let fail = false;

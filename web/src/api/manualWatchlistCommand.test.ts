@@ -58,6 +58,28 @@ it("发送带同源校验的原请求，移出 JSON 不含加入字段", async (
   expect(sent[0]).not.toHaveProperty("expires_at");
 });
 
+it("从选股本页加入时持久命令保留选股来源", async () => {
+  const post = vi.fn(async (body: ManualWatchlistCommandBody) => ({
+    command_id: body.command_id,
+    ts_code: CODE,
+    action: "add" as const,
+    status: "pending" as const,
+    version: null,
+    message: "正在处理",
+  }));
+  await session(post).start({
+    action: "add",
+    generationId: GENERATION,
+    expectedVersion: null,
+    observedStatus: "absent",
+    source: "screen_result",
+  });
+  expect(post).toHaveBeenCalledWith(expect.objectContaining({ source: "screen_result" }));
+  expect(window.localStorage.getItem(`${MANUAL_WATCHLIST_JOURNAL_KEY}:tester:${CODE}`)).toContain(
+    '"source":"screen_result"',
+  );
+});
+
 it("把 409 的有类型容量或冲突回执交给原命令核对", async () => {
   server.use(
     http.post("*/api/v1/watchlist/commands", () =>

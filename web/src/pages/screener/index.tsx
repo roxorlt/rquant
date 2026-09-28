@@ -596,6 +596,13 @@ export default function ScreenerPage() {
             error={error}
             running={running}
             pageIndex={pageIndex}
+            batchRevision={JSON.stringify([
+              snapshotKey,
+              successfulRunRevision,
+              conditionRevision,
+              sourceEpoch.current,
+              draftEpoch.current,
+            ])}
             onStock={setSelectedStock}
             onPrevious={() => runPage(pageIndex - 1, cursors[pageIndex - 1] ?? null)}
             onNext={() => runPage(pageIndex + 1, result?.next_cursor ?? null)}

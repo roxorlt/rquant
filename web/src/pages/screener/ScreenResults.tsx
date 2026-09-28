@@ -3,6 +3,7 @@ import { formatCount, formatNumber, formatPrice } from "@/format/number";
 import { type DataColumn, DataTable } from "@/table/DataTable";
 import { Button, ChangeText, EmptyState, Panel, SkeletonRows } from "@/ui";
 import { StockCell } from "../shared/StockCell";
+import { ScreenWatchlistBatch } from "./ScreenWatchlistBatch";
 
 const PAGE_SIZE = 20;
 const COLUMNS: DataColumn<ScreenRow>[] = [
@@ -102,6 +103,7 @@ export function ScreenResults({
   error,
   running,
   pageIndex,
+  batchRevision,
   onStock,
   onPrevious,
   onNext,
@@ -113,6 +115,7 @@ export function ScreenResults({
   error: string | null;
   running: boolean;
   pageIndex: number;
+  batchRevision: string;
   onStock: (code: string) => void;
   onPrevious: () => void;
   onNext: () => void;
@@ -201,6 +204,13 @@ export function ScreenResults({
           running={running}
           onStock={onStock}
           usesFundamental={usesFundamental}
+        />
+        <ScreenWatchlistBatch
+          data={data}
+          pageIndex={pageIndex}
+          revision={batchRevision}
+          stale={stale}
+          running={running}
         />
         {data?.status === "ready" && data.total !== null && data.total > 0 ? (
           <div className="screen-pages">

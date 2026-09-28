@@ -40,6 +40,7 @@ export type WatchlistBasis = {
   generationId: string;
   expectedVersion: number | null;
   observedStatus: "active" | "expired" | "deleted" | "absent";
+  source?: "detail" | "screen_result";
 };
 
 function object(value: unknown): value is Record<string, unknown> {
@@ -101,7 +102,7 @@ function validBody(value: unknown, tsCode: string): value is ManualWatchlistComm
     return (
       keys ===
         "action,command_id,expected_version,generation_id,price_levels,requested_at,source,ts_code" &&
-      value.source === "detail" &&
+      (value.source === "detail" || value.source === "screen_result") &&
       Array.isArray(value.price_levels) &&
       value.price_levels.length === 0
     );
@@ -206,6 +207,7 @@ interface SessionOptions {
   tsCode: string;
   post: (body: ManualWatchlistCommandBody) => Promise<Receipt>;
   verifyBasis: (basis: WatchlistBasis) => Promise<"ready" | "stale" | "unavailable">;
+  verifyOwner?: () => Promise<boolean>;
   nextId: () => string;
   now: () => string;
   withLock: (name: string, task: () => Promise<void>) => Promise<void>;
@@ -356,6 +358,10 @@ export class ManualWatchlistCommandSession {
       this.emit({ busy: false });
     }
   }
+  private async ownerReady(): Promise<boolean> {
+    if (!this.options.verifyOwner) return true;
+    return this.options.verifyOwner().catch(() => false);
+  }
   async start(basis: WatchlistBasis): Promise<void> {
     await this.locked(async () => {
       if (!this.refresh()) return;
@@ -383,6 +389,10 @@ export class ManualWatchlistCommandSession {
         });
         return;
       }
+      if (!(await this.ownerReady())) {
+        this.emit({ message: "登录身份已变化，请切回原账户核对。" });
+        return;
+      }
       const common = {
         command_id: this.options.nextId(),
         requested_at: this.options.now(),
@@ -392,7 +402,7 @@ export class ManualWatchlistCommandSession {
       };
       const body: ManualWatchlistCommandBody =
         basis.action === "add"
-          ? { ...common, action: "add", source: "detail", price_levels: [] }
+          ? { ...common, action: "add", source: basis.source ?? "detail", price_levels: [] }
           : { ...common, action: "remove", expected_version: basis.expectedVersion };
       if (!validBody(body, this.options.tsCode)) {
         this.emit({ message: "暂时无法创建请求，请重试。" });
@@ -405,7 +415,13 @@ export class ManualWatchlistCommandSession {
     await this.locked(async () => {
       if (!this.refresh()) return;
       const entry = this.current.record;
-      if (entry && !TERMINAL.has(entry.status)) await this.send(entry.body);
+      if (entry && !TERMINAL.has(entry.status)) {
+        if (!(await this.ownerReady())) {
+          this.emit({ message: "登录身份已变化，请切回原账户核对。" });
+          return;
+        }
+        await this.send(entry.body);
+      }
     });
   }
 }
@@ -423,48 +439,102 @@ function randomId(): string {
   );
 }
 
-/** A fresh authenticated meta and exact GET back every new browser command. */
-async function verifyBasis(
+export type TrustedWatchlistBasis = {
+  status: "active" | "expired" | "deleted" | "absent";
+  version: number | null;
+};
+
+/** A fresh authenticated meta and same-generation exact read back each batch decision. */
+export async function readTrustedWatchlistBasis(
   viewer: string,
+  generationId: string,
   tsCode: string,
-  basis: WatchlistBasis,
   updateMeta: (meta: Awaited<ReturnType<typeof fetchMeta>>) => void,
-): Promise<"ready" | "stale" | "unavailable"> {
+): Promise<
+  { state: "ready"; basis: TrustedWatchlistBasis } | { state: "stale" | "unavailable"; basis: null }
+> {
   try {
+    if (!CODE.test(tsCode) || !HASH.test(generationId))
+      return { state: "unavailable", basis: null };
     const meta = await fetchMeta();
     updateMeta(meta);
     if (
       meta.data.viewer !== viewer ||
       meta.serving.state !== "ready" ||
-      meta.serving.generation_id !== basis.generationId ||
-      meta.data.generation?.generation_id !== basis.generationId ||
+      meta.serving.generation_id !== generationId ||
+      meta.data.generation?.generation_id !== generationId ||
       !Number.isFinite(Date.parse(meta.data.server_time))
     )
-      return "stale";
+      return { state: "stale", basis: null };
     const { data } = await apiClient().GET("/api/v1/watchlist/{ts_code}", {
       params: { path: { ts_code: tsCode } },
       signal: AbortSignal.timeout(12_000),
     });
     if (
       data?.serving.state !== "ready" ||
-      data.serving.generation_id !== basis.generationId ||
+      data.serving.generation_id !== generationId ||
       data.data.availability !== "ready" ||
       data.data.ts_code !== tsCode
     )
-      return "unavailable";
+      return { state: "unavailable", basis: null };
     const fact = data.data;
     const expires = fact.expires_at === null ? null : Date.parse(fact.expires_at);
-    if (expires !== null && !Number.isFinite(expires)) return "unavailable";
+    if (expires !== null && !Number.isFinite(expires)) return { state: "unavailable", basis: null };
     const currentStatus =
       fact.status === "active" && expires !== null && expires <= Date.parse(meta.data.server_time)
         ? "expired"
         : fact.status;
-    return currentStatus === basis.observedStatus && fact.version === basis.expectedVersion
-      ? "ready"
-      : "stale";
+    if (currentStatus === "absent" && fact.version === null)
+      return { state: "ready", basis: { status: "absent", version: null } };
+    if (
+      (currentStatus === "active" || currentStatus === "expired" || currentStatus === "deleted") &&
+      Number.isInteger(fact.version) &&
+      Number(fact.version) >= 1
+    )
+      return { state: "ready", basis: { status: currentStatus, version: fact.version } };
+    return { state: "unavailable", basis: null };
   } catch {
-    return "unavailable";
+    return { state: "unavailable", basis: null };
   }
+}
+
+async function verifyBasis(
+  viewer: string,
+  tsCode: string,
+  basis: WatchlistBasis,
+  updateMeta: (meta: Awaited<ReturnType<typeof fetchMeta>>) => void,
+): Promise<"ready" | "stale" | "unavailable"> {
+  const current = await readTrustedWatchlistBasis(viewer, basis.generationId, tsCode, updateMeta);
+  if (current.state !== "ready") return current.state;
+  return current.basis.status === basis.observedStatus &&
+    current.basis.version === basis.expectedVersion
+    ? "ready"
+    : "stale";
+}
+
+export function createBrowserManualWatchlistSession(
+  viewer: string | null,
+  tsCode: string | null,
+  updateMeta: (meta: Awaited<ReturnType<typeof fetchMeta>>) => void,
+  verifyOwner?: () => Promise<boolean>,
+): ManualWatchlistCommandSession {
+  return new ManualWatchlistCommandSession({
+    storage: (() => {
+      try {
+        return typeof navigator.locks !== "undefined" ? window.localStorage : null;
+      } catch {
+        return null;
+      }
+    })(),
+    viewer,
+    tsCode: tsCode ?? "",
+    post: submitManualWatchlistCommand,
+    verifyBasis: (basis) => verifyBasis(viewer ?? "", tsCode ?? "", basis, updateMeta),
+    verifyOwner,
+    nextId: randomId,
+    now: () => new Date().toISOString(),
+    withLock: browserLock,
+  });
 }
 
 export function useManualWatchlistCommand(
@@ -475,25 +545,9 @@ export function useManualWatchlistCommand(
   const queryClient = useQueryClient();
   const session = useMemo(
     () =>
-      new ManualWatchlistCommandSession({
-        storage: (() => {
-          try {
-            return typeof navigator.locks !== "undefined" ? window.localStorage : null;
-          } catch {
-            return null;
-          }
-        })(),
-        viewer,
-        tsCode: tsCode ?? "",
-        post: submitManualWatchlistCommand,
-        verifyBasis: (basis) =>
-          verifyBasis(viewer ?? "", tsCode ?? "", basis, (meta) =>
-            queryClient.setQueryData(META_QUERY_KEY, meta),
-          ),
-        nextId: randomId,
-        now: () => new Date().toISOString(),
-        withLock: browserLock,
-      }),
+      createBrowserManualWatchlistSession(viewer, tsCode, (meta) =>
+        queryClient.setQueryData(META_QUERY_KEY, meta),
+      ),
     [queryClient, viewer, tsCode],
   );
   const state = useSyncExternalStore(session.subscribe, session.snapshot, session.snapshot);
