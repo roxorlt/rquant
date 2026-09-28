@@ -67,6 +67,7 @@ from rquant.web.routes import (
     paper,
     pool_editor,
     pools,
+    price_alert_rules,
     screen,
     service_logs,
     stocks,
@@ -80,6 +81,7 @@ from rquant.web.settings import WebSettings
 
 if TYPE_CHECKING:
     from rquant.alert_ack_admission import AckAdmissionClient
+    from rquant.price_alert_admission import PriceAlertAdmissionClient
     from rquant.watchlist_admission import WatchlistAdmissionClient
 
 API_TITLE = "rQuant Web API"
@@ -92,6 +94,7 @@ _WRITE_BODY_LIMITS = {
     "/api/v1/pools/editor/nl-preview": pool_editor.MAX_NL_REQUEST_BYTES,
     "/api/v1/monitor/ack": monitor.MAX_ACK_REQUEST_BYTES,
     "/api/v1/watchlist/commands": manual_watchlist.MAX_COMMAND_REQUEST_BYTES,
+    "/api/v1/monitor/rules/commands": price_alert_rules.MAX_COMMAND_REQUEST_BYTES,
     "/api/v1/data/backfill-plans/commands": backfill_plan_commands.MAX_REQUEST_BYTES,
     "/api/v1/data/audit-report/commands": data_audit_report_commands.MAX_REQUEST_BYTES,
     "/api/v1/screen/tdx/market/commands": formula_market_commands.MAX_REQUEST_BYTES,
@@ -119,6 +122,7 @@ class WebContext:
     ack_lookup: AckLookupGateway
     ack_admission: AckAdmissionClient | None
     watchlist_admission: WatchlistAdmissionClient | None
+    price_rule_admission: PriceAlertAdmissionClient | None
     unit_log_client: UnitLogClient | None
     unit_log_access_audit: ServiceLogAccessAudit | None
     unit_log_gate: threading.BoundedSemaphore
@@ -138,6 +142,7 @@ def create_app(
     ack_lookup_transport: AckLookupTransport | None = None,
     ack_admission_client: AckAdmissionClient | None = None,
     watchlist_admission_client: WatchlistAdmissionClient | None = None,
+    price_rule_admission_client: PriceAlertAdmissionClient | None = None,
     unit_log_client: UnitLogClient | None = None,
     unit_log_access_audit: ServiceLogAccessAudit | None = None,
     backfill_plan_command_transport: BackfillPlanCommandTransport | None = None,
@@ -207,6 +212,21 @@ def create_app(
             if watchlist_admission_client is not None
             else WatchlistAdmissionClient(settings.watchlist_admission_socket_path)
         )
+    configured_price_rule_admission = None
+    if settings.price_rule_admission_socket_path is not None:
+        from rquant.price_alert_admission import PriceAlertAdmissionClient
+
+        assert settings.price_rule_admission_service_uid is not None
+        assert settings.price_rule_admission_shared_gid is not None
+        configured_price_rule_admission = (
+            price_rule_admission_client
+            if price_rule_admission_client is not None
+            else PriceAlertAdmissionClient(
+                settings.price_rule_admission_socket_path,
+                expected_service_uid=settings.price_rule_admission_service_uid,
+                shared_gid=settings.price_rule_admission_shared_gid,
+            )
+        )
     configured_unit_log = None
     if settings.unit_log_socket_path is not None:
         assert settings.unit_log_service_uid is not None
@@ -257,6 +277,7 @@ def create_app(
         ),
         ack_admission=configured_ack_admission,
         watchlist_admission=configured_watchlist_admission,
+        price_rule_admission=configured_price_rule_admission,
         unit_log_client=configured_unit_log,
         unit_log_access_audit=unit_log_access_audit,
         unit_log_gate=threading.BoundedSemaphore(1),
@@ -331,6 +352,8 @@ def create_app(
             return JSONResponse(status_code=422, content={"detail": "确认请求有误，请刷新后重试。"})
         if request.url.path == "/api/v1/watchlist/commands":
             return JSONResponse(status_code=422, content={"detail": "名单请求有误，请检查后重试。"})
+        if request.url.path == "/api/v1/monitor/rules/commands":
+            return JSONResponse(status_code=422, content={"detail": "规则请求有误，请检查后重试。"})
         if request.url.path == "/api/v1/data/backfill-plans/commands":
             return JSONResponse(status_code=422, content={"detail": "计划日期有误，请检查后重试。"})
         if request.url.path == "/api/v1/data/audit-report/commands":
@@ -354,6 +377,7 @@ def create_app(
     app.include_router(pool_editor.router, prefix="/api/v1", tags=["pools"], dependencies=private)
     app.include_router(paper.router, prefix="/api/v1", tags=["paper"], dependencies=private)
     app.include_router(monitor.router, prefix="/api/v1", tags=["monitor"], dependencies=private)
+    app.include_router(price_alert_rules.router, prefix="/api/v1", tags=["monitor"])
     app.include_router(manual_watchlist.router, prefix="/api/v1", tags=["watchlist"])
     app.include_router(tasks.router, prefix="/api/v1", tags=["tasks"], dependencies=private)
     app.include_router(service_logs.router, prefix="/api/v1", tags=["tasks"])

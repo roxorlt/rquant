@@ -42,6 +42,9 @@ NL_OPENAI_API_KEY_ENV_VAR = "RQUANT_WEB_NL_OPENAI_API_KEY"
 NL_OPENAI_MODEL_ENV_VAR = "RQUANT_WEB_NL_OPENAI_MODEL"
 ACK_ADMISSION_SOCKET_ENV_VAR = "RQUANT_WEB_ACK_ADMISSION_SOCKET"
 WATCHLIST_ADMISSION_SOCKET_ENV_VAR = "RQUANT_WEB_WATCHLIST_ADMISSION_SOCKET"
+PRICE_RULE_ADMISSION_SOCKET_ENV_VAR = "RQUANT_WEB_PRICE_RULE_ADMISSION_SOCKET"
+PRICE_RULE_ADMISSION_SERVICE_UID_ENV_VAR = "RQUANT_WEB_PRICE_RULE_ADMISSION_SERVICE_UID"
+PRICE_RULE_ADMISSION_SHARED_GID_ENV_VAR = "RQUANT_WEB_PRICE_RULE_ADMISSION_SHARED_GID"
 INGRESS_SOCKET_ENV_VAR = "RQUANT_WEB_INGRESS_SOCKET"
 PROXY_PROOF_FILE_ENV_VAR = "RQUANT_WEB_PROXY_PROOF_FILE"
 LOG_ADMIN_USERS_ENV_VAR = "RQUANT_WEB_LOG_ADMIN_USERS"
@@ -111,6 +114,9 @@ class WebSettings(BaseModel):
     nl_openai_model: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
     ack_admission_socket_path: Path | None = None
     watchlist_admission_socket_path: Path | None = None
+    price_rule_admission_socket_path: Path | None = None
+    price_rule_admission_service_uid: StrictInt | None = None
+    price_rule_admission_shared_gid: StrictInt | None = None
     ingress_socket_path: Path | None = None
     proxy_proof_file: Path | None = None
     log_admin_users: frozenset[str] = frozenset()
@@ -150,6 +156,28 @@ class WebSettings(BaseModel):
                 reserved.add(self.ack_admission_socket_path.parent)
             if self.watchlist_admission_socket_path.parent in reserved:
                 raise ValueError("watchlist admission socket needs a separate directory")
+        price_fields = (
+            self.price_rule_admission_socket_path,
+            self.price_rule_admission_service_uid,
+            self.price_rule_admission_shared_gid,
+        )
+        if any(value is not None for value in price_fields):
+            if not all(value is not None for value in price_fields):
+                raise ValueError("price rule admission settings must be configured together")
+            if self.ingress_socket_path is None:
+                raise ValueError("price rule admission requires private Web ingress")
+            assert self.price_rule_admission_socket_path is not None
+            reserved = {self.ingress_socket_path.parent}
+            if self.ack_admission_socket_path is not None:
+                reserved.add(self.ack_admission_socket_path.parent)
+            if self.watchlist_admission_socket_path is not None:
+                reserved.add(self.watchlist_admission_socket_path.parent)
+            if self.unit_log_socket_path is not None:
+                reserved.add(self.unit_log_socket_path.parent)
+            if self.price_rule_admission_socket_path.parent in reserved:
+                raise ValueError("price rule admission needs a separate directory")
+            if self.price_rule_admission_service_uid == os.geteuid():
+                raise ValueError("price rule admission service UID must differ from Web")
         log_fields = (
             self.unit_log_socket_path,
             self.unit_log_service_uid,
@@ -204,6 +232,20 @@ class WebSettings(BaseModel):
     def validate_ack_admission_socket_path(cls, value: Path | None) -> Path | None:
         if value is not None and not value.is_absolute():
             raise ValueError("ack admission socket path must be absolute")
+        return value
+
+    @field_validator("price_rule_admission_socket_path")
+    @classmethod
+    def validate_price_rule_admission_socket_path(cls, value: Path | None) -> Path | None:
+        if value is not None and (not value.is_absolute() or ".." in value.parts):
+            raise ValueError("price rule admission socket path must be absolute and canonical")
+        return value
+
+    @field_validator("price_rule_admission_service_uid", "price_rule_admission_shared_gid")
+    @classmethod
+    def validate_price_rule_admission_identity(cls, value: int | None) -> int | None:
+        if value is not None and (type(value) is not int or value < 0):
+            raise ValueError("price rule admission IDs must be nonnegative integers")
         return value
 
     @field_validator("ingress_socket_path")
@@ -327,6 +369,15 @@ class WebSettings(BaseModel):
         watchlist_socket = source.get(WATCHLIST_ADMISSION_SOCKET_ENV_VAR, "").strip()
         if watchlist_socket:
             values["watchlist_admission_socket_path"] = Path(watchlist_socket)
+        price_rule_socket = source.get(PRICE_RULE_ADMISSION_SOCKET_ENV_VAR, "").strip()
+        if price_rule_socket:
+            values["price_rule_admission_socket_path"] = Path(price_rule_socket)
+        service_uid = source.get(PRICE_RULE_ADMISSION_SERVICE_UID_ENV_VAR, "").strip()
+        if service_uid:
+            values["price_rule_admission_service_uid"] = int(service_uid)
+        shared_gid = source.get(PRICE_RULE_ADMISSION_SHARED_GID_ENV_VAR, "").strip()
+        if shared_gid:
+            values["price_rule_admission_shared_gid"] = int(shared_gid)
         ingress_socket = source.get(INGRESS_SOCKET_ENV_VAR, "").strip()
         if ingress_socket:
             if bind is not None or source.get(BIND_ENV_VAR, "").strip():
