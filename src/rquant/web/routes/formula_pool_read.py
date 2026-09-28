@@ -38,6 +38,7 @@ router = APIRouter(prefix="/pools/formula")
 _UNREADABLE = "公式池暂时无法读取，请稍后重试。"
 _MEMBERS_UNREADABLE = "池子结果暂时无法读取，请稍后重试。"
 _CHANGED = "池子结果已更新，请重新打开查看。"
+_MAX_CURSOR_CHARS = 2048
 _UNKNOWN_LABELS = {
     "missing_projection_code": "缺少行情资料",
     "listing_conflict": "上市资料不一致",
@@ -78,7 +79,7 @@ def _encode_cursor(cursor: _MembersCursor, key: bytes) -> str:
 
 def _decode_cursor(token: str, key: bytes) -> _MembersCursor:
     try:
-        if len(token) > 512:
+        if len(token) > _MAX_CURSOR_CHARS:
             raise ValueError("cursor too long")
         payload_text, signature_text = token.split(".")
         payload = b64decode(
@@ -171,6 +172,7 @@ def list_formula_pools(
                 display_name=item.display_name,
                 formula=item.formula,
                 syntax_version=item.syntax_version,
+                version=item.version,
                 created_at=item.created_at,
                 status_label="尚未运行" if item.pool_name not in by_name else "已有结果",
                 latest_result=(
@@ -205,7 +207,7 @@ def get_formula_pool_members(
     response: Response,
     _viewer: Annotated[str | None, Depends(current_user)],
     page_size: Annotated[int, Query(ge=1, le=100)] = 50,
-    cursor: Annotated[str | None, Query(min_length=1, max_length=512)] = None,
+    cursor: Annotated[str | None, Query(min_length=1, max_length=_MAX_CURSOR_CHARS)] = None,
 ) -> Envelope[FormulaPoolMembersData]:
     _only_queries(request, frozenset({"page_size", "cursor"}))
     if _NAME.fullmatch(base_name) is None:

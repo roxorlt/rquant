@@ -5079,6 +5079,11 @@
           "syntax_version": {
             "title": "Syntax Version",
             "type": "string"
+          },
+          "version": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Version",
+            "type": "string"
           }
         },
         "required": [
@@ -5086,6 +5091,7 @@
           "display_name",
           "formula",
           "syntax_version",
+          "version",
           "created_at",
           "status_label",
           "latest_result"
@@ -12783,7 +12789,7 @@
             "schema": {
               "anyOf": [
                 {
-                  "maxLength": 512,
+                  "maxLength": 2048,
                   "minLength": 1,
                   "type": "string"
                 },

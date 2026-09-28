@@ -32,6 +32,7 @@ class FormulaPoolItem(_PublicModel):
     display_name: str
     formula: str
     syntax_version: str
+    version: str = Field(pattern=r"^[0-9a-f]{64}$")
     created_at: datetime
     status_label: str
     latest_result: FormulaPoolLatestResult | None
