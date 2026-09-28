@@ -477,9 +477,37 @@ def test_same_day_sell_is_blocked_by_shared_broker_t_plus_one(tmp_path: Path) ->
     assert rejected.reject_reason is PaperRejectReason.T_PLUS_ONE
 
 
+def test_pit_accepts_classification_visible_at_decision_cutoff() -> None:
+    data = _request((_CODES[0],)).model_dump(mode="python")
+    cutoff = _at(_TRADE_DATES[0], 9, 25)
+    data["days"][0]["instruments"][0]["classification_observed_at"] = cutoff
+
+    request = BacktestRequest.model_validate(data)
+
+    assert request.days[0].instruments[0].classification_observed_at == cutoff
+
+
+def test_pit_requires_ranking_before_cutoff() -> None:
+    cutoff = _at(_TRADE_DATES[0], 9, 25)
+    data = _request((_CODES[0],)).model_dump(mode="python")
+    data["days"][0]["ranking"]["observed_at"] = cutoff
+    with pytest.raises(ValidationError, match="ranking observation must precede"):
+        BacktestRequest.model_validate(data)
+
+
+def test_pit_requires_decision_price_before_cutoff() -> None:
+    cutoff = _at(_TRADE_DATES[0], 9, 25)
+    data = _request((_CODES[0],)).model_dump(mode="python")
+    data["days"][0]["instruments"][0]["decision_price_observed_at"] = cutoff
+    with pytest.raises(ValidationError, match="decision price must be visible before"):
+        BacktestRequest.model_validate(data)
+
+
 def test_pit_requires_authoritative_source_and_visible_classification() -> None:
     data = _request((_CODES[0],)).model_dump(mode="python")
-    data["days"][0]["instruments"][0]["classification_observed_at"] = _at(_TRADE_DATES[0], 9, 26)
+    data["days"][0]["instruments"][0]["classification_observed_at"] = _at(
+        _TRADE_DATES[0], 9, 25
+    ).replace(second=1)
     with pytest.raises(ValidationError, match="classification.*cutoff"):
         BacktestRequest.model_validate(data)
     data = _request((_CODES[0],)).model_dump(mode="python")

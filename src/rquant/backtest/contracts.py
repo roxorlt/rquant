@@ -163,7 +163,9 @@ class BacktestRequest(RuntimeContractModel):
             if not (_local_at(previous_date, 15, 0) <= day.ranking.observed_at < cutoff):
                 raise ValueError("ranking observation must precede the 09:25 cutoff")
             for quote in day.instruments:
-                if quote.classification_observed_at >= cutoff:
+                # The reference publisher commits before 09:25 and makes classification
+                # records visible exactly at the decision instant.
+                if quote.classification_observed_at > cutoff:
                     raise ValueError("instrument classification is not visible at decision cutoff")
                 if quote.decision_price_observed_at is not None and not (
                     _local_at(previous_date, 15, 0) <= quote.decision_price_observed_at < cutoff
