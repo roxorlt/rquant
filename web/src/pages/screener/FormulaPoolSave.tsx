@@ -84,23 +84,24 @@ export function readFormulaPoolSaveTaskId(viewer: string | null): string | null 
   return viewer !== null && journal?.viewer === viewer ? journal.request.task_id : null;
 }
 
-export function FormulaPoolSave({
-  taskId,
-  formula,
-  tradeDate,
-  matchCount,
-  unknownCount,
-  resultReady,
-  onSelectTask,
-}: {
+type FormulaPoolSaveProps = {
   taskId: string;
-  formula: string;
-  tradeDate: string;
-  matchCount: number;
-  unknownCount: number;
-  resultReady: boolean;
   onSelectTask: (taskId: string) => void;
-}) {
+} & (
+  | { recoveryOnly: true }
+  | {
+      recoveryOnly?: false;
+      formula: string;
+      tradeDate: string;
+      matchCount: number;
+      unknownCount: number;
+      resultReady: boolean;
+    }
+);
+
+export function FormulaPoolSave(props: FormulaPoolSaveProps) {
+  const { taskId, onSelectTask } = props;
+  const resultReady = !props.recoveryOnly && props.resultReady;
   const meta = useCurrentMeta();
   const generation = useCurrentGeneration();
   const viewer = meta.data?.data.viewer ?? null;
@@ -210,11 +211,15 @@ export function FormulaPoolSave({
     });
   }
 
+  if (props.recoveryOnly && active === null && notice === null) return null;
+
   return (
     <section className="formula-pool-save" aria-label="保存公式池">
       <div className="formula-market-recent-heading">
         <h4>保存为池子</h4>
-        <span className="formula-pool-save-date num">{tradeDate}</span>
+        {!props.recoveryOnly ? (
+          <span className="formula-pool-save-date num">{props.tradeDate}</span>
+        ) : null}
       </div>
       {active ? (
         <div className="formula-pool-save-state" role="status">
@@ -257,13 +262,13 @@ export function FormulaPoolSave({
             </Button>
           ) : null}
         </div>
-      ) : (
+      ) : !props.recoveryOnly ? (
         <>
           <div className="formula-pool-save-proof">
-            <code className="mono">{formula}</code>
+            <code className="mono">{props.formula}</code>
             <span>
-              命中 <b className="num">{formatCount(matchCount)}</b> · 未能判断{" "}
-              <b className="num">{formatCount(unknownCount)}</b>
+              命中 <b className="num">{formatCount(props.matchCount)}</b> · 未能判断{" "}
+              <b className="num">{formatCount(props.unknownCount)}</b>
             </span>
           </div>
           <div className="formula-pool-save-compose">
@@ -294,7 +299,7 @@ export function FormulaPoolSave({
             </Button>
           </div>
         </>
-      )}
+      ) : null}
       {notice ? (
         <p className="formula-market-notice" role="status">
           {notice}

@@ -386,19 +386,23 @@ describe("全市场公式选股", () => {
     const submitted: Schemas["FormulaPoolSaveCommandRequest"][] = [];
     let published = false;
     let unreadable = false;
+    let recentVisible = true;
+    let jobsUnavailable = false;
     server.use(
       http.get("*/api/v1/screen/tdx/market/jobs", () =>
-        HttpResponse.json({
-          data: {
-            availability: "ready",
-            available_at: "2026-09-24T07:32:00Z",
-            has_older_tasks: false,
-            jobs: [job],
-            message: "",
-            total_task_count: 1,
-          },
-          serving,
-        }),
+        jobsUnavailable
+          ? HttpResponse.json({ detail: "暂不可用" }, { status: 503 })
+          : HttpResponse.json({
+              data: {
+                availability: "ready",
+                available_at: "2026-09-24T07:32:00Z",
+                has_older_tasks: false,
+                jobs: recentVisible ? [job] : [],
+                message: "",
+                total_task_count: 1,
+              },
+              serving,
+            }),
       ),
       http.get(`*/api/v1/screen/tdx/market/jobs/${taskId}`, () =>
         HttpResponse.json({ data: { job, summary }, serving }),
@@ -475,9 +479,18 @@ describe("全市场公式选股", () => {
     expect(within(otherDrawer).queryByText("保存状态待确认")).toBeNull();
     other.unmount();
 
+    recentVisible = false;
+    const absent = renderPreview(true);
+    const absentDrawer = await screen.findByRole("dialog", { name: "公式预览" });
+    expect(await within(absentDrawer).findByText("保存状态待确认")).toBeVisible();
+    expect(within(absentDrawer).getByRole("button", { name: "继续核对" })).toBeVisible();
+    absent.unmount();
+
+    jobsUnavailable = true;
     renderPreview(true);
     const restored = await screen.findByRole("dialog", { name: "公式预览" });
     expect(await within(restored).findByText("保存状态待确认")).toBeVisible();
+    expect(await within(restored).findByText("最近运行暂不可用")).toBeVisible();
     await user.click(within(restored).getByRole("button", { name: "继续核对" }));
     expect(await within(restored).findByText("已保存，暂无法确认池子")).toBeVisible();
     expect(submitted[1]).toEqual(submitted[0]);
@@ -487,6 +500,8 @@ describe("全市场公式选股", () => {
     published = true;
     await user.click(within(restored).getByRole("button", { name: "检查发布" }));
     expect(await within(restored).findByText("已保存，可在池子画布查看")).toBeVisible();
+    await user.click(within(restored).getByRole("button", { name: "保存另一个" }));
+    expect(within(restored).queryByRole("region", { name: "保存公式池" })).toBeNull();
     expect(findJargon(restored.textContent ?? "")).toEqual([]);
   });
 });

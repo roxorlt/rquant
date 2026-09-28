@@ -567,7 +567,7 @@
     grid-template-columns: minmax(0, 1fr);
   }
   .pools-layout .flow-graph {
-    height: 480px;
+    max-height: 480px;
   }
 }
 @media (max-width: 390px) {

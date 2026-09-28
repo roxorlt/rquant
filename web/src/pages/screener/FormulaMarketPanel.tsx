@@ -107,6 +107,9 @@ export function FormulaMarketPanel({ formula, checked }: { formula: string; chec
   const jobList =
     generation === undefined || jobs.serving?.generation_id === generation ? jobs.data : undefined;
   const selectedListJob = jobList?.jobs.find((job) => job.task_id === selectedId);
+  const savedPoolTaskId = readFormulaPoolSaveTaskId(viewer);
+  const showSaveRecovery =
+    savedPoolTaskId !== null && !jobList?.jobs.some((job) => job.task_id === savedPoolTaskId);
   const unreadableTaskId =
     selectedListJob?.status === "succeeded" && !selectedListJob.result_available
       ? selectedListJob.task_id
@@ -355,6 +358,10 @@ export function FormulaMarketPanel({ formula, checked }: { formula: string; chec
           ) : null}
         </>
       )}
+
+      {showSaveRecovery && savedPoolTaskId !== null ? (
+        <FormulaPoolSave taskId={savedPoolTaskId} onSelectTask={selectJob} recoveryOnly />
+      ) : null}
 
       {selectedListJob !== undefined ? (
         <section className="formula-market-detail" aria-label="运行详情">
