@@ -64,7 +64,11 @@ for (const width of [1440, 390]) {
       await expect(page.getByRole("tooltip", { name: /2026-09-24/ })).toBeVisible();
       await page.mouse.move(5, 70);
       await expect(page.getByRole("tooltip", { name: /2026-09-24/ })).toHaveCount(0);
-      await expect(page.getByRole("button", { name: "新建规则" })).toHaveCount(0);
+      await expect(
+        page
+          .getByRole("region", { name: "价格提醒规则" })
+          .getByRole("button", { name: "新建规则" }),
+      ).toBeDisabled();
       await expect(page.getByRole("button", { name: "确认" })).toHaveCount(0);
       await expectNoHorizontalOverflow(page, "monitor");
       expect(findJargon(await page.locator("main").innerText())).toEqual([]);

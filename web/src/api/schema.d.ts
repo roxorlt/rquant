@@ -293,6 +293,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/monitor/rules": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 我的价格规则 */
+        get: operations["list_price_alert_rules_api_v1_monitor_rules_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/monitor/rules/commands": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 保存或删除价格规则 */
+        post: operations["submit_price_alert_rule_command_api_v1_monitor_rules_commands_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/monitor/timeline": {
         parameters: {
             query?: never;
@@ -2177,6 +2211,27 @@ export interface components {
             status: "fresh" | "stale" | "degraded" | "unavailable";
             user_status: components["schemas"]["StatusInfo"];
         };
+        /** DeletePriceAlertRuleRequest */
+        DeletePriceAlertRuleRequest: {
+            /** Command Id */
+            command_id: string;
+            /** Expected Version */
+            expected_version: number;
+            /** Generation Id */
+            generation_id: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "delete_price_alert_rule";
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+            /** Rule Id */
+            rule_id: string;
+        };
         /** DeliveriesSummary */
         DeliveriesSummary: {
             /** Delivered */
@@ -2392,6 +2447,11 @@ export interface components {
         /** Envelope[PoolsData] */
         Envelope_PoolsData_: {
             data: components["schemas"]["PoolsData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[PriceAlertRuleListData] */
+        Envelope_PriceAlertRuleListData_: {
+            data: components["schemas"]["PriceAlertRuleListData"];
             serving: components["schemas"]["ServingMeta"];
         };
         /** Envelope[PulseData] */
@@ -3844,6 +3904,117 @@ export interface components {
              */
             state: "ready" | "no_data" | "unavailable";
         };
+        /** PriceAlertRule */
+        PriceAlertRule: {
+            /**
+             * Comparison
+             * @enum {string}
+             */
+            comparison: "gte" | "lte";
+            /** Enabled */
+            enabled: boolean;
+            /** Name */
+            name: string;
+            /**
+             * Priority
+             * @enum {string}
+             */
+            priority: "P0" | "P1" | "P2" | "P3";
+            /** Rule Id */
+            rule_id: string;
+            /** Threshold */
+            threshold: number | string;
+            /**
+             * Valid From
+             * Format: time
+             */
+            valid_from: string;
+            /**
+             * Valid Until
+             * Format: time
+             */
+            valid_until: string;
+        };
+        /** PriceAlertRuleCommandReceipt */
+        PriceAlertRuleCommandReceipt: {
+            /** Command Id */
+            command_id: string;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "save_price_alert_rule" | "set_price_alert_rule_enabled" | "delete_price_alert_rule";
+            /** Message */
+            message: string;
+            /** Reason */
+            reason?: ("command_conflict" | "generation_changed" | "version_conflict" | "membership_changed" | "capacity_exceeded") | null;
+            /** Rule Id */
+            rule_id: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "pending" | "processing" | "saved_syncing" | "published" | "conflict" | "capacity" | "failed" | "uncertain";
+            /** Version */
+            version?: number | null;
+        };
+        /** PriceAlertRuleItemData */
+        PriceAlertRuleItemData: {
+            /** Comparison */
+            comparison: ("gte" | "lte") | null;
+            /** Deleted */
+            deleted: boolean;
+            /** Enabled */
+            enabled: boolean | null;
+            /** Membership Version */
+            membership_version: number | null;
+            /** Name */
+            name: string | null;
+            /** Priority */
+            priority: ("P0" | "P1" | "P2" | "P3") | null;
+            /** Rule Id */
+            rule_id: string;
+            /**
+             * Scope Status
+             * @enum {string}
+             */
+            scope_status: "valid" | "expired" | "removed" | "changed" | "deleted";
+            /** Threshold */
+            threshold: string | null;
+            /** Ts Code */
+            ts_code: string | null;
+            /**
+             * Updated At
+             * Format: date-time
+             */
+            updated_at: string;
+            /** Valid From */
+            valid_from: string | null;
+            /** Valid Until */
+            valid_until: string | null;
+            /** Version */
+            version: number;
+        };
+        /** PriceAlertRuleListData */
+        PriceAlertRuleListData: {
+            /**
+             * Availability
+             * @enum {string}
+             */
+            availability: "ready" | "not_ready" | "unavailable";
+            /** Available At */
+            available_at: string | null;
+            /**
+             * Evaluation Running
+             * @default false
+             * @constant
+             */
+            evaluation_running: false;
+            /** Items */
+            items: components["schemas"]["PriceAlertRuleItemData"][];
+            /** Message */
+            message: string;
+        };
         /** ProjectionInfo */
         ProjectionInfo: {
             /** Available */
@@ -4146,6 +4317,30 @@ export interface components {
             requested_at: string;
             /** Rule Calls */
             rule_calls: components["schemas"]["EditorRuleCall"][];
+        };
+        /** SavePriceAlertRuleRequest */
+        SavePriceAlertRuleRequest: {
+            /** Command Id */
+            command_id: string;
+            /** Expected Version */
+            expected_version?: number | null;
+            /** Generation Id */
+            generation_id: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "save_price_alert_rule";
+            /** Membership Version */
+            membership_version: number;
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+            rule: components["schemas"]["PriceAlertRule"];
+            /** Ts Code */
+            ts_code: string;
         };
         /** SaveRankedPoolCommand */
         SaveRankedPoolCommand: {
@@ -4528,6 +4723,29 @@ export interface components {
             today: string;
             /** Trade Date */
             trade_date: string | null;
+        };
+        /** SetPriceAlertRuleEnabledRequest */
+        SetPriceAlertRuleEnabledRequest: {
+            /** Command Id */
+            command_id: string;
+            /** Enabled */
+            enabled: boolean;
+            /** Expected Version */
+            expected_version: number;
+            /** Generation Id */
+            generation_id: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "set_price_alert_rule_enabled";
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+            /** Rule Id */
+            rule_id: string;
         };
         /** SignalItem */
         SignalItem: {
@@ -5407,6 +5625,59 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_MonitorChannelsData_"];
+                };
+            };
+        };
+    };
+    list_price_alert_rules_api_v1_monitor_rules_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_PriceAlertRuleListData_"];
+                };
+            };
+        };
+    };
+    submit_price_alert_rule_command_api_v1_monitor_rules_commands_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SavePriceAlertRuleRequest"] | components["schemas"]["SetPriceAlertRuleEnabledRequest"] | components["schemas"]["DeletePriceAlertRuleRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PriceAlertRuleCommandReceipt"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };

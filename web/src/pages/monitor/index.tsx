@@ -30,6 +30,7 @@ import { AlertAcknowledgment, unacknowledgedKpi } from "../shared/AlertAcknowled
 import { StockCell } from "../shared/StockCell";
 import { type AckCommandSnapshot, AlertAckCommandSession } from "./alertAckCommandSession";
 import { ChannelStatus } from "./ChannelStatus";
+import { PriceRulePanel } from "./PriceRulePanel";
 import "./monitor.css";
 
 const ALERT_ID = /^[0-9a-f]{64}$/;
@@ -556,6 +557,16 @@ export default function MonitorPage() {
     currentGeneration !== undefined &&
     currentGeneration !== null &&
     currentGeneration === result.serving.generation_id;
+  const ruleFresh =
+    meta.isFetchedAfterMount &&
+    !meta.isError &&
+    meta.data?.serving.state === "ready" &&
+    typeof viewer === "string" &&
+    viewer.trim().length > 0 &&
+    Number.isFinite(Date.parse(meta.data.data.server_time)) &&
+    currentGeneration !== undefined &&
+    currentGeneration !== null &&
+    currentGeneration === meta.data.serving.generation_id;
   const canConfirm =
     pageFresh &&
     !!viewer &&
@@ -611,6 +622,12 @@ export default function MonitorPage() {
       />
       <ChannelStatus data={channelData} loading={channelLoading} retry={channelResult.refetch} />
       <ManualWatchlistPanel onStock={setSelectedStock} />
+      <PriceRulePanel
+        viewer={viewer && viewer.trim().length > 0 ? viewer : null}
+        generationId={currentGeneration ?? null}
+        fresh={ruleFresh}
+        refreshMeta={() => void meta.refetch()}
+      />
       {result.isLoading || (oldGeneration && !result.error) ? (
         <PageSkeleton label="告警时间线加载中" />
       ) : result.error ? (

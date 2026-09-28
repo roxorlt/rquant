@@ -3710,6 +3710,53 @@
         "title": "DatasetWatermarkInfo",
         "type": "object"
       },
+      "DeletePriceAlertRuleRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "command_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Command Id",
+            "type": "string"
+          },
+          "expected_version": {
+            "minimum": 1.0,
+            "title": "Expected Version",
+            "type": "integer"
+          },
+          "generation_id": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Generation Id",
+            "type": "string"
+          },
+          "kind": {
+            "const": "delete_price_alert_rule",
+            "title": "Kind",
+            "type": "string"
+          },
+          "requested_at": {
+            "format": "date-time",
+            "title": "Requested At",
+            "type": "string"
+          },
+          "rule_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Rule Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "command_id",
+          "requested_at",
+          "generation_id",
+          "kind",
+          "rule_id",
+          "expected_version"
+        ],
+        "title": "DeletePriceAlertRuleRequest",
+        "type": "object"
+      },
       "DeliveriesSummary": {
         "properties": {
           "delivered": {
@@ -4377,6 +4424,22 @@
           "serving"
         ],
         "title": "Envelope[PoolsData]",
+        "type": "object"
+      },
+      "Envelope_PriceAlertRuleListData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/PriceAlertRuleListData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[PriceAlertRuleListData]",
         "type": "object"
       },
       "Envelope_PulseData_": {
@@ -8952,6 +9015,378 @@
         "title": "PoolsData",
         "type": "object"
       },
+      "PriceAlertRule": {
+        "additionalProperties": false,
+        "properties": {
+          "comparison": {
+            "enum": [
+              "gte",
+              "lte"
+            ],
+            "title": "Comparison",
+            "type": "string"
+          },
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "name": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "priority": {
+            "enum": [
+              "P0",
+              "P1",
+              "P2",
+              "P3"
+            ],
+            "title": "Priority",
+            "type": "string"
+          },
+          "rule_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Rule Id",
+            "type": "string"
+          },
+          "threshold": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "type": "number"
+              },
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              }
+            ],
+            "title": "Threshold"
+          },
+          "valid_from": {
+            "format": "time",
+            "title": "Valid From",
+            "type": "string"
+          },
+          "valid_until": {
+            "format": "time",
+            "title": "Valid Until",
+            "type": "string"
+          }
+        },
+        "required": [
+          "rule_id",
+          "name",
+          "priority",
+          "enabled",
+          "comparison",
+          "threshold",
+          "valid_from",
+          "valid_until"
+        ],
+        "title": "PriceAlertRule",
+        "type": "object"
+      },
+      "PriceAlertRuleCommandReceipt": {
+        "additionalProperties": false,
+        "properties": {
+          "command_id": {
+            "title": "Command Id",
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "save_price_alert_rule",
+              "set_price_alert_rule_enabled",
+              "delete_price_alert_rule"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "command_conflict",
+                  "generation_changed",
+                  "version_conflict",
+                  "membership_changed",
+                  "capacity_exceeded"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "rule_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Rule Id",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "pending",
+              "processing",
+              "saved_syncing",
+              "published",
+              "conflict",
+              "capacity",
+              "failed",
+              "uncertain"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "version": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Version"
+          }
+        },
+        "required": [
+          "command_id",
+          "kind",
+          "rule_id",
+          "status",
+          "message"
+        ],
+        "title": "PriceAlertRuleCommandReceipt",
+        "type": "object"
+      },
+      "PriceAlertRuleItemData": {
+        "additionalProperties": false,
+        "properties": {
+          "comparison": {
+            "anyOf": [
+              {
+                "enum": [
+                  "gte",
+                  "lte"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Comparison"
+          },
+          "deleted": {
+            "title": "Deleted",
+            "type": "boolean"
+          },
+          "enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enabled"
+          },
+          "membership_version": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Membership Version"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "priority": {
+            "anyOf": [
+              {
+                "enum": [
+                  "P0",
+                  "P1",
+                  "P2",
+                  "P3"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Priority"
+          },
+          "rule_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Rule Id",
+            "type": "string"
+          },
+          "scope_status": {
+            "enum": [
+              "valid",
+              "expired",
+              "removed",
+              "changed",
+              "deleted"
+            ],
+            "title": "Scope Status",
+            "type": "string"
+          },
+          "threshold": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Threshold"
+          },
+          "ts_code": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9]{6}\\.(?:SH|SZ|BJ)$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ts Code"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
+            "type": "string"
+          },
+          "valid_from": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Valid From"
+          },
+          "valid_until": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Valid Until"
+          },
+          "version": {
+            "minimum": 1.0,
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "rule_id",
+          "version",
+          "deleted",
+          "ts_code",
+          "membership_version",
+          "name",
+          "priority",
+          "enabled",
+          "comparison",
+          "threshold",
+          "valid_from",
+          "valid_until",
+          "scope_status",
+          "updated_at"
+        ],
+        "title": "PriceAlertRuleItemData",
+        "type": "object"
+      },
+      "PriceAlertRuleListData": {
+        "additionalProperties": false,
+        "properties": {
+          "availability": {
+            "enum": [
+              "ready",
+              "not_ready",
+              "unavailable"
+            ],
+            "title": "Availability",
+            "type": "string"
+          },
+          "available_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Available At"
+          },
+          "evaluation_running": {
+            "const": false,
+            "default": false,
+            "title": "Evaluation Running",
+            "type": "boolean"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/PriceAlertRuleItemData"
+            },
+            "maxItems": 10000,
+            "title": "Items",
+            "type": "array"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          }
+        },
+        "required": [
+          "availability",
+          "message",
+          "available_at",
+          "items"
+        ],
+        "title": "PriceAlertRuleListData",
+        "type": "object"
+      },
       "ProjectionInfo": {
         "properties": {
           "available": {
@@ -10074,6 +10509,68 @@
           "rule_calls"
         ],
         "title": "SavePoolCommand",
+        "type": "object"
+      },
+      "SavePriceAlertRuleRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "command_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Command Id",
+            "type": "string"
+          },
+          "expected_version": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Version"
+          },
+          "generation_id": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Generation Id",
+            "type": "string"
+          },
+          "kind": {
+            "const": "save_price_alert_rule",
+            "title": "Kind",
+            "type": "string"
+          },
+          "membership_version": {
+            "minimum": 1.0,
+            "title": "Membership Version",
+            "type": "integer"
+          },
+          "requested_at": {
+            "format": "date-time",
+            "title": "Requested At",
+            "type": "string"
+          },
+          "rule": {
+            "$ref": "#/components/schemas/PriceAlertRule"
+          },
+          "ts_code": {
+            "pattern": "^[0-9]{6}\\.(?:SH|SZ|BJ)$",
+            "title": "Ts Code",
+            "type": "string"
+          }
+        },
+        "required": [
+          "command_id",
+          "requested_at",
+          "generation_id",
+          "kind",
+          "ts_code",
+          "membership_version",
+          "rule"
+        ],
+        "title": "SavePriceAlertRuleRequest",
         "type": "object"
       },
       "SaveRankedPoolCommand": {
@@ -11252,6 +11749,58 @@
           "next_trading_day"
         ],
         "title": "SessionInfo",
+        "type": "object"
+      },
+      "SetPriceAlertRuleEnabledRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "command_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Command Id",
+            "type": "string"
+          },
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "expected_version": {
+            "minimum": 1.0,
+            "title": "Expected Version",
+            "type": "integer"
+          },
+          "generation_id": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Generation Id",
+            "type": "string"
+          },
+          "kind": {
+            "const": "set_price_alert_rule_enabled",
+            "title": "Kind",
+            "type": "string"
+          },
+          "requested_at": {
+            "format": "date-time",
+            "title": "Requested At",
+            "type": "string"
+          },
+          "rule_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Rule Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "command_id",
+          "requested_at",
+          "generation_id",
+          "kind",
+          "rule_id",
+          "expected_version",
+          "enabled"
+        ],
+        "title": "SetPriceAlertRuleEnabledRequest",
         "type": "object"
       },
       "SignalItem": {
@@ -13148,6 +13697,87 @@
           }
         },
         "summary": "推送通道提交状态",
+        "tags": [
+          "monitor"
+        ]
+      }
+    },
+    "/api/v1/monitor/rules": {
+      "get": {
+        "operationId": "list_price_alert_rules_api_v1_monitor_rules_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_PriceAlertRuleListData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "我的价格规则",
+        "tags": [
+          "monitor"
+        ]
+      }
+    },
+    "/api/v1/monitor/rules/commands": {
+      "post": {
+        "operationId": "submit_price_alert_rule_command_api_v1_monitor_rules_commands_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "discriminator": {
+                  "mapping": {
+                    "delete_price_alert_rule": "#/components/schemas/DeletePriceAlertRuleRequest",
+                    "save_price_alert_rule": "#/components/schemas/SavePriceAlertRuleRequest",
+                    "set_price_alert_rule_enabled": "#/components/schemas/SetPriceAlertRuleEnabledRequest"
+                  },
+                  "propertyName": "kind"
+                },
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/SavePriceAlertRuleRequest"
+                  },
+                  {
+                    "$ref": "#/components/schemas/SetPriceAlertRuleEnabledRequest"
+                  },
+                  {
+                    "$ref": "#/components/schemas/DeletePriceAlertRuleRequest"
+                  }
+                ],
+                "title": "Body"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PriceAlertRuleCommandReceipt"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "保存或删除价格规则",
         "tags": [
           "monitor"
         ]

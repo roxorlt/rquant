@@ -1,0 +1,180 @@
+.price-rule-overview {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  margin-bottom: 10px;
+}
+
+.price-rule-message {
+  color: var(--muted);
+  font-size: 12px;
+}
+.price-rule-list {
+  list-style: none;
+  border-top: 1px solid var(--rule);
+}
+.price-rule-column-head {
+  display: grid;
+  grid-template-columns: 38px minmax(130px, 1.25fr) minmax(135px, 1.1fr) minmax(90px, 0.75fr) minmax(
+      105px,
+      0.85fr
+    ) auto;
+  gap: 12px;
+  padding: 5px 0;
+  color: var(--muted);
+  font-size: 11px;
+}
+.price-rule-column-head + .price-rule-list {
+  border-top: 0;
+}
+.price-rule-row {
+  display: grid;
+  grid-template-columns: 38px minmax(130px, 1.25fr) minmax(135px, 1.1fr) minmax(90px, 0.75fr) minmax(
+      105px,
+      0.85fr
+    ) auto;
+  gap: 12px;
+  align-items: center;
+  min-height: 52px;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--rule);
+  font-size: 13px;
+}
+.price-rule-row:last-child {
+  border-bottom: 0;
+}
+.price-rule-row > * {
+  min-width: 0;
+}
+.price-rule-identity {
+  display: grid;
+  gap: 3px;
+}
+.price-rule-identity strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 650;
+}
+.price-rule-identity .mono {
+  color: var(--muted);
+  font-size: 11px;
+}
+.price-rule-label {
+  display: none;
+}
+.price-rule-condition .num {
+  white-space: nowrap;
+}
+.price-rule-time {
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.price-rule-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
+  white-space: nowrap;
+}
+.price-rule-info {
+  border: 0;
+  background: none;
+  cursor: help;
+  color: var(--muted);
+  font-size: 14px;
+  padding: 4px;
+}
+.price-rule-editor {
+  margin: 0 0 14px;
+  padding: 14px;
+  border: 1px solid var(--rule);
+  border-radius: 10px;
+  background: var(--surface-2);
+}
+.price-rule-editor-head,
+.price-rule-editor-foot {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.price-rule-fields {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  margin: 12px 0;
+}
+.price-rule-fields .field {
+  min-width: 0;
+}
+.price-rule-fields .inp {
+  width: 100%;
+}
+.price-rule-editor-foot .hint {
+  font-size: 11px;
+}
+.price-rule-recovery {
+  grid-template-columns: minmax(160px, 1fr) auto auto;
+}
+
+@media (max-width: 760px) {
+  .price-rule-column-head {
+    display: none;
+  }
+  .price-rule-column-head + .price-rule-list {
+    border-top: 1px solid var(--rule);
+  }
+  .price-rule-row {
+    grid-template-columns: 38px minmax(0, 1fr) auto;
+    gap: 8px 10px;
+    padding: 13px 0;
+  }
+  .price-rule-switch {
+    grid-row: span 2;
+  }
+  .price-rule-condition {
+    grid-column: 2;
+  }
+  .price-rule-time {
+    grid-column: 3;
+    grid-row: 2;
+  }
+  .price-rule-state {
+    grid-column: 3;
+    grid-row: 1;
+  }
+  .price-rule-actions {
+    grid-column: 2 / -1;
+    justify-content: flex-start;
+    flex-wrap: wrap;
+  }
+  .price-rule-recovery {
+    grid-template-columns: 1fr auto;
+  }
+  .price-rule-recovery .price-rule-identity {
+    grid-column: 1;
+  }
+  .price-rule-recovery .price-rule-state {
+    grid-column: 2;
+    grid-row: 1;
+  }
+  .price-rule-fields {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 420px) {
+  .price-rule-row {
+    grid-template-columns: 32px minmax(0, 1fr) auto;
+    font-size: 12px;
+  }
+  .price-rule-time {
+    font-size: 11px;
+  }
+  .price-rule-actions .btn {
+    min-height: 34px;
+  }
+}
