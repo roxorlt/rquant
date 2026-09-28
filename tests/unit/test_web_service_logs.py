@@ -2,21 +2,33 @@
 
 from __future__ import annotations
 
+import json
 import os
 import socket
 import threading
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+import uvicorn
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from rquant.unit_log_reader import JournalEntry, JournalPage
 from rquant.unit_log_service import UnitLogServiceError
+from rquant.web import app as app_module
+from rquant.web import cli as web_cli
+from rquant.web import ingress as ingress_module
 from rquant.web.app import create_app
-from rquant.web.service_log_access_audit import ServiceLogAccessRecord
+from rquant.web.service_log_access_audit import (
+    AUDIT_FILE_NAME,
+    JsonlServiceLogAccessAudit,
+    ServiceLogAccessRecord,
+)
 from rquant.web.settings import WebSettings
 from tests.unit.test_ops_status import _manifest, _signed
 
@@ -384,6 +396,148 @@ def test_service_log_environment_is_explicit_and_defaults_to_no_verified_units(
             source
             | {"RQUANT_WEB_UNIT_LOG_VERIFIED_UNITS": "rquant-daily.service,rquant-daily.service"}
         )
+
+
+def test_audit_dir_setting_requires_full_private_service_log_configuration(tmp_path: Path) -> None:
+    directory = tmp_path / "audit"
+    directory.mkdir(mode=0o700)
+    values = _configured(tmp_path).model_dump()
+    configured = WebSettings.model_validate(values | {"unit_log_audit_dir": directory})
+    assert configured.unit_log_audit_dir == directory
+    with pytest.raises(ValidationError):
+        WebSettings.model_validate(values | {"unit_log_audit_dir": Path("relative")})
+    with pytest.raises(ValidationError):
+        WebSettings(serving_root=tmp_path, unit_log_audit_dir=directory)
+    with pytest.raises(ValidationError):
+        WebSettings.model_validate(
+            values | {"ingress_socket_path": None, "unit_log_audit_dir": directory}
+        )
+    source = {
+        "RQUANT_WEB_INGRESS_SOCKET": str(values["ingress_socket_path"]),
+        "RQUANT_WEB_LOG_ADMIN_USERS": "liutong",
+        "RQUANT_WEB_UNIT_LOG_SOCKET": str(values["unit_log_socket_path"]),
+        "RQUANT_WEB_UNIT_LOG_SERVICE_UID": str(values["unit_log_service_uid"]),
+        "RQUANT_WEB_UNIT_LOG_WEB_GROUP_GID": str(values["unit_log_web_group_gid"]),
+        "RQUANT_WEB_UNIT_LOG_MANIFEST": str(values["unit_log_manifest_path"]),
+        "RQUANT_WEB_UNIT_LOG_PUBLIC_KEY": str(values["unit_log_public_key_path"]),
+        "RQUANT_WEB_UNIT_LOG_EXPECTED_HOST": str(values["unit_log_expected_host"]),
+        "RQUANT_WEB_UNIT_LOG_AUDIT_DIR": str(directory),
+    }
+    assert WebSettings.from_env(source).unit_log_audit_dir == directory
+
+
+def test_web_serve_alone_injects_real_audit_when_configured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    directory = tmp_path / "audit"
+    directory.mkdir(mode=0o700)
+    settings = WebSettings.model_validate(
+        _configured(tmp_path).model_dump() | {"unit_log_audit_dir": directory}
+    )
+    observed: list[object] = []
+    from_env_calls: list[object] = []
+
+    def settings_from_env(_cls: type[WebSettings], *, bind: str | None = None) -> WebSettings:
+        from_env_calls.append(bind)
+        return settings
+
+    def capture_app(_settings: WebSettings, **kwargs: object) -> object:
+        observed.append(kwargs.get("unit_log_access_audit"))
+        return object()
+
+    @contextmanager
+    def fake_ingress(_path: Path, *, nginx_group_gid: int) -> Iterator[SimpleNamespace]:
+        assert nginx_group_gid == os.getegid()
+        yield SimpleNamespace(fileno=lambda: 123)
+
+    monkeypatch.setattr(WebSettings, "from_env", classmethod(settings_from_env))
+    monkeypatch.setattr(app_module, "create_app", capture_app)
+    monkeypatch.setattr(app_module, "openapi_document", lambda _app: "{}")
+    monkeypatch.setattr(ingress_module, "private_web_ingress_socket", fake_ingress)
+    monkeypatch.setattr(web_cli.grp, "getgrnam", lambda _name: SimpleNamespace(gr_gid=os.getegid()))
+    monkeypatch.setattr(uvicorn, "run", lambda _app, **_options: None)
+
+    assert web_cli.main(["web-serve"]) == 0
+    assert type(observed.pop()) is JsonlServiceLogAccessAudit
+    assert from_env_calls == [None]
+    assert not (directory / AUDIT_FILE_NAME).exists()
+
+    assert web_cli.main(["web-openapi"]) == 0
+    assert observed.pop() is None
+    assert from_env_calls == [None]
+    assert capsys.readouterr().out == "{}"
+
+    disabled = WebSettings(serving_root=tmp_path)
+    monkeypatch.setattr(
+        WebSettings, "from_env", classmethod(lambda _cls, *, bind=None: disabled)
+    )
+    assert web_cli.main(["web-serve"]) == 0
+    assert observed.pop() is None
+
+
+def test_real_audit_is_durable_before_client_read(tmp_path: Path) -> None:
+    directory = tmp_path / "audit"
+    directory.mkdir(mode=0o700)
+    path = directory / AUDIT_FILE_NAME
+
+    class CheckingClient(FakeClient):
+        def read(self, **kwargs: object) -> JournalPage:
+            rows = path.read_bytes().splitlines()
+            assert len(rows) == 1
+            assert json.loads(rows[0]) == {
+                "operator": "liutong",
+                "unit": UNIT,
+                "result_class": "admitted",
+                "at": NOW.isoformat().replace("+00:00", "Z"),
+            }
+            return super().read(**kwargs)
+
+    fake = CheckingClient()
+    settings = WebSettings.model_validate(
+        _configured(tmp_path).model_dump() | {"unit_log_audit_dir": directory}
+    )
+    app = create_app(
+        settings,
+        clock=lambda: NOW,
+        background=False,
+        unit_log_client=fake,
+        unit_log_access_audit=JsonlServiceLogAccessAudit(directory),
+    )
+    with TestClient(app) as client:
+        response = client.get(
+            URL, headers=ADMIN, params={"since": SINCE.isoformat(), "cursor": "secret.cursor"}
+        )
+    assert response.status_code == 200
+    assert len(fake.calls) == 1
+    assert b"secret.cursor" not in path.read_bytes()
+
+
+def test_real_audit_sync_failure_returns_503_before_client_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory = tmp_path / "audit"
+    directory.mkdir(mode=0o700)
+    fake = FakeClient()
+    settings = WebSettings.model_validate(
+        _configured(tmp_path).model_dump() | {"unit_log_audit_dir": directory}
+    )
+    app = create_app(
+        settings,
+        clock=lambda: NOW,
+        background=False,
+        unit_log_client=fake,
+        unit_log_access_audit=JsonlServiceLogAccessAudit(directory),
+    )
+
+    def fail_sync(_descriptor: int) -> None:
+        raise OSError("Bearer secret from storage")
+
+    monkeypatch.setattr(os, "fsync", fail_sync)
+    with TestClient(app) as client:
+        response = client.get(URL, headers=ADMIN, params={"since": SINCE.isoformat()})
+    assert response.status_code == 503
+    assert "Bearer" not in response.text
+    assert fake.calls == []
 
 
 def test_untrusted_or_oversized_public_key_file_never_reaches_transport(tmp_path: Path) -> None:
