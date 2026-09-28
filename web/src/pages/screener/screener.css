@@ -180,6 +180,61 @@
   padding-top: 22px;
   border-top: 1px solid var(--rule);
 }
+.formula-pool-save {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  margin-top: 16px;
+  padding: 14px;
+  border: 1px solid var(--rule);
+  border-radius: 10px;
+  background: var(--surface);
+}
+.formula-pool-save h4 {
+  margin: 0;
+  font-size: 14px;
+}
+.formula-pool-save-date {
+  color: var(--muted);
+  font-size: 12px;
+}
+.formula-pool-save-proof {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+  font-size: 12px;
+  color: var(--ink-2);
+}
+.formula-pool-save-proof code {
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  color: var(--ink);
+}
+.formula-pool-save-compose {
+  display: flex;
+  align-items: end;
+  gap: 10px;
+}
+.formula-pool-save-compose .field {
+  flex: 1;
+  min-width: 0;
+}
+.formula-pool-save-compose .inp {
+  width: 100%;
+}
+.formula-pool-save-state {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+.formula-pool-save-state strong {
+  color: var(--ink);
+}
+.formula-pool-save-state span {
+  overflow-wrap: anywhere;
+}
 .formula-market-heading,
 .formula-market-recent-heading,
 .formula-market-detail-head,
@@ -615,6 +670,13 @@
     grid-template-columns: 1fr;
   }
   .formula-market-compose .btn {
+    width: 100%;
+  }
+  .formula-pool-save-compose {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .formula-pool-save-compose .btn {
     width: 100%;
   }
   .formula-market-job-select {

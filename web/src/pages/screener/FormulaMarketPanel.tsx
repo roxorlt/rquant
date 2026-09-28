@@ -8,11 +8,12 @@ import {
   useFormulaMarketJobs,
   useFormulaMarketMatches,
 } from "@/api/formulaMarket";
-import { useCurrentGeneration } from "@/api/useMeta";
+import { useCurrentGeneration, useCurrentMeta } from "@/api/useMeta";
 import { StockDrawer } from "@/app/StockDrawer";
 import { formatCount } from "@/format/number";
 import { formatAge, formatShanghaiDateTime, formatShanghaiTime, shanghaiDate } from "@/format/time";
 import { Button, ConfirmDialog, EmptyState, RelativeTime, Tip, useNow } from "@/ui";
+import { FormulaPoolSave, readFormulaPoolSaveTaskId } from "./FormulaPoolSave";
 
 const JOURNAL_KEY = "rquant-formula-market-command-v1";
 
@@ -101,6 +102,7 @@ export function FormulaMarketPanel({ formula, checked }: { formula: string; chec
   const [stockCode, setStockCode] = useState<string | null>(null);
   const now = useNow();
   const generation = useCurrentGeneration();
+  const viewer = useCurrentMeta().data?.data.viewer ?? null;
   const jobs = useFormulaMarketJobs(pollJobs);
   const jobList =
     generation === undefined || jobs.serving?.generation_id === generation ? jobs.data : undefined;
@@ -154,6 +156,12 @@ export function FormulaMarketPanel({ formula, checked }: { formula: string; chec
   useEffect(() => {
     setPollJobs(journal !== null || activeJob === true);
   }, [journal, activeJob]);
+
+  useEffect(() => {
+    if (selectedId !== null) return;
+    const savedTask = readFormulaPoolSaveTaskId(viewer);
+    if (savedTask !== null) setSelectedId(savedTask);
+  }, [selectedId, viewer]);
 
   useEffect(() => {
     if (journal?.state !== "queued" || journal.taskId === null) return;
@@ -522,6 +530,23 @@ export function FormulaMarketPanel({ formula, checked }: { formula: string; chec
           )}
         </section>
       ) : null}
+      <FormulaPoolSave
+        key={viewer ?? "unknown"}
+        candidate={
+          job?.status === "succeeded" &&
+          job.result_available &&
+          currentDetail?.summary &&
+          resultReady === true
+            ? {
+                taskId: job.task_id,
+                formula: job.formula,
+                tradeDate: job.trade_date,
+                matchCount: currentDetail.summary.match_count,
+                unknownCount: currentDetail.summary.unknown_count,
+              }
+            : null
+        }
+      />
       <ConfirmDialog
         open={confirmDraft !== null}
         level="heavy"

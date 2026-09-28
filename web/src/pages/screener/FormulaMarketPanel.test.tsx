@@ -57,9 +57,11 @@ function setupSource(): void {
   );
 }
 
-function renderPreview() {
+function renderPreview(seedMeta = false, viewer = "tester") {
+  const queryClient = testQueryClient();
+  if (seedMeta) queryClient.setQueryData(["meta"], metaEnvelope({ viewer }));
   return render(
-    <AppProviders queryClient={testQueryClient()}>
+    <AppProviders queryClient={queryClient}>
       <FormulaPreviewDialog onClose={() => undefined} />
     </AppProviders>,
   );
@@ -377,5 +379,272 @@ describe("全市场公式选股", () => {
     expect(await within(drawer).findByRole("button", { name: /600002.SH/ })).toBeVisible();
     expect(within(drawer).getByText("第 1 页")).toBeVisible();
     expect(cursors).toEqual([null, "page-2", null]);
+  });
+
+  it("保存状态不明时跨页面保留原命令；成功后等精确版本发布才提示可查看", async () => {
+    setupSource();
+    const submitted: Schemas["FormulaPoolSaveCommandRequest"][] = [];
+    let published = false;
+    let unreadable = false;
+    let recentVisible = true;
+    let jobsUnavailable = false;
+    server.use(
+      http.get("*/api/v1/screen/tdx/market/jobs", () =>
+        jobsUnavailable
+          ? HttpResponse.json({ detail: "暂不可用" }, { status: 503 })
+          : HttpResponse.json({
+              data: {
+                availability: "ready",
+                available_at: "2026-09-24T07:32:00Z",
+                has_older_tasks: false,
+                jobs: recentVisible ? [job] : [],
+                message: "",
+                total_task_count: 1,
+              },
+              serving,
+            }),
+      ),
+      http.get(`*/api/v1/screen/tdx/market/jobs/${taskId}`, () =>
+        HttpResponse.json({ data: { job, summary }, serving }),
+      ),
+      http.get(`*/api/v1/screen/tdx/market/jobs/${taskId}/matches`, () =>
+        HttpResponse.json({
+          data: {
+            task_id: taskId,
+            total: 51,
+            offset: 0,
+            match_codes: ["600001.SH"],
+            next_cursor: null,
+          },
+          serving,
+        }),
+      ),
+      http.get("*/api/v1/pools/formula", () =>
+        HttpResponse.json({
+          data: {
+            availability: unreadable ? "unavailable" : published ? "ready" : "empty",
+            available_at: null,
+            message: "",
+            pools: published
+              ? [
+                  {
+                    pool_name: "user/趋势池",
+                    display_name: "趋势池",
+                    formula,
+                    syntax_version: "tdx-v1",
+                    created_at: "2026-09-24T07:31:00Z",
+                    status_label: "尚未运行",
+                    latest_result: null,
+                    version: "f".repeat(64),
+                  },
+                ]
+              : [],
+          },
+          serving,
+        }),
+      ),
+      http.post("*/api/v1/pools/formula/commands", async ({ request }) => {
+        expect(request.headers.get("X-Rquant-Csrf")).toBe("1");
+        submitted.push((await request.json()) as Schemas["FormulaPoolSaveCommandRequest"]);
+        if (submitted.length === 1)
+          return HttpResponse.json({ detail: "请重试原请求" }, { status: 503 });
+        unreadable = true;
+        return HttpResponse.json({
+          command_id: submitted[0]?.command_id,
+          status: "succeeded",
+          pool_name: "user/趋势池",
+          version: "f".repeat(64),
+          message: "已保存",
+        });
+      }),
+    );
+    const user = userEvent.setup();
+    const view = renderPreview(true);
+    const drawer = await screen.findByRole("dialog", { name: "公式预览" });
+    await user.click(await within(drawer).findByRole("button", { name: /CLOSE>MA/ }));
+    expect(await within(drawer).findByRole("region", { name: "市场结果" })).toBeVisible();
+    await user.type(within(drawer).getByRole("textbox", { name: "池子名称" }), "趋势池");
+    await user.click(within(drawer).getByRole("button", { name: "保存为池子" }));
+    expect(await within(drawer).findByText("保存状态待确认")).toBeVisible();
+    expect(submitted[0]).toMatchObject({
+      base_name: "趋势池",
+      display_name: "趋势池",
+      task_id: taskId,
+      expected_version: null,
+    });
+    view.unmount();
+
+    const other = renderPreview(true, "another-viewer");
+    const otherDrawer = await screen.findByRole("dialog", { name: "公式预览" });
+    expect(within(otherDrawer).queryByText("保存状态待确认")).toBeNull();
+    other.unmount();
+
+    recentVisible = false;
+    const absent = renderPreview(true);
+    const absentDrawer = await screen.findByRole("dialog", { name: "公式预览" });
+    expect(await within(absentDrawer).findByText("保存状态待确认")).toBeVisible();
+    expect(within(absentDrawer).getByRole("button", { name: "继续核对" })).toBeVisible();
+    absent.unmount();
+
+    jobsUnavailable = true;
+    renderPreview(true);
+    const restored = await screen.findByRole("dialog", { name: "公式预览" });
+    expect(await within(restored).findByText("保存状态待确认")).toBeVisible();
+    expect(await within(restored).findByText("最近运行暂不可用")).toBeVisible();
+    await user.click(within(restored).getByRole("button", { name: "继续核对" }));
+    expect(await within(restored).findByText("已保存，暂无法确认池子")).toBeVisible();
+    expect(submitted[1]).toEqual(submitted[0]);
+    unreadable = false;
+    await user.click(within(restored).getByRole("button", { name: "重试读取" }));
+    expect(await within(restored).findByText("已保存，等待池子发布")).toBeVisible();
+    published = true;
+    await user.click(within(restored).getByRole("button", { name: "检查发布" }));
+    expect(await within(restored).findByText("已保存，可在池子画布查看")).toBeVisible();
+    await user.click(within(restored).getByRole("button", { name: "保存另一个" }));
+    expect(within(restored).queryByRole("region", { name: "保存公式池" })).toBeNull();
+    expect(findJargon(restored.textContent ?? "")).toEqual([]);
+  });
+
+  it("待确认的池子任务仍在列表但结果不可读时，可用原命令继续核对", async () => {
+    setupSource();
+    const request: Schemas["FormulaPoolSaveCommandRequest"] = {
+      base_name: "趋势池",
+      display_name: "趋势池",
+      task_id: taskId,
+      expected_version: null,
+      command_id: "c".repeat(32),
+      requested_at: "2026-09-24T07:34:00Z",
+    };
+    window.localStorage.setItem(
+      "rquant-formula-pool-save-v1",
+      JSON.stringify({
+        viewer: "tester",
+        request,
+        status: "pending",
+        poolName: null,
+        version: null,
+      }),
+    );
+    const submitted: Schemas["FormulaPoolSaveCommandRequest"][] = [];
+    server.use(
+      http.get("*/api/v1/screen/tdx/market/jobs", () =>
+        HttpResponse.json({
+          data: {
+            availability: "ready",
+            available_at: "2026-09-24T07:32:00Z",
+            has_older_tasks: false,
+            jobs: [{ ...job, result_available: false }],
+            message: "",
+            total_task_count: 1,
+          },
+          serving,
+        }),
+      ),
+      http.post("*/api/v1/pools/formula/commands", async ({ request: received }) => {
+        submitted.push((await received.json()) as Schemas["FormulaPoolSaveCommandRequest"]);
+        return HttpResponse.json({ detail: "请使用原请求重试。" }, { status: 503 });
+      }),
+    );
+    const user = userEvent.setup();
+    renderPreview(true);
+    const drawer = await screen.findByRole("dialog", { name: "公式预览" });
+    expect(await within(drawer).findByText("结果暂时无法读取")).toBeVisible();
+    expect(within(drawer).getAllByRole("region", { name: "保存公式池" })).toHaveLength(1);
+    await user.click(within(drawer).getByRole("button", { name: "继续核对" }));
+    await waitFor(() => {
+      expect(submitted).toEqual([request]);
+      expect(within(drawer).getByRole("button", { name: "继续核对" })).toBeEnabled();
+    });
+    expect(within(drawer).getAllByRole("region", { name: "保存公式池" })).toHaveLength(1);
+    expect(within(drawer).queryByText("保存状态待确认，请继续核对。")).toBeNull();
+  });
+
+  it("选看另一个任务时待确认保存只出现一次，结束后立即显示所选任务表单", async () => {
+    setupSource();
+    const otherTaskId = "b".repeat(32);
+    const otherJob: Schemas["FormulaMarketJobItem"] = {
+      ...job,
+      task_id: otherTaskId,
+      formula: "OPEN>0",
+    };
+    const request: Schemas["FormulaPoolSaveCommandRequest"] = {
+      base_name: "趋势池",
+      display_name: "趋势池",
+      task_id: taskId,
+      expected_version: null,
+      command_id: "c".repeat(32),
+      requested_at: "2026-09-24T07:34:00Z",
+    };
+    window.localStorage.setItem(
+      "rquant-formula-pool-save-v1",
+      JSON.stringify({
+        viewer: "tester",
+        request,
+        status: "pending",
+        poolName: null,
+        version: null,
+      }),
+    );
+    const submitted: Schemas["FormulaPoolSaveCommandRequest"][] = [];
+    server.use(
+      http.get("*/api/v1/screen/tdx/market/jobs", () =>
+        HttpResponse.json({
+          data: {
+            availability: "ready",
+            available_at: "2026-09-24T07:32:00Z",
+            has_older_tasks: true,
+            jobs: [otherJob],
+            message: "",
+            total_task_count: 2,
+          },
+          serving,
+        }),
+      ),
+      http.get(`*/api/v1/screen/tdx/market/jobs/${otherTaskId}`, () =>
+        HttpResponse.json({ data: { job: otherJob, summary }, serving }),
+      ),
+      http.get(`*/api/v1/screen/tdx/market/jobs/${otherTaskId}/matches`, () =>
+        HttpResponse.json({
+          data: {
+            task_id: otherTaskId,
+            total: 51,
+            offset: 0,
+            match_codes: ["600001.SH"],
+            next_cursor: null,
+          },
+          serving,
+        }),
+      ),
+      http.get("*/api/v1/pools/formula", () =>
+        HttpResponse.json({
+          data: { availability: "empty", available_at: null, message: "", pools: [] },
+          serving,
+        }),
+      ),
+      http.post("*/api/v1/pools/formula/commands", async ({ request: received }) => {
+        submitted.push((await received.json()) as Schemas["FormulaPoolSaveCommandRequest"]);
+        return HttpResponse.json({
+          command_id: request.command_id,
+          status: "succeeded",
+          pool_name: "user/趋势池",
+          version: "f".repeat(64),
+          message: "已保存",
+        });
+      }),
+    );
+    const user = userEvent.setup();
+    renderPreview(true);
+    const drawer = await screen.findByRole("dialog", { name: "公式预览" });
+    await user.click(await within(drawer).findByRole("button", { name: /OPEN>0/ }));
+    expect(await within(drawer).findByRole("region", { name: "市场结果" })).toBeVisible();
+    expect(within(drawer).getAllByRole("region", { name: "保存公式池" })).toHaveLength(1);
+    expect(within(drawer).getByText("保存状态待确认")).toBeVisible();
+    expect(within(drawer).queryByRole("textbox", { name: "池子名称" })).toBeNull();
+    await user.click(within(drawer).getByRole("button", { name: "继续核对" }));
+    await waitFor(() => expect(submitted).toEqual([request]));
+    await user.click(await within(drawer).findByRole("button", { name: "保存另一个" }));
+    expect(within(drawer).getAllByRole("region", { name: "保存公式池" })).toHaveLength(1);
+    expect(within(drawer).getByRole("textbox", { name: "池子名称" })).toBeVisible();
+    expect(within(drawer).queryByText("保存状态待确认")).toBeNull();
   });
 });

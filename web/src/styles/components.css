@@ -560,9 +560,65 @@
 }
 .flow-graph {
   width: 100%;
-  height: 420px;
+  max-height: 420px;
   min-width: 0;
+  overflow: auto;
   background: var(--surface-2);
+}
+.flow-graph-canvas {
+  position: relative;
+  min-width: 100%;
+  background-image: radial-gradient(var(--rule-strong) 0.7px, transparent 0.7px);
+  background-size: 26px 26px;
+}
+.flow-graph-lines {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+.flow-graph-edge {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 1.5;
+}
+.flow-graph-node {
+  position: absolute;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 8px;
+  border: 1px solid var(--rule-strong);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--ink);
+  font: inherit;
+  white-space: pre-line;
+  overflow-wrap: anywhere;
+  line-height: 1.35;
+  font-size: 12px;
+  text-align: center;
+  cursor: pointer;
+}
+.flow-graph-node:hover {
+  border-color: var(--accent);
+}
+.flow-graph-node[aria-pressed="true"] {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-weak);
+}
+.flow-graph-node:disabled {
+  cursor: default;
+}
+.flow-graph-node:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.flow-graph-node.condition {
+  border: 1px dashed var(--accent);
+  border-radius: 10px;
+  background: var(--accent-weak);
+  color: var(--accent-t);
+  font-weight: 600;
 }
 
 @media (max-width: 760px) {

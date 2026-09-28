@@ -53,6 +53,14 @@ export const formulaMarketJobsHandler = () =>
     }),
   );
 
+export const formulaPoolsHandler = () =>
+  http.get("*/api/v1/pools/formula", () =>
+    HttpResponse.json({
+      data: { availability: "empty", available_at: null, message: "还没有公式池。", pools: [] },
+      serving: metaEnvelope().serving,
+    }),
+  );
+
 /** MSW server for component tests; every test starts with ready responses. */
 export const server = setupServer(
   metaHandler(),
@@ -64,4 +72,5 @@ export const server = setupServer(
   paperHandler(),
   poolEditorHandler(),
   formulaMarketJobsHandler(),
+  formulaPoolsHandler(),
 );
