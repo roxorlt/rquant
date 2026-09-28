@@ -38,23 +38,23 @@ for (const viewport of [
       await expect(pool).toHaveAttribute("aria-pressed", "true");
       await expect(page.getByRole("region", { name: "池子详情" })).toContainText("3 只");
       const graph = page.getByRole("group", { name: "已发布规则与池子" });
-      await expect(graph.locator('.react-flow__node[data-id^="condition:"]')).toHaveCount(2);
-      await expect(graph.locator(".react-flow__edge")).toHaveCount(3);
+      await expect(graph.locator('.flow-graph-node[data-id^="condition:"]')).toHaveCount(2);
+      await expect(graph.locator(".flow-graph-edge")).toHaveCount(3);
       if (viewport.name === "phone") {
         const bounds = await graph
-          .locator('.react-flow__node[data-id="condition:n-shape-pool1"]')
+          .locator('.flow-graph-node[data-id="condition:n-shape-pool1"]')
           .boundingBox();
         expect(bounds?.width).toBeGreaterThanOrEqual(120);
       }
-      const secondCondition = graph.locator('.react-flow__node[data-id="condition:n-shape-pool2"]');
+      const secondCondition = graph.locator('.flow-graph-node[data-id="condition:n-shape-pool2"]');
       await secondCondition.focus();
       await secondCondition.press("Space");
       await expect(detail.getByRole("list", { name: "已发布条件" }).locator("li")).toHaveCount(3);
-      const secondNode = graph.locator('.react-flow__node[data-id="n-shape-pool2"]');
+      const secondNode = graph.locator('.flow-graph-node[data-id="n-shape-pool2"]');
       await secondNode.focus();
       await secondNode.press("Enter");
       await expect(page.getByRole("region", { name: "池子详情" })).toContainText("2 只");
-      const firstNode = graph.locator('.react-flow__node[data-id="n-shape-pool1"]');
+      const firstNode = graph.locator('.flow-graph-node[data-id="n-shape-pool1"]');
       await firstNode.focus();
       await expect(firstNode).toBeFocused();
       await firstNode.press("Space");

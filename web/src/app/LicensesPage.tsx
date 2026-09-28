@@ -32,7 +32,6 @@ const LICENSES: readonly LicenseRow[] = [
     url: "https://github.com/tradingview/lightweight-charts",
     note: "TradingView Lightweight Charts™，Copyright © TradingView, Inc.；图表内保留 TradingView 署名",
   },
-  { name: "@xyflow/react", license: "MIT", url: "https://github.com/xyflow/xyflow" },
   { name: "@dagrejs/dagre", license: "MIT", url: "https://github.com/dagrejs/dagre" },
   {
     name: "IBM Plex Mono / IBM Plex Sans Condensed（拉丁子集）",
