@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from datetime import date, datetime
 from pathlib import Path
 from typing import Literal
@@ -16,6 +17,7 @@ from rquant.screen.formula_history_projection import (
     VerifiedFormulaHistoryProjection,
 )
 from rquant.screen.tdx.evaluate import (
+    CompiledFormula,
     EvaluationRejectedError,
     FormulaEvaluationInput,
     compile_formula,
@@ -46,48 +48,31 @@ class FormulaCatalogRunSummary(BaseModel):
     match_codes: tuple[str, ...]
 
 
-def run_formula_catalog(
-    root: Path, formula: str, trade_date: date, decision_at: datetime,
-    *, expected_identity: str,
-) -> FormulaCatalogRunSummary:
-    """Return a result only after every candidate and the final generation check pass."""
-    started_at = time.monotonic()
-
-    def check_deadline() -> None:
-        if time.monotonic() - started_at > MAX_CATALOG_RUN_SECONDS:
-            raise FormulaCatalogRunTimeoutError("formula catalog run timed out")
-
-    compiled = compile_formula(formula)
-    evaluate_compiled_formula(
-        FormulaEvaluationInput(
-            formula=formula, decision_date=trade_date,
-            decision_at=decision_at, stocks=(),
-        ),
-        compiled,
-    )
-    projection = VerifiedFormulaHistoryProjection(root)
-    catalog = projection.catalog_snapshot(trade_date, expected_identity=expected_identity)
-    check_deadline()
-
-    future_excluded = 0
-    match_codes: list[str] = []
+def _evaluate_candidates(
+    projection: VerifiedFormulaHistoryProjection,
+    codes: tuple[str, ...],
+    compiled: CompiledFormula,
+    formula: str,
+    trade_date: date,
+    decision_at: datetime,
+    *,
+    expected_identity: str,
+    check_deadline: Callable[[], None],
+    unknown_reasons: dict[str, int],
+) -> tuple[tuple[str, ...], int]:
+    """Use the same verified single-stock read and pure evaluator for either universe."""
+    matches: list[str] = []
     no_match_count = 0
-    unknown_reasons: dict[str, int] = {}
 
     def unknown(reason: str) -> None:
         unknown_reasons[reason] = unknown_reasons.get(reason, 0) + 1
 
-    for entry in catalog.entries:
+    for code in codes:
         check_deadline()
-        if entry.list_date is not None and entry.list_date > trade_date:
-            future_excluded += 1
-            continue
-        if entry.list_date is None:
-            unknown("missing_listing")
-            continue
         try:
             snapshot = projection.formula_history(
-                trade_date, entry.stock_code,
+                trade_date,
+                code,
                 expected_identity=expected_identity,
                 lookback=compiled.parsed.translation.window_lookback_bars,
                 full_history=compiled.parsed.translation.requires_full_history,
@@ -103,8 +88,10 @@ def run_formula_catalog(
         try:
             decision = evaluate_compiled_formula(
                 FormulaEvaluationInput(
-                    formula=formula, decision_date=trade_date,
-                    decision_at=decision_at, stocks=(snapshot.stock,),
+                    formula=formula,
+                    decision_date=trade_date,
+                    decision_at=decision_at,
+                    stocks=(snapshot.stock,),
                 ),
                 compiled,
             ).decisions[0]
@@ -114,13 +101,72 @@ def run_formula_catalog(
             unknown("evaluation_budget")
             continue
         if decision.status == "match":
-            match_codes.append(entry.stock_code)
+            matches.append(code)
         elif decision.status == "no_match":
             no_match_count += 1
         elif decision.reason is not None:
             unknown(decision.reason)
         else:
             raise FormulaProjectionUnavailableError("formula answer has no reason")
+    return tuple(matches), no_match_count
+
+
+def run_formula_catalog(
+    root: Path,
+    formula: str,
+    trade_date: date,
+    decision_at: datetime,
+    *,
+    expected_identity: str,
+) -> FormulaCatalogRunSummary:
+    """Return a result only after every candidate and the final generation check pass."""
+    started_at = time.monotonic()
+
+    def check_deadline() -> None:
+        if time.monotonic() - started_at > MAX_CATALOG_RUN_SECONDS:
+            raise FormulaCatalogRunTimeoutError("formula catalog run timed out")
+
+    compiled = compile_formula(formula)
+    evaluate_compiled_formula(
+        FormulaEvaluationInput(
+            formula=formula,
+            decision_date=trade_date,
+            decision_at=decision_at,
+            stocks=(),
+        ),
+        compiled,
+    )
+    projection = VerifiedFormulaHistoryProjection(root)
+    catalog = projection.catalog_snapshot(trade_date, expected_identity=expected_identity)
+    check_deadline()
+
+    future_excluded = 0
+    candidate_codes: list[str] = []
+    unknown_reasons: dict[str, int] = {}
+
+    def unknown(reason: str) -> None:
+        unknown_reasons[reason] = unknown_reasons.get(reason, 0) + 1
+
+    for entry in catalog.entries:
+        if entry.list_date is not None and entry.list_date > trade_date:
+            future_excluded += 1
+            continue
+        if entry.list_date is None:
+            unknown("missing_listing")
+            continue
+        candidate_codes.append(entry.stock_code)
+
+    match_codes, no_match_count = _evaluate_candidates(
+        projection,
+        tuple(candidate_codes),
+        compiled,
+        formula,
+        trade_date,
+        decision_at,
+        expected_identity=expected_identity,
+        check_deadline=check_deadline,
+        unknown_reasons=unknown_reasons,
+    )
 
     check_deadline()
     if projection.catalog().identity != expected_identity:
@@ -131,11 +177,15 @@ def run_formula_catalog(
     if len(match_codes) + no_match_count + unknown_count != candidate_total:
         raise FormulaProjectionUnavailableError("formula catalog counts are inconsistent")
     return FormulaCatalogRunSummary(
-        trade_date=trade_date, identity=expected_identity,
+        trade_date=trade_date,
+        identity=expected_identity,
         source_updated_at=catalog.updated_at,
-        catalog_total=len(catalog.entries), candidate_total=candidate_total,
+        catalog_total=len(catalog.entries),
+        candidate_total=candidate_total,
         future_listing_excluded=future_excluded,
-        match_count=len(match_codes), no_match_count=no_match_count,
-        unknown_count=unknown_count, unknown_reasons=unknown_reasons,
-        match_codes=tuple(match_codes),
+        match_count=len(match_codes),
+        no_match_count=no_match_count,
+        unknown_count=unknown_count,
+        unknown_reasons=unknown_reasons,
+        match_codes=match_codes,
     )
