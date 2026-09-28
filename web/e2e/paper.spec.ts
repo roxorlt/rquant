@@ -129,8 +129,10 @@ for (const viewport of [
       await row.focus();
       await row.press("Enter");
       const detail = page.getByRole("dialog", { name: /样本05.*指令详情/ });
-      await expect(detail).toContainText("12.3456");
-      await expect(detail).toContainText("1.3345");
+      await expect(detail).toContainText("12.35");
+      await expect(detail).toContainText("1.33");
+      await expect(detail).not.toContainText("12.3456");
+      await expect(detail).not.toContainText("1.3345");
       await expectNoHorizontalOverflow(page, "paper instruction detail");
       await page.keyboard.press("Escape");
       await expect(detail).toHaveCount(0);

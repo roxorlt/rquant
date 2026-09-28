@@ -1,6 +1,6 @@
 import { useState } from "react";
 import type { PaperAccountsData } from "@/api/endpoints";
-import { EMPTY, formatCount } from "@/format/number";
+import { formatCount, formatNumber, formatPrice } from "@/format/number";
 import { formatShanghaiDateTime, formatTradeDate, shanghaiDateOf } from "@/format/time";
 import { type DataColumn, DataTable } from "@/table/DataTable";
 import { EmptyState, Panel, RelativeTime, Segmented, SideDrawer, Tip } from "@/ui";
@@ -11,10 +11,16 @@ type PaperOrder = PaperHistoryData["orders"][number];
 type PaperFill = PaperOrder["fills"][number];
 type HistoryView = "day" | "recent";
 
-function exactDecimal(value: string | null): string {
-  if (value === null) return EMPTY;
-  const [whole = "0", fraction = ""] = value.split(".");
-  return `${whole.replace(/\B(?=(\d{3})+(?!\d))/g, ",")}.${fraction.padEnd(2, "0")}`;
+function DecimalValue({ value, kind }: { value: string | null; kind: "price" | "amount" }) {
+  const number = value === null ? null : Number(value);
+  const display = kind === "price" ? formatPrice(number) : formatNumber(number);
+  const fraction = value?.split(".")[1] ?? "";
+  const original = value !== null && (fraction.length > 2 || /[eE]/.test(value)) ? value : null;
+  return (
+    <Tip content={original ? `原始值 ${original}` : null}>
+      <span className="num">{display}</span>
+    </Tip>
+  );
 }
 
 function orderStateClass(order: PaperOrder): string {
@@ -67,7 +73,7 @@ const ORDER_COLUMNS: DataColumn<PaperOrder>[] = [
     id: "price",
     header: "成交均价",
     value: (row) => row.average_fill_price,
-    cell: (row) => <span className="num">{exactDecimal(row.average_fill_price)}</span>,
+    cell: (row) => <DecimalValue value={row.average_fill_price} kind="price" />,
     numeric: true,
     secondary: true,
   },
@@ -95,17 +101,22 @@ function fillDetail(fill: PaperFill) {
         </div>
         <div>
           <dt>成交价</dt>
-          <dd className="num">{exactDecimal(fill.price)}</dd>
+          <dd className="num">
+            <DecimalValue value={fill.price} kind="price" />
+          </dd>
         </div>
         <div>
           <dt>费用合计</dt>
-          <dd className="num">{exactDecimal(fill.total_fees)}</dd>
+          <dd className="num">
+            <DecimalValue value={fill.total_fees} kind="amount" />
+          </dd>
         </div>
         <div>
           <dt>佣金 / 过户费 / 印花税</dt>
           <dd className="num">
-            {exactDecimal(fill.commission)} / {exactDecimal(fill.transfer_fee)} /{" "}
-            {exactDecimal(fill.tax)}
+            <DecimalValue value={fill.commission} kind="amount" /> /{" "}
+            <DecimalValue value={fill.transfer_fee} kind="amount" /> /{" "}
+            <DecimalValue value={fill.tax} kind="amount" />
           </dd>
         </div>
       </dl>
@@ -144,7 +155,9 @@ function OrderDetail({ order, onClose }: { order: PaperOrder | null; onClose: ()
             </div>
             <div>
               <dt>成交均价</dt>
-              <dd className="num">{exactDecimal(order.average_fill_price)}</dd>
+              <dd className="num">
+                <DecimalValue value={order.average_fill_price} kind="price" />
+              </dd>
             </div>
             <div>
               <dt>指令方式</dt>
