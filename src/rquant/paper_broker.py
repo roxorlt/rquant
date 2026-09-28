@@ -4119,6 +4119,7 @@ class PaperBrokerStore:
             if any(order.created_at > cutoff or order.updated_at > cutoff for order in orders):
                 raise PaperBrokerReconciliationError("paper history order is later than cutoff")
             receipts: dict[str, PaperExecutionReceipt] = {}
+            final_receipts: dict[str, PaperExecutionReceipt] = {}
             for row, order in zip(retained, orders, strict=True):
                 if row["intent_payload_json"] is None:
                     raise PaperBrokerReconciliationError(
@@ -4165,6 +4166,7 @@ class PaperBrokerStore:
                         f"order {order.order_id} initial execution receipt mismatch"
                     )
                 receipts[execution_id] = receipt
+                final_receipts[str(order.order_id)] = receipt
             order_ids = tuple(order.order_id for order in orders)
             fill_rows: list[sqlite3.Row] = []
             if order_ids:
@@ -4197,6 +4199,7 @@ class PaperBrokerStore:
                     raise PaperBrokerReconciliationError(
                         f"fill {fill.fill_id} immutable execution receipt mismatch"
                     )
+                final_receipts[str(fill.order_id)] = receipt
             by_order: dict[str, list[PaperHistoryFill]] = {
                 str(order_id): [] for order_id in order_ids
             }
@@ -4229,6 +4232,14 @@ class PaperBrokerStore:
                 ):
                     raise PaperBrokerReconciliationError(
                         "paper history fill summary is inconsistent"
+                    )
+                if order.status in {PaperOrderStatus.CANCELLED, PaperOrderStatus.EXPIRED}:
+                    raise PaperBrokerReconciliationError(
+                        f"order {order.order_id} has unverifiable close status"
+                    )
+                if order != final_receipts[str(order.order_id)].order:
+                    raise PaperBrokerReconciliationError(
+                        f"order {order.order_id} final execution receipt mismatch"
                     )
             return PaperOrderHistorySnapshot(
                 account_id=self.account_id,
