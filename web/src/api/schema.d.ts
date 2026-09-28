@@ -531,6 +531,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/screen/tdx/market/commands": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 提交全市场公式选股 */
+        post: operations["submit_formula_market_command_api_v1_screen_tdx_market_commands_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/screen/tdx/parse": {
         parameters: {
             query?: never;
@@ -2245,6 +2262,37 @@ export interface components {
              * @constant
              */
             syntax_version: "tdx-v1";
+        };
+        /** FormulaMarketCommandReceipt */
+        FormulaMarketCommandReceipt: {
+            /** Command Id */
+            command_id: string;
+            /** Message */
+            message: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "queued" | "pending" | "processing" | "failed" | "ambiguous" | "conflict";
+            /** Task Id */
+            task_id?: string | null;
+        };
+        /** FormulaMarketCommandRequest */
+        FormulaMarketCommandRequest: {
+            /** Command Id */
+            command_id: string;
+            /** Formula */
+            formula: string;
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+            /**
+             * Trade Date
+             * Format: date
+             */
+            trade_date: string;
         };
         /** FreshnessItem */
         FreshnessItem: {
@@ -4984,6 +5032,48 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_ScreenRunData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    submit_formula_market_command_api_v1_screen_tdx_market_commands_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["FormulaMarketCommandRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FormulaMarketCommandReceipt"];
+                };
+            };
+            /** @description Conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FormulaMarketCommandReceipt"];
                 };
             };
             /** @description Validation Error */

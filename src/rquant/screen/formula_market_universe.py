@@ -60,6 +60,7 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 _MAX_PARTITION_ROWS = 5999
 _MAX_FILE_BYTES = 8 * 1024 * 1024
+_MAX_POINTER_BYTES = 512
 _DIR_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
 _READ_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
 _WRITE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
@@ -402,6 +403,7 @@ def _read_file(
     name: str,
     *,
     allowed_links: tuple[int, ...] = (1,),
+    max_bytes: int = _MAX_FILE_BYTES,
 ) -> tuple[bytes, tuple[int, ...]]:
     before = os.stat(name, dir_fd=parent, follow_symlinks=False)
     if (
@@ -409,7 +411,7 @@ def _read_file(
         or before.st_uid != os.geteuid()
         or stat.S_IMODE(before.st_mode) != 0o600
         or before.st_nlink not in allowed_links
-        or not 0 < before.st_size <= _MAX_FILE_BYTES
+        or not 0 < before.st_size <= max_bytes
     ):
         raise FormulaMarketUniverseError("market-list file is unsafe")
     descriptor = os.open(name, _READ_FLAGS, dir_fd=parent)
@@ -648,3 +650,33 @@ def load_formula_market_universe(
         raise FormulaMarketUniverseError(
             "market-list generation is unavailable or invalid"
         ) from exc
+
+
+def peek_formula_market_universe_identity(root: Path, trade_date: date) -> str:
+    """Read only a day's bounded, private current pointer; the worker verifies its archive."""
+    candidate = _absolute_root(root)
+    if type(trade_date) is not date:
+        raise ValueError("market-list date is invalid")
+    try:
+        root_fd = _open_directory(candidate)
+        try:
+            day_fd = _open_child(root_fd, trade_date.isoformat(), create=False)
+            try:
+                payload, _ = _read_file(
+                    day_fd, "current.json", max_bytes=_MAX_POINTER_BYTES
+                )
+                pointer = _Pointer.model_validate(strict_canonical_json_loads(payload))
+                if (
+                    pointer.trade_date != trade_date
+                    or canonical_json_bytes(pointer.model_dump(mode="json")) != payload
+                ):
+                    raise FormulaMarketUniverseError("market-list pointer is invalid")
+                return pointer.content_sha256
+            finally:
+                os.close(day_fd)
+        finally:
+            os.close(root_fd)
+    except FormulaMarketUniverseError:
+        raise
+    except Exception as exc:
+        raise FormulaMarketUniverseError("market-list pointer is unavailable") from exc

@@ -33,7 +33,9 @@ from rquant.page_control import (
     AckAlert,
     BackfillPlanPageControlBackend,
     DataAuditReportPageControlBackend,
+    FormulaMarketPageControlBackend,
     LabPageControlBackend,
+    PageControlCommandConflictError,
     PageControlConsumer,
     PageControlOutbox,
     PageControlService,
@@ -130,6 +132,7 @@ def build_page_control_service(
     lab_backend: LabPageControlBackend | None = None,
     backfill_plan_backend: BackfillPlanPageControlBackend | None = None,
     data_audit_report_backend: DataAuditReportPageControlBackend | None = None,
+    formula_market_backend: FormulaMarketPageControlBackend | None = None,
     load_default_lab_backend: bool = True,
     clock: Callable[[], datetime] | None = None,
     lease_seconds: int = 30,
@@ -146,6 +149,7 @@ def build_page_control_service(
         lab_backend=lab_backend,
         backfill_plan_backend=backfill_plan_backend,
         data_audit_report_backend=data_audit_report_backend,
+        formula_market_backend=formula_market_backend,
         load_default_lab_backend=load_default_lab_backend,
         clock=clock,
         lease_seconds=lease_seconds,
@@ -165,6 +169,7 @@ def build_page_control_service_with_dependencies(
     lab_backend: LabPageControlBackend | None = None,
     backfill_plan_backend: BackfillPlanPageControlBackend | None = None,
     data_audit_report_backend: DataAuditReportPageControlBackend | None = None,
+    formula_market_backend: FormulaMarketPageControlBackend | None = None,
     load_default_lab_backend: bool = True,
     clock: Callable[[], datetime] | None = None,
     lease_seconds: int = 30,
@@ -207,6 +212,7 @@ def build_page_control_service_with_dependencies(
             ),
             backfill_plan_backend=backfill_plan_backend,
             data_audit_report_backend=data_audit_report_backend,
+            formula_market_backend=formula_market_backend,
             clock=clock,
             lease_seconds=lease_seconds,
             consumer_id=consumer_instance_id,
@@ -255,6 +261,9 @@ def handler_for(service: PageControlService) -> type[BaseHTTPRequestHandler]:
             else:
                 try:
                     response = service.submit(command).model_dump(mode="json")
+                except PageControlCommandConflictError:
+                    self._write_json(409, {"error": "command conflict"})
+                    return
                 except Exception as exc:
                     self._write_json(400, {"error": f"{type(exc).__name__}: {exc}"})
                     return
