@@ -15,7 +15,11 @@ from typing import Literal
 from pydantic import Field, field_validator, model_validator
 
 from rquant.formula_market_private_config import FormulaMarketPrivateConfig
-from rquant.formula_pool_daily import FormulaPoolDailyRecalculator, FormulaPoolDailyResultV1
+from rquant.formula_pool_daily import (
+    FormulaPoolDailyRecalculator,
+    FormulaPoolDailyResultV1,
+    _run_identity,
+)
 from rquant.formula_pool_definition import (
     FormulaPoolDefinitionStore,
     FormulaPoolDefinitionV1,
@@ -175,6 +179,8 @@ class FormulaPoolBatchResult(RuntimeContractModel):
 
     trade_date: date
     catalog_identity: str = Field(pattern=r"^[0-9a-f]{64}$")
+    universe_identity: str = Field(pattern=r"^[0-9a-f]{64}$")
+    projection_identity: str = Field(pattern=r"^[0-9a-f]{64}$")
     total_count: int = Field(ge=0)
     page_start: int = Field(ge=0)
     pools: tuple[FormulaPoolBatchItem, ...]
@@ -203,13 +209,61 @@ class FormulaPoolBatchResult(RuntimeContractModel):
             or self.page_start + len(self.pools) > self.total_count
             or self.all_complete
             != (self.page_start == 0 and self.completed_count == self.total_count)
+            or any(
+                item.daily is not None
+                and (
+                    item.daily.trade_date != self.trade_date
+                    or item.daily.universe_identity != self.universe_identity
+                    or item.daily.projection_identity != self.projection_identity
+                )
+                for item in self.pools
+            )
         ):
             raise ValueError("formula batch summary is inconsistent")
         return self
 
 
+class FormulaPoolBatchDayResult(RuntimeContractModel):
+    """One complete catalog traversal, bound to one day and source generation."""
+
+    trade_date: date
+    catalog_identity: str = Field(pattern=r"^[0-9a-f]{64}$")
+    universe_identity: str = Field(pattern=r"^[0-9a-f]{64}$")
+    projection_identity: str = Field(pattern=r"^[0-9a-f]{64}$")
+    total_count: int = Field(ge=0, le=_MAX_DEFINITIONS)
+    pools: tuple[FormulaPoolBatchItem, ...] = Field(max_length=_MAX_DEFINITIONS)
+    completed_count: int = Field(ge=0)
+    waiting_count: int = Field(ge=0)
+    failed_count: int = Field(ge=0)
+    all_complete: bool
+
+    @model_validator(mode="after")
+    def require_complete_honest_summary(self) -> FormulaPoolBatchDayResult:
+        names = tuple(item.pool_name for item in self.pools)
+        if (
+            len(self.pools) != self.total_count
+            or names != tuple(sorted(set(names)))
+            or self.completed_count
+            != sum(item.status == "completed" for item in self.pools)
+            or self.waiting_count != sum(item.status == "waiting" for item in self.pools)
+            or self.failed_count != sum(item.status == "failed" for item in self.pools)
+            or self.all_complete != (self.completed_count == self.total_count)
+            or any(
+                item.daily is not None
+                and (
+                    item.daily.trade_date != self.trade_date
+                    or item.daily.universe_identity != self.universe_identity
+                    or item.daily.projection_identity != self.projection_identity
+                )
+                for item in self.pools
+            )
+        ):
+            raise ValueError("formula batch day summary is inconsistent")
+        return self
+
+
 class FormulaPoolBatchCoordinator:
-    """Preflight the full catalog, then touch only one bounded stable page."""
+    """Preflight the full catalog and reconcile stable, bounded pages."""
 
     def __init__(
         self,
@@ -308,6 +362,19 @@ class FormulaPoolBatchCoordinator:
             for item in results
         ):
             raise ValueError("formula batch sources changed during reconciliation")
+        for definition, item in zip(catalog[start:end], results, strict=True):
+            if item.task_id is None:
+                continue
+            run_identity = _run_identity(
+                definition.pool_name,
+                definition.version,
+                trade_date,
+                universe,
+                projection,
+            )
+            admitted = self.runner.task_store.admission_by_key(run_identity)
+            if admitted is None or admitted[1] != item.task_id:
+                raise ValueError("formula batch admission sources changed during reconciliation")
         next_cursor = f"{cursor_identity}:{end}" if end < len(catalog) else None
         completed = sum(item.status == "completed" for item in results)
         waiting = sum(item.status == "waiting" for item in results)
@@ -315,6 +382,8 @@ class FormulaPoolBatchCoordinator:
         return FormulaPoolBatchResult(
             trade_date=trade_date,
             catalog_identity=catalog_identity,
+            universe_identity=universe,
+            projection_identity=projection,
             total_count=len(catalog),
             page_start=start,
             pools=results,
@@ -324,6 +393,51 @@ class FormulaPoolBatchCoordinator:
             unprocessed_count=len(catalog) - len(results),
             next_cursor=next_cursor,
             all_complete=start == 0 and completed == len(catalog),
+        )
+
+    def run_day(self, trade_date: date) -> FormulaPoolBatchDayResult:
+        """Visit every stable page once; leave queued work to the shared worker."""
+        catalog, catalog_identity = self._catalog()
+        universe, projection, _ = self.runner._sources(trade_date)
+        pools: list[FormulaPoolBatchItem] = []
+        cursor: str | None = None
+        while True:
+            page = self.run(trade_date, limit=_MAX_PAGE, cursor=cursor)
+            if (page.universe_identity, page.projection_identity) != (universe, projection):
+                raise ValueError("formula batch sources changed during day sweep")
+            expected = catalog[len(pools) : len(pools) + _MAX_PAGE]
+            if (
+                page.catalog_identity != catalog_identity
+                or page.total_count != len(catalog)
+                or page.page_start != len(pools)
+                or tuple((item.pool_name, item.definition_version) for item in page.pools)
+                != tuple((item.pool_name, item.version) for item in expected)
+            ):
+                raise ValueError("formula batch catalog changed during day sweep")
+            pools.extend(page.pools)
+            if len(pools) == len(catalog):
+                if page.next_cursor is not None:
+                    raise ValueError("formula batch day sweep ended with a cursor")
+                break
+            if page.next_cursor is None:
+                raise ValueError("formula batch day sweep ended before the catalog")
+            cursor = page.next_cursor
+        if self._catalog()[1] != catalog_identity:
+            raise ValueError("formula batch catalog changed during day sweep")
+        if self.runner._sources(trade_date)[:2] != (universe, projection):
+            raise ValueError("formula batch sources changed during day sweep")
+        completed = sum(item.status == "completed" for item in pools)
+        return FormulaPoolBatchDayResult(
+            trade_date=trade_date,
+            catalog_identity=catalog_identity,
+            universe_identity=universe,
+            projection_identity=projection,
+            total_count=len(catalog),
+            pools=tuple(pools),
+            completed_count=completed,
+            waiting_count=sum(item.status == "waiting" for item in pools),
+            failed_count=sum(item.status == "failed" for item in pools),
+            all_complete=completed == len(catalog),
         )
 
     def _process(
@@ -383,9 +497,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Reconcile a bounded local formula pool day batch")
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--trade-date", required=True)
-    parser.add_argument("--limit", type=int, default=_MAX_PAGE)
+    parser.add_argument("--all", action="store_true", help="reconcile the full catalog once")
+    parser.add_argument("--limit", type=int)
     parser.add_argument("--cursor")
     args = parser.parse_args(list(argv) if argv is not None else None)
+    if args.all and (args.limit is not None or args.cursor is not None):
+        print("formula_batch_arguments_invalid", file=sys.stderr)
+        return 2
     try:
         config = load_private_formula_pool_batch_config(args.config)
         target = date.fromisoformat(args.trade_date)
@@ -393,8 +511,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("formula_batch_config_invalid", file=sys.stderr)
         return 2
     try:
-        result = FormulaPoolBatchCoordinator(config=config).run(
-            target, limit=args.limit, cursor=args.cursor
+        coordinator = FormulaPoolBatchCoordinator(config=config)
+        result = (
+            coordinator.run_day(target)
+            if args.all
+            else coordinator.run(
+                target,
+                limit=_MAX_PAGE if args.limit is None else args.limit,
+                cursor=args.cursor,
+            )
         )
     except (OSError, RuntimeError, ValueError):
         print("formula_batch_unavailable", file=sys.stderr)
