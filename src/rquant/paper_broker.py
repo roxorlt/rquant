@@ -198,6 +198,7 @@ class PaperOrderHistorySnapshot(RuntimeContractModel):
     account_id: str = Field(min_length=1)
     as_of: AwareUtcDatetime
     ledger_revision: int = Field(ge=1)
+    price_tick: PositiveDecimal
     total_orders: int = Field(ge=0)
     has_more: bool
     orders: tuple[PaperOrder, ...]
@@ -4101,8 +4102,14 @@ class PaperBrokerStore:
             assert total_row is not None
             total_orders = int(total_row[0])
             rows = connection.execute(
-                "SELECT * FROM paper_order WHERE account_id = ? "
-                "ORDER BY updated_at DESC, order_id DESC LIMIT ?",
+                "SELECT o.*, i.payload_json AS intent_payload_json, "
+                "i.account_id AS intent_account_id, i.signal_id AS intent_signal_id, "
+                "i.entry_signal_id AS intent_entry_signal_id, i.ts_code AS intent_ts_code, "
+                "i.side AS intent_side, i.persisted_at AS intent_persisted_at, "
+                "i.initial_execution_id AS initial_execution_id, "
+                "i.initial_execution_request_fingerprint AS initial_request_fingerprint "
+                "FROM paper_order AS o LEFT JOIN paper_intent AS i ON i.intent_id = o.intent_id "
+                "WHERE o.account_id = ? ORDER BY o.updated_at DESC, o.order_id DESC LIMIT ?",
                 (self.account_id, _MAX_HISTORY_ORDERS + 1),
             ).fetchall()
             retained = rows[:_MAX_HISTORY_ORDERS]
@@ -4111,6 +4118,53 @@ class PaperBrokerStore:
             orders = tuple(self._order_from_row(row) for row in retained)
             if any(order.created_at > cutoff or order.updated_at > cutoff for order in orders):
                 raise PaperBrokerReconciliationError("paper history order is later than cutoff")
+            receipts: dict[str, PaperExecutionReceipt] = {}
+            for row, order in zip(retained, orders, strict=True):
+                if row["intent_payload_json"] is None:
+                    raise PaperBrokerReconciliationError(
+                        f"order {order.order_id} intent/order mismatch"
+                    )
+                intent = PaperOrderIntent.model_validate_json(row["intent_payload_json"])
+                if (
+                    intent.intent_id != order.intent_id
+                    or intent.account_id != order.account_id
+                    or intent.ts_code != order.ts_code
+                    or intent.side is not order.side
+                    or intent.order_type is not order.order_type
+                    or intent.quantity != order.quantity
+                    or row["intent_account_id"] != intent.account_id
+                    or row["intent_signal_id"] != intent.signal_id
+                    or row["intent_entry_signal_id"] != intent.entry_signal_id
+                    or row["intent_ts_code"] != intent.ts_code
+                    or row["intent_side"] != intent.side.value
+                    or row["entry_signal_id"]
+                    != (None if intent.side is PaperSide.BUY else intent.entry_signal_id)
+                    or self._required_ledger_timestamp(
+                        row["intent_persisted_at"], label="paper intent persisted_at"
+                    )
+                    > cutoff
+                ):
+                    raise PaperBrokerReconciliationError(
+                        f"order {order.order_id} intent/order mismatch"
+                    )
+                execution_id = row["initial_execution_id"]
+                receipt = self._execution_receipt(connection, execution_id=execution_id)
+                if receipt is None or (
+                    receipt.intent_id != intent.intent_id
+                    or receipt.request_fingerprint != row["initial_request_fingerprint"]
+                    or receipt.order.order_id != order.order_id
+                    or receipt.order.account_id != order.account_id
+                    or receipt.order.ts_code != order.ts_code
+                    or receipt.order.side is not order.side
+                    or receipt.order.order_type is not order.order_type
+                    or receipt.order.quantity != order.quantity
+                    or receipt.order.created_at != order.created_at
+                    or receipt.persisted_at > cutoff
+                ):
+                    raise PaperBrokerReconciliationError(
+                        f"order {order.order_id} initial execution receipt mismatch"
+                    )
+                receipts[execution_id] = receipt
             order_ids = tuple(order.order_id for order in orders)
             fill_rows: list[sqlite3.Row] = []
             if order_ids:
@@ -4131,6 +4185,18 @@ class PaperBrokerStore:
                 )
                 for row in fill_rows
             )
+            for row, fill in zip(fill_rows, fills, strict=True):
+                receipt = receipts.get(fill.execution_id)
+                if receipt is None:
+                    receipt = self._execution_receipt(connection, execution_id=fill.execution_id)
+                if receipt is None or (
+                    receipt.fill != self._fill_from_row(row)
+                    or receipt.order.order_id != fill.order_id
+                    or receipt.persisted_at != fill.persisted_at
+                ):
+                    raise PaperBrokerReconciliationError(
+                        f"fill {fill.fill_id} immutable execution receipt mismatch"
+                    )
             by_order: dict[str, list[PaperHistoryFill]] = {
                 str(order_id): [] for order_id in order_ids
             }
@@ -4168,6 +4234,7 @@ class PaperBrokerStore:
                 account_id=self.account_id,
                 as_of=cutoff,
                 ledger_revision=ledger_revision,
+                price_tick=self._execution_price_tick,
                 total_orders=total_orders,
                 has_more=total_orders > len(orders),
                 orders=orders,

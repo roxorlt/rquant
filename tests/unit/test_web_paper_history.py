@@ -35,6 +35,7 @@ def _history(*, empty: bool = False) -> PaperOrderHistorySnapshot:
             account_id="shadow-main",
             as_of=AT,
             ledger_revision=1,
+            price_tick=Decimal("0.0001"),
             total_orders=0,
             has_more=False,
             orders=(),
@@ -77,6 +78,7 @@ def _history(*, empty: bool = False) -> PaperOrderHistorySnapshot:
         account_id="shadow-main",
         as_of=AT,
         ledger_revision=2,
+        price_tick=Decimal("0.0001"),
         total_orders=1,
         has_more=False,
         orders=(order,),
@@ -152,6 +154,40 @@ def test_published_empty_history_is_distinct_from_unpublished(tmp_path: Path) ->
     assert history["orders"] == []
 
 
+def test_published_history_rejects_average_price_unrelated_to_fills(tmp_path: Path) -> None:
+    root = tmp_path / "serving"
+    snapshot = _history()
+    changed = snapshot.orders[0].model_copy(update={"average_fill_price": Decimal("99.9999")})
+    corrupt = snapshot.model_copy(update={"orders": (changed,)})
+    build_web_fixture(
+        root, "baseline", paper_history_projections=paper_history_projections(corrupt)
+    )
+
+    with TestClient(_app(root)) as client:
+        response = client.get("/api/v1/paper/accounts")
+
+    assert response.status_code == 503
+
+
+def test_published_history_uses_broker_price_tick(tmp_path: Path) -> None:
+    root = tmp_path / "serving"
+    snapshot = _history()
+    order = snapshot.orders[0].model_copy(update={"average_fill_price": Decimal("10.00")})
+    fill = snapshot.fills[0].model_copy(update={"price": Decimal("10.0049")})
+    rounded = snapshot.model_copy(
+        update={"price_tick": Decimal("0.01"), "orders": (order,), "fills": (fill,)}
+    )
+    build_web_fixture(
+        root, "baseline", paper_history_projections=paper_history_projections(rounded)
+    )
+
+    with TestClient(_app(root)) as client:
+        response = client.get("/api/v1/paper/accounts")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["data"]["history"]["orders"][0]["average_fill_price"] == "10.00"
+
+
 def test_partial_projection_set_is_503_instead_of_zero_history(tmp_path: Path) -> None:
     root = tmp_path / "serving"
     window = paper_history_projections(_history(empty=True))[0]
@@ -165,7 +201,8 @@ def test_partial_projection_set_is_503_instead_of_zero_history(tmp_path: Path) -
 
 
 @pytest.mark.parametrize(
-    "fault", ["orphan_fill", "window_count", "status_owner", "future_fill", "legacy_fill"]
+    "fault",
+    ["orphan_fill", "window_count", "missing_tick", "status_owner", "future_fill", "legacy_fill"],
 )
 def test_corrupt_history_evidence_fails_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str
@@ -190,6 +227,8 @@ def test_corrupt_history_evidence_fails_closed(
                 self.rows[0] = (*first[:2], "f" * 64, *first[3:])
             elif fault == "window_count" and "FROM paper_order_window" in sql:
                 self.rows[0] = (*first[:4], 0, *first[5:])
+            elif fault == "missing_tick" and "FROM paper_order_window" in sql:
+                self.rows[0] = (*first[:3], None, *first[4:])
             elif fault == "status_owner" and "FROM projection_status" in sql:
                 self.rows[0] = (*first[:4], "f" * 64, *first[5:])
             elif fault == "future_fill" and "FROM paper_fill_history" in sql:

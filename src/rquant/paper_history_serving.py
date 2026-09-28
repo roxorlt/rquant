@@ -20,6 +20,7 @@ def paper_history_projections(
                 "snapshot_key": "recent",
                 "account_id": snapshot.account_id,
                 "as_of_time": at.isoformat().replace("+00:00", "Z"),
+                "price_tick": str(snapshot.price_tick),
                 "total_orders": snapshot.total_orders,
                 "retained_orders": len(snapshot.orders),
                 "retained_fills": len(snapshot.fills),

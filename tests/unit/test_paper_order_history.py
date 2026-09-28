@@ -152,6 +152,38 @@ def test_tampered_order_is_not_read_as_valid_history(tmp_path: Path) -> None:
         store.recent_order_history(as_of=BUY_TIME + timedelta(minutes=1))
 
 
+def test_order_identity_must_match_immutable_intent_and_receipt(tmp_path: Path) -> None:
+    path = tmp_path / "paper.sqlite3"
+    store = _store(path, paper_cost_policy())
+    order = store.submit_intent(
+        _intent(), decision_time=BUY_TIME, trade_date=BUY_DATE, quote=_quote("10.00")
+    )
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "UPDATE paper_order SET ts_code = '600999.SH' WHERE order_id = ?",
+            (order.order_id,),
+        )
+
+    with pytest.raises(PaperBrokerReconciliationError, match="intent/order mismatch"):
+        store.recent_order_history(as_of=BUY_TIME + timedelta(minutes=1))
+
+
+def test_order_creation_time_must_match_initial_receipt(tmp_path: Path) -> None:
+    path = tmp_path / "paper.sqlite3"
+    store = _store(path, paper_cost_policy())
+    order = store.submit_intent(
+        _intent(), decision_time=BUY_TIME, trade_date=BUY_DATE, quote=_quote("10.00")
+    )
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "UPDATE paper_order SET created_at = ? WHERE order_id = ?",
+            ((BUY_TIME - timedelta(minutes=1)).isoformat(), order.order_id),
+        )
+
+    with pytest.raises(PaperBrokerReconciliationError, match="initial execution receipt mismatch"):
+        store.recent_order_history(as_of=BUY_TIME + timedelta(minutes=1))
+
+
 def test_writer_commit_during_history_read_does_not_split_count_and_rows(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
