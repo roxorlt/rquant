@@ -1,0 +1,261 @@
+import { render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { HttpResponse, http } from "msw";
+import type { Schemas } from "@/api/client";
+import { AppProviders } from "@/app/App";
+import { metaEnvelope } from "@/test/fixtures";
+import { findJargon } from "@/test/jargon";
+import { testQueryClient } from "@/test/queryClient";
+import { server } from "@/test/server";
+import { FormulaPreviewDialog } from "./FormulaPreviewDialog";
+
+const serving = metaEnvelope().serving;
+const taskId = "a".repeat(32);
+const formula = "CLOSE>MA(CLOSE,2)";
+const tradeDate = "2026-09-24";
+const job: Schemas["FormulaMarketJobItem"] = {
+  task_id: taskId,
+  status: "succeeded",
+  status_label: "已完成",
+  hint: "可以查看命中股票。",
+  formula,
+  trade_date: tradeDate,
+  created_at: "2026-09-24T07:30:00Z",
+  updated_at: "2026-09-24T07:31:00Z",
+  result_available: true,
+};
+const summary: Schemas["FormulaMarketResultSummary"] = {
+  market_total: 100,
+  listed_count: 100,
+  paused_count: 0,
+  match_count: 51,
+  no_match_count: 40,
+  unknown_count: 9,
+  unknown_reasons: [{ reason: "missing_value", label: "行情字段缺失", count: 9 }],
+};
+
+function setupSource(): void {
+  server.use(
+    http.get("*/api/v1/screen/tdx/preview/source", () =>
+      HttpResponse.json({
+        available: true,
+        dates: [tradeDate],
+        source: { identity: "b".repeat(64), updated_at: "2026-09-24T07:31:00Z" },
+      }),
+    ),
+    http.post("*/api/v1/screen/tdx/parse", () =>
+      HttpResponse.json({
+        syntax_version: "tdx-v1",
+        status: "parsed",
+        capability: "parse_only",
+        ast: null,
+        translation: null,
+        issues: [],
+        unsupported: [],
+      }),
+    ),
+  );
+}
+
+function renderPreview() {
+  return render(
+    <AppProviders queryClient={testQueryClient()}>
+      <FormulaPreviewDialog onClose={() => undefined} />
+    </AppProviders>,
+  );
+}
+
+async function checkAndChooseDate(user: ReturnType<typeof userEvent.setup>): Promise<HTMLElement> {
+  const drawer = await screen.findByRole("dialog", { name: "公式预览" });
+  await user.type(within(drawer).getByRole("textbox", { name: "通达信公式" }), formula);
+  await user.click(within(drawer).getByRole("button", { name: "检查公式" }));
+  await within(drawer).findByText("公式检查通过，可预览或批量运行。");
+  await user.type(within(drawer).getByLabelText("运行日期"), tradeDate);
+  return drawer;
+}
+
+describe("全市场公式选股", () => {
+  it("确认后提交一次；任务尚未发布时保留回执，发布后展示真实分页和历史公式", async () => {
+    setupSource();
+    let published = false;
+    const submitted: Schemas["FormulaMarketCommandRequest"][] = [];
+    const cursors: (string | null)[] = [];
+    server.use(
+      http.get("*/api/v1/screen/tdx/market/jobs", () =>
+        HttpResponse.json({
+          data: {
+            availability: published ? "ready" : "empty",
+            available_at: "2026-09-24T07:32:00Z",
+            has_older_tasks: false,
+            jobs: published ? [job] : [],
+            message: published ? "" : "还没有选股任务。",
+            total_task_count: published ? 1 : 0,
+          },
+          serving,
+        }),
+      ),
+      http.post("*/api/v1/screen/tdx/market/commands", async ({ request }) => {
+        expect(request.headers.get("X-Rquant-Csrf")).toBe("1");
+        submitted.push((await request.json()) as Schemas["FormulaMarketCommandRequest"]);
+        return HttpResponse.json({
+          command_id: submitted[0]?.command_id,
+          status: "queued",
+          task_id: taskId,
+          message: "已提交，等待选股结果。",
+        });
+      }),
+      http.get(`*/api/v1/screen/tdx/market/jobs/${taskId}`, () =>
+        published
+          ? HttpResponse.json({ data: { job, summary }, serving })
+          : HttpResponse.json({ detail: "没有找到这项选股任务。" }, { status: 404 }),
+      ),
+      http.get(`*/api/v1/screen/tdx/market/jobs/${taskId}/matches`, ({ request }) => {
+        const cursor = new URL(request.url).searchParams.get("cursor");
+        cursors.push(cursor);
+        return HttpResponse.json({
+          data: {
+            task_id: taskId,
+            total: 51,
+            offset: cursor ? 50 : 0,
+            match_codes: cursor ? ["600051.SH"] : ["600001.SH"],
+            next_cursor: cursor ? null : "page-2",
+          },
+          serving,
+        });
+      }),
+      http.get("*/api/v1/stocks/600001.SH/summary", () =>
+        HttpResponse.json({
+          data: { ts_code: "600001.SH", name: "样本01", price: 11, as_of: null, pools: [] },
+          serving,
+        }),
+      ),
+      http.get("*/api/v1/panorama/stocks/600001.SH/daily", () =>
+        HttpResponse.json({ data: { ts_code: "600001.SH", name: "样本01", bars: [] }, serving }),
+      ),
+    );
+    const user = userEvent.setup();
+    renderPreview();
+    const drawer = await checkAndChooseDate(user);
+    await user.click(within(drawer).getByRole("button", { name: "运行全市场" }));
+    expect(submitted).toHaveLength(0);
+    expect(await screen.findByText(/将用 2026-09-24 的已归档 A 股计算/)).toHaveTextContent(
+      tradeDate,
+    );
+    await user.click(screen.getByRole("button", { name: "确认运行" }));
+    expect(await within(drawer).findByText("已提交，等待任务出现")).toBeVisible();
+    expect(submitted).toHaveLength(1);
+    expect(submitted[0]).toMatchObject({ formula, trade_date: tradeDate });
+    expect(submitted[0]?.command_id).toBeTruthy();
+    expect(drawer.textContent).not.toContain(taskId);
+
+    published = true;
+    await user.click(within(drawer).getByRole("button", { name: "刷新任务" }));
+    expect(await within(drawer).findByRole("region", { name: "市场结果" })).toHaveTextContent("51");
+    expect(within(drawer).getByRole("region", { name: "市场结果" })).toHaveTextContent("100");
+    expect(within(drawer).getByText("行情字段缺失")).toBeVisible();
+    await user.click(within(drawer).getByRole("button", { name: /600001.SH/ }));
+    const stockTitle = await screen.findByText(/样本01/);
+    const stockDrawer = stockTitle.closest('[role="dialog"]');
+    expect(stockDrawer).not.toBeNull();
+    await user.click(within(stockDrawer as HTMLElement).getByRole("button", { name: "关闭" }));
+
+    await user.click(within(drawer).getByRole("button", { name: "下一页" }));
+    expect(await within(drawer).findByRole("button", { name: /600051.SH/ })).toBeVisible();
+    expect(cursors).toEqual([null, "page-2"]);
+    await user.type(within(drawer).getByRole("textbox", { name: "通达信公式" }), " AND OPEN>0");
+    expect(within(drawer).getByText("历史公式与日期")).toBeVisible();
+    expect(await within(drawer).findByRole("button", { name: /600001.SH/ })).toBeVisible();
+    expect(within(drawer).getByRole("button", { name: "运行全市场" })).toBeDisabled();
+    expect(findJargon(drawer.textContent ?? "")).toEqual([]);
+  });
+
+  it("待确认请求离开后仍能同编号重试，不生成第二条命令", async () => {
+    setupSource();
+    const submitted: Schemas["FormulaMarketCommandRequest"][] = [];
+    server.use(
+      http.post("*/api/v1/screen/tdx/market/commands", async ({ request }) => {
+        submitted.push((await request.json()) as Schemas["FormulaMarketCommandRequest"]);
+        if (submitted.length === 1) {
+          return HttpResponse.json(
+            { detail: "提交状态待确认，请使用原请求重试。" },
+            { status: 503 },
+          );
+        }
+        return HttpResponse.json({
+          command_id: submitted[1]?.command_id,
+          status: "queued",
+          task_id: taskId,
+          message: "已提交，等待选股结果。",
+        });
+      }),
+      http.get(`*/api/v1/screen/tdx/market/jobs/${taskId}`, () =>
+        HttpResponse.json({ detail: "没有找到这项选股任务。" }, { status: 404 }),
+      ),
+    );
+    const user = userEvent.setup();
+    const view = renderPreview();
+    const drawer = await checkAndChooseDate(user);
+    await user.click(within(drawer).getByRole("button", { name: "运行全市场" }));
+    await user.click(await screen.findByRole("button", { name: "确认运行" }));
+    expect(await within(drawer).findByText("提交状态待确认")).toBeVisible();
+    view.unmount();
+
+    renderPreview();
+    const restored = await screen.findByRole("dialog", { name: "公式预览" });
+    expect(within(restored).getByText("提交状态待确认")).toBeVisible();
+    await user.click(within(restored).getByRole("button", { name: "重试原请求" }));
+    expect(await within(restored).findByText("已提交，等待任务出现")).toBeVisible();
+    expect(submitted).toHaveLength(2);
+    expect(submitted[1]).toEqual(submitted[0]);
+  });
+
+  it("失败的历史任务须再次确认，并用新编号重试原公式与日期", async () => {
+    setupSource();
+    const failed: Schemas["FormulaMarketJobItem"] = {
+      ...job,
+      status: "failed",
+      status_label: "未完成",
+      hint: "请检查公式和数据后重试。",
+      result_available: false,
+    };
+    const submitted: Schemas["FormulaMarketCommandRequest"][] = [];
+    server.use(
+      http.get("*/api/v1/screen/tdx/market/jobs", () =>
+        HttpResponse.json({
+          data: {
+            availability: "ready",
+            available_at: "2026-09-24T07:32:00Z",
+            has_older_tasks: false,
+            jobs: [failed],
+            message: "",
+            total_task_count: 1,
+          },
+          serving,
+        }),
+      ),
+      http.get(`*/api/v1/screen/tdx/market/jobs/${taskId}`, () =>
+        HttpResponse.json({ data: { job: failed, summary: null }, serving }),
+      ),
+      http.post("*/api/v1/screen/tdx/market/commands", async ({ request }) => {
+        submitted.push((await request.json()) as Schemas["FormulaMarketCommandRequest"]);
+        return HttpResponse.json({
+          command_id: submitted[0]?.command_id,
+          status: "failed",
+          task_id: null,
+          message: "提交失败，请检查公式和数据后重试。",
+        });
+      }),
+    );
+    const user = userEvent.setup();
+    renderPreview();
+    const drawer = await screen.findByRole("dialog", { name: "公式预览" });
+    await user.click(await within(drawer).findByRole("button", { name: /CLOSE>MA/ }));
+    expect(await within(drawer).findByText("请检查公式和数据后重试。")).toBeVisible();
+    await user.click(within(drawer).getByRole("button", { name: "重新运行此公式" }));
+    expect(submitted).toHaveLength(0);
+    await user.click(await screen.findByRole("button", { name: "确认运行" }));
+    await waitFor(() => expect(submitted).toHaveLength(1));
+    expect(submitted[0]).toMatchObject({ formula, trade_date: tradeDate });
+    expect(submitted[0]?.command_id).not.toBe(taskId);
+  });
+});

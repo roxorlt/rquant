@@ -38,6 +38,21 @@ export const poolEditorHandler = () =>
     }),
   );
 
+export const formulaMarketJobsHandler = () =>
+  http.get("*/api/v1/screen/tdx/market/jobs", () =>
+    HttpResponse.json({
+      data: {
+        availability: "not_published",
+        available_at: null,
+        has_older_tasks: false,
+        jobs: [],
+        message: "选股任务尚未发布。",
+        total_task_count: 0,
+      },
+      serving: metaEnvelope().serving,
+    }),
+  );
+
 /** MSW server for component tests; every test starts with ready responses. */
 export const server = setupServer(
   metaHandler(),
@@ -48,4 +63,5 @@ export const server = setupServer(
   logCapabilitiesHandler(),
   paperHandler(),
   poolEditorHandler(),
+  formulaMarketJobsHandler(),
 );

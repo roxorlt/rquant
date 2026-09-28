@@ -61,7 +61,7 @@ test("单股公式预览先检查再判断，来源换代后桌面与手机要�
   await dialog.getByRole("textbox", { name: "股票代码" }).fill("600001.SH");
   await expect(dialog.getByRole("button", { name: "预览这只股票" })).toBeDisabled();
   await dialog.getByRole("button", { name: "检查公式" }).click();
-  await expect(dialog.getByText("公式可以预览这只股票。")).toBeVisible();
+  await expect(dialog.getByText("公式检查通过，可预览或批量运行。")).toBeVisible();
   await dialog.getByRole("button", { name: "预览这只股票" }).click();
   await expect(dialog.getByRole("status")).toContainText("符合");
   expect(await dialog.innerText()).not.toContain(identity);

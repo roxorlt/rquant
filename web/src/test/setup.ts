@@ -31,6 +31,7 @@ afterEach(() => {
   cleanup();
   server.resetHandlers();
   window.localStorage.clear();
+  window.sessionStorage.clear();
   document.documentElement.removeAttribute("data-theme");
 });
 afterAll(() => server.close());
