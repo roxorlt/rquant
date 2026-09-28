@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import errno
 import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -1284,6 +1286,36 @@ def test_page_control_consumer_mutex_rejects_symlink_lock_path(tmp_path: Path) -
         )
 
     assert not (tmp_path / "data" / "canvases" / "breakout.json").exists()
+
+
+def test_managed_directory_walk_uses_path_only_for_traversable_ancestors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    managed = tmp_path / "traverse" / "managed"
+    managed.mkdir(parents=True)
+    original_open = os.open
+    path_only = 1 << 29
+    monkeypatch.setattr(page_control.os, "O_PATH", path_only, raising=False)
+
+    def guarded_open(
+        path: str | bytes | os.PathLike[str],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        if path == "traverse" and not flags & path_only:
+            raise PermissionError(errno.EACCES, "ancestor has execute but no read permission")
+        if path == "managed":
+            assert not flags & path_only
+        return original_open(path, flags & ~path_only, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(page_control.os, "open", guarded_open)
+    binding = page_control._bind_managed_directory(managed, create=False)
+    try:
+        binding.verify()
+    finally:
+        binding.close()
 
 
 def test_page_control_consumer_mutex_fails_closed_when_lock_replaced_before_flock(

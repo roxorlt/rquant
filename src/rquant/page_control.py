@@ -4242,11 +4242,13 @@ def _bind_managed_directory(path: Path, *, create: bool) -> _BoundManagedDirecto
         flags |= os.O_DIRECTORY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
+    # Linux allows safe traversal through execute-only ancestors with O_PATH.
+    ancestor_flags = flags | os.O_PATH if hasattr(os, "O_PATH") else flags
     descriptors: list[int] = []
     component_names: list[str] = []
     try:
-        descriptors.append(os.open(normalized.anchor, flags))
         components = normalized.parts[1:]
+        descriptors.append(os.open(normalized.anchor, ancestor_flags if components else flags))
         for index, component in enumerate(components):
             parent = descriptors[-1]
             try:
@@ -4260,7 +4262,11 @@ def _bind_managed_directory(path: Path, *, create: bool) -> _BoundManagedDirecto
                 raise ValueError(f"managed directory ancestor cannot be a symlink: {normalized}")
             if not stat.S_ISDIR(entry.st_mode):
                 raise ValueError(f"managed directory ancestor is not a directory: {normalized}")
-            descriptor = os.open(component, flags, dir_fd=parent)
+            descriptor = os.open(
+                component,
+                flags if index == len(components) - 1 else ancestor_flags,
+                dir_fd=parent,
+            )
             opened = os.fstat(descriptor)
             if _file_node_tuple(entry) != _file_node_tuple(opened):
                 os.close(descriptor)
