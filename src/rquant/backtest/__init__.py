@@ -22,6 +22,7 @@ from rquant.backtest.contracts import (
     SSECalendar,
     TradeConditions,
 )
+from rquant.backtest.report import BacktestHtmlReport, render_backtest_html
 from rquant.backtest.runner import run_portfolio_backtest
 
 __all__ = [
@@ -29,6 +30,7 @@ __all__ = [
     "BacktestDayResult",
     "BacktestDecision",
     "BacktestInstrument",
+    "BacktestHtmlReport",
     "BacktestOrder",
     "BacktestRequest",
     "BacktestResult",
@@ -43,5 +45,6 @@ __all__ = [
     "TradeConditions",
     "compare_backtest_to_benchmark",
     "load_benchmark_series",
+    "render_backtest_html",
     "run_portfolio_backtest",
 ]
