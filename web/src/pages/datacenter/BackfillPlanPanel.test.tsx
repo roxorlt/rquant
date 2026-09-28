@@ -486,8 +486,9 @@ describe("数据中心回补计划", () => {
     fireEvent.change(within(form).getByLabelText("开始日期"), { target: { value: "2010-01-01" } });
     expect(within(form).getByText("一次最多核对 3660 天。")).toBeInTheDocument();
     expect(within(form).getByRole("button", { name: "核对并生成" })).toBeDisabled();
-    fireEvent.change(within(form).getByLabelText("开始日期"), { target: { value: "2024-09-01" } });
-    fireEvent.change(within(form).getByLabelText("结束日期"), { target: { value: "2026-09-28" } });
+    const future = new Date(Date.now() + 7 * 86_400_000).toISOString().slice(0, 10);
+    fireEvent.change(within(form).getByLabelText("开始日期"), { target: { value: future } });
+    fireEvent.change(within(form).getByLabelText("结束日期"), { target: { value: future } });
     expect(within(form).getByText("结束日期须在收盘之后。")).toBeInTheDocument();
   });
 

@@ -7,12 +7,13 @@ import json
 import time as time_module
 from collections.abc import Callable
 from datetime import UTC, date, datetime
-from typing import Literal, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
 
 import pandas as pd
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from rquant.storage.duckdb import DuckDBStore
+if TYPE_CHECKING:
+    from rquant.storage.duckdb import DuckDBStore
 
 SessionScope = Literal["full_day", "partial", "unknown"]
 CoverageState = Literal["complete", "unverified_empty", "unsupported"]

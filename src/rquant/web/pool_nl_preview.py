@@ -12,7 +12,7 @@ from functools import lru_cache
 
 from pydantic import ValidationError
 
-from rquant.llm.dispatch import build_rules
+from rquant.llm.compile import compile_screen_plan
 from rquant.llm.registry import REGISTRY_BY_NAME
 from rquant.llm.schemas import RuleCall, ScreenPlan, Stage
 from rquant.screen.loader import FUNDAMENTAL_COLS_MAP
@@ -192,7 +192,7 @@ def validate_pool_draft(
     if not calls:
         raise InvalidPoolDraftError
     try:
-        build_rules(
+        compile_screen_plan(
             ScreenPlan(
                 trade_date="1900-01-01",
                 stages=[
