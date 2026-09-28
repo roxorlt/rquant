@@ -19,6 +19,7 @@ const journal: CanvasCreateJournal = {
 const editor: Schemas["PoolEditorData"] = {
   state: "ready",
   canvas_create_available: true,
+  nl_preview_available: false,
   pools: [],
   copy_sources: [],
   canvases: [

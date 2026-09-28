@@ -110,6 +110,97 @@
   color: var(--muted);
   font-size: 13px;
 }
+.pool-sentence-edit {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid var(--rule-strong);
+  border-radius: 10px;
+  background: var(--surface-2);
+}
+.pool-sentence-body {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+.pool-sentence-input {
+  width: 100%;
+  min-width: 0;
+  resize: vertical;
+  line-height: 1.55;
+}
+.pool-sentence-actions,
+.pool-sentence-preview-foot,
+.pool-sentence-applied {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+}
+.pool-sentence-preview {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  background: var(--accent-weak);
+}
+.pool-sentence-preview-head,
+.pool-sentence-preview li {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+.pool-sentence-preview-head {
+  justify-content: space-between;
+  font-size: 13px;
+}
+.pool-sentence-preview-head > span {
+  color: var(--muted);
+  font-size: 12px;
+}
+.pool-sentence-preview ul {
+  display: grid;
+  gap: 8px;
+  padding: 0;
+  margin: 0;
+  list-style: none;
+}
+.pool-sentence-preview li {
+  min-width: 0;
+  font-size: 12px;
+}
+.pool-sentence-kind {
+  flex: none;
+  min-width: 42px;
+  color: var(--accent-t);
+  font-weight: 650;
+}
+.pool-sentence-removed {
+  color: var(--warn-t);
+}
+.pool-sentence-change {
+  display: grid;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.pool-sentence-change small {
+  color: var(--muted);
+  font-size: 12px;
+}
+.pool-sentence-preview-foot {
+  justify-content: space-between;
+  padding-top: 9px;
+  border-top: 1px solid var(--rule);
+  color: var(--ink-2);
+  font-size: 12px;
+}
+.pool-sentence-applied {
+  justify-content: space-between;
+  color: var(--accent-t);
+  font-size: 12px;
+}
 .pool-editor-fields {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -274,6 +365,13 @@
   gap: 8px;
 }
 @media (max-width: 540px) {
+  .pools-toolbar {
+    flex-wrap: wrap;
+  }
+  .pool-sentence-preview-foot .btn,
+  .pool-sentence-actions .btn {
+    width: 100%;
+  }
   .pool-editor-fields {
     grid-template-columns: minmax(0, 1fr);
   }

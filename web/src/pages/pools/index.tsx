@@ -375,7 +375,7 @@ export default function PoolsPage() {
   const autoRetry = useRef({ commandId: "", attempts: 0 });
   const [editorMode, setEditorMode] = useState<
     | { kind: "create"; parentKey: string | null }
-    | { kind: "edit"; pool: EditablePool }
+    | { kind: "edit"; pool: EditablePool; startWithNl?: boolean }
     | { kind: "copy"; source: BuiltinPoolCopySource }
     | null
   >(null);
@@ -831,6 +831,24 @@ export default function PoolsPage() {
                 <span className="pools-info">画布说明</span>
               </Tip>
             ) : null}
+            {shown.length > 0 ? (
+              <Button
+                size="sm"
+                disabledReason={
+                  !editorReady
+                    ? "池子数据正在更新，请稍后再试。"
+                    : selectedKind !== "condition" || !selectedEditable
+                      ? "先在画布上选择自建池的条件节点。"
+                      : undefined
+                }
+                onClick={() => {
+                  if (selectedKind === "condition" && selectedEditable)
+                    setEditorMode({ kind: "edit", pool: selectedEditable, startWithNl: true });
+                }}
+              >
+                用一句话改池子
+              </Button>
+            ) : null}
             <Button
               className="pools-create-canvas-button"
               size="sm"
@@ -1135,6 +1153,8 @@ export default function PoolsPage() {
           generationId={editorReady ? (visibleGeneration ?? null) : null}
           verifiedVersion={verifiedVersion}
           attachmentVersion={attachmentVersion}
+          nlPreviewAvailable={editorQuery.data?.nl_preview_available === true}
+          startWithNl={activeMode.kind === "edit" && activeMode.startWithNl === true}
           session={editorSession}
           snapshot={editorSnapshot}
           publicationStage={stage}

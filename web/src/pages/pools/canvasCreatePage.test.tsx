@@ -50,6 +50,7 @@ function respondEmpty(viewer: string | null = "tester") {
         data: {
           state: "ready",
           canvas_create_available: true,
+          nl_preview_available: false,
           pools: [],
           copy_sources: [],
           canvases: [],
@@ -88,6 +89,7 @@ it("creates a blank canvas from the keyboard, waits for matching publication, th
         data: {
           state: "ready",
           canvas_create_available: true,
+          nl_preview_available: false,
           pools: [],
           copy_sources: [],
           canvases: published ? [{ ...editableCanvas, command_id: sent?.command_id ?? "" }] : [],

@@ -10,6 +10,9 @@ export type EditorCommand =
   | Schemas["AttachPoolCommand"]
   | Schemas["CreateCanvasCommand"];
 export type EditorReceipt = Schemas["PoolEditorReceipt"];
+export type PoolNlPreviewRequest = Schemas["PoolNlPreviewRequest"];
+export type PoolNlPreview = Schemas["PoolNlPreview"];
+export type PoolRuleChange = Schemas["PoolRuleChange"];
 
 export function usePoolEditor(): ServingQueryResult<PoolEditorData> {
   return useServingQuery(["pools", "editor"], async () => {
@@ -36,6 +39,30 @@ export async function submitPoolEditorCommand(body: EditorCommand): Promise<Edit
     throw new ApiError(
       response.status,
       typeof detail === "string" ? detail : "请求状态暂时无法确认。",
+    );
+  }
+  return data;
+}
+
+export async function previewPoolSentenceEdit(
+  body: PoolNlPreviewRequest,
+  signal: AbortSignal,
+): Promise<PoolNlPreview> {
+  const { data, error, response } = await apiClient()
+    .POST("/api/v1/pools/editor/nl-preview", {
+      body,
+      headers: { "X-Rquant-Csrf": "1" },
+      signal,
+    })
+    .catch(() => {
+      throw new ApiError(503, "暂无法生成，请稍后重试。");
+    });
+  if (data === undefined) {
+    const detail =
+      typeof error === "object" && error !== null && "detail" in error ? error.detail : null;
+    throw new ApiError(
+      response.status,
+      typeof detail === "string" ? detail : "暂无法生成，请稍后重试。",
     );
   }
   return data;

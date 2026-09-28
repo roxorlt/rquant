@@ -497,6 +497,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/pools/editor/nl-preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 预览一句话修改池子 */
+        post: operations["preview_pool_natural_language_api_v1_pools_editor_nl_preview_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/pools/formula": {
         parameters: {
             query?: never;
@@ -3396,6 +3413,11 @@ export interface components {
             canvases: components["schemas"]["EditableCanvas"][];
             /** Copy Sources */
             copy_sources: components["schemas"]["BuiltinPoolCopySource"][];
+            /**
+             * Nl Preview Available
+             * @default false
+             */
+            nl_preview_available: boolean;
             /** Pools */
             pools: components["schemas"]["EditablePool"][];
             /**
@@ -3443,6 +3465,32 @@ export interface components {
             /** Pct Chg */
             pct_chg: number | null;
         };
+        /** PoolNlPreview */
+        PoolNlPreview: {
+            /** Base Generation Id */
+            base_generation_id: string;
+            /** Base Version */
+            base_version: string;
+            /** Changes */
+            changes: components["schemas"]["PoolRuleChange"][];
+            /** Message */
+            message?: string | null;
+            /** Pool Key */
+            pool_key: string;
+            /** Rule Calls */
+            rule_calls: components["schemas"]["EditorRuleCall"][];
+        };
+        /** PoolNlPreviewRequest */
+        PoolNlPreviewRequest: {
+            /** Expected Version */
+            expected_version: string;
+            /** Generation Id */
+            generation_id: string;
+            /** Instruction */
+            instruction: string;
+            /** Pool Key */
+            pool_key: string;
+        };
         /** PoolResultView */
         PoolResultView: {
             /** Hit Count */
@@ -3458,6 +3506,18 @@ export interface components {
             trade_date: string | null;
             /** Zero Hit Label */
             zero_hit_label?: string | null;
+        };
+        /** PoolRuleChange */
+        PoolRuleChange: {
+            after?: components["schemas"]["EditorRuleCall"] | null;
+            before?: components["schemas"]["EditorRuleCall"] | null;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "added" | "removed" | "parameter_changed";
+            /** Label */
+            label: string;
         };
         /** PoolRuleItem */
         PoolRuleItem: {
@@ -5315,6 +5375,39 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["PoolEditorReceipt"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    preview_pool_natural_language_api_v1_pools_editor_nl_preview_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PoolNlPreviewRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PoolNlPreview"];
                 };
             };
             /** @description Validation Error */

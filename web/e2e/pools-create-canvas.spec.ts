@@ -51,6 +51,7 @@ for (const viewport of [
         body.data = {
           state: "ready",
           canvas_create_available: true,
+          nl_preview_available: false,
           pools: [],
           copy_sources: [],
           canvases: published

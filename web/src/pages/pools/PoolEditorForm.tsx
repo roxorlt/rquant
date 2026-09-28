@@ -1,6 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { PublishedPool } from "@/api/endpoints";
-import type { BuiltinPoolCopySource, EditableCanvas, EditablePool } from "@/api/poolEditor";
+import type {
+  BuiltinPoolCopySource,
+  EditableCanvas,
+  EditablePool,
+  PoolNlPreview,
+} from "@/api/poolEditor";
 import {
   catalogUsableForGeneration,
   isFundamentalScreenField,
@@ -11,6 +16,7 @@ import {
 import { Button, ParamControl, type ParameterValue, SideDrawer, Tip } from "@/ui";
 import type { PublicationStage } from "./editorPublication";
 import type { EditorSessionSnapshot, PoolEditorSession, SaveInput } from "./editorSession";
+import { PoolSentenceEdit } from "./PoolSentenceEdit";
 
 type RuleDraft = { id: number; key: string; args: Record<string, ParameterValue> };
 type Mode =
@@ -26,6 +32,47 @@ function initialRules(pool: Pick<EditablePool, "rule_calls"> | null): RuleDraft[
       args: rule.args as Record<string, ParameterValue>,
     })) ?? []
   );
+}
+
+function ruleKey(rule: { name: string; args: Record<string, unknown> }): string {
+  return JSON.stringify([
+    rule.name,
+    Object.entries(rule.args).sort(([left], [right]) => left.localeCompare(right)),
+  ]);
+}
+
+function reconcileSuggestion(
+  original: RuleDraft[],
+  candidate: PoolNlPreview["rule_calls"],
+): RuleDraft[] {
+  const available = [...original];
+  const matched = new Map<number, RuleDraft>();
+  let nextId = Math.max(0, ...original.map((rule) => rule.id)) + 1;
+  candidate.forEach((rule, index) => {
+    const match = available.findIndex(
+      (item) => ruleKey({ name: item.key, args: item.args }) === ruleKey(rule),
+    );
+    if (match >= 0) {
+      const [old] = available.splice(match, 1);
+      if (old) matched.set(index, old);
+    }
+  });
+  candidate.forEach((rule, index) => {
+    if (matched.has(index)) return;
+    const match = available.findIndex((item) => item.key === rule.name);
+    if (match >= 0) {
+      const [old] = available.splice(match, 1);
+      if (old) matched.set(index, old);
+    }
+  });
+  return candidate.map((rule, index) => {
+    const old = matched.get(index);
+    return {
+      id: old?.id ?? nextId++,
+      key: rule.name,
+      args: rule.args as Record<string, ParameterValue>,
+    };
+  });
 }
 
 function initialArgs(block: ScreenBlock): Record<string, ParameterValue> {
@@ -150,6 +197,8 @@ export function PoolEditorForm({
   generationId,
   verifiedVersion,
   attachmentVersion,
+  nlPreviewAvailable,
+  startWithNl,
   session,
   snapshot,
   publicationStage,
@@ -163,6 +212,8 @@ export function PoolEditorForm({
   generationId: string | null;
   verifiedVersion: string | null;
   attachmentVersion: string | null;
+  nlPreviewAvailable: boolean;
+  startWithNl: boolean;
   session: PoolEditorSession;
   snapshot: EditorSessionSnapshot;
   publicationStage: PublicationStage;
@@ -194,6 +245,8 @@ export function PoolEditorForm({
   const [chosenBlock, setChosenBlock] = useState("");
   const [rules, setRules] = useState<RuleDraft[]>(() => initialRules(editing ?? copying));
   const [originalRules] = useState<RuleDraft[]>(() => initialRules(editing ?? copying));
+  const [ruleRevision, setRuleRevision] = useState(0);
+  const [metadataRevision, setMetadataRevision] = useState(0);
   const [preview, setPreview] = useState(false);
   const previewGeneration = useRef(generationId);
   const previewRef = useRef<HTMLElement>(null);
@@ -211,6 +264,9 @@ export function PoolEditorForm({
     [catalog.data?.blocks],
   );
   const blockMap = useMemo(() => new Map(blocks.map((block) => [block.key, block])), [blocks]);
+  const rulesChanged =
+    JSON.stringify(rules.map((rule) => ({ name: rule.key, args: rule.args }))) !==
+    JSON.stringify(originalRules.map((rule) => ({ name: rule.key, args: rule.args })));
   const parentPool = publishedPools.find((pool) => pool.key === parent);
   const targetCanvas = canvases.find((item) => item.name === canvas);
   const alreadyAttached = !!editing && !!targetCanvas?.pool_refs.includes(editing.key);
@@ -304,6 +360,15 @@ export function PoolEditorForm({
     ]);
     setChosenBlock("");
     setPreview(false);
+    setRuleRevision((current) => current + 1);
+  };
+  const markRuleEdit = () => {
+    setPreview(false);
+    setRuleRevision((current) => current + 1);
+  };
+  const markMetadataEdit = () => {
+    setPreview(false);
+    setMetadataRevision((current) => current + 1);
   };
   const submit = async () => {
     if (!canSubmit || !preview) return;
@@ -473,6 +538,28 @@ export function PoolEditorForm({
                 ? "选好条件，预览后加入当前画布。"
                 : "从父池筛选，保存后加入所选画布。"}
         </p>
+        {editing ? (
+          <PoolSentenceEdit
+            pool={editing}
+            generationId={generationId}
+            verifiedVersion={verifiedVersion}
+            available={nlPreviewAvailable}
+            busy={snapshot.busy}
+            rulesChanged={rulesChanged}
+            ruleRevision={ruleRevision}
+            metadataRevision={metadataRevision}
+            blocks={blocks}
+            startOpen={startWithNl}
+            onApply={(candidate) => {
+              setRules(reconcileSuggestion(originalRules, candidate));
+              setPreview(false);
+            }}
+            onUndo={() => {
+              setRules(originalRules);
+              setPreview(false);
+            }}
+          />
+        ) : null}
         <div className="pool-editor-fields">
           <label className="field">
             <span className="lbl">池子名称</span>
@@ -482,7 +569,7 @@ export function PoolEditorForm({
               value={name}
               onChange={(event) => {
                 setName(event.target.value);
-                setPreview(false);
+                markMetadataEdit();
               }}
             />
           </label>
@@ -496,7 +583,7 @@ export function PoolEditorForm({
               value={description}
               onChange={(event) => {
                 setDescription(event.target.value);
-                setPreview(false);
+                markMetadataEdit();
               }}
             />
           </label>
@@ -507,7 +594,7 @@ export function PoolEditorForm({
               value={parent}
               onChange={(event) => {
                 setParent(event.target.value);
-                setPreview(false);
+                markMetadataEdit();
               }}
             >
               {editing || copying || firstPoolMode ? <option value="">独立筛选</option> : null}
@@ -532,7 +619,7 @@ export function PoolEditorForm({
               disabled={!parent}
               onChange={(event) => {
                 setDelay(Number(event.target.value));
-                setPreview(false);
+                markMetadataEdit();
               }}
             />
           </label>
@@ -543,7 +630,7 @@ export function PoolEditorForm({
               value={canvas}
               onChange={(event) => {
                 setCanvas(event.target.value);
-                setPreview(false);
+                markMetadataEdit();
               }}
             >
               {!firstPoolMode ? <option value="">仅保存池子</option> : null}
@@ -583,7 +670,7 @@ export function PoolEditorForm({
                     size="sm"
                     onClick={() => {
                       setRules((current) => current.filter((item) => item.id !== rule.id));
-                      setPreview(false);
+                      markRuleEdit();
                     }}
                     aria-label={`移除第 ${index + 1} 条条件`}
                   >
@@ -624,7 +711,7 @@ export function PoolEditorForm({
                                 : item,
                             ),
                           );
-                          setPreview(false);
+                          markRuleEdit();
                         }}
                       />
                     ))}

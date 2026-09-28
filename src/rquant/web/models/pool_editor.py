@@ -68,6 +68,42 @@ class PoolEditorData(BaseModel):
     copy_sources: list[BuiltinPoolCopySource]
     canvases: list[EditableCanvas]
     canvas_create_available: bool
+    nl_preview_available: bool = False
+
+
+class PoolNlPreviewRequest(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    pool_key: str = Field(min_length=1, max_length=100)
+    generation_id: str = Field(min_length=1, max_length=128)
+    expected_version: str = Field(pattern=_SHA256)
+    instruction: str = Field(min_length=1, max_length=500)
+
+    @model_validator(mode="after")
+    def validate_instruction(self) -> PoolNlPreviewRequest:
+        if not self.instruction.strip():
+            raise ValueError("instruction must not be blank")
+        return self
+
+
+class PoolRuleChange(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    kind: Literal["added", "removed", "parameter_changed"]
+    label: str
+    before: EditorRuleCall | None = None
+    after: EditorRuleCall | None = None
+
+
+class PoolNlPreview(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    pool_key: str
+    base_generation_id: str
+    base_version: str
+    rule_calls: list[EditorRuleCall]
+    changes: list[PoolRuleChange]
+    message: str | None = None
 
 
 class _EditorCommand(BaseModel):

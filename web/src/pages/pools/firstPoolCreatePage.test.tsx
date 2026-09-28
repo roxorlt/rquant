@@ -128,6 +128,7 @@ function respondFirstPool(
         data: {
           state: options.editorState ?? "ready",
           canvas_create_available: true,
+          nl_preview_available: false,
           pools: isPublished()
             ? [
                 {

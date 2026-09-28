@@ -144,6 +144,7 @@ const published: Schemas["PoolsData"] = {
 const editor: Schemas["PoolEditorData"] = {
   state: "ready",
   canvas_create_available: true,
+  nl_preview_available: true,
   copy_sources: [],
   pools: [
     {
@@ -399,6 +400,248 @@ it("edits only the verified custom version and does not offer direct builtin edi
   expect(screen.getByRole("button", { name: "复制为自建池" })).toBeDisabled();
 });
 
+it("previews a sentence edit without changing the draft, then applies, corrects, and saves it", async () => {
+  respond();
+  const saves: Schemas["SavePoolCommand"][] = [];
+  server.use(
+    http.post("*/api/v1/pools/editor/nl-preview", async ({ request }) => {
+      expect(request.headers.get("X-Rquant-Csrf")).toBe("1");
+      expect(await request.json()).toEqual({
+        pool_key: "user/自建观察",
+        generation_id: serving.generation_id,
+        expected_version: VERSION,
+        instruction: "把放量倍数调到 3",
+      });
+      return HttpResponse.json({
+        pool_key: "user/自建观察",
+        base_generation_id: serving.generation_id,
+        base_version: VERSION,
+        rule_calls: [{ name: "volume_ratio_gte", args: { n: 3, window: 5 } }],
+        changes: [
+          {
+            kind: "parameter_changed",
+            label: "成交量放大",
+            before: { name: "volume_ratio_gte", args: { n: 2, window: 5 } },
+            after: { name: "volume_ratio_gte", args: { n: 3, window: 5 } },
+          },
+        ],
+        message: null,
+      });
+    }),
+    http.post("*/api/v1/pools/editor/commands", async ({ request }) => {
+      const body = (await request.json()) as Schemas["SavePoolCommand"];
+      saves.push(body);
+      return HttpResponse.json({
+        command_id: body.command_id,
+        status: "succeeded",
+        message: "池子已保存",
+        pool_version: NEXT_VERSION,
+      });
+    }),
+  );
+  const user = userEvent.setup();
+  const { container } = renderApp("/pools");
+  await user.click(await screen.findByRole("button", { name: "查看 自建观察条件" }));
+  await user.click(screen.getByRole("button", { name: "用一句话改池子" }));
+  const dialog = screen.getByRole("dialog", { name: "编辑规则" });
+  const instruction = within(dialog).getByRole("textbox", { name: "修改描述" });
+  expect(instruction).toHaveFocus();
+  await user.type(instruction, "把放量倍数调到 3");
+  await user.click(within(dialog).getByRole("button", { name: "解析并预览" }));
+  const suggestion = await within(dialog).findByRole("region", { name: "建议预览" });
+  expect(suggestion).toHaveTextContent("放量倍数 2 → 3");
+  expect(suggestion).toHaveTextContent("暂无法估算");
+  expect(within(dialog).getByRole("spinbutton", { name: "放量倍数" })).toHaveValue(2);
+  expect(saves).toHaveLength(0);
+  await user.click(within(dialog).getByRole("button", { name: "应用到草稿" }));
+  expect(within(dialog).getByRole("spinbutton", { name: "放量倍数" })).toHaveValue(3);
+  await user.clear(within(dialog).getByRole("spinbutton", { name: "放量倍数" }));
+  await user.type(within(dialog).getByRole("spinbutton", { name: "放量倍数" }), "4");
+  await user.click(within(dialog).getByRole("button", { name: "预览变更" }));
+  await user.click(within(dialog).getByRole("button", { name: "保存规则" }));
+  await waitFor(() => expect(saves).toHaveLength(1));
+  expect(saves[0]).toMatchObject({
+    expected_version: VERSION,
+    rule_calls: [{ name: "volume_ratio_gte", args: { n: 4, window: 5 } }],
+  });
+  expect(findJargon(container.textContent ?? "")).toEqual([]);
+});
+
+it("can undo an applied suggestion without discarding the original rules", async () => {
+  respond();
+  server.use(
+    http.post("*/api/v1/pools/editor/nl-preview", () =>
+      HttpResponse.json({
+        pool_key: "user/自建观察",
+        base_generation_id: serving.generation_id,
+        base_version: VERSION,
+        rule_calls: [
+          { name: "volume_ratio_gte", args: { n: 3, window: 5 } },
+          { name: "not_st", args: {} },
+        ],
+        changes: [
+          {
+            kind: "added",
+            label: "排除 ST",
+            before: null,
+            after: { name: "not_st", args: {} },
+          },
+        ],
+        message: null,
+      }),
+    ),
+  );
+  const user = userEvent.setup();
+  renderApp("/pools");
+  await user.click(await screen.findByRole("button", { name: "查看 自建观察条件" }));
+  await user.click(screen.getByRole("button", { name: "用一句话改池子" }));
+  const dialog = screen.getByRole("dialog", { name: "编辑规则" });
+  await user.type(within(dialog).getByRole("textbox", { name: "修改描述" }), "加上排除 ST");
+  await user.click(within(dialog).getByRole("button", { name: "解析并预览" }));
+  const suggestion = await within(dialog).findByRole("region", { name: "建议预览" });
+  expect(within(suggestion).getAllByText("排除 ST")).toHaveLength(1);
+  await user.click(within(suggestion).getByRole("button", { name: "应用到草稿" }));
+  expect(within(dialog).getAllByText("排除 ST").length).toBeGreaterThan(0);
+  await user.click(within(dialog).getByRole("button", { name: "撤销应用" }));
+  expect(within(dialog).getByRole("spinbutton", { name: "放量倍数" })).toHaveValue(2);
+  expect(within(dialog).queryByRole("button", { name: "撤销应用" })).not.toBeInTheDocument();
+});
+
+it("keeps undo available after editing pool details and preserves those edits", async () => {
+  respond();
+  server.use(
+    http.post("*/api/v1/pools/editor/nl-preview", () =>
+      HttpResponse.json({
+        pool_key: "user/自建观察",
+        base_generation_id: serving.generation_id,
+        base_version: VERSION,
+        rule_calls: [{ name: "volume_ratio_gte", args: { n: 3, window: 5 } }],
+        changes: [
+          {
+            kind: "parameter_changed",
+            label: "成交量放大",
+            before: { name: "volume_ratio_gte", args: { n: 2, window: 5 } },
+            after: { name: "volume_ratio_gte", args: { n: 3, window: 5 } },
+          },
+        ],
+        message: null,
+      }),
+    ),
+  );
+  const user = userEvent.setup();
+  renderApp("/pools");
+  await user.click(await screen.findByRole("button", { name: "查看 自建观察条件" }));
+  await user.click(screen.getByRole("button", { name: "用一句话改池子" }));
+  const dialog = screen.getByRole("dialog", { name: "编辑规则" });
+  await user.type(within(dialog).getByRole("textbox", { name: "修改描述" }), "把放量倍数调到 3");
+  await user.click(within(dialog).getByRole("button", { name: "解析并预览" }));
+  await user.click(await within(dialog).findByRole("button", { name: "应用到草稿" }));
+  await user.type(within(dialog).getByRole("textbox", { name: "简短说明 选填" }), "盘后观察");
+  expect(within(dialog).getByRole("button", { name: "撤销应用" })).toBeEnabled();
+  await user.click(within(dialog).getByRole("button", { name: "撤销应用" }));
+  expect(within(dialog).getByRole("spinbutton", { name: "放量倍数" })).toHaveValue(2);
+  expect(within(dialog).getByRole("textbox", { name: "简短说明 选填" })).toHaveValue("盘后观察");
+});
+
+it("keeps manual rules when sentence preview is unavailable or returns a stale version", async () => {
+  respond({ editor: { ...editor, nl_preview_available: false } });
+  const user = userEvent.setup();
+  const { unmount } = renderApp("/pools");
+  await user.click(await screen.findByRole("button", { name: "查看 自建观察条件" }));
+  await user.click(screen.getByRole("button", { name: "用一句话改池子" }));
+  const unavailableDialog = screen.getByRole("dialog", { name: "编辑规则" });
+  expect(within(unavailableDialog).getByText("暂不能生成，仍可手动编辑")).toBeInTheDocument();
+  expect(within(unavailableDialog).queryByRole("textbox", { name: "修改描述" })).toBeNull();
+  unmount();
+
+  respond();
+  server.use(
+    http.post("*/api/v1/pools/editor/nl-preview", () =>
+      HttpResponse.json({ detail: "规则已更新" }, { status: 409 }),
+    ),
+  );
+  renderApp("/pools");
+  await user.click(await screen.findByRole("button", { name: "查看 自建观察条件" }));
+  await user.click(screen.getByRole("button", { name: "用一句话改池子" }));
+  const staleDialog = screen.getByRole("dialog", { name: "编辑规则" });
+  await user.type(
+    within(staleDialog).getByRole("textbox", { name: "修改描述" }),
+    "把放量倍数调到 3",
+  );
+  await user.click(within(staleDialog).getByRole("button", { name: "解析并预览" }));
+  expect(await within(staleDialog).findByRole("alert")).toHaveTextContent(
+    "规则已更新，请重新打开后再试。",
+  );
+  expect(within(staleDialog).getByRole("spinbutton", { name: "放量倍数" })).toHaveValue(2);
+});
+
+it("does not replace a manually edited rule with an authoritative sentence suggestion", async () => {
+  respond();
+  let previewCalls = 0;
+  server.use(
+    http.post("*/api/v1/pools/editor/nl-preview", () => {
+      previewCalls += 1;
+      return HttpResponse.json({ detail: "unexpected request" }, { status: 500 });
+    }),
+  );
+  const user = userEvent.setup();
+  renderApp("/pools");
+  await user.click(await screen.findByRole("button", { name: "查看 自建观察条件" }));
+  await user.click(screen.getByRole("button", { name: "编辑规则" }));
+  const dialog = screen.getByRole("dialog", { name: "编辑规则" });
+  await user.clear(within(dialog).getByRole("spinbutton", { name: "放量倍数" }));
+  await user.type(within(dialog).getByRole("spinbutton", { name: "放量倍数" }), "4");
+  await user.click(within(dialog).getByRole("button", { name: "用一句话改池子" }));
+  await user.type(within(dialog).getByRole("textbox", { name: "修改描述" }), "把放量倍数调到 3");
+  expect(within(dialog).getByRole("button", { name: "解析并预览" })).toBeDisabled();
+  expect(within(dialog).getByText(/已有未保存的条件修改/)).toBeInTheDocument();
+  expect(within(dialog).getByRole("spinbutton", { name: "放量倍数" })).toHaveValue(4);
+  expect(previewCalls).toBe(0);
+});
+
+it("discards an in-flight suggestion when the description changes", async () => {
+  respond();
+  let release = () => {};
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let requests = 0;
+  server.use(
+    http.post("*/api/v1/pools/editor/nl-preview", async () => {
+      requests += 1;
+      await gate;
+      return HttpResponse.json({
+        pool_key: "user/自建观察",
+        base_generation_id: serving.generation_id,
+        base_version: VERSION,
+        rule_calls: [{ name: "volume_ratio_gte", args: { n: 3, window: 5 } }],
+        changes: [
+          {
+            kind: "parameter_changed",
+            label: "成交量放大",
+            before: { name: "volume_ratio_gte", args: { n: 2, window: 5 } },
+            after: { name: "volume_ratio_gte", args: { n: 3, window: 5 } },
+          },
+        ],
+        message: null,
+      });
+    }),
+  );
+  const user = userEvent.setup();
+  renderApp("/pools");
+  await user.click(await screen.findByRole("button", { name: "查看 自建观察条件" }));
+  await user.click(screen.getByRole("button", { name: "用一句话改池子" }));
+  const dialog = screen.getByRole("dialog", { name: "编辑规则" });
+  const instruction = within(dialog).getByRole("textbox", { name: "修改描述" });
+  await user.type(instruction, "把放量倍数调到 3");
+  await user.click(within(dialog).getByRole("button", { name: "解析并预览" }));
+  await waitFor(() => expect(requests).toBe(1));
+  await user.type(instruction, "，再排除 ST");
+  await act(async () => release());
+  expect(within(dialog).queryByRole("region", { name: "建议预览" })).not.toBeInTheDocument();
+  expect(within(dialog).getByRole("spinbutton", { name: "放量倍数" })).toHaveValue(2);
+});
+
 const copySource: Schemas["BuiltinPoolCopySource"] = {
   key: "n-shape-pool1",
   display_name: "N 形态一池",
@@ -485,6 +728,107 @@ const builtinOneCatalog: Schemas["ScreenBlock"][] = [
     intParam("exclude_offset", "排除前几日"),
   ]),
 ];
+
+it("keeps a historic operand editable when a suggestion reorders duplicate conditions", async () => {
+  const pool = editor.pools[0];
+  if (!pool) throw new Error("missing pool fixture");
+  const historicRule = { name: "gt", args: { left: "HIGH[0]", right: "CLOSE[1]" } };
+  const secondRule = { name: "gt", args: { left: "HIGH[0]", right: "CLOSE[0]" } };
+  const changedSecond = { name: "gt", args: { left: "CLOSE[0]", right: "CLOSE[0]" } };
+  respond({
+    editor: {
+      ...editor,
+      pools: [{ ...pool, rule_calls: [historicRule, secondRule, ...pool.rule_calls] }],
+    },
+  });
+  server.use(
+    http.get("*/api/v1/screen/blocks", () =>
+      HttpResponse.json({
+        data: {
+          ...catalog,
+          blocks: [
+            ...catalog.blocks,
+            ...builtinOneCatalog.filter((item) => item.key !== "not_st" && item.key !== "gt"),
+            block("gt", "大于", [
+              parameter("left", "左侧", "operand", [
+                option("HIGH[0]", "最高价"),
+                option("CLOSE[0]", "收盘价"),
+              ]),
+              parameter("right", "右侧", "operand", [option("CLOSE[0]", "收盘价")]),
+            ]),
+          ],
+        },
+        serving,
+      }),
+    ),
+    http.post("*/api/v1/pools/editor/nl-preview", () =>
+      HttpResponse.json({
+        pool_key: pool.key,
+        base_generation_id: serving.generation_id,
+        base_version: VERSION,
+        rule_calls: [
+          changedSecond,
+          { name: "volume_ratio_gte", args: { n: 3, window: 5 } },
+          historicRule,
+        ],
+        changes: [
+          {
+            kind: "parameter_changed",
+            label: "大于",
+            before: secondRule,
+            after: changedSecond,
+          },
+          {
+            kind: "parameter_changed",
+            label: "成交量放大",
+            before: pool.rule_calls[0],
+            after: { name: "volume_ratio_gte", args: { n: 3, window: 5 } },
+          },
+        ],
+        message: null,
+      }),
+    ),
+  );
+  const saves: Schemas["SavePoolCommand"][] = [];
+  server.use(
+    http.post("*/api/v1/pools/editor/commands", async ({ request }) => {
+      const body = (await request.json()) as Schemas["SavePoolCommand"];
+      saves.push(body);
+      return HttpResponse.json({
+        command_id: body.command_id,
+        status: "succeeded",
+        message: "池子已保存",
+        pool_version: NEXT_VERSION,
+      });
+    }),
+  );
+  const user = userEvent.setup();
+  renderApp("/pools");
+  await user.click(await screen.findByRole("button", { name: "查看 自建观察条件" }));
+  await user.click(screen.getByRole("button", { name: "用一句话改池子" }));
+  const dialog = screen.getByRole("dialog", { name: "编辑规则" });
+  await user.type(within(dialog).getByRole("textbox", { name: "修改描述" }), "把放量倍数改为 3");
+  await user.click(within(dialog).getByRole("button", { name: "解析并预览" }));
+  await user.click(await within(dialog).findByRole("button", { name: "应用到草稿" }));
+  expect(
+    within(dialog)
+      .getAllByRole("combobox", { name: "右侧" })
+      .some(
+        (input) =>
+          input.getAttribute("value") === "CLOSE[1]" ||
+          (input as HTMLSelectElement).value === "CLOSE[1]",
+      ),
+  ).toBe(true);
+  await user.click(within(dialog).getByRole("button", { name: "预览变更" }));
+  expect(within(dialog).getByRole("button", { name: "保存规则" })).toBeEnabled();
+  await user.click(within(dialog).getByRole("button", { name: "保存规则" }));
+  await waitFor(() => expect(saves).toHaveLength(1));
+  expect(saves[0]?.rule_calls).toEqual([
+    changedSecond,
+    { name: "volume_ratio_gte", args: { n: 3, window: 5 } },
+    historicRule,
+  ]);
+});
 
 it("copies every verified builtin-one rule, including the prior close operand", async () => {
   respond({

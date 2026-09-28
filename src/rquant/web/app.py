@@ -40,7 +40,9 @@ from rquant.web.formula_market_command_gateway import (
     FormulaMarketCommandGateway,
     FormulaMarketCommandTransport,
 )
+from rquant.web.nl_parser import OpenAiScreenPlanParser, ScreenPlanParser
 from rquant.web.pool_editor_gateway import PoolCommandGateway, PoolCommandTransport
+from rquant.web.pool_nl_preview import PoolNlRateLimiter
 from rquant.web.routes import (
     backfill_plan_commands,
     backfill_plans,
@@ -82,6 +84,7 @@ API_TITLE = "rQuant Web API"
 API_VERSION = "1"
 _WRITE_BODY_LIMITS = {
     "/api/v1/pools/editor/commands": pool_editor.MAX_REQUEST_BYTES,
+    "/api/v1/pools/editor/nl-preview": pool_editor.MAX_NL_REQUEST_BYTES,
     "/api/v1/monitor/ack": monitor.MAX_ACK_REQUEST_BYTES,
     "/api/v1/data/backfill-plans/commands": backfill_plan_commands.MAX_REQUEST_BYTES,
     "/api/v1/data/audit-report/commands": data_audit_report_commands.MAX_REQUEST_BYTES,
@@ -103,6 +106,9 @@ class WebContext:
     screen_gate: threading.BoundedSemaphore
     screen_service: ScreenApplicationService
     pool_commands: PoolCommandGateway
+    nl_parser: ScreenPlanParser | None
+    nl_gate: threading.BoundedSemaphore
+    nl_rate_limiter: PoolNlRateLimiter
     ack_lookup: AckLookupGateway
     ack_admission: AckAdmissionClient | None
     unit_log_client: UnitLogClient | None
@@ -120,6 +126,7 @@ def create_app(
     clock: Callable[[], datetime] = _utc_now,
     background: bool = True,
     pool_command_transport: PoolCommandTransport | None = None,
+    nl_parser: ScreenPlanParser | None = None,
     ack_lookup_transport: AckLookupTransport | None = None,
     ack_admission_client: AckAdmissionClient | None = None,
     unit_log_client: UnitLogClient | None = None,
@@ -195,6 +202,13 @@ def create_app(
                 web_group_gid=settings.unit_log_web_group_gid,
             )
         )
+    configured_nl_parser = nl_parser
+    if configured_nl_parser is None and settings.nl_openai_api_key is not None:
+        assert settings.nl_openai_model is not None
+        configured_nl_parser = OpenAiScreenPlanParser(
+            api_key=settings.nl_openai_api_key,
+            model=settings.nl_openai_model,
+        )
     app.state.web = WebContext(
         settings=settings,
         tracker=generation_tracker,
@@ -211,6 +225,9 @@ def create_app(
             endpoint=settings.page_control_url,
             transport=pool_command_transport,
         ),
+        nl_parser=configured_nl_parser,
+        nl_gate=threading.BoundedSemaphore(1),
+        nl_rate_limiter=PoolNlRateLimiter(),
         ack_lookup=AckLookupGateway(
             endpoint=settings.page_control_url,
             transport=ack_lookup_transport,
@@ -282,6 +299,8 @@ def create_app(
             )
         if request.url.path == "/api/v1/pools/editor/commands":
             return JSONResponse(status_code=422, content={"detail": "编辑内容有误，请检查后重试。"})
+        if request.url.path == "/api/v1/pools/editor/nl-preview":
+            return JSONResponse(status_code=422, content={"detail": "修改描述有误，请检查后重试。"})
         if request.url.path == "/api/v1/monitor/ack":
             return JSONResponse(status_code=422, content={"detail": "确认请求有误，请刷新后重试。"})
         if request.url.path == "/api/v1/data/backfill-plans/commands":

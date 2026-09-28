@@ -15,7 +15,15 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Self
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    StrictInt,
+    field_validator,
+    model_validator,
+)
 
 from rquant.serving_paths import serving_root_from_env
 
@@ -29,6 +37,8 @@ SCREEN_RSI_ENV_VAR = "RQUANT_WEB_SCREEN_RSI_ROOT"
 FORMULA_MARKET_RESULT_ENV_VAR = "RQUANT_WEB_FORMULA_MARKET_RESULT_ROOT"
 FORMULA_POOL_DAILY_RESULT_ENV_VAR = "RQUANT_WEB_FORMULA_POOL_DAILY_RESULT_ROOT"
 CATALOG_SAMPLES_ENV_VAR = "RQUANT_WEB_CATALOG_SAMPLES_FILE"
+NL_OPENAI_API_KEY_ENV_VAR = "RQUANT_WEB_NL_OPENAI_API_KEY"
+NL_OPENAI_MODEL_ENV_VAR = "RQUANT_WEB_NL_OPENAI_MODEL"
 ACK_ADMISSION_SOCKET_ENV_VAR = "RQUANT_WEB_ACK_ADMISSION_SOCKET"
 INGRESS_SOCKET_ENV_VAR = "RQUANT_WEB_INGRESS_SOCKET"
 LOG_ADMIN_USERS_ENV_VAR = "RQUANT_WEB_LOG_ADMIN_USERS"
@@ -94,6 +104,8 @@ class WebSettings(BaseModel):
     formula_market_result_root: Path | None = None
     formula_pool_daily_result_root: Path | None = None
     catalog_samples_file: Path | None = None
+    nl_openai_api_key: SecretStr | None = None
+    nl_openai_model: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
     ack_admission_socket_path: Path | None = None
     ingress_socket_path: Path | None = None
     log_admin_users: frozenset[str] = frozenset()
@@ -108,6 +120,10 @@ class WebSettings(BaseModel):
 
     @model_validator(mode="after")
     def validate_sources_and_ingress(self) -> Self:
+        if (self.nl_openai_api_key is None) != (self.nl_openai_model is None):
+            raise ValueError("natural-language API key and model must be configured together")
+        if self.nl_openai_api_key is not None and self.ingress_socket_path is None:
+            raise ValueError("natural-language model requires private Web ingress")
         if (self.screen_primary_path is None) != (self.screen_replica_path is None):
             raise ValueError("screen primary and replica paths must be configured together")
         if self.ingress_socket_path is not None and self.bind != DEFAULT_BIND:
@@ -275,6 +291,12 @@ class WebSettings(BaseModel):
         samples = source.get(CATALOG_SAMPLES_ENV_VAR, "").strip()
         if samples:
             values["catalog_samples_file"] = Path(samples)
+        nl_key = source.get(NL_OPENAI_API_KEY_ENV_VAR, "").strip()
+        nl_model = source.get(NL_OPENAI_MODEL_ENV_VAR, "").strip()
+        if nl_key:
+            values["nl_openai_api_key"] = SecretStr(nl_key)
+        if nl_model:
+            values["nl_openai_model"] = nl_model
         admission_socket = source.get(ACK_ADMISSION_SOCKET_ENV_VAR, "").strip()
         if admission_socket:
             values["ack_admission_socket_path"] = Path(admission_socket)

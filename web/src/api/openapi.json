@@ -7770,6 +7770,11 @@
             "title": "Copy Sources",
             "type": "array"
           },
+          "nl_preview_available": {
+            "default": false,
+            "title": "Nl Preview Available",
+            "type": "boolean"
+          },
           "pools": {
             "items": {
               "$ref": "#/components/schemas/EditablePool"
@@ -7970,6 +7975,92 @@
         "title": "PoolMember",
         "type": "object"
       },
+      "PoolNlPreview": {
+        "properties": {
+          "base_generation_id": {
+            "title": "Base Generation Id",
+            "type": "string"
+          },
+          "base_version": {
+            "title": "Base Version",
+            "type": "string"
+          },
+          "changes": {
+            "items": {
+              "$ref": "#/components/schemas/PoolRuleChange"
+            },
+            "title": "Changes",
+            "type": "array"
+          },
+          "message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Message"
+          },
+          "pool_key": {
+            "title": "Pool Key",
+            "type": "string"
+          },
+          "rule_calls": {
+            "items": {
+              "$ref": "#/components/schemas/EditorRuleCall"
+            },
+            "title": "Rule Calls",
+            "type": "array"
+          }
+        },
+        "required": [
+          "pool_key",
+          "base_generation_id",
+          "base_version",
+          "rule_calls",
+          "changes"
+        ],
+        "title": "PoolNlPreview",
+        "type": "object"
+      },
+      "PoolNlPreviewRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "expected_version": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Expected Version",
+            "type": "string"
+          },
+          "generation_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Generation Id",
+            "type": "string"
+          },
+          "instruction": {
+            "maxLength": 500,
+            "minLength": 1,
+            "title": "Instruction",
+            "type": "string"
+          },
+          "pool_key": {
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Pool Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "pool_key",
+          "generation_id",
+          "expected_version",
+          "instruction"
+        ],
+        "title": "PoolNlPreviewRequest",
+        "type": "object"
+      },
       "PoolResultView": {
         "properties": {
           "hit_count": {
@@ -8030,6 +8121,49 @@
           "hit_count"
         ],
         "title": "PoolResultView",
+        "type": "object"
+      },
+      "PoolRuleChange": {
+        "properties": {
+          "after": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EditorRuleCall"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "before": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EditorRuleCall"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "kind": {
+            "enum": [
+              "added",
+              "removed",
+              "parameter_changed"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "label"
+        ],
+        "title": "PoolRuleChange",
         "type": "object"
       },
       "PoolRuleItem": {
@@ -12677,6 +12811,47 @@
           }
         },
         "summary": "保存池子或管理画布",
+        "tags": [
+          "pools"
+        ]
+      }
+    },
+    "/api/v1/pools/editor/nl-preview": {
+      "post": {
+        "operationId": "preview_pool_natural_language_api_v1_pools_editor_nl_preview_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PoolNlPreviewRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PoolNlPreview"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "预览一句话修改池子",
         "tags": [
           "pools"
         ]
