@@ -9,6 +9,7 @@ import stat
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -58,6 +59,52 @@ def test_first_record_is_fsynced_before_return_and_contains_only_closed_fields(
     }
     assert synced == [stat.S_IFREG, stat.S_IFDIR]
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_preflight_reads_current_audit_state_without_creating_or_appending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory = tmp_path / "audit"
+    directory.mkdir(mode=0o700)
+    sink = audit_module.JsonlServiceLogAccessAudit(directory)
+    path = directory / audit_module.AUDIT_FILE_NAME
+    assert sink.preflight() is True
+    assert not path.exists()
+
+    sink.record(_event())
+    original = path.read_bytes()
+    assert sink.preflight() is True
+    assert path.read_bytes() == original
+
+    path.chmod(0o644)
+    assert sink.preflight() is False
+    path.chmod(0o600)
+    path.write_bytes(b"incomplete")
+    assert sink.preflight() is False
+    path.write_bytes(original)
+    monkeypatch.setattr(audit_module, "_MAX_AUDIT_BYTES", len(original))
+    assert sink.preflight() is False
+    assert path.read_bytes() == original
+
+
+def test_preflight_rejects_a_read_only_audit_filesystem(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory = tmp_path / "audit"
+    directory.mkdir(mode=0o700)
+    sink = audit_module.JsonlServiceLogAccessAudit(directory)
+    filesystem = os.statvfs(directory)
+    monkeypatch.setattr(
+        os,
+        "fstatvfs",
+        lambda _descriptor: SimpleNamespace(
+            f_bavail=filesystem.f_bavail,
+            f_frsize=filesystem.f_frsize,
+            f_flag=filesystem.f_flag | os.ST_RDONLY,
+        ),
+    )
+    assert sink.preflight() is False
+    assert not (directory / audit_module.AUDIT_FILE_NAME).exists()
 
 
 def test_parallel_threads_and_processes_append_whole_lines(tmp_path: Path) -> None:
@@ -118,6 +165,7 @@ def test_existing_unsafe_audit_file_fails_closed(tmp_path: Path, bad_file: str) 
         else:
             os.link(path, tmp_path / "other")
     sink = audit_module.JsonlServiceLogAccessAudit(directory)
+    assert sink.preflight() is False
     with pytest.raises((OSError, ValueError)):
         sink.record(_event())
 

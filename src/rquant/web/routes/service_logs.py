@@ -147,7 +147,10 @@ def _runtime_ready(request: Request) -> bool:
     ):
         return False
     try:
-        return web.unit_log_client.preflight() is True
+        return (
+            web.unit_log_access_audit.preflight() is True
+            and web.unit_log_client.preflight() is True
+        )
     except Exception:
         return False
 
