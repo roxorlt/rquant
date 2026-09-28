@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { ApiError } from "@/api/client";
 import { fetchServiceLogPage, type JournalPage, type LogLevel } from "@/api/endpoints";
 import { formatShanghaiDateTime } from "@/format/time";
@@ -13,7 +13,7 @@ export interface SelectedServiceLog {
 }
 
 type Range = "hour" | "day" | "week";
-type LogError = "busy" | "stale" | "unavailable";
+type LogError = "busy" | "stale" | "expired" | "unavailable";
 type DisplayEntry = { at: string; level: string; text: string; key: number };
 const SAFE_TEXTS = new Set<JournalPage["entries"][number]["text"]>([
   "任务已开始",
@@ -34,8 +34,14 @@ const SAFE_LEVELS = new Set<JournalPage["entries"][number]["level"]>([
 const RANGE_MS: Record<Range, number> = {
   hour: 3_600_000,
   day: 86_400_000,
-  week: 7 * 86_400_000 - 60_000,
+  week: 7 * 86_400_000 - 30 * 60_000,
 };
+const MAX_SINCE_AGE_MS = 7 * 86_400_000;
+const EXPIRY_GUARD_MS = 10_000;
+
+function expiresAt(since: string): number {
+  return Date.parse(since) + MAX_SINCE_AGE_MS - EXPIRY_GUARD_MS;
+}
 
 function sinceFor(range: Range): string {
   return new Date(Date.now() - RANGE_MS[range]).toISOString();
@@ -60,6 +66,20 @@ function ServiceLogContent({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<LogError | null>(null);
   const [halted, setHalted] = useState(false);
+
+  const expireRange = useCallback((): void => {
+    setEntries([]);
+    setNextCursor(null);
+    setCursor(null);
+    setLoading(false);
+    setError("expired");
+    setHalted(true);
+  }, []);
+
+  useEffect(() => {
+    const timer = window.setTimeout(expireRange, Math.max(0, expiresAt(filter.since) - Date.now()));
+    return () => window.clearTimeout(timer);
+  }, [filter.since, expireRange]);
 
   useEffect(() => {
     if (halted) return;
@@ -93,13 +113,17 @@ function ServiceLogContent({
           setHalted(true);
           return;
         }
+        if (failure instanceof ApiError && failure.status === 422) {
+          expireRange();
+          return;
+        }
         setError(failure instanceof ApiError && failure.status === 429 ? "busy" : "unavailable");
       })
       .finally(() => {
         if (!controller.signal.aborted) setLoading(false);
       });
     return () => controller.abort();
-  }, [selected.unit, filter, cursor, onRevoked, halted]);
+  }, [selected.unit, filter, cursor, onRevoked, halted, expireRange]);
 
   function changeRange(value: Range): void {
     setEntries([]);
@@ -162,9 +186,11 @@ function ServiceLogContent({
           </select>
         </label>
       </div>
-      {error === "stale" ? (
+      {error === "stale" || error === "expired" ? (
         <div className="tasks-event-message" role="alert">
-          <p>日志已更新，请重新查看。</p>
+          <p>
+            {error === "expired" ? "日志筛选范围已过期，请重新查看。" : "日志已更新，请重新查看。"}
+          </p>
           <Button size="sm" onClick={restart}>
             重新查看
           </Button>
@@ -201,7 +227,12 @@ function ServiceLogContent({
             <EmptyState title="所选范围还没有可显示的日志。" />
           ) : null}
           {nextCursor !== null && !loading && error === null ? (
-            <Button size="sm" onClick={() => setCursor(nextCursor)}>
+            <Button
+              size="sm"
+              onClick={() =>
+                Date.now() >= expiresAt(filter.since) ? expireRange() : setCursor(nextCursor)
+              }
+            >
               加载更早记录
             </Button>
           ) : null}

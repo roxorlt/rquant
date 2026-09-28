@@ -25,6 +25,8 @@ class ServiceLogAccessRecord(RuntimeContractModel):
 class ServiceLogAccessAudit(Protocol):
     """Return only after durably recording the authorized read attempt."""
 
+    def preflight(self) -> bool: ...
+
     def record(self, event: ServiceLogAccessRecord) -> None: ...
 
 
@@ -33,6 +35,7 @@ _MAX_RECORD_BYTES = 512
 _MAX_AUDIT_BYTES = 16 * 1024 * 1024
 _DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _FILE_FLAGS = os.O_RDWR | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+_PREFLIGHT_FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
 
 
 class JsonlServiceLogAccessAudit:
@@ -87,6 +90,39 @@ class JsonlServiceLogAccessAudit:
         ):
             raise ValueError("service log audit file has unsafe identity or mode")
         return identity
+
+    def preflight(self) -> bool:
+        """Check currently verifiable sink safety without creating or changing it."""
+        try:
+            directory_fd = self._open_directory()
+            try:
+                filesystem = os.fstatvfs(directory_fd)
+                if (
+                    filesystem.f_flag & os.ST_RDONLY
+                    or filesystem.f_bavail * filesystem.f_frsize < _MAX_RECORD_BYTES
+                ):
+                    return False
+                try:
+                    file_fd = os.open(
+                        AUDIT_FILE_NAME, _PREFLIGHT_FILE_FLAGS, dir_fd=directory_fd
+                    )
+                except FileNotFoundError:
+                    return True
+                try:
+                    identity = self._validate_file(file_fd, directory_fd)
+                    return (
+                        identity.st_size + _MAX_RECORD_BYTES <= _MAX_AUDIT_BYTES
+                        and (
+                            identity.st_size == 0
+                            or os.pread(file_fd, 1, identity.st_size - 1) == b"\n"
+                        )
+                    )
+                finally:
+                    os.close(file_fd)
+            finally:
+                os.close(directory_fd)
+        except (OSError, ValueError):
+            return False
 
     def record(self, event: ServiceLogAccessRecord) -> None:
         validated = ServiceLogAccessRecord.model_validate(

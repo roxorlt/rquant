@@ -70,6 +70,9 @@ class FakeAudit:
         if self.error is not None:
             raise self.error
 
+    def preflight(self) -> bool:
+        return True
+
 
 def _configured(tmp_path: Path, *, accepted: frozenset[str] = frozenset({UNIT})) -> WebSettings:
     signed, public = _signed(
@@ -153,6 +156,37 @@ def test_capability_only_lists_currently_admitted_exact_units_without_side_effec
             settings=settings.model_copy(update={"unit_log_verified_units": frozenset()}),
         )
         assert client.get(capability_url, headers=ADMIN).json() == {"units": []}
+
+
+def test_capability_rechecks_current_audit_directory_without_side_effects(
+    tmp_path: Path,
+) -> None:
+    fake = FakeClient()
+    settings = _configured(tmp_path)
+    directory = tmp_path / "audit"
+    directory.mkdir(mode=0o700)
+    audit = JsonlServiceLogAccessAudit(directory)
+    app = create_app(
+        settings,
+        clock=lambda: NOW,
+        background=False,
+        unit_log_client=fake,
+        unit_log_access_audit=audit,
+    )
+    capability_url = "/api/v1/tasks/services/log-capabilities"
+    audit_path = directory / AUDIT_FILE_NAME
+    with TestClient(app) as client:
+        assert client.get(capability_url, headers=ADMIN).json() == {"units": [UNIT]}
+        assert not audit_path.exists()
+        directory.chmod(0o755)
+        assert client.get(capability_url, headers=ADMIN).json() == {"units": []}
+        assert (
+            client.get(URL, headers=ADMIN, params={"since": SINCE.isoformat()}).status_code == 503
+        )
+        assert not audit_path.exists()
+        assert fake.calls == []
+        assert app.state.web.unit_log_gate.acquire(blocking=False)
+        app.state.web.unit_log_gate.release()
 
 
 def test_capability_fails_closed_on_missing_client_audit_and_manifest(tmp_path: Path) -> None:
