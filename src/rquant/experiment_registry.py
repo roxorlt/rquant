@@ -754,6 +754,7 @@ class ExperimentRegistryReadonlyReader:
                         )
                     ):
                         raise ValueError("attempt payload does not match indexed evidence")
+                    self._validate_attempt_outcome_index(connection, row, attempt)
                 except (TypeError, ValueError, IndexError) as exc:
                     raise ExperimentRegistryError("experiment attempt evidence is invalid") from exc
                 attempts.append(attempt)
@@ -777,6 +778,63 @@ class ExperimentRegistryReadonlyReader:
             registration_high_water=registration_high_water,
             next_cursor=next_cursor,
         )
+
+    @staticmethod
+    def _validate_attempt_outcome_index(
+        connection: sqlite3.Connection,
+        row: sqlite3.Row,
+        attempt: ExperimentAttempt,
+    ) -> None:
+        indexed = connection.execute(
+            """
+            SELECT o.outcome_json, o.attempted_configuration_count,
+                   o.selected_rank, o.raw_p_value,
+                   a.hypothesis_family AS adjustment_family,
+                   a.adjusted_p_value, a.adjusted_at
+            FROM experiment_outcome AS o
+            LEFT JOIN family_adjustment AS a USING(experiment_id)
+            WHERE o.experiment_id = ?
+            """,
+            (row["experiment_id"],),
+        ).fetchone()
+        outcome = attempt.outcome
+        if (indexed is None) != (outcome is None):
+            raise ValueError("attempt outcome index is incomplete")
+        if indexed is None or outcome is None:
+            return
+        payload = ExperimentOutcome.model_validate_json(indexed["outcome_json"])
+        if (
+            payload.adjusted_p_value is not None
+            or payload.model_copy(update={"adjusted_p_value": outcome.adjusted_p_value}) != outcome
+            or type(indexed["attempted_configuration_count"]) is not int
+            or indexed["attempted_configuration_count"] != payload.attempted_configuration_count
+            or type(indexed["selected_rank"]) is not int
+            or indexed["selected_rank"] != payload.selected_rank
+            or indexed["raw_p_value"] != format(payload.raw_p_value, "f")
+        ):
+            raise ValueError("attempt outcome index does not match payload")
+
+        indexed_adjustment = indexed["adjusted_p_value"]
+        if indexed_adjustment is None:
+            if (
+                indexed["adjustment_family"] is not None
+                or indexed["adjusted_at"] is not None
+                or outcome.adjusted_p_value is not None
+            ):
+                raise ValueError("attempt adjustment index is incomplete")
+            return
+        adjusted_at = _parse_utc(indexed["adjusted_at"])
+        if (
+            indexed["adjustment_family"] != row["hypothesis_family"]
+            or outcome.adjusted_p_value is None
+            or not isinstance(indexed_adjustment, str)
+            or indexed_adjustment != format(outcome.adjusted_p_value, "f")
+            or adjusted_at is None
+            or _utc_iso(adjusted_at) != indexed["adjusted_at"]
+            or attempt.completed_at is None
+            or adjusted_at < attempt.completed_at
+        ):
+            raise ValueError("attempt adjustment index is invalid")
 
     def resolve_formal_plan(
         self,

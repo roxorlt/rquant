@@ -1139,6 +1139,55 @@ def test_readonly_attempt_page_rejects_outcome_bound_to_another_experiment(
         )
 
 
+@pytest.mark.parametrize(
+    ("table", "column", "corrupt_value"),
+    [
+        ("experiment_outcome", "attempted_configuration_count", 2),
+        ("experiment_outcome", "selected_rank", 2),
+        ("experiment_outcome", "raw_p_value", "0.99"),
+        ("family_adjustment", "hypothesis_family", "other-family"),
+        ("family_adjustment", "adjusted_at", "1000-invalid"),
+    ],
+)
+def test_readonly_attempt_page_rejects_denormalized_outcome_or_adjustment_index(
+    tmp_path: Path,
+    table: str,
+    column: str,
+    corrupt_value: str | int,
+) -> None:
+    path = tmp_path / "experiments.sqlite3"
+    registry = ExperimentRegistry(path, managed_trust_root=tmp_path)
+    spec = _spec()
+    _register_family(registry, [spec])
+    _succeed(registry, spec, _outcome(spec, attempted=1, rank=1, raw_p="0.01"))
+    registry.adjust_hypothesis_family(spec.hypothesis_family, adjusted_at=_NOW + timedelta(hours=1))
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            f"UPDATE {table} SET {column} = ? WHERE experiment_id = ?",
+            (corrupt_value, spec.experiment_id),
+        )
+
+    with pytest.raises(ExperimentRegistryError, match="attempt evidence is invalid"):
+        ExperimentRegistryReadonlyReader(path, managed_trust_root=tmp_path).list_attempts_page(
+            as_of=_NOW + timedelta(hours=2)
+        )
+
+
+def test_readonly_attempt_page_preserves_valid_adjusted_outcome(tmp_path: Path) -> None:
+    path = tmp_path / "experiments.sqlite3"
+    registry = ExperimentRegistry(path, managed_trust_root=tmp_path)
+    spec = _spec()
+    _register_family(registry, [spec])
+    _succeed(registry, spec, _outcome(spec, attempted=1, rank=1, raw_p="0.01"))
+    registry.adjust_hypothesis_family(spec.hypothesis_family, adjusted_at=_NOW + timedelta(hours=1))
+
+    page = ExperimentRegistryReadonlyReader(path, managed_trust_root=tmp_path).list_attempts_page(
+        as_of=_NOW + timedelta(hours=2)
+    )
+    assert page.items[0].outcome is not None
+    assert page.items[0].outcome.adjusted_p_value == Decimal("0.01")
+
+
 def test_readonly_attempt_page_does_not_create_or_modify_registry(tmp_path: Path) -> None:
     path = tmp_path / "experiments.sqlite3"
     reader = ExperimentRegistryReadonlyReader(path, managed_trust_root=tmp_path)
