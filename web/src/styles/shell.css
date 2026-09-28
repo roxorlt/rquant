@@ -247,6 +247,24 @@
   flex-wrap: wrap;
   gap: 6px;
 }
+.stock-watchlist {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  padding: 10px 14px;
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  background: var(--surface-2);
+}
+.stock-watchlist-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+}
 .stock-chart-title {
   margin: 0;
   font-size: 14px;

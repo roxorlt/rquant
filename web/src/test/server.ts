@@ -65,6 +65,38 @@ export const formulaPoolsHandler = () =>
     }),
   );
 
+export const manualWatchlistUnavailableHandler = () =>
+  http.get("*/api/v1/watchlist", () =>
+    HttpResponse.json({
+      data: {
+        availability: "unavailable",
+        available_at: null,
+        message: "名单暂不可用，请稍后重试。",
+        items: [],
+      },
+      serving: metaEnvelope().serving,
+    }),
+  );
+
+export const manualWatchlistExactUnavailableHandler = () =>
+  http.get("*/api/v1/watchlist/:code", ({ params }) =>
+    HttpResponse.json({
+      data: {
+        availability: "unavailable",
+        available_at: null,
+        message: "名单暂不可用，请稍后重试。",
+        price_levels: [],
+        source: null,
+        status: null,
+        ts_code: params.code,
+        version: null,
+        expires_at: null,
+        updated_at: null,
+      },
+      serving: metaEnvelope().serving,
+    }),
+  );
+
 /** MSW server for component tests; every test starts with ready responses. */
 export const server = setupServer(
   metaHandler(),
@@ -78,4 +110,6 @@ export const server = setupServer(
   poolEditorHandler(),
   formulaMarketJobsHandler(),
   formulaPoolsHandler(),
+  manualWatchlistUnavailableHandler(),
+  manualWatchlistExactUnavailableHandler(),
 );

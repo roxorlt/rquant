@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import { submitAlertAckCommand } from "@/api/alertAckCommand";
 import { ApiError } from "@/api/client";
 import { type MonitorTimelineItem, useMonitorChannels, useMonitorTimeline } from "@/api/endpoints";
+import { type ManualWatchlistItem, useManualWatchlist } from "@/api/manualWatchlist";
 import { useCurrentMeta } from "@/api/useMeta";
 import { StockDrawer } from "@/app/StockDrawer";
 import { formatCount, formatPrice } from "@/format/number";
@@ -44,6 +45,51 @@ const RECEIPT_KPI_VALUE = {
   has_receipts: "有回执",
   truncated: "仅部分",
 } as const;
+
+const WATCHLIST_SOURCE = {
+  detail: "来自个股详情",
+  screen_result: "来自选股结果",
+  pool_member: "来自池子结果",
+} as const satisfies Record<ManualWatchlistItem["source"], string>;
+
+function ManualWatchlistPanel({ onStock }: { onStock: (code: string) => void }) {
+  const watchlist = useManualWatchlist();
+  return (
+    <Panel title="手动盯盘" label="手动盯盘" sub="手动加入 · 与自动策略分开">
+      {watchlist.state === "loading" ? (
+        <p className="hint" role="status">
+          正在读取名单
+        </p>
+      ) : watchlist.state === "unavailable" ? (
+        <div className="manual-watchlist-unavailable">
+          <p>名单暂不可用，请稍后重试</p>
+          <Button size="sm" onClick={watchlist.retry}>
+            重试
+          </Button>
+        </div>
+      ) : watchlist.items.length === 0 ? (
+        <EmptyState title="暂无手动盯盘股票" hint="从个股详情加入后会显示在这里。" />
+      ) : (
+        <ul className="manual-watchlist" aria-label="手动盯盘名单">
+          {watchlist.items.map((item) => (
+            <li key={item.ts_code}>
+              <button
+                className="manual-watchlist-stock"
+                type="button"
+                onClick={() => onStock(item.ts_code)}
+                aria-label={`查看 ${item.ts_code} 详情`}
+              >
+                {item.ts_code}
+              </button>
+              <span className="hint">{WATCHLIST_SOURCE[item.source]}</span>
+              <Pill kind="ok">已加入</Pill>
+            </li>
+          ))}
+        </ul>
+      )}
+    </Panel>
+  );
+}
 
 function TimelineEntry({
   row,
@@ -397,6 +443,7 @@ export default function MonitorPage() {
         }
       />
       <ChannelStatus data={channelData} loading={channelLoading} retry={channelResult.refetch} />
+      <ManualWatchlistPanel onStock={setSelectedStock} />
       {result.isLoading || (oldGeneration && !result.error) ? (
         <PageSkeleton label="告警时间线加载中" />
       ) : result.error ? (
@@ -413,7 +460,10 @@ export default function MonitorPage() {
       ) : data ? (
         <div className="monitor-content">
           <KpiStrip items={metrics} label="信号与通知概况" compact />
-          <Panel title="告警时间线" sub={`最近 30 天 · 按时间倒序 · 每页最多 ${data.page_size} 条`}>
+          <Panel
+            title="告警时间线"
+            sub={`自动策略与池子 · 最近 30 天 · 每页最多 ${data.page_size} 条`}
+          >
             {data.source_note ? (
               <p className="monitor-notice" role="status">
                 {data.source_note}

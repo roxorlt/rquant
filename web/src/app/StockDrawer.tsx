@@ -1,5 +1,6 @@
 import { useMemo } from "react";
 import { useDaily, useStockSummary } from "@/api/endpoints";
+import { useManualWatchlistExact } from "@/api/manualWatchlist";
 import { PriceChart } from "@/charts/PriceChart";
 import { formatPrice } from "@/format/number";
 import { Button, EmptyState, Pill, SideDrawer, SkeletonRows, Tip } from "@/ui";
@@ -20,6 +21,7 @@ export function StockDrawer({
 }) {
   const summary = useStockSummary(tsCode);
   const daily = useDaily(tsCode);
+  const watchlist = useManualWatchlistExact(tsCode);
   const name = summary.data?.name ?? tsCode ?? "个股";
   const bars = useMemo(
     () =>
@@ -104,6 +106,29 @@ export function StockDrawer({
             </div>
           </div>
         )}
+        <section className="stock-watchlist" aria-label="手动盯盘状态">
+          <div className="stock-watchlist-head">
+            <span className="hint">手动盯盘</span>
+            {watchlist.status === "active" ? (
+              <Pill kind="ok">已加入盯盘</Pill>
+            ) : watchlist.status === "expired" ? (
+              <Pill kind="warn">已到期</Pill>
+            ) : watchlist.status === "deleted" ? (
+              <Pill kind="idle">已移出盯盘</Pill>
+            ) : watchlist.status === "absent" ? (
+              <Pill kind="idle">尚未加入</Pill>
+            ) : (
+              <span className="hint" role="status">
+                {watchlist.status === "loading" ? "正在核对名单" : watchlist.message}
+              </span>
+            )}
+          </div>
+          {watchlist.status === "unavailable" ? (
+            <Button size="sm" variant="ghost" onClick={watchlist.retry}>
+              重试
+            </Button>
+          ) : null}
+        </section>
         <section aria-label="日 K 走势">
           <div className="stock-chart-heading">
             <h3 className="stock-chart-title">日 K</h3>
