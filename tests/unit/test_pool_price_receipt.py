@@ -274,7 +274,7 @@ def test_v11_receipt_upgrades_without_acquiring_price_proof(tmp_path: Path) -> N
         ).fetchone() == ("screen-run-receipt/v1", None)
         assert connection.execute(
             "SELECT version FROM schema_migration ORDER BY version"
-        ).fetchall() == [(version,) for version in range(1, 13)]
+        ).fetchall() == [(migration.version,) for migration in MIGRATIONS]
     with DuckDBStore(path, read_only=True) as store:
         assert store.query_screen_run_receipt(DAY.isoformat(), "pool") == old
 
