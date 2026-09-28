@@ -169,6 +169,7 @@ PAGE_PROJECTION_CONTRACTS: Mapping[str, ServingProjectionContract] = MappingProx
                 ("snapshot_key", "string"),
                 ("account_id", "string"),
                 ("as_of_time", "timestamp"),
+                ("price_tick", "string"),
                 ("total_orders", "int"),
                 ("retained_orders", "int"),
                 ("retained_fills", "int"),

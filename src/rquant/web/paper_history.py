@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from datetime import datetime
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any, Literal
 
 from rquant.paper_broker import PaperHistoryFill
@@ -167,13 +168,23 @@ def read_paper_history(
     ):
         raise ValueError("paper history row budget is inconsistent")
     window = borrowed.cursor.execute(
-        "SELECT snapshot_key, account_id, as_of_time, total_orders, retained_orders, "
+        "SELECT snapshot_key, account_id, as_of_time, price_tick, total_orders, retained_orders, "
         "retained_fills, has_more, newest_updated_at, oldest_updated_at "
         "FROM paper_order_window LIMIT 2"
     ).fetchall()
     if len(window) != 1:
         raise ValueError("paper history window is missing")
-    key, account_id, as_of, total, retained, retained_fills, has_more, newest, oldest = window[0]
+    key, account_id, as_of, tick_text, total, retained, retained_fills, has_more, newest, oldest = (
+        window[0]
+    )
+    if not isinstance(tick_text, str):
+        raise ValueError("paper history price precision is missing")
+    try:
+        price_tick = Decimal(tick_text)
+    except InvalidOperation as exc:
+        raise ValueError("paper history price precision is invalid") from exc
+    if not price_tick.is_finite() or price_tick <= 0:
+        raise ValueError("paper history price precision is invalid")
     order_rows = _model_rows(
         borrowed,
         "paper_order_history",
@@ -233,9 +244,21 @@ def read_paper_history(
         fills_by_order[fill.order_id].append(fill)
     for order in orders:
         parts = fills_by_order[order.order_id]
+        quantity = sum(fill.quantity for fill in parts)
+        try:
+            average = (
+                (
+                    sum((fill.price * fill.quantity for fill in parts), Decimal("0")) / quantity
+                ).quantize(price_tick, rounding=ROUND_HALF_UP)
+                if quantity
+                else None
+            )
+        except InvalidOperation as exc:
+            raise ValueError("paper history fill price precision is invalid") from exc
         if (
             [fill.sequence for fill in parts] != list(range(1, len(parts) + 1))
-            or sum(fill.quantity for fill in parts) != order.filled_quantity
+            or quantity != order.filled_quantity
+            or average != order.average_fill_price
             or any(fill.persisted_at > order.updated_at for fill in parts)
         ):
             raise ValueError("paper history fill summary is inconsistent")

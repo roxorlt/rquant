@@ -35,6 +35,7 @@ def test_empty_window_still_publishes_one_window_row(tmp_path: Path) -> None:
     assert window.rows[0]["retained_orders"] == 0
     assert window.rows[0]["retained_fills"] == 0
     assert window.rows[0]["has_more"] is False
+    assert window.rows[0]["price_tick"] == "0.0001"
 
 
 def test_history_projection_keeps_exact_money_and_all_order_evidence(tmp_path: Path) -> None:
