@@ -111,6 +111,7 @@ from rquant.pool_definition_projection import PoolMutation, build_pool_definitio
 from rquant.pool_member_return import calculate_adjusted_pool_return
 from rquant.pool_membership import PoolDayEvidence, PoolMemberClose, compute_pool_membership
 from rquant.pool_result_receipt import ScreenRunReceipt, member_price_digest, member_set_digest
+from rquant.price_alert_rule_store import _SCHEMA_COLUMNS, PriceAlertRuleRepository
 from rquant.readside_replica_gate import (
     UNLIMITED_READ_PROFILE,
     ReplicaRead,
@@ -142,6 +143,15 @@ from rquant.serving_manual_watchlist_projection import (
     ManualWatchlistProjectionRow,
     build_manual_watchlist_projections,
     validate_manual_watchlist_projections,
+)
+from rquant.serving_price_alert_rule_projection import (
+    MAX_PRICE_ALERT_RULE_ROWS as _MAX_PRICE_ALERT_RULE_ROWS,
+)
+from rquant.serving_price_alert_rule_projection import (
+    PriceAlertRuleAuthoritySnapshot,
+    PriceAlertRuleProjectionRow,
+    build_price_alert_rule_projections,
+    validate_price_alert_rule_projections,
 )
 from rquant.serving_read_models import ProjectionScalar, ServingProjectionPayload
 from rquant.storage.duckdb import DuckDBStore
@@ -926,13 +936,14 @@ class _ReadonlyPageControlAuditReader:
         self.path = Path(os.path.abspath(path))
         self._snapshot_connection: sqlite3.Connection | None = None
         self._reject_sidecars = reject_sidecars
+        self._price_rule_read = False
         self._require_no_sidecars()
         validated = self._validate_schema()
         self._require_no_sidecars()
         self._validated_node_identity = (validated.st_dev, validated.st_ino)
 
     def _require_no_sidecars(self) -> None:
-        if not self._reject_sidecars:
+        if not (self._reject_sidecars or self._price_rule_read):
             return
         for suffix in ("-wal", "-shm"):
             try:
@@ -944,7 +955,7 @@ class _ReadonlyPageControlAuditReader:
                     "PageControl audit sidecar cannot be checked"
                 ) from exc
             raise PageProjectionSourceIntegrityError(
-                "PageControl audit sidecar is not allowed for formula pools"
+                "PageControl audit sidecar is not allowed for verified projections"
             )
 
     def _connect(self, path: Path | str | None = None) -> sqlite3.Connection:
@@ -1341,6 +1352,69 @@ class _ReadonlyPageControlAuditReader:
         except (TypeError, ValueError) as exc:
             raise PageProjectionSourceIntegrityError(
                 "PageControl manual watchlist snapshot is invalid"
+            ) from exc
+
+    def price_alert_rule_snapshot(self) -> PriceAlertRuleAuthoritySnapshot | None:
+        """Read all current heads in the same pinned transaction as the watchlist."""
+        if self._snapshot_connection is None:
+            raise RuntimeError("PageControl price rules require an active audit snapshot")
+        self._price_rule_read = True
+        self._require_no_sidecars()
+        try:
+            with self._read_connection() as connection:
+                marker = connection.execute(
+                    "SELECT protocol_version, activated_at FROM page_control_protocol_activation "
+                    "WHERE marker_name = ?",
+                    ("price-alert-rule/v1",),
+                ).fetchone()
+                table = connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'price_alert_rule'"
+                ).fetchone()
+                if marker is None and table is None:
+                    return None
+                if marker is None or table is None or marker["protocol_version"] != 1:
+                    raise PageProjectionSourceIntegrityError(
+                        "PageControl price rule activation and table are inconsistent"
+                    )
+                actual = tuple(
+                    (row[1], row[2], row[3], row[5])
+                    for row in connection.execute("PRAGMA table_info(price_alert_rule)")
+                )
+                if actual != _SCHEMA_COLUMNS:
+                    raise PageProjectionSourceIntegrityError(
+                        "PageControl price rule schema is invalid"
+                    )
+                rows = connection.execute(
+                    "SELECT owner_id, rule_id, version, deleted, ts_code, "
+                    "membership_version, rule_json, updated_at_utc FROM price_alert_rule "
+                    "ORDER BY owner_id, rule_id LIMIT ?",
+                    (_MAX_PRICE_ALERT_RULE_ROWS + 1,),
+                ).fetchall()
+            self._require_no_sidecars()
+            if len(rows) > _MAX_PRICE_ALERT_RULE_ROWS:
+                raise PageProjectionSourceIntegrityError(
+                    "PageControl price rules exceed their bounded snapshot"
+                )
+            activated = marker["activated_at"]
+            if not isinstance(activated, str):
+                raise ValueError("price rule activation time is invalid")
+            activated_at = normalize_aware_utc(datetime.fromisoformat(activated))
+            if activated_at.isoformat(timespec="microseconds") != activated:
+                raise ValueError("price rule activation time is not canonical")
+            return PriceAlertRuleAuthoritySnapshot.create(
+                activated_at=activated_at,
+                rows=(
+                    PriceAlertRuleProjectionRow.from_entry(PriceAlertRuleRepository._entry(row))
+                    for row in rows
+                ),
+            )
+        except sqlite3.Error as exc:
+            raise PageProjectionSourceIntegrityError(
+                "PageControl price rule authority cannot be read"
+            ) from exc
+        except (TypeError, ValueError) as exc:
+            raise PageProjectionSourceIntegrityError(
+                "PageControl price rule snapshot is invalid"
             ) from exc
 
     def audit(self, command_id: str) -> _ReadonlyPageControlAudit | None:
@@ -2635,6 +2709,19 @@ class DuckDBSignalPageProjectionSource:
             manual_watchlist_projections = build_manual_watchlist_projections(
                 None, observed_at=observed
             )
+        try:
+            price_alert_rule_projections = build_price_alert_rule_projections(
+                None
+                if self.page_control_outbox is None
+                else self.page_control_outbox.price_alert_rule_snapshot(),
+                observed_at=observed,
+                unavailable=self.page_control_outbox is None,
+            )
+        except (OSError, sqlite3.Error, PageProjectionSourceIntegrityError, ValueError) as exc:
+            logger.warning("价格提醒规则来源暂不可用：{}", exc)
+            price_alert_rule_projections = build_price_alert_rule_projections(
+                None, observed_at=observed, unavailable=True
+            )
         formula_pool_projections: tuple[ServingProjectionPayload, ...] = ()
         if self.formula_pool_config is not None:
             try:
@@ -2683,6 +2770,10 @@ class DuckDBSignalPageProjectionSource:
             manual_watchlist_state=manual_watchlist_projections[0],
             manual_watchlist=(
                 manual_watchlist_projections[1] if len(manual_watchlist_projections) > 1 else None
+            ),
+            price_alert_rule_state=price_alert_rule_projections[0],
+            price_alert_rule=(
+                price_alert_rule_projections[1] if len(price_alert_rule_projections) > 1 else None
             ),
         )
 
@@ -4019,6 +4110,8 @@ class SignalPageProjectionProducer:
                     "alert_ack",
                     "manual_watchlist_state",
                     "manual_watchlist",
+                    "price_alert_rule_state",
+                    "price_alert_rule",
                 }
             )
             try:
@@ -4036,6 +4129,9 @@ class SignalPageProjectionProducer:
             )
             page_projections += build_ack_source_projections(None, observed_at=observed)
             page_projections += build_manual_watchlist_projections(None, observed_at=observed)
+            page_projections += build_price_alert_rule_projections(
+                None, observed_at=observed, unavailable=True
+            )
             page_available_at = max(item.available_at for item in page_projections)
             page_generation_id = canonical_sha256(
                 {"source": "signal-page-projections-partial", "projections": page_projections}
@@ -4968,6 +5064,8 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
             "alert_ack",
             "manual_watchlist_state",
             "manual_watchlist",
+            "price_alert_rule_state",
+            "price_alert_rule",
             "legacy_notification",
             "legacy_notification_status",
         }
@@ -4978,6 +5076,7 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
             raise ValueError("signal page projection snapshot is incomplete")
         validate_formula_pool_projections({item.table_name: item for item in self.projections})
         validate_manual_watchlist_projections({item.table_name: item for item in self.projections})
+        validate_price_alert_rule_projections({item.table_name: item for item in self.projections})
         expected = canonical_sha256(self.model_dump(mode="python", exclude={"content_sha256"}))
         if self.content_sha256 != expected:
             raise ValueError("signal page projection snapshot hash mismatch")
@@ -5010,6 +5109,8 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
         alert_ack: ServingProjectionPayload | None = None,
         manual_watchlist_state: ServingProjectionPayload | None = None,
         manual_watchlist: ServingProjectionPayload | None = None,
+        price_alert_rule_state: ServingProjectionPayload | None = None,
+        price_alert_rule: ServingProjectionPayload | None = None,
         legacy_notification: ServingProjectionPayload | None = None,
         legacy_notification_status: ServingProjectionPayload | None = None,
     ) -> SignalPageProjectionSnapshot:
@@ -5078,6 +5179,8 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
             ("alert_ack", alert_ack),
             ("manual_watchlist_state", manual_watchlist_state),
             ("manual_watchlist", manual_watchlist),
+            ("price_alert_rule_state", price_alert_rule_state),
+            ("price_alert_rule", price_alert_rule),
             ("legacy_notification", legacy_notification),
             ("legacy_notification_status", legacy_notification_status),
         ):

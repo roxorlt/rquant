@@ -508,6 +508,43 @@ PAGE_PROJECTION_CONTRACTS: Mapping[str, ServingProjectionContract] = MappingProx
             max_bytes=2 * 1024 * 1024,
             event_time_columns=("updated_at",),
         ),
+        "price_alert_rule_state": _contract(
+            "signals",
+            (
+                ("snapshot_key", "string"),
+                ("state", "string"),
+                ("activated_at", "timestamp"),
+                ("row_count", "int"),
+                ("rows_sha256", "string"),
+            ),
+            ("snapshot_key",),
+            max_rows=1,
+            max_bytes=4096,
+            event_time_columns=("activated_at",),
+        ),
+        "price_alert_rule": _contract(
+            "signals",
+            (
+                ("owner_id", "string"),
+                ("rule_id", "string"),
+                ("version", "int"),
+                ("deleted", "bool"),
+                ("ts_code", "string"),
+                ("membership_version", "int"),
+                ("name", "string"),
+                ("priority", "string"),
+                ("enabled", "bool"),
+                ("comparison", "string"),
+                ("threshold", "string"),
+                ("valid_from", "string"),
+                ("valid_until", "string"),
+                ("updated_at", "timestamp"),
+            ),
+            ("owner_id", "rule_id"),
+            max_rows=10_000,
+            max_bytes=2 * 1024 * 1024,
+            event_time_columns=("updated_at",),
+        ),
         "signal_observed_prefix": _contract(
             "signals",
             (
@@ -1719,6 +1756,18 @@ class ServingReadModelInput(RuntimeContractModel):
             from rquant.formula_pool_serving_projection import validate_formula_pool_projections
 
             validate_formula_pool_projections(
+                {projection.table_name: projection for projection in self.projections}
+            )
+
+        if any(
+            projection.table_name in {"price_alert_rule_state", "price_alert_rule"}
+            for projection in self.projections
+        ):
+            from rquant.serving_price_alert_rule_projection import (
+                validate_price_alert_rule_projections,
+            )
+
+            validate_price_alert_rule_projections(
                 {projection.table_name: projection for projection in self.projections}
             )
 

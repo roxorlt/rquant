@@ -54,6 +54,7 @@ if TYPE_CHECKING:
     from rquant.serving_read_models import ServingSignalRecord
 
 from rquant.serving_manual_watchlist_projection import validate_manual_watchlist_projections
+from rquant.serving_price_alert_rule_projection import validate_price_alert_rule_projections
 from rquant.serving_read_models import ServingProjectionPayload
 
 _REQUIRED_NOTIFICATION_PROJECTION_TABLES = frozenset(
@@ -82,6 +83,8 @@ _OPTIONAL_NOTIFICATION_PROJECTION_TABLES = frozenset(
         "alert_ack",
         "manual_watchlist_state",
         "manual_watchlist",
+        "price_alert_rule_state",
+        "price_alert_rule",
         "legacy_notification",
         "legacy_notification_status",
         "pool_definition",
@@ -350,6 +353,9 @@ class NotificationProjectionAuthoritySnapshot(RuntimeContractModel):
                 "required by the core contract and only registered optional projections"
             )
         validate_manual_watchlist_projections(
+            {projection.table_name: projection for projection in self.projections}
+        )
+        validate_price_alert_rule_projections(
             {projection.table_name: projection for projection in self.projections}
         )
         if self.available_at > self.observed_at:
