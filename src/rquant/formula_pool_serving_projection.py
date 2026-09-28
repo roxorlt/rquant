@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Literal
@@ -50,6 +51,7 @@ FORMULA_POOL_PROJECTION_TABLES = frozenset(
 MAX_FORMULA_POOL_DEFINITIONS = 512
 _MAX_DAILY_DAYS = 4096
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
 
 class FormulaPoolServingConfig(RuntimeContractModel):
@@ -75,6 +77,80 @@ class FormulaPoolServingConfig(RuntimeContractModel):
         if any(_canonical_path(path) != path for path in paths) or len(set(paths)) != len(paths):
             raise ValueError("formula pool Serving paths must be distinct and canonical")
         return self
+
+
+@dataclass(frozen=True, slots=True)
+class FormulaPoolSourceWatch:
+    """Cheap invalidation keys for one already-verified formula-pool projection group."""
+
+    paths: tuple[Path, ...]
+
+    @staticmethod
+    def _base_paths(config: FormulaPoolServingConfig, audit_path: Path) -> set[Path]:
+        paths = {
+            config.definition_root,
+            config.daily_root,
+            config.rule_root,
+            config.task_state_path,
+            config.artifact_root,
+            audit_path,
+        }
+        for database in (config.task_state_path, audit_path):
+            paths.update(Path(f"{database}{suffix}") for suffix in ("-wal", "-shm", "-journal"))
+        return paths
+
+    @classmethod
+    def catalog_identity(
+        cls, config: FormulaPoolServingConfig, audit_path: Path
+    ) -> tuple[tuple[Path, tuple[int, ...] | None], ...]:
+        """Bind roots and existing children around a full read, including each daily subdir."""
+        paths = cls._base_paths(config, audit_path)
+        paths.update(
+            config.definition_root / name
+            for name in _list_private(config.definition_root, limit=MAX_FORMULA_POOL_DEFINITIONS)
+        )
+        paths.update(
+            config.daily_root / name
+            for name in _list_private(config.daily_root, limit=MAX_FORMULA_POOL_DEFINITIONS)
+        )
+        watch = cls(paths=tuple(sorted(paths)))
+        return tuple(zip(watch.paths, watch.identity(), strict=True))
+
+    @classmethod
+    def from_projections(
+        cls,
+        config: FormulaPoolServingConfig,
+        audit_path: Path,
+        projections: tuple[ServingProjectionPayload, ...],
+    ) -> FormulaPoolSourceWatch:
+        by_name = {item.table_name: item for item in projections}
+        validate_formula_pool_projections(by_name)
+        paths = cls._base_paths(config, audit_path)
+        for item in by_name["formula_pool_definition"].rows:
+            row = FormulaPoolDefinitionRow.model_validate(dict(item))
+            base_name = row.pool_name.removeprefix("user/")
+            paths.add(config.definition_root / f"{base_name}.json")
+            paths.add(config.daily_root / base_name)
+            paths.add(
+                config.artifact_root
+                / f"formula-market-v1-{row.creation_task_id}-{row.creation_result_sha256}.json"
+            )
+        for item in by_name["formula_pool_latest_result"].rows:
+            row = FormulaPoolLatestResultRow.model_validate(dict(item))
+            paths.add(config.daily_root / row.relative_path)
+            paths.add(
+                config.artifact_root / f"formula-market-v1-{row.task_id}-{row.result_sha256}.json"
+            )
+        return cls(paths=tuple(sorted(paths)))
+
+    def identity(self) -> tuple[tuple[int, ...] | None, ...]:
+        result: list[tuple[int, ...] | None] = []
+        for path in self.paths:
+            try:
+                result.append(_file_identity(path.lstat()))
+            except FileNotFoundError:
+                result.append(None)
+        return tuple(result)
 
 
 class FormulaPoolStateRow(RuntimeContractModel):
@@ -389,10 +465,17 @@ def read_formula_pool_projections(
         if recent is not None:
             _verify_daily(definition, recent, tasks[recent.task_id], config)
             latest_rows.append(_index(recent))
+    available_at = max(
+        (
+            *(item.created_at for item in definitions.values()),
+            *(item.receipt.updated_at for item in tasks.values()),
+        ),
+        default=_EPOCH,
+    )
     projections = (
         ServingProjectionPayload(
             table_name="formula_pool_state",
-            available_at=observed,
+            available_at=available_at,
             rows=(
                 FormulaPoolStateRow(
                     availability="ready" if definitions else "empty",
@@ -403,12 +486,12 @@ def read_formula_pool_projections(
         ),
         ServingProjectionPayload(
             table_name="formula_pool_definition",
-            available_at=observed,
+            available_at=available_at,
             rows=tuple(row.model_dump(mode="json") for row in definition_rows),
         ),
         ServingProjectionPayload(
             table_name="formula_pool_latest_result",
-            available_at=observed,
+            available_at=available_at,
             rows=tuple(row.model_dump(mode="json") for row in latest_rows),
         ),
     )

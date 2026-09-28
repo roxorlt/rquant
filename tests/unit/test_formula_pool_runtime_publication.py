@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import sqlite3
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -10,6 +12,7 @@ import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
+import rquant.serving_page_projection_source as source_module
 from rquant.formula_pool_serving_projection import (
     FORMULA_POOL_PROJECTION_TABLES,
     FormulaPoolServingConfig,
@@ -349,3 +352,181 @@ def test_wrong_page_control_audit_does_not_advance_configured_authority(
     assert _read_authority(authority, observed + timedelta(seconds=1)).generation_id == (
         old.generation_id
     )
+
+
+def test_unchanged_pool_does_not_republish_or_rescan_every_notifier_tick(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    service, admission, _definitions, _version, data_dir = _saved(source)
+    config = _config(admission, data_dir)
+    observed = datetime.now(UTC) + timedelta(minutes=2)
+    clock = [observed]
+    scanned: list[datetime] = []
+    original = source_module.read_formula_pool_projections
+
+    def counted(*args: object, **kwargs: object) -> object:
+        scanned.append(clock[0])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(source_module, "read_formula_pool_projections", counted)
+    step, authority = _notifier_step(
+        tmp_path,
+        observed=observed,
+        config=config,
+        audit_path=service.outbox.path,
+        clock=lambda: clock[0],
+    )
+
+    first = step()
+    initial = _read_authority(authority, clock[0]).generation_id
+    clock[0] += timedelta(seconds=2)
+    second = step()
+
+    assert first.projection_published is True
+    assert second.projection_published is False
+    assert _read_authority(authority, clock[0]).generation_id == initial
+    assert scanned == [observed]
+
+
+def test_new_daily_file_in_existing_pool_directory_invalidates_cache(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    service, admission, definitions, version, data_dir = _saved(source)
+    config = _config(admission, data_dir)
+    _runner(admission, definitions, data_dir).run_one("research", version, DAY)
+    observed = datetime.now(UTC) + timedelta(minutes=2)
+    clock = [observed]
+    step, authority = _notifier_step(
+        tmp_path,
+        observed=observed,
+        config=config,
+        audit_path=service.outbox.path,
+        clock=lambda: clock[0],
+    )
+    step()
+    old = _read_authority(authority, clock[0])
+    root_mtime = config.daily_root.stat().st_mtime_ns
+    _publish_market_day(config.universe_root, DAY2)
+    _publish_history_day2(config.projection_root)
+    latest = _runner(admission, definitions, data_dir).run_one("research", version, DAY2)
+    assert config.daily_root.stat().st_mtime_ns == root_mtime
+
+    clock[0] += timedelta(seconds=2)
+    result = step()
+    new = _read_authority(authority, clock[0])
+    assert result.projection_published is True
+    assert new.generation_id != old.generation_id
+    rows = {item.table_name: item for item in new.payload.projections}
+    assert rows["formula_pool_latest_result"].rows[0]["result_sha256"] == (latest.result_sha256)
+
+
+def test_task_sqlite_wal_change_invalidates_cache_and_refuses_bad_task(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    service, admission, definitions, version, data_dir = _saved(source)
+    config = _config(admission, data_dir)
+    definition = definitions.read("research", expected_version=version)
+    observed = datetime.now(UTC) + timedelta(minutes=2)
+    clock = [observed]
+    step, authority = _notifier_step(
+        tmp_path,
+        observed=observed,
+        config=config,
+        audit_path=service.outbox.path,
+        clock=lambda: clock[0],
+    )
+    with sqlite3.connect(config.task_state_path) as connection:
+        assert connection.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+        connection.execute("PRAGMA wal_autocheckpoint=0")
+        step()
+        old = _read_authority(authority, clock[0]).generation_id
+        main_before = config.task_state_path.stat()
+        connection.execute(
+            "UPDATE formula_market_job SET status='failed' WHERE task_id=?",
+            (definition.creation.task_id,),
+        )
+        connection.commit()
+        assert (main_before.st_size, main_before.st_mtime_ns) == (
+            config.task_state_path.stat().st_size,
+            config.task_state_path.stat().st_mtime_ns,
+        )
+        assert Path(f"{config.task_state_path}-wal").stat().st_size > 0
+
+        clock[0] += timedelta(seconds=2)
+        with pytest.raises(PageProjectionSourceIntegrityError, match="formula pool authority"):
+            step()
+        assert _read_authority(authority, clock[0]).generation_id == old
+
+
+@pytest.mark.parametrize("target", ("definition", "daily"))
+def test_in_place_pool_file_corruption_invalidates_cache_and_keeps_old_authority(
+    tmp_path: Path, target: str
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    service, admission, definitions, version, data_dir = _saved(source)
+    config = _config(admission, data_dir)
+    _runner(admission, definitions, data_dir).run_one("research", version, DAY)
+    observed = datetime.now(UTC) + timedelta(minutes=2)
+    clock = [observed]
+    step, authority = _notifier_step(
+        tmp_path,
+        observed=observed,
+        config=config,
+        audit_path=service.outbox.path,
+        clock=lambda: clock[0],
+    )
+    step()
+    old = _read_authority(authority, clock[0]).generation_id
+    file = (
+        config.definition_root / "research.json"
+        if target == "definition"
+        else config.daily_root / "research" / f"{DAY.isoformat()}.json"
+    )
+    before = file.stat()
+    payload = file.read_bytes()
+    file.write_bytes(b"!" + payload[1:])
+    os.utime(file, ns=(before.st_atime_ns, before.st_mtime_ns))
+    after = file.stat()
+    assert (after.st_size, after.st_mtime_ns) == (before.st_size, before.st_mtime_ns)
+    assert after.st_ctime_ns != before.st_ctime_ns
+
+    clock[0] += timedelta(seconds=2)
+    with pytest.raises(PageProjectionSourceIntegrityError, match="formula pool authority"):
+        step()
+    assert _read_authority(authority, clock[0]).generation_id == old
+
+
+@pytest.mark.parametrize("new_entry", ("definition", "daily"))
+def test_new_catalog_entry_during_first_full_read_refuses_cache_binding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, new_entry: str
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    service, admission, definitions, version, data_dir = _saved(source)
+    config = _config(admission, data_dir)
+    _runner(admission, definitions, data_dir).run_one("research", version, DAY)
+    observed = datetime.now(UTC) + timedelta(minutes=2)
+    original = source_module.read_formula_pool_projections
+
+    def changed_after_read(*args: object, **kwargs: object) -> object:
+        rows = original(*args, **kwargs)
+        path = (
+            config.definition_root / "late.json"
+            if new_entry == "definition"
+            else config.daily_root / "research" / f"{DAY2.isoformat()}.json"
+        )
+        path.write_bytes(b"{}")
+        path.chmod(0o600)
+        return rows
+
+    monkeypatch.setattr(source_module, "read_formula_pool_projections", changed_after_read)
+    step, authority = _notifier_step(
+        tmp_path, observed=observed, config=config, audit_path=service.outbox.path
+    )
+
+    with pytest.raises(PageProjectionSourceIntegrityError, match="changed while binding"):
+        step()
+    assert not (authority / "current.json").exists()

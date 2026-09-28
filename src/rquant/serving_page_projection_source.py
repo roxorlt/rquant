@@ -89,6 +89,7 @@ from rquant.formula_market_job_projection import (
 )
 from rquant.formula_pool_serving_projection import (
     FormulaPoolServingConfig,
+    FormulaPoolSourceWatch,
     read_formula_pool_projections,
     validate_formula_pool_projections,
 )
@@ -2290,6 +2291,9 @@ class DuckDBSignalPageProjectionSource:
             raise PageProjectionSourceIntegrityError(
                 "configured formula pools require readonly PageControl audit authority"
             )
+        self._formula_pool_watch: FormulaPoolSourceWatch | None = None
+        self._formula_pool_identity: tuple[tuple[int, ...] | None, ...] | None = None
+        self._cached_formula_pool_projections: tuple[ServingProjectionPayload, ...] | None = None
         if self.canvas_catalog_root is not None and (
             self.canvas_receipt_root is None or self.canvas_publication_keyring is None
         ):
@@ -2335,6 +2339,52 @@ class DuckDBSignalPageProjectionSource:
             return self._build_snapshot(observed_at)
         with self.page_control_outbox.snapshot():
             return self._build_snapshot(observed_at)
+
+    def _read_formula_pool_projections(
+        self, observed: datetime
+    ) -> tuple[ServingProjectionPayload, ...]:
+        config = self.formula_pool_config
+        if config is None:
+            return ()
+        assert self.page_control_outbox is not None
+        watch = self._formula_pool_watch
+        cached = self._cached_formula_pool_projections
+        if watch is not None and cached is not None:
+            current = watch.identity()
+            if current == self._formula_pool_identity:
+                if watch.identity() != current:
+                    raise PageProjectionSourceIntegrityError(
+                        "formula pool authority changed while reusing verified projection"
+                    )
+                if cached[0].available_at > observed:
+                    raise PageProjectionSourceIntegrityError(
+                        "formula pool authority is newer than observation"
+                    )
+                return cached
+        catalog_before = FormulaPoolSourceWatch.catalog_identity(
+            config, self.page_control_outbox.path
+        )
+        projections = read_formula_pool_projections(
+            config,
+            self.page_control_outbox.formula_pool_saves(),
+            observed_at=observed,
+        )
+        watch = FormulaPoolSourceWatch.from_projections(
+            config, self.page_control_outbox.path, projections
+        )
+        identity = watch.identity()
+        if (
+            FormulaPoolSourceWatch.catalog_identity(config, self.page_control_outbox.path)
+            != catalog_before
+            or watch.identity() != identity
+        ):
+            raise PageProjectionSourceIntegrityError(
+                "formula pool authority changed while binding verified projection"
+            )
+        self._formula_pool_watch = watch
+        self._formula_pool_identity = identity
+        self._cached_formula_pool_projections = projections
+        return projections
 
     def _build_snapshot(self, observed_at: datetime) -> SignalPageProjectionSnapshot:
         observed = normalize_aware_utc(observed_at)
@@ -2437,13 +2487,8 @@ class DuckDBSignalPageProjectionSource:
         )
         formula_pool_projections: tuple[ServingProjectionPayload, ...] = ()
         if self.formula_pool_config is not None:
-            assert self.page_control_outbox is not None
             try:
-                formula_pool_projections = read_formula_pool_projections(
-                    self.formula_pool_config,
-                    self.page_control_outbox.formula_pool_saves(),
-                    observed_at=observed,
-                )
+                formula_pool_projections = self._read_formula_pool_projections(observed)
             except (OSError, sqlite3.Error, KeyError, ValueError) as exc:
                 raise PageProjectionSourceIntegrityError(
                     "configured formula pool authority is invalid"
