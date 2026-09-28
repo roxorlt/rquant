@@ -53,6 +53,7 @@ if TYPE_CHECKING:
     from rquant.runtime_serving_snapshot import SignalDeliveryReadPayload
     from rquant.serving_read_models import ServingSignalRecord
 
+from rquant.serving_manual_watchlist_projection import validate_manual_watchlist_projections
 from rquant.serving_read_models import ServingProjectionPayload
 
 _REQUIRED_NOTIFICATION_PROJECTION_TABLES = frozenset(
@@ -79,6 +80,8 @@ _OPTIONAL_NOTIFICATION_PROJECTION_TABLES = frozenset(
         "surge_event",
         "alert_ack_state",
         "alert_ack",
+        "manual_watchlist_state",
+        "manual_watchlist",
         "legacy_notification",
         "legacy_notification_status",
         "pool_definition",
@@ -346,6 +349,9 @@ class NotificationProjectionAuthoritySnapshot(RuntimeContractModel):
                 "notification authority must publish exactly the notification projections "
                 "required by the core contract and only registered optional projections"
             )
+        validate_manual_watchlist_projections(
+            {projection.table_name: projection for projection in self.projections}
+        )
         if self.available_at > self.observed_at:
             raise ValueError("notification projection availability exceeds observation time")
         if any(projection.available_at > self.available_at for projection in self.projections):

@@ -477,6 +477,37 @@ PAGE_PROJECTION_CONTRACTS: Mapping[str, ServingProjectionContract] = MappingProx
             max_bytes=2 * 1024 * 1024,
             event_time_columns=("confirmed_at",),
         ),
+        "manual_watchlist_state": _contract(
+            "signals",
+            (
+                ("snapshot_key", "string"),
+                ("state", "string"),
+                ("activated_at", "timestamp"),
+                ("row_count", "int"),
+                ("rows_sha256", "string"),
+            ),
+            ("snapshot_key",),
+            max_rows=1,
+            max_bytes=4096,
+            event_time_columns=("activated_at",),
+        ),
+        "manual_watchlist": _contract(
+            "signals",
+            (
+                ("owner_id", "string"),
+                ("ts_code", "string"),
+                ("version", "int"),
+                ("deleted", "bool"),
+                ("source", "string"),
+                ("price_levels_json", "string"),
+                ("expires_at", "timestamp"),
+                ("updated_at", "timestamp"),
+            ),
+            ("owner_id", "ts_code"),
+            max_rows=10_000,
+            max_bytes=2 * 1024 * 1024,
+            event_time_columns=("updated_at",),
+        ),
         "signal_observed_prefix": _contract(
             "signals",
             (

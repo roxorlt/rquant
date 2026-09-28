@@ -134,6 +134,15 @@ from rquant.serving_alert_projection import (
     AlertAckAuthoritySnapshot,
     build_ack_source_projections,
 )
+from rquant.serving_manual_watchlist_projection import (
+    MAX_MANUAL_WATCHLIST_ROWS as _MAX_MANUAL_WATCHLIST_ROWS,
+)
+from rquant.serving_manual_watchlist_projection import (
+    ManualWatchlistAuthoritySnapshot,
+    ManualWatchlistProjectionRow,
+    build_manual_watchlist_projections,
+    validate_manual_watchlist_projections,
+)
 from rquant.serving_read_models import ProjectionScalar, ServingProjectionPayload
 from rquant.storage.duckdb import DuckDBStore
 from rquant.strict_json import StrictJsonError, strict_json_loads
@@ -221,6 +230,10 @@ _EMPTY_PROJECTION_AVAILABLE_AT = datetime(1970, 1, 1, tzinfo=UTC)
 
 class PageProjectionSourceIntegrityError(RuntimeError):
     """A mutable or malformed operational snapshot cannot become Serving evidence."""
+
+
+class _PageControlAuditSnapshotUnavailableError(PageProjectionSourceIntegrityError):
+    """The shared audit transaction itself could not enter or finish safely."""
 
 
 @dataclass(frozen=True)
@@ -1242,6 +1255,92 @@ class _ReadonlyPageControlAuditReader:
         except (TypeError, ValueError) as exc:
             raise PageProjectionSourceIntegrityError(
                 "PageControl alert authority snapshot is invalid"
+            ) from exc
+
+    def manual_watchlist_snapshot(self) -> ManualWatchlistAuthoritySnapshot | None:
+        """Read activation and the full bounded row set in the pinned audit transaction."""
+        if self._snapshot_connection is None:
+            raise RuntimeError("PageControl watchlist read requires an active audit snapshot")
+        try:
+            return self._read_manual_watchlist_snapshot()
+        except sqlite3.Error as exc:
+            raise PageProjectionSourceIntegrityError(
+                "PageControl manual watchlist authority cannot be read"
+            ) from exc
+
+    def _read_manual_watchlist_snapshot(self) -> ManualWatchlistAuthoritySnapshot | None:
+        with self._read_connection() as connection:
+            marker = connection.execute(
+                "SELECT protocol_version, activated_at FROM page_control_protocol_activation "
+                "WHERE marker_name = ?",
+                ("manual-watchlist/v1",),
+            ).fetchone()
+            table = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'manual_watchlist'"
+            ).fetchone()
+            if marker is None and table is None:
+                return None
+            if marker is None or table is None or marker["protocol_version"] != 1:
+                raise PageProjectionSourceIntegrityError(
+                    "PageControl manual watchlist activation and table are inconsistent"
+                )
+            expected = {
+                "owner_id": ("TEXT", 1, None, 1),
+                "ts_code": ("TEXT", 1, None, 2),
+                "version": ("INTEGER", 1, None, 0),
+                "deleted": ("INTEGER", 1, None, 0),
+                "source": ("TEXT", 0, None, 0),
+                "price_levels_json": ("TEXT", 1, None, 0),
+                "expires_at_utc": ("TEXT", 0, None, 0),
+                "updated_at_utc": ("TEXT", 0, None, 0),
+            }
+            observed = {
+                str(row[1]): (
+                    str(row[2]).upper(),
+                    int(row[3]),
+                    None if row[4] is None else str(row[4]),
+                    int(row[5]),
+                )
+                for row in connection.execute("PRAGMA table_info(manual_watchlist)")
+            }
+            if observed != expected:
+                raise PageProjectionSourceIntegrityError(
+                    "PageControl manual watchlist schema is invalid"
+                )
+            rows = connection.execute(
+                "SELECT owner_id, ts_code, version, deleted, source, price_levels_json, "
+                "expires_at_utc, updated_at_utc FROM manual_watchlist "
+                "ORDER BY owner_id, ts_code LIMIT ?",
+                (_MAX_MANUAL_WATCHLIST_ROWS + 1,),
+            ).fetchall()
+        if len(rows) > _MAX_MANUAL_WATCHLIST_ROWS:
+            raise PageProjectionSourceIntegrityError(
+                "PageControl manual watchlist exceeds its bounded snapshot"
+            )
+        try:
+            entries = []
+            for row in rows:
+                if type(row["deleted"]) is not int or row["deleted"] not in (0, 1):
+                    raise ValueError("manual watchlist deletion marker is invalid")
+                entries.append(
+                    ManualWatchlistProjectionRow(
+                        owner_id=row["owner_id"],
+                        ts_code=row["ts_code"],
+                        version=row["version"],
+                        deleted=bool(row["deleted"]),
+                        source=row["source"],
+                        price_levels_json=row["price_levels_json"],
+                        expires_at=row["expires_at_utc"],
+                        updated_at=row["updated_at_utc"],
+                    )
+                )
+            return ManualWatchlistAuthoritySnapshot.create(
+                activated_at=datetime.fromisoformat(marker["activated_at"]),
+                rows=entries,
+            )
+        except (TypeError, ValueError) as exc:
+            raise PageProjectionSourceIntegrityError(
+                "PageControl manual watchlist snapshot is invalid"
             ) from exc
 
     def audit(self, command_id: str) -> _ReadonlyPageControlAudit | None:
@@ -2364,8 +2463,20 @@ class DuckDBSignalPageProjectionSource:
     def __call__(self, observed_at: datetime, /) -> SignalPageProjectionSnapshot:
         if self.page_control_outbox is None:
             return self._build_snapshot(observed_at)
-        with self.page_control_outbox.snapshot():
-            return self._build_snapshot(observed_at)
+        entered = False
+        built = False
+        try:
+            with self.page_control_outbox.snapshot():
+                entered = True
+                result = self._build_snapshot(observed_at)
+                built = True
+            return result
+        except (PageProjectionSourceIntegrityError, OSError, sqlite3.Error, ValueError) as exc:
+            if not entered or built:
+                raise _PageControlAuditSnapshotUnavailableError(
+                    f"PageControl shared audit snapshot is unavailable: {exc}"
+                ) from exc
+            raise
 
     def _read_formula_pool_projections(
         self, observed: datetime
@@ -2512,6 +2623,18 @@ class DuckDBSignalPageProjectionSource:
             else self.page_control_outbox.alert_ack_snapshot(),
             observed_at=observed,
         )
+        try:
+            manual_watchlist_projections = build_manual_watchlist_projections(
+                None
+                if self.page_control_outbox is None
+                else self.page_control_outbox.manual_watchlist_snapshot(),
+                observed_at=observed,
+            )
+        except (OSError, sqlite3.Error, PageProjectionSourceIntegrityError, ValueError) as exc:
+            logger.warning("手动盯盘名单来源暂不可用：{}", exc)
+            manual_watchlist_projections = build_manual_watchlist_projections(
+                None, observed_at=observed
+            )
         formula_pool_projections: tuple[ServingProjectionPayload, ...] = ()
         if self.formula_pool_config is not None:
             try:
@@ -2557,6 +2680,10 @@ class DuckDBSignalPageProjectionSource:
             legacy_notification_status=legacy_notification_status,
             alert_ack_state=alert_ack_projections[0],
             alert_ack=(alert_ack_projections[1] if len(alert_ack_projections) > 1 else None),
+            manual_watchlist_state=manual_watchlist_projections[0],
+            manual_watchlist=(
+                manual_watchlist_projections[1] if len(manual_watchlist_projections) > 1 else None
+            ),
         )
 
     def legacy_notification_projections(
@@ -3864,7 +3991,9 @@ class SignalPageProjectionProducer:
         try:
             snapshot = self.source(observed)
         except (PageProjectionSourceIntegrityError, OSError, duckdb.Error, ValueError) as error:
-            if self.source.formula_pool_config is not None:
+            if self.source.formula_pool_config is not None and not isinstance(
+                error, _PageControlAuditSnapshotUnavailableError
+            ):
                 raise
             previous = self.store.serving_snapshot(observed_at=observed, history_limit=1)
             if previous.projection_generation_id is None:
@@ -3883,8 +4012,13 @@ class SignalPageProjectionProducer:
                     "screen_run_receipt",
                     "pool_membership",
                     "pool_member_return",
+                    "formula_pool_state",
+                    "formula_pool_definition",
+                    "formula_pool_latest_result",
                     "alert_ack_state",
                     "alert_ack",
+                    "manual_watchlist_state",
+                    "manual_watchlist",
                 }
             )
             try:
@@ -3901,6 +4035,7 @@ class SignalPageProjectionProducer:
                 item for item in (legacy_notification, legacy_status) if item is not None
             )
             page_projections += build_ack_source_projections(None, observed_at=observed)
+            page_projections += build_manual_watchlist_projections(None, observed_at=observed)
             page_available_at = max(item.available_at for item in page_projections)
             page_generation_id = canonical_sha256(
                 {"source": "signal-page-projections-partial", "projections": page_projections}
@@ -4831,6 +4966,8 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
             "surge_event",
             "alert_ack_state",
             "alert_ack",
+            "manual_watchlist_state",
+            "manual_watchlist",
             "legacy_notification",
             "legacy_notification_status",
         }
@@ -4840,6 +4977,7 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
         ):
             raise ValueError("signal page projection snapshot is incomplete")
         validate_formula_pool_projections({item.table_name: item for item in self.projections})
+        validate_manual_watchlist_projections({item.table_name: item for item in self.projections})
         expected = canonical_sha256(self.model_dump(mode="python", exclude={"content_sha256"}))
         if self.content_sha256 != expected:
             raise ValueError("signal page projection snapshot hash mismatch")
@@ -4870,6 +5008,8 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
         surge_event: ServingProjectionPayload | None = None,
         alert_ack_state: ServingProjectionPayload | None = None,
         alert_ack: ServingProjectionPayload | None = None,
+        manual_watchlist_state: ServingProjectionPayload | None = None,
+        manual_watchlist: ServingProjectionPayload | None = None,
         legacy_notification: ServingProjectionPayload | None = None,
         legacy_notification_status: ServingProjectionPayload | None = None,
     ) -> SignalPageProjectionSnapshot:
@@ -4936,6 +5076,8 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
             ("surge_event", surge_event),
             ("alert_ack_state", alert_ack_state),
             ("alert_ack", alert_ack),
+            ("manual_watchlist_state", manual_watchlist_state),
+            ("manual_watchlist", manual_watchlist),
             ("legacy_notification", legacy_notification),
             ("legacy_notification_status", legacy_notification_status),
         ):
