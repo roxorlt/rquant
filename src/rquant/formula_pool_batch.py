@@ -223,6 +223,8 @@ class FormulaPoolBatchCoordinator:
             definition_root=self.config.definition_root,
             rule_pool_root=self.config.rule_pool_root,
         )
+        # Reject a dirty or oversized catalog before the task store creates SQLite state.
+        self._catalog()
         store = FormulaMarketJobStore(
             state_path=self.config.market.state_path,
             artifact_directory=self.config.market.artifact_directory,
@@ -237,13 +239,20 @@ class FormulaPoolBatchCoordinator:
         )
 
     def _catalog(self) -> tuple[tuple[FormulaPoolDefinitionV1, ...], str]:
+        def bounded_names(directory: int) -> list[str]:
+            names: list[str] = []
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    names.append(entry.name)
+                    if len(names) > _MAX_DEFINITIONS:
+                        raise ValueError("formula definition catalog exceeds capacity")
+            return sorted(names)
+
         rules = _open_private_directory(self.config.rule_pool_root, create=False)
         os.close(rules)
         directory = _open_private_directory(self.config.definition_root, create=False)
         try:
-            names = sorted(entry.name for entry in os.scandir(directory))
-            if len(names) > _MAX_DEFINITIONS:
-                raise ValueError("formula definition catalog exceeds capacity")
+            names = bounded_names(directory)
             definitions: list[FormulaPoolDefinitionV1] = []
             for name in names:
                 if not name.endswith(".json"):
@@ -254,7 +263,7 @@ class FormulaPoolBatchCoordinator:
                     raise ValueError("formula definition syntax is unsupported")
                 self.definitions._reject_rule_name(base_name)
                 definitions.append(definition)
-            if names != sorted(entry.name for entry in os.scandir(directory)):
+            if names != bounded_names(directory):
                 raise ValueError("formula definition catalog changed during preflight")
         finally:
             os.close(directory)

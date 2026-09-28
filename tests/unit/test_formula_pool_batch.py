@@ -9,6 +9,8 @@ from pathlib import Path
 
 import pytest
 
+import rquant.formula_pool_batch as batch_module
+from rquant.formula_market_private_config import FormulaMarketPrivateConfig
 from rquant.formula_pool_batch import (
     FormulaPoolBatchCoordinator,
     FormulaPoolBatchPrivateConfig,
@@ -122,6 +124,97 @@ def test_preflight_rejects_dirty_catalog_before_new_admission(tmp_path: Path) ->
     with pytest.raises((ValueError, FileExistsError), match="rule|collision"):
         batch.run(DAY)
     assert admission.store.latest().status == "succeeded"
+
+
+def test_bad_catalog_and_bad_private_config_leave_new_task_paths_uncreated(
+    tmp_path: Path,
+) -> None:
+    batch, _, _ = _fixture(tmp_path)
+    state_path = tmp_path / "fresh-tasks" / "jobs.sqlite"
+    artifact_root = tmp_path / "fresh-artifacts"
+    config = FormulaPoolBatchPrivateConfig(
+        market=FormulaMarketPrivateConfig(
+            universe_root=batch.config.market.universe_root,
+            projection_root=batch.config.market.projection_root,
+            state_path=state_path,
+            artifact_directory=artifact_root,
+        ),
+        definition_root=batch.config.definition_root,
+        rule_pool_root=batch.config.rule_pool_root,
+        daily_result_root=batch.config.daily_result_root,
+    )
+    dirty = config.definition_root / ".unfinished.stage"
+    dirty.write_text("partial")
+    with pytest.raises(ValueError, match="catalog"):
+        FormulaPoolBatchCoordinator(config=config, clock=lambda: NOW)
+    assert not state_path.parent.exists()
+    assert not artifact_root.exists()
+    dirty.unlink()
+
+    config_path = tmp_path / "unsafe-batch.json"
+    config_path.write_bytes(canonical_json_bytes(config.model_dump(mode="json")))
+    os.chmod(config_path, 0o644)
+    assert main(["--config", str(config_path), "--trade-date", DAY.isoformat()]) == 2
+    assert not state_path.parent.exists()
+    assert not artifact_root.exists()
+
+
+class _GuardedScan:
+    def __init__(self, scan: object, counts: list[int]) -> None:
+        self.scan = scan
+        self.counts = counts
+        self.counts.append(0)
+
+    def __enter__(self) -> _GuardedScan:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.scan.close()
+
+    def __iter__(self) -> _GuardedScan:
+        return self
+
+    def __next__(self) -> object:
+        entry = next(self.scan)
+        self.counts[-1] += 1
+        if self.counts[-1] > 513:
+            raise AssertionError("catalog read beyond the 513th entry")
+        return entry
+
+
+def test_initial_catalog_scan_stops_on_entry_513(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    batch, _, _ = _fixture(tmp_path)
+    for number in range(600):
+        (batch.config.definition_root / f"extra-{number}.json").write_text("{}")
+    original = os.scandir
+    counts: list[int] = []
+    monkeypatch.setattr(
+        batch_module.os, "scandir", lambda directory: _GuardedScan(original(directory), counts)
+    )
+    with pytest.raises(ValueError, match="capacity"):
+        batch._catalog()
+    assert counts == [513]
+
+
+def test_recheck_catalog_scan_stops_on_entry_513(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    batch, _, _ = _fixture(tmp_path)
+    original = os.scandir
+    counts: list[int] = []
+
+    def scan(directory: int) -> _GuardedScan:
+        if counts:
+            for number in range(511):
+                (batch.config.definition_root / f"late-{number}.json").write_text("{}")
+        return _GuardedScan(original(directory), counts)
+
+    monkeypatch.setattr(batch_module.os, "scandir", scan)
+    with pytest.raises(ValueError, match="capacity"):
+        batch._catalog()
+    assert counts == [2, 513]
 
 
 def test_missing_rule_pool_directory_is_not_silent_empty_catalog(tmp_path: Path) -> None:
