@@ -156,9 +156,8 @@ def load_verified_screen_candidates(
     try:
         connection.execute("BEGIN TRANSACTION")
         try:
-            receipt = _read_receipt(connection, source_trade_date, preset_name)
-            snapshot = _verify_snapshot(
-                connection, receipt, source_trade_date, decision_trade_date, preset_name
+            snapshot = verify_screen_candidates(
+                connection, source_trade_date, decision_trade_date, preset_name
             )
         except Exception:
             connection.execute("ROLLBACK")
@@ -169,3 +168,23 @@ def load_verified_screen_candidates(
         raise ScreenCandidateSourceError("frozen screen tables are unavailable") from exc
     finally:
         connection.close()
+
+
+def verify_screen_candidates(
+    connection: duckdb.DuckDBPyConnection,
+    source_trade_date: date,
+    decision_trade_date: date,
+    preset_name: str,
+) -> VerifiedScreenCandidateSnapshot:
+    """Verify a receipt and its rows inside the caller's read-only transaction."""
+    if source_trade_date >= decision_trade_date:
+        raise ScreenCandidateSourceError("decision date must follow the source date")
+    if not preset_name.strip():
+        raise ScreenCandidateSourceError("a screen preset is required")
+    try:
+        receipt = _read_receipt(connection, source_trade_date, preset_name)
+        return _verify_snapshot(
+            connection, receipt, source_trade_date, decision_trade_date, preset_name
+        )
+    except duckdb.Error as exc:
+        raise ScreenCandidateSourceError("frozen screen tables are unavailable") from exc
