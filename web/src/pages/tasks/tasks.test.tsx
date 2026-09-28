@@ -533,6 +533,75 @@ describe("服务运行日志", () => {
     expect(document.body).not.toHaveTextContent("private validation detail");
   });
 
+  it.each([
+    { filterName: "时间范围", value: "day" },
+    { filterName: "日志级别", value: "warning" },
+  ])(
+    "starts a fresh page when changing $filterName after expiry",
+    async ({ filterName, value }) => {
+      const instant = Date.now();
+      const clock = vi.spyOn(Date, "now").mockReturnValue(instant);
+      const requests: URL[] = [];
+      try {
+        server.use(
+          http.get("*/api/v1/tasks/services/log-capabilities", () =>
+            HttpResponse.json({ units: ["rquant-daily.service"] }),
+          ),
+          http.get("*/api/v1/tasks/services/:unit/logs", ({ request }) => {
+            const url = new URL(request.url);
+            requests.push(url);
+            if (url.searchParams.has("cursor")) {
+              return HttpResponse.json({ detail: "private validation detail" }, { status: 422 });
+            }
+            return HttpResponse.json({
+              service_label: "每日任务",
+              scope: "本机本次开机以来的服务日志（含手动运行）",
+              entries: [
+                {
+                  at: "2026-09-28T04:00:00Z",
+                  level: "信息",
+                  text: requests.length === 4 ? "任务已完成" : "任务已开始",
+                },
+              ],
+              next_cursor: "signed-page-cursor",
+            });
+          }),
+        );
+        const user = userEvent.setup();
+        renderApp("/tasks");
+        await user.click(await screen.findByRole("button", { name: "查看日线更新的运行日志" }));
+        const dialog = await screen.findByRole("dialog", { name: /服务日志/ });
+        await user.selectOptions(
+          within(dialog).getByRole("combobox", { name: "时间范围" }),
+          "week",
+        );
+        await waitFor(() => expect(requests).toHaveLength(2));
+        const oldSince = requests[1]?.searchParams.get("since");
+        await user.click(within(dialog).getByRole("button", { name: "加载更早记录" }));
+        expect(
+          await within(dialog).findByText("日志筛选范围已过期，请重新查看。"),
+        ).toBeInTheDocument();
+        expect(within(dialog).queryByText("任务已开始")).toBeNull();
+
+        clock.mockReturnValue(instant + 1000);
+        await user.selectOptions(within(dialog).getByRole("combobox", { name: filterName }), value);
+        expect(within(dialog).queryByText("所选范围还没有可显示的日志。")).toBeNull();
+        expect(await within(dialog).findByText("任务已完成")).toBeInTheDocument();
+        expect(within(dialog).queryByText("任务已开始")).toBeNull();
+        expect(requests).toHaveLength(4);
+        expect(requests[3]?.searchParams.get("cursor")).toBeNull();
+        expect(Date.parse(requests[3]?.searchParams.get("since") ?? "")).toBeGreaterThan(
+          Date.parse(oldSince ?? ""),
+        );
+        if (filterName === "日志级别") {
+          expect(requests[3]?.searchParams.get("level")).toBe("warning");
+        }
+      } finally {
+        clock.mockRestore();
+      }
+    },
+  );
+
   it("shows a safe 429 state and retry without displaying transport detail", async () => {
     let busy = true;
     server.use(
