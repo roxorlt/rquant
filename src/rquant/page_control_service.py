@@ -27,6 +27,7 @@ from rquant.canvas_publication_receipt import (
 )
 from rquant.formula_market_page_backend import FormulaMarketPageBackend
 from rquant.formula_market_private_config import load_private_formula_market_config
+from rquant.formula_pool_definition import FormulaPoolDefinitionStore, FormulaPoolSaveBackend
 from rquant.job_center_authority import resolve_current_job_center_authority_binding
 from rquant.lab_daemon import load_lab_job_center_authority_manifest
 from rquant.lab_page_control import build_lab_page_control_writer
@@ -36,6 +37,7 @@ from rquant.page_control import (
     BackfillPlanPageControlBackend,
     DataAuditReportPageControlBackend,
     FormulaMarketPageControlBackend,
+    FormulaPoolPageControlBackend,
     LabPageControlBackend,
     PageControlCommandConflictError,
     PageControlConsumer,
@@ -135,6 +137,7 @@ def build_page_control_service(
     backfill_plan_backend: BackfillPlanPageControlBackend | None = None,
     data_audit_report_backend: DataAuditReportPageControlBackend | None = None,
     formula_market_backend: FormulaMarketPageControlBackend | None = None,
+    formula_pool_backend: FormulaPoolPageControlBackend | None = None,
     load_default_lab_backend: bool = True,
     clock: Callable[[], datetime] | None = None,
     lease_seconds: int = 30,
@@ -152,6 +155,7 @@ def build_page_control_service(
         backfill_plan_backend=backfill_plan_backend,
         data_audit_report_backend=data_audit_report_backend,
         formula_market_backend=formula_market_backend,
+        formula_pool_backend=formula_pool_backend,
         load_default_lab_backend=load_default_lab_backend,
         clock=clock,
         lease_seconds=lease_seconds,
@@ -172,6 +176,7 @@ def build_page_control_service_with_dependencies(
     backfill_plan_backend: BackfillPlanPageControlBackend | None = None,
     data_audit_report_backend: DataAuditReportPageControlBackend | None = None,
     formula_market_backend: FormulaMarketPageControlBackend | None = None,
+    formula_pool_backend: FormulaPoolPageControlBackend | None = None,
     load_default_lab_backend: bool = True,
     clock: Callable[[], datetime] | None = None,
     lease_seconds: int = 30,
@@ -215,6 +220,7 @@ def build_page_control_service_with_dependencies(
             backfill_plan_backend=backfill_plan_backend,
             data_audit_report_backend=data_audit_report_backend,
             formula_market_backend=formula_market_backend,
+            formula_pool_backend=formula_pool_backend,
             clock=clock,
             lease_seconds=lease_seconds,
             consumer_id=consumer_instance_id,
@@ -425,9 +431,17 @@ def _serve(
     ):
         raise ValueError("page control endpoint must be an explicit loopback command URL")
     formula_market_backend = None
+    formula_pool_backend = None
     if formula_market_config_path is not None:
         formula_market_backend = FormulaMarketPageBackend(
             load_private_formula_market_config(formula_market_config_path)
+        )
+        formula_pool_backend = FormulaPoolSaveBackend(
+            task_store=formula_market_backend.store,
+            definitions=FormulaPoolDefinitionStore(
+                definition_root=page_profile.data_dir / "formula_pools",
+                rule_pool_root=page_profile.data_dir / "user_presets",
+            ),
         )
     service = build_page_control_service(
         outbox_path=page_profile.outbox_path,
@@ -435,6 +449,7 @@ def _serve(
         log_dir=page_profile.log_dir,
         allowed_lab_export_roots=(page_profile.data_dir / "exports",),
         formula_market_backend=formula_market_backend,
+        formula_pool_backend=formula_pool_backend,
         load_default_lab_backend=False,
         consumer_service_id=canvas_profile.consumer_service_id,
         consumer_instance_id=canvas_profile.consumer_instance_id,

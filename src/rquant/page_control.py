@@ -186,6 +186,19 @@ class SaveUserPoolV2(PageControlCommand):
         return _validated_name(value, label="user pool name")
 
 
+class SaveFormulaPoolV1(PageControlCommand):
+    kind: Literal["save_formula_pool_v1"] = "save_formula_pool_v1"
+    base_name: str = Field(min_length=1, max_length=80)
+    display_name: str = Field(min_length=1, max_length=80)
+    task_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    expected_version: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+    @field_validator("base_name")
+    @classmethod
+    def validate_base_name(cls, value: str) -> str:
+        return _validated_name(value, label="formula pool name")
+
+
 class DeleteUserPool(PageControlCommand):
     kind: Literal["delete_user_pool"] = "delete_user_pool"
     base_name: str
@@ -335,6 +348,12 @@ class FormulaMarketPageControlBackend(Protocol):
     def recover(self, command: SubmitFormulaMarketRun) -> JsonValue | None: ...
 
 
+class FormulaPoolPageControlBackend(Protocol):
+    def submit(self, command: SaveFormulaPoolV1) -> JsonValue: ...
+
+    def recover(self, command: SaveFormulaPoolV1) -> JsonValue | None: ...
+
+
 PageControlCommandValue = Annotated[
     AckAlert
     | SaveCanvas
@@ -344,6 +363,7 @@ PageControlCommandValue = Annotated[
     | AddPoolToCanvas
     | SaveUserPool
     | SaveUserPoolV2
+    | SaveFormulaPoolV1
     | DeleteUserPool
     | ForkBuiltinPool
     | SaveNlPreset
@@ -1451,6 +1471,7 @@ class PageControlConsumer:
         backfill_plan_backend: BackfillPlanPageControlBackend | None = None,
         data_audit_report_backend: DataAuditReportPageControlBackend | None = None,
         formula_market_backend: FormulaMarketPageControlBackend | None = None,
+        formula_pool_backend: FormulaPoolPageControlBackend | None = None,
         clock: Callable[[], datetime] | None = None,
         lease_seconds: int = _DEFAULT_LEASE_SECONDS,
         consumer_id: str | None = None,
@@ -1468,6 +1489,7 @@ class PageControlConsumer:
         self.backfill_plan_backend = backfill_plan_backend
         self.data_audit_report_backend = data_audit_report_backend
         self.formula_market_backend = formula_market_backend
+        self.formula_pool_backend = formula_pool_backend
         self.clock = clock or (lambda: datetime.now(UTC))
         self.lease_seconds = lease_seconds
         self.consumer_service_id = consumer_service_id
@@ -1638,9 +1660,7 @@ class PageControlConsumer:
                 recovered = self._recover_started_effect(command)
             except Exception as exc:
                 if self._must_recover_before_failure(command, created=created):
-                    raise _RetryableUncertainEffectError(
-                        f"{type(exc).__name__}: {exc}"
-                    ) from exc
+                    raise _RetryableUncertainEffectError(f"{type(exc).__name__}: {exc}") from exc
                 effect = self.outbox.finish_effect(
                     command.command_id,
                     status=PageControlEffectStatus.FAILED,
@@ -1790,6 +1810,8 @@ class PageControlConsumer:
             return not created or self.data_audit_report_backend is not None
         if isinstance(command, SubmitFormulaMarketRun):
             return not created or self.formula_market_backend is not None
+        if isinstance(command, SaveFormulaPoolV1):
+            return not created or self.formula_pool_backend is not None
         return self._has_committed_local_mutation(command)
 
     def _has_committed_local_mutation(self, command: PageControlCommandValue) -> bool:
@@ -1875,6 +1897,8 @@ class PageControlConsumer:
             return result
         if isinstance(command, SaveUserPoolV2):
             return self._save_user_pool_v2(command)
+        if isinstance(command, SaveFormulaPoolV1):
+            return self._formula_pool_backend().submit(command)
         if isinstance(command, DeleteUserPool):
             return {"deleted": self._delete(self._user_pool_path(command.base_name))}
         if isinstance(command, ForkBuiltinPool):
@@ -1934,6 +1958,11 @@ class PageControlConsumer:
         if self.formula_market_backend is None:
             raise RuntimeError("formula market backend is unavailable")
         return self.formula_market_backend
+
+    def _formula_pool_backend(self) -> FormulaPoolPageControlBackend:
+        if self.formula_pool_backend is None:
+            raise RuntimeError("formula pool backend is unavailable")
+        return self.formula_pool_backend
 
     def _local_effect_fence_targets(
         self,
@@ -2149,6 +2178,8 @@ class PageControlConsumer:
             return self._data_audit_report_backend().recover(command)
         if isinstance(command, SubmitFormulaMarketRun):
             return self._formula_market_backend().recover(command)
+        if isinstance(command, SaveFormulaPoolV1):
+            return self._formula_pool_backend().recover(command)
         if isinstance(command, CreateCanvas):
             return self._recover_create_canvas_result(command)
         if isinstance(command, SaveCanvas):
@@ -2350,6 +2381,7 @@ class PageControlConsumer:
         identity_command: PageControlCommandValue | None = None,
     ) -> JsonValue:
         identity = command if identity_command is None else identity_command
+        self._assert_no_formula_pool_name(command.base_name)
         path = self._user_pool_path(command.base_name)
         if self._managed_json_exists(path) and self._read_json(path).get("schema_version") == 2:
             raise ValueError("v2 pool definition requires save_user_pool_v2")
@@ -2367,6 +2399,7 @@ class PageControlConsumer:
         return {"path": str(path)}
 
     def _save_user_pool_v2(self, command: SaveUserPoolV2) -> JsonValue:
+        self._assert_no_formula_pool_name(command.base_name)
         from rquant.llm.dispatch import build_rules
         from rquant.llm.schemas import ScreenPlan, Stage
         from rquant.presets import BUILTIN_PRESET_SCREENS, load_user_presets
@@ -2972,6 +3005,12 @@ class PageControlConsumer:
 
     def _user_pool_path(self, name: str) -> Path:
         return self.data_dir / "user_presets" / f"{_validated_name(name, label='pool name')}.json"
+
+    def _assert_no_formula_pool_name(self, name: str) -> None:
+        validated = _validated_name(name, label="pool name")
+        path = self.data_dir / "formula_pools" / f"{validated}.json"
+        if self._managed_json_exists(path):
+            raise FileExistsError("formula pool already uses this user/ name")
 
     @staticmethod
     def _read_json(path: Path) -> dict[str, object]:
@@ -3784,6 +3823,7 @@ __all__ = [
     "BackfillPlanPageControlBackend",
     "DataAuditReportPageControlBackend",
     "FormulaMarketPageControlBackend",
+    "FormulaPoolPageControlBackend",
     "PageControlCommandValue",
     "PageControlClient",
     "PageControlCommandConflictError",
@@ -3795,6 +3835,7 @@ __all__ = [
     "PageControlUnavailableError",
     "parse_page_control_command",
     "SaveCanvas",
+    "SaveFormulaPoolV1",
     "SaveNlPreset",
     "SaveUserPool",
     "SaveUserPoolV2",
