@@ -1,6 +1,7 @@
 import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { HttpResponse, http } from "msw";
+import { vi } from "vitest";
 import type { Schemas } from "@/api/client";
 import { metaEnvelope } from "@/test/fixtures";
 import { findJargon } from "@/test/jargon";
@@ -9,6 +10,7 @@ import { server } from "@/test/server";
 
 const serving = metaEnvelope().serving;
 const source = { identity: "a".repeat(64), updated_at: "2026-09-24T07:30:00Z" };
+const RECENT_DESCRIPTIONS_KEY = "rquant.screen.recent-descriptions.v1";
 const blocks: Schemas["ScreenBlock"][] = [
   {
     key: "not_st",
@@ -86,6 +88,152 @@ function stockDrawer() {
 }
 
 describe("选股器", () => {
+  it("最近描述只记校验成功的预览，去重置顶并保留最近五条", async () => {
+    catalog(true, true);
+    let fail = false;
+    server.use(
+      http.post("*/api/v1/screen/nl-preview", () =>
+        fail
+          ? HttpResponse.json({ detail: "说法不够明确" }, { status: 422 })
+          : HttpResponse.json({
+              source_kind: "replica",
+              source_identity: source.identity,
+              trade_date: "2026-09-24",
+              conditions: [{ key: "not_st", args: {} }],
+            }),
+      ),
+    );
+    const user = userEvent.setup();
+    renderApp("/screener");
+    const input = await screen.findByRole("textbox", { name: "选股描述" });
+    expect(screen.getByText("最近描述")).toBeInTheDocument();
+    for (const description of ["描述一", "描述二", "描述三", "描述四", "描述五", "描述六"]) {
+      await user.clear(input);
+      await user.type(input, description);
+      await user.click(screen.getByRole("button", { name: "生成条件" }));
+      expect(await screen.findByRole("region", { name: "建议条件" })).toBeInTheDocument();
+    }
+    expect(JSON.parse(sessionStorage.getItem(RECENT_DESCRIPTIONS_KEY) ?? "null")).toEqual([
+      "描述六",
+      "描述五",
+      "描述四",
+      "描述三",
+      "描述二",
+    ]);
+    fail = true;
+    await user.clear(input);
+    await user.type(input, "含糊描述");
+    await user.click(screen.getByRole("button", { name: "生成条件" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("没能确定条件");
+    expect(screen.queryByRole("button", { name: "含糊描述" })).toBeNull();
+    expect(JSON.parse(sessionStorage.getItem(RECENT_DESCRIPTIONS_KEY) ?? "null")).toEqual([
+      "描述六",
+      "描述五",
+      "描述四",
+      "描述三",
+      "描述二",
+    ]);
+    fail = false;
+    await user.clear(input);
+    await user.type(input, "描述三");
+    await user.click(screen.getByRole("button", { name: "生成条件" }));
+    expect(await screen.findByRole("region", { name: "建议条件" })).toBeInTheDocument();
+    expect(JSON.parse(sessionStorage.getItem(RECENT_DESCRIPTIONS_KEY) ?? "null")).toEqual([
+      "描述三",
+      "描述六",
+      "描述五",
+      "描述四",
+      "描述二",
+    ]);
+    expect(screen.getAllByRole("button", { name: /^描述/ })).toHaveLength(5);
+  });
+
+  it("点击最近描述只回填和聚焦，清除旧建议但保留手工条件与真实结果，刷新后可恢复", async () => {
+    catalog(true, true);
+    let previews = 0;
+    let runs = 0;
+    server.use(
+      http.post("*/api/v1/screen/nl-preview", () => {
+        previews += 1;
+        return HttpResponse.json({
+          source_kind: "replica",
+          source_identity: source.identity,
+          trade_date: "2026-09-24",
+          conditions: [{ key: "not_st", args: {} }],
+        });
+      }),
+      http.post("*/api/v1/screen/run", () => {
+        runs += 1;
+        return HttpResponse.json({
+          data: {
+            trade_date: "2026-09-24",
+            status: "ready",
+            base_count: 30,
+            total: 27,
+            steps: [{ label: "排除 ST", count: 27 }],
+            rows: [],
+            next_cursor: null,
+            source,
+          },
+          serving,
+        });
+      }),
+    );
+    const user = userEvent.setup();
+    const app = renderApp("/screener");
+    await user.click(await screen.findByRole("button", { name: "运行筛选" }));
+    expect(await screen.findByText("命中 27 只")).toBeInTheDocument();
+    const input = screen.getByRole("textbox", { name: "选股描述" });
+    await user.type(input, "排除 ST");
+    await user.click(screen.getByRole("button", { name: "生成条件" }));
+    expect(await screen.findByRole("region", { name: "建议条件" })).toBeInTheDocument();
+    await user.clear(input);
+    await user.type(input, "排除风险股");
+    await user.click(screen.getByRole("button", { name: "生成条件" }));
+    expect(await screen.findByRole("region", { name: "建议条件" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "排除 ST" }));
+    expect(input).toHaveValue("排除 ST");
+    expect(input).toHaveFocus();
+    expect(screen.queryByRole("region", { name: "建议条件" })).toBeNull();
+    expect(screen.getAllByRole("button", { name: /删除第/ })).toHaveLength(1);
+    expect(screen.getByText("命中 27 只")).toBeInTheDocument();
+    expect(previews).toBe(2);
+    expect(runs).toBe(1);
+    app.unmount();
+    renderApp("/screener");
+    expect(await screen.findByRole("button", { name: "排除风险股" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "排除 ST" })).toBeInTheDocument();
+  });
+
+  it("损坏或不可写的会话记录不影响生成条件", async () => {
+    sessionStorage.setItem(RECENT_DESCRIPTIONS_KEY, "{损坏");
+    const setItem = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new DOMException("blocked", "QuotaExceededError");
+    });
+    try {
+      catalog(true, true);
+      server.use(
+        http.post("*/api/v1/screen/nl-preview", () =>
+          HttpResponse.json({
+            source_kind: "replica",
+            source_identity: source.identity,
+            trade_date: "2026-09-24",
+            conditions: [{ key: "not_st", args: {} }],
+          }),
+        ),
+      );
+      const user = userEvent.setup();
+      renderApp("/screener");
+      await user.type(await screen.findByRole("textbox", { name: "选股描述" }), "排除 ST");
+      await user.click(screen.getByRole("button", { name: "生成条件" }));
+      expect(await screen.findByRole("region", { name: "建议条件" })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "排除 ST" })).toBeInTheDocument();
+      expect(sessionStorage.getItem(RECENT_DESCRIPTIONS_KEY)).toBe("{损坏");
+    } finally {
+      setItem.mockRestore();
+    }
+  });
+
   it("一句话建议先预览，应用后旧结果过期，手改并运行才出现新命中", async () => {
     catalog(true, true);
     const previews: unknown[] = [];
@@ -344,6 +492,7 @@ describe("选股器", () => {
     release?.();
     await waitFor(() => expect(screen.queryByText("正在生成条件…")).toBeNull());
     expect(screen.queryByRole("region", { name: "建议条件" })).toBeNull();
+    expect(sessionStorage.getItem(RECENT_DESCRIPTIONS_KEY)).toBeNull();
     expect(screen.getAllByText("排除 ST").length).toBeGreaterThanOrEqual(1);
     await user.click(screen.getByRole("button", { name: "生成条件" }));
     expect(await screen.findByRole("alert")).toHaveTextContent(
@@ -351,6 +500,7 @@ describe("选股器", () => {
     );
     expect(screen.getAllByRole("button", { name: /删除第/ })).toHaveLength(2);
     expect(document.body).not.toHaveTextContent("内部解析细节不应展示");
+    expect(sessionStorage.getItem(RECENT_DESCRIPTIONS_KEY)).toBeNull();
   });
 
   it("生成建议要求换日期时给出明确下一步且保留手工条件", async () => {

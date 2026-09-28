@@ -170,6 +170,10 @@ test("一句话建议经键盘预览和人工应用，手机手改后才运行�
   await expect(preview).toContainText("排除 ST");
   await expect(preview).toContainText("市值上限（亿元） 80");
   await expect(preview).not.toContainText("命中");
+  const recent = page.getByRole("region", { name: "最近描述" }).getByRole("button", {
+    name: "排除 ST，流通市值低于 80 亿",
+  });
+  await expect(recent).toBeVisible();
   expect(previews).toHaveLength(1);
   expect(runs).toHaveLength(1);
   await expectNoHorizontalOverflow(page, "screen suggestion desktop");
@@ -191,6 +195,14 @@ test("一句话建议经键盘预览和人工应用，手机手改后才运行�
     { key: "circ_mv_lt", args: { threshold_yi: 90, offset: 0 } },
   ]);
   await expect(page.getByText(/条件已改，请重新运行/)).toHaveCount(0);
+  await description.fill("下一次想看的股票");
+  await recent.focus();
+  await page.keyboard.press("Enter");
+  await expect(description).toHaveValue("排除 ST，流通市值低于 80 亿");
+  await expect(description).toBeFocused();
+  expect(previews).toHaveLength(1);
+  expect(runs).toHaveLength(2);
+  await expectNoHorizontalOverflow(page, "screen recent descriptions phone");
   expect(findJargon(await page.locator("main").innerText())).toEqual([]);
   expect(watcher.problems).toEqual([]);
 });

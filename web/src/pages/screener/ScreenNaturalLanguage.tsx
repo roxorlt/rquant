@@ -10,6 +10,32 @@ import { Button, Panel, type ParameterValue, Tip } from "@/ui";
 
 type ConditionDescription = { label: string; parameters: string[] };
 export type EditableScreenCondition = { key: string; args: Record<string, ParameterValue> };
+const RECENT_DESCRIPTIONS_KEY = "rquant.screen.recent-descriptions.v1";
+const RECENT_LIMIT = 5;
+const DESCRIPTION_LIMIT = 500;
+
+function readRecentDescriptions(): string[] {
+  try {
+    const raw = window.sessionStorage.getItem(RECENT_DESCRIPTIONS_KEY);
+    if (!raw || raw.length > 16_384) return [];
+    const stored: unknown = JSON.parse(raw);
+    if (!Array.isArray(stored)) return [];
+    const descriptions: string[] = [];
+    for (const item of stored.slice(0, RECENT_LIMIT)) {
+      if (
+        typeof item === "string" &&
+        item.trim().length > 0 &&
+        item.length <= DESCRIPTION_LIMIT &&
+        !descriptions.includes(item)
+      ) {
+        descriptions.push(item);
+      }
+    }
+    return descriptions;
+  } catch {
+    return [];
+  }
+}
 
 function offsetLabel(offset: number): string {
   return offset === 1 ? "前一交易日" : `前 ${offset} 个交易日`;
@@ -145,6 +171,9 @@ export function ScreenNaturalLanguage({
   const [applied, setApplied] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [recentDescriptions, setRecentDescriptions] = useState(readRecentDescriptions);
+  const recentRef = useRef(recentDescriptions);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
   const controllerRef = useRef<AbortController | null>(null);
   const requestId = useRef(0);
   const context = JSON.stringify({
@@ -185,6 +214,27 @@ export function ScreenNaturalLanguage({
     setError(null);
   };
 
+  const rememberDescription = (description: string) => {
+    if (!description.trim() || description.length > DESCRIPTION_LIMIT) return;
+    const next = [description, ...recentRef.current.filter((item) => item !== description)].slice(
+      0,
+      RECENT_LIMIT,
+    );
+    recentRef.current = next;
+    setRecentDescriptions(next);
+    try {
+      window.sessionStorage.setItem(RECENT_DESCRIPTIONS_KEY, JSON.stringify(next));
+    } catch {
+      // The current tab still keeps the in-memory list when storage is unavailable.
+    }
+  };
+
+  const recallDescription = (description: string) => {
+    discardPending();
+    setInstruction(description);
+    textareaRef.current?.focus();
+  };
+
   const generate = async () => {
     const trimmed = instruction.trim();
     if (!available || !sourceKind || !sourceIdentity || !tradeDate || !trimmed || applied) return;
@@ -223,6 +273,7 @@ export function ScreenNaturalLanguage({
         return;
       }
       setSuggestion(preview);
+      rememberDescription(instruction);
     } catch (caught) {
       if (id !== requestId.current || requestedContext !== contextRef.current) return;
       if (caught instanceof ApiError && caught.status === 409) onConflict();
@@ -258,9 +309,10 @@ export function ScreenNaturalLanguage({
             <label className="field">
               <span className="lbl">选股描述</span>
               <textarea
+                ref={textareaRef}
                 className="inp"
                 rows={2}
-                maxLength={500}
+                maxLength={DESCRIPTION_LIMIT}
                 placeholder="例如：排除 ST，流通市值低于 80 亿"
                 value={instruction}
                 onChange={(event) => {
@@ -285,6 +337,28 @@ export function ScreenNaturalLanguage({
               {loading ? "正在生成…" : "生成条件"}
             </Button>
           </div>
+          <section className="screen-nl-recent" aria-label="最近描述">
+            <Tip content="仅保留当前标签页成功生成的描述。">
+              <strong className="screen-nl-recent-title">最近描述</strong>
+            </Tip>
+            {recentDescriptions.length === 0 ? (
+              <span className="screen-nl-note">暂无</span>
+            ) : (
+              <div className="screen-nl-recent-list">
+                {recentDescriptions.map((description) => (
+                  <button
+                    key={description}
+                    type="button"
+                    className="screen-nl-recent-item"
+                    title={description}
+                    onClick={() => recallDescription(description)}
+                  >
+                    {description}
+                  </button>
+                ))}
+              </div>
+            )}
+          </section>
           {loading ? (
             <p className="screen-nl-note" role="status">
               正在生成条件…
