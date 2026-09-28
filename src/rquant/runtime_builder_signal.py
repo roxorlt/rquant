@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import os
+import time
 from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
+from loguru import logger
 from pydantic import Field, StrictBool, StrictInt, field_validator, model_validator
 
 from rquant.delivery_contracts import DeliveryChannel, OutboxStatus
+from rquant.formula_pool_serving_projection import FormulaPoolServingConfig
 from rquant.notification_state import NotificationServingSnapshot, NotificationStateStore
 from rquant.notification_worker import (
     NotificationProvider,
@@ -67,6 +70,7 @@ if TYPE_CHECKING:
     from rquant.serving_page_projection_source import SignalPageProjectionProducer
 
 _MAX_BATCH_LIMIT = 1_000
+_BUS_PREFIX_LINK_MIN_INTERVAL_SECONDS = 60.0
 _SIGNALS_DATASET_ID = "signals"
 _ACTIVE_OUTBOX_STATUSES = frozenset({OutboxStatus.PENDING, OutboxStatus.RETRY, OutboxStatus.LEASED})
 
@@ -266,8 +270,10 @@ class NotifierSettings(RuntimeContractModel):
     page_projection_database_path: Path | None = None
     page_projection_surge_live_root: Path | None = None
     page_projection_canvas_catalog_root: Path | None = None
+    page_projection_user_presets_root: Path | None = None
     page_projection_canvas_receipt_root: Path | None = None
     page_projection_page_control_outbox_path: Path | None = None
+    page_projection_formula_pool_config: FormulaPoolServingConfig | None = None
     page_projection_canvas_active_key_id: str | None = Field(
         default=None,
         pattern=r"^[a-z0-9][a-z0-9_.-]{0,127}$",
@@ -320,6 +326,7 @@ class NotifierSettings(RuntimeContractModel):
         "page_projection_database_path",
         "page_projection_surge_live_root",
         "page_projection_canvas_catalog_root",
+        "page_projection_user_presets_root",
         "page_projection_canvas_receipt_root",
         "page_projection_page_control_outbox_path",
         "serving_authority_root",
@@ -348,20 +355,41 @@ class NotifierSettings(RuntimeContractModel):
             and self.page_projection_database_path is None
         ):
             raise ValueError("canvas catalog projection requires a page projection database")
+        if self.page_projection_user_presets_root is not None and (
+            self.page_projection_database_path is None
+            or self.page_projection_page_control_outbox_path is None
+        ):
+            raise ValueError("pool projection requires a database and PageControl audit")
+        if self.page_projection_formula_pool_config is not None and (
+            self.page_projection_database_path is None
+            or self.serving_authority_root is None
+            or self.page_projection_page_control_outbox_path is None
+        ):
+            raise ValueError(
+                "formula pool projection requires a database, signals authority "
+                "and PageControl audit"
+            )
         canvas_authority = (
             self.page_projection_canvas_receipt_root,
-            self.page_projection_page_control_outbox_path,
             self.page_projection_canvas_active_key_id,
             self.page_projection_canvas_active_public_key_pem,
         )
-        if self.page_projection_canvas_catalog_root is not None and any(
-            value is None for value in canvas_authority
+        if self.page_projection_canvas_catalog_root is not None and (
+            any(value is None for value in canvas_authority)
+            or self.page_projection_page_control_outbox_path is None
         ):
             raise ValueError("canvas catalog projection requires its full public authority")
         if self.page_projection_canvas_catalog_root is None and any(
             value is not None for value in canvas_authority
         ):
             raise ValueError("canvas projection authority requires a catalog root")
+        if (
+            self.page_projection_page_control_outbox_path is not None
+            and self.page_projection_canvas_catalog_root is None
+            and self.page_projection_user_presets_root is None
+            and self.page_projection_formula_pool_config is None
+        ):
+            raise ValueError("PageControl audit requires a canvas or pool projection")
         if (
             self.page_projection_canvas_active_key_id
             in self.page_projection_canvas_previous_public_key_pems
@@ -495,16 +523,27 @@ def _signal_source_result(
 ) -> SourceReadResult:
     from rquant.runtime_serving_snapshot import SignalDeliveryPayload, SourceReadResult
     from rquant.serving_contracts import FreshnessStatus
+    from rquant.serving_read_models import ServingProjectionPayload
 
     status = FreshnessStatus.DEGRADED if snapshot.truncated else FreshnessStatus.FRESH
     reason = (
         f"history_limit_truncated:{snapshot.omitted_signal_count}" if snapshot.truncated else None
     )
+    projections = snapshot.payload.projections
+    if snapshot.signal_observed_prefix is not None:
+        receipt = snapshot.signal_observed_prefix
+        projections += (
+            ServingProjectionPayload(
+                table_name="signal_observed_prefix",
+                available_at=receipt.source_inspected_at,
+                rows=(receipt.model_dump(mode="json"),),
+            ),
+        )
     writer_payload = SignalDeliveryPayload(
         signals=snapshot.payload.signals,
         routes=snapshot.payload.routes,
         deliveries=snapshot.payload.deliveries,
-        projections=snapshot.payload.projections,
+        projections=projections,
     )
     provisional = SourceReadResult(
         dataset_id=_SIGNALS_DATASET_ID,
@@ -653,6 +692,7 @@ def signal_router_builder(
     source_loader: SignalSourceLoader | None = None,
     target_resolver: TargetResolver | None = None,
     clock: Callable[[], datetime],
+    monotonic_clock: Callable[[], float] = time.monotonic,
     runtime_root: Path | None = None,
 ) -> RuntimeServiceBuilder:
     if (source_loader is None) != (target_resolver is None):
@@ -760,7 +800,10 @@ def signal_router_builder(
         if resolved_source_loader is None or resolved_target_resolver is None:
             raise RuntimeError("signal router dependencies are unavailable")
 
+        last_prefix_attempt_tick: float | None = None
+
         def step() -> RuntimeStepResult:
+            nonlocal last_prefix_attempt_tick
             before_publish = publish_signal_bus_prefix(
                 bus=bus,
                 spool=signal_spool,
@@ -888,6 +931,18 @@ def signal_router_builder(
                 spool=signal_spool,
                 limit=settings.batch_limit,
             )
+            if published.published_high_watermark >= published.source_high_watermark:
+                try:
+                    tick = monotonic_clock()
+                    if (
+                        last_prefix_attempt_tick is None
+                        or tick < last_prefix_attempt_tick
+                        or tick - last_prefix_attempt_tick >= _BUS_PREFIX_LINK_MIN_INTERVAL_SECONDS
+                    ):
+                        last_prefix_attempt_tick = tick
+                        signal_spool.publish_bus_prefix_link(bus=bus, observed_at=observed_at)
+                except Exception as exc:
+                    logger.warning("signal bus prefix link unavailable: {}", exc)
             return RuntimeStepResult(
                 input_sequence=input_sequence,
                 output_sequence=output_sequence,
@@ -1074,6 +1129,7 @@ def notifier_builder(
                         clock=clock,
                         surge_live_root=settings.page_projection_surge_live_root,
                         canvas_catalog_root=settings.page_projection_canvas_catalog_root,
+                        user_presets_root=settings.page_projection_user_presets_root,
                         canvas_receipt_root=settings.page_projection_canvas_receipt_root,
                         canvas_publication_keyring=canvas_keyring,
                         #: #241: the outbox belongs to the page-control service and its
@@ -1081,6 +1137,7 @@ def notifier_builder(
                         #: generation it reads with an open descriptor and writes nothing
                         #: anywhere, so this role needs no scratch directory of its own.
                         page_control_outbox=(settings.page_projection_page_control_outbox_path),
+                        formula_pool_config=settings.page_projection_formula_pool_config,
                         #: #255: the DuckDB build on the production host refuses
                         #: `/proc/self/fd/<n>` as well, and the branch that used to run
                         #: instead hard-linked beside the database -- `EROFS`, every
@@ -1134,6 +1191,8 @@ def notifier_builder(
             projection_published: bool | None = None
             if page_projection_producer is not None:
                 page_projection_producer.source.begin_replica_iteration()
+            # The clock is a lower bound for the verified spool read, never a later claim.
+            source_inspected_at = clock()
             descriptor = source.source_descriptor()
             cursor = store.replication_cursor()
             if settings.paused:
@@ -1184,6 +1243,7 @@ def notifier_builder(
                 descriptor,
                 visible_records,
                 observed_at=observed_at,
+                source_inspected_at=source_inspected_at,
             )
             loaded_providers = resolved_provider_loader()
             if settings.suppress_delivery:

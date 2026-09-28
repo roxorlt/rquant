@@ -26,6 +26,8 @@ RQUANT_SERVING_ROOT=/Users/<你>/rquant-web-serving RQUANT_WEB_STALE_AFTER_SECON
 pnpm -C web dev          # http://127.0.0.1:5173/
 ```
 
+选股接口默认沿用 Serving。仅在本地验证已核验只读副本时，同时设置 `RQUANT_WEB_SCREEN_PRIMARY_PATH`（预期来源的绝对路径）和 `RQUANT_WEB_SCREEN_REPLICA_PATH`（副本绝对路径）；网页只检查 sidecar 中的来源身份，不访问主库。配置后副本失效会报错，不回退 Serving。生产启用还需完成[副本接入门禁](../docs/plans/2026-09-27-screen-web-source-boundary.md)。
+
 ## 测试
 
 ```bash

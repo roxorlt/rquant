@@ -4,6 +4,227 @@
  */
 
 export interface paths {
+    "/api/v1/backtests": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 最近分钟回放 */
+        get: operations["list_backtests_api_v1_backtests_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/backtests/{run_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 分钟回放详情 */
+        get: operations["get_backtest_api_v1_backtests__run_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/data/audit-report/calendar": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 审计日期可选交易日 */
+        get: operations["get_data_audit_report_calendar_api_v1_data_audit_report_calendar_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/data/audit-report/commands": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 生成日线数据审计报告 */
+        post: operations["submit_data_audit_report_command_api_v1_data_audit_report_commands_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/data/backfill-plans": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 历史日线回补计划 */
+        get: operations["get_backfill_plans_api_v1_data_backfill_plans_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/data/backfill-plans/commands": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 生成历史日线回补计划 */
+        post: operations["submit_backfill_plan_command_api_v1_data_backfill_plans_commands_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/data/backfill-plans/{plan_hash}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 历史日线回补计划详情 */
+        get: operations["get_backfill_plan_detail_api_v1_data_backfill_plans__plan_hash__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/data/catalog": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 数据目录 */
+        get: operations["list_datasets_api_v1_data_catalog_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/data/catalog/{dataset}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 数据集字段说明 */
+        get: operations["get_dataset_api_v1_data_catalog__dataset__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/data/fundamentals/summary": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 财务数据概况 */
+        get: operations["get_fundamental_summary_api_v1_data_fundamentals_summary_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/data/health": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 数据审计状态 */
+        get: operations["get_data_health_api_v1_data_health_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/data/issues": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 数据审计问题 */
+        get: operations["get_data_issues_api_v1_data_issues_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/data/report": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 日线数据审计报告 */
+        get: operations["get_data_audit_report_api_v1_data_report_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/health": {
         parameters: {
             query?: never;
@@ -30,6 +251,57 @@ export interface paths {
         };
         /** 数据代、数据集水位与市场阶段 */
         get: operations["get_meta_api_v1_meta_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/monitor/ack": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 确认一条告警 */
+        post: operations["acknowledge_alert_api_v1_monitor_ack_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/monitor/channels": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 推送通道提交状态 */
+        get: operations["get_channels_api_v1_monitor_channels_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/monitor/timeline": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 告警时间线 */
+        get: operations["get_timeline_api_v1_monitor_timeline_get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -174,6 +446,312 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/paper/accounts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 模拟账户与持仓 */
+        get: operations["get_accounts_api_v1_paper_accounts_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/pools": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 已发布池子画布 */
+        get: operations["get_pools_api_v1_pools_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/pools/editor": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 可编辑池子与画布 */
+        get: operations["get_pool_editor_api_v1_pools_editor_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/pools/editor/commands": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 保存池子或管理画布 */
+        post: operations["submit_pool_editor_command_api_v1_pools_editor_commands_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/pools/editor/nl-preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 预览一句话修改池子 */
+        post: operations["preview_pool_natural_language_api_v1_pools_editor_nl_preview_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/pools/formula": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 公式池列表 */
+        get: operations["list_formula_pools_api_v1_pools_formula_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/pools/formula/commands": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 保存公式池 */
+        post: operations["submit_formula_pool_save_command_api_v1_pools_formula_commands_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/pools/formula/{base_name}/members": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 公式池命中代码 */
+        get: operations["get_formula_pool_members_api_v1_pools_formula__base_name__members_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/screen/blocks": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 选股条件目录 */
+        get: operations["get_blocks_api_v1_screen_blocks_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/screen/nl-preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 预览一句话选股条件 */
+        post: operations["preview_screen_natural_language_api_v1_screen_nl_preview_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/screen/run": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 运行选股条件 */
+        post: operations["run_screen_api_v1_screen_run_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/screen/tdx/market/commands": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 提交全市场公式选股 */
+        post: operations["submit_formula_market_command_api_v1_screen_tdx_market_commands_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/screen/tdx/market/jobs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 公式选股任务 */
+        get: operations["list_formula_market_jobs_api_v1_screen_tdx_market_jobs_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/screen/tdx/market/jobs/{task_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 公式选股任务详情 */
+        get: operations["get_formula_market_job_api_v1_screen_tdx_market_jobs__task_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/screen/tdx/market/jobs/{task_id}/matches": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 公式选股命中代码 */
+        get: operations["get_formula_market_matches_api_v1_screen_tdx_market_jobs__task_id__matches_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/screen/tdx/parse": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 检查通达信公式 */
+        post: operations["parse_tdx_formula_api_v1_screen_tdx_parse_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/screen/tdx/preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 单股预览通达信公式 */
+        post: operations["preview_tdx_formula_api_v1_screen_tdx_preview_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/screen/tdx/preview/source": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 公式预览数据 */
+        get: operations["get_tdx_preview_source_api_v1_screen_tdx_preview_source_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/stocks/search": {
         parameters: {
             query?: never;
@@ -208,10 +786,181 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/tasks/jobs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 研究任务队列 */
+        get: operations["get_jobs_api_v1_tasks_jobs_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tasks/jobs/{job_id}/events": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 研究任务进展 */
+        get: operations["get_job_events_api_v1_tasks_jobs__job_id__events_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tasks/overview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 任务与运行状态 */
+        get: operations["get_overview_api_v1_tasks_overview_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tasks/services/log-capabilities": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 可查看的服务日志 */
+        get: operations["get_log_capabilities_api_v1_tasks_services_log_capabilities_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tasks/services/{unit}/logs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 服务运行日志 */
+        get: operations["get_service_logs_api_v1_tasks_services__unit__logs_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/watchlist": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 我的盯盘名单 */
+        get: operations["list_manual_watchlist_api_v1_watchlist_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/watchlist/commands": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 加入或移出我的盯盘名单 */
+        post: operations["submit_manual_watchlist_command_api_v1_watchlist_commands_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/watchlist/{ts_code}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 盯盘状态 */
+        get: operations["get_manual_watchlist_item_api_v1_watchlist__ts_code__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /** AckCommandConflict */
+        AckCommandConflict: {
+            /** Code */
+            code?: "stale_generation_no_effect" | null;
+            /** Detail */
+            detail: string;
+        };
+        /** AckCommandReceipt */
+        AckCommandReceipt: {
+            /** Command Id */
+            command_id: string;
+            /** Confirmation Id */
+            confirmation_id?: string | null;
+            /** Message */
+            message: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "pending" | "processing" | "succeeded" | "failed" | "ambiguous";
+        };
+        /** AckCommandRequest */
+        AckCommandRequest: {
+            /** Alert Id */
+            alert_id: string;
+            /** Command Id */
+            command_id: string;
+            /** Generation Id */
+            generation_id: string;
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+        };
         /** ActionCount */
         ActionCount: {
             /** Action */
@@ -220,6 +969,54 @@ export interface components {
             count: number;
             /** Label */
             label: string;
+        };
+        /** AlertAcknowledgmentView */
+        AlertAcknowledgmentView: {
+            /** Alert Id */
+            alert_id?: string | null;
+            /** Confirmation Id */
+            confirmation_id?: string | null;
+            /** Confirmed At */
+            confirmed_at?: string | null;
+            /** Eligible */
+            eligible: boolean;
+            /** Label */
+            label: string;
+            /** Note */
+            note?: string | null;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "unavailable" | "historical" | "unconfirmed" | "confirmed";
+        };
+        /** Assignment */
+        Assignment: {
+            /** Name */
+            name: string;
+            /** Value */
+            value: components["schemas"]["NumberExpr"] | components["schemas"]["FieldExpr"] | components["schemas"]["LocalExpr"] | components["schemas"]["UnaryExpr"] | components["schemas"]["BinaryExpr"] | components["schemas"]["CallExpr"];
+        };
+        /** AttachPoolCommand */
+        AttachPoolCommand: {
+            /** Canvas Name */
+            canvas_name: string;
+            /** Command Id */
+            command_id: string;
+            /** Expected Pool Version */
+            expected_pool_version: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "add_pool_to_canvas";
+            /** Pool Name */
+            pool_name: string;
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
         };
         /** AttentionItem */
         AttentionItem: {
@@ -236,6 +1033,807 @@ export interface components {
             title: string;
             /** To */
             to: string;
+        };
+        /** AuditAttempt */
+        AuditAttempt: {
+            /** Completed At */
+            completed_at: string | null;
+            /** Label */
+            label: string;
+            /**
+             * Observed At
+             * Format: date-time
+             */
+            observed_at: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "running" | "completed" | "failed";
+        };
+        /** AuditReportCalendarData */
+        AuditReportCalendarData: {
+            /**
+             * Availability
+             * @enum {string}
+             */
+            availability: "ready" | "unavailable";
+            /** Earliest Selectable Date */
+            earliest_selectable_date: string | null;
+            /** Latest Closed Date */
+            latest_closed_date: string | null;
+            /** Open Dates */
+            open_dates: string[];
+        };
+        /** AuditReportCommandReceipt */
+        AuditReportCommandReceipt: {
+            /** Command Id */
+            command_id: string;
+            /** Message */
+            message: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "queued" | "pending" | "processing" | "failed" | "ambiguous";
+            /** Task Id */
+            task_id?: string | null;
+        };
+        /** AuditReportCommandRequest */
+        AuditReportCommandRequest: {
+            /**
+             * Audit Start
+             * Format: date
+             */
+            audit_start: string;
+            /** Command Id */
+            command_id: string;
+            /**
+             * Observed Through
+             * Format: date
+             */
+            observed_through: string;
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+        };
+        /** AuditReportIssue */
+        AuditReportIssue: {
+            /** Field Label */
+            field_label: string | null;
+            /** Field Name */
+            field_name: string | null;
+            /** Name */
+            name: string;
+            /** Null Rows */
+            null_rows: number | null;
+            /** Number */
+            number: number;
+            /** Observed Rows */
+            observed_rows: number | null;
+            /** Observed Value */
+            observed_value: string | null;
+            /** Reference Value */
+            reference_value: string | null;
+            /**
+             * Rule Id
+             * @enum {string}
+             */
+            rule_id: "daily_bar.close_above_limit" | "daily_bar.close_below_limit" | "daily_bar.zero_volume_unsuspended" | "daily_bar.field_null_ratio";
+            /**
+             * Trade Date
+             * Format: date
+             */
+            trade_date: string;
+            /** Ts Code */
+            ts_code: string | null;
+        };
+        /** AuditReportMonth */
+        AuditReportMonth: {
+            /** Coverage Ratio */
+            coverage_ratio: number | null;
+            /** Covered Open Days */
+            covered_open_days: number;
+            /** Expected Open Days */
+            expected_open_days: number;
+            /**
+             * Month
+             * Format: date
+             */
+            month: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "measured" | "no_expected_sessions";
+            /** Status Label */
+            status_label: string;
+        };
+        /** AuditReportOverview */
+        AuditReportOverview: {
+            /**
+             * Audit Start
+             * Format: date
+             */
+            audit_start: string;
+            /** Closed Day Count */
+            closed_day_count: number;
+            /** Collection Completed Through */
+            collection_completed_through: null;
+            /** Collection Label */
+            collection_label: string;
+            /**
+             * Collection Status
+             * @constant
+             */
+            collection_status: "collection_unconfirmed";
+            /**
+             * Coverage Conclusion
+             * @constant
+             */
+            coverage_conclusion: "unconfirmed";
+            /** Coverage Label */
+            coverage_label: string;
+            /** Covered Open Days */
+            covered_open_days: number;
+            /**
+             * Current
+             * @constant
+             */
+            current: false;
+            /** Expected Open Days */
+            expected_open_days: number;
+            /** Gap Count */
+            gap_count: number;
+            /** Indexed Issue Count */
+            indexed_issue_count: number;
+            /** Longest Gap Open Days */
+            longest_gap_open_days: number;
+            /** Missing Open Days */
+            missing_open_days: number;
+            /** Monthly Count */
+            monthly_count: number;
+            /**
+             * Observed Through
+             * Format: date
+             */
+            observed_through: string;
+            /** Omitted Issue Count */
+            omitted_issue_count: number;
+            /**
+             * Quality Conclusion
+             * @enum {string}
+             */
+            quality_conclusion: "not_fully_assessed" | "issues_observed" | "no_issues_observed";
+            /** Quality Issue Count */
+            quality_issue_count: number;
+            /** Quality Label */
+            quality_label: string;
+            /** Replica Generation Id */
+            replica_generation_id: null;
+            /** Report Hash */
+            report_hash: string;
+            /** Rule Count */
+            rule_count: number;
+            /**
+             * Rule Version
+             * @constant
+             */
+            rule_version: "daily-bar-quality-v1";
+            /**
+             * Run Status
+             * @constant
+             */
+            run_status: "completed";
+            /**
+             * Schema Version
+             * @constant
+             */
+            schema_version: 1;
+            /**
+             * Source Mode
+             * @constant
+             */
+            source_mode: "production_unverified";
+            /**
+             * Source Namespace
+             * @constant
+             */
+            source_namespace: "production";
+            /** Unassessed Rule Days */
+            unassessed_rule_days: number;
+        };
+        /** AuditReportRule */
+        AuditReportRule: {
+            /** Assessed Days */
+            assessed_days: number;
+            /** Assessment Complete */
+            assessment_complete: boolean;
+            /** Checked Days */
+            checked_days: number;
+            /** Expected Days */
+            expected_days: number;
+            /** Field Label */
+            field_label: string | null;
+            /** Field Name */
+            field_name: string | null;
+            /** First Assessed Date */
+            first_assessed_date: string | null;
+            /** Issue Count */
+            issue_count: number;
+            /** Last Assessed Date */
+            last_assessed_date: string | null;
+            /** Name */
+            name: string;
+            /**
+             * Rule Id
+             * @enum {string}
+             */
+            rule_id: "daily_bar.close_limit" | "daily_bar.zero_volume" | "daily_bar.field_null_ratio";
+            /** Unassessed Days */
+            unassessed_days: number;
+            /** Unassessed Reasons */
+            unassessed_reasons: components["schemas"]["AuditReportUnassessedReason"][];
+        };
+        /** AuditReportTaskEvent */
+        AuditReportTaskEvent: {
+            /**
+             * Event Type
+             * @enum {string}
+             */
+            event_type: "queued" | "started" | "resumed" | "source_check" | "succeeded" | "failed";
+            /** Label */
+            label: string;
+            /**
+             * Occurred At
+             * Format: date-time
+             */
+            occurred_at: string;
+        };
+        /** AuditReportTaskProgress */
+        AuditReportTaskProgress: {
+            /**
+             * Availability
+             * @enum {string}
+             */
+            availability: "unavailable" | "empty" | "ready";
+            /** Events */
+            events?: components["schemas"]["AuditReportTaskEvent"][];
+            /** Latest Attempts */
+            latest_attempts?: number | null;
+            /** Latest Created At */
+            latest_created_at?: string | null;
+            /** Latest Hint */
+            latest_hint?: string | null;
+            /** Latest Status */
+            latest_status?: ("queued" | "running" | "succeeded" | "failed") | null;
+            /** Latest Status Label */
+            latest_status_label?: string | null;
+            /** Latest Task Id */
+            latest_task_id?: string | null;
+            /** Latest Updated At */
+            latest_updated_at?: string | null;
+            /** Successful Created At */
+            successful_created_at?: string | null;
+            /** Successful Report Hash */
+            successful_report_hash?: string | null;
+            /** Successful Task Id */
+            successful_task_id?: string | null;
+            /** Successful Updated At */
+            successful_updated_at?: string | null;
+        };
+        /** AuditReportUnassessedReason */
+        AuditReportUnassessedReason: {
+            /** Days */
+            days: number;
+            /** Name */
+            name: string;
+            /**
+             * Reason
+             * @enum {string}
+             */
+            reason: "no_daily_bar" | "close_missing" | "limits_unavailable" | "volume_missing" | "suspension_unknown" | "no_observations";
+        };
+        /** AuditSuccess */
+        AuditSuccess: {
+            /**
+             * As Of Date
+             * Format: date
+             */
+            as_of_date: string;
+            /**
+             * Completed At
+             * Format: date-time
+             */
+            completed_at: string;
+            /** Finding Count */
+            finding_count: number;
+            /** P0 Count */
+            p0_count: number;
+            /**
+             * Range End
+             * Format: date
+             */
+            range_end: string;
+            /**
+             * Range Start
+             * Format: date
+             */
+            range_start: string;
+        };
+        /** BackfillEstimateAssumptions */
+        BackfillEstimateAssumptions: {
+            /** Adapter Seconds Per Operation */
+            adapter_seconds_per_operation: string;
+            /** Market Throttle Seconds Per Operation */
+            market_throttle_seconds_per_operation: string;
+            /** Retry Allowance Seconds Per Operation */
+            retry_allowance_seconds_per_operation: string;
+            /**
+             * Status Namechange Start
+             * Format: date
+             */
+            status_namechange_start: string;
+            /**
+             * Status Source As Of
+             * Format: date
+             */
+            status_source_as_of: string;
+            /** Status Throttle Seconds Per Operation */
+            status_throttle_seconds_per_operation: string;
+            /** Status Window Years */
+            status_window_years: number;
+        };
+        /** BackfillLogicalOperations */
+        BackfillLogicalOperations: {
+            /** Adj Factor */
+            adj_factor: number;
+            /** Daily */
+            daily: number;
+            /** Daily Basic */
+            daily_basic: number;
+            /** Namechange Context Batches */
+            namechange_context_batches: number;
+            /** Namechange Windows */
+            namechange_windows: number;
+            /** Stock St Upper Bound */
+            stock_st_upper_bound: number;
+            /** Total */
+            total: number;
+            /**
+             * Trade Cal
+             * @constant
+             */
+            trade_cal: 0;
+        };
+        /** BackfillPlanCommandReceipt */
+        BackfillPlanCommandReceipt: {
+            /** Command Id */
+            command_id: string;
+            /** Message */
+            message: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "queued" | "pending" | "processing" | "failed" | "ambiguous";
+            /** Task Id */
+            task_id?: string | null;
+        };
+        /** BackfillPlanCommandRequest */
+        BackfillPlanCommandRequest: {
+            /**
+             * Audit Start
+             * Format: date
+             */
+            audit_start: string;
+            /** Command Id */
+            command_id: string;
+            /**
+             * Completed Through
+             * Format: date
+             */
+            completed_through: string;
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+        };
+        /** BackfillPlanDetail */
+        BackfillPlanDetail: {
+            /**
+             * Audit Start
+             * Format: date
+             */
+            audit_start: string;
+            /**
+             * Collection Complete Verified
+             * @constant
+             */
+            collection_complete_verified: false;
+            /**
+             * Completed Through
+             * Format: date
+             */
+            completed_through: string;
+            /**
+             * Coverage Scope
+             * @constant
+             */
+            coverage_scope: "whole_day_presence_only";
+            /**
+             * Cutoff Observed At
+             * Format: date-time
+             */
+            cutoff_observed_at: string;
+            estimate: components["schemas"]["BackfillPlanEstimate"];
+            /** Estimated Seconds */
+            estimated_seconds: string;
+            /**
+             * Executable
+             * @constant
+             */
+            executable: false;
+            /** Gap Count */
+            gap_count: number;
+            /**
+             * Identity Verified
+             * @constant
+             */
+            identity_verified: false;
+            /** Missing Dates */
+            missing_dates: string[];
+            /** Missing Day Count */
+            missing_day_count: number;
+            /** Monthly */
+            monthly: components["schemas"]["BackfillPlanMonth"][];
+            /** Plan Hash */
+            plan_hash: string;
+            /**
+             * Published At
+             * Format: date-time
+             */
+            published_at: string;
+            /**
+             * Quota Status
+             * @constant
+             */
+            quota_status: "unverified";
+            /** Snapshot Label */
+            snapshot_label: string;
+            source: components["schemas"]["BackfillPlanSource"];
+            /**
+             * Source Mode
+             * @constant
+             */
+            source_mode: "production_unverified";
+        };
+        /** BackfillPlanDetailData */
+        BackfillPlanDetailData: {
+            plan?: components["schemas"]["BackfillPlanDetail"] | null;
+            progress?: components["schemas"]["BackfillPlanProgress"] | null;
+            /**
+             * Source State
+             * @enum {string}
+             */
+            source_state: "ready" | "empty" | "not_published" | "unavailable";
+        };
+        /** BackfillPlanEstimate */
+        BackfillPlanEstimate: {
+            /**
+             * Actual Http Calls Known
+             * @constant
+             */
+            actual_http_calls_known: false;
+            assumptions: components["schemas"]["BackfillEstimateAssumptions"];
+            /** Estimated Seconds */
+            estimated_seconds: string;
+            logical_operations: components["schemas"]["BackfillLogicalOperations"];
+            /**
+             * Quota Status
+             * @constant
+             */
+            quota_status: "unverified";
+        };
+        /** BackfillPlanItem */
+        BackfillPlanItem: {
+            /**
+             * Audit Start
+             * Format: date
+             */
+            audit_start: string;
+            /**
+             * Collection Complete Verified
+             * @constant
+             */
+            collection_complete_verified: false;
+            /**
+             * Completed Through
+             * Format: date
+             */
+            completed_through: string;
+            /**
+             * Cutoff Observed At
+             * Format: date-time
+             */
+            cutoff_observed_at: string;
+            /** Estimated Seconds */
+            estimated_seconds: string;
+            /**
+             * Executable
+             * @constant
+             */
+            executable: false;
+            /**
+             * Identity Verified
+             * @constant
+             */
+            identity_verified: false;
+            /** Missing Day Count */
+            missing_day_count: number;
+            /** Plan Hash */
+            plan_hash: string;
+            /**
+             * Published At
+             * Format: date-time
+             */
+            published_at: string;
+            /**
+             * Quota Status
+             * @constant
+             */
+            quota_status: "unverified";
+            /** Rank */
+            rank: number;
+            /** Snapshot Label */
+            snapshot_label: string;
+            /**
+             * Source Mode
+             * @constant
+             */
+            source_mode: "production_unverified";
+        };
+        /** BackfillPlanMonth */
+        BackfillPlanMonth: {
+            /** Covered Open Days */
+            covered_open_days: number;
+            /** Expected Open Days */
+            expected_open_days: number;
+            /** Missing Open Days */
+            missing_open_days: number;
+            /**
+             * Month
+             * Format: date
+             */
+            month: string;
+        };
+        /** BackfillPlanProgress */
+        BackfillPlanProgress: {
+            /** Attempts */
+            attempts?: number | null;
+            /**
+             * Availability
+             * @enum {string}
+             */
+            availability: "unavailable" | "empty" | "ready";
+            /** Created At */
+            created_at?: string | null;
+            /**
+             * Event History
+             * @default unavailable
+             * @enum {string}
+             */
+            event_history: "available" | "unavailable";
+            /** Logs */
+            logs?: components["schemas"]["BackfillPlanProgressLog"][];
+            /** Message */
+            message: string;
+            /** Plan Hash */
+            plan_hash?: string | null;
+            /** Status */
+            status?: ("queued" | "running" | "succeeded" | "failed") | null;
+            /** Task Id */
+            task_id?: string | null;
+            /** Updated At */
+            updated_at?: string | null;
+        };
+        /** BackfillPlanProgressLog */
+        BackfillPlanProgressLog: {
+            /** Attempts */
+            attempts: number;
+            /** Event Id */
+            event_id: number;
+            /**
+             * Event Type
+             * @enum {string}
+             */
+            event_type: "queued" | "started" | "resumed" | "source_check" | "succeeded" | "failed" | "retried";
+            /** Message */
+            message: string;
+            /**
+             * Occurred At
+             * Format: date-time
+             */
+            occurred_at: string;
+        };
+        /** BackfillPlanSource */
+        BackfillPlanSource: {
+            /** Claimed File Sha256 */
+            claimed_file_sha256: string;
+            /**
+             * Collection Complete Verified
+             * @constant
+             */
+            collection_complete_verified: false;
+            /**
+             * Identity Verified
+             * @constant
+             */
+            identity_verified: false;
+            /**
+             * Mode
+             * @constant
+             */
+            mode: "production_unverified";
+            /** Snapshot Label */
+            snapshot_label: string;
+        };
+        /** BackfillPlansData */
+        BackfillPlansData: {
+            /** Items */
+            items: components["schemas"]["BackfillPlanItem"][];
+            /** Next Cursor */
+            next_cursor?: string | null;
+            /** Page Size */
+            page_size: number;
+            progress?: components["schemas"]["BackfillPlanProgress"] | null;
+            /**
+             * Source State
+             * @enum {string}
+             */
+            source_state: "ready" | "empty" | "not_published" | "unavailable";
+            /** Total */
+            total?: number | null;
+        };
+        /** BacktestDetailData */
+        BacktestDetailData: {
+            /** Groups */
+            groups: components["schemas"]["BacktestGroup"][];
+            /** Next Offset */
+            next_offset: number | null;
+            run: components["schemas"]["BacktestRun"] | null;
+            /** Summary Available */
+            summary_available: boolean;
+            /** Total Trades */
+            total_trades: number;
+            /** Trades */
+            trades: components["schemas"]["BacktestTrade"][];
+            /** Trades Available */
+            trades_available: boolean;
+        };
+        /** BacktestGroup */
+        BacktestGroup: {
+            /** Best Ret Pct */
+            best_ret_pct: number | null;
+            /** Candidates */
+            candidates: number;
+            /** Entry Mode */
+            entry_mode: string;
+            /** Entry Mode Label */
+            entry_mode_label: string;
+            /** Gap Stop Rate Pct */
+            gap_stop_rate_pct: number | null;
+            /** Mean Ret Pct */
+            mean_ret_pct: number | null;
+            /** Median Ret Pct */
+            median_ret_pct: number | null;
+            /** Profile Variant */
+            profile_variant: string;
+            /** Profile Variant Label */
+            profile_variant_label: string;
+            /** Trades */
+            trades: number;
+            /** Trigger Rate Pct */
+            trigger_rate_pct: number | null;
+            /** Win Rate Pct */
+            win_rate_pct: number | null;
+            /** Worst Ret Pct */
+            worst_ret_pct: number | null;
+        };
+        /** BacktestListData */
+        BacktestListData: {
+            /** Available */
+            available: boolean;
+            /** Next Offset */
+            next_offset: number | null;
+            /** Runs */
+            runs: components["schemas"]["BacktestRun"][];
+            /** Total */
+            total: number;
+        };
+        /** BacktestRun */
+        BacktestRun: {
+            /** Candidates */
+            candidates: number;
+            /**
+             * Computed At
+             * Format: date-time
+             */
+            computed_at: string;
+            /** Configurations */
+            configurations: number;
+            /**
+             * End Date
+             * Format: date
+             */
+            end_date: string;
+            /** Max Hold Days */
+            max_hold_days: number;
+            /** Run Id */
+            run_id: string;
+            /**
+             * Start Date
+             * Format: date
+             */
+            start_date: string;
+            /** Trades */
+            trades: number;
+        };
+        /** BacktestTrade */
+        BacktestTrade: {
+            /** Entry Mode */
+            entry_mode: string;
+            /** Entry Mode Label */
+            entry_mode_label: string;
+            /** Entry Price */
+            entry_price: number | null;
+            /** Entry Time */
+            entry_time: string | null;
+            /** Exit Price */
+            exit_price: number | null;
+            /** Exit Reason */
+            exit_reason: string | null;
+            /** Exit Reason Label */
+            exit_reason_label: string;
+            /** Exit Time */
+            exit_time: string | null;
+            /** Name */
+            name: string | null;
+            /** Profile Variant */
+            profile_variant: string;
+            /** Profile Variant Label */
+            profile_variant_label: string;
+            /** Ret Pct */
+            ret_pct: number | null;
+            /**
+             * Signal Date
+             * Format: date
+             */
+            signal_date: string;
+            /** Trade Id */
+            trade_id: string;
+            /** Ts Code */
+            ts_code: string;
+        };
+        /** BinaryExpr */
+        BinaryExpr: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "binary";
+            /** Left */
+            left: components["schemas"]["NumberExpr"] | components["schemas"]["FieldExpr"] | components["schemas"]["LocalExpr"] | components["schemas"]["UnaryExpr"] | components["schemas"]["BinaryExpr"] | components["schemas"]["CallExpr"];
+            /**
+             * Op
+             * @enum {string}
+             */
+            op: "+" | "-" | "*" | "/" | ">" | ">=" | "<" | "<=" | "=" | "<>" | "AND" | "OR";
+            /** Right */
+            right: components["schemas"]["NumberExpr"] | components["schemas"]["FieldExpr"] | components["schemas"]["LocalExpr"] | components["schemas"]["UnaryExpr"] | components["schemas"]["BinaryExpr"] | components["schemas"]["CallExpr"];
         };
         /** BoardRow */
         BoardRow: {
@@ -274,6 +1872,47 @@ export interface components {
             system: string;
             /** Systems */
             systems: string[];
+        };
+        /** BuiltinPoolCopySource */
+        BuiltinPoolCopySource: {
+            /** Copy Block Reason */
+            copy_block_reason: string | null;
+            /** Copyable */
+            copyable: boolean;
+            /** Delay Days */
+            delay_days: number;
+            /**
+             * Delay Mode
+             * @enum {string}
+             */
+            delay_mode: "none" | "exact" | "legacy_window";
+            /** Depends On */
+            depends_on: string | null;
+            /** Description */
+            description: string;
+            /** Display Name */
+            display_name: string;
+            /** Include Columns */
+            include_columns: string[];
+            /** Key */
+            key: string;
+            ranking?: components["schemas"]["PoolRankingPlan"] | null;
+            /** Rule Calls */
+            rule_calls: components["schemas"]["EditorRuleCall"][];
+            /** Version */
+            version: string;
+        };
+        /** CallExpr */
+        CallExpr: {
+            /** Args */
+            args: (components["schemas"]["NumberExpr"] | components["schemas"]["FieldExpr"] | components["schemas"]["LocalExpr"] | components["schemas"]["UnaryExpr"] | components["schemas"]["BinaryExpr"] | components["schemas"]["CallExpr"])[];
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "call";
+            /** Name */
+            name: string;
         };
         /** CandidateGroup */
         CandidateGroup: {
@@ -317,6 +1956,106 @@ export interface components {
             /** Total */
             total: number;
         };
+        /** CatalogDatasetDetail */
+        CatalogDatasetDetail: {
+            /** Category */
+            category: string;
+            /** Dataset Id */
+            dataset_id: string;
+            /** Fields */
+            fields: components["schemas"]["CatalogField"][];
+            /** Name */
+            name: string;
+            /** Primary Key */
+            primary_key: string[];
+            /** Purpose */
+            purpose: string;
+            sample: components["schemas"]["CatalogSample"];
+            /**
+             * Sample Available
+             * @default false
+             */
+            sample_available: boolean;
+            /** Sample Fields */
+            sample_fields: components["schemas"]["CatalogField"][];
+            /** Schema Available */
+            schema_available: boolean;
+            /** Sources */
+            sources: string[];
+            /** Table Name */
+            table_name: string;
+            /** Update Note */
+            update_note: string;
+            /** Visibility Note */
+            visibility_note: string;
+        };
+        /** CatalogField */
+        CatalogField: {
+            /** Data Type */
+            data_type: string;
+            /** Description */
+            description: string;
+            /** Is Primary Key */
+            is_primary_key: boolean;
+            /** Key */
+            key: string;
+            /** Name */
+            name: string;
+            /** Unit */
+            unit: string | null;
+        };
+        /** CatalogList */
+        CatalogList: {
+            /** Datasets */
+            datasets: components["schemas"]["CatalogSummary"][];
+            /** Version */
+            version: number;
+        };
+        /** CatalogSample */
+        CatalogSample: {
+            /** Rows */
+            rows: {
+                [key: string]: string | number | boolean | null;
+            }[];
+            state: components["schemas"]["SampleState"];
+        };
+        /** CatalogSummary */
+        CatalogSummary: {
+            /** Category */
+            category: string;
+            /** Dataset Id */
+            dataset_id: string;
+            /** Name */
+            name: string;
+            /** Purpose */
+            purpose: string;
+            /** Schema Available */
+            schema_available: boolean;
+            /** Sources */
+            sources: string[];
+        };
+        /** CreateCanvasCommand */
+        CreateCanvasCommand: {
+            /** Command Id */
+            command_id: string;
+            /**
+             * Description
+             * @default
+             */
+            description: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "create_canvas";
+            /** Name */
+            name: string;
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+        };
         /** DailyBar */
         DailyBar: {
             /** Close */
@@ -351,6 +2090,65 @@ export interface components {
             name: string | null;
             /** Ts Code */
             ts_code: string;
+        };
+        /** DataAuditHealthData */
+        DataAuditHealthData: {
+            latest_attempt: components["schemas"]["AuditAttempt"] | null;
+            latest_success: components["schemas"]["AuditSuccess"] | null;
+            /**
+             * Source State
+             * @enum {string}
+             */
+            source_state: "ready" | "not_published" | "unavailable";
+        };
+        /** DataAuditIssueItem */
+        DataAuditIssueItem: {
+            /** Name */
+            name: string;
+            /** Number */
+            number: number;
+            /**
+             * Severity
+             * @enum {string}
+             */
+            severity: "P0" | "P1" | "P2" | "P3";
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "待处理" | "已处理";
+        };
+        /** DataAuditIssuesData */
+        DataAuditIssuesData: {
+            /** Dataset Name */
+            dataset_name: string;
+            /** Issues */
+            issues: components["schemas"]["DataAuditIssueItem"][];
+            /** Partial */
+            partial: boolean;
+            /**
+             * Source State
+             * @enum {string}
+             */
+            source_state: "ready" | "not_published" | "unavailable";
+            /** Total Count */
+            total_count: number;
+        };
+        /** DataAuditReportData */
+        DataAuditReportData: {
+            /** Issues */
+            issues: components["schemas"]["AuditReportIssue"][];
+            /** Months */
+            months: components["schemas"]["AuditReportMonth"][];
+            overview: components["schemas"]["AuditReportOverview"] | null;
+            progress?: components["schemas"]["AuditReportTaskProgress"];
+            /** Rules */
+            rules: components["schemas"]["AuditReportRule"][];
+            /**
+             * Source State
+             * @enum {string}
+             */
+            source_state: "ready" | "not_published" | "unavailable";
         };
         /** DatasetWatermarkInfo */
         DatasetWatermarkInfo: {
@@ -401,14 +2199,139 @@ export interface components {
             /** Total */
             total: number;
         };
+        /** EditableCanvas */
+        EditableCanvas: {
+            /** Command Id */
+            command_id: string;
+            /** Description */
+            description: string;
+            /** Name */
+            name: string;
+            /** Pool Refs */
+            pool_refs: string[];
+            /** Record Hash */
+            record_hash: string;
+            /** Version */
+            version: string;
+        };
+        /** EditablePool */
+        EditablePool: {
+            /** Delay Days */
+            delay_days: number;
+            /** Depends On */
+            depends_on: string | null;
+            /** Description */
+            description: string;
+            /** Display Name */
+            display_name: string;
+            /** Include Columns */
+            include_columns: string[];
+            /** Key */
+            key: string;
+            ranking?: components["schemas"]["PoolRankingPlan"] | null;
+            /** Rule Calls */
+            rule_calls: components["schemas"]["EditorRuleCall"][];
+            /**
+             * Save Kind
+             * @default save_user_pool_v2
+             * @enum {string}
+             */
+            save_kind: "save_user_pool_v2" | "save_user_pool_v3";
+            /** Version */
+            version: string;
+        };
+        /** EditorRuleCall */
+        EditorRuleCall: {
+            /** Args */
+            args: {
+                [key: string]: components["schemas"]["JsonValue"];
+            };
+            /** Name */
+            name: string;
+        };
+        /** Envelope[AuditReportCalendarData] */
+        Envelope_AuditReportCalendarData_: {
+            data: components["schemas"]["AuditReportCalendarData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[BackfillPlanDetailData] */
+        Envelope_BackfillPlanDetailData_: {
+            data: components["schemas"]["BackfillPlanDetailData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[BackfillPlansData] */
+        Envelope_BackfillPlansData_: {
+            data: components["schemas"]["BackfillPlansData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[BacktestDetailData] */
+        Envelope_BacktestDetailData_: {
+            data: components["schemas"]["BacktestDetailData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[BacktestListData] */
+        Envelope_BacktestListData_: {
+            data: components["schemas"]["BacktestListData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
         /** Envelope[BoardsData] */
         Envelope_BoardsData_: {
             data: components["schemas"]["BoardsData"];
             serving: components["schemas"]["ServingMeta"];
         };
+        /** Envelope[CatalogDatasetDetail] */
+        Envelope_CatalogDatasetDetail_: {
+            data: components["schemas"]["CatalogDatasetDetail"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[CatalogList] */
+        Envelope_CatalogList_: {
+            data: components["schemas"]["CatalogList"];
+            serving: components["schemas"]["ServingMeta"];
+        };
         /** Envelope[DailyData] */
         Envelope_DailyData_: {
             data: components["schemas"]["DailyData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[DataAuditHealthData] */
+        Envelope_DataAuditHealthData_: {
+            data: components["schemas"]["DataAuditHealthData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[DataAuditIssuesData] */
+        Envelope_DataAuditIssuesData_: {
+            data: components["schemas"]["DataAuditIssuesData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[DataAuditReportData] */
+        Envelope_DataAuditReportData_: {
+            data: components["schemas"]["DataAuditReportData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[FormulaMarketJobDetailData] */
+        Envelope_FormulaMarketJobDetailData_: {
+            data: components["schemas"]["FormulaMarketJobDetailData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[FormulaMarketJobListData] */
+        Envelope_FormulaMarketJobListData_: {
+            data: components["schemas"]["FormulaMarketJobListData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[FormulaMarketMatchesData] */
+        Envelope_FormulaMarketMatchesData_: {
+            data: components["schemas"]["FormulaMarketMatchesData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[FormulaPoolListData] */
+        Envelope_FormulaPoolListData_: {
+            data: components["schemas"]["FormulaPoolListData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[FormulaPoolMembersData] */
+        Envelope_FormulaPoolMembersData_: {
+            data: components["schemas"]["FormulaPoolMembersData"];
             serving: components["schemas"]["ServingMeta"];
         };
         /** Envelope[HealthData] */
@@ -421,6 +2344,16 @@ export interface components {
             data: components["schemas"]["IntradayData"];
             serving: components["schemas"]["ServingMeta"];
         };
+        /** Envelope[ManualWatchlistExactData] */
+        Envelope_ManualWatchlistExactData_: {
+            data: components["schemas"]["ManualWatchlistExactData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[ManualWatchlistListData] */
+        Envelope_ManualWatchlistListData_: {
+            data: components["schemas"]["ManualWatchlistListData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
         /** Envelope[MembersData] */
         Envelope_MembersData_: {
             data: components["schemas"]["MembersData"];
@@ -431,14 +2364,54 @@ export interface components {
             data: components["schemas"]["MetaData"];
             serving: components["schemas"]["ServingMeta"];
         };
+        /** Envelope[MonitorChannelsData] */
+        Envelope_MonitorChannelsData_: {
+            data: components["schemas"]["MonitorChannelsData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[MonitorTimelineData] */
+        Envelope_MonitorTimelineData_: {
+            data: components["schemas"]["MonitorTimelineData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
         /** Envelope[OverviewData] */
         Envelope_OverviewData_: {
             data: components["schemas"]["OverviewData"];
             serving: components["schemas"]["ServingMeta"];
         };
+        /** Envelope[PaperAccountsData] */
+        Envelope_PaperAccountsData_: {
+            data: components["schemas"]["PaperAccountsData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[PoolEditorData] */
+        Envelope_PoolEditorData_: {
+            data: components["schemas"]["PoolEditorData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[PoolsData] */
+        Envelope_PoolsData_: {
+            data: components["schemas"]["PoolsData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
         /** Envelope[PulseData] */
         Envelope_PulseData_: {
             data: components["schemas"]["PulseData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[ResearchJobsData] */
+        Envelope_ResearchJobsData_: {
+            data: components["schemas"]["ResearchJobsData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[ScreenCatalogData] */
+        Envelope_ScreenCatalogData_: {
+            data: components["schemas"]["ScreenCatalogData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[ScreenRunData] */
+        Envelope_ScreenRunData_: {
+            data: components["schemas"]["ScreenRunData"];
             serving: components["schemas"]["ServingMeta"];
         };
         /** Envelope[StockSearchData] */
@@ -461,6 +2434,11 @@ export interface components {
             data: components["schemas"]["SurgeSearchData"];
             serving: components["schemas"]["ServingMeta"];
         };
+        /** Envelope[TaskOverviewData] */
+        Envelope_TaskOverviewData_: {
+            data: components["schemas"]["TaskOverviewData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
         /** ErrorItem */
         ErrorItem: {
             /** At */
@@ -473,6 +2451,309 @@ export interface components {
             service_id: string;
             /** Summary */
             summary: string;
+        };
+        /** FieldExpr */
+        FieldExpr: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "field";
+            /** Name */
+            name: string;
+        };
+        /** FinancialFieldCount */
+        FinancialFieldCount: {
+            /**
+             * Key
+             * @enum {string}
+             */
+            key: "pe_ttm" | "pb" | "dv_ttm" | "roe" | "or_yoy" | "netprofit_yoy";
+            /** Known Count */
+            known_count: number | null;
+            /** Label */
+            label: string;
+            /** Reasons */
+            reasons: components["schemas"]["FinancialReasonCount"][];
+            /** Unit */
+            unit: string;
+            /** Unknown Count */
+            unknown_count: number | null;
+        };
+        /** FinancialReasonCount */
+        FinancialReasonCount: {
+            /** Count */
+            count: number;
+            /**
+             * Label
+             * @enum {string}
+             */
+            label: "尚无来源记录" | "披露尚未可见" | "字段缺值" | "来源证据不足" | "日历待核验" | "候选数量超限" | "数值不可用" | "其他原因";
+        };
+        /** FinancialSummarySource */
+        FinancialSummarySource: {
+            /** Identity */
+            identity: string;
+            /**
+             * Updated At
+             * Format: date-time
+             */
+            updated_at: string;
+        };
+        /** FormulaAst */
+        FormulaAst: {
+            /** Assignments */
+            assignments: components["schemas"]["Assignment"][];
+            /** Output */
+            output: components["schemas"]["NumberExpr"] | components["schemas"]["FieldExpr"] | components["schemas"]["LocalExpr"] | components["schemas"]["UnaryExpr"] | components["schemas"]["BinaryExpr"] | components["schemas"]["CallExpr"];
+            /** Output Name */
+            output_name: string | null;
+            /**
+             * Syntax Version
+             * @default tdx-v1
+             * @constant
+             */
+            syntax_version: "tdx-v1";
+        };
+        /** FormulaMarketCommandReceipt */
+        FormulaMarketCommandReceipt: {
+            /** Command Id */
+            command_id: string;
+            /** Message */
+            message: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "queued" | "pending" | "processing" | "failed" | "ambiguous" | "conflict";
+            /** Task Id */
+            task_id?: string | null;
+        };
+        /** FormulaMarketCommandRequest */
+        FormulaMarketCommandRequest: {
+            /** Command Id */
+            command_id: string;
+            /** Formula */
+            formula: string;
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+            /**
+             * Trade Date
+             * Format: date
+             */
+            trade_date: string;
+        };
+        /** FormulaMarketJobDetailData */
+        FormulaMarketJobDetailData: {
+            job: components["schemas"]["FormulaMarketJobItem"];
+            summary: components["schemas"]["FormulaMarketResultSummary"] | null;
+        };
+        /** FormulaMarketJobItem */
+        FormulaMarketJobItem: {
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /** Formula */
+            formula: string;
+            /** Hint */
+            hint: string;
+            /** Result Available */
+            result_available: boolean;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "queued" | "running" | "succeeded" | "failed";
+            /** Status Label */
+            status_label: string;
+            /** Task Id */
+            task_id: string;
+            /**
+             * Trade Date
+             * Format: date
+             */
+            trade_date: string;
+            /**
+             * Updated At
+             * Format: date-time
+             */
+            updated_at: string;
+        };
+        /** FormulaMarketJobListData */
+        FormulaMarketJobListData: {
+            /**
+             * Availability
+             * @enum {string}
+             */
+            availability: "unavailable" | "not_published" | "empty" | "ready";
+            /** Available At */
+            available_at: string | null;
+            /** Has Older Tasks */
+            has_older_tasks: boolean;
+            /** Jobs */
+            jobs: components["schemas"]["FormulaMarketJobItem"][];
+            /** Message */
+            message: string;
+            /** Total Task Count */
+            total_task_count: number;
+        };
+        /** FormulaMarketMatchesData */
+        FormulaMarketMatchesData: {
+            /** Match Codes */
+            match_codes: string[];
+            /** Next Cursor */
+            next_cursor: string | null;
+            /** Offset */
+            offset: number;
+            /** Task Id */
+            task_id: string;
+            /** Total */
+            total: number;
+        };
+        /** FormulaMarketResultSummary */
+        FormulaMarketResultSummary: {
+            /** Listed Count */
+            listed_count: number;
+            /** Market Total */
+            market_total: number;
+            /** Match Count */
+            match_count: number;
+            /** No Match Count */
+            no_match_count: number;
+            /** Paused Count */
+            paused_count: number;
+            /** Unknown Count */
+            unknown_count: number;
+            /** Unknown Reasons */
+            unknown_reasons: components["schemas"]["FormulaMarketUnknownReason"][];
+        };
+        /** FormulaMarketUnknownReason */
+        FormulaMarketUnknownReason: {
+            /** Count */
+            count: number;
+            /** Label */
+            label: string;
+            /** Reason */
+            reason: string;
+        };
+        /** FormulaPoolItem */
+        FormulaPoolItem: {
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /** Display Name */
+            display_name: string;
+            /** Formula */
+            formula: string;
+            latest_result: components["schemas"]["FormulaPoolLatestResult"] | null;
+            /** Pool Name */
+            pool_name: string;
+            /** Status Label */
+            status_label: string;
+            /** Syntax Version */
+            syntax_version: string;
+            /** Version */
+            version: string;
+        };
+        /** FormulaPoolLatestResult */
+        FormulaPoolLatestResult: {
+            /** Market Total */
+            market_total: number;
+            /** Match Count */
+            match_count: number;
+            /** No Match Count */
+            no_match_count: number;
+            /**
+             * Trade Date
+             * Format: date
+             */
+            trade_date: string;
+            /** Unknown Count */
+            unknown_count: number;
+            /** Unknown Reasons */
+            unknown_reasons: components["schemas"]["FormulaPoolUnknownReason"][];
+        };
+        /** FormulaPoolListData */
+        FormulaPoolListData: {
+            /**
+             * Availability
+             * @enum {string}
+             */
+            availability: "unavailable" | "not_published" | "empty" | "ready";
+            /** Available At */
+            available_at: string | null;
+            /** Message */
+            message: string;
+            /** Pools */
+            pools: components["schemas"]["FormulaPoolItem"][];
+        };
+        /** FormulaPoolMembersData */
+        FormulaPoolMembersData: {
+            /** Match Codes */
+            match_codes: string[];
+            /** Next Cursor */
+            next_cursor: string | null;
+            /** Offset */
+            offset: number;
+            /** Pool Name */
+            pool_name: string;
+            /** Total */
+            total: number;
+            /**
+             * Trade Date
+             * Format: date
+             */
+            trade_date: string;
+        };
+        /** FormulaPoolSaveCommandReceipt */
+        FormulaPoolSaveCommandReceipt: {
+            /** Command Id */
+            command_id: string;
+            /** Message */
+            message: string;
+            /** Pool Name */
+            pool_name?: string | null;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "succeeded" | "pending" | "processing" | "failed" | "ambiguous" | "conflict";
+            /** Version */
+            version?: string | null;
+        };
+        /** FormulaPoolSaveCommandRequest */
+        FormulaPoolSaveCommandRequest: {
+            /** Base Name */
+            base_name: string;
+            /** Command Id */
+            command_id: string;
+            /** Display Name */
+            display_name: string;
+            /** Expected Version */
+            expected_version: null;
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+            /** Task Id */
+            task_id: string;
+        };
+        /** FormulaPoolUnknownReason */
+        FormulaPoolUnknownReason: {
+            /** Count */
+            count: number;
+            /** Label */
+            label: string;
+            /** Reason */
+            reason: string;
         };
         /** FreshnessItem */
         FreshnessItem: {
@@ -503,6 +2784,28 @@ export interface components {
             no_source: number;
             /** On Time */
             on_time: number;
+        };
+        /** FundamentalSummaryData */
+        FundamentalSummaryData: {
+            /**
+             * Coverage Note
+             * @constant
+             */
+            coverage_note: "全市场覆盖尚未核验";
+            /** Decision Date */
+            decision_date: string | null;
+            /** Fields */
+            fields: components["schemas"]["FinancialFieldCount"][];
+            /** Record Count */
+            record_count: number | null;
+            source: components["schemas"]["FinancialSummarySource"] | null;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "ready" | "not_configured" | "calendar_unavailable" | "no_records";
+            /** Waiting For Today */
+            waiting_for_today: boolean;
         };
         /** GenerationInfo */
         GenerationInfo: {
@@ -573,6 +2876,178 @@ export interface components {
             name: string | null;
             /** Ts Code */
             ts_code: string;
+        };
+        /** JobCounts */
+        JobCounts: {
+            /** Cancelled */
+            cancelled: number;
+            /** Checkpointed */
+            checkpointed: number;
+            /** Failed */
+            failed: number;
+            /** Other */
+            other: number;
+            /** Queued */
+            queued: number;
+            /** Running */
+            running: number;
+            /** Succeeded */
+            succeeded: number;
+        };
+        /** JournalEntry */
+        JournalEntry: {
+            /**
+             * At
+             * Format: date-time
+             */
+            at: string;
+            /**
+             * Level
+             * @enum {string}
+             */
+            level: "紧急" | "警报" | "严重" | "错误" | "警告" | "注意" | "信息" | "调试";
+            /**
+             * Text
+             * @enum {string}
+             */
+            text: "任务已开始" | "任务已完成" | "任务未完成" | "该条内容暂不可显示";
+        };
+        /** JournalPage */
+        JournalPage: {
+            /** Entries */
+            entries: components["schemas"]["JournalEntry"][];
+            /** Next Cursor */
+            next_cursor?: string | null;
+            /**
+             * Scope
+             * @default 本机本次开机以来的服务日志（含手动运行）
+             * @constant
+             */
+            scope: "本机本次开机以来的服务日志（含手动运行）";
+            /** Service Label */
+            service_label: string;
+        };
+        JsonValue: unknown;
+        /** LocalExpr */
+        LocalExpr: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "local";
+            /** Name */
+            name: string;
+        };
+        /** LogCapabilities */
+        LogCapabilities: {
+            /**
+             * Units
+             * @default []
+             */
+            units: string[];
+        };
+        /** ManualWatchlistCommandReceipt */
+        ManualWatchlistCommandReceipt: {
+            /**
+             * Action
+             * @enum {string}
+             */
+            action: "add" | "remove";
+            /** Command Id */
+            command_id: string;
+            /** Message */
+            message: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "pending" | "processing" | "saved_syncing" | "published" | "conflict" | "capacity" | "failed" | "uncertain";
+            /** Ts Code */
+            ts_code: string;
+            /** Version */
+            version?: number | null;
+        };
+        /** ManualWatchlistCommandRequest */
+        ManualWatchlistCommandRequest: {
+            /**
+             * Action
+             * @enum {string}
+             */
+            action: "add" | "remove";
+            /** Command Id */
+            command_id: string;
+            /** Expected Version */
+            expected_version?: number | null;
+            /** Expires At */
+            expires_at?: string | null;
+            /** Generation Id */
+            generation_id: string;
+            /** Price Levels */
+            price_levels?: (number | string)[] | null;
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+            source?: components["schemas"]["WatchlistSource"] | null;
+            /** Ts Code */
+            ts_code: string;
+        };
+        /** ManualWatchlistExactData */
+        ManualWatchlistExactData: {
+            /**
+             * Availability
+             * @enum {string}
+             */
+            availability: "ready" | "unavailable";
+            /** Available At */
+            available_at: string | null;
+            /** Expires At */
+            expires_at: string | null;
+            /** Message */
+            message: string;
+            /** Price Levels */
+            price_levels: string[];
+            source: components["schemas"]["WatchlistSource"] | null;
+            /** Status */
+            status: ("active" | "expired" | "deleted" | "absent") | null;
+            /** Ts Code */
+            ts_code: string;
+            /** Updated At */
+            updated_at: string | null;
+            /** Version */
+            version: number | null;
+        };
+        /** ManualWatchlistItemData */
+        ManualWatchlistItemData: {
+            /** Expires At */
+            expires_at: string | null;
+            /** Price Levels */
+            price_levels: string[];
+            source: components["schemas"]["WatchlistSource"];
+            /** Ts Code */
+            ts_code: string;
+            /**
+             * Updated At
+             * Format: date-time
+             */
+            updated_at: string;
+            /** Version */
+            version: number;
+        };
+        /** ManualWatchlistListData */
+        ManualWatchlistListData: {
+            /**
+             * Availability
+             * @enum {string}
+             */
+            availability: "ready" | "unavailable";
+            /** Available At */
+            available_at: string | null;
+            /** Items */
+            items: components["schemas"]["ManualWatchlistItemData"][];
+            /** Message */
+            message: string;
         };
         /** MarketInfo */
         MarketInfo: {
@@ -667,6 +3142,231 @@ export interface components {
             /** Volume */
             volume: number | null;
         };
+        /** MonitorChannelSubmission */
+        MonitorChannelSubmission: {
+            /**
+             * Channel
+             * @enum {string}
+             */
+            channel: "pushdeer" | "pushplus";
+            /** Channel Label */
+            channel_label: string;
+            /** Last Success At */
+            last_success_at: string | null;
+            /** Seven Day Attempts */
+            seven_day_attempts: number;
+            /** Seven Day Submitted */
+            seven_day_submitted: number;
+            /** Seven Day Success Pct */
+            seven_day_success_pct: number | null;
+            /** Today Submitted */
+            today_submitted: number;
+        };
+        /** MonitorChannelsData */
+        MonitorChannelsData: {
+            /** Channels */
+            channels: components["schemas"]["MonitorChannelSubmission"][];
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "ready" | "unavailable";
+        };
+        /** MonitorNotification */
+        MonitorNotification: {
+            /**
+             * At
+             * Format: date-time
+             */
+            at: string;
+            /** Channel Label */
+            channel_label: string;
+            /** Event Key */
+            event_key: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "notification";
+            /** Scene Label */
+            scene_label: string;
+            /** Submission Label */
+            submission_label: string;
+            /** Submitted */
+            submitted: boolean;
+        };
+        /** MonitorReceipt */
+        MonitorReceipt: {
+            /** Attempt Count */
+            attempt_count: number;
+            /** Channel */
+            channel: string;
+            /** Channel Label */
+            channel_label: string;
+            /** Outbox Id */
+            outbox_id: string;
+            /** Recipient Id */
+            recipient_id: string;
+            /** Status */
+            status: string;
+            /** Status Label */
+            status_label: string;
+            /**
+             * Updated At
+             * Format: date-time
+             */
+            updated_at: string;
+        };
+        /** MonitorSignal */
+        MonitorSignal: {
+            acknowledgment?: components["schemas"]["AlertAcknowledgmentView"];
+            /** Action */
+            action: string;
+            /** Action Label */
+            action_label: string;
+            /**
+             * At
+             * Format: date-time
+             */
+            at: string;
+            /** Code */
+            code: string;
+            /**
+             * Delivery
+             * @enum {string}
+             */
+            delivery: "delivered" | "recorded" | "unconfirmed" | "sending" | "failed" | "expired" | "none";
+            /** Delivery Label */
+            delivery_label: string;
+            /** Delivery Note */
+            delivery_note: string | null;
+            /** Event Key */
+            event_key: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "signal";
+            /** Name */
+            name: string | null;
+            /** Reasons */
+            reasons: string[];
+            /** Receipts */
+            receipts: components["schemas"]["MonitorReceipt"][];
+            /** Sequence */
+            sequence: number;
+            /** Signal Id */
+            signal_id: string;
+            /** Strategy Id */
+            strategy_id: string;
+            /** Strategy Name */
+            strategy_name: string;
+        };
+        /** MonitorSurge */
+        MonitorSurge: {
+            acknowledgment?: components["schemas"]["AlertAcknowledgmentView"];
+            /**
+             * At
+             * Format: date-time
+             */
+            at: string;
+            /** Code */
+            code: string;
+            /** Event Key */
+            event_key: string;
+            /** Event Label */
+            event_label: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "surge";
+            /** Name */
+            name: string | null;
+            /** Pct Chg */
+            pct_chg: number | null;
+            /** Price */
+            price: number | null;
+            /** Status Label */
+            status_label: string;
+        };
+        /** MonitorTimelineData */
+        MonitorTimelineData: {
+            /** Items */
+            items: (components["schemas"]["MonitorSignal"] | components["schemas"]["MonitorTrigger"] | components["schemas"]["MonitorSurge"] | components["schemas"]["MonitorNotification"])[];
+            /** Market Note */
+            market_note: string | null;
+            /**
+             * Mode
+             * @enum {string}
+             */
+            mode: "live" | "shadow" | "unknown";
+            /** Mode Label */
+            mode_label: string;
+            /** Mode Note */
+            mode_note: string | null;
+            /** Next Cursor */
+            next_cursor: string | null;
+            /** Page Size */
+            page_size: number;
+            /** Receipt Label */
+            receipt_label: string;
+            /**
+             * Receipt State
+             * @enum {string}
+             */
+            receipt_state: "not_published" | "no_receipts" | "has_receipts" | "truncated";
+            /** Source Label */
+            source_label: string;
+            /** Source Note */
+            source_note: string | null;
+            /**
+             * Source State
+             * @enum {string}
+             */
+            source_state: "unavailable" | "not_published" | "empty" | "ready";
+            /** Total */
+            total: number | null;
+            unacknowledged?: components["schemas"]["UnacknowledgedSummary"];
+        };
+        /** MonitorTrigger */
+        MonitorTrigger: {
+            acknowledgment?: components["schemas"]["AlertAcknowledgmentView"];
+            /**
+             * At
+             * Format: date-time
+             */
+            at: string;
+            /** Code */
+            code: string;
+            /** Event Key */
+            event_key: string;
+            /** Event Label */
+            event_label: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "monitor";
+            /** Level Price */
+            level_price: number | null;
+            /** Name */
+            name: string | null;
+            /** Price */
+            price: number | null;
+            /** Status Label */
+            status_label: string;
+        };
+        /** NumberExpr */
+        NumberExpr: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "number";
+            /** Value */
+            value: number;
+        };
         /** OverviewData */
         OverviewData: {
             /** Attention */
@@ -680,6 +3380,7 @@ export interface components {
             services: components["schemas"]["StateCounts"];
             session: components["schemas"]["SessionInfo"];
             signals: components["schemas"]["SignalsSummary"];
+            unacknowledged?: components["schemas"]["UnacknowledgedSummary"];
         };
         /**
          * PageDataStatus
@@ -700,6 +3401,174 @@ export interface components {
             /** Unpublished */
             unpublished: components["schemas"]["TableItem"][];
         };
+        /** PaperAccountItem */
+        PaperAccountItem: {
+            /** Account Id */
+            account_id: string;
+            /**
+             * As Of
+             * Format: date-time
+             */
+            as_of: string;
+            /** Cash */
+            cash: number;
+            /** Holdings */
+            holdings: components["schemas"]["PaperHoldingItem"][];
+            /** Market Value */
+            market_value: number;
+            /** Nav */
+            nav: number;
+            /** Unrealized Pnl */
+            unrealized_pnl: number;
+        };
+        /** PaperAccountsData */
+        PaperAccountsData: {
+            /** Accounts */
+            accounts: components["schemas"]["PaperAccountItem"][];
+            history: components["schemas"]["PaperHistoryData"];
+            /** Source Note */
+            source_note: string | null;
+            /**
+             * Source State
+             * @enum {string}
+             */
+            source_state: "ready" | "empty" | "not_published" | "unavailable";
+            /** Source Updated At */
+            source_updated_at: string | null;
+            /** Valuation Note */
+            valuation_note: string | null;
+        };
+        /** PaperFillItem */
+        PaperFillItem: {
+            /** Commission */
+            commission: string;
+            /**
+             * Executed At
+             * Format: date-time
+             */
+            executed_at: string;
+            /** Fill Id */
+            fill_id: string;
+            /**
+             * Persisted At
+             * Format: date-time
+             */
+            persisted_at: string;
+            /** Price */
+            price: string;
+            /** Quantity */
+            quantity: number;
+            /** Sequence */
+            sequence: number;
+            /** Tax */
+            tax: string;
+            /** Total Fees */
+            total_fees: string | null;
+            /** Transfer Fee */
+            transfer_fee: string | null;
+        };
+        /** PaperHistoryData */
+        PaperHistoryData: {
+            /** Account Id */
+            account_id: string | null;
+            /** Has More */
+            has_more: boolean;
+            /** Newest Updated At */
+            newest_updated_at: string | null;
+            /** Oldest Updated At */
+            oldest_updated_at: string | null;
+            /** Orders */
+            orders: components["schemas"]["PaperOrderItem"][];
+            /** Source Note */
+            source_note: string | null;
+            /**
+             * Source State
+             * @enum {string}
+             */
+            source_state: "ready" | "empty" | "not_published" | "unavailable";
+            /** Source Updated At */
+            source_updated_at: string | null;
+            /** Total Orders */
+            total_orders: number | null;
+        };
+        /** PaperHoldingItem */
+        PaperHoldingItem: {
+            /** Available Quantity */
+            available_quantity: number;
+            /** Average Cost */
+            average_cost: number;
+            /** Code */
+            code: string;
+            /** Market Price */
+            market_price: number;
+            /** Market Value */
+            market_value: number;
+            /** Name */
+            name: string | null;
+            /** Quantity */
+            quantity: number;
+            /** Unrealized Pct */
+            unrealized_pct: number | null;
+            /** Unrealized Pnl */
+            unrealized_pnl: number;
+        };
+        /** PaperOrderItem */
+        PaperOrderItem: {
+            /** Average Fill Price */
+            average_fill_price: string | null;
+            /** Code */
+            code: string;
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /** Filled Quantity */
+            filled_quantity: number;
+            /** Fills */
+            fills: components["schemas"]["PaperFillItem"][];
+            /** Name */
+            name: string | null;
+            /** Order Id */
+            order_id: string;
+            order_type: components["schemas"]["PaperOrderType"];
+            /** Quantity */
+            quantity: number;
+            /** Reject Message */
+            reject_message: string | null;
+            reject_reason: components["schemas"]["PaperRejectReason"] | null;
+            side: components["schemas"]["PaperSide"];
+            /** Side Label */
+            side_label: string;
+            status: components["schemas"]["PaperOrderStatus"];
+            /** Status Label */
+            status_label: string;
+            /**
+             * Updated At
+             * Format: date-time
+             */
+            updated_at: string;
+        };
+        /**
+         * PaperOrderStatus
+         * @enum {string}
+         */
+        PaperOrderStatus: "PENDING" | "ACCEPTED" | "PARTIALLY_FILLED" | "FILLED" | "REJECTED" | "CANCELLED" | "EXPIRED";
+        /**
+         * PaperOrderType
+         * @enum {string}
+         */
+        PaperOrderType: "MARKET" | "LIMIT";
+        /**
+         * PaperRejectReason
+         * @enum {string}
+         */
+        PaperRejectReason: "T_PLUS_ONE" | "SUSPENDED" | "LIMIT_LOCKED" | "INSUFFICIENT_CASH" | "INSUFFICIENT_POSITION" | "INVALID_LOT" | "EXPIRED" | "RISK_REJECTED";
+        /**
+         * PaperSide
+         * @enum {string}
+         */
+        PaperSide: "BUY" | "SELL";
         /** PaperSummary */
         PaperSummary: {
             /** Account Id */
@@ -722,6 +3591,17 @@ export interface components {
             /** Unrealized Pnl */
             unrealized_pnl: number;
         };
+        /** ParseIssue */
+        ParseIssue: {
+            /**
+             * Code
+             * @enum {string}
+             */
+            code: "syntax" | "type" | "range" | "future" | "limit" | "name";
+            /** Message */
+            message: string;
+            position: components["schemas"]["SourcePosition"];
+        };
         /** PipelineStage */
         PipelineStage: {
             /** Hint */
@@ -742,6 +3622,228 @@ export interface components {
             /** Window */
             window: string;
         };
+        /** PoolDefinitionView */
+        PoolDefinitionView: {
+            /** Delay Label */
+            delay_label: string | null;
+            /** Depends On */
+            depends_on: string | null;
+            /** Description */
+            description: string | null;
+            /** Name */
+            name: string;
+            ranking?: components["schemas"]["PoolRankingView"] | null;
+            /** Reason Label */
+            reason_label: string | null;
+            /** Rules */
+            rules: components["schemas"]["PoolRuleItem"][];
+            /** Source Label */
+            source_label: string;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "available" | "migration_required" | "unavailable" | "deleted" | "limit_exceeded";
+            /** Status Label */
+            status_label: string;
+        };
+        /** PoolEditorData */
+        PoolEditorData: {
+            /** Canvas Create Available */
+            canvas_create_available: boolean;
+            /** Canvases */
+            canvases: components["schemas"]["EditableCanvas"][];
+            /** Copy Sources */
+            copy_sources: components["schemas"]["BuiltinPoolCopySource"][];
+            /**
+             * Nl Preview Available
+             * @default false
+             */
+            nl_preview_available: boolean;
+            /** Pools */
+            pools: components["schemas"]["EditablePool"][];
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "ready" | "unavailable";
+        };
+        /** PoolEditorReceipt */
+        PoolEditorReceipt: {
+            /** Canvas Name */
+            canvas_name?: string | null;
+            /** Canvas Record Hash */
+            canvas_record_hash?: string | null;
+            /** Command Id */
+            command_id: string;
+            /** Message */
+            message: string;
+            /** Pool Version */
+            pool_version?: string | null;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "pending" | "processing" | "succeeded" | "failed" | "ambiguous";
+        };
+        /** PoolMember */
+        PoolMember: {
+            /** Close */
+            close: number | null;
+            /** Code */
+            code: string;
+            /** Entry Close */
+            entry_close: number | null;
+            /** Entry Line Price */
+            entry_line_price: number | null;
+            /** Entry Trade Date */
+            entry_trade_date: string | null;
+            /** Gain Pct */
+            gain_pct: number | null;
+            /** Gain Through Date */
+            gain_through_date: string | null;
+            /** Name */
+            name: string | null;
+            /** Pct Chg */
+            pct_chg: number | null;
+        };
+        /** PoolNlPreview */
+        PoolNlPreview: {
+            /** Base Generation Id */
+            base_generation_id: string;
+            /** Base Version */
+            base_version: string;
+            /** Changes */
+            changes: components["schemas"]["PoolRuleChange"][];
+            /** Message */
+            message?: string | null;
+            /** Pool Key */
+            pool_key: string;
+            /** Rule Calls */
+            rule_calls: components["schemas"]["EditorRuleCall"][];
+        };
+        /** PoolNlPreviewRequest */
+        PoolNlPreviewRequest: {
+            /** Expected Version */
+            expected_version: string;
+            /** Generation Id */
+            generation_id: string;
+            /** Instruction */
+            instruction: string;
+            /** Pool Key */
+            pool_key: string;
+        };
+        /** PoolRankingCondition */
+        PoolRankingCondition: {
+            /** Ascending */
+            ascending: boolean;
+            /**
+             * Metric
+             * @enum {string}
+             */
+            metric: "RETURN_20D_PCT[0]" | "TURNOVER_RATE[0]" | "CIRC_MV[0]" | "PCT_CHG[0]";
+            /** Weight */
+            weight: number;
+        };
+        /** PoolRankingItem */
+        PoolRankingItem: {
+            /** Direction Label */
+            direction_label: string;
+            /** Label */
+            label: string;
+            /** Weight */
+            weight: number;
+        };
+        /** PoolRankingPlan */
+        PoolRankingPlan: {
+            /** Conditions */
+            conditions: components["schemas"]["PoolRankingCondition"][];
+            /** Top N */
+            top_n: number;
+        };
+        /** PoolRankingView */
+        PoolRankingView: {
+            /** Conditions */
+            conditions: components["schemas"]["PoolRankingItem"][];
+            /** Top N */
+            top_n: number;
+        };
+        /** PoolResultView */
+        PoolResultView: {
+            /** Hit Count */
+            hit_count: number | null;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "current_rules" | "older_rules" | "rules_changed" | "unverified" | "not_run" | "unavailable";
+            /** Status Label */
+            status_label: string;
+            /** Trade Date */
+            trade_date: string | null;
+            /** Zero Hit Label */
+            zero_hit_label?: string | null;
+        };
+        /** PoolRuleChange */
+        PoolRuleChange: {
+            after?: components["schemas"]["EditorRuleCall"] | null;
+            before?: components["schemas"]["EditorRuleCall"] | null;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "added" | "removed" | "parameter_changed";
+            /** Label */
+            label: string;
+        };
+        /** PoolRuleItem */
+        PoolRuleItem: {
+            /** Label */
+            label: string;
+            /** Parameters */
+            parameters: components["schemas"]["PoolRuleParameter"][];
+        };
+        /** PoolRuleParameter */
+        PoolRuleParameter: {
+            /** Label */
+            label: string;
+            /** Value */
+            value: string;
+        };
+        /** PoolStep */
+        PoolStep: {
+            /** Count */
+            count: number;
+            /** Label */
+            label: string;
+            /** Step Index */
+            step_index: number;
+        };
+        /** PoolsData */
+        PoolsData: {
+            /** Canvases */
+            canvases: components["schemas"]["SavedCanvas"][];
+            /** Canvases Truncated */
+            canvases_truncated: boolean;
+            /** Definitions Available */
+            definitions_available: boolean;
+            /** Latest Trade Date */
+            latest_trade_date: string | null;
+            /** Pools */
+            pools: components["schemas"]["PublishedPool"][];
+            /** Pools Truncated */
+            pools_truncated: boolean;
+            /**
+             * Rules Available
+             * @default false
+             */
+            rules_available: boolean;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "ready" | "no_data" | "unavailable";
+        };
         /** ProjectionInfo */
         ProjectionInfo: {
             /** Available */
@@ -754,6 +3856,36 @@ export interface components {
             reason: string | null;
             /** Table Name */
             table_name: string;
+        };
+        /** PublishedPool */
+        PublishedPool: {
+            definition?: components["schemas"]["PoolDefinitionView"] | null;
+            /** Gain Sample Avg Pct */
+            gain_sample_avg_pct: number | null;
+            /** Gain Verified Count */
+            gain_verified_count: number;
+            /** Key */
+            key: string;
+            /** Member Count */
+            member_count: number | null;
+            /** Members */
+            members: components["schemas"]["PoolMember"][];
+            /** Members Truncated */
+            members_truncated: boolean;
+            /** Name */
+            name: string;
+            result: components["schemas"]["PoolResultView"];
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "current" | "older" | "no_data" | "unpublished" | "unavailable";
+            /** Steps */
+            steps: components["schemas"]["PoolStep"][];
+            /** Steps Truncated */
+            steps_truncated: boolean;
+            /** Trade Date */
+            trade_date: string | null;
         };
         /** PulseAlert */
         PulseAlert: {
@@ -815,6 +3947,517 @@ export interface components {
             t: string;
             /** Up Ratio Pct */
             up_ratio_pct: number | null;
+        };
+        /** ResearchJobItem */
+        ResearchJobItem: {
+            /** Eta At */
+            eta_at: string | null;
+            /** Eta High */
+            eta_high: string | null;
+            /** Eta Label */
+            eta_label: string;
+            /** Eta Low */
+            eta_low: string | null;
+            /** Job Id */
+            job_id: string;
+            /** Job Type Label */
+            job_type_label: string;
+            /** Progress Fraction */
+            progress_fraction: number;
+            /** Resource Label */
+            resource_label: string;
+            status: components["schemas"]["StatusInfo"];
+            /** Strategy Name */
+            strategy_name: string;
+            /** Terminal Shards */
+            terminal_shards: number;
+            /** Total Shards */
+            total_shards: number;
+            /**
+             * Updated At
+             * Format: date-time
+             */
+            updated_at: string;
+        };
+        /** ResearchJobsData */
+        ResearchJobsData: {
+            counts: components["schemas"]["JobCounts"] | null;
+            /** Items */
+            items: components["schemas"]["ResearchJobItem"][];
+            /** Next Cursor */
+            next_cursor: string | null;
+            /** Page Size */
+            page_size: number;
+            /** Source Label */
+            source_label: string;
+            /** Source Note */
+            source_note: string | null;
+            /**
+             * Source State
+             * @enum {string}
+             */
+            source_state: "ready" | "empty" | "not_published" | "unavailable";
+            /** Source Updated At */
+            source_updated_at: string | null;
+            /** Total */
+            total: number | null;
+        };
+        /** ResearchTaskEvent */
+        ResearchTaskEvent: {
+            /** Event Id */
+            event_id: number;
+            /** Label */
+            label: string;
+            /**
+             * Occurred At
+             * Format: date-time
+             */
+            occurred_at: string;
+            /** Status Label */
+            status_label: string;
+        };
+        /** ResearchTaskEventsData */
+        ResearchTaskEventsData: {
+            /** Events */
+            events: components["schemas"]["ResearchTaskEvent"][];
+            /** Generation Id */
+            generation_id: string | null;
+            /** Note */
+            note: string;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "ready" | "empty" | "truncated" | "not_published" | "not_included" | "unavailable";
+            /** Truncated */
+            truncated: boolean;
+            /** Updated At */
+            updated_at: string | null;
+        };
+        /** ResourceGroupItem */
+        ResourceGroupItem: {
+            /** Memory Current Bytes */
+            memory_current_bytes: number | null;
+            /** Memory Peak Bytes */
+            memory_peak_bytes: number | null;
+            /** Name */
+            name: string;
+            /** Slice Unit */
+            slice_unit: string;
+        };
+        /** ResourcesData */
+        ResourcesData: {
+            /** Cpu Note */
+            cpu_note: string;
+            /** Cpu Usage Percent */
+            cpu_usage_percent: number | null;
+            /** Expires At */
+            expires_at: string | null;
+            /** Groups */
+            groups: components["schemas"]["ResourceGroupItem"][];
+            /** Host Memory Available Bytes */
+            host_memory_available_bytes: number | null;
+            /** Host Memory Total Bytes */
+            host_memory_total_bytes: number | null;
+            /** Remaining Seconds */
+            remaining_seconds: number | null;
+            /** Rquant Memory Current Bytes */
+            rquant_memory_current_bytes: number | null;
+            /** Rquant Memory Peak Bytes */
+            rquant_memory_peak_bytes: number | null;
+            /** Source Label */
+            source_label: string;
+            /** Source Note */
+            source_note: string | null;
+            /**
+             * Source State
+             * @enum {string}
+             */
+            source_state: "ready" | "unavailable";
+            /** Source Updated At */
+            source_updated_at: string | null;
+        };
+        /** RuntimeServiceItem */
+        RuntimeServiceItem: {
+            /** Heartbeat At */
+            heartbeat_at: string | null;
+            /** Name */
+            name: string;
+            /** Plane Label */
+            plane_label: string;
+            /** Service Id */
+            service_id: string;
+            status: components["schemas"]["StatusInfo"];
+        };
+        /** RuntimeServicesData */
+        RuntimeServicesData: {
+            /** Items */
+            items: components["schemas"]["RuntimeServiceItem"][];
+            /** Source Label */
+            source_label: string;
+            /** Source Note */
+            source_note: string | null;
+            /**
+             * Source State
+             * @enum {string}
+             */
+            source_state: "ready" | "unavailable";
+            /** Source Updated At */
+            source_updated_at: string | null;
+        };
+        /**
+         * SampleState
+         * @enum {string}
+         */
+        SampleState: "available" | "empty" | "missing" | "unsupported" | "unpublished" | "stale" | "error";
+        /** SavePoolCommand */
+        SavePoolCommand: {
+            /** Base Name */
+            base_name: string;
+            /** Command Id */
+            command_id: string;
+            /**
+             * Delay Days
+             * @default 0
+             */
+            delay_days: number;
+            /** Depends On */
+            depends_on?: string | null;
+            /**
+             * Description
+             * @default
+             */
+            description: string;
+            /** Display Name */
+            display_name: string;
+            /** Expected Version */
+            expected_version?: string | null;
+            /** Include Columns */
+            include_columns?: string[];
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "save_user_pool_v2";
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+            /** Rule Calls */
+            rule_calls: components["schemas"]["EditorRuleCall"][];
+        };
+        /** SaveRankedPoolCommand */
+        SaveRankedPoolCommand: {
+            /** Base Name */
+            base_name: string;
+            /** Command Id */
+            command_id: string;
+            /**
+             * Delay Days
+             * @default 0
+             */
+            delay_days: number;
+            /** Depends On */
+            depends_on?: string | null;
+            /**
+             * Description
+             * @default
+             */
+            description: string;
+            /** Display Name */
+            display_name: string;
+            /** Expected Version */
+            expected_version?: string | null;
+            /** Include Columns */
+            include_columns?: string[];
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "save_user_pool_v3";
+            ranking: components["schemas"]["PoolRankingPlan"] | null;
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+            /** Rule Calls */
+            rule_calls?: components["schemas"]["EditorRuleCall"][];
+        };
+        /** SavedCanvas */
+        SavedCanvas: {
+            /** Description */
+            description: string;
+            /** Name */
+            name: string;
+            /** Pool Keys */
+            pool_keys: string[];
+            /** Refs Truncated */
+            refs_truncated: boolean;
+        };
+        /** ScheduledTaskItem */
+        ScheduledTaskItem: {
+            /** Duration Seconds */
+            duration_seconds: number | null;
+            /** Last Trigger At */
+            last_trigger_at: string | null;
+            /** Name */
+            name: string;
+            /** Next At */
+            next_at: string | null;
+            /** Result Label */
+            result_label: string;
+            /** Service Unit */
+            service_unit: string;
+            status: components["schemas"]["StatusInfo"];
+            /** Timer Unit */
+            timer_unit: string;
+        };
+        /** ScheduledTasksData */
+        ScheduledTasksData: {
+            /** Expires At */
+            expires_at: string | null;
+            /** Items */
+            items: components["schemas"]["ScheduledTaskItem"][];
+            /** Remaining Seconds */
+            remaining_seconds: number | null;
+            /** Source Label */
+            source_label: string;
+            /** Source Note */
+            source_note: string | null;
+            /**
+             * Source State
+             * @enum {string}
+             */
+            source_state: "ready" | "unavailable";
+            /** Source Updated At */
+            source_updated_at: string | null;
+        };
+        /** ScreenBlock */
+        ScreenBlock: {
+            /** Category */
+            category: string;
+            /** Category Label */
+            category_label: string;
+            /** Hint */
+            hint: string;
+            /** Key */
+            key: string;
+            /** Label */
+            label: string;
+            /** Parameters */
+            parameters: components["schemas"]["ScreenParameter"][];
+        };
+        /** ScreenCatalogData */
+        ScreenCatalogData: {
+            /** Available */
+            available: boolean;
+            /** Blocks */
+            blocks: components["schemas"]["ScreenBlock"][];
+            /** Dates */
+            dates: string[];
+            /**
+             * Nl Generate Available
+             * @default false
+             */
+            nl_generate_available: boolean;
+            /** Ranking Metrics */
+            ranking_metrics: components["schemas"]["ScreenOption"][];
+            source: components["schemas"]["ScreenSourceInfo"] | null;
+            /**
+             * Source Kind
+             * @enum {string}
+             */
+            source_kind: "serving" | "replica";
+        };
+        /** ScreenCondition */
+        ScreenCondition: {
+            /** Args */
+            args?: {
+                [key: string]: unknown;
+            };
+            /** Key */
+            key: string;
+        };
+        /** ScreenNlPreviewData */
+        ScreenNlPreviewData: {
+            /** Conditions */
+            conditions: components["schemas"]["ScreenCondition"][];
+            /** Source Identity */
+            source_identity: string;
+            /**
+             * Source Kind
+             * @enum {string}
+             */
+            source_kind: "serving" | "replica";
+            /**
+             * Trade Date
+             * Format: date
+             */
+            trade_date: string;
+        };
+        /** ScreenNlPreviewRequest */
+        ScreenNlPreviewRequest: {
+            /** Instruction */
+            instruction: string;
+            /** Source Identity */
+            source_identity: string;
+            /**
+             * Source Kind
+             * @enum {string}
+             */
+            source_kind: "serving" | "replica";
+            /**
+             * Trade Date
+             * Format: date
+             */
+            trade_date: string;
+        };
+        /** ScreenOption */
+        ScreenOption: {
+            /** Label */
+            label: string;
+            /** Value */
+            value: string;
+        };
+        /** ScreenParameter */
+        ScreenParameter: {
+            /**
+             * Custom Ma
+             * @default false
+             */
+            custom_ma: boolean;
+            /** Hint */
+            hint?: string | null;
+            /** Initial */
+            initial: string | number | string[] | null;
+            /**
+             * Input
+             * @enum {string}
+             */
+            input: "number" | "integer" | "choice" | "multi_choice" | "field" | "operand";
+            /** Key */
+            key: string;
+            /** Label */
+            label: string;
+            /** Maximum */
+            maximum?: number | null;
+            /** Minimum */
+            minimum?: number | null;
+            /** Options */
+            options?: components["schemas"]["ScreenOption"][];
+            /** Required */
+            required: boolean;
+            /**
+             * Scale
+             * @default 1
+             */
+            scale: number;
+        };
+        /** ScreenRankingCondition */
+        ScreenRankingCondition: {
+            /** Ascending */
+            ascending: boolean;
+            /** Metric */
+            metric: string;
+            /** Weight */
+            weight: number;
+        };
+        /** ScreenRankingPlan */
+        ScreenRankingPlan: {
+            /** Conditions */
+            conditions: components["schemas"]["ScreenRankingCondition"][];
+            /** Top N */
+            top_n: number;
+        };
+        /** ScreenRow */
+        ScreenRow: {
+            /** Close */
+            close: number | null;
+            /** Name */
+            name: string | null;
+            /** Pct Chg */
+            pct_chg: number | null;
+            /** Rank Position */
+            rank_position?: number | null;
+            /** Ranking Score */
+            ranking_score?: number | null;
+            /** Ts Code */
+            ts_code: string;
+        };
+        /** ScreenRunData */
+        ScreenRunData: {
+            /** Base Count */
+            base_count: number | null;
+            /** Next Cursor */
+            next_cursor: string | null;
+            /** Ranked Count */
+            ranked_count?: number | null;
+            /** Rows */
+            rows: components["schemas"]["ScreenRow"][];
+            source: components["schemas"]["ScreenSourceInfo"] | null;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "ready" | "unavailable" | "no_date";
+            /** Steps */
+            steps: components["schemas"]["ScreenStep"][];
+            /** Total */
+            total: number | null;
+            /**
+             * Trade Date
+             * Format: date
+             */
+            trade_date: string;
+            /**
+             * Unknown Count
+             * @default 0
+             */
+            unknown_count: number;
+        };
+        /** ScreenRunRequest */
+        ScreenRunRequest: {
+            /** Conditions */
+            conditions: components["schemas"]["ScreenCondition"][];
+            /** Cursor */
+            cursor?: string | null;
+            /**
+             * Page Size
+             * @default 20
+             */
+            page_size: number;
+            ranking?: components["schemas"]["ScreenRankingPlan"] | null;
+            /** Source Identity */
+            source_identity?: string | null;
+            /**
+             * Trade Date
+             * Format: date
+             */
+            trade_date: string;
+        };
+        /** ScreenSourceInfo */
+        ScreenSourceInfo: {
+            /** Identity */
+            identity: string;
+            /**
+             * Updated At
+             * Format: date-time
+             */
+            updated_at: string;
+        };
+        /** ScreenStep */
+        ScreenStep: {
+            /** Count */
+            count: number;
+            /** Label */
+            label: string;
+            /**
+             * Unknown Count
+             * @default 0
+             */
+            unknown_count: number;
         };
         /** ServiceItem */
         ServiceItem: {
@@ -927,6 +4570,15 @@ export interface components {
             items: components["schemas"]["SignalItem"][];
             /** Total */
             total: number;
+        };
+        /** SourcePosition */
+        SourcePosition: {
+            /** Column */
+            column: number;
+            /** Line */
+            line: number;
+            /** Offset */
+            offset: number;
         };
         /** StateCounts */
         StateCounts: {
@@ -1070,6 +4722,163 @@ export interface components {
             /** Name */
             name: string;
         };
+        /** TaskOverviewData */
+        TaskOverviewData: {
+            /**
+             * Can View Research Logs
+             * @default false
+             */
+            can_view_research_logs: boolean;
+            research: components["schemas"]["ResearchJobsData"];
+            resources: components["schemas"]["ResourcesData"];
+            scheduled: components["schemas"]["ScheduledTasksData"];
+            services: components["schemas"]["RuntimeServicesData"];
+        };
+        /** TdxParseData */
+        TdxParseData: {
+            ast: components["schemas"]["FormulaAst"] | null;
+            /**
+             * Capability
+             * @default parse_only
+             * @constant
+             */
+            capability: "parse_only";
+            /** Issues */
+            issues: components["schemas"]["ParseIssue"][];
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "parsed" | "rejected";
+            /**
+             * Syntax Version
+             * @default tdx-v1
+             * @constant
+             */
+            syntax_version: "tdx-v1";
+            translation: components["schemas"]["TranslationPlan"] | null;
+            /** Unsupported */
+            unsupported: components["schemas"]["UnsupportedItem"][];
+        };
+        /** TdxParseRequest */
+        TdxParseRequest: {
+            /**
+             * Source
+             * @default
+             */
+            source: string;
+        };
+        /** TdxPreviewData */
+        TdxPreviewData: {
+            /** Reason */
+            reason: string | null;
+            /**
+             * Source Updated At
+             * Format: date-time
+             */
+            source_updated_at: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "match" | "no_match" | "unknown";
+            /** Stock Code */
+            stock_code: string;
+            /**
+             * Trade Date
+             * Format: date
+             */
+            trade_date: string;
+        };
+        /** TdxPreviewRequest */
+        TdxPreviewRequest: {
+            /**
+             * Source
+             * @default
+             */
+            source: string;
+            /** Source Identity */
+            source_identity: string;
+            /** Stock Code */
+            stock_code: string;
+            /**
+             * Trade Date
+             * Format: date
+             */
+            trade_date: string;
+        };
+        /** TdxPreviewSourceData */
+        TdxPreviewSourceData: {
+            /** Available */
+            available: boolean;
+            /** Dates */
+            dates: string[];
+            source: components["schemas"]["ScreenSourceInfo"] | null;
+        };
+        /** TranslationPlan */
+        TranslationPlan: {
+            /** Assignments */
+            assignments: string[];
+            /** Fields */
+            fields: string[];
+            /** Functions */
+            functions: string[];
+            /** Requires Full History */
+            requires_full_history: boolean;
+            /** Window Lookback Bars */
+            window_lookback_bars: number;
+        };
+        /** UnacknowledgedSummary */
+        UnacknowledgedSummary: {
+            /** Count */
+            count?: number | null;
+            /** Count As Of */
+            count_as_of?: string | null;
+            /**
+             * Label
+             * @default 确认状态暂不可用
+             */
+            label: string;
+            /**
+             * Note
+             * @default 确认信息尚未发布，请稍后查看。
+             */
+            note: string | null;
+            /**
+             * State
+             * @default unavailable
+             * @enum {string}
+             */
+            state: "unavailable" | "source_incomplete" | "ready";
+        };
+        /** UnaryExpr */
+        UnaryExpr: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "unary";
+            /**
+             * Op
+             * @enum {string}
+             */
+            op: "+" | "-" | "NOT";
+            /** Operand */
+            operand: components["schemas"]["NumberExpr"] | components["schemas"]["FieldExpr"] | components["schemas"]["LocalExpr"] | components["schemas"]["UnaryExpr"] | components["schemas"]["BinaryExpr"] | components["schemas"]["CallExpr"];
+        };
+        /** UnsupportedItem */
+        UnsupportedItem: {
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "function" | "field";
+            /** Message */
+            message: string;
+            /** Name */
+            name: string;
+            position: components["schemas"]["SourcePosition"];
+        };
         /**
          * UserState
          * @enum {string}
@@ -1088,6 +4897,11 @@ export interface components {
             /** Error Type */
             type: string;
         };
+        /**
+         * WatchlistSource
+         * @enum {string}
+         */
+        WatchlistSource: "detail" | "screen_result" | "pool_member";
     };
     responses: never;
     parameters: never;
@@ -1097,6 +4911,404 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    list_backtests_api_v1_backtests_get: {
+        parameters: {
+            query?: {
+                limit?: number;
+                offset?: number;
+                generation_id?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_BacktestListData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_backtest_api_v1_backtests__run_id__get: {
+        parameters: {
+            query: {
+                generation_id: string;
+                limit?: number;
+                offset?: number;
+                entry_mode?: string | null;
+                profile_variant?: string | null;
+            };
+            header?: never;
+            path: {
+                run_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_BacktestDetailData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_data_audit_report_calendar_api_v1_data_audit_report_calendar_get: {
+        parameters: {
+            query?: {
+                generation?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_AuditReportCalendarData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    submit_data_audit_report_command_api_v1_data_audit_report_commands_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AuditReportCommandRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AuditReportCommandReceipt"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_backfill_plans_api_v1_data_backfill_plans_get: {
+        parameters: {
+            query?: {
+                page_size?: number;
+                generation?: string | null;
+                cursor?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_BackfillPlansData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    submit_backfill_plan_command_api_v1_data_backfill_plans_commands_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BackfillPlanCommandRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BackfillPlanCommandReceipt"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_backfill_plan_detail_api_v1_data_backfill_plans__plan_hash__get: {
+        parameters: {
+            query?: {
+                generation?: string | null;
+            };
+            header?: never;
+            path: {
+                plan_hash: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_BackfillPlanDetailData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_datasets_api_v1_data_catalog_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_CatalogList_"];
+                };
+            };
+        };
+    };
+    get_dataset_api_v1_data_catalog__dataset__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                dataset: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_CatalogDatasetDetail_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_fundamental_summary_api_v1_data_fundamentals_summary_get: {
+        parameters: {
+            query?: {
+                expected_identity?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FundamentalSummaryData"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_data_health_api_v1_data_health_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_DataAuditHealthData_"];
+                };
+            };
+        };
+    };
+    get_data_issues_api_v1_data_issues_get: {
+        parameters: {
+            query: {
+                dataset: string;
+                generation?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_DataAuditIssuesData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_data_audit_report_api_v1_data_report_get: {
+        parameters: {
+            query?: {
+                generation?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_DataAuditReportData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     get_health_api_v1_health_get: {
         parameters: {
             query?: never;
@@ -1133,6 +5345,100 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_MetaData_"];
+                };
+            };
+        };
+    };
+    acknowledge_alert_api_v1_monitor_ack_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AckCommandRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AckCommandReceipt"];
+                };
+            };
+            /** @description Conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AckCommandConflict"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_channels_api_v1_monitor_channels_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_MonitorChannelsData_"];
+                };
+            };
+        };
+    };
+    get_timeline_api_v1_monitor_timeline_get: {
+        parameters: {
+            query?: {
+                page_size?: number;
+                cursor?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_MonitorTimelineData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };
@@ -1368,6 +5674,527 @@ export interface operations {
             };
         };
     };
+    get_accounts_api_v1_paper_accounts_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_PaperAccountsData_"];
+                };
+            };
+        };
+    };
+    get_pools_api_v1_pools_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_PoolsData_"];
+                };
+            };
+        };
+    };
+    get_pool_editor_api_v1_pools_editor_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_PoolEditorData_"];
+                };
+            };
+        };
+    };
+    submit_pool_editor_command_api_v1_pools_editor_commands_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SavePoolCommand"] | components["schemas"]["SaveRankedPoolCommand"] | components["schemas"]["AttachPoolCommand"] | components["schemas"]["CreateCanvasCommand"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PoolEditorReceipt"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    preview_pool_natural_language_api_v1_pools_editor_nl_preview_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PoolNlPreviewRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PoolNlPreview"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_formula_pools_api_v1_pools_formula_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_FormulaPoolListData_"];
+                };
+            };
+        };
+    };
+    submit_formula_pool_save_command_api_v1_pools_formula_commands_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["FormulaPoolSaveCommandRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FormulaPoolSaveCommandReceipt"];
+                };
+            };
+            /** @description Conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FormulaPoolSaveCommandReceipt"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_formula_pool_members_api_v1_pools_formula__base_name__members_get: {
+        parameters: {
+            query?: {
+                page_size?: number;
+                cursor?: string | null;
+            };
+            header?: never;
+            path: {
+                base_name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_FormulaPoolMembersData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_blocks_api_v1_screen_blocks_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_ScreenCatalogData_"];
+                };
+            };
+        };
+    };
+    preview_screen_natural_language_api_v1_screen_nl_preview_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ScreenNlPreviewRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ScreenNlPreviewData"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    run_screen_api_v1_screen_run_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ScreenRunRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_ScreenRunData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    submit_formula_market_command_api_v1_screen_tdx_market_commands_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["FormulaMarketCommandRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FormulaMarketCommandReceipt"];
+                };
+            };
+            /** @description Conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FormulaMarketCommandReceipt"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_formula_market_jobs_api_v1_screen_tdx_market_jobs_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_FormulaMarketJobListData_"];
+                };
+            };
+        };
+    };
+    get_formula_market_job_api_v1_screen_tdx_market_jobs__task_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                task_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_FormulaMarketJobDetailData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_formula_market_matches_api_v1_screen_tdx_market_jobs__task_id__matches_get: {
+        parameters: {
+            query?: {
+                page_size?: number;
+                cursor?: string | null;
+            };
+            header?: never;
+            path: {
+                task_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_FormulaMarketMatchesData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    parse_tdx_formula_api_v1_screen_tdx_parse_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TdxParseRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TdxParseData"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    preview_tdx_formula_api_v1_screen_tdx_preview_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TdxPreviewRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TdxPreviewData"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_tdx_preview_source_api_v1_screen_tdx_preview_source_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TdxPreviewSourceData"];
+                };
+            };
+        };
+    };
     search_stocks_api_v1_stocks_search_get: {
         parameters: {
             query: {
@@ -1417,6 +6244,243 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_StockSummaryData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_jobs_api_v1_tasks_jobs_get: {
+        parameters: {
+            query?: {
+                page_size?: number;
+                cursor?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_ResearchJobsData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_job_events_api_v1_tasks_jobs__job_id__events_get: {
+        parameters: {
+            query?: {
+                generation_id?: string | null;
+            };
+            header?: never;
+            path: {
+                job_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResearchTaskEventsData"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_overview_api_v1_tasks_overview_get: {
+        parameters: {
+            query?: {
+                page_size?: number;
+                cursor?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_TaskOverviewData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_log_capabilities_api_v1_tasks_services_log_capabilities_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LogCapabilities"];
+                };
+            };
+        };
+    };
+    get_service_logs_api_v1_tasks_services__unit__logs_get: {
+        parameters: {
+            query: {
+                since: string;
+                level?: "emerg" | "alert" | "crit" | "err" | "warning" | "notice" | "info" | "debug";
+                page_size?: number;
+                cursor?: string;
+            };
+            header?: never;
+            path: {
+                unit: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["JournalPage"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_manual_watchlist_api_v1_watchlist_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_ManualWatchlistListData_"];
+                };
+            };
+        };
+    };
+    submit_manual_watchlist_command_api_v1_watchlist_commands_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ManualWatchlistCommandRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManualWatchlistCommandReceipt"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_manual_watchlist_item_api_v1_watchlist__ts_code__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                ts_code: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_ManualWatchlistExactData_"];
                 };
             };
             /** @description Validation Error */

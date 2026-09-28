@@ -92,6 +92,8 @@ TABLE_LABELS: dict[str, str] = {
     "dc_board": "东财板块",
     "dc_board_member": "东财板块成分",
     "intraday_kline": "分时",
+    "legacy_notification": "通知提交记录",
+    "legacy_notification_status": "通知记录状态",
     "kpl_concept_member": "开盘啦题材成分",
     "market_liquidity": "流动性基准",
     "market_overview": "板块总表",
@@ -112,6 +114,20 @@ TABLE_LABELS: dict[str, str] = {
     "surge_event": "爆量记录",
     "surge_runtime_config": "爆量参数",
     "trade_calendar": "交易日历",
+    "data_audit_status": "数据审计状态",
+    "data_audit_issue": "数据审计问题",
+}
+
+AUDIT_RULE_LABELS: dict[str, str] = {
+    "stock-status-coverage": "股票状态记录缺失",
+    "stock-status-intentional-exclusion": "股票状态不适用",
+    "limit-up-pool-calendar-coverage": "涨停池日期异常",
+    "minute-without-daily": "分钟线缺少日线",
+    "eligible-daily-without-authoritative-minute": "日线缺少分钟线",
+    "unknown-source-or-freq-semantics": "分钟线来源未确认",
+    "incomplete-authoritative-session": "分钟线时段不完整",
+    "cross-source-exact-overlap": "分钟线重复",
+    "cross-source-conflicting-overlap": "分钟线来源冲突",
 }
 
 DELIVERY_LABELS: dict[str, str] = {
@@ -159,8 +175,13 @@ def table_label(table_name: str) -> str:
     return TABLE_LABELS.get(table_name, "其他数据表")
 
 
+def audit_rule_label(rule_id: str) -> str:
+    return AUDIT_RULE_LABELS.get(rule_id, "数据质量问题")
+
+
 __all__ = [
     "ACTION_LABELS",
+    "AUDIT_RULE_LABELS",
     "CHANNEL_LABELS",
     "DATASET_LABELS",
     "DELIVERY_LABELS",
@@ -168,6 +189,7 @@ __all__ = [
     "PRESET_LABELS",
     "STRATEGY_LABELS",
     "TABLE_LABELS",
+    "audit_rule_label",
     "dataset_label",
     "service_label",
     "split_service_id",

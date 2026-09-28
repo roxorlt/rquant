@@ -20,7 +20,7 @@ BACKUP_UNIT = ROOT / "deploy" / "systemd" / "rquant-backup.service"
 BACKUP_TIMER = ROOT / "deploy" / "systemd" / "rquant-backup.timer"
 
 
-def _project(tmp_path: Path) -> Path:
+def _project(tmp_path: Path, *, lifecycle_capture: bool = False) -> Path:
     project = tmp_path / "rquant"
     (project / "scripts").mkdir(parents=True)
     (project / "data").mkdir()
@@ -37,6 +37,17 @@ RQUANT_WORKLOAD_ARBITER_HELD=maintenance exec "$@"
     )
     arbiter.chmod(0o755)
     source = (ROOT / "scripts/backup-snapshot.sh").read_text(encoding="utf-8")
+    if lifecycle_capture:
+        emitter = project / "test-libexec/lifecycle-capture"
+        emitter.write_text(
+            "#!/usr/bin/env bash\n"
+            'printf "%s\\n" "$*" >> "${RQUANT_TEST_LIFECYCLE_LOG}"\n'
+            'printf "credential=never-expose" >&2\n'
+            'exit "${RQUANT_TEST_LIFECYCLE_FAIL:-0}"\n',
+            encoding="utf-8",
+        )
+        emitter.chmod(0o755)
+        source = source.replace('"${VENV_PY}" -m rquant.unit_log_emitter', str(emitter))
     script = project / "scripts/backup-snapshot.sh"
     script.write_text(
         source.replace("/usr/local/libexec/rquant-workload-arbiter", str(arbiter)),
@@ -66,7 +77,6 @@ def _priority_shims(directory: Path) -> Path:
     return shim_dir
 
 
-
 def _write_db(path: Path, marker: str) -> None:
     conn = duckdb.connect(str(path))
     conn.execute("CREATE TABLE marker (value VARCHAR)")
@@ -90,6 +100,8 @@ def _run(
     runtime_root: Path | None = None,
     ionice_mode: str | None = None,
     priority_log: Path | None = None,
+    lifecycle_log: Path | None = None,
+    lifecycle_fail: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     for name in (
@@ -129,6 +141,10 @@ def _run(
     if priority_log is not None:
         env["RQUANT_TEST_PRIORITY_LOG"] = str(priority_log)
         env["PATH"] = f"{_priority_shims(priority_log.parent)}:{env['PATH']}"
+    if lifecycle_log is not None:
+        env["RQUANT_TEST_LIFECYCLE_LOG"] = str(lifecycle_log)
+    if lifecycle_fail:
+        env["RQUANT_TEST_LIFECYCLE_FAIL"] = "7"
     return subprocess.run(
         [str(project / "scripts" / "backup-snapshot.sh")],
         cwd=project,
@@ -162,6 +178,46 @@ def test_scheduled_backup_defaults_to_verified_replica(tmp_path: Path) -> None:
     assert metadata["verified"] is True
     assert metadata["table_count"] >= 1
     assert metadata["source_lag_seconds"] >= 0
+
+
+@pytest.mark.parametrize("send_fails", [False, True])
+def test_backup_emits_started_and_success_without_changing_result(
+    tmp_path: Path, send_fails: bool
+) -> None:
+    project = _project(tmp_path, lifecycle_capture=True)
+    _write_db(project / "data" / "rquant_ro.duckdb", "replica")
+    _write_db(project / "data" / "rquant.duckdb", "main")
+    lifecycle_log = tmp_path / "lifecycle.log"
+
+    result = _run(project, lifecycle_log=lifecycle_log, lifecycle_fail=send_fails)
+
+    assert result.returncode == 0
+    assert "credential=never-expose" not in result.stdout + result.stderr
+    lines = lifecycle_log.read_text(encoding="utf-8").splitlines()
+    assert lines[0] == "run_started"
+    assert len(lines) == 2
+    assert lines[1].startswith("run_succeeded ")
+    assert lines[1].endswith(" 0")
+    assert lines[1].split()[1].isdigit()
+
+
+@pytest.mark.parametrize("send_fails", [False, True])
+def test_backup_emits_failure_on_early_exit_without_changing_result(
+    tmp_path: Path, send_fails: bool
+) -> None:
+    project = _project(tmp_path, lifecycle_capture=True)
+    lifecycle_log = tmp_path / "lifecycle.log"
+
+    result = _run(project, source="invalid", lifecycle_log=lifecycle_log, lifecycle_fail=send_fails)
+
+    assert result.returncode == 2
+    assert "credential=never-expose" not in result.stdout + result.stderr
+    lines = lifecycle_log.read_text(encoding="utf-8").splitlines()
+    assert lines[0] == "run_started"
+    assert len(lines) == 2
+    assert lines[1].startswith("run_failed ")
+    assert lines[1].endswith(" 2")
+    assert lines[1].split()[1].isdigit()
 
 
 def test_quiescent_main_backup_checkpoints_and_verifies_snapshot(
@@ -316,7 +372,7 @@ def test_terminated_backup_cleans_private_generation(
     tmp_path: Path,
     signal_number: signal.Signals,
 ) -> None:
-    project = _project(tmp_path)
+    project = _project(tmp_path, lifecycle_capture=True)
     _write_db(project / "data" / "rquant.duckdb", "main")
     assert _run(project, source="main").returncode == 0
     previous = (project / "backup" / "latest.duckdb.gz").read_bytes()
@@ -334,6 +390,8 @@ def test_terminated_backup_cleans_private_generation(
     env["PATH"] = f"{fake_bin}:{env['PATH']}"
     env["RQUANT_BACKUP_SOURCE"] = "main"
     env["RQUANT_TEST_GZIP_ENTERED"] = str(entered)
+    lifecycle_log = tmp_path / "lifecycle.log"
+    env["RQUANT_TEST_LIFECYCLE_LOG"] = str(lifecycle_log)
     process = subprocess.Popen(
         [str(project / "scripts" / "backup-snapshot.sh")],
         cwd=project,
@@ -360,6 +418,11 @@ def test_terminated_backup_cleans_private_generation(
     # The script's own handler ran (128+signum), rather than bash dying from the
     # signal, which would report a negative returncode and leave the generation.
     assert process.returncode == 128 + int(signal_number)
+    lifecycle = lifecycle_log.read_text(encoding="utf-8").splitlines()
+    assert lifecycle[0] == "run_started"
+    assert len(lifecycle) == 2
+    assert lifecycle[1].startswith("run_failed ")
+    assert lifecycle[1].endswith(f" {process.returncode}")
     assert not tuple((project / "backup").glob(".latest.*"))
     assert (project / "backup" / "latest.duckdb.gz").read_bytes() == previous
 

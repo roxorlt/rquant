@@ -8,6 +8,7 @@ export function StockCell({ code, name }: { code: string; name: string | null | 
   return (
     <div className="cell2">
       <span className="nm">{name}</span>
+      {"\u00a0"}
       <span className="s mono">{code}</span>
     </div>
   );

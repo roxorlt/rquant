@@ -7,12 +7,15 @@ import json
 import os
 import socket
 import sys
+import threading
 from collections.abc import Callable, Sequence
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
+
+from loguru import logger
 
 from rquant.canvas_publication_receipt import (
     CANVAS_PUBLICATION_PROBE_NAMESPACE,
@@ -22,12 +25,21 @@ from rquant.canvas_publication_receipt import (
     Ed25519CanvasPublicationSigner,
     SecureCanvasPublicationSigningClient,
 )
+from rquant.formula_market_page_backend import FormulaMarketPageBackend
+from rquant.formula_market_private_config import load_private_formula_market_config
+from rquant.formula_pool_definition import FormulaPoolDefinitionStore, FormulaPoolSaveBackend
 from rquant.job_center_authority import resolve_current_job_center_authority_binding
 from rquant.lab_daemon import load_lab_job_center_authority_manifest
 from rquant.lab_page_control import build_lab_page_control_writer
 from rquant.page_control import (
     DEFAULT_PAGE_CONTROL_SERVICE_ID,
+    AckAlert,
+    BackfillPlanPageControlBackend,
+    DataAuditReportPageControlBackend,
+    FormulaMarketPageControlBackend,
+    FormulaPoolPageControlBackend,
     LabPageControlBackend,
+    PageControlCommandConflictError,
     PageControlConsumer,
     PageControlOutbox,
     PageControlService,
@@ -122,6 +134,10 @@ def build_page_control_service(
     log_dir: Path | None = None,
     allowed_lab_export_roots: tuple[Path, ...] | None = None,
     lab_backend: LabPageControlBackend | None = None,
+    backfill_plan_backend: BackfillPlanPageControlBackend | None = None,
+    data_audit_report_backend: DataAuditReportPageControlBackend | None = None,
+    formula_market_backend: FormulaMarketPageControlBackend | None = None,
+    formula_pool_backend: FormulaPoolPageControlBackend | None = None,
     load_default_lab_backend: bool = True,
     clock: Callable[[], datetime] | None = None,
     lease_seconds: int = 30,
@@ -136,6 +152,10 @@ def build_page_control_service(
         log_dir=log_dir,
         allowed_lab_export_roots=allowed_lab_export_roots,
         lab_backend=lab_backend,
+        backfill_plan_backend=backfill_plan_backend,
+        data_audit_report_backend=data_audit_report_backend,
+        formula_market_backend=formula_market_backend,
+        formula_pool_backend=formula_pool_backend,
         load_default_lab_backend=load_default_lab_backend,
         clock=clock,
         lease_seconds=lease_seconds,
@@ -153,6 +173,10 @@ def build_page_control_service_with_dependencies(
     log_dir: Path | None = None,
     allowed_lab_export_roots: tuple[Path, ...] | None = None,
     lab_backend: LabPageControlBackend | None = None,
+    backfill_plan_backend: BackfillPlanPageControlBackend | None = None,
+    data_audit_report_backend: DataAuditReportPageControlBackend | None = None,
+    formula_market_backend: FormulaMarketPageControlBackend | None = None,
+    formula_pool_backend: FormulaPoolPageControlBackend | None = None,
     load_default_lab_backend: bool = True,
     clock: Callable[[], datetime] | None = None,
     lease_seconds: int = 30,
@@ -193,6 +217,10 @@ def build_page_control_service_with_dependencies(
                 if lab_backend is not None or not load_default_lab_backend
                 else _build_lab_backend()
             ),
+            backfill_plan_backend=backfill_plan_backend,
+            data_audit_report_backend=data_audit_report_backend,
+            formula_market_backend=formula_market_backend,
+            formula_pool_backend=formula_pool_backend,
             clock=clock,
             lease_seconds=lease_seconds,
             consumer_id=consumer_instance_id,
@@ -206,7 +234,7 @@ def build_page_control_service_with_dependencies(
 def handler_for(service: PageControlService) -> type[BaseHTTPRequestHandler]:
     class PageControlHandler(BaseHTTPRequestHandler):
         def do_POST(self) -> None:  # noqa: N802
-            if self.path != "/v1/commands":
+            if self.path not in {"/v1/commands", "/v1/commands/lookup"}:
                 self.send_error(404)
                 return
             try:
@@ -215,13 +243,38 @@ def handler_for(service: PageControlService) -> type[BaseHTTPRequestHandler]:
                     raise ValueError("request body must be between 1 byte and 1 MiB")
                 payload = json.loads(self.rfile.read(content_length))
                 command = parse_page_control_command(payload)
-                response = service.submit(command).model_dump(mode="json")
             except Exception as exc:
                 self._write_json(
                     400,
                     {"error": f"{type(exc).__name__}: {exc}"},
                 )
                 return
+            if self.path == "/v1/commands/lookup":
+                if not isinstance(command, AckAlert):
+                    self._write_json(400, {"error": "lookup requires ack_alert"})
+                    return
+                try:
+                    receipt = service.lookup_ack_command(command)
+                except ValueError:
+                    self._write_json(409, {"error": "command conflict"})
+                    return
+                except Exception:
+                    self._write_json(503, {"error": "lookup unavailable"})
+                    return
+                response = (
+                    {"found": False}
+                    if receipt is None
+                    else {"found": True, "receipt": receipt.model_dump(mode="json")}
+                )
+            else:
+                try:
+                    response = service.submit(command).model_dump(mode="json")
+                except PageControlCommandConflictError:
+                    self._write_json(409, {"error": "command conflict"})
+                    return
+                except Exception as exc:
+                    self._write_json(400, {"error": f"{type(exc).__name__}: {exc}"})
+                    return
             self._write_json(200, response)
 
         def log_message(self, format: str, *args: object) -> None:
@@ -254,6 +307,31 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--control-root", required=True, type=Path)
     parser.add_argument("--expected-commit", required=True)
     parser.add_argument("--expected-generation", required=True)
+    parser.add_argument(
+        "--formula-market-config",
+        type=Path,
+        help="owner-private local formula admission config; absent means disabled",
+    )
+    parser.add_argument(
+        "--watchlist-socket",
+        type=Path,
+        help="owner-private local watchlist admission socket; absent means disabled",
+    )
+    parser.add_argument(
+        "--price-rule-socket",
+        type=Path,
+        help="separate-UID private price rule socket; absent means disabled",
+    )
+    parser.add_argument(
+        "--price-rule-web-uid",
+        type=int,
+        help="dedicated trusted Web UID for price rule admission",
+    )
+    parser.add_argument(
+        "--price-rule-shared-gid",
+        type=int,
+        help="shared private socket GID for price rule admission",
+    )
     return parser
 
 
@@ -262,19 +340,64 @@ def main(
     *,
     runtime_root: Path | None = None,
     expected_commit: str | None = None,
+    ack_socket_path: Path | None = None,
+    ack_serving_root: Path | None = None,
+    watchlist_socket_path: Path | None = None,
+    price_rule_socket_path: Path | None = None,
+    price_rule_web_uid: int | None = None,
+    price_rule_shared_gid: int | None = None,
+    formula_market_config_path: Path | None = None,
 ) -> None:
     """Entry point. `argv` is what the runtime wrapper derived; keywords are for tests."""
 
     if argv is not None:
         arguments = build_parser().parse_args(list(argv))
         expected_commit = expected_commit or arguments.expected_commit
-    return _serve(runtime_root=runtime_root, expected_commit=expected_commit)
+        if formula_market_config_path is not None and arguments.formula_market_config is not None:
+            raise ValueError("formula market config was supplied twice")
+        formula_market_config_path = formula_market_config_path or arguments.formula_market_config
+        if watchlist_socket_path is not None and arguments.watchlist_socket is not None:
+            raise ValueError("watchlist socket was supplied twice")
+        watchlist_socket_path = watchlist_socket_path or arguments.watchlist_socket
+        if price_rule_socket_path is not None and arguments.price_rule_socket is not None:
+            raise ValueError("price rule socket was supplied twice")
+        if price_rule_web_uid is not None and arguments.price_rule_web_uid is not None:
+            raise ValueError("price rule Web UID was supplied twice")
+        if price_rule_shared_gid is not None and arguments.price_rule_shared_gid is not None:
+            raise ValueError("price rule shared GID was supplied twice")
+        price_rule_socket_path = price_rule_socket_path or arguments.price_rule_socket
+        price_rule_web_uid = (
+            price_rule_web_uid if price_rule_web_uid is not None else arguments.price_rule_web_uid
+        )
+        price_rule_shared_gid = (
+            price_rule_shared_gid
+            if price_rule_shared_gid is not None
+            else arguments.price_rule_shared_gid
+        )
+    return _serve(
+        runtime_root=runtime_root,
+        expected_commit=expected_commit,
+        ack_socket_path=ack_socket_path,
+        ack_serving_root=ack_serving_root,
+        watchlist_socket_path=watchlist_socket_path,
+        price_rule_socket_path=price_rule_socket_path,
+        price_rule_web_uid=price_rule_web_uid,
+        price_rule_shared_gid=price_rule_shared_gid,
+        formula_market_config_path=formula_market_config_path,
+    )
 
 
 def _serve(
     *,
     runtime_root: Path | None = None,
     expected_commit: str | None = None,
+    ack_socket_path: Path | None = None,
+    ack_serving_root: Path | None = None,
+    watchlist_socket_path: Path | None = None,
+    price_rule_socket_path: Path | None = None,
+    price_rule_web_uid: int | None = None,
+    price_rule_shared_gid: int | None = None,
+    formula_market_config_path: Path | None = None,
 ) -> None:
     from rquant.runtime_deployment_profile import (
         LINUX_PRODUCTION_RUNTIME_ROOT,
@@ -357,11 +480,26 @@ def _serve(
         or port <= 0
     ):
         raise ValueError("page control endpoint must be an explicit loopback command URL")
+    formula_market_backend = None
+    formula_pool_backend = None
+    if formula_market_config_path is not None:
+        formula_market_backend = FormulaMarketPageBackend(
+            load_private_formula_market_config(formula_market_config_path)
+        )
+        formula_pool_backend = FormulaPoolSaveBackend(
+            task_store=formula_market_backend.store,
+            definitions=FormulaPoolDefinitionStore(
+                definition_root=page_profile.data_dir / "formula_pools",
+                rule_pool_root=page_profile.data_dir / "user_presets",
+            ),
+        )
     service = build_page_control_service(
         outbox_path=page_profile.outbox_path,
         data_dir=page_profile.data_dir,
         log_dir=page_profile.log_dir,
         allowed_lab_export_roots=(page_profile.data_dir / "exports",),
+        formula_market_backend=formula_market_backend,
+        formula_pool_backend=formula_pool_backend,
         load_default_lab_backend=False,
         consumer_service_id=canvas_profile.consumer_service_id,
         consumer_instance_id=canvas_profile.consumer_instance_id,
@@ -371,9 +509,101 @@ def _serve(
         ),
         canvas_publication_keyring=keyring,
     )
+    if (ack_socket_path is None) != (ack_serving_root is None):
+        raise ValueError("ack socket and Serving root must be configured together")
+    ack_server = None
+    if ack_socket_path is not None and ack_serving_root is not None:
+        try:
+            from rquant.alert_ack_admission import AckAdmission, build_ack_admission_server
+
+            ack_server = build_ack_admission_server(
+                AckAdmission(service, ack_serving_root),
+                socket_path=ack_socket_path,
+            )
+        except Exception:
+            logger.exception("AckAlert admission listener disabled during startup")
+    watchlist_server = None
+    if watchlist_socket_path is not None:
+        try:
+            from rquant.watchlist_admission import (
+                WatchlistAdmission,
+                build_watchlist_admission_server,
+            )
+
+            watchlist_server = build_watchlist_admission_server(
+                WatchlistAdmission(service), socket_path=watchlist_socket_path
+            )
+        except Exception:
+            logger.exception("Watchlist admission listener disabled during startup")
+    price_rule_server = None
+    if any(
+        value is not None
+        for value in (price_rule_socket_path, price_rule_web_uid, price_rule_shared_gid)
+    ):
+        try:
+            from rquant.price_alert_admission import (
+                PriceAlertAdmission,
+                build_price_alert_admission_server,
+            )
+
+            price_rule_server = build_price_alert_admission_server(
+                PriceAlertAdmission(service),
+                socket_path=price_rule_socket_path,
+                trusted_web_uid=price_rule_web_uid,
+                shared_gid=price_rule_shared_gid,
+            )
+        except Exception:
+            logger.exception("Price rule admission listener disabled during startup")
     server_class = _server_class_for_host(host)
-    server = server_class((host, port), handler_for(service))
-    server.serve_forever()
+    try:
+        server = server_class((host, port), handler_for(service))
+    except Exception:
+        if ack_server is not None:
+            ack_server.server_close()
+        if watchlist_server is not None:
+            watchlist_server.server_close()
+        if price_rule_server is not None:
+            price_rule_server.server_close()
+        raise
+    ack_thread = None
+    ack_started = False
+    watchlist_thread = None
+    watchlist_started = False
+    price_rule_thread = None
+    price_rule_started = False
+    try:
+        if ack_server is not None:
+            ack_thread = threading.Thread(target=ack_server.serve_forever, daemon=True)
+            ack_thread.start()
+            ack_started = True
+        if watchlist_server is not None:
+            watchlist_thread = threading.Thread(target=watchlist_server.serve_forever, daemon=True)
+            watchlist_thread.start()
+            watchlist_started = True
+        if price_rule_server is not None:
+            price_rule_thread = threading.Thread(
+                target=price_rule_server.serve_forever, daemon=True
+            )
+            price_rule_thread.start()
+            price_rule_started = True
+        server.serve_forever()
+    finally:
+        server.server_close()
+        if ack_server is not None:
+            if ack_started and ack_thread is not None:
+                ack_server.shutdown()
+                ack_thread.join()
+            ack_server.server_close()
+        if watchlist_server is not None:
+            if watchlist_started and watchlist_thread is not None:
+                watchlist_server.shutdown()
+                watchlist_thread.join()
+            watchlist_server.server_close()
+        if price_rule_server is not None:
+            if price_rule_started and price_rule_thread is not None:
+                price_rule_server.shutdown()
+                price_rule_thread.join()
+            price_rule_server.server_close()
 
 
 if __name__ == "__main__":

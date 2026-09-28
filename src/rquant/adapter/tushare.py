@@ -405,9 +405,9 @@ class TushareAdapter:
         return df
 
     def daily_basic_by_date(self, trade_date: date) -> pd.DataFrame:
-        """按交易日拉全市场每日基本面指标（历史回补用，字段对齐 daily_basic 表）。"""
+        """按交易日拉全市场每日指标，含旧表字段和 PIT 估值观察字段。"""
         ds = trade_date.strftime("%Y%m%d")
-        fields = "ts_code,trade_date,turnover_rate,volume_ratio,total_mv,circ_mv"
+        fields = "ts_code,trade_date,turnover_rate,volume_ratio,total_mv,circ_mv,pe_ttm,pb,dv_ttm"
         logger.info(f"Tushare daily_basic(by_date) 请求：trade_date={ds}")
 
         df = self._call_with_backoff(
@@ -850,7 +850,7 @@ class TushareAdapter:
         logger.info(f"Tushare daily_basic 返回 {len(df)} 行")
         return df
 
-    def stock_basic(self, list_status: str = "L") -> pd.DataFrame:
+    def stock_basic(self, list_status: str = "L", exchange: str = "") -> pd.DataFrame:
         """股票基础信息（代码 / 名称 / 行业 / 上市日期 / 退市日期等）。
 
         list_status: L=上市, D=退市, P=暂停上市
@@ -861,15 +861,8 @@ class TushareAdapter:
         `stock_basic source is missing columns: delist_date` 失败、一次都没发布过。
         空结果也保持列齐全（#277 同一类）：零行但没有列的表会被校验当成「缺列」整批拒。
         """
-        logger.info(f"Tushare stock_basic 请求：list_status={list_status}")
-        df = self._call_with_backoff(
-            "stock_basic",
-            lambda: self._pro.stock_basic(
-                exchange="",
-                list_status=list_status,
-                fields=",".join(STOCK_BASIC_COLUMNS),
-            ),
-        )
+        logger.info(f"Tushare stock_basic 请求：exchange={exchange} list_status={list_status}")
+        df = self._stock_basic_raw(list_status=list_status, exchange=exchange)
         if df is None or df.empty:
             logger.info(f"Tushare stock_basic 成功返回空：list_status={list_status}")
             return pd.DataFrame(
@@ -877,6 +870,28 @@ class TushareAdapter:
             )
         logger.info(f"Tushare stock_basic 返回 {len(df)} 行")
         return df
+
+    def stock_basic_partition(self, *, list_status: str, exchange: str) -> pd.DataFrame:
+        """Return one raw source partition, refusing ambiguous empty responses."""
+        df = self._stock_basic_raw(list_status=list_status, exchange=exchange)
+        if not isinstance(df, pd.DataFrame):
+            raise RuntimeError("Tushare stock_basic partition did not return a table")
+        missing = set(STOCK_BASIC_COLUMNS) - set(df.columns)
+        if missing:
+            raise RuntimeError(
+                "Tushare stock_basic partition missing columns: " + ", ".join(sorted(missing))
+            )
+        return df
+
+    def _stock_basic_raw(self, *, list_status: str, exchange: str) -> pd.DataFrame | None:
+        return self._call_with_backoff(
+            "stock_basic",
+            lambda: self._pro.stock_basic(
+                exchange=exchange,
+                list_status=list_status,
+                fields=",".join(STOCK_BASIC_COLUMNS),
+            ),
+        )
 
     # ══ 统一数据集回补层薄方法（dataset_backfill 注册表用） ══════════════════
     # 各方法 docstring 里的字段清单为 2026-07-01 trade_date=20260701 实测返回。

@@ -13,10 +13,13 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from rquant.storage.schema import (
     BASE_DDL,
+    DAILY_BASIC_VALUATION_OBSERVATION_DDLS,
     DATA_AUDIT_RUN_DDL,
     DATA_METADATA_TABLE_DDLS,
     DATA_REPAIR_AUDIT_DDL,
     DATASET_SNAPSHOT_BINDING_DDL,
+    FINANCIAL_PIT_OBSERVATION_DDLS,
+    FUNDAMENTAL_DAILY_VERSION_DDLS,
     LIMIT_UP_POOL_WRITE_GUARD_DDL,
     LIMIT_UP_POOL_WRITE_GUARD_SEED_DML,
     MARKET_SENTIMENT_HIGH60_MIGRATION_DDL,
@@ -28,6 +31,8 @@ from rquant.storage.schema import (
     PAPER_POSITION_SIGNAL_FACTORS_MIGRATION_DDL,
     PAPER_POSITION_STRATEGY_NAME_MIGRATION_DDL,
     PAPER_POSITION_TAKE_PROFIT_BASIS_MIGRATION_DDL,
+    SCREEN_RUN_PRICE_RECEIPT_MIGRATION_DDLS,
+    SCREEN_RUN_RECEIPT_DDL,
     STOCK_STATUS_DAILY_V4_DDL,
     STOCK_STATUS_NAME_OPTIONAL_MIGRATION_DDLS,
     STOCK_SUSPEND_COVERAGE_DDL,
@@ -159,6 +164,31 @@ MIGRATIONS: tuple[Migration, ...] = (
         version=10,
         name="immutable dataset snapshot execution binding",
         statements=(DATASET_SNAPSHOT_BINDING_DDL,),
+    ),
+    Migration(
+        version=11,
+        name="screen run result lineage",
+        statements=(SCREEN_RUN_RECEIPT_DDL,),
+    ),
+    Migration(
+        version=12,
+        name="screen run price proof",
+        statements=SCREEN_RUN_PRICE_RECEIPT_MIGRATION_DDLS,
+    ),
+    Migration(
+        version=13,
+        name="financial PIT observations",
+        statements=FINANCIAL_PIT_OBSERVATION_DDLS,
+    ),
+    Migration(
+        version=14,
+        name="daily basic valuation PIT observations",
+        statements=DAILY_BASIC_VALUATION_OBSERVATION_DDLS,
+    ),
+    Migration(
+        version=15,
+        name="immutable fundamental daily derivations",
+        statements=FUNDAMENTAL_DAILY_VERSION_DDLS,
     ),
 )
 

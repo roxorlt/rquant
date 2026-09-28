@@ -84,6 +84,9 @@ class ServingIntegrityError(RuntimeError):
     """A serving pointer, manifest, or database failed integrity validation."""
 
 
+ServingQueryError = duckdb.Error
+
+
 class ServingTableSpec(RuntimeContractModel):
     """Deterministic physical row order for one serving table."""
 

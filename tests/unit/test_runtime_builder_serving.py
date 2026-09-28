@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
+from rquant.paper_contracts import PaperAccountSnapshot
 from rquant.runtime_builder_serving import (
     DEFAULT_OPTIONAL_SOURCE_DATASETS,
     ServingReferenceSlowEvidence,
@@ -19,6 +21,7 @@ from rquant.runtime_service_entrypoint import RuntimeServiceKind, RuntimeService
 from rquant.runtime_serving_authority import ServingSourceAuthorityPublisher
 from rquant.runtime_serving_snapshot import (
     LAB_JOBS_DATASET_ID,
+    OPS_STATUS_DATASET_ID,
     PAPER_ACCOUNTS_DATASET_ID,
     PROMOTIONS_DATASET_ID,
     REFERENCE_SLOW_AUTHORITY_DATASET_ID,
@@ -27,6 +30,7 @@ from rquant.runtime_serving_snapshot import (
     RUNTIME_HEALTH_DATASET_ID,
     SIGNALS_DATASET_ID,
     LabJobsPayload,
+    OpsStatusPayload,
     PaperAccountsPayload,
     PromotionsPayload,
     ReferenceSlowPayload,
@@ -175,7 +179,7 @@ def _authority_settings(
     *,
     unpublished: frozenset[str] = frozenset(),
 ) -> tuple[dict[str, object], dict[str, Path]]:
-    """The six owner authorities, minus any the caller says never published.
+    """The seven owner authorities, minus any the caller says never published.
 
     An authority root that was never written is exactly what the host shows for the two
     research datasets: the settings still name it, and the read is what finds nothing.
@@ -187,6 +191,7 @@ def _authority_settings(
         RUNTIME_HEALTH_DATASET_ID: RuntimeHealthPayload(),
         LAB_JOBS_DATASET_ID: LabJobsPayload(),
         PROMOTIONS_DATASET_ID: PromotionsPayload(),
+        OPS_STATUS_DATASET_ID: OpsStatusPayload(),
         REFERENCE_SLOW_AUTHORITY_DATASET_ID: ReferenceSlowPayload(
             **_reference_evidence(available_at=NOW - timedelta(seconds=1)).model_dump()
         ),
@@ -194,7 +199,7 @@ def _authority_settings(
     roots = {dataset_id: tmp_path / "authorities" / dataset_id for dataset_id in payloads}
     (tmp_path / "authorities").mkdir(parents=True)
     for dataset_id, payload in payloads.items():
-        if dataset_id in unpublished:
+        if dataset_id in unpublished or dataset_id == OPS_STATUS_DATASET_ID:
             continue
         ServingSourceAuthorityPublisher(
             root=roots[dataset_id],
@@ -207,6 +212,7 @@ def _authority_settings(
         {
             "serving_root": str(tmp_path / "serving"),
             "schema_version": 3,
+            "ops_manifest_digest": "a" * 64,
             "source_authorities": [
                 {"dataset_id": dataset_id, "root": str(root)} for dataset_id, root in roots.items()
             ],
@@ -324,7 +330,7 @@ def test_repeated_identical_snapshot_is_idempotent_without_extra_generation(
     second = step()
     second_paths = tuple((tmp_path / "serving" / "generations").iterdir())
 
-    # Same six source generations, so the second iteration selects the generation that
+    # Same source generations, so the second iteration selects the generation that
     # is already current and never opens a DuckDB file to build another (#271).
     assert first.generation_published is True
     assert second.generation_published is False
@@ -407,6 +413,89 @@ def test_default_builder_reads_five_dynamic_owner_authorities(tmp_path: Path) ->
     assert second.output_sequence == 2
 
 
+def test_exact_seven_and_legacy_six_owner_shapes_are_the_only_accepted_sets(
+    tmp_path: Path,
+) -> None:
+    settings, _roots = _authority_settings(tmp_path)
+    assert {item["dataset_id"] for item in settings["source_authorities"]} == {
+        SIGNALS_DATASET_ID,
+        PAPER_ACCOUNTS_DATASET_ID,
+        RUNTIME_HEALTH_DATASET_ID,
+        LAB_JOBS_DATASET_ID,
+        PROMOTIONS_DATASET_ID,
+        OPS_STATUS_DATASET_ID,
+        REFERENCE_SLOW_AUTHORITY_DATASET_ID,
+    }
+    seven = serving_publisher_builder(snapshot_loader=None, clock=lambda: NOW)(
+        _manifest(tmp_path, settings=settings)
+    )
+    assert OPS_STATUS_DATASET_ID in seven().source_generations
+
+    missing_digest = dict(settings)
+    missing_digest.pop("ops_manifest_digest")
+    with pytest.raises(ValidationError, match="ops_manifest_digest"):
+        ServingRuntimeSettings.model_validate(missing_digest)
+
+    mandatory_ops = dict(settings)
+    mandatory_ops["optional_source_datasets"] = [LAB_JOBS_DATASET_ID, PROMOTIONS_DATASET_ID]
+    with pytest.raises(ValidationError, match="ops_status must be optional"):
+        ServingRuntimeSettings.model_validate(mandatory_ops)
+
+    legacy = dict(settings)
+    legacy.pop("ops_manifest_digest")
+    legacy["serving_root"] = str(tmp_path / "legacy-serving")
+    legacy["source_authorities"] = [
+        item
+        for item in settings["source_authorities"]
+        if item["dataset_id"] != OPS_STATUS_DATASET_ID
+    ]
+    legacy["optional_source_datasets"] = [LAB_JOBS_DATASET_ID, PROMOTIONS_DATASET_ID]
+    old = serving_publisher_builder(snapshot_loader=None, clock=lambda: NOW)(
+        _manifest(tmp_path / "legacy", settings=legacy)
+    )
+    result = old()
+    assert any(
+        reason.startswith("serving:ops_status:unavailable:")
+        for reason in result.degraded_reasons
+    )
+
+    five = dict(legacy)
+    five["source_authorities"] = legacy["source_authorities"][:-1]
+    with pytest.raises(ValidationError, match="seven owner datasets|legacy six"):
+        ServingRuntimeSettings.model_validate(five)
+
+    wrong_six = dict(settings)
+    wrong_six["source_authorities"] = [
+        item for item in settings["source_authorities"] if item["dataset_id"] != SIGNALS_DATASET_ID
+    ]
+    with pytest.raises(ValidationError, match="seven owner datasets|legacy six"):
+        ServingRuntimeSettings.model_validate(wrong_six)
+
+
+def test_corrupt_optional_ops_authority_does_not_block_other_serving_sources(
+    tmp_path: Path,
+) -> None:
+    settings, roots = _authority_settings(tmp_path)
+    roots[OPS_STATUS_DATASET_ID].mkdir(parents=True)
+    (roots[OPS_STATUS_DATASET_ID] / "current.json").write_bytes(b"{")
+    step = serving_publisher_builder(snapshot_loader=None, clock=lambda: NOW)(
+        _manifest(tmp_path, settings=settings)
+    )
+
+    result = step()
+    assert result.generation_published is True
+    assert any(
+        reason.startswith("serving:ops_status:unavailable:")
+        for reason in result.degraded_reasons
+    )
+    with ServingReader(tmp_path / "serving").acquire_generation() as lease:
+        mark = next(
+            item for item in lease.manifest.watermarks if item.dataset_id == OPS_STATUS_DATASET_ID
+        )
+        assert mark.status is FreshnessStatus.UNAVAILABLE
+        assert lease.connection.execute("SELECT COUNT(*) FROM ops_unit_status").fetchone() == (0,)
+
+
 def test_the_research_sources_are_optional_by_default_and_reference_slow_never_is() -> None:
     """What a manifest written before #283 gets, and what no manifest may ask for."""
 
@@ -469,6 +558,8 @@ def test_serving_publishes_while_the_research_authorities_have_never_published(
     assert sorted(result.degraded_reasons) == [
         "serving:lab_jobs:unavailable:ServingSourceAuthorityUnavailableError: "
         "current authority is unavailable",
+        "serving:ops_status:unavailable:ServingSourceAuthorityUnavailableError: "
+        "current authority is unavailable",
         "serving:promotions:unavailable:ServingSourceAuthorityUnavailableError: "
         "current authority is unavailable",
     ]
@@ -479,14 +570,120 @@ def test_serving_publishes_while_the_research_authorities_have_never_published(
     assert absent[LAB_JOBS_DATASET_ID] != absent[PROMOTIONS_DATASET_ID]
 
 
+@pytest.mark.parametrize("root_exists", [False, True])
+def test_unpublished_paper_authority_stays_unavailable_then_recovers_or_fails_closed(
+    tmp_path: Path,
+    root_exists: bool,
+) -> None:
+    settings, roots = _authority_settings(
+        tmp_path,
+        unpublished=frozenset({PAPER_ACCOUNTS_DATASET_ID}),
+    )
+    settings["optional_source_datasets"] = [
+        LAB_JOBS_DATASET_ID,
+        OPS_STATUS_DATASET_ID,
+        PAPER_ACCOUNTS_DATASET_ID,
+        PROMOTIONS_DATASET_ID,
+    ]
+    if root_exists:
+        roots[PAPER_ACCOUNTS_DATASET_ID].mkdir(parents=True)
+    unavailable_reason = (
+        "current pointer is unavailable" if root_exists else "current authority is unavailable"
+    )
+    clock = [NOW]
+    step = serving_publisher_builder(snapshot_loader=None, clock=lambda: clock[0])(
+        _manifest(tmp_path, settings=settings)
+    )
+
+    first = step()
+    assert first.generation_published is True
+    assert first.degraded_reasons == (
+        "serving:ops_status:unavailable:ServingSourceAuthorityUnavailableError: "
+        "current authority is unavailable",
+        "serving:paper_accounts:unavailable:ServingSourceAuthorityUnavailableError: "
+        f"{unavailable_reason}",
+    )
+    with ServingReader(tmp_path / "serving").acquire_generation() as lease:
+        paper_watermark = next(
+            item
+            for item in lease.manifest.watermarks
+            if item.dataset_id == PAPER_ACCOUNTS_DATASET_ID
+        )
+        assert paper_watermark.status is FreshnessStatus.UNAVAILABLE
+        assert lease.connection.execute("SELECT COUNT(*) FROM paper_accounts").fetchone() == (0,)
+        first_generation = lease.manifest.generation_id
+
+    clock[0] += timedelta(seconds=30)
+    unchanged = step()
+    assert unchanged.generation_published is False
+    assert unchanged.source_generations[PAPER_ACCOUNTS_DATASET_ID] == (
+        first.source_generations[PAPER_ACCOUNTS_DATASET_ID]
+    )
+
+    account = PaperAccountSnapshot(
+        account_id="shadow-main",
+        as_of_time=NOW,
+        cash=Decimal("100000"),
+        available_cash=Decimal("100000"),
+        frozen_cash=Decimal("0"),
+        realized_pnl=Decimal("0"),
+        unrealized_pnl=Decimal("0"),
+        nav=Decimal("100000"),
+    )
+    ServingSourceAuthorityPublisher(
+        root=roots[PAPER_ACCOUNTS_DATASET_ID],
+        producer_commit=COMMIT,
+        dataset_id=PAPER_ACCOUNTS_DATASET_ID,
+        payload_kind="paper_accounts",
+        clock=lambda: clock[0],
+    ).publish(
+        _authority_result(
+            PAPER_ACCOUNTS_DATASET_ID,
+            PaperAccountsPayload(paper_accounts=(account,)),
+            published_at=NOW + timedelta(seconds=1),
+        )
+    )
+    recovered = step()
+    assert recovered.generation_published is True
+    assert recovered.degraded_reasons == (
+        "serving:ops_status:unavailable:ServingSourceAuthorityUnavailableError: "
+        "current authority is unavailable",
+    )
+    with ServingReader(tmp_path / "serving").acquire_generation() as lease:
+        assert lease.manifest.generation_id != first_generation
+        assert lease.connection.execute("SELECT account_id FROM paper_accounts").fetchall() == [
+            ("shadow-main",)
+        ]
+
+    current_paper_pointer = roots[PAPER_ACCOUNTS_DATASET_ID] / "current.json"
+    current_paper_pointer.write_bytes(b"{")
+    with pytest.raises(RuntimeError, match="paper_accounts reader failed"):
+        step()
+    assert ServingReader(tmp_path / "serving").current_manifest().generation_id == (
+        recovered.source_generations["serving_generation"]
+    )
+
+    current_paper_pointer.unlink()
+    restarted_step = serving_publisher_builder(snapshot_loader=None, clock=lambda: clock[0])(
+        _manifest(tmp_path, settings=settings)
+    )
+    with pytest.raises(RuntimeError, match="paper_accounts reader failed"):
+        restarted_step()
+    with ServingReader(tmp_path / "serving").acquire_generation() as lease:
+        assert lease.manifest.generation_id == recovered.source_generations["serving_generation"]
+        assert lease.connection.execute("SELECT account_id FROM paper_accounts").fetchall() == [
+            ("shadow-main",)
+        ]
+
+
 def test_the_manifest_decides_which_sources_are_optional_not_the_default(
     tmp_path: Path,
 ) -> None:
     """A profile that shortens the list back to `[]` really tightens the rule.
 
-    The builder's default and what `runtime_production_profile` writes into the manifest
-    are the same two datasets today, so every other case here cannot tell the two paths
-    apart: wiring `:313` back to the constant leaves all of them green. That matters
+    The builder's legacy default names two research datasets while the current profile
+    explicitly adds paper accounts. This case still guards manifest authority: wiring
+    the builder directly to its default would hide a profile change. That matters
     because writing the list into the manifest is the whole reason the profile spells it
     out -- the day the research plane publishes, shortening it to `[]` is meant to be a
     profile change with its own fingerprint, and it has to actually bite.
@@ -500,6 +697,12 @@ def test_the_manifest_decides_which_sources_are_optional_not_the_default(
         tmp_path,
         unpublished=frozenset({LAB_JOBS_DATASET_ID}),
     )
+    settings["source_authorities"] = [
+        item
+        for item in settings["source_authorities"]
+        if item["dataset_id"] != OPS_STATUS_DATASET_ID
+    ]
+    settings.pop("ops_manifest_digest")
     settings["optional_source_datasets"] = []
     step = serving_publisher_builder(snapshot_loader=None, clock=lambda: NOW)(
         _manifest(tmp_path, settings=settings)
@@ -519,9 +722,15 @@ def test_a_source_outside_the_optional_set_stops_the_whole_round(
     tmp_path: Path,
     dataset_id: str,
 ) -> None:
-    """The negative half of #283, at the builder: only the two research sources degrade."""
+    """The new optional paper source does not weaken the three required owner reads."""
 
     settings, _roots = _authority_settings(tmp_path, unpublished=frozenset({dataset_id}))
+    settings["optional_source_datasets"] = [
+        LAB_JOBS_DATASET_ID,
+        OPS_STATUS_DATASET_ID,
+        PAPER_ACCOUNTS_DATASET_ID,
+        PROMOTIONS_DATASET_ID,
+    ]
     step = serving_publisher_builder(snapshot_loader=None, clock=lambda: NOW)(
         _manifest(tmp_path, settings=settings)
     )
@@ -616,7 +825,7 @@ def test_default_builder_requires_exact_owner_authority_set(tmp_path: Path) -> N
     authorities = list(settings["source_authorities"])
     settings["source_authorities"] = authorities[:-1]
 
-    with pytest.raises(ValidationError, match="exactly.*six|missing"):
+    with pytest.raises(ValidationError, match="exactly.*seven|missing"):
         serving_publisher_builder(snapshot_loader=None, clock=lambda: NOW)(
             _manifest(tmp_path, settings=settings)
         )
@@ -641,7 +850,7 @@ def test_injected_loader_cannot_mix_with_owner_authorities(tmp_path: Path) -> No
 
 
 def test_sixty_idle_steps_of_the_built_role_leave_one_generation(tmp_path: Path) -> None:
-    """#271, through the role's own step: the clock moves, the six sources do not.
+    """#271, through the role's own step: the clock moves, the sources do not.
 
     This is what production looks like once runtime health and lab jobs stop restating
     themselves: the assembler still stamps `observed_at = as_of` into the read model, and

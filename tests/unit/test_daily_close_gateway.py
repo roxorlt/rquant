@@ -12,12 +12,15 @@ from threading import Event
 
 import pandas as pd
 import pytest
+from pydantic import ValidationError
 
 import rquant.daily_close_gateway as daily_close_gateway_module
 import rquant.runtime_builder_daily as runtime_builder_daily
 from rquant.daily_close_gateway import (
     DAILY_CLOSE_SOURCE_INTERFACES,
+    DailyBasicFact,
     DailyCloseDataset,
+    DailyCloseFacts,
     DailyCloseFetchResult,
     DailyCloseGateway,
     DailyCloseGatewayConfig,
@@ -27,6 +30,7 @@ from rquant.daily_close_gateway import (
 )
 from rquant.live_contracts import BatchQualityStatus, LiveChannel
 from rquant.live_spool import LiveBatchSpool
+from rquant.runtime_contracts import canonical_sha256
 from rquant.source_quota_store import SourceQuotaAttemptOutcome, SourceQuotaStore
 from rquant.source_quota_transport import QuotaBoundTransportObserver
 
@@ -124,6 +128,41 @@ def _gateway(
         quota_store=quota_store,
         transport_observer=transport_observer,
     )
+
+
+def test_legacy_daily_basic_payload_keeps_its_original_content_identity() -> None:
+    old_snapshot = _snapshot()
+    facts = DailyCloseFacts.model_validate(old_snapshot)
+    assert facts.identity_sha256 == canonical_sha256(old_snapshot)
+    assert facts.daily_basic[0].valuation_observed is False
+
+    request = DailyCloseSourceRequest(source="tushare.daily_close", trade_date=TRADE_DATE)
+    payload = DailyCloseRawPayload(
+        schema_version=1,
+        source_request=request,
+        source_request_id=request.identity_sha256,
+        observed_at=OBSERVED_AT,
+        available_at=AVAILABLE_AT,
+        revision=1,
+        content_sha256=facts.identity_sha256,
+        quality_status=BatchQualityStatus.PUBLISHED,
+        facts=facts,
+    )
+    raw_json = payload.model_dump(mode="json")
+    old_row = raw_json["facts"]["daily_basic"][0]
+    for field_name in ("pe_ttm", "pb", "dv_ttm", "valuation_observed"):
+        old_row.pop(field_name)
+    restored = DailyCloseGateway.decode_payload(
+        json.dumps(raw_json, sort_keys=True).encode("utf-8")
+    )
+    assert restored.facts.identity_sha256 == facts.identity_sha256
+
+
+def test_observed_valuation_requires_all_three_source_fields() -> None:
+    basic = _snapshot()["daily_basic"][0]
+    assert isinstance(basic, dict)
+    with pytest.raises(ValidationError, match="include all source fields"):
+        DailyBasicFact.model_validate({**basic, "pb": 1.25, "valuation_observed": True})
 
 
 def test_transport_restart_aggregates_a_killed_second_call_as_unknown(
@@ -474,10 +513,16 @@ def test_gateway_rejects_a_seven_call_receipt_with_repeated_interface(tmp_path: 
     assert quota.list_attempts()[0].outcome is SourceQuotaAttemptOutcome.FAILURE
 
 
-def test_default_daily_fetcher_returns_a_seven_interface_usage_receipt(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("missing_pe", (None, float("nan")))
+def test_default_daily_fetcher_preserves_mixed_missing_pe_and_usage_receipt(
+    monkeypatch: pytest.MonkeyPatch, missing_pe: float | None
 ) -> None:
     snapshot = _snapshot()
+    basic_row = snapshot["daily_basic"][0]
+    assert isinstance(basic_row, dict)
+    basic_row.update(pe_ttm=10.0, pb=1.25, dv_ttm=2.5)
+    missing_row = {**basic_row, "ts_code": "000001.SZ", "pe_ttm": missing_pe}
+    snapshot["daily_basic"] = (basic_row, missing_row)
 
     class FakeAdapter:
         def __init__(self, *, token: str, backup_token: str) -> None:
@@ -520,6 +565,58 @@ def test_default_daily_fetcher_returns_a_seven_interface_usage_receipt(
     assert isinstance(result, DailyCloseFetchResult)
     assert result.actual_call_count == 7
     assert result.interface_calls == DAILY_CLOSE_SOURCE_INTERFACES
+    observed_basic = result.payload["daily_basic"]
+    assert observed_basic[0] == {**basic_row, "valuation_observed": True}
+    assert observed_basic[1] == {**missing_row, "pe_ttm": None, "valuation_observed": True}
+    assert DailyBasicFact.model_validate(observed_basic[1]).pe_ttm is None
+
+
+@pytest.mark.parametrize("field", ("pe_ttm", "pb", "dv_ttm"))
+@pytest.mark.parametrize("invalid", (float("inf"), -float("inf")))
+def test_daily_basic_source_rejects_infinite_valuation_before_signing(
+    monkeypatch: pytest.MonkeyPatch, field: str, invalid: float
+) -> None:
+    snapshot = _snapshot()
+    basic_row = snapshot["daily_basic"][0]
+    assert isinstance(basic_row, dict)
+    basic_row.update(pe_ttm=None, pb=1.25, dv_ttm=2.5)
+    basic_row[field] = invalid
+
+    class FakeAdapter:
+        def __init__(self, *, token: str, backup_token: str) -> None:
+            assert token == "not-a-real-token"
+            assert backup_token == ""
+
+        def daily_by_date(self, _trade_date: date) -> pd.DataFrame:
+            return pd.DataFrame(snapshot["daily_bar"])
+
+        def daily_basic_by_date(self, _trade_date: date) -> pd.DataFrame:
+            return pd.DataFrame(snapshot["daily_basic"])
+
+        def adj_factor_by_date(self, _trade_date: date) -> pd.DataFrame:
+            return pd.DataFrame(snapshot["adj_factor"])
+
+        def index_daily_major_by_date(self, _trade_date: date) -> pd.DataFrame:
+            return pd.DataFrame(snapshot["index_daily"])
+
+        def stock_basic(self, list_status: str = "L") -> pd.DataFrame:
+            return pd.DataFrame(
+                ({"ts_code": "600000.SH", "name": "浦发银行", "list_status": list_status},)
+            )
+
+        def stock_st_raw(self, _trade_date: date) -> pd.DataFrame:
+            return pd.DataFrame(columns=("ts_code",))
+
+        def suspend_d_raw(self, _trade_date: date) -> pd.DataFrame:
+            return pd.DataFrame(columns=("ts_code", "trade_date", "suspend_type", "suspend_timing"))
+
+    monkeypatch.setattr("rquant.adapter.tushare.TushareAdapter", FakeAdapter)
+    fetch = runtime_builder_daily._tushare_daily_close_fetcher(
+        {"TUSHARE_TOKEN_MAIN": "not-a-real-token"}
+    )
+
+    with pytest.raises(ValueError, match=f"daily-close daily_basic {field} is nonfinite"):
+        fetch(DailyCloseSourceRequest(source="tushare.daily_close", trade_date=TRADE_DATE))
 
 
 def _records(gateway: DailyCloseGateway):

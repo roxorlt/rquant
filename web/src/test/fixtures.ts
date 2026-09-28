@@ -1,4 +1,4 @@
-import type { MetaEnvelope } from "@/api/client";
+import type { MetaEnvelope, Schemas } from "@/api/client";
 import type { HealthEnvelope, OverviewEnvelope } from "@/api/endpoints";
 
 /** A synthetic /api/v1/meta envelope (shape from the generated schema). */
@@ -58,6 +58,222 @@ const SERVING = {
   message: null,
   detail: "serving generation verified",
 } as const;
+
+export function monitorEnvelope(
+  overrides: Partial<Schemas["MonitorTimelineData"]> = {},
+): Schemas["Envelope_MonitorTimelineData_"] {
+  return {
+    serving: { ...SERVING },
+    data: {
+      source_state: "ready",
+      source_label: "告警时间线",
+      source_note: null,
+      receipt_state: "has_receipts",
+      receipt_label: "通知回执已更新",
+      total: 4,
+      page_size: 20,
+      mode: "shadow",
+      mode_label: "仅记录",
+      mode_note: "正式推送开通前只记录不发送",
+      market_note: "今天休市，显示历史告警",
+      next_cursor: "fixture-next",
+      items: [
+        {
+          kind: "signal",
+          event_key: "signal:signal-internal-2",
+          signal_id: "signal-internal-2",
+          sequence: 2,
+          at: "2026-09-24T05:05:14Z",
+          code: "002238.SZ",
+          name: "天威视讯",
+          strategy_id: "auction_gap",
+          strategy_name: "竞价跳空",
+          action: "b_intent",
+          action_label: "买入意向",
+          reasons: ["竞价跳空确认"],
+          delivery: "unconfirmed",
+          delivery_label: "送达未确认",
+          delivery_note: "回执没有保存当时的推送方式，无法确认是否到达手机",
+          receipts: [
+            {
+              outbox_id: "outbox-internal",
+              recipient_id: "admin",
+              channel: "pushdeer",
+              channel_label: "PushDeer",
+              status: "succeeded",
+              status_label: "送达未确认",
+              updated_at: "2026-09-24T05:05:20Z",
+              attempt_count: 1,
+            },
+          ],
+        },
+        {
+          kind: "monitor",
+          event_key: "monitor:fixture-1",
+          at: "2026-09-24T02:05:00Z",
+          code: "600005.SH",
+          name: "样本05",
+          event_label: "上攻突破",
+          price: 12.34,
+          level_price: 12,
+          status_label: "已触发",
+        },
+        {
+          kind: "surge",
+          event_key: "surge:fixture-1",
+          at: "2026-09-24T01:52:00Z",
+          code: "600004.SH",
+          name: "样本04",
+          event_label: "爆量",
+          price: 11.25,
+          pct_chg: 3.15,
+          status_label: "已确认",
+        },
+        {
+          kind: "signal",
+          event_key: "signal:signal-internal-1",
+          signal_id: "signal-internal-1",
+          sequence: 1,
+          at: "2026-09-23T01:47:00Z",
+          code: "600001.SH",
+          name: "样本01",
+          strategy_id: "n_shape",
+          strategy_name: "N 字",
+          action: "watch",
+          action_label: "观察",
+          reasons: [],
+          delivery: "none",
+          delivery_label: "暂无回执",
+          delivery_note: null,
+          receipts: [],
+        },
+      ],
+      ...overrides,
+    },
+  };
+}
+
+export function channelsEnvelope(
+  overrides: Partial<Schemas["MonitorChannelsData"]> = {},
+): Schemas["Envelope_MonitorChannelsData_"] {
+  return {
+    serving: { ...SERVING },
+    data: { state: "unavailable", channels: [], ...overrides },
+  };
+}
+
+export function tasksEnvelope(
+  overrides: Partial<Schemas["ResearchJobsData"]> = {},
+): Schemas["Envelope_ResearchJobsData_"] {
+  return {
+    serving: { ...SERVING },
+    data: {
+      source_state: "ready",
+      source_label: "研究任务",
+      source_note: null,
+      source_updated_at: "2026-09-24T07:30:40Z",
+      total: 2,
+      counts: {
+        queued: 1,
+        running: 1,
+        checkpointed: 0,
+        succeeded: 0,
+        failed: 0,
+        cancelled: 0,
+        other: 0,
+      },
+      page_size: 1,
+      next_cursor: "fixture-next",
+      items: [
+        {
+          job_id: "00000000-0000-0000-0000-000000000001",
+          strategy_name: "动量参数搜索",
+          job_type_label: "参数搜索",
+          resource_label: "标准",
+          status: { state: "ok", label: "运行中", reason: "任务正在运行" },
+          progress_fraction: 0.25,
+          terminal_shards: 1,
+          total_shards: 4,
+          eta_at: "2026-09-24T07:35:00Z",
+          eta_low: "2026-09-24T07:33:00Z",
+          eta_high: "2026-09-24T07:37:00Z",
+          eta_label: "预计结束",
+          updated_at: "2026-09-24T07:30:00Z",
+        },
+      ],
+      ...overrides,
+    },
+  };
+}
+
+export function paperEnvelope(
+  overrides: Partial<Schemas["PaperAccountsData"]> = {},
+): Schemas["Envelope_PaperAccountsData_"] {
+  return {
+    serving: { ...SERVING },
+    data: {
+      source_state: "ready",
+      source_updated_at: "2026-09-24T07:30:20Z",
+      source_note: null,
+      valuation_note: "持仓按最近成交价估值，不是实时价",
+      history: {
+        source_state: "not_published",
+        source_updated_at: null,
+        source_note: "指令记录尚未发布。",
+        account_id: null,
+        total_orders: null,
+        has_more: false,
+        newest_updated_at: null,
+        oldest_updated_at: null,
+        orders: [],
+      },
+      accounts: [
+        {
+          account_id: "shadow-main",
+          as_of: "2026-09-24T07:30:30Z",
+          nav: 100042,
+          cash: 97620,
+          market_value: 2422,
+          unrealized_pnl: 42,
+          holdings: [
+            {
+              code: "600005.SH",
+              name: "样本05",
+              quantity: 100,
+              available_quantity: 100,
+              average_cost: 15,
+              market_price: 15.42,
+              market_value: 1542,
+              unrealized_pnl: 42,
+              unrealized_pct: 2.8,
+            },
+            {
+              code: "600001.SH",
+              name: "样本01",
+              quantity: 100,
+              available_quantity: 0,
+              average_cost: 8.8,
+              market_price: 8.8,
+              market_value: 880,
+              unrealized_pnl: 0,
+              unrealized_pct: 0,
+            },
+          ],
+        },
+        {
+          account_id: "cash-only",
+          as_of: "2026-09-24T07:29:30Z",
+          nav: 5000,
+          cash: 5000,
+          market_value: 0,
+          unrealized_pnl: 0,
+          holdings: [],
+        },
+      ],
+      ...overrides,
+    },
+  };
+}
 
 /** A synthetic /api/v1/overview envelope shaped like the 2026-09-24 replay. */
 export function overviewEnvelope(

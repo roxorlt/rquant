@@ -49,15 +49,15 @@ _REFERENCE_SLOW_AUTHORITY_DATASET_ID = "reference_slow_authority"
 _REFERENCE_SLOW_DATASET_ID = "reference_slow"
 _REFERENCE_SLOW_CONTRACT_DATASET_ID = "reference_slow_contract"
 
-#: The two sources serving degrades on instead of refusing the whole round (#283). Both
-#: belong to the research plane, which has never published a generation on the host, and
-#: neither is evidence any serving consumer prices or alerts against: an empty
-#: `LabJobsPayload` / `PromotionsPayload` is a legal value of its own contract. The other
-#: four stay fail-closed, and `signals` above all: criterion (3b) reads "no signal today"
+#: The research sources and ops_status may be absent without stopping serving. An absent
+#: ops sample never counts as a healthy task or resource reading. Required pricing and
+#: signal sources stay fail-closed: criterion (3b) reads "no signal today"
 #: off an empty `signals` table, and that reading is only worth anything while a broken
 #: `signals` reader still refuses the round instead of publishing the same empty table.
 #: It lives here rather than in `runtime_serving_snapshot`, which imports this module.
-DEFAULT_OPTIONAL_SOURCE_DATASETS: frozenset[str] = frozenset({"lab_jobs", "promotions"})
+DEFAULT_OPTIONAL_SOURCE_DATASETS: frozenset[str] = frozenset(
+    {"lab_jobs", "promotions", "ops_status"}
+)
 
 
 def current_runtime_schema_consumer_acknowledgers(
@@ -79,9 +79,10 @@ class ServingRuntimeSettings(RuntimeContractModel):
     serving_root: Path
     schema_version: StrictInt = Field(ge=1)
     source_authorities: tuple[ServingSourceAuthoritySettings, ...] = ()
-    #: A manifest written before #283 does not carry this key, and the default is what
-    #: this release decided, so such a manifest gets the same behaviour without being
-    #: rewritten. The reverse does not hold: `RuntimeContractModel` forbids extra keys, so
+    ops_manifest_digest: GenerationId | None = None
+    #: The legacy six-owner production manifest keeps its explicit optional set; the
+    #: missing ops owner is separately forced unavailable at build. The reverse does not hold:
+    #: `RuntimeContractModel` forbids extra keys, so
     #: a runtime generation staged by this code and left published while the code rolls
     #: back to one that has no such field is refused at build. Roll the runtime generation
     #: back together with the code.
@@ -115,13 +116,23 @@ class ServingRuntimeSettings(RuntimeContractModel):
         dataset_ids = tuple(item.dataset_id for item in self.source_authorities)
         if len(dataset_ids) != len(set(dataset_ids)):
             raise ValueError("serving source authorities contain duplicate datasets")
-        if set(dataset_ids) != set(_SOURCE_PAYLOAD_KINDS):
-            missing = sorted(set(_SOURCE_PAYLOAD_KINDS).difference(dataset_ids))
+        expected = set(_SOURCE_PAYLOAD_KINDS)
+        observed = set(dataset_ids)
+        legacy = expected.difference({"ops_status"})
+        if observed not in (expected, legacy):
+            missing = sorted(expected.difference(dataset_ids))
             unexpected = sorted(set(dataset_ids).difference(_SOURCE_PAYLOAD_KINDS))
             raise ValueError(
-                "serving source authorities require exactly six owner datasets; "
+                "serving source authorities require exactly seven owner datasets "
+                "or the legacy six without ops_status; "
                 f"missing={missing}, unexpected={unexpected}"
             )
+        if observed == expected and "ops_status" not in self.optional_source_datasets:
+            raise ValueError("ops_status must be optional in the seven-owner serving manifest")
+        if observed == expected and self.ops_manifest_digest is None:
+            raise ValueError("seven-owner serving manifest requires ops_manifest_digest")
+        if observed == legacy and self.ops_manifest_digest is not None:
+            raise ValueError("legacy six-owner manifest cannot assert ops_manifest_digest")
         return self
 
 
@@ -144,10 +155,11 @@ _SOURCE_PAYLOAD_KINDS = {
     "runtime_health": "runtime_health",
     "lab_jobs": "lab_jobs",
     "promotions": "promotions",
+    "ops_status": "ops_status",
     _REFERENCE_SLOW_AUTHORITY_DATASET_ID: "reference_slow",
 }
 
-#: The one list of owner datasets serving reads. Both guards that have to name the six
+#: The one list of owner datasets serving reads. Both guards that have to name the seven
 #: derive from here -- `ServingRuntimeSettings.validate_optional_source_datasets` above,
 #: and `ServingSnapshotAssembler`'s construction check, which imports this name. A
 #: profile's `source_authorities` cannot be derived (each entry carries its own root),
@@ -266,7 +278,7 @@ def serving_publisher_builder(
         build_events: tuple[str, ...] = ()
         if resolved_snapshot_loader is None:
             if not settings.source_authorities:
-                raise ValueError("default serving publisher requires six source authorities")
+                raise ValueError("default serving publisher requires seven source authorities")
             from rquant.runtime_generation_lineage import producer_commit_lineage
             from rquant.runtime_serving_authority import (
                 ServingSourceAuthorityReader,
@@ -274,11 +286,11 @@ def serving_publisher_builder(
             )
             from rquant.runtime_serving_snapshot import ServingSnapshotAssembler
 
-            # Each of the six `current.json` files belongs to a role this one only reads,
+            # Each source `current.json` belongs to an independent owner,
             # and none of them is republished until its owner runs again, so after a
             # release every one of them still carries the previous generation's commit.
             # `signals` is the one the 2026-09-09 window failed on (#253); the rule is the
-            # same for all six, and a commit no generation of ours ran is still refused.
+            # same for every configured owner, and an unknown commit is still refused.
             # The pointer cannot be rewritten from here: `deploy/systemd/
             # rquant-runtime-serving@.service` mounts `control/` and
             # `live/notifications/` read-only for this role, so the owner rewrites it on
@@ -314,12 +326,14 @@ def serving_publisher_builder(
                 runtime_health_reader=readers["runtime_health"],
                 lab_jobs_reader=readers["lab_jobs"],
                 promotions_reader=readers["promotions"],
+                ops_status_reader=readers.get("ops_status"),
+                expected_ops_manifest_digest=settings.ops_manifest_digest,
                 reference_slow_reader=readers[_REFERENCE_SLOW_AUTHORITY_DATASET_ID],
-                #: #283: the research plane has never published a generation on the host,
-                #: and a fail-closed read of it stopped serving from cutting any
-                #: generation at all. These two degrade to an empty payload and an
-                #: `unavailable` watermark; the other four still refuse the round.
-                optional_datasets=frozenset(settings.optional_source_datasets),
+                #: The legacy six-owner shape has no ops authority yet. Other sources
+                #: follow the manifest; only classified ops integrity is also optional.
+                optional_datasets=frozenset(settings.optional_source_datasets).union(
+                    {"ops_status"} if "ops_status" not in readers else ()
+                ),
             )
             resolved_snapshot_loader = assembler.assemble
             build_events = handover_events

@@ -20,10 +20,28 @@ def test_openapi_snapshot_matches_the_app_byte_for_byte() -> None:
     assert SNAPSHOT.read_text(encoding="utf-8") == openapi_document(app)
 
 
-def test_every_api_path_is_versioned_and_read_only() -> None:
+def test_every_api_path_is_versioned_and_only_defined_mutations_use_post() -> None:
     app = create_app(WebSettings(serving_root=Path("data/runtime/serving")), background=False)
     paths = app.openapi()["paths"]
     assert paths
     for path, operations in paths.items():
         assert path.startswith("/api/v1/")
-        assert set(operations) == {"get"}
+        assert set(operations) == (
+            {"post"}
+            if path
+            in {
+                "/api/v1/screen/run",
+                "/api/v1/screen/nl-preview",
+                "/api/v1/screen/tdx/parse",
+                "/api/v1/screen/tdx/preview",
+                "/api/v1/pools/editor/commands",
+                "/api/v1/pools/editor/nl-preview",
+                "/api/v1/monitor/ack",
+                "/api/v1/watchlist/commands",
+                "/api/v1/data/backfill-plans/commands",
+                "/api/v1/data/audit-report/commands",
+                "/api/v1/screen/tdx/market/commands",
+                "/api/v1/pools/formula/commands",
+            }
+            else {"get"}
+        )

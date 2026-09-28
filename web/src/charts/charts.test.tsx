@@ -14,7 +14,13 @@ import { SLOTS_PER_DAY, sessionPosition, sessionTime, slotLabel } from "./sessio
 import { chartColors } from "./tokens";
 
 const chart = vi.hoisted(() => {
-  const series = { applyOptions: vi.fn(), setData: vi.fn() };
+  const priceLine = { id: "entry" };
+  const series = {
+    applyOptions: vi.fn(),
+    setData: vi.fn(),
+    createPriceLine: vi.fn(() => priceLine),
+    removePriceLine: vi.fn(),
+  };
   const markers = { setMarkers: vi.fn() };
   const scale = {
     fitContent: vi.fn(),
@@ -31,7 +37,7 @@ const chart = vi.hoisted(() => {
     unsubscribeCrosshairMove: vi.fn(),
     remove: vi.fn(),
   };
-  return { api, series, markers, scale, createChart: vi.fn(() => api) };
+  return { api, series, priceLine, markers, scale, createChart: vi.fn(() => api) };
 });
 
 vi.mock("lightweight-charts", () => ({
@@ -105,6 +111,53 @@ describe("price chart", () => {
     ]);
     unmount();
     expect(chart.api.remove).toHaveBeenCalledOnce();
+    cleanup();
+  });
+
+  it("places an entry marker on its daily candle without adding a price line", () => {
+    const cleanup = withTokens();
+    const { unmount } = render(
+      <ThemeProvider>
+        <PriceChart
+          mode="daily"
+          bars={[{ time: "2026-09-22", open: 10, high: 11, low: 9.8, close: 10.5 }]}
+          marks={[{ time: "2026-09-22", label: "入池" }]}
+          label="日 K"
+        />
+      </ThemeProvider>,
+    );
+    expect(chart.markers.setMarkers).toHaveBeenCalledWith(
+      expect.arrayContaining([
+        expect.objectContaining({ time: "2026-09-22", text: "入池", position: "belowBar" }),
+      ]),
+    );
+    unmount();
+    cleanup();
+  });
+
+  it("removes the previous entry price when the trusted line disappears", () => {
+    const cleanup = withTokens();
+    const bars = [{ time: "2026-09-22", open: 10, high: 11, low: 9.8, close: 10.5 }];
+    const { rerender, unmount } = render(
+      <ThemeProvider>
+        <PriceChart
+          mode="daily"
+          bars={bars}
+          referenceLine={{ price: 10.25, label: "入池日收盘价" }}
+          label="日 K"
+        />
+      </ThemeProvider>,
+    );
+    expect(chart.series.createPriceLine).toHaveBeenCalledWith(
+      expect.objectContaining({ price: 10.25, title: "入池日收盘价" }),
+    );
+    rerender(
+      <ThemeProvider>
+        <PriceChart mode="daily" bars={bars} label="日 K" />
+      </ThemeProvider>,
+    );
+    expect(chart.series.removePriceLine).toHaveBeenCalledWith(chart.priceLine);
+    unmount();
     cleanup();
   });
 

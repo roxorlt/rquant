@@ -13,9 +13,12 @@ from pathlib import Path
 import duckdb
 import pytest
 
+from rquant import page_control
 from rquant.canvas_publication_receipt import CanvasPublicationReceipt
+from rquant.llm.schemas import RuleCall
 from rquant.notification_state import NotificationStateStore
 from rquant.page_control import (
+    AddPoolToCanvas,
     DeleteCanvas,
     PageControlConsumer,
     PageControlOutbox,
@@ -23,6 +26,7 @@ from rquant.page_control import (
     PageControlService,
     PageControlStatus,
     SaveCanvas,
+    SaveUserPoolV2,
 )
 from rquant.research_gate import ResearchGateFailure
 from rquant.runtime_contracts import canonical_sha256
@@ -243,8 +247,369 @@ def _signal_projection_database(path: Path) -> None:
                1000, 11000, 'future-source', '2026-08-03 17:00:01')
             """
         )
+        connection.execute(
+            """
+            CREATE TABLE monitor_event (
+                trade_date DATE NOT NULL, ts_code VARCHAR NOT NULL, level VARCHAR NOT NULL,
+                trigger_price DOUBLE, level_price DOUBLE, trigger_time TIMESTAMP NOT NULL,
+                trigger_type VARCHAR, pool VARCHAR
+            )
+            """
+        )
     finally:
         connection.close()
+
+
+def test_real_monitor_and_surge_formats_reach_notification_authority(tmp_path: Path) -> None:
+    from rquant.surge_watch import SurgeConfirmed
+
+    database = tmp_path / "rquant_ro.duckdb"
+    _signal_projection_database(database)
+    with duckdb.connect(str(database)) as connection:
+        connection.execute(
+            "INSERT INTO monitor_event VALUES "
+            "('2026-08-03', '600001.SH', 'attack_break_high', 12.34, 12.00, "
+            "'2026-08-03 10:05:00', 'attack', 'pool2')"
+        )
+    live_root = tmp_path / "surge_live"
+    live_root.mkdir()
+    source_path = live_root / "events-2026-08-03.jsonl"
+    source_path.write_text(
+        json.dumps(
+            SurgeConfirmed(
+                ts_code="600002.SH",
+                name="样本02",
+                confirmed_at="09:52",
+                price=11.25,
+                pct_chg=3.15,
+                status="confirmed",
+            ).model_dump(),
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    stamp = (NOW - timedelta(seconds=1)).timestamp()
+    os.utime(source_path, (stamp, stamp))
+
+    store = NotificationStateStore(tmp_path / "notification.sqlite3")
+    producer = SignalPageProjectionProducer(
+        source=DuckDBSignalPageProjectionSource(database, surge_live_root=live_root),
+        store=store,
+    )
+    producer.publish(NOW)
+    published = {
+        item.table_name: item
+        for item in store.serving_snapshot(observed_at=NOW, history_limit=1).payload.projections
+    }
+    assert published["monitor_event"].rows[0]["trigger_time"] == "2026-08-03T02:05:00+00:00"
+    assert published["surge_event"].rows[0]["confirmed_at"] == "09:52"
+
+
+def test_monitor_source_keeps_only_thirty_local_days_and_rejects_overflow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rquant import serving_page_projection_source as source_module
+
+    database = tmp_path / "rquant_ro.duckdb"
+    _signal_projection_database(database)
+    with duckdb.connect(str(database)) as connection:
+        connection.execute(
+            "INSERT INTO monitor_event VALUES "
+            "('2026-07-04', '600001.SH', 'old', 1, 1, '2026-07-04 09:40:00', NULL, NULL), "
+            "('2026-07-05', '600001.SH', 'edge', 2, 2, '2026-07-05 09:41:00', NULL, NULL), "
+            "('2026-08-03', '600001.SH', 'future', 3, 3, '2026-08-03 16:01:00', NULL, NULL)"
+        )
+    source = DuckDBSignalPageProjectionSource(database)
+    rows = {item.table_name: item for item in source(NOW).projections}["monitor_event"].rows
+    assert [row["level"] for row in rows] == ["edge"]
+    monkeypatch.setattr(source_module, "_MAX_EVENT_ROWS", 0)
+    with pytest.raises(PageProjectionSourceIntegrityError, match="row bound"):
+        DuckDBSignalPageProjectionSource(database)(NOW)
+
+
+@pytest.mark.parametrize("failure", ("missing", "read_error"))
+def test_unreadable_monitor_source_publishes_partial_new_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+
+    database = tmp_path / "rquant_ro.duckdb"
+    _signal_projection_database(database)
+    store = NotificationStateStore(tmp_path / "notification.sqlite3")
+    producer = SignalPageProjectionProducer(
+        source=DuckDBSignalPageProjectionSource(database), store=store
+    )
+    first = producer.publish(NOW)
+    if failure == "missing":
+        with duckdb.connect(str(database)) as connection:
+            connection.execute("DROP TABLE monitor_event")
+    else:
+
+        def fail_read(*args: object, **kwargs: object) -> object:
+            raise duckdb.IOException("synthetic replica read failure")
+
+        monkeypatch.setattr(DuckDBSignalPageProjectionSource, "__call__", fail_read)
+    second = producer.publish(NOW + timedelta(seconds=1))
+    latest = store.serving_snapshot(observed_at=NOW + timedelta(seconds=1), history_limit=1)
+    assert second.written
+    assert latest.projection_generation_id != first.generation_id
+    assert "monitor_event" not in {item.table_name for item in latest.payload.projections}
+    assert "screen_bounds" in {item.table_name for item in latest.payload.projections}
+    historical = store.serving_snapshot(observed_at=NOW, history_limit=1)
+    assert "monitor_event" in {item.table_name for item in historical.payload.projections}
+
+
+@pytest.mark.parametrize("failure", ("missing", "half_line", "overflow_time"))
+def test_legacy_notification_failure_revokes_old_records_in_new_authority(
+    tmp_path: Path, failure: str
+) -> None:
+    database = tmp_path / "rquant_ro.duckdb"
+    _signal_projection_database(database)
+    path = tmp_path / "logs" / "notification_log.jsonl"
+    path.parent.mkdir()
+    path.write_text(
+        json.dumps(
+            {
+                "sent_at": "2026-08-03T09:47:00",
+                "scene": "price_level",
+                "channel": "pushdeer",
+                "target": "SECRET-CANARY",
+                "success": True,
+                "error_msg": "SECRET-CANARY",
+                "title": "SECRET-CANARY",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    os.utime(path, ((NOW - timedelta(seconds=2)).timestamp(),) * 2)
+    store = NotificationStateStore(tmp_path / "notification.sqlite3")
+    producer = SignalPageProjectionProducer(
+        source=DuckDBSignalPageProjectionSource(database, notification_log_path=path), store=store
+    )
+    first = producer.publish(NOW)
+    first_tables = {
+        item.table_name: item
+        for item in store.serving_snapshot(observed_at=NOW, history_limit=1).payload.projections
+    }
+    assert len(first_tables["legacy_notification"].rows) == 1
+    assert "SECRET-CANARY" not in repr(first_tables["legacy_notification"])
+
+    if failure == "missing":
+        path.unlink()
+    elif failure == "half_line":
+        path.write_text('{"sent_at":', encoding="utf-8")
+    else:
+        path.write_text(
+            json.dumps(
+                {
+                    "sent_at": "0001-01-01T00:00:00",
+                    "scene": "price_level",
+                    "channel": "pushdeer",
+                    "target": "SECRET-CANARY",
+                    "success": True,
+                    "error_msg": "SECRET-CANARY",
+                    "title": "SECRET-CANARY",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        stamp = (NOW - timedelta(seconds=1)).timestamp()
+        os.utime(path, (stamp, stamp))
+    second = producer.publish(NOW + timedelta(seconds=1))
+    latest = {
+        item.table_name: item
+        for item in store.serving_snapshot(
+            observed_at=NOW + timedelta(seconds=1), history_limit=1
+        ).payload.projections
+    }
+    assert second.written and second.generation_id != first.generation_id
+    assert "legacy_notification" not in latest
+    assert latest["legacy_notification_status"].rows[0]["state"] == "unavailable"
+    assert "monitor_event" in latest
+    assert "SECRET-CANARY" not in repr(latest)
+
+
+@pytest.mark.parametrize(
+    ("record", "ending"),
+    (
+        ({"confirmed_at": "25:90"}, "\n"),
+        ({"ts_code": "broken"}, "\n"),
+        ({}, ""),
+    ),
+)
+def test_bad_surge_file_is_unpublished_without_reusing_old_rows(
+    tmp_path: Path, record: dict[str, object], ending: str
+) -> None:
+    from rquant.surge_watch import SurgeConfirmed
+
+    database = tmp_path / "rquant_ro.duckdb"
+    _signal_projection_database(database)
+    live_root = tmp_path / "surge_live"
+    live_root.mkdir()
+    path = live_root / "events-2026-08-03.jsonl"
+    normal = SurgeConfirmed(ts_code="600002.SH", name="样本02", confirmed_at="09:52")
+    path.write_text(json.dumps(normal.model_dump(), ensure_ascii=False) + "\n", encoding="utf-8")
+    os.utime(path, (NOW.timestamp() - 2, NOW.timestamp() - 2))
+    store = NotificationStateStore(tmp_path / "notification.sqlite3")
+    producer = SignalPageProjectionProducer(
+        source=DuckDBSignalPageProjectionSource(database, surge_live_root=live_root),
+        store=store,
+    )
+    producer.publish(NOW)
+    assert "surge_event" in {
+        item.table_name
+        for item in store.serving_snapshot(observed_at=NOW, history_limit=1).payload.projections
+    }
+
+    path.write_text(
+        json.dumps({**normal.model_dump(), **record}, ensure_ascii=False) + ending,
+        encoding="utf-8",
+    )
+    os.utime(path, (NOW.timestamp() - 1, NOW.timestamp() - 1))
+    producer.publish(NOW + timedelta(seconds=1))
+    latest = {
+        item.table_name
+        for item in store.serving_snapshot(
+            observed_at=NOW + timedelta(seconds=1), history_limit=1
+        ).payload.projections
+    }
+    assert "monitor_event" in latest
+    assert "surge_event" not in latest
+
+
+def test_surge_source_rejects_symlink_and_byte_budget_but_accepts_absent_day(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rquant import serving_page_projection_source as source_module
+    from rquant.surge_watch import SurgeConfirmed
+
+    root = tmp_path / "surge_live"
+    root.mkdir()
+    empty = source_module._read_surge_event_projection(root, observed=NOW)
+    assert empty is not None and empty.rows == ()
+    (root / "unrelated.txt").write_text("pulse", encoding="utf-8")
+    assert source_module._read_surge_event_projection(root, observed=NOW) == empty
+    assert source_module._read_surge_event_projection(tmp_path / "missing", observed=NOW) is None
+
+    target = tmp_path / "outside.jsonl"
+    target.write_text(
+        json.dumps(
+            SurgeConfirmed(ts_code="600002.SH", name="样本02", confirmed_at="09:52").model_dump()
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    link = root / "events-2026-08-03.jsonl"
+    link.symlink_to(target)
+    with pytest.raises(PageProjectionSourceIntegrityError, match="non-symlink"):
+        source_module._read_surge_event_projection(root, observed=NOW)
+    link.unlink()
+    link.write_bytes(target.read_bytes())
+    os.utime(link, (NOW.timestamp() - 1, NOW.timestamp() - 1))
+    monkeypatch.setattr(source_module, "_MAX_SURGE_EVENT_BYTES", 32)
+    with pytest.raises(PageProjectionSourceIntegrityError, match="size bound"):
+        source_module._read_surge_event_projection(root, observed=NOW)
+
+
+def test_surge_source_rejects_file_replacement_during_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rquant import serving_page_projection_source as source_module
+    from rquant.surge_watch import SurgeConfirmed
+
+    root = tmp_path / "surge_live"
+    root.mkdir()
+    name = "events-2026-08-03.jsonl"
+    first = root / name
+    replacement = root / "replacement.jsonl"
+    line = (
+        json.dumps(
+            SurgeConfirmed(ts_code="600002.SH", name="样本02", confirmed_at="09:52").model_dump()
+        )
+        + "\n"
+    )
+    first.write_text(line, encoding="utf-8")
+    replacement.write_text(line, encoding="utf-8")
+    stamp = NOW.timestamp() - 1
+    os.utime(first, (stamp, stamp))
+    os.utime(replacement, (stamp, stamp))
+    original_open = source_module.os.open
+
+    def rotate_after_open(path: str | os.PathLike[str], *args: object, **kwargs: object) -> int:
+        descriptor = original_open(path, *args, **kwargs)
+        if path == name:
+            os.replace(replacement, first)
+        return descriptor
+
+    monkeypatch.setattr(source_module.os, "open", rotate_after_open)
+    with pytest.raises(PageProjectionSourceIntegrityError, match="rotated while read"):
+        source_module._read_surge_event_projection(root, observed=NOW)
+
+
+def test_surge_source_rejects_same_inode_rewrite_with_restored_mtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rquant import serving_page_projection_source as source_module
+    from rquant.surge_watch import SurgeConfirmed
+
+    root = tmp_path / "surge_live"
+    root.mkdir()
+    path = root / "events-2026-08-03.jsonl"
+    line = (
+        json.dumps(
+            SurgeConfirmed(ts_code="600002.SH", name="样本02", confirmed_at="09:52").model_dump(),
+            ensure_ascii=False,
+        )
+        + "\n"
+    )
+    path.write_text(line, encoding="utf-8")
+    stamp = NOW.timestamp() - 1
+    os.utime(path, (stamp, stamp))
+    original = source_module._read_bound_optional_file
+
+    def rewrite_after_read(*args: object, **kwargs: object) -> object:
+        result = original(*args, **kwargs)
+        if result is not None:
+            path.write_text(line.replace("样本02", "样本03"), encoding="utf-8")
+            os.utime(path, (stamp, stamp))
+        return result
+
+    monkeypatch.setattr(source_module, "_read_bound_optional_file", rewrite_after_read)
+    with pytest.raises(PageProjectionSourceIntegrityError, match="changed while read"):
+        source_module._read_surge_event_projection(root, observed=NOW)
+
+
+def test_surge_duplicates_have_stable_selection_and_quality_log(tmp_path: Path) -> None:
+    from loguru import logger
+
+    from rquant import serving_page_projection_source as source_module
+    from rquant.surge_watch import SurgeConfirmed
+
+    root = tmp_path / "surge_live"
+    root.mkdir()
+    path = root / "events-2026-08-03.jsonl"
+    first = SurgeConfirmed(ts_code="600002.SH", name="样本02", confirmed_at="09:52", price=11.0)
+    second = first.model_copy(update={"price": 12.0})
+    messages: list[str] = []
+    handler = logger.add(lambda message: messages.append(message.record["message"]))
+    try:
+        rows = []
+        for records in ((first, second), (second, first)):
+            path.write_text(
+                "".join(json.dumps(item.model_dump()) + "\n" for item in records),
+                encoding="utf-8",
+            )
+            os.utime(path, (NOW.timestamp() - 1, NOW.timestamp() - 1))
+            projection = source_module._read_surge_event_projection(root, observed=NOW)
+            assert projection is not None
+            rows.append(projection.rows)
+    finally:
+        logger.remove(handler)
+    assert rows[0] == rows[1]
+    assert len(rows[0]) == 1
+    assert sum("重复记录" in message for message in messages) == 2
 
 
 def test_duckdb_signal_source_builds_bounded_pit_page_projections(tmp_path: Path) -> None:
@@ -612,6 +977,50 @@ def test_signal_source_publishes_canvas_definitions_from_bounded_catalog(tmp_pat
     }
     assert len(str(definition["version_hash"])) == 64
     assert len(str(definition["record_hash"])) == 64
+
+
+def test_signal_source_first_publication_accepts_create_canvas_audit(tmp_path: Path) -> None:
+    database = tmp_path / "rquant_ro.duckdb"
+    _signal_projection_database(database)
+    outbox = PageControlOutbox(tmp_path / "create-control.sqlite3")
+    authority = create_canvas_ed25519_test_authority(tmp_path / "create-keys")
+    data_dir = tmp_path / "create-data"
+    service = PageControlService(
+        outbox=outbox,
+        consumer=PageControlConsumer(
+            outbox=outbox,
+            data_dir=data_dir,
+            log_dir=tmp_path / "create-logs",
+            canvas_publication_signer=authority.signer,
+            canvas_publication_keyring=authority.keyring,
+        ),
+    )
+    command = page_control.CreateCanvas(
+        command_id="create-first-publication",
+        requested_at=NOW - timedelta(days=1),
+        name="新画布",
+        description="自选观察",
+    )
+    receipt = service.submit(command)
+    assert receipt.status is PageControlStatus.SUCCEEDED
+
+    snapshot = DuckDBSignalPageProjectionSource(
+        database,
+        canvas_catalog_root=data_dir / "canvases",
+        canvas_receipt_root=data_dir / "canvas-publication-receipts",
+        canvas_publication_keyring=authority.keyring,
+        page_control_outbox=outbox,
+    )(NOW)
+
+    projection = next(
+        item for item in snapshot.projections if item.table_name == "canvas_definition"
+    )
+    assert len(projection.rows) == 1
+    assert projection.rows[0]["name"] == "新画布"
+    assert projection.rows[0]["description"] == "自选观察"
+    assert projection.rows[0]["pool_refs_json"] == "[]"
+    assert projection.rows[0]["command_id"] == command.command_id
+    assert projection.rows[0]["record_hash"] == receipt.result["record_hash"]
 
 
 def test_signal_source_rejects_catalog_and_outbox_tamper_even_when_hashes_recomputed(
@@ -1241,6 +1650,71 @@ def test_signal_source_canvas_definition_update_and_delete_create_new_snapshots(
     assert definitions.rows == ()
 
 
+def test_signal_source_publishes_a_verified_page_control_canvas_attachment(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "rquant_ro.duckdb"
+    _signal_projection_database(database)
+    outbox = PageControlOutbox(tmp_path / "page-control.sqlite3")
+    data_dir = tmp_path / "page-data"
+    authority = create_canvas_ed25519_test_authority(tmp_path / "page-keys")
+    service = PageControlService(
+        outbox=outbox,
+        consumer=PageControlConsumer(
+            outbox=outbox,
+            data_dir=data_dir,
+            log_dir=tmp_path / "page-logs",
+            canvas_publication_signer=authority.signer,
+            canvas_publication_keyring=authority.keyring,
+        ),
+    )
+    assert (
+        service.submit(
+            SaveCanvas(
+                command_id="canvas-seed",
+                requested_at=NOW - timedelta(days=1),
+                name="breakout",
+                pool_refs=("n-shape-pool1",),
+            )
+        ).status
+        is PageControlStatus.SUCCEEDED
+    )
+    saved = service.submit(
+        SaveUserPoolV2(
+            command_id="pool-save",
+            requested_at=NOW - timedelta(hours=2),
+            base_name="first",
+            display_name="First",
+            rule_calls=(RuleCall(name="not_st", args={}),),
+        )
+    )
+    assert saved.status is PageControlStatus.SUCCEEDED
+    assert isinstance(saved.result, dict)
+    attached = service.submit(
+        AddPoolToCanvas(
+            command_id="pool-attach",
+            requested_at=NOW - timedelta(hours=1),
+            canvas_name="breakout",
+            pool_name="user/first",
+            expected_pool_version=saved.result["version"],
+        )
+    )
+    assert attached.status is PageControlStatus.SUCCEEDED
+
+    snapshot = DuckDBSignalPageProjectionSource(
+        database,
+        canvas_catalog_root=data_dir / "canvases",
+        canvas_receipt_root=data_dir / "canvas-publication-receipts",
+        canvas_publication_keyring=authority.keyring,
+        page_control_outbox=outbox,
+    )(NOW)
+    definition = next(
+        item for item in snapshot.projections if item.table_name == "canvas_definition"
+    )
+    assert len(definition.rows) == 1
+    assert json.loads(definition.rows[0]["pool_refs_json"]) == ["n-shape-pool1", "user/first"]
+
+
 @pytest.mark.parametrize("after_delete", [False, True])
 def test_signal_source_rejects_replayed_old_signed_canvas_version(
     tmp_path: Path,
@@ -1644,9 +2118,11 @@ def test_duckdb_lab_source_publishes_explicit_empty_gate_projection(tmp_path: Pa
 
     snapshot = DuckDBLabPageProjectionSource(database)(NOW)
 
-    assert len(snapshot.projections) == 1
-    assert snapshot.projections[0].table_name == "research_gate_metadata"
-    assert snapshot.projections[0].rows == ()
+    projections = {item.table_name: item for item in snapshot.projections}
+    assert set(projections) == {"research_gate_metadata", "data_audit_status", "data_audit_issue"}
+    assert projections["research_gate_metadata"].rows == ()
+    assert projections["data_audit_status"].rows[0]["latest_status"] == "never_run"
+    assert projections["data_audit_issue"].rows == ()
 
 
 def test_duckdb_lab_source_reuses_bound_generation_for_research_gate_store(
@@ -1681,7 +2157,9 @@ def test_duckdb_lab_source_reuses_bound_generation_for_research_gate_store(
 
     snapshot = DuckDBLabPageProjectionSource(database)(NOW)
 
-    assert snapshot.projections[0].rows == ()
+    assert {item.table_name: item for item in snapshot.projections}[
+        "research_gate_metadata"
+    ].rows == ()
     assert attacker_swaps >= 2
 
 
@@ -1778,7 +2256,7 @@ def test_lab_page_projection_serializes_research_gate_metadata() -> None:
         ),
     )
 
-    projection = snapshot.projections[0]
+    projection = {item.table_name: item for item in snapshot.projections}["research_gate_metadata"]
     assert projection.table_name == "research_gate_metadata"
     assert projection.rows[0]["coverage_ratios_json"] == '{"minute":0.9}'
     assert '"sample_warning"' in str(projection.rows[0]["failures_json"])
@@ -1907,7 +2385,6 @@ def test_the_pinned_generation_is_the_one_the_reader_opened(tmp_path: Path) -> N
         #: the same rows are still readable through the pinned descriptor
         assert reader.canvas_mutations() is not None
         os.replace(replacement, outbox.path)
-
 
 
 def test_the_duckdb_reader_pins_through_a_descriptor_where_the_engine_takes_one(
@@ -2336,7 +2813,6 @@ def test_a_source_whose_only_changed_stamp_is_ctime_is_still_refused(
     )
     assert after.st_ctime_ns != before.st_ctime_ns
     assert not any(control.iterdir())
-
 
 
 def _count_database_opens(monkeypatch: pytest.MonkeyPatch) -> list[int]:

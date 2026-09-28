@@ -37,6 +37,8 @@ from rquant.lab_jobs import (
     LabJobReader,
     LabJobRecord,
     LabJobSummary,
+    LabPublishedEventIntegrityError,
+    LabPublishedJobsEventSnapshot,
     LabResultState,
 )
 from rquant.lab_worker import LabShardResultManifest
@@ -48,11 +50,17 @@ from rquant.runtime_serving_authority import (
 )
 from rquant.runtime_serving_snapshot import (
     LAB_JOBS_DATASET_ID,
+    UNAVAILABLE_EVIDENCE_INSTANT,
     LabJobsPayload,
     SourceReadResult,
 )
 from rquant.serving_contracts import FreshnessStatus
-from rquant.serving_read_models import ServingLabJobRecord, ServingProjectionPayload
+from rquant.serving_read_models import (
+    LAB_EVENT_LABEL_BY_TYPE,
+    UNKNOWN_LAB_EVENT_LABEL,
+    ServingLabJobRecord,
+    ServingProjectionPayload,
+)
 
 StrategyProjectionReader = Callable[
     [tuple[LabJobSummary, ...], datetime],
@@ -808,7 +816,8 @@ class LabJobsServingSourceReader:
 
     def __call__(self, observed_at: datetime, /) -> SourceReadResult:
         observed = normalize_aware_utc(observed_at)
-        first_page = self.reader.list_jobs(limit=self.max_jobs)
+        first = self.reader.list_published_jobs_with_events(limit=self.max_jobs)
+        first_page = first.page
         self._validate_summaries(first_page, observed_at=observed)
 
         records = tuple(
@@ -831,12 +840,21 @@ class LabJobsServingSourceReader:
         page_projections = (
             self.page_projection_reader(observed) if self.page_projection_reader is not None else ()
         )
-        projections = strategy_projections + page_projections
+        projections = (
+            *_event_projections(first, observed_at=observed),
+            *strategy_projections,
+            *page_projections,
+        )
 
-        second_page = self.reader.list_jobs(limit=self.max_jobs)
-        if second_page != first_page:
+        second = self.reader.list_published_jobs_with_events(limit=self.max_jobs)
+        second_page = second.page
+        if second.page != first.page:
             raise LabJobsServingAuthorityIntegrityError(
                 "lab jobs changed while building serving source"
+            )
+        if second.windows != first.windows:
+            raise LabPublishedEventIntegrityError(
+                "lab events changed while building serving source"
             )
         repeated_strategy_projections = (
             self.strategy_projection_reader(second_page.items, observed)
@@ -909,6 +927,60 @@ class LabJobsServingSourceReader:
             raise LabJobsServingAuthorityIntegrityError("lab job ETA contains future evidence")
 
 
+def _event_projections(
+    snapshot: LabPublishedJobsEventSnapshot,
+    *,
+    observed_at: datetime,
+) -> tuple[ServingProjectionPayload, ServingProjectionPayload]:
+    if any(
+        event.created_at > observed_at
+        for window in snapshot.windows
+        for event in window.events
+    ):
+        raise LabPublishedEventIntegrityError("lab event contains future evidence")
+    window_rows = tuple(
+        {
+            "job_id": str(window.job_id),
+            "job_version": summary.version,
+            "state": (
+                "truncated" if window.truncated else "available" if window.events else "empty"
+            ),
+            "retained_count": len(window.events),
+            "truncated": window.truncated,
+        }
+        for summary, window in zip(snapshot.page.items, snapshot.windows, strict=True)
+    )
+    event_rows = tuple(
+        {
+            "job_id": str(window.job_id),
+            "event_id": event.event_id,
+            "job_version": event.job_version,
+            "occurred_at": event.created_at.isoformat(),
+            "new_status": event.new_status.value,
+            "label": LAB_EVENT_LABEL_BY_TYPE.get(event.event_type, UNKNOWN_LAB_EVENT_LABEL),
+        }
+        for window in snapshot.windows
+        for event in window.events
+    )
+    try:
+        return (
+            ServingProjectionPayload(
+                table_name="lab_job_event_window",
+                available_at=observed_at,
+                rows=window_rows,
+            ),
+            ServingProjectionPayload(
+                table_name="lab_job_event",
+                available_at=observed_at,
+                rows=event_rows,
+            ),
+        )
+    except ValueError:
+        raise LabPublishedEventIntegrityError(
+            "bounded lab event projection cannot be published"
+        ) from None
+
+
 #: What a Lab Jobs read says about *when* it was asked rather than about the jobs. The
 #: top four are the reader's own clock; the two ETA fields are the estimate restated
 #: against it -- `as_of` is the question's timestamp and `finish_at` is `as_of` plus the
@@ -941,6 +1013,12 @@ def lab_jobs_state_identity(result: SourceReadResult) -> str:
             if isinstance(eta, dict):
                 for name in _LAB_JOBS_ETA_OBSERVATION_FIELDS:
                     eta.pop(name, None)
+        for projection in payload.get("projections") or ():
+            if isinstance(projection, dict) and projection.get("table_name") in {
+                "lab_job_event_window",
+                "lab_job_event",
+            }:
+                projection.pop("available_at", None)
     return canonical_sha256({"contract": "lab-jobs-state/v1", "state": state})
 
 
@@ -965,8 +1043,23 @@ class LabJobsServingAuthorityPublisher:
         self.publisher = publisher
 
     def publish(self, observed_at: datetime) -> ServingSourceAuthorityPublication:
+        observed = normalize_aware_utc(observed_at)
+        try:
+            result = self.reader(observed)
+        except LabPublishedEventIntegrityError:
+            values: dict[str, object] = {
+                "dataset_id": LAB_JOBS_DATASET_ID,
+                "sequence": _sequence_for(observed),
+                "event_time": UNAVAILABLE_EVIDENCE_INSTANT,
+                "published_at": observed,
+                "status": FreshnessStatus.UNAVAILABLE,
+                "reason": "lab_event_snapshot_invalid",
+                "payload": LabJobsPayload(),
+            }
+            values["generation_id"] = canonical_sha256(values)
+            result = SourceReadResult.model_validate(values)
         return self.publisher.publish_if_changed(
-            self.reader(observed_at),
+            result,
             unchanged_identity=lab_jobs_state_identity,
         )
 

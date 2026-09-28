@@ -1,0 +1,235 @@
+import type { ScreenRow, ScreenRunData } from "@/api/screen";
+import { formatCount, formatNumber, formatPrice } from "@/format/number";
+import { type DataColumn, DataTable } from "@/table/DataTable";
+import { Button, ChangeText, EmptyState, Panel, SkeletonRows } from "@/ui";
+import { StockCell } from "../shared/StockCell";
+import { ScreenWatchlistBatch } from "./ScreenWatchlistBatch";
+
+const PAGE_SIZE = 20;
+const COLUMNS: DataColumn<ScreenRow>[] = [
+  {
+    id: "stock",
+    header: "股票",
+    value: (row) => row.name ?? row.ts_code,
+    cell: (row) => <StockCell code={row.ts_code} name={row.name} />,
+  },
+  {
+    id: "close",
+    header: "收盘价",
+    value: (row) => row.close,
+    cell: (row) => <span className="num">{formatPrice(row.close)}</span>,
+    numeric: true,
+  },
+  {
+    id: "change",
+    header: "涨跌幅",
+    value: (row) => row.pct_chg,
+    cell: (row) => <ChangeText value={row.pct_chg} />,
+    numeric: true,
+  },
+];
+const RANKED_COLUMNS: DataColumn<ScreenRow>[] = [
+  {
+    id: "rank",
+    header: "名次",
+    value: (row) => row.rank_position ?? null,
+    cell: (row) => <span className="num">{formatCount(row.rank_position)}</span>,
+    numeric: true,
+  },
+  ...COLUMNS,
+  {
+    id: "score",
+    header: "排名分",
+    value: (row) => row.ranking_score ?? null,
+    cell: (row) => <strong className="num">{formatNumber(row.ranking_score, 1)}</strong>,
+    numeric: true,
+  },
+];
+
+function ResultBody({
+  data,
+  running,
+  onStock,
+  usesFundamental,
+}: {
+  data: ScreenRunData | null;
+  running: boolean;
+  onStock: (code: string) => void;
+  usesFundamental: boolean;
+}) {
+  if (data === null) {
+    return running ? (
+      <SkeletonRows rows={5} />
+    ) : (
+      <EmptyState title="还没有运行筛选" hint="调整条件后，点「运行筛选」查看结果。" />
+    );
+  }
+  if (data.status === "unavailable") {
+    return <EmptyState title="选股数据暂不可用" hint="数据发布后就能运行条件。" />;
+  }
+  if (data.status === "no_date") {
+    return <EmptyState title="所选日期没有选股数据" hint="换一个数据日期后重试。" />;
+  }
+  if (data.total === 0 && (data.unknown_count ?? 0) > 0) {
+    return (
+      <EmptyState
+        title="暂无确定命中"
+        hint={
+          usesFundamental
+            ? "有股票基本面数据不足，换日期核对或调整条件后重试。"
+            : "有股票数据不足，换日期核对或调整条件后重试。"
+        }
+      />
+    );
+  }
+  if (data.total === 0) {
+    return <EmptyState title="没有命中股票" hint="查看逐条命中，放宽让数量变为 0 的条件。" />;
+  }
+  return (
+    <DataTable
+      rows={data.rows}
+      columns={data.ranked_count == null ? COLUMNS : RANKED_COLUMNS}
+      rowKey={(row) => row.ts_code}
+      label="选股结果"
+      onSelect={(row) => onStock(row.ts_code)}
+    />
+  );
+}
+
+export function ScreenResults({
+  data,
+  stale,
+  staleText,
+  error,
+  running,
+  pageIndex,
+  batchRevision,
+  onStock,
+  onPrevious,
+  onNext,
+  usesFundamental,
+}: {
+  data: ScreenRunData | null;
+  stale: boolean;
+  staleText: string;
+  error: string | null;
+  running: boolean;
+  pageIndex: number;
+  batchRevision: string;
+  onStock: (code: string) => void;
+  onPrevious: () => void;
+  onNext: () => void;
+  usesFundamental: boolean;
+}) {
+  return (
+    <>
+      <section className="screen-funnel" aria-label="逐条命中">
+        <h2>逐条命中</h2>
+        {data?.status === "ready" && data.base_count !== null ? (
+          <ol>
+            {[{ label: "全部股票", count: data.base_count, unknown_count: 0 }, ...data.steps].map(
+              (step, index) => (
+                // biome-ignore lint/suspicious/noArrayIndexKey: the ordered funnel has no stateful children.
+                <li key={`${index}-${step.label}`}>
+                  <span>{step.label}</span>
+                  <div className="screen-funnel-track" aria-hidden="true">
+                    <span
+                      style={{
+                        width: `${Math.max(2, (step.count / Math.max(data.base_count ?? 1, 1)) * 100)}%`,
+                      }}
+                    />
+                  </div>
+                  <span className="screen-step-count">
+                    <strong className="num">{formatCount(step.count)}</strong>
+                    {(step.unknown_count ?? 0) > 0 ? (
+                      <small>未知 {formatCount(step.unknown_count)} 只</small>
+                    ) : null}
+                  </span>
+                </li>
+              ),
+            )}
+          </ol>
+        ) : (
+          <p className="hint">运行后查看每条条件留下多少只。</p>
+        )}
+      </section>
+      <Panel
+        title={
+          data?.status === "ready" ? (
+            <>
+              结果 ·{" "}
+              <span>
+                {(data.unknown_count ?? 0) > 0 ? "已确认命中" : "命中"} {formatCount(data.total)} 只
+              </span>
+              {(data.unknown_count ?? 0) > 0 ? (
+                <span> · 未判定 {formatCount(data.unknown_count)} 只</span>
+              ) : null}
+            </>
+          ) : (
+            "结果"
+          )
+        }
+        sub={
+          data?.status === "ready" ? (
+            <>
+              {data.ranked_count == null ? null : (
+                <span>按排名分展示前 {formatCount(data.ranked_count)} 只</span>
+              )}
+              {data.ranked_count == null ? null : " · "}
+              {data.trade_date} 收盘
+            </>
+          ) : undefined
+        }
+        flush
+      >
+        {stale ? (
+          <p className="screen-notice" role="status">
+            {staleText}
+          </p>
+        ) : null}
+        {error ? (
+          <p className="screen-notice error" role="alert">
+            {error}
+          </p>
+        ) : null}
+        {data?.status === "ready" && (data.unknown_count ?? 0) > 0 ? (
+          <p className="screen-notice">
+            {usesFundamental
+              ? "有股票基本面数据不足，结果仅包含已确认命中。"
+              : "有股票因条件数据缺失或历史不足未判定；结果仅包含已确认命中的股票。"}
+          </p>
+        ) : null}
+        <ResultBody
+          data={data}
+          running={running}
+          onStock={onStock}
+          usesFundamental={usesFundamental}
+        />
+        <ScreenWatchlistBatch
+          data={data}
+          pageIndex={pageIndex}
+          revision={batchRevision}
+          stale={stale}
+          running={running}
+        />
+        {data?.status === "ready" && data.total !== null && data.total > 0 ? (
+          <div className="screen-pages">
+            <span className="hint">
+              第 {pageIndex + 1} 页 · 每页最多 {PAGE_SIZE} 只
+            </span>
+            <Button size="sm" onClick={onPrevious} disabled={running || stale || pageIndex === 0}>
+              上一页
+            </Button>
+            <Button
+              size="sm"
+              onClick={onNext}
+              disabled={running || stale || data.next_cursor === null}
+            >
+              下一页
+            </Button>
+          </div>
+        ) : null}
+      </Panel>
+    </>
+  );
+}

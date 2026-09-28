@@ -6,15 +6,22 @@ from decimal import Decimal
 import pytest
 from pydantic import ValidationError
 
+from rquant.ops_status import STATIC_TIMER_STEMS, OpsResourceEvidence, OpsSnapshot, OpsUnitEvidence
+from rquant.ops_status_serving import ops_status_source_result
 from rquant.paper_contracts import PaperAccountSnapshot
 from rquant.runtime_service_control import (
     RuntimeServiceHealth,
     RuntimeServicePlane,
     RuntimeServiceStatus,
 )
+from rquant.runtime_serving_authority import (
+    ServingSourceAuthorityIntegrityError,
+    ServingSourceAuthorityUnavailableError,
+)
 from rquant.runtime_serving_snapshot import (
     DEFAULT_OPTIONAL_SOURCE_DATASETS,
     LAB_JOBS_DATASET_ID,
+    OPS_STATUS_DATASET_ID,
     PAPER_ACCOUNTS_DATASET_ID,
     PROMOTIONS_DATASET_ID,
     REFERENCE_SLOW_AUTHORITY_DATASET_ID,
@@ -25,6 +32,7 @@ from rquant.runtime_serving_snapshot import (
     SOURCE_DATASET_IDS,
     UNAVAILABLE_EVIDENCE_INSTANT,
     LabJobsPayload,
+    OpsStatusPayload,
     PaperAccountsPayload,
     PromotionsPayload,
     ReferenceSlowPayload,
@@ -34,7 +42,11 @@ from rquant.runtime_serving_snapshot import (
     SourceReadResult,
 )
 from rquant.serving_contracts import FreshnessStatus
-from rquant.serving_read_models import ServingProjectionPayload, ServingSignalRecord
+from rquant.serving_read_models import (
+    ServingProjectionPayload,
+    ServingSignalRecord,
+    build_serving_read_models,
+)
 from rquant.signal_contracts import SignalAction, SignalEnvelope
 
 NOW = datetime(2026, 7, 31, 2, 31, tzinfo=UTC)
@@ -159,8 +171,194 @@ def _assembler(
             ),
             generation_character="7",
         ),
+        expected_ops_manifest_digest="a" * 64,
         optional_datasets=optional_datasets,
     )
+
+
+def _ops_sample() -> OpsSnapshot:
+    return OpsSnapshot(
+        sampled_at=NOW,
+        host_name="rquant-test",
+        boot_id="12345678-1234-1234-1234-123456789abc",
+        manifest_digest="a" * 64,
+        units=tuple(
+            OpsUnitEvidence(
+                timer=f"rquant-{stem}.timer",
+                service=f"rquant-{stem}.service",
+                label="定时任务",
+                expected_enabled=False,
+                session="all",
+                resource_group="maintenance",
+            )
+            for stem in STATIC_TIMER_STEMS
+        ),
+        resources=tuple(
+            OpsResourceEvidence(slice_name=name)
+            for name in (
+                "rquant.slice",
+                "rquant-live.slice",
+                "rquant-serving.slice",
+                "rquant-research.slice",
+                "rquant-maintenance.slice",
+            )
+        ),
+    )
+
+
+def test_ops_owner_is_optional_and_unavailable_without_a_collector() -> None:
+    snapshot = _assembler().assemble(NOW)
+    watermark = next(
+        item for item in snapshot.watermarks if item.dataset_id == OPS_STATUS_DATASET_ID
+    )
+    assert watermark.status is FreshnessStatus.UNAVAILABLE
+    assert not any(item.table_name.startswith("ops_") for item in snapshot.read_model.projections)
+
+
+def test_ops_owner_accepts_one_fresh_sample_then_expires_at_120_seconds() -> None:
+    result = ops_status_source_result(_ops_sample())
+    assembler = _assembler()
+    object.__setattr__(assembler, "ops_status_reader", lambda _as_of: result)
+
+    fresh = assembler.assemble(NOW + timedelta(seconds=119, milliseconds=999))
+    assert next(
+        item for item in fresh.watermarks if item.dataset_id == OPS_STATUS_DATASET_ID
+    ).status is FreshnessStatus.FRESH
+    names = {
+        item.table_name
+        for item in fresh.read_model.projections
+        if item.table_name.startswith("ops_")
+    }
+    assert names == {"ops_host_status", "ops_unit_status", "ops_resource_status"}
+
+    expired = assembler.assemble(NOW + timedelta(seconds=120))
+    assert next(
+        item for item in expired.watermarks if item.dataset_id == OPS_STATUS_DATASET_ID
+    ).status is FreshnessStatus.UNAVAILABLE
+    assert not any(item.table_name.startswith("ops_") for item in expired.read_model.projections)
+
+    object.__setattr__(
+        assembler,
+        "ops_status_reader",
+        lambda _as_of: result.model_copy(
+            update={"status": FreshnessStatus.STALE, "reason": "source delayed"}
+        ),
+    )
+    stale = assembler.assemble(NOW + timedelta(seconds=121))
+    assert next(
+        item for item in stale.watermarks if item.dataset_id == OPS_STATUS_DATASET_ID
+    ).status is FreshnessStatus.UNAVAILABLE
+
+
+def test_ops_known_corruption_degrades_but_unclassified_error_refuses_round(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rquant.runtime_serving_snapshot as module
+
+    events: list[dict[str, object]] = []
+
+    class EventLogger:
+        def bind(self, **fields: object) -> EventLogger:
+            events.append(fields)
+            return self
+
+        def warning(self, _message: str) -> None:
+            pass
+
+    monkeypatch.setattr(module, "logger", EventLogger())
+    assembler = _assembler()
+    object.__setattr__(
+        assembler,
+        "ops_status_reader",
+        _failing_reader("ops pointer is corrupt", ServingSourceAuthorityIntegrityError),
+    )
+    degraded = assembler.assemble(NOW)
+    assert next(
+        item for item in degraded.watermarks if item.dataset_id == OPS_STATUS_DATASET_ID
+    ).status is FreshnessStatus.UNAVAILABLE
+    assert events and "ops_status_security_event" in events[-1]
+
+    object.__setattr__(assembler, "ops_status_reader", _failing_reader("unexpected", OSError))
+    with pytest.raises(RuntimeError, match="ops_status reader failed"):
+        assembler.assemble(NOW)
+
+
+def test_ops_source_with_another_install_manifest_cannot_be_served() -> None:
+    changed = _ops_sample().model_copy(update={"manifest_digest": "b" * 64})
+    assembler = _assembler()
+    object.__setattr__(
+        assembler, "ops_status_reader", lambda _as_of: ops_status_source_result(changed)
+    )
+
+    snapshot = assembler.assemble(NOW)
+    mark = next(item for item in snapshot.watermarks if item.dataset_id == OPS_STATUS_DATASET_ID)
+    assert mark.status is FreshnessStatus.UNAVAILABLE
+    assert "manifest" in (mark.reason or "")
+
+
+def test_missing_ops_source_records_one_event_until_state_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rquant.runtime_serving_snapshot as module
+
+    events: list[dict[str, object]] = []
+
+    class EventLogger:
+        def bind(self, **fields: object) -> EventLogger:
+            events.append(fields)
+            return self
+
+        def warning(self, _message: str) -> None:
+            pass
+
+    monkeypatch.setattr(module, "logger", EventLogger())
+    assembler = _assembler()
+    assembler.assemble(NOW)
+    assembler.assemble(NOW + timedelta(seconds=30))
+    assert len(events) == 1
+    object.__setattr__(
+        assembler, "ops_status_reader", lambda _as_of: ops_status_source_result(_ops_sample())
+    )
+    assembler.assemble(NOW + timedelta(seconds=30))
+    object.__setattr__(
+        assembler,
+        "ops_status_reader",
+        _failing_reader(
+            "ops status collector is not installed", ServingSourceAuthorityUnavailableError
+        ),
+    )
+    assembler.assemble(NOW + timedelta(seconds=60))
+    assert len(events) == 2
+
+
+def test_ops_projection_cannot_conflict_with_its_sample() -> None:
+    result = ops_status_source_result(_ops_sample())
+    assert isinstance(result.payload, OpsStatusPayload)
+    projections = list(result.payload.projections)
+    host = projections[0]
+    row = dict(host.rows[0])
+    row["memory_total_bytes"] = 999
+    projections[0] = host.model_copy(update={"rows": (row,)})
+
+    with pytest.raises(ValueError, match="match sample"):
+        OpsStatusPayload(snapshot=_ops_sample(), projections=tuple(projections))
+
+
+def test_alert_projection_serializes_from_the_same_fixed_serving_input() -> None:
+    signal_result = _result(
+        SIGNALS_DATASET_ID,
+        SignalDeliveryPayload(signals=(_signal_record(1, "600000.SH"),)),
+        generation_character="1",
+    )
+    snapshot = _assembler(signal_result=signal_result).assemble(NOW)
+    projections = {item.table_name: item for item in snapshot.read_model.projections}
+    tables = build_serving_read_models(snapshot.read_model)
+
+    assert projections["alert_event"].owner_generation_id == signal_result.generation_id
+    assert len(tables["alert_event"]) == 1
+    assert tables["alert_event"].iloc[0]["source"] == "signal"
+    assert tables["alert_overview"]["unacknowledged_count"].isna().all()
+    assert set(tables["alert_source_coverage"]["state"]) == {"unavailable"}
 
 
 def test_assembles_all_owner_readers_into_one_coherent_snapshot() -> None:
@@ -319,16 +517,25 @@ def test_page_projection_is_bound_to_the_verified_owner_generation() -> None:
 
     snapshot = assembler.assemble(NOW)
 
-    assert len(snapshot.read_model.projections) == 1
-    projection = snapshot.read_model.projections[0]
+    projections = {item.table_name: item for item in snapshot.read_model.projections}
+    assert set(projections) == {
+        "alert_event",
+        "alert_source_coverage",
+        "alert_overview",
+        "stock_basic",
+    }
+    projection = projections["stock_basic"]
     assert projection.table_name == "stock_basic"
     assert projection.owner_dataset_id == REFERENCE_SLOW_AUTHORITY_DATASET_ID
     assert projection.owner_generation_id == "7" * 64
 
 
-def _failing_reader(message: str):
+def _failing_reader(
+    message: str,
+    error_type: type[Exception] = OSError,
+):
     def reader(_as_of: datetime) -> SourceReadResult:
-        raise OSError(message)
+        raise error_type(message)
 
     return reader
 
@@ -374,13 +581,19 @@ def test_an_absent_research_source_degrades_to_an_empty_payload(
     """#283: the research plane has published nothing, and serving still cuts a generation."""
 
     assembler = _assembler()
-    object.__setattr__(assembler, attribute, _failing_reader("research authority is unavailable"))
+    object.__setattr__(
+        assembler,
+        attribute,
+        _failing_reader("current authority is unavailable", ServingSourceAuthorityUnavailableError),
+    )
 
     snapshot = assembler.assemble(NOW)
     watermark = next(item for item in snapshot.watermarks if item.dataset_id == dataset_id)
 
     assert watermark.status is FreshnessStatus.UNAVAILABLE
-    assert watermark.reason == "OSError: research authority is unavailable"
+    assert watermark.reason == (
+        "ServingSourceAuthorityUnavailableError: current authority is unavailable"
+    )
     assert snapshot.source_generations[dataset_id] == watermark.generation_id
     assert snapshot.read_model.lab_jobs == ()
     assert snapshot.read_model.promotions == ()
@@ -403,7 +616,7 @@ def test_an_absent_source_puts_no_clock_in_the_generation_it_contributes() -> No
     object.__setattr__(
         assembler,
         "lab_jobs_reader",
-        _failing_reader("research authority is unavailable"),
+        _failing_reader("current authority is unavailable", ServingSourceAuthorityUnavailableError),
     )
 
     first = assembler.assemble(NOW)
@@ -424,9 +637,40 @@ def test_an_absent_source_puts_no_clock_in_the_generation_it_contributes() -> No
     #: and it is still an identity, not a constant: a different refusal is a different
     #: source, which is what makes the publisher rebuild when the reason really changes
     other = _assembler()
-    object.__setattr__(other, "lab_jobs_reader", _failing_reader("authority is corrupt"))
+    object.__setattr__(
+        other,
+        "lab_jobs_reader",
+        _failing_reader("authority is not yet available", ServingSourceAuthorityUnavailableError),
+    )
     other_generation = other.assemble(NOW).source_generations[LAB_JOBS_DATASET_ID]
     assert other_generation != absent_generation
+
+
+@pytest.mark.parametrize(
+    ("dataset_id", "attribute"),
+    [
+        (PAPER_ACCOUNTS_DATASET_ID, "paper_accounts_reader"),
+        (LAB_JOBS_DATASET_ID, "lab_jobs_reader"),
+        (PROMOTIONS_DATASET_ID, "promotions_reader"),
+    ],
+)
+@pytest.mark.parametrize("error_type", [ServingSourceAuthorityIntegrityError, OSError])
+def test_optional_source_integrity_or_unknown_failure_refuses_generation(
+    dataset_id: str,
+    attribute: str,
+    error_type: type[Exception],
+) -> None:
+    assembler = _assembler(
+        optional_datasets=DEFAULT_OPTIONAL_SOURCE_DATASETS | {PAPER_ACCOUNTS_DATASET_ID}
+    )
+    object.__setattr__(
+        assembler,
+        attribute,
+        _failing_reader("published authority is unsafe", error_type),
+    )
+
+    with pytest.raises(RuntimeError, match=f"{dataset_id} reader failed"):
+        assembler.assemble(NOW)
 
 
 def test_reference_slow_can_never_be_made_optional() -> None:
@@ -459,12 +703,12 @@ def test_reference_slow_can_never_be_made_optional() -> None:
         smuggled.assemble(NOW)
 
 
-def test_the_six_owner_datasets_are_named_in_one_place() -> None:
+def test_the_seven_owner_datasets_are_named_in_one_place() -> None:
     """The guards read one list; the module's own constants must agree with it.
 
     `SOURCE_DATASET_IDS` is `runtime_builder_serving`'s payload-kind mapping, so the
     assembler's construction check and the settings validator cannot drift apart. What
-    that does not cover is the six id *strings* this module also spells out, so they are
+    that does not cover is the seven id *strings* this module also spells out, so they are
     compared here. The third place a dataset id is written -- a profile's
     `source_authorities` -- carries a root per entry and cannot be derived; it is checked
     against the same mapping by `ServingRuntimeSettings.validate_source_authorities`.
@@ -475,6 +719,7 @@ def test_the_six_owner_datasets_are_named_in_one_place() -> None:
         PAPER_ACCOUNTS_DATASET_ID,
         RUNTIME_HEALTH_DATASET_ID,
         LAB_JOBS_DATASET_ID,
+        OPS_STATUS_DATASET_ID,
         PROMOTIONS_DATASET_ID,
         REFERENCE_SLOW_AUTHORITY_DATASET_ID,
     } == SOURCE_DATASET_IDS

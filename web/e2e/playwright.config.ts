@@ -3,6 +3,7 @@ import {
   API_NOW,
   API_PORT,
   APP_URL,
+  PROXY_PROOF_FILE,
   REPLAY_ROOT,
   REPO_ROOT,
   SERVING_ROOT,
@@ -12,7 +13,7 @@ import {
 
 const serve = (root: string) =>
   `${UV_RUN} python scripts/serve_web_fixture.py --root "${root}" --now ${API_NOW}` +
-  ` --bind 127.0.0.1:${API_PORT}`;
+  ` --bind 127.0.0.1:${API_PORT} --private-fixture --proxy-proof-file "${PROXY_PROOF_FILE}"`;
 const buildFixture =
   `${UV_RUN} python scripts/build_web_fixture.py --out "${SERVING_ROOT}" --scenario panorama` +
   " --replace";
@@ -55,7 +56,9 @@ export default defineConfig({
       stdout: "pipe",
     },
     {
-      command: `node e2e/static-server.mjs --port ${WEB_PORT} --api http://127.0.0.1:${API_PORT}`,
+      command:
+        `node e2e/static-server.mjs --port ${WEB_PORT} --api http://127.0.0.1:${API_PORT}` +
+        ` --proof-file "${PROXY_PROOF_FILE}"`,
       cwd: `${REPO_ROOT}/web`,
       url: APP_URL,
       reuseExistingServer: false,

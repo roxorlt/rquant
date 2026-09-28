@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -70,6 +71,39 @@ def test_panorama_publishes_every_panorama_projection(tmp_path: Path) -> None:
     assert [row[0] for row in systems] == ["东财概念", "东财行业", "开盘啦题材"]
 
 
+def test_audit_fixture_projects_synthetic_research_metadata_through_serving(tmp_path: Path) -> None:
+    root = tmp_path / "audit"
+    manifest = build_web_fixture(root, "panorama", audit=True)
+
+    assert manifest.row_counts["data_audit_status"] == 1
+    assert manifest.row_counts["data_audit_issue"] == 2
+    with ServingReader(root).acquire_generation() as lease:
+        status = lease.connection.execute(
+            "SELECT latest_status, finding_count FROM data_audit_status"
+        ).fetchone()
+        issues = lease.connection.execute(
+            "SELECT dataset_id, rule_id FROM data_audit_issue ORDER BY dataset_id"
+        ).fetchall()
+    assert status == ("failed", 2)
+    assert issues == [
+        ("limit_up_pool_daily", "limit-up-pool-calendar-coverage"),
+        ("minute_bar", "minute-without-daily"),
+    ]
+
+
+def test_cli_can_publish_an_audit_generation_for_browser_checks(tmp_path: Path) -> None:
+    root = tmp_path / "serving"
+    assert fixture_cli.main(["--out", str(root), "--scenario", "panorama"]) == 0
+    assert (
+        fixture_cli.main(
+            ["--out", str(root), "--scenario", "panorama", "--publish-next", "--audit"]
+        )
+        == 0
+    )
+    with ServingReader(root).acquire_generation() as lease:
+        assert lease.manifest.row_counts["data_audit_issue"] == 2
+
+
 def test_degraded_marks_watermarks_and_leaves_projections_unpublished(tmp_path: Path) -> None:
     root = tmp_path / "degraded"
     manifest = build_web_fixture(root, "degraded")
@@ -124,11 +158,16 @@ def test_the_trade_calendar_is_the_2026_sse_schedule_not_a_weekday_rule(tmp_path
     build_web_fixture(root, "baseline")
     with ServingReader(root).acquire_generation() as lease:
         rows = lease.connection.execute(
-            "SELECT trade_date FROM trade_calendar WHERE exchange = 'SSE' AND is_open "
+            "SELECT trade_date, is_open FROM trade_calendar WHERE exchange = 'SSE' "
             "ORDER BY trade_date"
         ).fetchall()
-    open_days = {row[0] for row in rows}
+    open_days = {day for day, is_open in rows if is_open}
 
+    assert len(rows) == 365
+    assert rows[0] == (date(2026, 1, 1), False)
+    assert (date(2026, 9, 25), False) in rows
+    assert (date(2026, 9, 27), False) in rows
+    assert (date(2026, 9, 28), True) in rows
     assert len(open_days) == 242
     assert min(open_days).isoformat() == "2026-01-05"
     assert max(open_days).isoformat() == "2026-12-31"

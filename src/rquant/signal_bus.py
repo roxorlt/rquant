@@ -11,9 +11,9 @@ from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, Self
+from typing import Annotated, Literal, Self
 
-from pydantic import Field, StringConstraints, field_validator, model_validator
+from pydantic import Field, StrictInt, StringConstraints, field_validator, model_validator
 
 from rquant.delivery_contracts import (
     DeliveryChannel,
@@ -37,6 +37,7 @@ from rquant.signal_contracts import (
 )
 
 Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
+_MAX_OBSERVED_PREFIX_RECORDS = 10_000
 
 
 class SignalBusLeaseError(RuntimeError):
@@ -217,6 +218,78 @@ class SignalBusRoutedRecord(SignalBusSignalRecord):
         if self.receipt.signal_id != self.signal_id:
             raise ValueError("route receipt signal_id does not match signal payload")
         return self
+
+
+def _observed_prefix_digest(
+    records: Iterable[SignalBusSignalRecord | SignalBusRoutedRecord],
+) -> str:
+    return canonical_sha256(
+        {
+            "contract": "signal-bus-observed-prefix/v1",
+            "rows": tuple(
+                (
+                    record.global_sequence,
+                    record.signal_id,
+                    record.payload_hash,
+                    record.received_at,
+                )
+                for record in records
+            ),
+        }
+    )
+
+
+class SignalBusObservedPrefixReceipt(RuntimeContractModel):
+    """A verified bus prefix. It does not attest to upstream producer coverage."""
+
+    source_generation_id: Sha256
+    source_created_at: AwareUtcDatetime
+    first_global_sequence: StrictInt = Field(ge=1)
+    source_high_watermark: StrictInt = Field(ge=0)
+    source_inspected_at: AwareUtcDatetime
+    prefix_row_count: StrictInt = Field(ge=0)
+    prefix_rows_sha256: Sha256
+    upstream_complete: Literal[False] = False
+
+    @model_validator(mode="after")
+    def validate_prefix(self) -> Self:
+        if self.first_global_sequence != 1:
+            raise ValueError("observed bus prefix must begin at global sequence one")
+        if self.prefix_row_count != self.source_high_watermark:
+            raise ValueError("observed bus prefix count differs from high watermark")
+        if self.source_created_at > self.source_inspected_at:
+            raise ValueError("bus source was created after observation")
+        return self
+
+    def matches_routed_prefix(
+        self,
+        source: SignalBusSourceDescriptor,
+        records: tuple[SignalBusRoutedRecord, ...],
+    ) -> bool:
+        """Compare a verified spool prefix to this bus cutoff without granting coverage."""
+        source = SignalBusSourceDescriptor.model_validate(source)
+        if (
+            source.generation_id != self.source_generation_id
+            or source.first_global_sequence != self.first_global_sequence
+            or source.high_watermark != self.source_high_watermark
+            or len(records) != self.prefix_row_count
+        ):
+            return False
+        verified: list[SignalBusRoutedRecord] = []
+        for expected, item in enumerate(records, start=1):
+            try:
+                record = SignalBusRoutedRecord.model_validate(item)
+            except ValueError:
+                return False
+            if (
+                record.global_sequence != expected
+                or record.received_at > self.source_inspected_at
+                or record.signal.available_at > self.source_inspected_at
+                or record.receipt.routed_at > self.source_inspected_at
+            ):
+                return False
+            verified.append(record)
+        return _observed_prefix_digest(verified) == self.prefix_rows_sha256
 
 
 class SignalRouteCursor(RuntimeContractModel):
@@ -578,6 +651,7 @@ class SignalBusStore:
 
     def _initialize(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        fresh_file = not self.path.exists()
         connection = self._connect()
         try:
             connection.executescript(
@@ -698,51 +772,67 @@ class SignalBusStore:
                 """
             )
             connection.execute(_WATERMARK_RECOVERY_TABLE)
-            connection.execute(
-                """
-                INSERT OR IGNORE INTO signal_bus_metadata(metadata_key, metadata_value)
-                VALUES ('retry_policy_fingerprint', ?)
-                """,
-                (self.retry_policy_fingerprint,),
-            )
-            connection.execute(
-                """
-                INSERT OR IGNORE INTO signal_bus_metadata(metadata_key, metadata_value)
-                VALUES ('source_generation_id', ?)
-                """,
-                (secrets.token_hex(32),),
-            )
-            persisted, observed_max = _read_high_watermark_state(connection)
-            if persisted is None:
-                # Only a genuinely empty store may seed its own watermark. Deriving one
-                # from `MAX(global_sequence)` on a store that already holds rows is a
-                # silent self-correction, and if those rows were truncated it moves the
-                # watermark *down* with no exception and no audit row. Rebuilding a lost
-                # watermark is `recover_signal_bus_high_watermark`, nothing else.
-                if observed_max:
-                    raise SignalBusWatermarkError(
-                        "signal bus high watermark row is missing from a store that already "
-                        f"holds signal rows through {observed_max}"
-                    )
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                metadata_count = int(
+                    connection.execute("SELECT COUNT(*) FROM signal_bus_metadata").fetchone()[0]
+                )
                 connection.execute(
                     """
-                    INSERT INTO signal_bus_metadata(metadata_key, metadata_value)
-                    VALUES ('signal_high_watermark', '0')
-                    """
+                    INSERT OR IGNORE INTO signal_bus_metadata(metadata_key, metadata_value)
+                    VALUES ('retry_policy_fingerprint', ?)
+                    """,
+                    (self.retry_policy_fingerprint,),
                 )
-            observed = connection.execute(
-                """
-                SELECT metadata_value
-                FROM signal_bus_metadata
-                WHERE metadata_key = 'retry_policy_fingerprint'
-                """
-            ).fetchone()
-            if observed is None or observed["metadata_value"] != self.retry_policy_fingerprint:
-                raise ValueError("retry policy does not match the persisted signal bus policy")
-            # The seeding above only ever runs on an empty store, and an existing row is
-            # never rewritten. Opening a store whose watermark already disagrees with its
-            # rows fails closed here.
-            _require_consistent_high_watermark(connection)
+                generation_insert = connection.execute(
+                    """
+                    INSERT OR IGNORE INTO signal_bus_metadata(metadata_key, metadata_value)
+                    VALUES ('source_generation_id', ?)
+                    """,
+                    (secrets.token_hex(32),),
+                )
+                persisted, observed_max = _read_high_watermark_state(connection)
+                if (
+                    fresh_file
+                    and generation_insert.rowcount == 1
+                    and metadata_count == 0
+                    and not observed_max
+                ):
+                    connection.execute(
+                        """
+                        INSERT INTO signal_bus_metadata(metadata_key, metadata_value)
+                        VALUES ('source_created_at', ?)
+                        """,
+                        (_encode_time(datetime.now(UTC)),),
+                    )
+                if persisted is None:
+                    # A store with existing rows may never derive its missing watermark.
+                    if observed_max:
+                        raise SignalBusWatermarkError(
+                            "signal bus high watermark row is missing from a store that already "
+                            f"holds signal rows through {observed_max}"
+                        )
+                    connection.execute(
+                        """
+                        INSERT INTO signal_bus_metadata(metadata_key, metadata_value)
+                        VALUES ('signal_high_watermark', '0')
+                        """
+                    )
+                observed = connection.execute(
+                    """
+                    SELECT metadata_value
+                    FROM signal_bus_metadata
+                    WHERE metadata_key = 'retry_policy_fingerprint'
+                    """
+                ).fetchone()
+                if observed is None or observed["metadata_value"] != self.retry_policy_fingerprint:
+                    raise ValueError("retry policy does not match the persisted signal bus policy")
+                _require_consistent_high_watermark(connection)
+                connection.execute("COMMIT")
+            except BaseException:
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                raise
         finally:
             connection.close()
 
@@ -873,6 +963,93 @@ class SignalBusStore:
             generation_id=generation_id,
             high_watermark=int(high_watermark),
         )
+
+    def observed_prefix_receipt(
+        self,
+        *,
+        observed_at: datetime,
+        max_records: int = _MAX_OBSERVED_PREFIX_RECORDS,
+    ) -> SignalBusObservedPrefixReceipt | None:
+        """Verify one durable bus prefix without assuming upstream completeness."""
+        if type(max_records) is not int or not 1 <= max_records <= _MAX_OBSERVED_PREFIX_RECORDS:
+            raise ValueError("max_records must be between 1 and 10000")
+        inspected = _normalize_time(observed_at)
+        with self._read_snapshot() as connection:
+            metadata = {
+                str(row["metadata_key"]): str(row["metadata_value"])
+                for row in connection.execute(
+                    """
+                    SELECT metadata_key, metadata_value FROM signal_bus_metadata
+                    WHERE metadata_key IN (
+                        'source_generation_id', 'source_created_at', 'signal_high_watermark'
+                    )
+                    """
+                ).fetchall()
+            }
+            if not all(
+                key in metadata
+                for key in ("source_generation_id", "source_created_at", "signal_high_watermark")
+            ):
+                return None
+            if not metadata["source_created_at"].endswith("Z"):
+                return None
+            try:
+                high = _require_consistent_high_watermark(connection)
+                created_at = _require_time(metadata["source_created_at"])
+            except (SignalBusWatermarkError, TypeError, ValueError):
+                return None
+            if high > max_records or created_at > inspected:
+                return None
+            rows = connection.execute(
+                """
+                SELECT global_sequence, signal_id, payload_hash, payload_json,
+                       length(CAST(payload_json AS BLOB)) AS payload_size, received_at
+                FROM signal_envelope
+                WHERE global_sequence <= ?
+                ORDER BY global_sequence
+                LIMIT ?
+                """,
+                (high, max_records + 1),
+            ).fetchall()
+            if len(rows) != high:
+                return None
+            records: list[SignalBusSignalRecord] = []
+            try:
+                for expected, row in enumerate(rows, start=1):
+                    if int(row["global_sequence"]) != expected:
+                        return None
+                    signal = parse_stored_signal(
+                        signal_id=str(row["signal_id"]),
+                        payload_hash=str(row["payload_hash"]),
+                        payload_json=str(row["payload_json"]),
+                        payload_size=int(row["payload_size"]),
+                    )
+                    if not str(row["received_at"]).endswith("Z"):
+                        return None
+                    received_at = _require_time(row["received_at"])
+                    if received_at > inspected or signal.available_at > inspected:
+                        return None
+                    records.append(
+                        SignalBusSignalRecord(
+                            global_sequence=expected,
+                            signal_id=str(row["signal_id"]),
+                            payload_hash=str(row["payload_hash"]),
+                            payload_json=str(row["payload_json"]),
+                            signal=signal,
+                            received_at=received_at,
+                        )
+                    )
+                return SignalBusObservedPrefixReceipt(
+                    source_generation_id=metadata["source_generation_id"],
+                    source_created_at=created_at,
+                    first_global_sequence=1,
+                    source_high_watermark=high,
+                    source_inspected_at=inspected,
+                    prefix_row_count=len(records),
+                    prefix_rows_sha256=_observed_prefix_digest(records),
+                )
+            except (TypeError, ValueError):
+                return None
 
     def signals_after_global_sequence(
         self,
@@ -1528,9 +1705,7 @@ class SignalBusStore:
                 source_id=str(row["source_id"]),
                 previous_generation_id=str(row["previous_generation_id"]),
                 previous_source_generation_id=str(row["previous_source_generation_id"]),
-                previous_strategy_spec_fingerprint=str(
-                    row["previous_strategy_spec_fingerprint"]
-                ),
+                previous_strategy_spec_fingerprint=str(row["previous_strategy_spec_fingerprint"]),
                 archived_source_id=str(row["archived_source_id"]),
                 routed_through_sequence=int(row["routed_through_sequence"]),
                 abandoned_sequences=int(row["abandoned_sequences"]),

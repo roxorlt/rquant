@@ -1,0 +1,51 @@
+"""C7.1 deterministic performance metrics for research artifacts."""
+
+from rquant.perf.core import (
+    EquityCurve,
+    HistogramBin,
+    PerformanceSummary,
+    RelativeMetrics,
+    ReturnDistribution,
+    StreakSummary,
+    annualized_turnover,
+    equity_curve,
+    monthly_returns,
+    performance_summary,
+    relative_metrics,
+    return_distribution,
+    rolling_metrics,
+    streaks,
+)
+from rquant.perf.trades import (
+    Fill,
+    RoundTrip,
+    RoundTripAnalysis,
+    RoundTripLedger,
+    RoundTripStats,
+    build_round_trips,
+    summarize_round_trips,
+)
+
+__all__ = [
+    "EquityCurve",
+    "Fill",
+    "HistogramBin",
+    "PerformanceSummary",
+    "RelativeMetrics",
+    "ReturnDistribution",
+    "RoundTrip",
+    "RoundTripAnalysis",
+    "RoundTripLedger",
+    "RoundTripStats",
+    "StreakSummary",
+    "annualized_turnover",
+    "build_round_trips",
+    "equity_curve",
+    "monthly_returns",
+    "performance_summary",
+    "relative_metrics",
+    "return_distribution",
+    "rolling_metrics",
+    "streaks",
+    "summarize_round_trips",
+]

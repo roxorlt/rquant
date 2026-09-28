@@ -16,11 +16,13 @@ from rquant.reference_slow_publisher import (
     ReferenceSecurityFact,
     ReferenceSlowPublicationError,
     ReferenceSlowSourceSnapshot,
+    _daily_calendar_projection_rows,
     build_reference_slow_serving_result,
     publish_reference_slow_snapshot,
 )
 from rquant.runtime_market_session import MarketCalendarAuthority
 from rquant.runtime_serving_snapshot import ReferenceSlowPayload
+from rquant.serving_read_models import ServingProjectionPayload
 
 COMMIT = "a" * 40
 TARGET_DATE = date(2026, 7, 31)
@@ -30,6 +32,29 @@ VISIBLE_AT = datetime(2026, 7, 31, 1, 24, 40, tzinfo=UTC)
 #: every record a window publishes becomes visible at the 09:25 decision time, however long
 #: its commit takes (#297; it used to be `prepared_at + 5 s`)
 AVAILABLE_AT = datetime(2026, 7, 31, 1, 25, tzinfo=UTC)
+
+
+def test_calendar_projection_keeps_a_complete_recent_3660_day_window() -> None:
+    start = date(2015, 1, 1)
+    end = date(2026, 12, 31)
+    open_dates = tuple(
+        day
+        for offset in range((end - start).days + 1)
+        for day in (start + timedelta(days=offset),)
+        if day.weekday() < 5
+    )
+    rows = _daily_calendar_projection_rows(
+        target_trade_date=date(2026, 9, 28),
+        open_dates=open_dates,
+        coverage_start=start,
+        coverage_end=end,
+    )
+
+    assert len(rows) == 3660
+    assert rows[0]["trade_date"] == (end - timedelta(days=3659)).isoformat()
+    assert rows[-1]["trade_date"] == end.isoformat()
+    assert any(row["is_open"] is False for row in rows)
+    ServingProjectionPayload(table_name="trade_calendar", available_at=CAPTURED_AT, rows=rows)
 
 
 def _calendar() -> MarketCalendarAuthority:

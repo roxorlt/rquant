@@ -4,16 +4,25 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from datetime import date
+from datetime import UTC, date, datetime
+from pathlib import Path
 
 import pandas as pd
 from loguru import logger
 from pydantic import Field
 
-from rquant.presets import PRESET_SCREENS, ScreenPreset
+from rquant.builtin_presets import builtin_definition_version
+from rquant.pool_result_receipt import ScreenRunReceipt, ScreenRunReceiptDraft, member_set_digest
+from rquant.presets import PRESET_SCREENS, ScreenPreset, load_user_presets
 from rquant.risk.blacklist import load_active_blacklist
 from rquant.runtime_contracts import RuntimeContractModel
 from rquant.screen.core import screen
+from rquant.screen.ranking import (
+    RETURN_20D_COLUMN,
+    RankingCondition,
+    load_twenty_day_adjusted_returns,
+    rank_screen_results,
+)
 from rquant.storage.duckdb import DuckDBStore
 
 
@@ -33,6 +42,60 @@ class DailyPoolPipelineResult(RuntimeContractModel):
     errors: tuple[str, ...] = ()
 
 
+class ParentMarketDataGapError(LookupError):
+    """A trusted parent trading day has no daily market rows."""
+
+
+class ParentRunEvidenceError(LookupError):
+    """A parent result cannot be tied to its definition and exact members."""
+
+
+def _definition_version(preset: ScreenPreset) -> str:
+    return preset.definition_version or builtin_definition_version(preset)
+
+
+def _verified_parent_run(
+    store: DuckDBStore,
+    presets: Mapping[str, ScreenPreset],
+    trade_date: str,
+    name: str,
+    *,
+    seen: frozenset[tuple[str, str]] = frozenset(),
+) -> tuple[list[str], ScreenRunReceipt]:
+    key = (trade_date, name)
+    if key in seen:
+        raise ParentRunEvidenceError("pool result lineage contains a cycle")
+    preset = presets.get(name)
+    receipt = store.query_screen_run_receipt(trade_date, name)
+    if preset is None or receipt is None:
+        raise ParentRunEvidenceError(f"parent run receipt missing: {name}/{trade_date}")
+    codes = store.query_screen_result(trade_date, name)["ts_code"].tolist()
+    if (
+        receipt.definition_version != _definition_version(preset)
+        or receipt.hit_count != len(codes)
+        or receipt.member_digest != member_set_digest(codes)
+    ):
+        raise ParentRunEvidenceError(f"parent run differs from definition or members: {name}")
+    if preset.delay_days is not None and preset.depends_on is not None:
+        expected_date = _get_exact_delayed_trading_date(
+            store, trade_date, preset.delay_days
+        )
+        if receipt.parent_trade_date != date.fromisoformat(expected_date):
+            raise ParentRunEvidenceError(f"parent run has a stale ancestor date: {name}")
+        _, ancestor = _verified_parent_run(
+            store,
+            presets,
+            expected_date,
+            preset.depends_on,
+            seen=seen | {key},
+        )
+        if receipt.parent_result_version != ancestor.result_version:
+            raise ParentRunEvidenceError(f"parent run has a stale ancestor version: {name}")
+    elif preset.depends_on is None and receipt.parent_result_version is not None:
+        raise ParentRunEvidenceError(f"root pool run has unexpected parent: {name}")
+    return codes, receipt
+
+
 def _get_prev_trading_date(store: DuckDBStore, trade_date: str, n: int = 1) -> str | None:
     """trade_date 前第 n 个交易日（n=1 = 前一天）。"""
     row = store._conn.execute(
@@ -48,6 +111,25 @@ def _get_prev_trading_date(store: DuckDBStore, trade_date: str, n: int = 1) -> s
         [trade_date, n - 1],
     ).fetchone()
     return row[0] if row else None
+
+
+def _get_exact_delayed_trading_date(
+    store: DuckDBStore, trade_date: str, delay_days: int
+) -> str:
+    anchor = date.fromisoformat(trade_date)
+    if not store.is_trading_day("SSE", anchor):
+        raise ValueError(f"v2 screen date is not an open trading day: {trade_date}")
+    for _ in range(delay_days):
+        anchor = store.previous_trading_day(anchor)
+    available = store._conn.execute(
+        "SELECT EXISTS(SELECT 1 FROM daily_bar WHERE trade_date = ?)",
+        [anchor],
+    ).fetchone()[0]
+    if not available:
+        raise ParentMarketDataGapError(
+            f"daily_bar missing for exact parent trading day {anchor.isoformat()}"
+        )
+    return anchor.isoformat()
 
 
 def _to_screen_result_df(
@@ -101,12 +183,26 @@ def _resolve_execution_order(
     presets: dict[str, ScreenPreset],
     names: list[str] | None = None,
 ) -> list[str]:
-    """按依赖拓扑排序：无 depends_on 的先跑。"""
-    selected = {n: presets[n] for n in names if n in presets} if names else presets
-
-    no_dep = [n for n, p in selected.items() if p.depends_on is None]
-    has_dep = [n for n, p in selected.items() if p.depends_on is not None]
-    return no_dep + has_dep
+    """按依赖拓扑排序，等价节点保持注册表声明顺序。"""
+    selected = {n: presets[n] for n in names if n in presets} if names is not None else presets
+    state: dict[str, int] = {}
+    ordered: list[str] = []
+    for name in selected:
+        chain: list[str] = []
+        current = name
+        while current in selected and state.get(current) != 2:
+            if state.get(current) == 1:
+                raise ValueError("pool dependency cycle")
+            state[current] = 1
+            chain.append(current)
+            parent = selected[current].depends_on
+            if parent is None:
+                break
+            current = parent
+        for item in reversed(chain):
+            state[item] = 2
+            ordered.append(item)
+    return ordered
 
 
 def _compute_levels(body_upper: float, body_lower: float) -> dict[str, float]:
@@ -183,6 +279,8 @@ def run_daily_screen_stage(
     *,
     preset_names: list[str] | None = None,
     store: DuckDBStore,
+    preset_directory: Path | None = None,
+    transaction_open: bool = False,
 ) -> DailyScreenPipelineResult:
     """Run only screen materialization. Notification is deliberately out of band."""
     count = store._conn.execute(
@@ -192,7 +290,20 @@ def run_daily_screen_stage(
         logger.warning(f"{trade_date} 无 daily_bar 数据，跳过")
         return DailyScreenPipelineResult(preset_hits={}, errors=())
 
-    order = _resolve_execution_order(PRESET_SCREENS, preset_names)
+    from rquant.config import settings
+
+    directory = (
+        Path(settings.data_dir) / "user_presets"
+        if preset_directory is None
+        else preset_directory
+    )
+    presets = {
+        name: preset
+        for name, preset in PRESET_SCREENS.items()
+        if not name.startswith("user/")
+    }
+    presets.update(load_user_presets(directory))
+    order = _resolve_execution_order(presets, preset_names)
     summary: dict[str, int] = {}
     errors: list[str] = []
     blacklist = load_active_blacklist(store)
@@ -200,48 +311,163 @@ def run_daily_screen_stage(
         logger.info(f"风险黑名单 active: {len(blacklist)} 只，将过滤所有 preset 新推荐")
 
     for name in order:
+        writing = False
+        transaction_started = False
         try:
-            preset = PRESET_SCREENS[name]
+            if not transaction_open:
+                store._conn.execute("BEGIN")
+                transaction_started = True
+            preset = presets[name]
             ts_whitelist: list[str] | None = None
+            parent_trade_date: date | None = None
+            parent_result_version: str | None = None
+            lineage_complete = preset.depends_on is None
             if preset.depends_on:
                 ts_whitelist = []
                 parent_dates = []
-                for offset in range(1, preset.offset_days + 1):
-                    parent_date = _get_prev_trading_date(store, trade_date, offset)
-                    if parent_date is None:
-                        continue
-                    parent_df = store.query_screen_result(parent_date, preset.depends_on)
-                    if not parent_df.empty:
-                        ts_whitelist.extend(parent_df["ts_code"].tolist())
-                        parent_dates.append(parent_date)
-                ts_whitelist = list(set(ts_whitelist))
+                # v2 延后只取 T-N；旧 offset_days 保持 T-1..T-N 回看窗口。
+                if preset.delay_days is not None:
+                    exact_date = _get_exact_delayed_trading_date(
+                        store, trade_date, preset.delay_days
+                    )
+                    parent_codes, parent_receipt = _verified_parent_run(
+                        store, presets, exact_date, preset.depends_on
+                    )
+                    ts_whitelist = parent_codes
+                    parent_trade_date = date.fromisoformat(exact_date)
+                    parent_result_version = parent_receipt.result_version
+                    lineage_complete = parent_receipt.lineage_complete
+                else:
+                    candidate_dates = tuple(
+                        _get_prev_trading_date(store, trade_date, offset)
+                        for offset in range(1, preset.offset_days + 1)
+                    )
+                    for parent_date in candidate_dates:
+                        if parent_date is None:
+                            continue
+                        parent_df = store.query_screen_result(parent_date, preset.depends_on)
+                        if not parent_df.empty:
+                            ts_whitelist.extend(parent_df["ts_code"].tolist())
+                            parent_dates.append(parent_date)
+                ts_whitelist = sorted(set(ts_whitelist))
                 if not ts_whitelist:
+                    lookback = (
+                        f"T-{preset.delay_days}"
+                        if preset.delay_days is not None
+                        else f"T-1~T-{preset.offset_days}"
+                    )
                     logger.info(
                         f"{name}: 父预设 {preset.depends_on} "
-                        f"在 T-1~T-{preset.offset_days} 无命中，跳过"
+                        f"在 {lookback} 无命中，跳过"
                     )
+                    empty = _to_screen_result_df(pd.DataFrame(), trade_date, name)
+                    receipt = ScreenRunReceiptDraft(
+                        trade_date=date.fromisoformat(trade_date),
+                        preset_name=name,
+                        definition_version=_definition_version(preset),
+                        parent_trade_date=parent_trade_date,
+                        parent_result_version=parent_result_version,
+                        hit_count=0,
+                        member_digest=member_set_digest([]),
+                        lineage_complete=lineage_complete,
+                        completed_at=datetime.now(UTC),
+                    )
+                    writing = True
+                    store.replace_screen_result_with_receipt(
+                        trade_date, name, empty, receipt,
+                        manage_transaction=False,
+                    )
+                    writing = False
+                    if transaction_started:
+                        store._conn.execute("COMMIT")
+                        transaction_started = False
                     summary[name] = 0
                     continue
-                logger.info(f"{name}: 从 {parent_dates} 合并 {len(ts_whitelist)} 只白名单")
+                dates = [parent_trade_date.isoformat()] if parent_trade_date else parent_dates
+                logger.info(f"{name}: 从 {dates} 合并 {len(ts_whitelist)} 只白名单")
 
+            screen_columns = list(preset.include_columns)
+            if preset.ranking is not None:
+                screen_columns.extend(
+                    condition.metric
+                    for condition in preset.ranking.conditions
+                    if condition.metric != RETURN_20D_COLUMN
+                    and condition.metric not in screen_columns
+                )
             result_df = screen(
                 trade_date=trade_date,
                 rules=preset.rules,
-                include_columns=preset.include_columns or None,
+                include_columns=screen_columns or None,
                 store=store,
                 ts_code_whitelist=ts_whitelist,
             )
+            if preset.ranking is not None:
+                if blacklist and not result_df.empty:
+                    hit_mask = result_df["ts_code"].isin(blacklist.keys())
+                    if hit_mask.any():
+                        removed = result_df.loc[hit_mask, "ts_code"].tolist()
+                        result_df = result_df.loc[~hit_mask].reset_index(drop=True)
+                        logger.warning(f"  {name}: 黑名单过滤剔除 {len(removed)} 只 → {removed}")
+                if RETURN_20D_COLUMN in {
+                    condition.metric for condition in preset.ranking.conditions
+                }:
+                    returns = load_twenty_day_adjusted_returns(
+                        store._conn,
+                        date.fromisoformat(trade_date),
+                        result_df["ts_code"].tolist(),
+                    )
+                    result_df = result_df.merge(
+                        returns, on="ts_code", how="left", validate="one_to_one"
+                    )
+                ranked = rank_screen_results(
+                    result_df,
+                    [
+                        RankingCondition(item.metric, item.ascending, item.weight)
+                        for item in preset.ranking.conditions
+                    ],
+                    top_n=preset.ranking.top_n,
+                )
+                visible_columns = [
+                    column
+                    for column in ranked.columns
+                    if column in {"ts_code", "name", "CLOSE[0]", "PCT_CHG[0]"}
+                    or column in preset.include_columns
+                ]
+                result_df = ranked[visible_columns]
             sr_df = _to_screen_result_df(result_df, trade_date, name)
-            if blacklist and not sr_df.empty:
+            if preset.ranking is None and blacklist and not sr_df.empty:
                 hit_mask = sr_df["ts_code"].isin(blacklist.keys())
                 if hit_mask.any():
                     removed = sr_df.loc[hit_mask, "ts_code"].tolist()
                     sr_df = sr_df.loc[~hit_mask].reset_index(drop=True)
                     logger.warning(f"  {name}: 黑名单过滤剔除 {len(removed)} 只 → {removed}")
-            store.upsert_screen_result(sr_df)
+            receipt = ScreenRunReceiptDraft(
+                trade_date=date.fromisoformat(trade_date),
+                preset_name=name,
+                definition_version=_definition_version(preset),
+                parent_trade_date=parent_trade_date,
+                parent_result_version=parent_result_version,
+                hit_count=len(sr_df),
+                member_digest=member_set_digest(sr_df["ts_code"].tolist()),
+                lineage_complete=lineage_complete,
+                completed_at=datetime.now(UTC),
+            )
+            writing = True
+            store.replace_screen_result_with_receipt(
+                trade_date, name, sr_df, receipt,
+                manage_transaction=False,
+            )
+            writing = False
+            if transaction_started:
+                store._conn.execute("COMMIT")
+                transaction_started = False
             summary[name] = len(sr_df)
             logger.info(f"  {name}: {len(sr_df)} 命中")
         except Exception as exc:
+            if transaction_started:
+                store._conn.execute("ROLLBACK")
+            if writing and transaction_open:
+                raise
             summary[name] = -1
             errors.append(f"screen:{name}:{type(exc).__name__}")
             logger.exception(f"preset {name} 执行失败，跳过，继续后续 preset")

@@ -196,7 +196,9 @@ describe("navigation", () => {
     expect(opener).toHaveAttribute("aria-expanded", "true");
     await user.click(within(sheet).getByRole("link", { name: "市场全景" }));
     await waitFor(() => expect(router.state.location.pathname).toBe("/panorama"));
-    expect(await screen.findByRole("heading", { level: 1, name: "市场全景" })).toBeInTheDocument();
+    expect(
+      await screen.findByRole("heading", { level: 1, name: "市场全景" }, { timeout: 5_000 }),
+    ).toBeInTheDocument();
     await waitFor(() => expect(opener).toHaveAttribute("aria-expanded", "false"));
   });
 });

@@ -423,7 +423,7 @@ def test_delivery_mode_is_read_from_the_notifier_heartbeats(
 
 
 def test_a_live_notifier_reports_real_deliveries_as_delivered() -> None:
-    from rquant.web.routes.overview import _delivery_state
+    from rquant.web.signal_display import delivery_state
     from rquant.web.status import delivery_mode
 
     class Row:
@@ -432,8 +432,8 @@ def test_a_live_notifier_reports_real_deliveries_as_delivered() -> None:
     live = delivery_mode([("running", False, 0, None)])
     shadow = delivery_mode([("degraded", False, 0, None)])
 
-    assert _delivery_state([Row()], live) == "delivered"  # type: ignore[list-item]
-    assert _delivery_state([Row()], shadow) == "recorded"  # type: ignore[list-item]
+    assert delivery_state([Row()], live) == "delivered"  # type: ignore[list-item]
+    assert delivery_state([Row()], shadow) == "recorded"  # type: ignore[list-item]
 
 
 def test_the_paper_valuation_caveat_is_a_tooltip_not_an_attention_item(

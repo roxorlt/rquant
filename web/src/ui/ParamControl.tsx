@@ -1,0 +1,140 @@
+import type { ScreenOption, ScreenParameter } from "@/api/screen";
+import { Tip } from "./Tip";
+
+export type ParameterValue = string | number | string[] | null;
+
+export function ParamControl({
+  parameter,
+  value,
+  extraOption,
+  numberUnit,
+  onChange,
+}: {
+  parameter: ScreenParameter;
+  value: ParameterValue;
+  extraOption?: ScreenOption | null;
+  numberUnit?: string | null;
+  onChange: (value: ParameterValue) => void;
+}) {
+  const options = extraOption
+    ? [...(parameter.options ?? []), extraOption]
+    : (parameter.options ?? []);
+  const label = (
+    <span className="lbl">
+      {parameter.label}
+      {numberUnit ? `（${numberUnit}）` : ""}
+      {parameter.hint ? (
+        <Tip content={parameter.hint}>
+          <span className="screen-help" role="img" aria-label={`${parameter.label}说明`}>
+            ?
+          </span>
+        </Tip>
+      ) : null}
+    </span>
+  );
+  if (parameter.input === "multi_choice") {
+    const selected = Array.isArray(value) ? value : [];
+    return (
+      <fieldset className="screen-multi">
+        <legend className="lbl">{parameter.label}</legend>
+        {options.map((option) => (
+          <label key={option.value}>
+            <input
+              type="checkbox"
+              checked={selected.includes(option.value)}
+              onChange={(event) =>
+                onChange(
+                  event.target.checked
+                    ? [...selected, option.value]
+                    : selected.filter((item) => item !== option.value),
+                )
+              }
+            />
+            {option.label}
+          </label>
+        ))}
+      </fieldset>
+    );
+  }
+  if (parameter.input === "operand") {
+    const numeric = typeof value === "number";
+    return (
+      <div className="field screen-param">
+        {label}
+        <select
+          className="inp"
+          aria-label={parameter.label}
+          value={numeric ? "__number__" : String(value ?? "")}
+          onChange={(event) =>
+            onChange(event.target.value === "__number__" ? 0 : event.target.value)
+          }
+        >
+          {options.map((option) => (
+            <option key={option.value} value={option.value}>
+              {option.label}
+            </option>
+          ))}
+          <option value="__number__">固定数字</option>
+        </select>
+        {numeric ? (
+          <div className="screen-number">
+            <input
+              className="inp num"
+              type="number"
+              inputMode="decimal"
+              step="any"
+              aria-label={`${parameter.label}数值${numberUnit ? `（${numberUnit}）` : ""}`}
+              value={value}
+              onChange={(event) =>
+                onChange(event.target.value === "" ? "" : Number(event.target.value))
+              }
+            />
+            {numberUnit ? (
+              <span className="screen-unit" aria-hidden="true">
+                {numberUnit}
+              </span>
+            ) : null}
+          </div>
+        ) : null}
+      </div>
+    );
+  }
+  if (parameter.input === "choice" || parameter.input === "field") {
+    return (
+      <label className="field screen-param">
+        {label}
+        <select
+          className="inp"
+          value={String(value ?? "")}
+          onChange={(event) => onChange(event.target.value)}
+        >
+          {options.map((option) => (
+            <option key={option.value} value={option.value}>
+              {option.label}
+            </option>
+          ))}
+        </select>
+      </label>
+    );
+  }
+  const scale = parameter.scale || 1;
+  const display = typeof value === "number" ? value * scale : (value ?? "");
+  return (
+    <label className="field screen-param">
+      {label}
+      <input
+        className="inp num"
+        type="number"
+        inputMode={parameter.input === "integer" ? "numeric" : "decimal"}
+        aria-label={`${parameter.label}${numberUnit ? `（${numberUnit}）` : ""}`}
+        step={parameter.input === "integer" ? 1 : "any"}
+        min={parameter.minimum == null ? undefined : parameter.minimum * scale}
+        max={parameter.maximum == null ? undefined : parameter.maximum * scale}
+        value={display}
+        onChange={(event) =>
+          onChange(event.target.value === "" ? "" : Number(event.target.value) / scale)
+        }
+      />
+    </label>
+  );
+}

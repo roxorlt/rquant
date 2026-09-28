@@ -30,6 +30,12 @@ from rquant.data_metadata import (
     normalize_utc_datetime,
     utc_now,
 )
+from rquant.pool_result_receipt import (
+    ScreenRunReceipt,
+    ScreenRunReceiptDraft,
+    member_price_digest,
+    member_set_digest,
+)
 from rquant.price_adjustment import resolve_price_factor_basis
 from rquant.security_status import (
     INTENTIONAL_STATUS_EXCLUSION_REASONS,
@@ -2525,6 +2531,177 @@ class DuckDBStore:
         count = len(df)
         logger.info(f"DuckDB upsert screen_result: {count} 行")
         return count
+
+    def replace_screen_result(
+        self, trade_date: str, preset_name: str, df: pd.DataFrame
+    ) -> int:
+        """Atomically replace one preset/date snapshot, including an empty result."""
+        if not df.empty and (
+            not (df["trade_date"] == trade_date).all()
+            or not (df["preset_name"] == preset_name).all()
+        ):
+            raise ValueError("screen result replacement contains another preset or date")
+        self._conn.register("screen_result_replace_tmp", df)
+        try:
+            self._conn.execute(
+                """
+                MERGE INTO screen_result AS target
+                USING screen_result_replace_tmp AS source
+                  ON target.trade_date = source.trade_date
+                 AND target.preset_name = source.preset_name
+                 AND target.ts_code = source.ts_code
+                WHEN MATCHED THEN UPDATE SET
+                    name = source.name,
+                    close = source.close,
+                    pct_chg = source.pct_chg,
+                    extra = source.extra
+                WHEN NOT MATCHED THEN INSERT
+                    (trade_date, preset_name, ts_code, name, close, pct_chg, extra)
+                    VALUES (source.trade_date, source.preset_name, source.ts_code,
+                            source.name, source.close, source.pct_chg, source.extra)
+                WHEN NOT MATCHED BY SOURCE
+                 AND target.trade_date = ? AND target.preset_name = ?
+                THEN DELETE
+                """,
+                [trade_date, preset_name],
+            )
+        finally:
+            self._conn.unregister("screen_result_replace_tmp")
+        logger.info(f"DuckDB replace screen_result {preset_name} {trade_date}: {len(df)} 行")
+        return len(df)
+
+    def replace_screen_result_with_receipt(
+        self,
+        trade_date: str,
+        preset_name: str,
+        df: pd.DataFrame,
+        receipt: ScreenRunReceipt | ScreenRunReceiptDraft,
+        *,
+        manage_transaction: bool = True,
+    ) -> int:
+        """Commit the exact member set and its proof together, including zero rows."""
+        if isinstance(receipt, ScreenRunReceiptDraft):
+            receipt = ScreenRunReceiptDraft.model_validate(receipt)
+        else:
+            receipt = ScreenRunReceipt.model_validate(receipt)
+            if receipt.contract == "screen-run-receipt/v2":
+                raise ValueError(
+                    "v2 price receipt requires an unsealed draft and persisted readback"
+                )
+        codes = [] if df.empty else df["ts_code"].tolist()
+        if (
+            receipt.trade_date.isoformat() != trade_date
+            or receipt.preset_name != preset_name
+            or receipt.hit_count != len(codes)
+            or receipt.member_digest != member_set_digest(codes)
+        ):
+            raise ValueError("screen run receipt does not describe replacement members")
+        started = False
+        try:
+            if manage_transaction:
+                self._conn.execute("BEGIN")
+                started = True
+            self.replace_screen_result(trade_date, preset_name, df)
+            if isinstance(receipt, ScreenRunReceiptDraft):
+                persisted = self._conn.execute(
+                    """
+                    SELECT ts_code, close FROM screen_result
+                    WHERE trade_date = ? AND preset_name = ?
+                    ORDER BY ts_code
+                    """,
+                    [trade_date, preset_name],
+                ).fetchall()
+                persisted_codes = [code for code, _ in persisted]
+                if (
+                    receipt.hit_count != len(persisted_codes)
+                    or receipt.member_digest != member_set_digest(persisted_codes)
+                ):
+                    raise ValueError("persisted screen members differ from receipt draft")
+                sealed = ScreenRunReceipt.model_validate(
+                    {
+                        **receipt.model_dump(mode="python"),
+                        "price_digest": member_price_digest(persisted),
+                    }
+                )
+            else:
+                sealed = receipt
+            self._upsert_screen_run_receipt(sealed)
+            if started:
+                self._conn.execute("COMMIT")
+                started = False
+        except Exception:
+            if started:
+                self._conn.execute("ROLLBACK")
+            raise
+        return len(codes)
+
+    def _upsert_screen_run_receipt(self, receipt: ScreenRunReceipt) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO screen_run_receipt (
+                trade_date, preset_name, definition_version, parent_trade_date,
+                parent_result_version, hit_count, member_digest, lineage_complete,
+                completed_at, result_version, contract, price_digest
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (trade_date, preset_name) DO UPDATE SET
+                definition_version = excluded.definition_version,
+                parent_trade_date = excluded.parent_trade_date,
+                parent_result_version = excluded.parent_result_version,
+                hit_count = excluded.hit_count,
+                member_digest = excluded.member_digest,
+                lineage_complete = excluded.lineage_complete,
+                completed_at = excluded.completed_at,
+                result_version = excluded.result_version,
+                contract = excluded.contract,
+                price_digest = excluded.price_digest
+            """,
+            [
+                receipt.trade_date,
+                receipt.preset_name,
+                receipt.definition_version,
+                receipt.parent_trade_date,
+                receipt.parent_result_version,
+                receipt.hit_count,
+                receipt.member_digest,
+                receipt.lineage_complete,
+                receipt.completed_at,
+                receipt.result_version,
+                receipt.contract,
+                receipt.price_digest,
+            ],
+        )
+
+    def query_screen_run_receipt(
+        self, trade_date: str, preset_name: str
+    ) -> ScreenRunReceipt | None:
+        columns = {
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info('screen_run_receipt')").fetchall()
+        }
+        price_columns = {"contract", "price_digest"}
+        if columns & price_columns and not price_columns <= columns:
+            raise ValueError("screen run receipt has incomplete price proof columns")
+        extra_select = ", contract, price_digest" if price_columns <= columns else ""
+        row = self._conn.execute(
+            f"""
+            SELECT trade_date, preset_name, definition_version, parent_trade_date,
+                   parent_result_version, hit_count, member_digest, lineage_complete,
+                   completed_at, result_version{extra_select}
+            FROM screen_run_receipt
+            WHERE trade_date = ? AND preset_name = ?
+            """,
+            [trade_date, preset_name],
+        ).fetchone()
+        if row is None:
+            return None
+        fields = (
+            "trade_date", "preset_name", "definition_version", "parent_trade_date",
+            "parent_result_version", "hit_count", "member_digest", "lineage_complete",
+            "completed_at", "result_version",
+        )
+        if price_columns <= columns:
+            fields += ("contract", "price_digest")
+        return ScreenRunReceipt.model_validate(dict(zip(fields, row, strict=True)))
 
     def query_screen_result(
         self, trade_date: str, preset_name: str

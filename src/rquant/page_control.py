@@ -18,14 +18,24 @@ from collections.abc import Callable, Mapping
 from contextlib import suppress
 from contextvars import ContextVar
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Literal, Protocol
+from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID, uuid4
 
-from pydantic import Field, JsonValue, TypeAdapter, field_validator
+from pydantic import (
+    Field,
+    JsonValue,
+    StrictBool,
+    StrictInt,
+    TypeAdapter,
+    field_validator,
+    model_validator,
+)
 
+from rquant.alert_price_rule import PriceAlertRule
 from rquant.canvas_publication_receipt import (
     CanvasPublicationCatalogRecord,
     CanvasPublicationCommand,
@@ -35,13 +45,35 @@ from rquant.canvas_publication_receipt import (
     CanvasPublicationSigner,
     build_canvas_publication_claims,
 )
+from rquant.data_audit_contracts import MAX_AUDIT_DAYS
 from rquant.lab_job_protocol import LabCommand
 from rquant.llm.schemas import RuleCall
+from rquant.manual_watchlist import (
+    ManualWatchlistDelete,
+    ManualWatchlistKey,
+    ManualWatchlistRepository,
+    ManualWatchlistUpsert,
+    OwnerId,
+    TsCode,
+    WatchlistCapacityError,
+    WatchlistVersionConflictError,
+)
+from rquant.price_alert_rule_store import (
+    PriceAlertRuleCapacityError,
+    PriceAlertRuleDelete,
+    PriceAlertRuleKey,
+    PriceAlertRuleRepository,
+    PriceAlertRuleScopeError,
+    PriceAlertRuleUpsert,
+    PriceAlertRuleVersionConflictError,
+    RuleId,
+)
 from rquant.runtime_contracts import (
     AwareUtcDatetime,
     RuntimeContractModel,
     canonical_sha256,
 )
+from rquant.screen.pool_ranking import PoolRankingPlan
 
 _SAFE_NAME = re.compile(r"^[\w\u4e00-\u9fff-]+$")
 _CANVAS_CATALOG_SCHEMA_VERSION = 1
@@ -55,6 +87,14 @@ DEFAULT_PAGE_CONTROL_SERVICE_ID = "rquant-page-control"
 _CONSUMER_MUTEX_SUFFIX = ".consumer.lock"
 _SAFE_EFFECT_JOURNAL_MARKER = "safe-effect-journal-v2"
 _SAFE_EFFECT_JOURNAL_VERSION = 2
+_MANUAL_WATCHLIST_MARKER = "manual-watchlist/v1"
+_MANUAL_WATCHLIST_VERSION = 1
+_MANUAL_WATCHLIST_KINDS = frozenset({"add_watchlist_item", "remove_watchlist_item"})
+_PRICE_RULE_MARKER = "price-alert-rule/v1"
+_PRICE_RULE_VERSION = 1
+_PRICE_RULE_KINDS = frozenset(
+    {"save_price_alert_rule", "set_price_alert_rule_enabled", "delete_price_alert_rule"}
+)
 _LOCAL_FILESYSTEM_FENCE_SCHEMA_VERSION = 1
 _CANVAS_HEAD_CONTRACT = "canvas-current-head/v1"
 _CANVAS_HEAD_SOURCE = "canvas_current_head"
@@ -75,12 +115,95 @@ class PageControlCommand(RuntimeContractModel):
     requested_at: AwareUtcDatetime
 
 
+class AckAlert(PageControlCommand):
+    kind: Literal["ack_alert"] = "ack_alert"
+    generation_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    alert_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    actor_id: str = Field(min_length=1, max_length=256)
+
+
+class AddWatchlistItem(PageControlCommand):
+    kind: Literal["add_watchlist_item"] = "add_watchlist_item"
+    item: ManualWatchlistUpsert
+
+
+class RemoveWatchlistItem(PageControlCommand):
+    kind: Literal["remove_watchlist_item"] = "remove_watchlist_item"
+    item: ManualWatchlistDelete
+
+
+class SavePriceAlertRule(PageControlCommand):
+    kind: Literal["save_price_alert_rule"] = "save_price_alert_rule"
+    ts_code: TsCode
+    membership_version: StrictInt = Field(ge=1)
+    expected_version: StrictInt | None = Field(default=None, ge=1)
+    rule: PriceAlertRule
+
+
+class SetPriceAlertRuleEnabled(PageControlCommand):
+    kind: Literal["set_price_alert_rule_enabled"] = "set_price_alert_rule_enabled"
+    rule_id: RuleId
+    expected_version: StrictInt = Field(ge=1)
+    enabled: StrictBool
+
+
+class DeletePriceAlertRule(PageControlCommand):
+    kind: Literal["delete_price_alert_rule"] = "delete_price_alert_rule"
+    rule_id: RuleId
+    expected_version: StrictInt = Field(ge=1)
+
+
+class _OwnedSavePriceAlertRule(SavePriceAlertRule):
+    owner_id: OwnerId
+
+
+class _OwnedSetPriceAlertRuleEnabled(SetPriceAlertRuleEnabled):
+    owner_id: OwnerId
+
+
+class _OwnedDeletePriceAlertRule(DeletePriceAlertRule):
+    owner_id: OwnerId
+
+
+PriceAlertRuleRequestValue = SavePriceAlertRule | SetPriceAlertRuleEnabled | DeletePriceAlertRule
+_OwnedPriceAlertRuleValue = (
+    _OwnedSavePriceAlertRule | _OwnedSetPriceAlertRuleEnabled | _OwnedDeletePriceAlertRule
+)
+
+
+def _owned_price_rule_command(
+    command: PriceAlertRuleRequestValue, *, authenticated_owner_id: str
+) -> _OwnedPriceAlertRuleValue:
+    if type(command) is SavePriceAlertRule:
+        model = _OwnedSavePriceAlertRule
+    elif type(command) is SetPriceAlertRuleEnabled:
+        model = _OwnedSetPriceAlertRuleEnabled
+    elif type(command) is DeletePriceAlertRule:
+        model = _OwnedDeletePriceAlertRule
+    else:
+        raise TypeError("trusted price rule submission requires an ownerless request")
+    return model.model_validate(
+        {**command.model_dump(mode="python"), "owner_id": authenticated_owner_id}
+    )
+
+
 class SaveCanvas(PageControlCommand):
     kind: Literal["save_canvas"] = "save_canvas"
     name: str
     description: str = ""
     pool_refs: tuple[str, ...] = ()
     source: str = "page_control"
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        return _validated_name(value, label="canvas name")
+
+
+class CreateCanvas(PageControlCommand):
+    kind: Literal["create_canvas"] = "create_canvas"
+    name: str = Field(min_length=1, max_length=80)
+    description: str = Field(default="", max_length=1_024)
 
     @field_validator("name")
     @classmethod
@@ -109,6 +232,26 @@ class SetCanvasPoolRefs(PageControlCommand):
         return _validated_name(value, label="canvas name")
 
 
+class AddPoolToCanvas(PageControlCommand):
+    kind: Literal["add_pool_to_canvas"] = "add_pool_to_canvas"
+    canvas_name: str
+    pool_name: str
+    expected_pool_version: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @field_validator("canvas_name")
+    @classmethod
+    def validate_canvas_name(cls, value: str) -> str:
+        return _validated_name(value, label="canvas name")
+
+    @field_validator("pool_name")
+    @classmethod
+    def validate_pool_name(cls, value: str) -> str:
+        if not value.startswith("user/"):
+            raise ValueError("only user pools may be added by this command")
+        _validated_name(value.removeprefix("user/"), label="pool name")
+        return value
+
+
 class SaveUserPool(PageControlCommand):
     kind: Literal["save_user_pool"] = "save_user_pool"
     base_name: str
@@ -127,6 +270,55 @@ class SaveUserPool(PageControlCommand):
     @classmethod
     def validate_canvas_name(cls, value: str | None) -> str | None:
         return None if value is None else _validated_name(value, label="canvas name")
+
+
+class SaveUserPoolV2(PageControlCommand):
+    kind: Literal["save_user_pool_v2"] = "save_user_pool_v2"
+    base_name: str
+    display_name: str = Field(min_length=1, max_length=80)
+    description: str = ""
+    rule_calls: tuple[RuleCall, ...] = ()
+    include_columns: tuple[str, ...] = ()
+    depends_on: str | None = None
+    delay_days: int = 0
+    expected_version: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+    @field_validator("base_name")
+    @classmethod
+    def validate_base_name(cls, value: str) -> str:
+        return _validated_name(value, label="user pool name")
+
+
+class SaveUserPoolV3(PageControlCommand):
+    kind: Literal["save_user_pool_v3"] = "save_user_pool_v3"
+    base_name: str
+    display_name: str = Field(min_length=1, max_length=80)
+    description: str = ""
+    rule_calls: tuple[RuleCall, ...] = Field(default=(), max_length=26)
+    include_columns: tuple[str, ...] = Field(default=(), max_length=26)
+    depends_on: str | None = None
+    delay_days: int = 0
+    expected_version: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    ranking: PoolRankingPlan | None
+
+    @field_validator("base_name")
+    @classmethod
+    def validate_base_name(cls, value: str) -> str:
+        return _validated_name(value, label="user pool name")
+
+
+class SaveFormulaPoolV1(PageControlCommand):
+    kind: Literal["save_formula_pool_v1"] = "save_formula_pool_v1"
+    base_name: str = Field(min_length=1, max_length=80)
+    display_name: str = Field(min_length=1, max_length=80)
+    task_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    actor_id: str = Field(min_length=1, max_length=256)
+    expected_version: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+    @field_validator("base_name")
+    @classmethod
+    def validate_base_name(cls, value: str) -> str:
+        return _validated_name(value, label="formula pool name")
 
 
 class DeleteUserPool(PageControlCommand):
@@ -190,6 +382,41 @@ class SubmitLabCommand(PageControlCommand):
     interaction_key: str | None = Field(default=None, min_length=1, max_length=256)
 
 
+class SubmitBackfillPlan(PageControlCommand):
+    kind: Literal["submit_backfill_plan"] = "submit_backfill_plan"
+    actor_id: str = Field(min_length=1, max_length=256)
+    audit_start: date
+    completed_through: date
+
+    @model_validator(mode="after")
+    def validate_range(self) -> SubmitBackfillPlan:
+        days = (self.completed_through - self.audit_start).days + 1
+        if days < 1 or days > MAX_AUDIT_DAYS:
+            raise ValueError(f"backfill plan audit range must contain 1 to {MAX_AUDIT_DAYS} days")
+        return self
+
+
+class SubmitDataAuditReport(PageControlCommand):
+    kind: Literal["submit_data_audit_report"] = "submit_data_audit_report"
+    actor_id: str = Field(min_length=1, max_length=256)
+    audit_start: date
+    observed_through: date
+
+    @model_validator(mode="after")
+    def validate_range(self) -> SubmitDataAuditReport:
+        days = (self.observed_through - self.audit_start).days + 1
+        if days < 1 or days > MAX_AUDIT_DAYS:
+            raise ValueError(f"data audit report range must contain 1 to {MAX_AUDIT_DAYS} days")
+        return self
+
+
+class SubmitFormulaMarketRun(PageControlCommand):
+    kind: Literal["submit_formula_market_run"] = "submit_formula_market_run"
+    actor_id: str = Field(min_length=1, max_length=256)
+    formula: str = Field(min_length=1, max_length=4096)
+    trade_date: date
+
+
 class ExportLabArtifactZip(PageControlCommand):
     kind: Literal["export_lab_artifact_zip"] = "export_lab_artifact_zip"
     job_id: UUID
@@ -225,17 +452,55 @@ class LabPageControlBackend(Protocol):
     def discard_zip(self, command: DiscardLabArtifactZip) -> JsonValue: ...
 
 
+class BackfillPlanPageControlBackend(Protocol):
+    def submit(self, command: SubmitBackfillPlan) -> JsonValue: ...
+
+    def recover(self, command: SubmitBackfillPlan) -> JsonValue | None: ...
+
+
+class DataAuditReportPageControlBackend(Protocol):
+    def submit(self, command: SubmitDataAuditReport) -> JsonValue: ...
+
+    def recover(self, command: SubmitDataAuditReport) -> JsonValue | None: ...
+
+
+class FormulaMarketPageControlBackend(Protocol):
+    def submit(self, command: SubmitFormulaMarketRun) -> JsonValue: ...
+
+    def recover(self, command: SubmitFormulaMarketRun) -> JsonValue | None: ...
+
+
+class FormulaPoolPageControlBackend(Protocol):
+    def submit(self, command: SaveFormulaPoolV1) -> JsonValue: ...
+
+    def recover(self, command: SaveFormulaPoolV1) -> JsonValue | None: ...
+
+
 PageControlCommandValue = Annotated[
-    SaveCanvas
+    AckAlert
+    | AddWatchlistItem
+    | RemoveWatchlistItem
+    | _OwnedSavePriceAlertRule
+    | _OwnedSetPriceAlertRuleEnabled
+    | _OwnedDeletePriceAlertRule
+    | SaveCanvas
+    | CreateCanvas
     | DeleteCanvas
     | SetCanvasPoolRefs
+    | AddPoolToCanvas
     | SaveUserPool
+    | SaveUserPoolV2
+    | SaveUserPoolV3
+    | SaveFormulaPoolV1
     | DeleteUserPool
     | ForkBuiltinPool
     | SaveNlPreset
     | AppendNlQueryLog
     | InitializeLabExports
     | SubmitLabCommand
+    | SubmitBackfillPlan
+    | SubmitDataAuditReport
+    | SubmitFormulaMarketRun
     | ExportLabArtifactZip
     | DiscardLabArtifactZip,
     Field(discriminator="kind"),
@@ -249,6 +514,10 @@ class PageControlStatus(StrEnum):
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     AMBIGUOUS = "ambiguous"
+
+
+class PageControlCommandConflictError(ValueError):
+    """A command ID already binds a different durable command payload."""
 
 
 class PageControlEffectStatus(StrEnum):
@@ -283,6 +552,14 @@ class PageControlReceipt(RuntimeContractModel):
     error: str | None = None
 
 
+class AlertAcknowledgment(RuntimeContractModel):
+    alert_id: str
+    confirmation_id: str
+    actor_id: str
+    confirmed_at: AwareUtcDatetime
+    generation_id: str
+
+
 class PageControlCommandAudit(RuntimeContractModel):
     command_id: str
     command_kind: str
@@ -315,8 +592,8 @@ class _ExecutionOutcome:
     error: str | None = None
 
 
-class _RetryableCommittedLocalEffectError(RuntimeError):
-    """A journaled local mutation needs recovery before it can be terminalized."""
+class _RetryableUncertainEffectError(RuntimeError):
+    """A durable effect may have committed; retry its recovery before finalizing."""
 
 
 @dataclass(frozen=True)
@@ -546,6 +823,17 @@ class PageControlOutbox:
                     protocol_version INTEGER NOT NULL,
                     activated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS page_control_alert_activation (
+                    marker_name TEXT PRIMARY KEY CHECK(marker_name = 'alert_ack'),
+                    activated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS page_control_alert_ack (
+                    alert_id TEXT PRIMARY KEY,
+                    confirmation_id TEXT NOT NULL UNIQUE,
+                    actor_id TEXT NOT NULL,
+                    confirmed_at TEXT NOT NULL,
+                    generation_id TEXT NOT NULL
+                );
                 """
             )
             self._ensure_column(connection, "processing_owner", "TEXT")
@@ -650,17 +938,96 @@ class PageControlOutbox:
         return connection
 
     def enqueue(self, command: PageControlCommandValue) -> PageControlReceipt:
+        if isinstance(command, AckAlert):
+            raise ValueError("ack_alert requires verified Serving eligibility")
+        if isinstance(command, (AddWatchlistItem, RemoveWatchlistItem)):
+            raise ValueError("watchlist commands require trusted submission")
+        if isinstance(
+            command, (SavePriceAlertRule, SetPriceAlertRuleEnabled, DeletePriceAlertRule)
+        ):
+            raise ValueError("price rule commands require trusted submission")
+        return self._enqueue(command)
+
+    def enqueue_verified_ack(self, command: AckAlert) -> PageControlReceipt:
+        """Internal admission point for a future verified Serving event lookup."""
+        if self.alert_ack_activated_at() is None:
+            raise ValueError("alert acknowledgment is not activated")
+        return self._enqueue(command)
+
+    def enqueue_trusted_watchlist(
+        self, command: AddWatchlistItem | RemoveWatchlistItem
+    ) -> PageControlReceipt:
+        if not isinstance(command, (AddWatchlistItem, RemoveWatchlistItem)):
+            raise TypeError("trusted watchlist submission requires a watchlist command")
+        return self._enqueue(command, require_watchlist_activation=True)
+
+    def enqueue_trusted_price_rule(self, command: _OwnedPriceAlertRuleValue) -> PageControlReceipt:
+        if not isinstance(
+            command,
+            (_OwnedSavePriceAlertRule, _OwnedSetPriceAlertRuleEnabled, _OwnedDeletePriceAlertRule),
+        ):
+            raise TypeError("trusted price rule submission requires an owned command")
+        return self._enqueue(command, require_price_rule_activation=True)
+
+    def _enqueue(
+        self,
+        command: PageControlCommandValue,
+        *,
+        require_watchlist_activation: bool = False,
+        require_price_rule_activation: bool = False,
+    ) -> PageControlReceipt:
+        if (
+            isinstance(command, (AddWatchlistItem, RemoveWatchlistItem))
+            != require_watchlist_activation
+        ):
+            raise ValueError("watchlist commands require trusted submission")
+        is_price_rule = isinstance(
+            command, (SavePriceAlertRule, SetPriceAlertRuleEnabled, DeletePriceAlertRule)
+        )
+        is_owned_price_rule = isinstance(
+            command,
+            (_OwnedSavePriceAlertRule, _OwnedSetPriceAlertRuleEnabled, _OwnedDeletePriceAlertRule),
+        )
+        if is_price_rule != require_price_rule_activation or (
+            require_price_rule_activation and not is_owned_price_rule
+        ):
+            raise ValueError("price rule commands require trusted submission")
         payload = command.model_dump_json()
         command_hash = _command_hash(command)
         enqueued_at = command.requested_at.isoformat(timespec="microseconds")
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if require_watchlist_activation and not self._manual_watchlist_activated(connection):
+                raise ValueError("manual watchlist is not activated")
+            if require_price_rule_activation:
+                assert isinstance(
+                    command,
+                    (
+                        _OwnedSavePriceAlertRule,
+                        _OwnedSetPriceAlertRuleEnabled,
+                        _OwnedDeletePriceAlertRule,
+                    ),
+                )
+                self._require_price_rule_activation(connection, command.owner_id)
             existing = connection.execute(
                 "SELECT * FROM page_control_command WHERE command_id = ?",
                 (command.command_id,),
             ).fetchone()
             if existing is not None:
                 if existing["command_hash"] != command_hash:
-                    raise ValueError("command_id already exists with different payload")
+                    raise PageControlCommandConflictError(
+                        "command_id already exists with different payload"
+                    )
+                if require_price_rule_activation:
+                    stored = _COMMAND_ADAPTER.validate_json(existing["payload_json"])
+                    if (
+                        stored != command
+                        or existing["command_kind"] != command.kind
+                        or _command_hash(stored) != command_hash
+                    ):
+                        raise PageControlCommandConflictError(
+                            "command_id already exists with different payload"
+                        )
                 return self._receipt(existing)
             connection.execute(
                 """
@@ -681,6 +1048,615 @@ class PageControlOutbox:
         receipt = self.receipt(command.command_id)
         assert receipt is not None
         return receipt
+
+    @staticmethod
+    def _manual_watchlist_activated(connection: sqlite3.Connection) -> bool:
+        marker = connection.execute(
+            "SELECT protocol_version FROM page_control_protocol_activation WHERE marker_name = ?",
+            (_MANUAL_WATCHLIST_MARKER,),
+        ).fetchone()
+        return marker is not None and marker["protocol_version"] == _MANUAL_WATCHLIST_VERSION
+
+    @staticmethod
+    def _require_price_rule_activation(connection: sqlite3.Connection, owner_id: str) -> None:
+        marker = connection.execute(
+            "SELECT protocol_version, activated_at FROM page_control_protocol_activation "
+            "WHERE marker_name = ?",
+            (_PRICE_RULE_MARKER,),
+        ).fetchone()
+        if marker is None or marker["protocol_version"] != _PRICE_RULE_VERSION:
+            raise ValueError("price rule protocol is not activated")
+        raw_time = marker["activated_at"]
+        if not isinstance(raw_time, str):
+            raise ValueError("price rule activation marker is malformed")
+        try:
+            canonical_time = _normalize_utc(datetime.fromisoformat(raw_time)).isoformat(
+                timespec="microseconds"
+            )
+        except ValueError as exc:
+            raise ValueError("price rule activation marker is malformed") from exc
+        if canonical_time != raw_time:
+            raise ValueError("price rule activation marker is malformed")
+        PriceAlertRuleRepository(connection).list_current(owner_id)
+
+    def activate_price_alert_rules(self, activated_at: datetime) -> datetime:
+        frozen = _normalize_utc(activated_at).isoformat(timespec="microseconds")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT protocol_version, activated_at FROM page_control_protocol_activation "
+                "WHERE marker_name = ?",
+                (_PRICE_RULE_MARKER,),
+            ).fetchone()
+            if existing is None:
+                PriceAlertRuleRepository(connection).install_schema()
+                connection.execute(
+                    "INSERT INTO page_control_protocol_activation "
+                    "(marker_name, protocol_version, activated_at) VALUES (?, ?, ?)",
+                    (_PRICE_RULE_MARKER, _PRICE_RULE_VERSION, frozen),
+                )
+            elif (
+                existing["protocol_version"] != _PRICE_RULE_VERSION
+                or existing["activated_at"] != frozen
+            ):
+                raise ValueError("price rule protocol was already activated differently")
+            else:
+                self._require_price_rule_activation(connection, "__price_rule_schema_probe__")
+        return datetime.fromisoformat(frozen)
+
+    def price_alert_rules_activated_at(self) -> datetime | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT protocol_version, activated_at FROM page_control_protocol_activation "
+                "WHERE marker_name = ?",
+                (_PRICE_RULE_MARKER,),
+            ).fetchone()
+        if row is None:
+            return None
+        if row["protocol_version"] != _PRICE_RULE_VERSION:
+            raise RuntimeError("price rule protocol version is unsupported")
+        return datetime.fromisoformat(row["activated_at"])
+
+    def activate_manual_watchlist(self, activated_at: datetime) -> datetime:
+        frozen = _normalize_utc(activated_at).isoformat(timespec="microseconds")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT protocol_version, activated_at FROM page_control_protocol_activation "
+                "WHERE marker_name = ?",
+                (_MANUAL_WATCHLIST_MARKER,),
+            ).fetchone()
+            if existing is None:
+                ManualWatchlistRepository(connection).install_schema()
+                connection.execute(
+                    "INSERT INTO page_control_protocol_activation "
+                    "(marker_name, protocol_version, activated_at) VALUES (?, ?, ?)",
+                    (_MANUAL_WATCHLIST_MARKER, _MANUAL_WATCHLIST_VERSION, frozen),
+                )
+            elif (
+                existing["protocol_version"] != _MANUAL_WATCHLIST_VERSION
+                or existing["activated_at"] != frozen
+            ):
+                raise ValueError("manual watchlist was already activated differently")
+            elif (
+                connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'manual_watchlist'"
+                ).fetchone()
+                is None
+            ):
+                raise RuntimeError("manual watchlist activation exists without its state table")
+        return datetime.fromisoformat(frozen)
+
+    def manual_watchlist_activated_at(self) -> datetime | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT protocol_version, activated_at FROM page_control_protocol_activation "
+                "WHERE marker_name = ?",
+                (_MANUAL_WATCHLIST_MARKER,),
+            ).fetchone()
+        if row is None:
+            return None
+        if row["protocol_version"] != _MANUAL_WATCHLIST_VERSION:
+            raise RuntimeError("manual watchlist activation version is unsupported")
+        return datetime.fromisoformat(row["activated_at"])
+
+    def activate_alert_ack(self, activated_at: datetime) -> datetime:
+        frozen = _normalize_utc(activated_at).isoformat(timespec="microseconds")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT activated_at FROM page_control_alert_activation "
+                "WHERE marker_name = 'alert_ack'"
+            ).fetchone()
+            if existing is None:
+                connection.execute(
+                    "INSERT INTO page_control_alert_activation(marker_name, activated_at) "
+                    "VALUES ('alert_ack', ?)",
+                    (frozen,),
+                )
+            elif existing["activated_at"] != frozen:
+                raise ValueError("alert acknowledgment was already activated at another time")
+        return datetime.fromisoformat(frozen)
+
+    def alert_ack_activated_at(self) -> datetime | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT activated_at FROM page_control_alert_activation "
+                "WHERE marker_name = 'alert_ack'"
+            ).fetchone()
+        return None if row is None else datetime.fromisoformat(row["activated_at"])
+
+    def lookup_ack_command(self, command: AckAlert) -> PageControlReceipt | None:
+        """Read-only exact retry lookup, safe across Serving generation changes."""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM page_control_command WHERE command_id = ?",
+                (command.command_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        if row["command_kind"] != command.kind or row["command_hash"] != _command_hash(command):
+            raise ValueError("command_id already exists with different payload")
+        stored = _COMMAND_ADAPTER.validate_json(row["payload_json"])
+        if not isinstance(stored, AckAlert) or _command_hash(stored) != row["command_hash"]:
+            raise ValueError("stored acknowledgment command conflicts with its hash")
+        return self._receipt(row)
+
+    def lookup_price_rule_command(
+        self, command: _OwnedPriceAlertRuleValue
+    ) -> PageControlReceipt | None:
+        """Read-only lookup of one exact persisted owner-bound rule request."""
+        if not isinstance(
+            command,
+            (_OwnedSavePriceAlertRule, _OwnedSetPriceAlertRuleEnabled, _OwnedDeletePriceAlertRule),
+        ):
+            raise TypeError("price rule lookup requires an owned command")
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM page_control_command WHERE command_id = ?",
+                (command.command_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        if row["command_kind"] != command.kind or row["command_hash"] != _command_hash(command):
+            raise PageControlCommandConflictError(
+                "command_id already exists with different payload"
+            )
+        stored = _COMMAND_ADAPTER.validate_json(row["payload_json"])
+        if stored != command or _command_hash(stored) != row["command_hash"]:
+            raise PageControlCommandConflictError(
+                "stored price rule command conflicts with its hash"
+            )
+        return self._receipt(row)
+
+    def acknowledgment(self, alert_id: str) -> AlertAcknowledgment | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM page_control_alert_ack WHERE alert_id = ?",
+                (alert_id,),
+            ).fetchone()
+        return None if row is None else self._acknowledgment(row)
+
+    def complete_ack(self, claim: PageControlClaim) -> PageControlReceipt:
+        """Commit first confirmation, effect, and terminal receipt in one SQLite transaction."""
+        command = claim.command
+        if not isinstance(command, AckAlert):
+            raise TypeError("complete_ack requires an ack_alert claim")
+        command_hash = _command_hash(command)
+        confirmed_at = datetime.now(UTC).isoformat(timespec="microseconds")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM page_control_command WHERE command_id = ?",
+                (command.command_id,),
+            ).fetchone()
+            if (
+                row is None
+                or row["command_kind"] != command.kind
+                or row["command_hash"] != command_hash
+            ):
+                raise ValueError("acknowledgment command content changed")
+            if (
+                row["status"] != PageControlStatus.PROCESSING.value
+                or row["processing_owner"] != claim.owner_id
+                or row["claim_token"] != claim.claim_token
+            ):
+                raise RuntimeError("stale acknowledgment claim cannot complete")
+            if (
+                connection.execute(
+                    "SELECT 1 FROM page_control_alert_activation WHERE marker_name = 'alert_ack'"
+                ).fetchone()
+                is None
+            ):
+                raise ValueError("alert acknowledgment is not activated")
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO page_control_alert_ack(
+                    alert_id, confirmation_id, actor_id, confirmed_at, generation_id
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    command.alert_id,
+                    command.command_id,
+                    command.actor_id,
+                    confirmed_at,
+                    command.generation_id,
+                ),
+            )
+            acknowledgment = connection.execute(
+                "SELECT * FROM page_control_alert_ack WHERE alert_id = ?",
+                (command.alert_id,),
+            ).fetchone()
+            assert acknowledgment is not None
+            result: JsonValue = {
+                "alert_id": command.alert_id,
+                "confirmation_id": acknowledgment["confirmation_id"],
+                "confirmed_by": acknowledgment["actor_id"],
+                "confirmed_at": acknowledgment["confirmed_at"],
+            }
+            result_json = json.dumps(result, ensure_ascii=True)
+            connection.execute(
+                """
+                INSERT INTO page_control_effect(
+                    command_id, command_hash, effect_kind, status,
+                    owner_id, claim_token, started_at, completed_at, result_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    command.command_id,
+                    command_hash,
+                    command.kind,
+                    PageControlEffectStatus.SUCCEEDED.value,
+                    claim.owner_id,
+                    claim.claim_token,
+                    confirmed_at,
+                    confirmed_at,
+                    result_json,
+                ),
+            )
+            changed = connection.execute(
+                """
+                UPDATE page_control_command
+                SET status = ?, completed_at = ?, result_json = ?, error = NULL,
+                    processing_owner = NULL, lease_expires_at = NULL, claim_token = NULL
+                WHERE command_id = ? AND status = ? AND processing_owner = ? AND claim_token = ?
+                """,
+                (
+                    PageControlStatus.SUCCEEDED.value,
+                    confirmed_at,
+                    result_json,
+                    command.command_id,
+                    PageControlStatus.PROCESSING.value,
+                    claim.owner_id,
+                    claim.claim_token,
+                ),
+            ).rowcount
+            if changed != 1:
+                raise RuntimeError("acknowledgment claim changed during completion")
+            completed = connection.execute(
+                "SELECT * FROM page_control_command WHERE command_id = ?",
+                (command.command_id,),
+            ).fetchone()
+            assert completed is not None
+        return self._receipt(completed)
+
+    def complete_watchlist(self, claim: PageControlClaim, *, now: datetime) -> PageControlReceipt:
+        """Commit a watchlist CAS, effect, and terminal receipt in one transaction."""
+        command = claim.command
+        if not isinstance(command, (AddWatchlistItem, RemoveWatchlistItem)):
+            raise TypeError("complete_watchlist requires a watchlist claim")
+        observed = _normalize_utc(now)
+        completed_at = observed.isoformat(timespec="microseconds")
+        command_hash = _command_hash(command)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM page_control_command WHERE command_id = ?",
+                (command.command_id,),
+            ).fetchone()
+            if (
+                row is None
+                or row["command_kind"] != command.kind
+                or row["command_hash"] != command_hash
+            ):
+                raise ValueError("watchlist command content changed")
+            stored = _COMMAND_ADAPTER.validate_json(row["payload_json"])
+            if stored != command or _command_hash(stored) != command_hash:
+                raise ValueError("stored watchlist command conflicts with its hash")
+            if (
+                row["status"] != PageControlStatus.PROCESSING.value
+                or row["processing_owner"] != claim.owner_id
+                or row["claim_token"] != claim.claim_token
+                or row["lease_expires_at"] is None
+                or row["lease_expires_at"] <= completed_at
+            ):
+                raise RuntimeError("stale or expired watchlist claim cannot complete")
+            if not self._manual_watchlist_activated(connection):
+                raise ValueError("manual watchlist is not activated")
+
+            action: Literal["add", "remove"] = (
+                "add" if isinstance(command, AddWatchlistItem) else "remove"
+            )
+            error: str | None = None
+            status = PageControlStatus.SUCCEEDED
+            if command.requested_at > observed + _MAX_REQUEST_FUTURE_SKEW:
+                status = PageControlStatus.FAILED
+                error = "watchlist command requested_at exceeds allowed future clock skew"
+                result: JsonValue = {
+                    "ts_code": command.item.ts_code,
+                    "action": action,
+                    "code": "future_request",
+                }
+            else:
+                repository = ManualWatchlistRepository(connection)
+                try:
+                    entry = (
+                        repository.upsert(command.item, now=observed)
+                        if isinstance(command, AddWatchlistItem)
+                        else repository.delete(command.item, now=observed)
+                    )
+                except WatchlistVersionConflictError:
+                    status = PageControlStatus.FAILED
+                    error = "watchlist version conflict"
+                    result = {
+                        "ts_code": command.item.ts_code,
+                        "action": action,
+                        "code": "version_conflict",
+                    }
+                except WatchlistCapacityError:
+                    status = PageControlStatus.FAILED
+                    error = "watchlist capacity exceeded"
+                    result = {
+                        "ts_code": command.item.ts_code,
+                        "action": action,
+                        "code": "capacity_exceeded",
+                    }
+                else:
+                    result = {
+                        "ts_code": entry.ts_code,
+                        "action": action,
+                        "version": entry.version,
+                        "state": entry.status,
+                    }
+            result_json = json.dumps(result, ensure_ascii=True)
+            connection.execute(
+                """
+                INSERT INTO page_control_effect(
+                    command_id, command_hash, effect_kind, status,
+                    owner_id, claim_token, started_at, completed_at, result_json, error
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    command.command_id,
+                    command_hash,
+                    command.kind,
+                    (
+                        PageControlEffectStatus.SUCCEEDED.value
+                        if status is PageControlStatus.SUCCEEDED
+                        else PageControlEffectStatus.FAILED.value
+                    ),
+                    claim.owner_id,
+                    claim.claim_token,
+                    completed_at,
+                    completed_at,
+                    result_json,
+                    error,
+                ),
+            )
+            changed = connection.execute(
+                """
+                UPDATE page_control_command
+                SET status = ?, completed_at = ?, result_json = ?, error = ?,
+                    processing_owner = NULL, lease_expires_at = NULL, claim_token = NULL
+                WHERE command_id = ? AND status = ? AND processing_owner = ?
+                  AND claim_token = ? AND lease_expires_at > ?
+                """,
+                (
+                    status.value,
+                    completed_at,
+                    result_json,
+                    error,
+                    command.command_id,
+                    PageControlStatus.PROCESSING.value,
+                    claim.owner_id,
+                    claim.claim_token,
+                    completed_at,
+                ),
+            ).rowcount
+            if changed != 1:
+                raise RuntimeError("watchlist claim changed during completion")
+            completed = connection.execute(
+                "SELECT * FROM page_control_command WHERE command_id = ?",
+                (command.command_id,),
+            ).fetchone()
+            assert completed is not None
+        return self._receipt(completed)
+
+    def complete_price_rule(self, claim: PageControlClaim, *, now: datetime) -> PageControlReceipt:
+        """Commit rule CAS, effect, and terminal receipt in one SQLite transaction."""
+        command = claim.command
+        if not isinstance(
+            command,
+            (_OwnedSavePriceAlertRule, _OwnedSetPriceAlertRuleEnabled, _OwnedDeletePriceAlertRule),
+        ):
+            raise TypeError("complete_price_rule requires an owned price rule claim")
+        observed = _normalize_utc(now)
+        completed_at = observed.isoformat(timespec="microseconds")
+        command_hash = _command_hash(command)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM page_control_command WHERE command_id = ?",
+                (command.command_id,),
+            ).fetchone()
+            if (
+                row is None
+                or row["command_kind"] != command.kind
+                or row["command_hash"] != command_hash
+            ):
+                raise ValueError("price rule command content changed")
+            stored = _COMMAND_ADAPTER.validate_json(row["payload_json"])
+            if stored != command or _command_hash(stored) != command_hash:
+                raise ValueError("stored price rule command conflicts with its hash")
+            if (
+                row["status"] != PageControlStatus.PROCESSING.value
+                or row["processing_owner"] != claim.owner_id
+                or row["claim_token"] != claim.claim_token
+                or row["lease_expires_at"] is None
+                or row["lease_expires_at"] <= completed_at
+            ):
+                raise RuntimeError("stale or expired price rule claim cannot complete")
+            self._require_price_rule_activation(connection, command.owner_id)
+
+            action = (
+                "save"
+                if isinstance(command, _OwnedSavePriceAlertRule)
+                else "set_enabled"
+                if isinstance(command, _OwnedSetPriceAlertRuleEnabled)
+                else "delete"
+            )
+            rule_id = (
+                command.rule.rule_id
+                if isinstance(command, _OwnedSavePriceAlertRule)
+                else command.rule_id
+            )
+            error: str | None = None
+            status = PageControlStatus.SUCCEEDED
+            if command.requested_at > observed + _MAX_REQUEST_FUTURE_SKEW:
+                status = PageControlStatus.FAILED
+                error = "price rule command requested_at exceeds allowed future clock skew"
+                result: JsonValue = {"rule_id": rule_id, "action": action, "code": "future_request"}
+            else:
+                repository = PriceAlertRuleRepository(connection)
+                try:
+                    if isinstance(command, _OwnedSavePriceAlertRule):
+                        entry = repository.upsert(
+                            PriceAlertRuleUpsert(
+                                owner_id=command.owner_id,
+                                ts_code=command.ts_code,
+                                membership_version=command.membership_version,
+                                expected_version=command.expected_version,
+                                rule=command.rule,
+                            ),
+                            now=observed,
+                        )
+                    elif isinstance(command, _OwnedSetPriceAlertRuleEnabled):
+                        current = repository.get(
+                            PriceAlertRuleKey(owner_id=command.owner_id, rule_id=command.rule_id)
+                        )
+                        if (
+                            current is None
+                            or current.deleted
+                            or current.version != command.expected_version
+                        ):
+                            raise PriceAlertRuleVersionConflictError(
+                                "price rule version does not match"
+                            )
+                        assert current.rule is not None
+                        assert current.ts_code is not None
+                        assert current.membership_version is not None
+                        entry = repository.upsert(
+                            PriceAlertRuleUpsert(
+                                owner_id=command.owner_id,
+                                ts_code=current.ts_code,
+                                membership_version=current.membership_version,
+                                expected_version=command.expected_version,
+                                rule=current.rule.model_copy(update={"enabled": command.enabled}),
+                            ),
+                            now=observed,
+                        )
+                    else:
+                        entry = repository.delete(
+                            PriceAlertRuleDelete(
+                                owner_id=command.owner_id,
+                                rule_id=command.rule_id,
+                                expected_version=command.expected_version,
+                            ),
+                            now=observed,
+                        )
+                except PriceAlertRuleVersionConflictError:
+                    status = PageControlStatus.FAILED
+                    error = "price rule version conflict"
+                    result = {"rule_id": rule_id, "action": action, "code": "version_conflict"}
+                except PriceAlertRuleScopeError:
+                    status = PageControlStatus.FAILED
+                    error = "price rule scope is invalid"
+                    result = {"rule_id": rule_id, "action": action, "code": "scope_invalid"}
+                except PriceAlertRuleCapacityError:
+                    status = PageControlStatus.FAILED
+                    error = "price rule capacity exceeded"
+                    result = {"rule_id": rule_id, "action": action, "code": "capacity_exceeded"}
+                else:
+                    result = {
+                        "rule_id": entry.rule_id,
+                        "action": action,
+                        "version": entry.version,
+                        "deleted": entry.deleted,
+                        "enabled": None if entry.rule is None else entry.rule.enabled,
+                    }
+            result_json = json.dumps(result, ensure_ascii=True)
+            connection.execute(
+                """
+                INSERT INTO page_control_effect(
+                    command_id, command_hash, effect_kind, status,
+                    owner_id, claim_token, started_at, completed_at, result_json, error
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    command.command_id,
+                    command_hash,
+                    command.kind,
+                    (
+                        PageControlEffectStatus.SUCCEEDED.value
+                        if status is PageControlStatus.SUCCEEDED
+                        else PageControlEffectStatus.FAILED.value
+                    ),
+                    claim.owner_id,
+                    claim.claim_token,
+                    completed_at,
+                    completed_at,
+                    result_json,
+                    error,
+                ),
+            )
+            changed = connection.execute(
+                """
+                UPDATE page_control_command
+                SET status = ?, completed_at = ?, result_json = ?, error = ?,
+                    processing_owner = NULL, lease_expires_at = NULL, claim_token = NULL
+                WHERE command_id = ? AND status = ? AND processing_owner = ?
+                  AND claim_token = ? AND lease_expires_at > ?
+                """,
+                (
+                    status.value,
+                    completed_at,
+                    result_json,
+                    error,
+                    command.command_id,
+                    PageControlStatus.PROCESSING.value,
+                    claim.owner_id,
+                    claim.claim_token,
+                    completed_at,
+                ),
+            ).rowcount
+            if changed != 1:
+                raise RuntimeError("price rule claim changed during completion")
+            completed = connection.execute(
+                "SELECT * FROM page_control_command WHERE command_id = ?",
+                (command.command_id,),
+            ).fetchone()
+            assert completed is not None
+        return self._receipt(completed)
+
+    @staticmethod
+    def _acknowledgment(row: sqlite3.Row) -> AlertAcknowledgment:
+        return AlertAcknowledgment(
+            alert_id=row["alert_id"],
+            confirmation_id=row["confirmation_id"],
+            actor_id=row["actor_id"],
+            confirmed_at=datetime.fromisoformat(row["confirmed_at"]),
+            generation_id=row["generation_id"],
+        )
 
     def claim(
         self,
@@ -707,6 +1683,7 @@ class PageControlOutbox:
         owner_id: str = "page-control-consumer",
         lease_seconds: int = _DEFAULT_LEASE_SECONDS,
         now: datetime | None = None,
+        target_command_id: str | None = None,
     ) -> tuple[PageControlClaim, ...]:
         if not 1 <= limit <= 100:
             raise ValueError("limit must be between 1 and 100")
@@ -723,23 +1700,58 @@ class PageControlOutbox:
             connection.execute("BEGIN IMMEDIATE")
             rows = connection.execute(
                 """
-                SELECT command_id, payload_json
+                SELECT command_id, command_kind, command_hash, payload_json
                 FROM page_control_command
-                WHERE status = ?
-                   OR (status = ? AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?)
+                WHERE (status = ?
+                   OR (status = ? AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?))
+                  AND (? IS NULL OR command_id = ?)
                 ORDER BY CASE status WHEN ? THEN 0 ELSE 1 END, enqueued_at, rowid
-                LIMIT ?
                 """,
                 (
                     PageControlStatus.PENDING.value,
                     PageControlStatus.PROCESSING.value,
                     observed_at,
+                    target_command_id,
+                    target_command_id,
                     PageControlStatus.PENDING.value,
-                    limit,
                 ),
-            ).fetchall()
+            )
+            eligible: list[sqlite3.Row] = []
+            try:
+                for row in rows:
+                    try:
+                        parsed_command = _COMMAND_ADAPTER.validate_json(row["payload_json"])
+                    except ValueError:
+                        if row["command_kind"] in _PRICE_RULE_KINDS:
+                            continue
+                        raise
+                    if isinstance(
+                        parsed_command,
+                        (
+                            _OwnedSavePriceAlertRule,
+                            _OwnedSetPriceAlertRuleEnabled,
+                            _OwnedDeletePriceAlertRule,
+                        ),
+                    ):
+                        try:
+                            if (
+                                parsed_command.kind != row["command_kind"]
+                                or parsed_command.command_id != row["command_id"]
+                                or _command_hash(parsed_command) != row["command_hash"]
+                            ):
+                                continue
+                            self._require_price_rule_activation(connection, parsed_command.owner_id)
+                        except (ValueError, RuntimeError, sqlite3.Error):
+                            continue
+                    elif row["command_kind"] in _PRICE_RULE_KINDS:
+                        continue
+                    eligible.append(row)
+                    if len(eligible) == limit:
+                        break
+            finally:
+                rows.close()
             claims: list[PageControlClaim] = []
-            for row in rows:
+            for row in eligible:
                 claim_token = uuid4().hex
                 changed = connection.execute(
                     """
@@ -802,6 +1814,14 @@ class PageControlOutbox:
             owner_predicate = " AND processing_owner = ? AND claim_token = ?"
             owner_values = (owner_id, claim_token)
         with self._connect() as connection:
+            kind = connection.execute(
+                "SELECT command_kind FROM page_control_command WHERE command_id = ?",
+                (command_id,),
+            ).fetchone()
+            if kind is not None and kind["command_kind"] in _MANUAL_WATCHLIST_KINDS:
+                raise ValueError("watchlist command requires atomic completion")
+            if kind is not None and kind["command_kind"] in _PRICE_RULE_KINDS:
+                raise ValueError("price rule command requires atomic completion")
             changed = connection.execute(
                 f"""
                 UPDATE page_control_command
@@ -883,6 +1903,12 @@ class PageControlOutbox:
         claim_token: str,
         now: datetime | None = None,
     ) -> tuple[PageControlEffectRecord, bool]:
+        if isinstance(command, (AddWatchlistItem, RemoveWatchlistItem)):
+            raise ValueError("watchlist command requires atomic completion")
+        if isinstance(
+            command, (SavePriceAlertRule, SetPriceAlertRuleEnabled, DeletePriceAlertRule)
+        ):
+            raise ValueError("price rule command requires atomic completion")
         command_hash = _command_hash(command)
         observed_at = _normalize_utc(now or datetime.now(UTC)).isoformat(timespec="microseconds")
         with self._connect() as connection:
@@ -1066,14 +2092,16 @@ class PageControlOutbox:
                 SELECT command_kind, command_hash, payload_json
                 FROM page_control_command
                 WHERE status = ?
-                  AND command_kind IN (?, ?, ?, ?, ?)
+                  AND command_kind IN (?, ?, ?, ?, ?, ?, ?)
                 ORDER BY rowid DESC
                 """,
                 (
                     PageControlStatus.SUCCEEDED.value,
                     "save_canvas",
+                    "create_canvas",
                     "delete_canvas",
                     "set_canvas_pool_refs",
+                    "add_pool_to_canvas",
                     "save_user_pool",
                     "fork_builtin_pool",
                 ),
@@ -1084,7 +2112,7 @@ class PageControlOutbox:
                 raise ValueError("PageControl canvas mutation authority is malformed")
             affected_canvas = (
                 command.name
-                if isinstance(command, (SaveCanvas, DeleteCanvas, SetCanvasPoolRefs))
+                if isinstance(command, (SaveCanvas, CreateCanvas, DeleteCanvas, SetCanvasPoolRefs))
                 else command.canvas_name
             )
             if affected_canvas == canvas_name:
@@ -1129,6 +2157,10 @@ class PageControlConsumer:
         log_dir: Path,
         allowed_lab_export_roots: tuple[Path, ...] = (),
         lab_backend: LabPageControlBackend | None = None,
+        backfill_plan_backend: BackfillPlanPageControlBackend | None = None,
+        data_audit_report_backend: DataAuditReportPageControlBackend | None = None,
+        formula_market_backend: FormulaMarketPageControlBackend | None = None,
+        formula_pool_backend: FormulaPoolPageControlBackend | None = None,
         clock: Callable[[], datetime] | None = None,
         lease_seconds: int = _DEFAULT_LEASE_SECONDS,
         consumer_id: str | None = None,
@@ -1143,6 +2175,10 @@ class PageControlConsumer:
             Path(os.path.abspath(path)) for path in allowed_lab_export_roots
         )
         self.lab_backend = lab_backend
+        self.backfill_plan_backend = backfill_plan_backend
+        self.data_audit_report_backend = data_audit_report_backend
+        self.formula_market_backend = formula_market_backend
+        self.formula_pool_backend = formula_pool_backend
         self.clock = clock or (lambda: datetime.now(UTC))
         self.lease_seconds = lease_seconds
         self.consumer_service_id = consumer_service_id
@@ -1159,6 +2195,26 @@ class PageControlConsumer:
                 return ()
             return self._drain_locked(limit=limit)
 
+    def drain_price_rule_command(
+        self, command: _OwnedPriceAlertRuleValue
+    ) -> tuple[PageControlReceipt, ...]:
+        with _PageControlExecutionMutex(self._consumer_mutex_path()) as acquired:
+            if not acquired:
+                return ()
+            claims = self.outbox.claim_records(
+                limit=1,
+                owner_id=self.consumer_id,
+                lease_seconds=self.lease_seconds,
+                now=self.clock(),
+                target_command_id=command.command_id,
+            )
+            if not claims:
+                return ()
+            claim = claims[0]
+            if claim.command != command:
+                raise PageControlCommandConflictError("price rule command changed before claim")
+            return (self.outbox.complete_price_rule(claim, now=self.clock()),)
+
     def _drain_locked(self, *, limit: int) -> tuple[PageControlReceipt, ...]:
         receipts: list[PageControlReceipt] = []
         for claim in self.outbox.claim_records(
@@ -1167,9 +2223,37 @@ class PageControlConsumer:
             lease_seconds=self.lease_seconds,
             now=self.clock(),
         ):
+            if isinstance(claim.command, (AddWatchlistItem, RemoveWatchlistItem)):
+                receipts.append(self.outbox.complete_watchlist(claim, now=self.clock()))
+                continue
+            if isinstance(
+                claim.command,
+                (
+                    _OwnedSavePriceAlertRule,
+                    _OwnedSetPriceAlertRuleEnabled,
+                    _OwnedDeletePriceAlertRule,
+                ),
+            ):
+                receipts.append(self.outbox.complete_price_rule(claim, now=self.clock()))
+                continue
+            if isinstance(claim.command, AckAlert):
+                try:
+                    self._assert_command_time(claim.command)
+                except ValueError as exc:
+                    receipts.append(
+                        self.outbox.complete(
+                            claim.command.command_id,
+                            error=f"{type(exc).__name__}: {exc}",
+                            owner_id=claim.owner_id,
+                            claim_token=claim.claim_token,
+                        )
+                    )
+                    continue
+                receipts.append(self.outbox.complete_ack(claim))
+                continue
             try:
                 outcome = self._execute_claim(claim)
-            except _RetryableCommittedLocalEffectError:
+            except _RetryableUncertainEffectError:
                 receipts.append(
                     self.outbox.release_claim_for_retry(
                         claim.command.command_id,
@@ -1297,10 +2381,8 @@ class PageControlConsumer:
             try:
                 recovered = self._recover_started_effect(command)
             except Exception as exc:
-                if self._has_committed_local_mutation(command):
-                    raise _RetryableCommittedLocalEffectError(
-                        f"{type(exc).__name__}: {exc}"
-                    ) from exc
+                if self._must_recover_before_failure(command, created=created):
+                    raise _RetryableUncertainEffectError(f"{type(exc).__name__}: {exc}") from exc
                 effect = self.outbox.finish_effect(
                     command.command_id,
                     status=PageControlEffectStatus.FAILED,
@@ -1342,8 +2424,8 @@ class PageControlConsumer:
             try:
                 recovered = self._recover_started_effect(command)
             except Exception as recovery_exc:
-                if self._has_committed_local_mutation(command):
-                    raise _RetryableCommittedLocalEffectError(
+                if self._must_recover_before_failure(command, created=created):
+                    raise _RetryableUncertainEffectError(
                         f"{type(exc).__name__}: {exc}; recovery failed: "
                         f"{type(recovery_exc).__name__}: {recovery_exc}"
                     ) from recovery_exc
@@ -1441,7 +2523,40 @@ class PageControlConsumer:
         binding.verify()
         return binding.descriptor
 
+    def _must_recover_before_failure(
+        self, command: PageControlCommandValue, *, created: bool
+    ) -> bool:
+        if isinstance(command, SubmitDataAuditReport):
+            # A started command may have queued a task before its receipt was lost.
+            # A first attempt without a configured backend cannot have done so.
+            return not created or self.data_audit_report_backend is not None
+        if isinstance(command, SubmitFormulaMarketRun):
+            return not created or self.formula_market_backend is not None
+        if isinstance(command, SaveFormulaPoolV1):
+            return not created or self.formula_pool_backend is not None
+        return self._has_committed_local_mutation(command)
+
     def _has_committed_local_mutation(self, command: PageControlCommandValue) -> bool:
+        if isinstance(command, CreateCanvas):
+            try:
+                record, _publication = self._read_verified_canvas_catalog(
+                    command.name, require_current_head=False
+                )
+            except Exception:
+                return False
+            return (
+                record.command_id == command.command_id
+                and record.description == command.description
+                and not record.pool_refs
+                and record.source == "page_control"
+            )
+        if isinstance(command, (SaveUserPoolV2, SaveUserPoolV3)):
+            try:
+                if isinstance(command, SaveUserPoolV3):
+                    return self._recover_user_pool_v3_result(command) is not None
+                return self._recover_user_pool_v2_result(command) is not None
+            except Exception:
+                return False
         if not isinstance(command, DeleteCanvas):
             return False
         try:
@@ -1473,6 +2588,8 @@ class PageControlConsumer:
         return _ExecutionOutcome(PageControlStatus.FAILED, effect.result, effect.error)
 
     def _execute(self, command: PageControlCommandValue) -> JsonValue:
+        if isinstance(command, CreateCanvas):
+            return self._create_canvas(command)
         if isinstance(command, SaveCanvas):
             return self._save_canvas(command)
         if isinstance(command, DeleteCanvas):
@@ -1488,6 +2605,8 @@ class PageControlConsumer:
                 source="canvas_edit",
             )
             return self._save_canvas(save, identity_command=command)
+        if isinstance(command, AddPoolToCanvas):
+            return self._add_verified_pool_to_canvas(command)
         if isinstance(command, SaveUserPool):
             result = self._save_user_pool(command)
             if command.canvas_name is not None and command.canvas_name != "__default__":
@@ -1500,6 +2619,12 @@ class PageControlConsumer:
                     result = dict(result)
                     result["canvas_result"] = canvas_result
             return result
+        if isinstance(command, SaveUserPoolV2):
+            return self._save_user_pool_v2(command)
+        if isinstance(command, SaveUserPoolV3):
+            return self._save_user_pool_v3(command)
+        if isinstance(command, SaveFormulaPoolV1):
+            return self._formula_pool_backend().submit(command)
         if isinstance(command, DeleteUserPool):
             return {"deleted": self._delete(self._user_pool_path(command.base_name))}
         if isinstance(command, ForkBuiltinPool):
@@ -1528,6 +2653,12 @@ class PageControlConsumer:
                 command.command,
                 interaction_key=command.interaction_key,
             )
+        if isinstance(command, SubmitBackfillPlan):
+            return self._backfill_plan_backend().submit(command)
+        if isinstance(command, SubmitDataAuditReport):
+            return self._data_audit_report_backend().submit(command)
+        if isinstance(command, SubmitFormulaMarketRun):
+            return self._formula_market_backend().submit(command)
         if isinstance(command, ExportLabArtifactZip):
             return self._lab_backend().export_zip(command.job_id)
         if isinstance(command, DiscardLabArtifactZip):
@@ -1539,14 +2670,43 @@ class PageControlConsumer:
             raise RuntimeError("Lab page control backend is unavailable")
         return self.lab_backend
 
+    def _backfill_plan_backend(self) -> BackfillPlanPageControlBackend:
+        if self.backfill_plan_backend is None:
+            raise RuntimeError("backfill plan backend is unavailable")
+        return self.backfill_plan_backend
+
+    def _data_audit_report_backend(self) -> DataAuditReportPageControlBackend:
+        if self.data_audit_report_backend is None:
+            raise RuntimeError("data audit report backend is unavailable")
+        return self.data_audit_report_backend
+
+    def _formula_market_backend(self) -> FormulaMarketPageControlBackend:
+        if self.formula_market_backend is None:
+            raise RuntimeError("formula market backend is unavailable")
+        return self.formula_market_backend
+
+    def _formula_pool_backend(self) -> FormulaPoolPageControlBackend:
+        if self.formula_pool_backend is None:
+            raise RuntimeError("formula pool backend is unavailable")
+        return self.formula_pool_backend
+
     def _local_effect_fence_targets(
         self,
         command: PageControlCommandValue,
     ) -> tuple[_LocalEffectFenceTarget, ...]:
-        if isinstance(command, SaveCanvas):
+        if isinstance(command, (SaveCanvas, CreateCanvas)):
             return self._canvas_publication_fence_targets(command.name)
         if isinstance(command, SetCanvasPoolRefs):
             return self._canvas_publication_fence_targets(command.name)
+        if isinstance(command, AddPoolToCanvas):
+            return (
+                _LocalEffectFenceTarget(
+                    role="user_pool_directory",
+                    path=self._user_pool_path(command.pool_name.removeprefix("user/")).parent,
+                    create=False,
+                ),
+                *self._canvas_publication_fence_targets(command.canvas_name),
+            )
         if isinstance(command, SaveUserPool):
             targets = [
                 _LocalEffectFenceTarget(
@@ -1557,6 +2717,13 @@ class PageControlConsumer:
             if command.canvas_name is not None and command.canvas_name != "__default__":
                 targets.extend(self._canvas_publication_fence_targets(command.canvas_name))
             return tuple(targets)
+        if isinstance(command, (SaveUserPoolV2, SaveUserPoolV3)):
+            return (
+                _LocalEffectFenceTarget(
+                    role="user_pool_directory",
+                    path=self._user_pool_path(command.base_name).parent,
+                ),
+            )
         if isinstance(command, SaveNlPreset):
             return (
                 _LocalEffectFenceTarget(
@@ -1731,10 +2898,23 @@ class PageControlConsumer:
         return None
 
     def _recover_started_effect(self, command: PageControlCommandValue) -> JsonValue | None:
+        if isinstance(command, SubmitBackfillPlan):
+            return self._backfill_plan_backend().recover(command)
+        if isinstance(command, SubmitDataAuditReport):
+            return self._data_audit_report_backend().recover(command)
+        if isinstance(command, SubmitFormulaMarketRun):
+            return self._formula_market_backend().recover(command)
+        if isinstance(command, SaveFormulaPoolV1):
+            return self._formula_pool_backend().recover(command)
+        if isinstance(command, CreateCanvas):
+            return self._recover_create_canvas_result(command)
         if isinstance(command, SaveCanvas):
             return self._recover_canvas_result(self._canvas_path(command.name), command)
         if isinstance(command, SetCanvasPoolRefs):
             return self._recover_canvas_result(self._canvas_path(command.name), command)
+        if isinstance(command, AddPoolToCanvas):
+            recovered = self._recover_canvas_result(self._canvas_path(command.canvas_name), command)
+            return None if recovered is None else self._attach_result(command, recovered)
         if isinstance(command, SaveUserPool):
             result = self._recover_user_pool_result(command, identity_command=command)
             if result is None:
@@ -1751,6 +2931,10 @@ class PageControlConsumer:
                     result = dict(result)
                     result["canvas_result"] = canvas_result
             return result
+        if isinstance(command, SaveUserPoolV2):
+            return self._recover_user_pool_v2_result(command)
+        if isinstance(command, SaveUserPoolV3):
+            return self._recover_user_pool_v3_result(command)
         if isinstance(command, SaveNlPreset):
             save = SaveUserPool(
                 command_id=command.command_id,
@@ -1858,6 +3042,66 @@ class PageControlConsumer:
         )
         return self._canvas_publication_result(path, publication)
 
+    def _create_canvas(self, command: CreateCanvas) -> JsonValue:
+        if command.name == "__default__":
+            raise ValueError("default canvas is virtual and cannot be persisted")
+        path = self._canvas_path(command.name)
+        current = self._current_canvas_head(command.name)
+        if current is not None or self._managed_json_exists(path):
+            raise FileExistsError("canvas name is already occupied")
+        watermark = self._current_canvas_watermark(command.name)
+        self._assert_canvas_watermark_matches_head(current, watermark)
+        self._assert_canvas_head_matches_latest_authority(command.name, current)
+        save = SaveCanvas(
+            command_id=command.command_id,
+            requested_at=command.requested_at,
+            name=command.name,
+            description=command.description,
+            pool_refs=(),
+            source="page_control",
+        )
+        return self._created_canvas_result(
+            command, self._save_canvas(save, identity_command=command)
+        )
+
+    def _recover_create_canvas_result(self, command: CreateCanvas) -> JsonValue | None:
+        path = self._canvas_path(command.name)
+        if not self._managed_json_exists(path):
+            return None
+        record, publication = self._read_verified_canvas_catalog(
+            command.name, require_current_head=False
+        )
+        if record.command_id != command.command_id:
+            return None
+        if (
+            record.description != command.description
+            or record.pool_refs
+            or record.source != "page_control"
+        ):
+            raise ValueError("created canvas differs from the original command")
+        current = self._current_canvas_head(command.name)
+        watermark = self._current_canvas_watermark(command.name)
+        if current is None and watermark is not None:
+            raise ValueError("canvas immutable watermark exists without its current head")
+        if current is not None and (
+            current.receipt.claims.command.command_id != command.command_id
+            or current.authority_command_kind != command.kind
+            or current.authority_command_hash != _command_hash(command)
+            or current.publication_receipt_id != publication.receipt_id
+            or current.sequence != 1
+            or current.previous_head_receipt_id is not None
+        ):
+            raise ValueError("created canvas conflicts with current head authority")
+        if current is not None and watermark is None:
+            self._publish_canvas_watermark(current)
+        recovered = self._recover_canvas_result(path, command)
+        return None if recovered is None else self._created_canvas_result(command, recovered)
+
+    @staticmethod
+    def _created_canvas_result(command: CreateCanvas, result: JsonValue) -> dict[str, JsonValue]:
+        assert isinstance(result, dict)
+        return {**result, "canvas_name": command.name}
+
     def _save_user_pool(
         self,
         command: SaveUserPool,
@@ -1865,7 +3109,13 @@ class PageControlConsumer:
         identity_command: PageControlCommandValue | None = None,
     ) -> JsonValue:
         identity = command if identity_command is None else identity_command
+        self._assert_no_formula_pool_name(command.base_name)
         path = self._user_pool_path(command.base_name)
+        if self._managed_json_exists(path) and self._read_json(path).get("schema_version") in (
+            2,
+            3,
+        ):
+            raise ValueError("versioned pool definition requires matching save command")
         payload = {
             "name": command.base_name,
             "description": command.description,
@@ -1878,6 +3128,149 @@ class PageControlConsumer:
         }
         self._atomic_json(path, payload, command_id=identity.command_id)
         return {"path": str(path)}
+
+    def _save_user_pool_v2(self, command: SaveUserPoolV2) -> JsonValue:
+        self._assert_no_formula_pool_name(command.base_name)
+        from rquant.llm.dispatch import build_rules
+        from rquant.llm.schemas import ScreenPlan, Stage
+        from rquant.presets import BUILTIN_PRESET_SCREENS, load_user_presets
+
+        path = self._user_pool_path(command.base_name)
+        current = self._read_json(path) if self._managed_json_exists(path) else None
+        if current is not None and current.get("schema_version") == 3:
+            raise ValueError("ranked pool definition requires save_user_pool_v3")
+        current_version = None if current is None else canonical_sha256(current)
+        if command.expected_version != current_version:
+            raise ValueError("pool version conflict: definition changed since it was read")
+        if not command.display_name.strip():
+            raise ValueError("pool display name is required")
+        if command.depends_on is None:
+            if command.delay_days != 0:
+                raise ValueError("delay_days must be 0 without a parent pool")
+        elif not 1 <= command.delay_days <= 252:
+            raise ValueError("delay_days must be 1..252 with a parent pool")
+
+        build_rules(
+            ScreenPlan(
+                trade_date="1900-01-01",
+                stages=[Stage(label="saved", rules=list(command.rule_calls))],
+                include_columns=list(command.include_columns),
+            )
+        )
+        candidate_name = f"user/{command.base_name}"
+        if command.depends_on == candidate_name:
+            raise ValueError("pool cannot depend on itself")
+        available = dict(BUILTIN_PRESET_SCREENS)
+        available.update(load_user_presets(path.parent))
+        parent_name = command.depends_on
+        visited = {candidate_name}
+        while parent_name is not None:
+            if parent_name in visited:
+                raise ValueError("pool dependency cycle")
+            visited.add(parent_name)
+            parent = available.get(parent_name)
+            if parent is None:
+                raise ValueError(f"parent pool does not exist or is invalid: {parent_name}")
+            parent_name = parent.depends_on
+
+        payload = {
+            "schema_version": 2,
+            "name": command.base_name,
+            "display_name": command.display_name.strip(),
+            "description": command.description,
+            "rules": [rule.model_dump(mode="json") for rule in command.rule_calls],
+            "include_columns": list(command.include_columns),
+            "depends_on": command.depends_on,
+            "delay_days": command.delay_days,
+            "updated_at": command.requested_at.astimezone(UTC).isoformat(timespec="seconds"),
+            "source": "page_control_v2",
+            "command_id": command.command_id,
+            "command_hash": _command_hash(command),
+        }
+        self._atomic_json(path, payload, command_id=command.command_id)
+        return {"path": str(path), "version": canonical_sha256(payload)}
+
+    def _save_user_pool_v3(self, command: SaveUserPoolV3) -> JsonValue:
+        self._assert_no_formula_pool_name(command.base_name)
+        from rquant.llm.dispatch import build_rules
+        from rquant.llm.schemas import ScreenPlan, Stage
+        from rquant.presets import BUILTIN_PRESET_SCREENS, load_user_presets
+        from rquant.screen.dynamic_ma import requested_dynamic_ma
+        from rquant.screen.dynamic_rsi import requested_dynamic_rsi
+        from rquant.screen.loader import FUNDAMENTAL_COLS_MAP, _selected_sources
+        from rquant.screen.rules import required_rule_columns
+
+        path = self._user_pool_path(command.base_name)
+        current = self._read_json(path) if self._managed_json_exists(path) else None
+        current_version = None if current is None else canonical_sha256(current)
+        if command.expected_version != current_version:
+            raise ValueError("pool version conflict: definition changed since it was read")
+        if not command.display_name.strip():
+            raise ValueError("pool display name is required")
+        if command.depends_on is None:
+            if command.delay_days != 0:
+                raise ValueError("delay_days must be 0 without a parent pool")
+        elif not 1 <= command.delay_days <= 252:
+            raise ValueError("delay_days must be 1..252 with a parent pool")
+
+        rules = build_rules(
+            ScreenPlan(
+                trade_date="1900-01-01",
+                stages=[Stage(label="saved", rules=list(command.rule_calls))],
+                include_columns=list(command.include_columns),
+            )
+        )
+        columns = required_rule_columns(rules) | frozenset(command.include_columns)
+        try:
+            _selected_sources(columns, 500)
+            fundamentals = set(FUNDAMENTAL_COLS_MAP.values())
+            unsupported = any(column.split("[", 1)[0] in fundamentals for column in columns)
+            dynamic_rsi = any(
+                period not in (6, 14) for period, _offset in requested_dynamic_rsi(columns).values()
+            )
+            dynamic_ma = bool(requested_dynamic_ma(columns))
+        except ValueError as error:
+            raise ValueError("pool conditions are not reproducible by the daily writer") from error
+        if unsupported or dynamic_rsi or dynamic_ma:
+            raise ValueError("pool conditions are not reproducible by the daily writer")
+
+        candidate_name = f"user/{command.base_name}"
+        if command.depends_on == candidate_name:
+            raise ValueError("pool cannot depend on itself")
+        available = dict(BUILTIN_PRESET_SCREENS)
+        available.update(load_user_presets(path.parent))
+        parent_name = command.depends_on
+        visited = {candidate_name}
+        while parent_name is not None:
+            if parent_name in visited:
+                raise ValueError("pool dependency cycle")
+            visited.add(parent_name)
+            parent = available.get(parent_name)
+            if parent is None:
+                raise ValueError(f"parent pool does not exist or is invalid: {parent_name}")
+            parent_name = parent.depends_on
+
+        payload = self._user_pool_v3_payload(command)
+        self._atomic_json(path, payload, command_id=command.command_id)
+        return {"path": str(path), "version": canonical_sha256(payload)}
+
+    @staticmethod
+    def _user_pool_v3_payload(command: SaveUserPoolV3) -> dict[str, JsonValue]:
+        return {
+            "schema_version": 3,
+            "name": command.base_name,
+            "display_name": command.display_name.strip(),
+            "description": command.description,
+            "rules": [rule.model_dump(mode="json") for rule in command.rule_calls],
+            "include_columns": list(command.include_columns),
+            "depends_on": command.depends_on,
+            "delay_days": command.delay_days,
+            "ranking": None if command.ranking is None else command.ranking.model_dump(mode="json"),
+            "updated_at": command.requested_at.astimezone(UTC).isoformat(timespec="seconds"),
+            "source": "page_control_v3",
+            "command_id": command.command_id,
+            "command_hash": _command_hash(command),
+        }
 
     def _fork_builtin(self, command: ForkBuiltinPool) -> JsonValue:
         save = self._fork_builtin_save_command(command)
@@ -1950,6 +3343,41 @@ class PageControlConsumer:
         )
         return self._save_canvas(save, identity_command=identity_command)
 
+    def _add_verified_pool_to_canvas(self, command: AddPoolToCanvas) -> JsonValue:
+        base_name = command.pool_name.removeprefix("user/")
+        path = self._user_pool_path(base_name)
+        if not self._managed_json_exists(path):
+            raise ValueError("pool definition is unavailable")
+        current = self._read_json(path)
+        versioned_source = (current.get("schema_version"), current.get("source")) in {
+            (2, "page_control_v2"),
+            (3, "page_control_v3"),
+        } and (current.get("schema_version") != 3 or "ranking" in current)
+        if (
+            not versioned_source
+            or current.get("name") != base_name
+            or canonical_sha256(current) != command.expected_pool_version
+        ):
+            raise ValueError("pool version conflict: definition changed since save")
+        if current["schema_version"] == 3 and current.get("ranking") is not None:
+            PoolRankingPlan.model_validate(current.get("ranking"))
+        result = self._add_pool_to_canvas(
+            command.canvas_name,
+            command.pool_name,
+            identity_command=command,
+        )
+        return self._attach_result(command, result)
+
+    @staticmethod
+    def _attach_result(command: AddPoolToCanvas, result: JsonValue) -> dict[str, JsonValue]:
+        assert isinstance(result, dict)
+        return {
+            **result,
+            "canvas_name": command.canvas_name,
+            "pool_name": command.pool_name,
+            "pool_version": command.expected_pool_version,
+        }
+
     def _recover_canvas_result(
         self,
         path: Path,
@@ -1992,6 +3420,26 @@ class PageControlConsumer:
         if raw.get("command_hash") != _command_hash(identity_command):
             return None
         return {"path": str(path)}
+
+    def _recover_user_pool_v2_result(self, command: SaveUserPoolV2) -> JsonValue | None:
+        path = self._user_pool_path(command.base_name)
+        if not self._managed_json_exists(path):
+            return None
+        raw = self._read_json(path)
+        if raw.get("command_id") != command.command_id:
+            return None
+        if raw.get("command_hash") != _command_hash(command):
+            return None
+        return {"path": str(path), "version": canonical_sha256(raw)}
+
+    def _recover_user_pool_v3_result(self, command: SaveUserPoolV3) -> JsonValue | None:
+        path = self._user_pool_path(command.base_name)
+        if not self._managed_json_exists(path):
+            return None
+        raw = self._read_json(path)
+        if raw != self._user_pool_v3_payload(command):
+            return None
+        return {"path": str(path), "version": canonical_sha256(raw)}
 
     def _recover_canvas_pool_link(
         self,
@@ -2387,6 +3835,12 @@ class PageControlConsumer:
     def _user_pool_path(self, name: str) -> Path:
         return self.data_dir / "user_presets" / f"{_validated_name(name, label='pool name')}.json"
 
+    def _assert_no_formula_pool_name(self, name: str) -> None:
+        validated = _validated_name(name, label="pool name")
+        path = self.data_dir / "formula_pools" / f"{validated}.json"
+        if self._managed_json_exists(path):
+            raise FileExistsError("formula pool already uses this user/ name")
+
     @staticmethod
     def _read_json(path: Path) -> dict[str, object]:
         descriptor = PageControlConsumer._open_effect_directory(
@@ -2502,11 +3956,79 @@ class PageControlService:
         self.consumer = consumer
 
     def submit(self, command: PageControlCommandValue) -> PageControlReceipt:
-        receipt = self.outbox.enqueue(command)
+        if isinstance(command, (AddWatchlistItem, RemoveWatchlistItem)):
+            raise ValueError("watchlist commands require trusted submission")
+        if isinstance(
+            command, (SavePriceAlertRule, SetPriceAlertRuleEnabled, DeletePriceAlertRule)
+        ):
+            raise ValueError("price rule commands require trusted submission")
+        if isinstance(command, AckAlert):
+            receipt = self.lookup_ack_command(command)
+            if receipt is None:
+                raise ValueError("ack_alert requires verified Serving eligibility")
+        else:
+            receipt = self.outbox.enqueue(command)
+        return self._settle(command, receipt)
+
+    def _submit_verified_ack(self, command: AckAlert) -> PageControlReceipt:
+        """Called only after the local Serving admission checks succeed."""
+        return self._settle(command, self.outbox.enqueue_verified_ack(command))
+
+    def _submit_trusted_watchlist(
+        self,
+        command: AddWatchlistItem | RemoveWatchlistItem,
+        *,
+        authenticated_owner_id: str,
+    ) -> PageControlReceipt:
+        """Internal entry point; a future protected boundary supplies the authenticated owner."""
+        if not isinstance(command, (AddWatchlistItem, RemoveWatchlistItem)):
+            raise TypeError("trusted watchlist submission requires a watchlist command")
+        identity = ManualWatchlistKey(
+            owner_id=authenticated_owner_id,
+            ts_code=command.item.ts_code,
+        )
+        if identity.owner_id != command.item.owner_id:
+            raise ValueError("authenticated owner does not match watchlist command owner")
+        return self._settle(command, self.outbox.enqueue_trusted_watchlist(command))
+
+    def _submit_trusted_price_rule(
+        self, command: PriceAlertRuleRequestValue, *, authenticated_owner_id: str
+    ) -> PageControlReceipt:
+        owned = _owned_price_rule_command(command, authenticated_owner_id=authenticated_owner_id)
+        return self._settle(
+            owned, self.outbox.enqueue_trusted_price_rule(owned), price_rule_command=owned
+        )
+
+    def _lookup_trusted_price_rule(
+        self, command: PriceAlertRuleRequestValue, *, authenticated_owner_id: str
+    ) -> PageControlReceipt | None:
+        owned = _owned_price_rule_command(command, authenticated_owner_id=authenticated_owner_id)
+        return self.outbox.lookup_price_rule_command(owned)
+
+    def _resume_trusted_price_rule(
+        self, command: PriceAlertRuleRequestValue, *, authenticated_owner_id: str
+    ) -> PageControlReceipt:
+        owned = _owned_price_rule_command(command, authenticated_owner_id=authenticated_owner_id)
+        receipt = self.outbox.lookup_price_rule_command(owned)
+        if receipt is None:
+            raise KeyError("price rule command not found")
+        return self._settle(owned, receipt, price_rule_command=owned)
+
+    def _settle(
+        self,
+        command: PageControlCommandValue,
+        receipt: PageControlReceipt,
+        *,
+        price_rule_command: _OwnedPriceAlertRuleValue | None = None,
+    ) -> PageControlReceipt:
         for _ in range(100):
             if receipt.status in _PAGE_CONTROL_TERMINAL_STATUSES:
                 return receipt
-            drained = self.consumer.drain(limit=100)
+            drained = (
+                self.consumer.drain(limit=100)
+                if price_rule_command is None
+                else self.consumer.drain_price_rule_command(price_rule_command)
+            )
             observed = self.outbox.receipt(command.command_id)
             if observed is None:
                 raise RuntimeError("page control command disappeared")
@@ -2516,6 +4038,9 @@ class PageControlService:
                 return observed
             receipt = observed
         raise RuntimeError("page control command did not reach a terminal state")
+
+    def lookup_ack_command(self, command: AckAlert) -> PageControlReceipt | None:
+        return self.outbox.lookup_ack_command(command)
 
 
 PageControlTransport = Callable[[dict[str, object]], dict[str, object]]
@@ -2533,6 +4058,7 @@ class PageControlClient:
         *,
         endpoint: str | None = None,
         transport: PageControlTransport | None = None,
+        lookup_transport: PageControlTransport | None = None,
         timeout_seconds: float = 1.0,
     ) -> None:
         self.endpoint = endpoint or os.environ.get(
@@ -2540,9 +4066,16 @@ class PageControlClient:
             "http://127.0.0.1:8767/v1/commands",
         )
         self.transport = transport or self._post
+        self.lookup_transport = lookup_transport or self._post_lookup
         self.timeout_seconds = timeout_seconds
 
     def submit(self, command: PageControlCommandValue) -> PageControlReceipt:
+        if isinstance(command, (AddWatchlistItem, RemoveWatchlistItem)):
+            raise ValueError("watchlist commands require trusted submission")
+        if isinstance(
+            command, (SavePriceAlertRule, SetPriceAlertRuleEnabled, DeletePriceAlertRule)
+        ):
+            raise ValueError("price rule commands require trusted submission")
         try:
             response = self.transport(command.model_dump(mode="json"))
         except (OSError, TimeoutError, urllib.error.URLError) as exc:
@@ -2551,9 +4084,56 @@ class PageControlClient:
             ) from exc
         return PageControlReceipt.model_validate(response)
 
+    def lookup_ack_command(self, command: AckAlert) -> PageControlReceipt | None:
+        try:
+            response = self.lookup_transport(command.model_dump(mode="json"))
+        except (OSError, TimeoutError, urllib.error.URLError) as exc:
+            raise PageControlUnavailableError(
+                f"page control lookup unavailable: {type(exc).__name__}: {exc}"
+            ) from exc
+        if response == {"found": False}:
+            return None
+        if (
+            isinstance(response, dict)
+            and response.get("found") is True
+            and set(response)
+            == {
+                "found",
+                "receipt",
+            }
+        ):
+            receipt = PageControlReceipt.model_validate(response["receipt"])
+            if receipt.command_id != command.command_id:
+                raise ValueError("invalid page control lookup response command_id")
+            return receipt
+        raise ValueError("invalid page control lookup response")
+
     def _post(self, payload: dict[str, object]) -> dict[str, object]:
+        return self._post_to(self.endpoint, payload)
+
+    def _post_lookup(self, payload: dict[str, object]) -> dict[str, object]:
+        endpoint = urlsplit(self.endpoint)
+        if (
+            endpoint.scheme != "http"
+            or endpoint.hostname not in {"127.0.0.1", "::1", "localhost"}
+            or endpoint.path != "/v1/commands"
+            or endpoint.query
+            or endpoint.fragment
+            or endpoint.username is not None
+            or endpoint.password is not None
+        ):
+            raise ValueError("PageControl lookup requires the fixed loopback endpoint")
+        lookup_url = urlunsplit((endpoint.scheme, endpoint.netloc, "/v1/commands/lookup", "", ""))
+        try:
+            return self._post_to(lookup_url, payload)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 409:
+                raise ValueError("command conflict") from exc
+            raise
+
+    def _post_to(self, endpoint: str, payload: dict[str, object]) -> dict[str, object]:
         request = urllib.request.Request(
-            self.endpoint,
+            endpoint,
             data=json.dumps(payload, ensure_ascii=True).encode("utf-8"),
             headers={"Content-Type": "application/json"},
             method="POST",
@@ -2662,11 +4242,13 @@ def _bind_managed_directory(path: Path, *, create: bool) -> _BoundManagedDirecto
         flags |= os.O_DIRECTORY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
+    # Linux allows safe traversal through execute-only ancestors with O_PATH.
+    ancestor_flags = flags | os.O_PATH if hasattr(os, "O_PATH") else flags
     descriptors: list[int] = []
     component_names: list[str] = []
     try:
-        descriptors.append(os.open(normalized.anchor, flags))
         components = normalized.parts[1:]
+        descriptors.append(os.open(normalized.anchor, ancestor_flags if components else flags))
         for index, component in enumerate(components):
             parent = descriptors[-1]
             try:
@@ -2680,7 +4262,11 @@ def _bind_managed_directory(path: Path, *, create: bool) -> _BoundManagedDirecto
                 raise ValueError(f"managed directory ancestor cannot be a symlink: {normalized}")
             if not stat.S_ISDIR(entry.st_mode):
                 raise ValueError(f"managed directory ancestor is not a directory: {normalized}")
-            descriptor = os.open(component, flags, dir_fd=parent)
+            descriptor = os.open(
+                component,
+                flags if index == len(components) - 1 else ancestor_flags,
+                dir_fd=parent,
+            )
             opened = os.fstat(descriptor)
             if _file_node_tuple(entry) != _file_node_tuple(opened):
                 os.close(descriptor)
@@ -3111,13 +4697,23 @@ def _fsync_descriptor(descriptor: int) -> None:
 
 
 def parse_page_control_command(payload: object) -> PageControlCommandValue:
+    if isinstance(payload, Mapping):
+        kind = payload.get("kind")
+        if isinstance(kind, str) and kind in _PRICE_RULE_KINDS:
+            raise ValueError("price rule commands require trusted submission")
     return _COMMAND_ADAPTER.validate_python(payload)
 
 
 __all__ = [
+    "AckAlert",
+    "AddWatchlistItem",
+    "AddPoolToCanvas",
+    "AlertAcknowledgment",
     "AppendNlQueryLog",
+    "CreateCanvas",
     "DEFAULT_PAGE_CONTROL_SERVICE_ID",
     "DeleteCanvas",
+    "DeletePriceAlertRule",
     "DeleteUserPool",
     "DiscardLabArtifactZip",
     "ExportLabArtifactZip",
@@ -3125,8 +4721,13 @@ __all__ = [
     "InitializeLabExports",
     "LabArtifactZipResult",
     "LabPageControlBackend",
+    "BackfillPlanPageControlBackend",
+    "DataAuditReportPageControlBackend",
+    "FormulaMarketPageControlBackend",
+    "FormulaPoolPageControlBackend",
     "PageControlCommandValue",
     "PageControlClient",
+    "PageControlCommandConflictError",
     "PageControlConsumer",
     "PageControlOutbox",
     "PageControlReceipt",
@@ -3134,9 +4735,18 @@ __all__ = [
     "PageControlStatus",
     "PageControlUnavailableError",
     "parse_page_control_command",
+    "RemoveWatchlistItem",
     "SaveCanvas",
+    "SavePriceAlertRule",
+    "SaveFormulaPoolV1",
     "SaveNlPreset",
     "SaveUserPool",
+    "SaveUserPoolV2",
+    "SaveUserPoolV3",
     "SetCanvasPoolRefs",
+    "SetPriceAlertRuleEnabled",
     "SubmitLabCommand",
+    "SubmitBackfillPlan",
+    "SubmitDataAuditReport",
+    "SubmitFormulaMarketRun",
 ]

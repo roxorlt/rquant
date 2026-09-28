@@ -72,6 +72,9 @@ class _FakeDailyPro:
                     "volume_ratio": 1.2,
                     "total_mv": 200.0,
                     "circ_mv": 180.0,
+                    "pe_ttm": 12.0,
+                    "pb": 1.5,
+                    "dv_ttm": 2.0,
                 },
             )
         )

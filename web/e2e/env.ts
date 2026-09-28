@@ -8,6 +8,8 @@ export const API_PORT = Number(process.env.RQ_E2E_API_PORT ?? 18768);
 export const WEB_PORT = Number(process.env.RQ_E2E_WEB_PORT ?? 14173);
 export const SERVING_ROOT =
   process.env.RQ_E2E_SERVING_ROOT ?? join(tmpdir(), "rquant-web-e2e", "serving");
+/** Synthetic proof shared only by the local API fixture and browser proxy. */
+export const PROXY_PROOF_FILE = join(REPO_ROOT, ".cache", "web-e2e", `proxy-proof-${API_PORT}`);
 export const APP_URL = `http://127.0.0.1:${WEB_PORT}/app/`;
 /** Runs the repository's Python without re-syncing the environment. */
 export const UV_RUN = process.env.RQ_E2E_UV_RUN ?? "uv run --no-sync";

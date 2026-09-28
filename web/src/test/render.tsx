@@ -7,10 +7,11 @@ import { testQueryClient } from "./queryClient";
 /** The whole app (providers + real routes) at `path`, on a memory router. */
 export function renderApp(path = "/overview") {
   const router = createMemoryRouter(appRoutes, { initialEntries: [path] });
+  const queryClient = testQueryClient();
   const utils = render(
-    <AppProviders queryClient={testQueryClient()}>
+    <AppProviders queryClient={queryClient}>
       <RouterProvider router={router} />
     </AppProviders>,
   );
-  return { ...utils, router };
+  return { ...utils, router, queryClient };
 }

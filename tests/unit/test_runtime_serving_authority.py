@@ -628,12 +628,29 @@ def test_reader_rejects_naive_as_of_and_missing_current_is_unavailable(
 ) -> None:
     root = tmp_path / "authority"
     root.mkdir()
+    (root / "generations").mkdir()
+    (root / "publications").mkdir()
     reader = _reader(root)
 
     with pytest.raises(ServingSourceAuthorityUnavailableError, match="timezone-aware"):
         reader(NOW.replace(tzinfo=None))
     with pytest.raises(ServingSourceAuthorityUnavailableError, match="current.*unavailable"):
         reader(NOW)
+
+
+def test_reader_rejects_current_pointer_removed_during_verified_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "authority"
+    _publisher(root).publish(_result())
+    _mutate_after_initial_pointer_read(
+        monkeypatch,
+        lambda: (root / "current.json").unlink(),
+    )
+
+    with pytest.raises(ServingSourceAuthorityIntegrityError, match="current pointer"):
+        _reader(root)(NOW)
 
 
 @pytest.mark.parametrize(
@@ -1069,7 +1086,7 @@ def test_reader_fails_closed_when_visible_history_exceeds_scan_bound(
         )
     )
 
-    with pytest.raises(ServingSourceAuthorityUnavailableError, match="scan limit"):
+    with pytest.raises(ServingSourceAuthorityIntegrityError, match="scan limit"):
         _reader(root, history_scan_limit=1)(NOW)
 
 
@@ -1251,4 +1268,3 @@ def test_carried_pointer_still_has_to_match_its_own_immutable_document(
 
     with pytest.raises(ServingSourceAuthorityIntegrityError):
         _lineage_reader(root)(NOW)
-

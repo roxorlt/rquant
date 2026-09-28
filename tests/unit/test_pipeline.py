@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import date, timedelta
 from unittest.mock import patch
 
 import pandas as pd
@@ -12,8 +13,10 @@ from rquant.pipeline import (
     _resolve_execution_order,
     _to_screen_result_df,
     run_daily_pipeline,
+    run_daily_screen_stage,
 )
 from rquant.presets import ScreenPreset
+from rquant.screen.pool_ranking import PoolRankingPlan
 from rquant.screen.rules import not_st
 from rquant.storage.duckdb import DuckDBStore
 
@@ -61,6 +64,100 @@ class TestToScreenResultDf:
         )
         result = _to_screen_result_df(df, "2026-04-18", "pool1")
         assert result.iloc[0]["extra"] is None
+
+
+def test_ranked_daily_pool_filters_risk_then_commits_only_top_members_and_receipt(
+    store: DuckDBStore,
+) -> None:
+    sessions = [date(2026, 8, 1) + timedelta(days=offset) for offset in range(21)]
+    codes = ("000001.SZ", "000002.SZ", "000003.SZ")
+    for index, session in enumerate(sessions):
+        store._conn.execute(
+            "INSERT INTO trade_calendar (exchange, cal_date, is_open, source, updated_at) "
+            "VALUES ('SSE', ?, TRUE, 'fixture', '2026-08-22 00:00:00+00')",
+            [session],
+        )
+        for code, ending_close in zip(codes, (30.0, 20.0, 15.0), strict=True):
+            store._conn.execute(
+                "INSERT INTO daily_bar (ts_code, trade_date, close) VALUES (?, ?, ?)",
+                [code, session, ending_close if index == 20 else 10.0],
+            )
+            store._conn.execute(
+                "INSERT INTO adj_factor (ts_code, trade_date, adj_factor) VALUES (?, ?, 1)",
+                [code, session],
+            )
+    frame = pd.DataFrame(
+        {
+            "ts_code": list(codes),
+            "name": ["风险", "第二", "第三"],
+            "CLOSE[0]": [30.0, 20.0, 15.0],
+            "PCT_CHG[0]": [1.0, 1.0, 1.0],
+            "TURNOVER_RATE[0]": [3.0, 2.0, 1.0],
+            "CIRC_MV[0]": [30.0, 20.0, 10.0],
+        }
+    )
+    preset = ScreenPreset(
+        name="ranked",
+        description="",
+        rules=[not_st()],
+        ranking=PoolRankingPlan.model_validate(
+            {
+                "conditions": [
+                    {"metric": "RETURN_20D_PCT[0]", "ascending": False, "weight": 60},
+                    {"metric": "TURNOVER_RATE[0]", "ascending": False, "weight": 20},
+                    {"metric": "CIRC_MV[0]", "ascending": False, "weight": 20},
+                ],
+                "top_n": 1,
+            }
+        ),
+    )
+    with (
+        patch("rquant.pipeline.PRESET_SCREENS", {"ranked": preset}),
+        patch("rquant.pipeline.screen", return_value=frame) as screened,
+        patch("rquant.pipeline.load_active_blacklist", return_value={"000001.SZ": object()}),
+    ):
+        outcome = run_daily_screen_stage(sessions[-1].isoformat(), store=store)
+    assert outcome.preset_hits == {"ranked": 1}
+    assert {"TURNOVER_RATE[0]", "CIRC_MV[0]"} <= set(
+        screened.call_args.kwargs["include_columns"]
+    )
+    saved = store.query_screen_result(sessions[-1].isoformat(), "ranked")
+    assert saved["ts_code"].tolist() == ["000002.SZ"]
+    assert saved.iloc[0]["extra"] is None
+    receipt = store.query_screen_run_receipt(sessions[-1].isoformat(), "ranked")
+    assert receipt is not None
+    assert receipt.hit_count == 1
+    assert receipt.price_digest is not None
+
+
+def test_ranked_daily_pool_fails_if_all_metric_facts_are_unknown(store: DuckDBStore) -> None:
+    day = date(2026, 8, 21)
+    store._conn.execute(
+        "INSERT INTO daily_bar (ts_code, trade_date, close) VALUES ('000001.SZ', ?, 10)",
+        [day],
+    )
+    frame = pd.DataFrame(
+        {"ts_code": ["000001.SZ"], "name": ["样本"], "CLOSE[0]": [10.0],
+         "PCT_CHG[0]": [0.0]}
+    )
+    preset = ScreenPreset(
+        name="ranked",
+        description="",
+        rules=[not_st()],
+        ranking=PoolRankingPlan.model_validate(
+            {"conditions": [{"metric": "RETURN_20D_PCT[0]", "ascending": False, "weight": 100}],
+             "top_n": 1}
+        ),
+    )
+    with (
+        patch("rquant.pipeline.PRESET_SCREENS", {"ranked": preset}),
+        patch("rquant.pipeline.screen", return_value=frame),
+    ):
+        outcome = run_daily_screen_stage(day.isoformat(), store=store)
+    assert outcome.preset_hits == {"ranked": -1}
+    assert outcome.errors == ("screen:ranked:ValueError",)
+    assert store.query_screen_result(day.isoformat(), "ranked").empty
+    assert store.query_screen_run_receipt(day.isoformat(), "ranked") is None
 
 
 class TestResolveExecutionOrder:

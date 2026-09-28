@@ -3,13 +3,30 @@
 
 from __future__ import annotations
 
+import re
+from collections.abc import Collection
 from datetime import date, datetime, time
+from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from rquant.fundamental_receipts import (
+    RECEIPT_JOIN,
+    RECEIPT_SELECT,
+    FundamentalReceiptError,
+    checked_fundamental_version,
+)
+from rquant.screen.dynamic_ma import (
+    derive_requested_ma,
+    dynamic_ma_day_count,
+    requested_dynamic_ma,
+)
+from rquant.screen.dynamic_rsi import requested_dynamic_rsi
 from rquant.screen.rules import AggregateRequest
-from rquant.storage.duckdb import DuckDBStore
+
+if TYPE_CHECKING:
+    from rquant.storage.duckdb import DuckDBStore
 
 PRICE_COLS_MAP = {
     "open": "OPEN",
@@ -23,10 +40,18 @@ PRICE_COLS_MAP = {
 }
 
 IND_COLS_MAP = {
-    "ma5": "MA5", "ma10": "MA10", "ma20": "MA20", "ma60": "MA60",
-    "rsi6": "RSI6", "rsi14": "RSI14",
-    "macd": "MACD", "macd_signal": "MACD_SIGNAL", "macd_hist": "MACD_HIST",
-    "kdj_k": "KDJ_K", "kdj_d": "KDJ_D", "kdj_j": "KDJ_J",
+    "ma5": "MA5",
+    "ma10": "MA10",
+    "ma20": "MA20",
+    "ma60": "MA60",
+    "rsi6": "RSI6",
+    "rsi14": "RSI14",
+    "macd": "MACD",
+    "macd_signal": "MACD_SIGNAL",
+    "macd_hist": "MACD_HIST",
+    "kdj_k": "KDJ_K",
+    "kdj_d": "KDJ_D",
+    "kdj_j": "KDJ_J",
 }
 
 STATE_COLS_MAP = {
@@ -53,6 +78,15 @@ BASIC_COLS_MAP = {
     "turnover_rate": "TURNOVER_RATE",
 }
 
+FUNDAMENTAL_COLS_MAP = {
+    "pe_ttm": "PE_TTM",
+    "pb": "PB",
+    "dv_ttm": "DV_TTM",
+    "roe": "ROE",
+    "or_yoy": "OR_YOY",
+    "netprofit_yoy": "NETPROFIT_YOY",
+}
+
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 DAILY_SCREEN_TIME = time(17, 0)
 CALENDAR_EXCHANGE = "SSE"
@@ -69,19 +103,36 @@ _AGGREGATE_SOURCE_COLUMNS = {
     "daily_bar": frozenset(PRICE_COLS_MAP),
     "daily_basic": frozenset(BASIC_COLS_MAP),
 }
+_WIDE_COLUMN = re.compile(r"([A-Z][A-Z0-9_]*)\[(0|[1-9][0-9]*)\]\Z")
+_WIDE_SOURCES = {
+    name: (table, source)
+    for table, mapping in (
+        ("daily_bar", PRICE_COLS_MAP),
+        ("daily_indicator", IND_COLS_MAP),
+        ("daily_state", STATE_COLS_MAP),
+        ("daily_basic", BASIC_COLS_MAP),
+        ("fundamental_daily_version", FUNDAMENTAL_COLS_MAP),
+    )
+    for source, name in mapping.items()
+}
+_BASE_DISPLAY_COLUMNS = frozenset({"CLOSE[0]", "PCT_CHG[0]"})
+_ATTRIBUTE_COLUMNS = frozenset({"is_st", "is_bj", "board_type"})
+_AGGREGATE_STOCK_BATCH = 64
 
 
 class ScreeningCalendarError(RuntimeError):
     """Authoritative trade-calendar coverage cannot support the screen."""
 
 
+class ScreeningFactError(ValueError):
+    """Selected screening facts have ambiguous stock/date identity."""
+
+
 def _parse_trade_date(trade_date: str) -> date:
     return date.fromisoformat(trade_date[:10])
 
 
-def _resolve_decision_at(
-    trade_date: str, decision_at: datetime | None
-) -> datetime:
+def _resolve_decision_at(trade_date: str, decision_at: datetime | None) -> datetime:
     daily_screen_at = datetime.combine(
         _parse_trade_date(trade_date),
         DAILY_SCREEN_TIME,
@@ -152,9 +203,7 @@ def _calendar_window(
     return dates, complete
 
 
-def _resolve_trading_dates(
-    store: DuckDBStore, trade_date: str, lookback: int
-) -> list[str]:
+def _resolve_trading_dates(store: DuckDBStore, trade_date: str, lookback: int) -> list[str]:
     """返回 [T 日, T-1 日, ..., T-lookback 日] 的字符串日期列表。"""
     anchor = _parse_trade_date(trade_date)
     anchor_row = store._conn.execute(
@@ -222,6 +271,8 @@ def _wide_from_long(
     long_df["offset"] = long_df["trade_date_str"].map(date_to_offset)
     long_df = long_df.dropna(subset=["offset"])
     long_df["offset"] = long_df["offset"].astype(int)
+    if long_df.duplicated(subset=["ts_code", "offset"]).any():
+        raise ScreeningFactError("duplicate selected screening facts")
 
     frames: list[pd.DataFrame] = []
     for src, dst in rename_map.items():
@@ -244,17 +295,15 @@ def _compute_aggregate(
     t0_date: str,
     ts_codes: list[str],
     decision_at: datetime,
+    *,
+    sparse_source: bool = False,
 ) -> pd.DataFrame:
     """根据 AggregateRequest 生成 DuckDB SQL，返回 (ts_code, <agg_col>) DataFrame。"""
     allowed_columns = _AGGREGATE_SOURCE_COLUMNS.get(req.source_table)
     if allowed_columns is None or req.source_col not in allowed_columns:
-        raise ValueError(
-            f"Unsupported aggregate source: {req.source_table}.{req.source_col}"
-        )
+        raise ValueError(f"Unsupported aggregate source: {req.source_table}.{req.source_col}")
 
-    window_dates, calendar_complete = _calendar_window(
-        store, t0_date, req.window
-    )
+    window_dates, calendar_complete = _calendar_window(store, t0_date, req.window)
     if req.exclude_offset is not None:
         if 0 <= req.exclude_offset < len(window_dates):
             exclude_date = window_dates[req.exclude_offset]
@@ -270,32 +319,32 @@ def _compute_aggregate(
             }
         )
 
-    complete_predicate = "? AND COUNT(*) FILTER (WHERE fact_known) = ?"
+    complete_predicate = (
+        "? AND COUNT(DISTINCT fact_date) = ? "
+        "AND COUNT(*) = COUNT(DISTINCT fact_date) "
+        "AND COUNT(*) FILTER (WHERE fact_known) = ?"
+    )
     if req.agg_func == "max":
-        agg_expr = (
-            f"CASE WHEN {complete_predicate} "
-            "THEN MAX(source_value) ELSE NULL END"
-        )
+        agg_expr = f"CASE WHEN {complete_predicate} THEN MAX(source_value) ELSE NULL END"
     elif req.agg_func == "sum":
-        agg_expr = (
-            f"CASE WHEN {complete_predicate} "
-            "THEN SUM(source_value) ELSE NULL END"
-        )
+        agg_expr = f"CASE WHEN {complete_predicate} THEN SUM(source_value) ELSE NULL END"
     elif req.agg_func == "any":
         agg_expr = """
         CASE
             WHEN NOT ? THEN NULL
+            WHEN COUNT(*) != COUNT(DISTINCT fact_date) THEN NULL
             WHEN COUNT(*) FILTER (
                 WHERE fact_known AND CAST(source_value AS BOOLEAN)
             ) > 0 THEN TRUE
-            WHEN COUNT(*) FILTER (WHERE fact_known) = ? THEN FALSE
+            WHEN COUNT(DISTINCT fact_date) = ?
+             AND COUNT(*) FILTER (WHERE fact_known) = ? THEN FALSE
             ELSE NULL
         END
         """
     elif req.agg_func == "count_nonzero":
-        agg_expr = """
+        agg_expr = f"""
         CASE
-            WHEN ? AND COUNT(*) FILTER (WHERE fact_known) = ?
+            WHEN {complete_predicate}
             THEN COUNT(*) FILTER (
                 WHERE fact_known AND CAST(source_value AS BOOLEAN)
             )
@@ -310,44 +359,335 @@ def _compute_aggregate(
         if req.source_table == "daily_state"
         else ""
     )
-    sql = f"""
-    WITH expected AS (
-        SELECT codes.ts_code, dates.trade_date
-        FROM UNNEST(?::VARCHAR[]) AS codes(ts_code)
-        CROSS JOIN UNNEST(?::DATE[]) AS dates(trade_date)
-    ),
-    facts AS (
-        SELECT
-            expected.ts_code,
-            source.{req.source_col} AS source_value,
-            source.ts_code IS NOT NULL
-                AND source.{req.source_col} IS NOT NULL
-                AND status.ts_code IS NOT NULL
-                AND status.conflict_reason IS NULL
-                AND status.is_st IS NOT NULL
-                AND status.available_at IS NOT NULL
-                AND status.available_at <= ?
-                {state_matches_status}
-                AS fact_known
-        FROM expected
-        LEFT JOIN {req.source_table} AS source
-            ON source.ts_code = expected.ts_code
-           AND source.trade_date = expected.trade_date
-        LEFT JOIN stock_status_daily AS status
-            ON status.ts_code = expected.ts_code
-           AND status.trade_date = expected.trade_date
-    )
-    SELECT ts_code, {agg_expr} AS aggregate_value
-    FROM facts
-    GROUP BY ts_code
-    ORDER BY ts_code
-    """
     expected_count = len(window_dates)
-    params: list[object] = [ts_codes, window_dates, decision_at]
-    params.extend([calendar_complete, expected_count])
+    if sparse_source:
+        code_slots = ",".join("?" for _ in ts_codes)
+        date_slots = ",".join("?" for _ in window_dates)
+        sql = f"""
+        WITH facts AS (
+            SELECT source.ts_code, source.trade_date AS fact_date,
+                   source.{req.source_col} AS source_value,
+                   source.{req.source_col} IS NOT NULL
+                     AND status.ts_code IS NOT NULL
+                     AND status.conflict_reason IS NULL
+                     AND status.is_st IS NOT NULL
+                     AND status.available_at IS NOT NULL
+                     AND status.available_at <= ?
+                     {state_matches_status}
+                     AS fact_known
+            FROM {req.source_table} AS source
+            LEFT JOIN stock_status_daily AS status
+              ON status.ts_code = source.ts_code
+             AND status.trade_date = source.trade_date
+            WHERE source.ts_code IN ({code_slots})
+              AND source.trade_date IN ({date_slots})
+        )
+        SELECT ts_code, {agg_expr} AS aggregate_value
+        FROM facts GROUP BY ts_code ORDER BY ts_code
+        """
+        params: list[object] = [decision_at, *ts_codes, *window_dates]
+    else:
+        sql = f"""
+        WITH expected AS (
+            SELECT codes.ts_code, dates.trade_date
+            FROM UNNEST(?::VARCHAR[]) AS codes(ts_code)
+            CROSS JOIN UNNEST(?::DATE[]) AS dates(trade_date)
+        ),
+        facts AS (
+            SELECT
+                expected.ts_code,
+                expected.trade_date AS fact_date,
+                source.{req.source_col} AS source_value,
+                source.ts_code IS NOT NULL
+                    AND source.{req.source_col} IS NOT NULL
+                    AND status.ts_code IS NOT NULL
+                    AND status.conflict_reason IS NULL
+                    AND status.is_st IS NOT NULL
+                    AND status.available_at IS NOT NULL
+                    AND status.available_at <= ?
+                    {state_matches_status}
+                    AS fact_known
+            FROM expected
+            LEFT JOIN {req.source_table} AS source
+                ON source.ts_code = expected.ts_code
+               AND source.trade_date = expected.trade_date
+            LEFT JOIN stock_status_daily AS status
+                ON status.ts_code = expected.ts_code
+               AND status.trade_date = expected.trade_date
+        )
+        SELECT ts_code, {agg_expr} AS aggregate_value
+        FROM facts
+        GROUP BY ts_code
+        ORDER BY ts_code
+        """
+        params = [ts_codes, window_dates, decision_at]
+    params.extend([calendar_complete, expected_count, expected_count])
     result = store._conn.execute(sql, params).fetchdf()
     result = result.rename(columns={"aggregate_value": req.name})
     return result
+
+
+def _selected_sources(
+    required_columns: Collection[str], lookback: int
+) -> tuple[dict[str, dict[str, set[int]]], frozenset[str]]:
+    selected: dict[str, dict[str, set[int]]] = {}
+    wide_columns = set(_BASE_DISPLAY_COLUMNS)
+    dynamic_ma = requested_dynamic_ma(required_columns)
+    dynamic_rsi = {
+        column
+        for column, (period, _) in requested_dynamic_rsi(frozenset(required_columns)).items()
+        if period not in (6, 14)
+    }
+    for column in required_columns:
+        if not isinstance(column, str):
+            raise ValueError("unsupported screen dependency")
+        if column in _ATTRIBUTE_COLUMNS:
+            continue
+        match = _WIDE_COLUMN.fullmatch(column)
+        if match is None or (
+            match.group(1) not in _WIDE_SOURCES
+            and column not in dynamic_ma
+            and column not in dynamic_rsi
+        ):
+            raise ValueError(f"unsupported screen dependency: {column}")
+        offset = int(match.group(2))
+        if offset > lookback:
+            raise ValueError(f"screen dependency offset exceeds lookback: {column}")
+        if match.group(1) in FUNDAMENTAL_COLS_MAP.values() and offset != 0:
+            raise ValueError(f"fundamental screen dependency offset must be zero: {column}")
+        wide_columns.add(column)
+    for column in sorted(wide_columns):
+        if column in dynamic_ma or column in dynamic_rsi:
+            continue
+        match = _WIDE_COLUMN.fullmatch(column)
+        assert match is not None
+        table, source = _WIDE_SOURCES[match.group(1)]
+        selected.setdefault(table, {}).setdefault(source, set()).add(int(match.group(2)))
+    return selected, frozenset(wide_columns)
+
+
+def _load_fundamental_wide(
+    store: DuckDBStore,
+    *,
+    trade_date: str,
+    ts_codes: list[str],
+    sources: Collection[str],
+    decision_at: datetime | None,
+) -> pd.DataFrame:
+    """Project exact head receipts in one bounded query, without re-deriving PIT."""
+    expected_decision = _resolve_decision_at(trade_date, None)
+    if _resolve_decision_at(trade_date, decision_at) != expected_decision:
+        raise ScreeningFactError("fundamental screen requires the fixed T17 decision")
+    code_slots = ",".join("?" for _ in ts_codes)
+    rows = store._conn.execute(
+        f"SELECT {RECEIPT_SELECT} {RECEIPT_JOIN} "
+        f"WHERE h.trade_date = ? AND h.ts_code IN ({code_slots}) ORDER BY h.ts_code",
+        [trade_date, *ts_codes],
+    ).fetchall()
+    expected_date = _parse_trade_date(trade_date)
+    seen: set[str] = set()
+    projected: list[dict[str, object]] = []
+    for row in rows:
+        if row[0] in seen:
+            raise ScreeningFactError("fundamental daily head is ambiguous or incomplete")
+        seen.add(row[0])
+        try:
+            version = checked_fundamental_version(row, expected_date=expected_date)
+        except FundamentalReceiptError as error:
+            raise ScreeningFactError("fundamental daily version receipt mismatch") from error
+        projected.append(
+            {
+                "ts_code": version.ts_code,
+                **{
+                    f"{FUNDAMENTAL_COLS_MAP[name]}[0]": (
+                        float(version.fields[name].value)
+                        if version.fields[name].value is not None
+                        else float("nan")
+                    )
+                    for name in sources
+                },
+            }
+        )
+    return pd.DataFrame(
+        projected, columns=["ts_code", *(f"{FUNDAMENTAL_COLS_MAP[name]}[0]" for name in sources)]
+    )
+
+
+def _load_selected_wide(
+    store: DuckDBStore,
+    table: str,
+    fields: dict[str, set[int]],
+    dates: list[str],
+    ts_codes: list[str],
+    decision_at: datetime,
+) -> list[pd.DataFrame]:
+    """Fetch fields sharing offsets together; never materialize their cross product."""
+    groups: dict[frozenset[int], list[str]] = {}
+    for source, offsets in fields.items():
+        groups.setdefault(frozenset(offsets), []).append(source)
+    mapping = {
+        "daily_bar": PRICE_COLS_MAP,
+        "daily_indicator": IND_COLS_MAP,
+        "daily_state": STATE_COLS_MAP,
+        "daily_basic": BASIC_COLS_MAP,
+    }[table]
+    code_slots = ",".join("?" for _ in ts_codes)
+    frames: list[pd.DataFrame] = []
+    for offsets, sources in groups.items():
+        selected_dates = [dates[offset] for offset in sorted(offsets)]
+        date_slots = ",".join("?" for _ in selected_dates)
+        if table == "daily_state" and any(source in PIT_STATE_COLS for source in sources):
+            state_columns_sql = ", ".join(f"state.{source}" for source in sources)
+            value_sql = ", ".join(
+                f"CASE WHEN status_visible THEN {source} ELSE NULL END AS {source}"
+                if source in PIT_STATE_COLS
+                else source
+                for source in sources
+            )
+            sql = f"""
+                WITH state_facts AS (
+                    SELECT state.ts_code, state.trade_date, {state_columns_sql},
+                           status.ts_code IS NOT NULL
+                             AND status.conflict_reason IS NULL
+                             AND status.is_st IS NOT NULL
+                             AND status.available_at IS NOT NULL
+                             AND status.available_at <= ?
+                             AND state.is_st IS NOT DISTINCT FROM status.is_st
+                             AS status_visible
+                    FROM daily_state AS state
+                    LEFT JOIN stock_status_daily AS status
+                      ON status.ts_code = state.ts_code
+                     AND status.trade_date = state.trade_date
+                    WHERE state.ts_code IN ({code_slots})
+                      AND state.trade_date IN ({date_slots})
+                )
+                SELECT ts_code, strftime(trade_date, '%Y-%m-%d') AS trade_date_str,
+                       {value_sql}
+                FROM state_facts
+            """
+            params: list[object] = [decision_at, *ts_codes, *selected_dates]
+        else:
+            sql = f"""
+                SELECT ts_code, strftime(trade_date, '%Y-%m-%d') AS trade_date_str,
+                       {", ".join(sources)}
+                FROM {table}
+                WHERE ts_code IN ({code_slots})
+                  AND trade_date IN ({date_slots})
+            """
+            params = [*ts_codes, *selected_dates]
+        long_frame = store._conn.execute(sql, params).fetchdf()
+        frames.append(
+            _wide_from_long(
+                long_frame,
+                {source: mapping[source] for source in sources},
+                {day: offset for offset, day in enumerate(dates)},
+            )
+        )
+    return frames
+
+
+def _load_universe_selective(
+    trade_date: str,
+    lookback: int,
+    store: DuckDBStore,
+    aggregate_requests: list[AggregateRequest] | None,
+    decision_at: datetime | None,
+    required_columns: Collection[str],
+) -> pd.DataFrame:
+    selected, wide_columns = _selected_sources(required_columns, lookback)
+    if "fundamental_daily_version" in selected:
+        raise ScreeningFactError("fundamental screen requires a verified replica")
+    dynamic_ma = requested_dynamic_ma(required_columns)
+    resolved_decision_at = _resolve_decision_at(trade_date, decision_at)
+    needed_days = dynamic_ma_day_count(dynamic_ma)
+    all_dates = _resolve_trading_dates(store, trade_date, max(lookback + 1, needed_days) - 1)
+    dates = all_dates[: lookback + 1]
+    t0_date = dates[0]
+    universe = store._conn.execute(
+        """
+        SELECT daily.ts_code,
+               CASE WHEN status.conflict_reason IS NULL
+                         AND status.name IS NOT NULL
+                         AND length(trim(status.name)) > 0
+                         AND status.available_at IS NOT NULL
+                         AND status.available_at <= ?
+                    THEN trim(status.name) ELSE NULL END AS name,
+               CASE WHEN status.conflict_reason IS NULL
+                         AND status.is_st IS NOT NULL
+                         AND status.available_at IS NOT NULL
+                         AND status.available_at <= ?
+                    THEN status.is_st ELSE NULL END AS is_st
+        FROM daily_bar AS daily
+        LEFT JOIN stock_status_daily AS status
+          ON status.ts_code = daily.ts_code AND status.trade_date = daily.trade_date
+        WHERE daily.trade_date = ?
+        ORDER BY daily.ts_code
+        """,
+        [resolved_decision_at, resolved_decision_at, t0_date],
+    ).fetchdf()
+    if universe.empty:
+        return pd.DataFrame()
+    if universe["ts_code"].duplicated().any():
+        raise ScreeningFactError("duplicate screen universe facts")
+
+    ts_codes = universe["ts_code"].tolist()
+    code_slots = ",".join("?" for _ in ts_codes)
+    state_t0 = store._conn.execute(
+        f"SELECT ts_code, is_bj, board_type FROM daily_state "
+        f"WHERE ts_code IN ({code_slots}) AND trade_date = ?",
+        [*ts_codes, t0_date],
+    ).fetchdf()
+    if state_t0["ts_code"].duplicated().any():
+        raise ScreeningFactError("duplicate screen state facts")
+    out = universe.merge(state_t0, on="ts_code", how="left")
+    for table, fields in selected.items():
+        for wide in _load_selected_wide(
+            store, table, fields, dates, ts_codes, resolved_decision_at
+        ):
+            if not wide.empty:
+                out = out.merge(wide, on="ts_code", how="left")
+
+    if dynamic_ma:
+        dynamic = derive_requested_ma(
+            store._conn,
+            dates=all_dates[:needed_days],
+            ts_codes=ts_codes,
+            columns=dynamic_ma,
+        )
+        out = out.merge(dynamic, on="ts_code", how="left", validate="one_to_one")
+
+    missing_columns = [column for column in sorted(wide_columns) if column not in out.columns]
+    if missing_columns:
+        out = pd.concat(
+            [out, pd.DataFrame(float("nan"), index=out.index, columns=missing_columns)],
+            axis=1,
+        )
+    for request in aggregate_requests or []:
+        aggregates = [
+            _compute_aggregate(
+                store,
+                request,
+                t0_date,
+                ts_codes[start : start + _AGGREGATE_STOCK_BATCH],
+                resolved_decision_at,
+                sparse_source=True,
+            )
+            for start in range(0, len(ts_codes), _AGGREGATE_STOCK_BATCH)
+        ]
+        aggregate = pd.concat(aggregates, ignore_index=True)
+        if not aggregate.empty:
+            out = out.merge(aggregate, on="ts_code", how="left")
+        else:
+            out[request.name] = pd.Series(pd.NA, index=out.index, dtype="object")
+    if "is_bj" not in out.columns:
+        out["is_bj"] = pd.Series(pd.NA, index=out.index, dtype="boolean")
+    if "board_type" not in out.columns:
+        out["board_type"] = pd.Series(pd.NA, index=out.index, dtype="string")
+    out["name"] = out["name"].astype("string")
+    out["is_st"] = out["is_st"].astype("boolean")
+    out["is_bj"] = out["is_bj"].astype("boolean")
+    out["board_type"] = out["board_type"].astype("string")
+    return out
 
 
 def load_universe(
@@ -356,6 +696,7 @@ def load_universe(
     store: DuckDBStore | None = None,
     aggregate_requests: list[AggregateRequest] | None = None,
     decision_at: datetime | None = None,
+    required_columns: Collection[str] | None = None,
 ) -> pd.DataFrame:
     """Load one post-close universe with PIT security status at ``decision_at``.
 
@@ -365,9 +706,21 @@ def load_universe(
     Research callers must enforce those dataset contracts before calling.
     """
     owns_store = store is None
-    store = store or DuckDBStore()
+    if not store:
+        from rquant.storage.duckdb import DuckDBStore
+
+        store = DuckDBStore()
 
     try:
+        if required_columns is not None:
+            return _load_universe_selective(
+                trade_date,
+                lookback,
+                store,
+                aggregate_requests,
+                decision_at,
+                required_columns,
+            )
         resolved_decision_at = _resolve_decision_at(trade_date, decision_at)
         dates = _resolve_trading_dates(store, trade_date, lookback)
         if not dates:
@@ -500,12 +853,18 @@ def load_universe(
         # - 数值规则（circ_mv_lt 内部 .fillna(inf)）拿 NaN 得 False（该股不入选）
         # - bool 状态规则只接受显式 True/False，NaN 会 fail closed
         max_offset = len(dates) - 1
+        missing_columns: list[str] = []
         for cmap in (PRICE_COLS_MAP, IND_COLS_MAP, BASIC_COLS_MAP, STATE_COLS_MAP):
             for dst in cmap.values():
                 for off in range(max_offset + 1):
                     col = f"{dst}[{off}]"
                     if col not in out.columns:
-                        out[col] = float("nan")
+                        missing_columns.append(col)
+        if missing_columns:
+            out = pd.concat(
+                [out, pd.DataFrame(float("nan"), index=out.index, columns=missing_columns)],
+                axis=1,
+            )
 
         # 聚合列：根据 AggregateRequest 动态生成 SQL
         if aggregate_requests:

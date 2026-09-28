@@ -5,7 +5,7 @@ board members from ``rquant.panorama_data``'s test-only fixtures. No real market
 The one real thing is the trade calendar: the published 2026 SSE schedule (weekdays minus
 the exchange holidays, e.g. 2026-09-25 中秋 is closed and the next open day is 09-28),
 because the top bar and the overview read it and a weekday rule would call a holiday a
-trading day. Like the production calendar it lists open dates only and ends 2026-12-31.
+trading day. It explicitly marks each natural day through 2026-12-31.
 
 Generations go through the production path — ``ServingReadModelInput`` validation,
 ``build_serving_read_models`` and a ``ServingPublisher`` over ``SERVING_TABLE_SPECS`` — so
@@ -18,7 +18,10 @@ Scenarios:
   ``minute_coverage``, the latest daily screen (``canvas_hit``,
   ``canvas_latest_trade_date``, ``screen_bounds``), ``trade_calendar`` and
   ``stock_basic``; every watermark fresh.
-* ``panorama``: ``baseline`` plus every table the market panorama reads.
+* ``panorama``: ``baseline`` plus market panorama tables, a second paper account,
+  and published minute replay rows for browser tests.
+* ``platform_empty``: published but empty minute replay tables.
+* ``platform_summary_only``: replay summaries published without trades.
 * ``degraded``: ``baseline`` with degraded / unavailable watermarks and two page
   projections left unpublished.
 
@@ -39,11 +42,13 @@ from collections.abc import Mapping, Sequence
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
 
+from rquant.data_metadata import DataAuditRun, DataAuditRunFinalization, DataQualityIssue
 from rquant.delivery_contracts import DeliveryChannel, DeliveryTarget, OutboxRecord, OutboxStatus
 from rquant.panorama_data import (
     _FAKE_CODES,
@@ -58,6 +63,7 @@ from rquant.panorama_data import (
     _session_minute_stamps,
 )
 from rquant.paper_contracts import PaperAccountSnapshot, PaperHolding
+from rquant.pool_definition_projection import build_pool_definition_rows
 from rquant.runtime_service_control import (
     RuntimeServiceHealth,
     RuntimeServiceHeartbeatProjection,
@@ -69,9 +75,11 @@ from rquant.serving_contracts import (
     ServingDatasetWatermark,
     ServingGenerationManifest,
 )
+from rquant.serving_page_projection_source import DuckDBLabPageProjectionSource
 from rquant.serving_publisher import ServingPublisher
 from rquant.serving_read_models import (
     SERVING_TABLE_SPECS,
+    ServingLabJobRecord,
     ServingProjectionInput,
     ServingProjectionPayload,
     ServingReadModelInput,
@@ -80,8 +88,16 @@ from rquant.serving_read_models import (
 )
 from rquant.signal_bus import RouteReceiptDisposition, SignalRouteReceipt
 from rquant.signal_contracts import SignalAction, SignalEnvelope
+from rquant.storage.duckdb import DuckDBStore
 
-SCENARIOS = ("baseline", "panorama", "degraded")
+SCENARIOS = (
+    "baseline",
+    "panorama",
+    "platform_empty",
+    "platform_summary_only",
+    "degraded",
+)
+_PANORAMA_SCENARIOS = frozenset(("panorama", "platform_empty", "platform_summary_only"))
 FIXTURE_PRODUCER_COMMIT = "0e5b0e5b0e5b0e5b0e5b0e5b0e5b0e5b0e5b0e5b"
 #: Schema version the production publisher writes (manifest ``schema_version`` 3).
 FIXTURE_SCHEMA_VERSION = 3
@@ -125,7 +141,7 @@ def _cst(day: date, hour: int, minute: int, second: int = 0) -> datetime:
 
 
 #: Weekday closures of the 2026 SSE calendar (the exchange's published holiday schedule;
-#: the same dates the production ``trade_calendar`` projection leaves out).
+#: the same dates the production ``trade_calendar`` projection marks closed).
 SSE_2026_WEEKDAY_CLOSURES = frozenset(
     date.fromisoformat(day)
     for day in (
@@ -359,6 +375,19 @@ def _paper_account(as_of: datetime) -> PaperAccountSnapshot:
     )
 
 
+def _cash_only_account(as_of: datetime) -> PaperAccountSnapshot:
+    return PaperAccountSnapshot(
+        account_id="cash-only",
+        as_of_time=as_of,
+        cash=Decimal("5000.00"),
+        available_cash=Decimal("5000.00"),
+        frozen_cash=Decimal("0"),
+        realized_pnl=Decimal("0"),
+        unrealized_pnl=Decimal("0"),
+        nav=Decimal("5000.00"),
+    )
+
+
 # ------------------------------------------------------------------ projections
 
 
@@ -379,6 +408,102 @@ def _projection(
         owner_dataset_id=owner,
         owner_generation_id=generations[owner],
     )
+
+
+def _backtest_summary(built_at: datetime) -> list[dict[str, object]]:
+    common: dict[str, object] = {
+        "start_date": "2026-07-01",
+        "end_date": "2026-07-31",
+        "max_hold_days": 3,
+        "candidates": 100,
+        "trigger_rate_pct": 22.0,
+        "mean_ret_pct": 2.0,
+        "median_ret_pct": 2.0,
+        "win_rate_pct": 100.0,
+        "best_ret_pct": 2.0,
+        "worst_ret_pct": 2.0,
+        "gap_stop_rate_pct": 0.0,
+    }
+    return [
+        {
+            **common,
+            "run_id": "run-earlier",
+            "computed_at": _utc_iso(built_at - timedelta(minutes=11)),
+            "entry_mode": "first_break",
+            "profile_variant": "baseline",
+            "trades": 22,
+        },
+        {
+            **common,
+            "run_id": "run-earlier",
+            "computed_at": _utc_iso(built_at - timedelta(minutes=10)),
+            "entry_mode": "break_retest",
+            "profile_variant": "vp_90",
+            "trades": 1,
+            "trigger_rate_pct": 1.0,
+            "mean_ret_pct": -2.0,
+            "median_ret_pct": -2.0,
+            "win_rate_pct": 0.0,
+            "best_ret_pct": -2.0,
+        },
+        {
+            **common,
+            "run_id": "run-later",
+            "computed_at": _utc_iso(built_at - timedelta(minutes=5)),
+            "entry_mode": "first_break",
+            "profile_variant": "baseline",
+            "trades": 0,
+            "trigger_rate_pct": 0.0,
+            "mean_ret_pct": None,
+            "median_ret_pct": None,
+            "win_rate_pct": None,
+            "best_ret_pct": None,
+            "worst_ret_pct": None,
+        },
+    ]
+
+
+def _backtest_trades() -> list[dict[str, object]]:
+    common: dict[str, object] = {
+        "run_id": "run-earlier",
+        "profile_variant": "baseline",
+        "entry_mode": "first_break",
+        "ts_code": "600001.SH",
+        "name": "样本01",
+        "entry_price_raw": 10.0,
+        "entry_price": 10.1,
+        "stop_loss_basis": 9.8,
+        "take_profit_basis": 10.5,
+        "volume_profile_lookbacks": "[]",
+        "volume_profile_rr": None,
+        "exit_price": 10.3,
+    }
+    trades = [
+        {
+            **common,
+            "trade_id": f"trade-{day}",
+            "signal_date": f"2026-07-{day:02d}",
+            "entry_time": f"2026-07-{day:02d}T01:31:00Z",
+            "exit_time": f"2026-07-{day:02d}T06:31:00Z",
+            "exit_reason": "time_3d" if day == 29 else "take_profit_trailing",
+            "ret_pct": 2.0,
+        }
+        for day in range(8, 30)
+    ]
+    trades.append(
+        {
+            **common,
+            "trade_id": "trade-3",
+            "signal_date": "2026-07-31",
+            "entry_mode": "break_retest",
+            "profile_variant": "vp_90",
+            "entry_time": "2026-07-31T01:31:00Z",
+            "exit_time": "2026-07-31T06:31:00Z",
+            "exit_reason": "stop_loss",
+            "ret_pct": -2.0,
+        },
+    )
+    return trades
 
 
 def _dashboard_summary(built_at: datetime) -> list[dict[str, object]]:
@@ -438,11 +563,12 @@ def _minute_coverage() -> list[dict[str, object]]:
 
 
 def _trade_calendar() -> list[dict[str, object]]:
-    # Open dates only, like the production projection.
-    return [
-        {"trade_date": day.isoformat(), "exchange": "SSE", "is_open": True}
-        for day in _trading_days(CALENDAR_START, CALENDAR_END)
-    ]
+    open_days = frozenset(_trading_days(CALENDAR_START, CALENDAR_END))
+    rows: list[dict[str, object]] = []
+    for offset in range((CALENDAR_END - CALENDAR_START).days + 1):
+        day = CALENDAR_START + timedelta(days=offset)
+        rows.append({"trade_date": day.isoformat(), "exchange": "SSE", "is_open": day in open_days})
+    return rows
 
 
 #: The latest daily screen: selected after the 2026-09-23 close for the 09-24 session.
@@ -502,6 +628,24 @@ def _stock_basic() -> list[dict[str, object]]:
     return [
         {"ts_code": code, "name": f"样本{index:02d}", "industry": industries[index % 5]}
         for index, code in enumerate(_FAKE_CODES, start=1)
+    ]
+
+
+def _nl_screen_universe() -> list[dict[str, object]]:
+    return [
+        {
+            "trade_date": FIXTURE_TRADE_DATE.isoformat(),
+            "ts_code": stock["ts_code"],
+            "name": stock["name"],
+            "is_st": index % 10 == 0,
+            "is_bj": False,
+            "board_type": "main",
+            "CLOSE[0]": float(10 + index),
+            "PCT_CHG[0]": float(index - 15),
+            "CIRC_MV[0]": float(index * 50_000),
+            "MA5[0]": float(20 + index // 2),
+        }
+        for index, stock in enumerate(_stock_basic(), start=1)
     ]
 
 
@@ -713,6 +857,43 @@ def _surge_events() -> list[dict[str, object]]:
     ]
 
 
+def _sample_surge_event() -> dict[str, object]:
+    return {
+        "trade_date": FIXTURE_TRADE_DATE.isoformat(),
+        "confirmed_at": "09:52",
+        "ts_code": "600004.SH",
+        "name": "样本04",
+        "theme": "工业",
+        "price": 11.25,
+        "pct_chg": 3.15,
+        "cum_amount": 1.2e8,
+        "rel_cum": 2.8,
+        "room_to_limit_pct": 6.85,
+        "status": "confirmed",
+    }
+
+
+def _timeline_surge_events(scenario: str) -> list[dict[str, object]]:
+    if scenario in _PANORAMA_SCENARIOS:
+        return _surge_events()
+    return [_sample_surge_event()]
+
+
+def _monitor_events() -> list[dict[str, object]]:
+    return [
+        {
+            "trade_date": FIXTURE_TRADE_DATE.isoformat(),
+            "trigger_time": _utc_iso(_cst(FIXTURE_TRADE_DATE, 10, 5)),
+            "ts_code": "600005.SH",
+            "level": "attack_break_high",
+            "trigger_price": 12.34,
+            "level_price": 12.0,
+            "trigger_type": "attack",
+            "pool": "pool2",
+        }
+    ]
+
+
 def _pulse_history() -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     for row in _fake_pulse_history().itertuples(index=False):
@@ -793,6 +974,9 @@ def _projections(
     projections = [
         reference("trade_calendar", _trade_calendar()),
         reference("stock_basic", _stock_basic()),
+        reference("nl_screen_universe", _nl_screen_universe()),
+        signal_owned("monitor_event", _monitor_events()),
+        signal_owned("surge_event", _timeline_surge_events(scenario)),
     ]
     if scenario != "degraded":
         projections.append(
@@ -815,11 +999,15 @@ def _projections(
                 signal_owned("screen_bounds", _screen_bounds()),
             )
         )
-    if scenario == "panorama":
+    if scenario in _PANORAMA_SCENARIOS:
         as_of = _cst(FIXTURE_TRADE_DATE, 15, 0, 3).astimezone(UTC)
         board_rows, member_rows = _dc_boards()
         projections.extend(
             (
+                signal_owned(
+                    "pool_definition",
+                    build_pool_definition_rows({}, {}, root_path="/synthetic"),
+                ),
                 signal_owned("market_snapshot", _market_snapshot(as_of)),
                 signal_owned("market_overview", _market_overview(as_of)),
                 reference("dc_board", board_rows),
@@ -828,7 +1016,6 @@ def _projections(
                 reference("market_liquidity", _market_liquidity()),
                 reference("daily_bar", _daily_bars()),
                 signal_owned("intraday_kline", _intraday_bars()),
-                signal_owned("surge_event", _surge_events()),
                 signal_owned("pulse_history", _pulse_history()),
                 signal_owned("pulse_alert", _pulse_alerts()),
                 signal_owned("surge_runtime_config", _surge_runtime_config(as_of)),
@@ -865,6 +1052,26 @@ def _projections(
                 ),
             )
         )
+    if scenario in _PANORAMA_SCENARIOS:
+        projections.append(
+            _projection(
+                "strategy_summary",
+                [] if scenario == "platform_empty" else _backtest_summary(built_at),
+                owner="lab_jobs",
+                generations=generations,
+                available_at=built_at - timedelta(seconds=10),
+            )
+        )
+        if scenario != "platform_summary_only":
+            projections.append(
+                _projection(
+                    "strategy_trade",
+                    [] if scenario == "platform_empty" else _backtest_trades(),
+                    owner="lab_jobs",
+                    generations=generations,
+                    available_at=built_at - timedelta(seconds=10),
+                )
+            )
     return tuple(sorted(projections, key=lambda item: item.table_name))
 
 
@@ -922,6 +1129,19 @@ def build_web_fixture(
     scenario: str,
     *,
     sequence: int = 0,
+    event_projections: tuple[ServingProjectionPayload, ...] | None = None,
+    lab_jobs: tuple[ServingLabJobRecord, ...] = (),
+    paper_accounts: tuple[PaperAccountSnapshot, ...] | None = None,
+    paper_history_projections: tuple[ServingProjectionPayload, ...] = (),
+    legacy_paper_schema: bool = False,
+    lab_page_projections: tuple[ServingProjectionPayload, ...] | None = None,
+    audit_report_projections: tuple[ServingProjectionPayload, ...] = (),
+    formula_market_projections: tuple[ServingProjectionPayload, ...] = (),
+    formula_pool_projections: tuple[ServingProjectionPayload, ...] = (),
+    backfill_plan_projections: tuple[ServingProjectionPayload, ...] = (),
+    audit: bool = False,
+    signal_projections: tuple[ServingProjectionPayload, ...] = (),
+    calendar_projection: ServingProjectionPayload | None = None,
 ) -> ServingGenerationManifest:
     """Publish generation ``sequence`` of ``scenario`` into ``root`` and select it."""
 
@@ -932,23 +1152,184 @@ def build_web_fixture(
     built_at = fixture_built_at(sequence)
     generations = _generation_ids(scenario, sequence)
     signals, routes, deliveries = _signal_bundle(built_at)
+    if audit:
+        if lab_page_projections is not None:
+            raise ValueError("audit fixture cannot also accept Lab projections")
+        with TemporaryDirectory(prefix="rquant-web-audit-") as directory:
+            research = Path(directory) / "research.duckdb"
+            observed_at = built_at - timedelta(minutes=10)
+            issue = DataQualityIssue.detected(
+                rule_id="minute-without-daily",
+                dataset_id="minute_bar",
+                severity="P1",
+                scope_key="synthetic/secret/2026-09-24",
+                message="Synthetic /private/path must stay hidden",
+                evidence={"path": "/private/path"},
+                observed_at=observed_at,
+            )
+            limit_up_issue = DataQualityIssue.detected(
+                rule_id="limit-up-pool-calendar-coverage",
+                dataset_id="limit_up_pool_daily",
+                severity="P2",
+                scope_key="synthetic/limit-up/2026-09-23",
+                message="Synthetic calendar gap /private/path",
+                evidence={"path": "/private/path"},
+                observed_at=observed_at,
+            )
+            with DuckDBStore(research) as store:
+                store.record_data_quality_issue(issue)
+                store.record_data_quality_issue(limit_up_issue)
+                completed = store.begin_data_audit_run(
+                    DataAuditRun.create(
+                        as_of_date=date(2026, 9, 23),
+                        range_start=date(2026, 9, 1),
+                        range_end=date(2026, 9, 23),
+                        rule_set_version="stage1-v3",
+                        observed_at=observed_at,
+                    )
+                )
+                store.finalize_data_audit_run(
+                    completed.audit_run_id,
+                    DataAuditRunFinalization(
+                        finding_issue_ids=(issue.issue_id, limit_up_issue.issue_id),
+                        p0_count=0,
+                        completed_at=observed_at + timedelta(minutes=1),
+                    ),
+                )
+                failed = store.begin_data_audit_run(
+                    DataAuditRun.create(
+                        as_of_date=date(2026, 9, 24),
+                        range_start=date(2026, 9, 1),
+                        range_end=date(2026, 9, 24),
+                        rule_set_version="stage1-v3",
+                        observed_at=observed_at + timedelta(minutes=2),
+                    )
+                )
+                store.fail_data_audit_run(
+                    failed.audit_run_id,
+                    error_message="Synthetic secret failure /private/path",
+                    completed_at=observed_at + timedelta(minutes=3),
+                )
+            lab_page_projections = DuckDBLabPageProjectionSource(research)(built_at).projections
+    projections = _projections(scenario, built_at=built_at, generations=generations)
+    if paper_history_projections:
+        projections += tuple(
+            ServingProjectionInput.bind(
+                item,
+                owner_dataset_id="paper_accounts",
+                owner_generation_id=generations["paper_accounts"],
+            )
+            for item in paper_history_projections
+        )
+    if calendar_projection is not None:
+        if calendar_projection.table_name != "trade_calendar":
+            raise ValueError("calendar fixture override must be trade_calendar")
+        replacement = ServingProjectionInput.bind(
+            calendar_projection,
+            owner_dataset_id="reference_slow_authority",
+            owner_generation_id=generations["reference_slow_authority"],
+        )
+        projections = tuple(
+            replacement if item.table_name == "trade_calendar" else item for item in projections
+        )
+    if signal_projections:
+        replacements = {
+            item.table_name: ServingProjectionInput.bind(
+                item,
+                owner_dataset_id="signals",
+                owner_generation_id=generations["signals"],
+            )
+            for item in signal_projections
+        }
+        projections = tuple(replacements.get(item.table_name, item) for item in projections)
+        projections += tuple(
+            item
+            for name, item in replacements.items()
+            if name not in {existing.table_name for existing in projections}
+        )
+    projections += tuple(
+        ServingProjectionInput.bind(
+            item,
+            owner_dataset_id="signals",
+            owner_generation_id=generations["signals"],
+        )
+        for item in formula_pool_projections
+    )
+    if lab_page_projections is not None:
+        if {item.table_name for item in lab_page_projections} != {
+            "data_audit_issue",
+            "data_audit_status",
+            "research_gate_metadata",
+        }:
+            raise ValueError("lab audit fixture projections are incomplete")
+        projections += tuple(
+            ServingProjectionInput.bind(
+                item,
+                owner_dataset_id="lab_jobs",
+                owner_generation_id=generations["lab_jobs"],
+            )
+            for item in lab_page_projections
+        )
+    projections += tuple(
+        ServingProjectionInput.bind(
+            item,
+            owner_dataset_id="lab_jobs",
+            owner_generation_id=generations["lab_jobs"],
+        )
+        for item in (
+            *audit_report_projections,
+            *formula_market_projections,
+            *backfill_plan_projections,
+        )
+    )
+    if event_projections is not None:
+        if {item.table_name for item in event_projections} != {"monitor_event", "surge_event"}:
+            raise ValueError("event replay must supply both event projections")
+        replacements = {
+            item.table_name: ServingProjectionInput.bind(
+                item,
+                owner_dataset_id="signals",
+                owner_generation_id=generations["signals"],
+            )
+            for item in event_projections
+        }
+        projections = tuple(replacements.get(item.table_name, item) for item in projections)
+    default_paper_accounts = (_paper_account(built_at - timedelta(seconds=30)),)
+    if scenario in _PANORAMA_SCENARIOS:
+        default_paper_accounts += (_cash_only_account(built_at - timedelta(minutes=1)),)
     source = ServingReadModelInput(
         observed_at=built_at,
         signals=signals,
         routes=routes,
         deliveries=deliveries,
-        paper_accounts=(_paper_account(built_at - timedelta(seconds=30)),),
+        paper_accounts=default_paper_accounts if paper_accounts is None else paper_accounts,
         runtime_services=_runtime_services(built_at - timedelta(seconds=5)),
-        projections=_projections(scenario, built_at=built_at, generations=generations),
+        lab_jobs=lab_jobs,
+        projections=projections,
     )
+    tables = dict(build_serving_read_models(source))
+    specs = dict(SERVING_TABLE_SPECS)
+    if legacy_paper_schema:
+        historical_tables = {
+            "paper_order_window",
+            "paper_order_history",
+            "paper_fill_history",
+        }
+        for table in historical_tables:
+            tables.pop(table)
+            specs.pop(table)
+        projection_status = tables["projection_status"]
+        tables["projection_status"] = projection_status.loc[
+            ~projection_status["table_name"].isin(historical_tables)
+        ].reset_index(drop=True)
     publisher = ServingPublisher(
         root,
         producer_commit=FIXTURE_PRODUCER_COMMIT,
         schema_version=FIXTURE_SCHEMA_VERSION,
-        table_specs=SERVING_TABLE_SPECS,
+        table_specs=specs,
     )
     return publisher.publish(
-        build_serving_read_models(source),
+        tables,
         watermarks=_watermarks(
             scenario, built_at=built_at, generations=generations, sequence=sequence
         ),

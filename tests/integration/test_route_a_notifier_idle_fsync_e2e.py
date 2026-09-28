@@ -10,9 +10,9 @@ independent of what the loop was given to do:
 * every iteration rewrote the replication cursor, because `updated_at` was the same clock.
 
 Both are `BEGIN IMMEDIATE ... COMMIT` on a `journal_mode=WAL`, `synchronous=FULL`
-database, so each was a real fsync. This drives the built notifier -- the same
-`notifier_builder` the production manifest is handed to -- for sixty idle iterations and
-asks the database file whether anything was committed at all.
+database, so each was a real fsync. The notifier now records one explicit empty-source
+observation per minute for alert coverage. This drives the production builder for sixty
+idle iterations and distinguishes those bounded observations from per-iteration writes.
 """
 
 from __future__ import annotations
@@ -98,10 +98,10 @@ def _projection_generations(database: Path) -> tuple[str, ...]:
         connection.close()
 
 
-def test_an_idle_notifier_commits_nothing_and_one_change_commits_once(
+def test_an_idle_notifier_only_commits_bounded_observations_and_one_change(
     tmp_path: Path,
 ) -> None:
-    """Sixty idle iterations, zero commits; one changed projection, exactly one row."""
+    """Sixty idle iterations, two source observations; one changed projection, one row."""
 
     _seed_outbox(tmp_path)
     replica = _page_projection_replica(tmp_path, synced_at=NOW - timedelta(minutes=1))
@@ -118,24 +118,35 @@ def test_an_idle_notifier_commits_nothing_and_one_change_commits_once(
         )
     )
 
-    # Two iterations to drain what the seed put in the outbox, so what follows is a
-    # notifier with genuinely nothing to do -- which is the whole of its day outside the
-    # session, and most of its day inside one.
+    # Two iterations drain the seed; the remaining empty source still needs a bounded
+    # positive observation every minute for alert coverage.
     settle = [step(), step()]
     assert [result.projection_published for result in settle] == [True, False]
 
     watcher = _CommitWatcher(state)
     try:
-        before = watcher.stamp()
+        previous = watcher.stamp()
         idle = []
+        observation_commits = []
         for index in range(IDLE_ITERATIONS):
             clock = NOW + INTERVAL * (index + 1)
             idle.append(step())
-        after = watcher.stamp()
+            current = watcher.stamp()
+            if (index + 1) % 30 == 0:
+                assert int(current[0]) == int(previous[0]) + 1
+                assert int(current[1]) > int(previous[1])
+                assert current[2:] == previous[2:]
+                assert watcher.connection.execute(
+                    "SELECT inspected_at FROM notification_source_observation"
+                ).fetchone() == (clock.isoformat(timespec="microseconds"),)
+                observation_commits.append(index + 1)
+                previous = current
+            else:
+                assert current == previous, "an idle iteration committed without new evidence"
     finally:
         watcher.close()
 
-    assert after == before, "an idle notifier committed to its state database"
+    assert observation_commits == [30, 60]
     assert [result.projection_published for result in idle] == [False] * IDLE_ITERATIONS
     assert [result.processed_count for result in idle] == [0] * IDLE_ITERATIONS
     assert len(_projection_generations(state)) == 1
