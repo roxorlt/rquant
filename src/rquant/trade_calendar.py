@@ -317,6 +317,22 @@ def _validate_authoritative_rows(
     return selected
 
 
+def validate_authoritative_trade_calendar_rows(
+    rows: Sequence[TradeCalendarDay],
+    *,
+    exchange: str,
+    start: date,
+    end: date,
+) -> list[TradeCalendarDay]:
+    """Validate complete civil coverage and the preceding-open-day chain."""
+    return _validate_authoritative_rows(
+        rows,
+        exchange=exchange,
+        start=start,
+        end=end,
+    )
+
+
 def fetch_trade_calendar_rows(
     adapter: TradeCalendarAdapter,
     *,
