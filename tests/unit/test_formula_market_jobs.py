@@ -10,7 +10,6 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
-from test_formula_market_run import DAY, DECISION_AT, _history, _market, _run
 
 from rquant.screen.formula_history_projection import FormulaProjectionBudgetError
 from rquant.screen.formula_market_jobs import (
@@ -25,6 +24,7 @@ from rquant.screen.formula_market_run import (
     FormulaMarketRunTimeoutError,
 )
 from rquant.strict_json import canonical_json_bytes
+from tests.unit.test_formula_market_run import DAY, DECISION_AT, _history, _market, _run
 
 
 class Clock:
