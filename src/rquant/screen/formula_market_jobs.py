@@ -478,6 +478,10 @@ class FormulaMarketJobStore:
             self._load_result(receipt, request, row["request_sha256"])
         return receipt
 
+    def read_request(self, task_id: str) -> FormulaMarketJobRequest:
+        """Read the validated request bound to a worker receipt."""
+        return self._request_from_row(self._row(task_id))
+
     def latest(self) -> FormulaMarketJobReceipt | None:
         with closing(self._connect()) as connection:
             row = connection.execute(
