@@ -772,6 +772,7 @@ export default function PoolsPage() {
       ) : data &&
         (data.state === "ready" ||
           data.pools.length > 0 ||
+          formulaShown.length > 0 ||
           (data.state !== "unavailable" && data.canvases.length > 0) ||
           editorReady) ? (
         <div className="pools-page">
@@ -796,7 +797,7 @@ export default function PoolsPage() {
                 </select>
               </label>
             ) : (
-              <span className="hint">已发布池子</span>
+              <span className="hint">全部池子</span>
             )}
             {canvas?.description ? (
               <Tip content={canvas.description}>
@@ -814,7 +815,7 @@ export default function PoolsPage() {
             >
               新建画布
             </Button>
-            {shown.length === 0 ? (
+            {shown.length === 0 && formulaShown.length === 0 ? (
               <FirstPoolAction
                 canvas={canvas}
                 editor={editorQuery.data}
@@ -826,7 +827,7 @@ export default function PoolsPage() {
                 storageAvailable={editorSnapshot.storageAvailable}
                 onCreate={() => setEditorMode({ kind: "create", parentKey: null })}
               />
-            ) : (
+            ) : shown.length > 0 ? (
               <Button
                 className="pools-add-button"
                 variant="primary"
@@ -841,9 +842,11 @@ export default function PoolsPage() {
               >
                 添加条件节点
               </Button>
-            )}
+            ) : null}
           </div>
-          {!editorReady && !editorQuery.isLoading ? (
+          {!editorReady &&
+          !editorQuery.isLoading &&
+          (shown.length > 0 || formulaShown.length === 0) ? (
             <p className="pools-note" role="status">
               {editorNotice}
             </p>

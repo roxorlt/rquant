@@ -79,8 +79,9 @@ function writeJournal(journal: Journal | null): void {
   }
 }
 
-export function readFormulaPoolSaveTaskId(): string | null {
-  return readJournal()?.request.task_id ?? null;
+export function readFormulaPoolSaveTaskId(viewer: string | null): string | null {
+  const journal = readJournal();
+  return viewer !== null && journal?.viewer === viewer ? journal.request.task_id : null;
 }
 
 export function FormulaPoolSave({
@@ -127,9 +128,14 @@ export function FormulaPoolSave({
     pools.serving?.generation_id === generation &&
     pools.data?.availability === "ready" &&
     pools.data.pools.some(
-      (pool) =>
-        pool.pool_name === active.poolName && "version" in pool && pool.version === active.version,
+      (pool) => pool.pool_name === active.poolName && pool.version === active.version,
     );
+  const readBlocked =
+    pools.error !== null ||
+    (pools.data !== undefined &&
+      (pools.data.availability === "unavailable" ||
+        pools.data.availability === "not_published" ||
+        pools.serving?.generation_id !== generation));
 
   function remember(value: Journal | null): void {
     setJournal(value);
@@ -144,9 +150,10 @@ export function FormulaPoolSave({
       const receipt = await submitFormulaPoolSave(value.request);
       if (
         receipt.status === "succeeded" &&
+        receipt.command_id === value.request.command_id &&
         receipt.pool_name === `user/${value.request.base_name}` &&
         typeof receipt.version === "string" &&
-        receipt.version.length > 0
+        /^[0-9a-f]{64}$/.test(receipt.version)
       ) {
         remember({
           ...value,
@@ -216,7 +223,9 @@ export function FormulaPoolSave({
               ? "保存状态待确认"
               : visible
                 ? "已保存，可在池子画布查看"
-                : "已保存，等待池子发布"}
+                : readBlocked
+                  ? "已保存，暂无法确认池子"
+                  : "已保存，等待池子发布"}
           </strong>
           <span>{active.request.display_name}</span>
           {pending ? (
@@ -232,7 +241,7 @@ export function FormulaPoolSave({
             </Button>
           ) : !visible ? (
             <Button size="sm" onClick={() => pools.refetch()} disabled={pools.isFetching}>
-              检查发布
+              {readBlocked ? "重试读取" : "检查发布"}
             </Button>
           ) : null}
           {saved ? (

@@ -57,9 +57,9 @@ function setupSource(): void {
   );
 }
 
-function renderPreview(seedMeta = false) {
+function renderPreview(seedMeta = false, viewer = "tester") {
   const queryClient = testQueryClient();
-  if (seedMeta) queryClient.setQueryData(["meta"], metaEnvelope());
+  if (seedMeta) queryClient.setQueryData(["meta"], metaEnvelope({ viewer }));
   return render(
     <AppProviders queryClient={queryClient}>
       <FormulaPreviewDialog onClose={() => undefined} />
@@ -385,6 +385,7 @@ describe("全市场公式选股", () => {
     setupSource();
     const submitted: Schemas["FormulaPoolSaveCommandRequest"][] = [];
     let published = false;
+    let unreadable = false;
     server.use(
       http.get("*/api/v1/screen/tdx/market/jobs", () =>
         HttpResponse.json({
@@ -417,7 +418,7 @@ describe("全市场公式选股", () => {
       http.get("*/api/v1/pools/formula", () =>
         HttpResponse.json({
           data: {
-            availability: published ? "ready" : "empty",
+            availability: unreadable ? "unavailable" : published ? "ready" : "empty",
             available_at: null,
             message: "",
             pools: published
@@ -443,6 +444,7 @@ describe("全市场公式选股", () => {
         submitted.push((await request.json()) as Schemas["FormulaPoolSaveCommandRequest"]);
         if (submitted.length === 1)
           return HttpResponse.json({ detail: "请重试原请求" }, { status: 503 });
+        unreadable = true;
         return HttpResponse.json({
           command_id: submitted[0]?.command_id,
           status: "succeeded",
@@ -468,12 +470,20 @@ describe("全市场公式选股", () => {
     });
     view.unmount();
 
+    const other = renderPreview(true, "another-viewer");
+    const otherDrawer = await screen.findByRole("dialog", { name: "公式预览" });
+    expect(within(otherDrawer).queryByText("保存状态待确认")).toBeNull();
+    other.unmount();
+
     renderPreview(true);
     const restored = await screen.findByRole("dialog", { name: "公式预览" });
     expect(await within(restored).findByText("保存状态待确认")).toBeVisible();
     await user.click(within(restored).getByRole("button", { name: "继续核对" }));
-    expect(await within(restored).findByText("已保存，等待池子发布")).toBeVisible();
+    expect(await within(restored).findByText("已保存，暂无法确认池子")).toBeVisible();
     expect(submitted[1]).toEqual(submitted[0]);
+    unreadable = false;
+    await user.click(within(restored).getByRole("button", { name: "重试读取" }));
+    expect(await within(restored).findByText("已保存，等待池子发布")).toBeVisible();
     published = true;
     await user.click(within(restored).getByRole("button", { name: "检查发布" }));
     expect(await within(restored).findByText("已保存，可在池子画布查看")).toBeVisible();

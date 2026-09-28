@@ -8,7 +8,7 @@ import {
   useFormulaMarketJobs,
   useFormulaMarketMatches,
 } from "@/api/formulaMarket";
-import { useCurrentGeneration } from "@/api/useMeta";
+import { useCurrentGeneration, useCurrentMeta } from "@/api/useMeta";
 import { StockDrawer } from "@/app/StockDrawer";
 import { formatCount } from "@/format/number";
 import { formatAge, formatShanghaiDateTime, formatShanghaiTime, shanghaiDate } from "@/format/time";
@@ -92,9 +92,7 @@ function jobTone(job: FormulaMarketJobItem): string {
 export function FormulaMarketPanel({ formula, checked }: { formula: string; checked: boolean }) {
   const [tradeDate, setTradeDate] = useState("");
   const [journal, setJournal] = useState<Journal | null>(readJournal);
-  const [selectedId, setSelectedId] = useState<string | null>(
-    () => readJournal()?.taskId ?? readFormulaPoolSaveTaskId(),
-  );
+  const [selectedId, setSelectedId] = useState<string | null>(() => readJournal()?.taskId ?? null);
   const [confirmDraft, setConfirmDraft] = useState<RunDraft | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
@@ -104,6 +102,7 @@ export function FormulaMarketPanel({ formula, checked }: { formula: string; chec
   const [stockCode, setStockCode] = useState<string | null>(null);
   const now = useNow();
   const generation = useCurrentGeneration();
+  const viewer = useCurrentMeta().data?.data.viewer ?? null;
   const jobs = useFormulaMarketJobs(pollJobs);
   const jobList =
     generation === undefined || jobs.serving?.generation_id === generation ? jobs.data : undefined;
@@ -157,6 +156,12 @@ export function FormulaMarketPanel({ formula, checked }: { formula: string; chec
   useEffect(() => {
     setPollJobs(journal !== null || activeJob === true);
   }, [journal, activeJob]);
+
+  useEffect(() => {
+    if (selectedId !== null) return;
+    const savedTask = readFormulaPoolSaveTaskId(viewer);
+    if (savedTask !== null) setSelectedId(savedTask);
+  }, [selectedId, viewer]);
 
   useEffect(() => {
     if (journal?.state !== "queued" || journal.taskId === null) return;
