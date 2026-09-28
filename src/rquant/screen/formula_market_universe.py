@@ -70,7 +70,7 @@ class FormulaMarketUniverseError(RuntimeError):
 
 
 class FormulaMarketUniverseAdapter(Protocol):
-    def stock_basic(self, list_status: str = "L", exchange: str = "") -> pd.DataFrame: ...
+    def stock_basic_partition(self, *, list_status: str, exchange: str) -> pd.DataFrame: ...
 
 
 class FormulaMarketEntry(RuntimeContractModel):
@@ -295,7 +295,7 @@ def capture_formula_market_universe(
         partitions: list[FormulaMarketPartition] = []
         entries: list[FormulaMarketEntry] = []
         for exchange, status in _PARTITIONS:
-            frame = adapter.stock_basic(list_status=status, exchange=exchange)
+            frame = adapter.stock_basic_partition(list_status=status, exchange=exchange)
             part, accepted = _capture_partition(
                 frame,
                 exchange=exchange,

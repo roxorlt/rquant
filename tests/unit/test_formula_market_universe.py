@@ -73,6 +73,9 @@ class FakeAdapter:
         self.calls.append(key)
         return self.frames[key].copy()
 
+    def stock_basic_partition(self, *, list_status: str, exchange: str) -> pd.DataFrame:
+        return self.stock_basic(list_status=list_status, exchange=exchange)
+
 
 def _calendar(
     *, is_open: bool = True, generated_at: datetime | None = None
@@ -140,6 +143,40 @@ def test_stock_basic_partition_parameter_preserves_default_call() -> None:
 
 def test_capture_contract_asks_for_the_adapters_existing_columns() -> None:
     assert FORMULA_STOCK_BASIC_COLUMNS == STOCK_BASIC_COLUMNS
+
+
+@pytest.mark.parametrize("bad_empty", [None, pd.DataFrame()], ids=["none", "no-columns"])
+def test_capture_rejects_ambiguous_empty_provider_partition(
+    bad_empty: pd.DataFrame | None,
+) -> None:
+    frames = _partitions()
+
+    def stock_basic(**kwargs: str) -> pd.DataFrame | None:
+        key = (kwargs["exchange"], kwargs["list_status"])
+        if key == ("SSE", "P"):
+            return bad_empty
+        return frames[key]
+
+    adapter = TushareAdapter.__new__(TushareAdapter)
+    adapter._pro = SimpleNamespace(stock_basic=stock_basic)  # type: ignore[attr-defined]
+    adapter._transport_observer = None  # type: ignore[attr-defined]
+
+    with pytest.raises(FormulaMarketUniverseError):
+        capture_formula_market_universe(adapter, _calendar(), DAY, clock=_clock())
+
+
+def test_capture_accepts_real_empty_partition_with_requested_columns() -> None:
+    frames = _partitions()
+
+    def stock_basic(**kwargs: str) -> pd.DataFrame:
+        return frames[(kwargs["exchange"], kwargs["list_status"])]
+
+    adapter = TushareAdapter.__new__(TushareAdapter)
+    adapter._pro = SimpleNamespace(stock_basic=stock_basic)  # type: ignore[attr-defined]
+    adapter._transport_observer = None  # type: ignore[attr-defined]
+
+    result = capture_formula_market_universe(adapter, _calendar(), DAY, clock=_clock())
+    assert len(result.partitions) == 6
 
 
 def test_capture_six_partitions_excludes_b_and_other_without_dropping_suspended() -> None:
