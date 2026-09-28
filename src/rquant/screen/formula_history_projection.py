@@ -237,6 +237,40 @@ class VerifiedFormulaHistoryProjection:
             connection.close()
             os.close(descriptor)
 
+    def require_day_bars_for_codes(
+        self,
+        trade_date: date,
+        codes: tuple[str, ...],
+        *,
+        expected_identity: str,
+    ) -> None:
+        """Confirm target-day bars for captured codes, including dates beyond the recent catalog."""
+        if type(trade_date) is not date or not codes or len(codes) > MAX_STOCKS:
+            raise FormulaProjectionDateError("target date or market codes are invalid")
+        if len(codes) != len(set(codes)) or any(
+            not isinstance(code, str) or _A_SHARE_CODE.fullmatch(code) is None for code in codes
+        ):
+            raise FormulaProjectionUnavailableError("market codes are invalid")
+        connection, descriptor, generation = self._open()
+        try:
+            if generation.identity != expected_identity:
+                raise FormulaProjectionChangedError("history changed")
+            for code in codes:
+                found = connection.execute(
+                    "SELECT 1 FROM bars INDEXED BY sqlite_autoindex_bars_1 "
+                    "WHERE ts_code=? AND trade_date=? LIMIT 1",
+                    (code, trade_date.isoformat()),
+                ).fetchone()
+                if found is not None:
+                    self._finish(descriptor, generation)
+                    return
+            raise FormulaProjectionDateError("target date has no market history bars")
+        except sqlite3.Error as error:
+            raise FormulaProjectionUnavailableError("history date lookup failed") from error
+        finally:
+            connection.close()
+            os.close(descriptor)
+
     def _open(self) -> tuple[sqlite3.Connection, int, _PinnedGeneration]:
         before = self._verify()
         path = self.root / before.manifest.file_name
