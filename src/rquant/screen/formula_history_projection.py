@@ -31,7 +31,26 @@ MAX_MANIFEST_BYTES = 16 * 1024
 MAX_SQLITE_STEPS = 1_000_000
 MAX_CATALOG_STOCKS = MAX_STOCKS
 _FILE_NAME = re.compile(r"[0-9a-f]{32}\.sqlite\Z")
-_A_SHARE_CODE = re.compile(r"[0-9]{6}\.(?:SH|SZ|BJ)\Z")
+_SZ_A_PREFIXES = ("000", "001", "002", "003", "300", "301")
+_SH_A_PREFIXES = ("600", "601", "603", "605", "688", "689")
+_BJ_A_PREFIXES = ("4", "8", "9")
+_A_SHARE_CODE = re.compile(
+    r"(?:"
+    rf"(?:{'|'.join(_SZ_A_PREFIXES)})[0-9]{{3}}\.SZ|"
+    rf"(?:{'|'.join(_SH_A_PREFIXES)})[0-9]{{3}}\.SH|"
+    rf"(?:{'|'.join(_BJ_A_PREFIXES)})[0-9]{{5}}\.BJ"
+    r")\Z"
+)
+_A_SHARE_LISTING_SQL = (
+    "SELECT ts_code,list_date FROM listing WHERE "
+    "(substr(ts_code,1,3) IN (" + ",".join("?" for _ in _SZ_A_PREFIXES)
+    + ") AND ts_code LIKE '%.SZ') OR "
+    "(substr(ts_code,1,3) IN (" + ",".join("?" for _ in _SH_A_PREFIXES)
+    + ") AND ts_code LIKE '%.SH') OR "
+    "(substr(ts_code,1,1) IN (" + ",".join("?" for _ in _BJ_A_PREFIXES)
+    + ") AND ts_code LIKE '%.BJ') "
+    "ORDER BY ts_code LIMIT ?"
+)
 _BARS_SQL = (
     "SELECT trade_date, open, high, low, close, vol, amount "
     "FROM bars INDEXED BY sqlite_autoindex_bars_1 "
@@ -240,8 +259,9 @@ class VerifiedFormulaHistoryProjection:
             connection.set_progress_handler(count_steps, 1000)
             try:
                 rows = connection.execute(
-                    "SELECT ts_code,list_date FROM listing ORDER BY ts_code LIMIT ?",
-                    (MAX_CATALOG_STOCKS + 1,),
+                    _A_SHARE_LISTING_SQL,
+                    (*_SZ_A_PREFIXES, *_SH_A_PREFIXES, *_BJ_A_PREFIXES,
+                     MAX_CATALOG_STOCKS + 1),
                 ).fetchall()
             finally:
                 connection.set_progress_handler(None, 0)

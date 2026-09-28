@@ -163,7 +163,7 @@ def test_recursive_formula_uses_full_listing_history_and_parses_once(
 
 
 @pytest.mark.parametrize("bad_code,bad_date", [
-    ("BAD", "2026-04-13"),
+    ("60000X.SH", "2026-04-13"),
     ("600001.SH", "2026-13-40"),
 ])
 def test_catalog_rejects_bad_listing_record(
@@ -196,7 +196,8 @@ def test_catalog_rejects_over_limit_instead_of_truncating(
     monkeypatch.setattr(projection_module, "MAX_CATALOG_STOCKS", 2)
     root, identity = _generation(
         tmp_path,
-        [(f"60000{index}.SH", "2026-04-13") for index in range(3)],
+        [("200001.SZ", "2026-04-13"), ("900901.SH", "2026-04-13")]
+        + [(f"60000{index}.SH", "2026-04-13") for index in range(3)],
         {},
     )
 
@@ -204,6 +205,28 @@ def test_catalog_rejects_over_limit_instead_of_truncating(
         VerifiedFormulaHistoryProjection(root).catalog_snapshot(
             DAY, expected_identity=identity,
         )
+
+
+def test_b_shares_and_fund_do_not_occupy_a_share_catalog_capacity_or_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    a_shares = ("000001.SZ", "430047.BJ", "600001.SH", "833533.BJ", "920001.BJ")
+    excluded = ("200001.SZ", "510050.SH", "900901.SH")
+    codes = a_shares + excluded
+    root, identity = _generation(
+        tmp_path,
+        [(code, DAY.isoformat()) for code in codes],
+        {code: [(DAY, 9.0)] for code in codes},
+    )
+    monkeypatch.setattr(projection_module, "MAX_CATALOG_STOCKS", len(a_shares))
+
+    result = _run(root, identity, "CLOSE>0")
+
+    assert result.catalog_total == len(a_shares)
+    assert result.candidate_total == len(a_shares)
+    assert result.match_count == len(a_shares)
+    assert result.match_codes == a_shares
+    assert (result.no_match_count, result.unknown_count) == (0, 0)
 
 
 def test_single_stock_history_budget_becomes_unknown(
