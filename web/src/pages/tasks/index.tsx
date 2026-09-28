@@ -174,6 +174,13 @@ function emptyHint(state: ResearchJobsData["source_state"]): string {
 export default function TasksPage() {
   const [cursors, setCursors] = useState<(string | null)[]>([null]);
   const [refreshKey, setRefreshKey] = useState(0);
+  const [failedRefresh, setFailedRefresh] = useState<{
+    jobId: string;
+    commandId: string;
+    viewer: string;
+    refreshKey: number;
+    grantState: "waiting" | "checking" | "allowed" | "denied";
+  } | null>(null);
   const [, setClockPulse] = useState(0);
   const [selected, setSelected] = useState<SelectedTask | null>(null);
   const [selectedLog, setSelectedLog] = useState<SelectedServiceLog | null>(null);
@@ -228,6 +235,38 @@ export default function TasksPage() {
     !labCapabilities.isError &&
     labCapabilities.data?.can_control === true &&
     data.research.source_state === "ready";
+  useEffect(() => {
+    if (
+      failedRefresh?.grantState !== "waiting" ||
+      failedRefresh.refreshKey !== refreshKey ||
+      failedRefresh.viewer !== trustedViewer ||
+      result.isFetching ||
+      result.error !== null ||
+      data?.can_control_research_jobs !== true
+    ) {
+      return;
+    }
+    const requested = failedRefresh;
+    setFailedRefresh({ ...requested, grantState: "checking" });
+    void labCapabilities.refetch().then((grant) => {
+      setFailedRefresh((current) =>
+        current?.commandId === requested.commandId && current.grantState === "checking"
+          ? {
+              ...current,
+              grantState: grant.isSuccess && grant.data.can_control ? "allowed" : "denied",
+            }
+          : current,
+      );
+    });
+  }, [
+    failedRefresh,
+    refreshKey,
+    trustedViewer,
+    result.isFetching,
+    result.error,
+    data?.can_control_research_jobs,
+    labCapabilities.refetch,
+  ]);
   const staleSelection =
     selected !== null &&
     (selected.generationId !== generationId ||
@@ -294,6 +333,21 @@ export default function TasksPage() {
     },
     [canViewProgress, generationId, trustedViewer],
   );
+  const refreshFailedControl = useCallback(
+    (jobId: string, commandId: string) => {
+      if (trustedViewer === null) return;
+      const next = refreshKey + 1;
+      setFailedRefresh({
+        jobId,
+        commandId,
+        viewer: trustedViewer,
+        refreshKey: next,
+        grantState: "waiting",
+      });
+      setRefreshKey(next);
+    },
+    [refreshKey, trustedViewer],
+  );
   const columns = useMemo(
     () =>
       COLUMNS.map((column) =>
@@ -316,6 +370,15 @@ export default function TasksPage() {
                           setCursors([null]);
                           setRefreshKey((value) => value + 1);
                         }}
+                        onFailedRefresh={(commandId) => refreshFailedControl(row.job_id, commandId)}
+                        rearmReadyForCommand={
+                          failedRefresh?.jobId === row.job_id &&
+                          failedRefresh.viewer === trustedViewer &&
+                          failedRefresh.refreshKey === refreshKey &&
+                          failedRefresh.grantState === "allowed"
+                            ? failedRefresh.commandId
+                            : null
+                        }
                         onRevoked={() => void labCapabilities.refetch()}
                       />
                     ) : undefined
@@ -325,7 +388,16 @@ export default function TasksPage() {
             }
           : column,
       ),
-    [canViewProgress, openProgress, canControlJobs, trustedViewer, labCapabilities.refetch],
+    [
+      canViewProgress,
+      openProgress,
+      canControlJobs,
+      trustedViewer,
+      labCapabilities.refetch,
+      refreshFailedControl,
+      failedRefresh,
+      refreshKey,
+    ],
   );
   const closeProgress = useCallback(() => setSelected(null), []);
   const openLog = useCallback(

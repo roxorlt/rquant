@@ -315,7 +315,7 @@ def test_authority_conflicts_and_mismatched_result_are_not_success(
     assert response.json().get("status") != "submitted"
 
 
-@pytest.mark.parametrize("wire_status", ["pending", "processing", "ambiguous", "failed"])
+@pytest.mark.parametrize("wire_status", ["pending", "processing", "ambiguous"])
 def test_unfinished_outer_receipt_never_claims_task_state(tmp_path: Path, wire_status: str) -> None:
     def transport(_payload: dict[str, object]) -> dict[str, object]:
         return {
@@ -336,3 +336,105 @@ def test_unfinished_outer_receipt_never_claims_task_state(tmp_path: Path, wire_s
     assert response.status_code == 200
     assert response.json()["status"] in {"pending", "processing", "unknown"}
     assert "已暂停" not in response.text
+
+
+def test_unverified_failure_cannot_clear_the_original_request(tmp_path: Path) -> None:
+    def transport(_payload: dict[str, object]) -> dict[str, object]:
+        return {"command_id": COMMAND_ID, "status": "failed", "enqueued_at": REQUESTED_AT}
+
+    with TestClient(
+        _client_app(tmp_path / "serving", lab_control_command_transport=transport),
+        headers=PROXY_HEADERS,
+    ) as client:
+        response = client.post(
+            "/api/v1/tasks/jobs/commands",
+            json=_body(),
+            headers={"x-rquant-user": "researcher", "x-rquant-csrf": "1"},
+        )
+    assert response.status_code == 502
+    assert response.json().get("status") != "failed"
+
+
+def test_ambiguous_effect_result_keeps_original_request_unknown(tmp_path: Path) -> None:
+    def transport(_payload: dict[str, object]) -> dict[str, object]:
+        return {
+            "command_id": COMMAND_ID,
+            "status": "ambiguous",
+            "enqueued_at": REQUESTED_AT,
+            "completed_at": REQUESTED_AT,
+            "result": {"outcome": "ambiguous_completed_at_most_once"},
+            "error": "external effect result missing",
+        }
+
+    with TestClient(
+        _client_app(tmp_path / "serving", lab_control_command_transport=transport),
+        headers=PROXY_HEADERS,
+    ) as client:
+        response = client.post(
+            "/api/v1/tasks/jobs/commands",
+            json=_body(),
+            headers={"x-rquant-user": "researcher", "x-rquant-csrf": "1"},
+        )
+    assert response.status_code == 200
+    assert response.json()["status"] == "unknown"
+
+
+@pytest.mark.parametrize(
+    ("error", "message"),
+    [
+        ("RuntimeError: Lab backend unavailable", "本次请求失败，请刷新任务后再确认。"),
+        (
+            "ValueError: page control command requested_at exceeds allowed future clock skew",
+            "设备时间可能不准，请校准后刷新任务。",
+        ),
+    ],
+)
+def test_verified_terminal_failure_is_distinct_from_unknown(
+    tmp_path: Path, error: str, message: str
+) -> None:
+    def transport(_payload: dict[str, object]) -> dict[str, object]:
+        return {
+            "command_id": COMMAND_ID,
+            "status": "failed",
+            "enqueued_at": REQUESTED_AT,
+            "completed_at": REQUESTED_AT,
+            "error": error,
+        }
+
+    with TestClient(
+        _client_app(tmp_path / "serving", lab_control_command_transport=transport),
+        headers=PROXY_HEADERS,
+    ) as client:
+        response = client.post(
+            "/api/v1/tasks/jobs/commands",
+            json=_body(),
+            headers={"x-rquant-user": "researcher", "x-rquant-csrf": "1"},
+        )
+    assert response.status_code == 200, response.text
+    assert response.json() == {"command_id": COMMAND_ID, "status": "failed", "message": message}
+    assert "Lab backend" not in response.text
+
+
+def test_future_browser_clock_is_rejected_before_page_control(tmp_path: Path) -> None:
+    calls: list[dict[str, object]] = []
+
+    def transport(payload: dict[str, object]) -> dict[str, object]:
+        calls.append(payload)
+        raise AssertionError("future request must not reach PageControl")
+
+    with TestClient(
+        _client_app(tmp_path / "serving", lab_control_command_transport=transport),
+        headers=PROXY_HEADERS,
+    ) as client:
+        response = client.post(
+            "/api/v1/tasks/jobs/commands",
+            json=_body(requested_at="2026-09-24T07:40:00Z"),
+            headers={"x-rquant-user": "researcher", "x-rquant-csrf": "1"},
+        )
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "command_id": COMMAND_ID,
+        "status": "failed",
+        "message": "设备时间可能不准，请校准后刷新任务。",
+    }
+    assert calls == []

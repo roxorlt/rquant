@@ -371,6 +371,7 @@ describe("研究任务控制", () => {
     const { unmount } = renderApp("/tasks");
     await user.click(await screen.findByRole("button", { name: "暂停动量参数搜索" }));
     expect(await screen.findByText("提交状态待确认，请查询或重试原请求。")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "刷新任务" })).toBeNull();
     expect(bodies).toHaveLength(1);
     unmount();
     renderApp("/tasks");
@@ -381,6 +382,105 @@ describe("研究任务控制", () => {
     expect(bodies[0]?.action).toBe("pause");
     expect(bodies[0]?.expected_version).toBe(7);
     expect(findJargon(document.body.textContent ?? "")).toEqual([]);
+  });
+
+  it("rechecks current task and grant before a new request after terminal failure", async () => {
+    const user = userEvent.setup();
+    let overviewReads = 0;
+    let grantReads = 0;
+    const bodies: Schemas["LabControlRequest"][] = [];
+    server.use(
+      http.get("*/api/v1/tasks/overview", () => {
+        overviewReads += 1;
+        return HttpResponse.json(
+          overviewEnvelope({
+            can_control_research_jobs: true,
+            research: {
+              ...tasksEnvelope().data,
+              items: [
+                { ...firstResearchJob(), job_version: 7, available_actions: ["pause", "cancel"] },
+              ],
+            },
+          }),
+        );
+      }),
+      http.get("*/api/v1/tasks/jobs/control-capabilities", () => {
+        grantReads += 1;
+        return HttpResponse.json({ can_control: true });
+      }),
+      http.post("*/api/v1/tasks/jobs/commands", async ({ request }) => {
+        bodies.push((await request.json()) as Schemas["LabControlRequest"]);
+        return HttpResponse.json(
+          bodies.length === 1
+            ? {
+                command_id: bodies[0]?.command_id,
+                status: "failed",
+                message: "设备时间可能不准，请校准后刷新任务。",
+              }
+            : {
+                command_id: bodies[1]?.command_id,
+                status: "submitted",
+                message: "已提交，等待状态更新。",
+              },
+        );
+      }),
+    );
+    renderApp("/tasks");
+    await user.click(await screen.findByRole("button", { name: "暂停动量参数搜索" }));
+    expect(await screen.findByText("设备时间可能不准，请校准后刷新任务。")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "查询或重试动量参数搜索" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "暂停动量参数搜索" })).toBeNull();
+    const before = [overviewReads, grantReads];
+    await user.click(screen.getByRole("button", { name: "刷新任务" }));
+    await waitFor(() => {
+      expect(overviewReads).toBeGreaterThan(before[0] ?? 0);
+      expect(grantReads).toBeGreaterThan(before[1] ?? 0);
+    });
+    expect(await screen.findByText("任务状态已刷新，请核对后再操作。")).toBeInTheDocument();
+    expect(bodies).toHaveLength(1);
+    await user.click(screen.getByRole("button", { name: "已核对" }));
+    await user.click(await screen.findByRole("button", { name: "暂停动量参数搜索" }));
+    await screen.findByText("已提交，等待状态更新。");
+    expect(bodies).toHaveLength(2);
+    expect(bodies[1]?.command_id).not.toBe(bodies[0]?.command_id);
+    expect(bodies[1]?.expected_version).toBe(7);
+  });
+
+  it("does not rearm an action removed from the refreshed task", async () => {
+    const user = userEvent.setup();
+    let actions: Schemas["ResearchJobItem"]["available_actions"] = ["pause"];
+    const bodies: unknown[] = [];
+    server.use(
+      http.get("*/api/v1/tasks/overview", () =>
+        HttpResponse.json(
+          overviewEnvelope({
+            can_control_research_jobs: true,
+            research: {
+              ...tasksEnvelope().data,
+              items: [{ ...firstResearchJob(), job_version: 7, available_actions: actions }],
+            },
+          }),
+        ),
+      ),
+      http.post("*/api/v1/tasks/jobs/commands", async ({ request }) => {
+        const body = (await request.json()) as Schemas["LabControlRequest"];
+        bodies.push(body);
+        return HttpResponse.json({
+          command_id: body.command_id,
+          status: "failed",
+          message: "本次请求失败，请刷新任务后再确认。",
+        });
+      }),
+    );
+    renderApp("/tasks");
+    await user.click(await screen.findByRole("button", { name: "暂停动量参数搜索" }));
+    await screen.findByText("本次请求失败，请刷新任务后再确认。");
+    actions = [];
+    await user.click(screen.getByRole("button", { name: "刷新任务" }));
+    await screen.findByText("任务状态已刷新，请核对后再操作。");
+    await user.click(screen.getByRole("button", { name: "已核对" }));
+    expect(screen.queryByRole("button", { name: "暂停动量参数搜索" })).toBeNull();
+    expect(bodies).toHaveLength(1);
   });
 
   it("keeps the original request available after the published task version changes", async () => {

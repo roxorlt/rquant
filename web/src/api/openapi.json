@@ -6022,7 +6022,8 @@
               "pending",
               "processing",
               "unknown",
-              "conflict"
+              "conflict",
+              "failed"
             ],
             "title": "Status",
             "type": "string"

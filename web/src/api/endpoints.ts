@@ -153,7 +153,7 @@ export async function submitLabControl(body: LabControlRequest): Promise<LabCont
     "command_id" in receipt &&
     receipt.command_id === body.command_id &&
     "status" in receipt &&
-    ["submitted", "pending", "processing", "unknown", "conflict"].includes(
+    ["submitted", "pending", "processing", "unknown", "conflict", "failed"].includes(
       String(receipt.status),
     ) &&
     "message" in receipt &&

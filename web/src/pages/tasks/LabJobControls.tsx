@@ -52,7 +52,9 @@ function readPending(storageKey: string, jobId: string): Pending | null {
       !Number.isInteger(body.expected_version) ||
       Number(body.expected_version) < 0 ||
       typeof parsed.status !== "string" ||
-      !["submitted", "pending", "processing", "unknown", "conflict"].includes(parsed.status) ||
+      !["submitted", "pending", "processing", "unknown", "conflict", "failed"].includes(
+        parsed.status,
+      ) ||
       typeof parsed.message !== "string" ||
       parsed.message.length > 80
     ) {
@@ -81,11 +83,15 @@ export function LabJobControls({
   row,
   viewer,
   onRefresh,
+  onFailedRefresh,
+  rearmReadyForCommand,
   onRevoked,
 }: {
   row: ResearchJobItem;
   viewer: string;
   onRefresh: () => void;
+  onFailedRefresh: (commandId: string) => void;
+  rearmReadyForCommand: string | null;
   onRevoked: () => void;
 }) {
   const storageKey = key(viewer, row.job_id);
@@ -156,12 +162,31 @@ export function LabJobControls({
   }
 
   const changed = pending !== null && row.job_version !== pending.body.expected_version;
+  const failedReady =
+    pending?.status === "failed" && pending.body.command_id === rearmReadyForCommand;
   return (
     <div className="tasks-job-controls">
       {pending ? (
         <div className="tasks-control-pending">
-          <span role="status">{changed ? "任务状态已更新，请核对结果。" : pending.message}</span>
-          {pending.status !== "conflict" ? (
+          <span role="status">
+            {pending.status === "failed"
+              ? failedReady
+                ? "任务状态已刷新，请核对后再操作。"
+                : pending.message
+              : changed
+                ? "任务状态已更新，请核对结果。"
+                : pending.message}
+          </span>
+          {pending.status === "failed" && !failedReady ? (
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() => onFailedRefresh(pending.body.command_id)}
+            >
+              刷新任务
+            </Button>
+          ) : null}
+          {pending.status !== "conflict" && pending.status !== "failed" ? (
             <Button
               size="sm"
               variant="ghost"
@@ -172,7 +197,8 @@ export function LabJobControls({
               查询 / 重试
             </Button>
           ) : null}
-          {changed || pending.status === "conflict" ? (
+          {(pending.status === "failed" && failedReady) ||
+          (pending.status !== "failed" && (changed || pending.status === "conflict")) ? (
             <Button
               size="sm"
               variant="ghost"

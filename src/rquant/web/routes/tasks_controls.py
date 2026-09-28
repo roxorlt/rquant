@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import timedelta
 from typing import Annotated
 from uuid import NAMESPACE_URL, uuid5
 
@@ -35,6 +36,12 @@ from rquant.web.security import current_user, require_csrf
 router = APIRouter(prefix="/tasks/jobs")
 MAX_REQUEST_BYTES = 1024
 _RESULT = TypeAdapter(CommandSubmissionResult)
+_MAX_FUTURE_SKEW = timedelta(minutes=5)
+_CLOCK_SKEW_ERROR = (
+    "ValueError: page control command requested_at exceeds allowed future clock skew"
+)
+_CLOCK_SKEW_MESSAGE = "设备时间可能不准，请校准后刷新任务。"
+_FAILED_MESSAGE = "本次请求失败，请刷新任务后再确认。"
 _REASONS = {
     "pause": "网页暂停研究任务",
     "resume": "网页恢复研究任务",
@@ -76,12 +83,26 @@ def _interaction_key(viewer: str, body: LabControlRequest) -> str:
 def _public_receipt(
     body: LabControlRequest, wire: LabControlWireReceipt, *, interaction_key: str
 ) -> LabControlReceipt:
+    if wire.status == "failed":
+        if wire.completed_at is None or not wire.error or wire.result is not None:
+            raise LabControlInvalidReceiptError("terminal PageControl failure is incomplete")
+        return LabControlReceipt(
+            command_id=body.command_id,
+            status="failed",
+            message=_CLOCK_SKEW_MESSAGE if wire.error == _CLOCK_SKEW_ERROR else _FAILED_MESSAGE,
+        )
+    if wire.status == "ambiguous":
+        return LabControlReceipt(
+            command_id=body.command_id,
+            status="unknown",
+            message="提交状态待确认，请查询或重试原请求。",
+        )
     if wire.status != "succeeded":
         if wire.result is not None:
             raise LabControlInvalidReceiptError("unfinished PageControl receipt has a result")
         return LabControlReceipt(
             command_id=body.command_id,
-            status="unknown" if wire.status in {"failed", "ambiguous"} else wire.status,
+            status=wire.status,
             message="提交状态待确认，请查询或重试原请求。",
         )
     if wire.completed_at is None or wire.error is not None or not isinstance(wire.result, dict):
@@ -141,6 +162,12 @@ async def submit_lab_control(
         raise HTTPException(status_code=403, detail="当前账号不能操作研究任务。")
     if len(await request.body()) > MAX_REQUEST_BYTES:
         raise HTTPException(status_code=413, detail="请求内容过长，请重试。")
+    if body.requested_at > web.clock() + _MAX_FUTURE_SKEW:
+        return LabControlReceipt(
+            command_id=body.command_id,
+            status="failed",
+            message=_CLOCK_SKEW_MESSAGE,
+        )
     interaction_key = _interaction_key(viewer, body)
     command = _COMMANDS[body.action](
         job_id=body.job_id,

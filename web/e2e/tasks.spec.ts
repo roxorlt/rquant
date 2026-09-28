@@ -159,6 +159,14 @@ for (const viewport of [
         posts.push(route.request().postDataJSON());
         if (posts.length === 1) {
           await route.fulfill({ status: 503, json: { detail: "提交状态待确认" } });
+        } else if (posts.length === 3) {
+          await route.fulfill({
+            json: {
+              command_id: posts.at(-1)?.command_id,
+              status: "failed",
+              message: "设备时间可能不准，请校准后刷新任务。",
+            },
+          });
         } else {
           await route.fulfill({
             json: {
@@ -187,8 +195,17 @@ for (const viewport of [
       await page.getByRole("button", { name: "已核对" }).click();
       await page.getByRole("button", { name: "取消动量参数搜索" }).click();
       await expect(page.getByRole("dialog")).toContainText("取消后无法继续当前任务");
-      await page.keyboard.press("Escape");
-      await expect(page.getByRole("dialog")).toBeHidden();
+      await page.getByRole("dialog").getByRole("button", { name: "确认取消" }).click();
+      await expect(page.getByText("设备时间可能不准，请校准后刷新任务。")).toBeVisible();
+      await expect(page.getByRole("button", { name: "查询或重试动量参数搜索" })).toHaveCount(0);
+      await page.getByRole("button", { name: "刷新任务" }).click();
+      await expect(page.getByText("任务状态已刷新，请核对后再操作。")).toBeVisible();
+      await page.getByRole("button", { name: "已核对" }).click();
+      await page.getByRole("button", { name: "取消动量参数搜索" }).click();
+      await page.getByRole("dialog").getByRole("button", { name: "确认取消" }).click();
+      await expect(page.getByText("已提交，等待状态更新。")).toBeVisible();
+      expect(posts).toHaveLength(4);
+      expect(posts[3]?.command_id).not.toBe(posts[2]?.command_id);
       await expectNoHorizontalOverflow(page, "research controls");
       expect(findJargon(await page.locator("main").innerText())).toEqual([]);
       expect(

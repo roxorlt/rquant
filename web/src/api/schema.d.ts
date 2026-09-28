@@ -2980,7 +2980,7 @@ export interface components {
              * Status
              * @enum {string}
              */
-            status: "submitted" | "pending" | "processing" | "unknown" | "conflict";
+            status: "submitted" | "pending" | "processing" | "unknown" | "conflict" | "failed";
         };
         /** LabControlRequest */
         LabControlRequest: {

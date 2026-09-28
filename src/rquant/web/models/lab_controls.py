@@ -35,7 +35,7 @@ class LabControlReceipt(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     command_id: UUID
-    status: Literal["submitted", "pending", "processing", "unknown", "conflict"]
+    status: Literal["submitted", "pending", "processing", "unknown", "conflict", "failed"]
     message: str = Field(min_length=1, max_length=80)
 
 
