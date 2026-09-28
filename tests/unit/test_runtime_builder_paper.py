@@ -390,6 +390,88 @@ def test_rejected_order_advances_history_without_changing_account_balance(
     assert window.rows[0]["total_orders"] == 1
 
 
+def test_new_close_evidence_advances_source_once_and_survives_replay(tmp_path: Path) -> None:
+    _publish_signal(tmp_path)
+    from rquant.paper_broker import BrokerCostPolicy, PaperBrokerStore
+    from rquant.paper_contracts import PaperOrderStatus, PaperOrderType
+
+    authority_root = tmp_path / "paper-authority"
+    settings = {
+        **_broker_settings(tmp_path),
+        "paused": True,
+        "serving_authority_root": str(authority_root),
+    }
+    manifest = RuntimeServiceManifest(
+        **{
+            **_manifest(tmp_path, RuntimeServiceKind.PAPER_BROKER).model_dump(mode="json"),
+            "settings": settings,
+        }
+    )
+    observed_at = datetime.now(UTC) + timedelta(minutes=1)
+    times = iter(
+        (
+            observed_at,
+            observed_at,
+            observed_at + timedelta(minutes=1),
+            observed_at + timedelta(minutes=1),
+            observed_at + timedelta(minutes=2),
+            observed_at + timedelta(minutes=2),
+        )
+    )
+    step = paper_broker_builder(
+        clock=lambda: next(times),
+        quote_resolver=lambda *_args: object(),  # type: ignore[arg-type]
+        trade_date_resolver=lambda _now: date(2026, 7, 31),
+    )(manifest)
+    store = PaperBrokerStore(
+        Path(settings["broker_path"]),
+        account_id="paper-main",
+        initial_cash=Decimal("100000"),
+        cost_policy=BrokerCostPolicy.from_execution_cost_spec(paper_execution_cost_spec()),
+    )
+    accepted = store.submit_intent(
+        _intent(
+            account_id="paper-main",
+            order_type=PaperOrderType.LIMIT,
+            limit_price=Decimal("9.90"),
+            event_time=NOW - timedelta(seconds=2),
+        ),
+        decision_time=NOW,
+        trade_date=date(2026, 7, 31),
+        quote=_quote("10.00"),
+    )
+    first = step()
+    store.close_open_order(
+        accepted.order_id,
+        status=PaperOrderStatus.CANCELLED,
+        decided_at=NOW + timedelta(minutes=1),
+    )
+    second = step()
+    replay = step()
+
+    assert (
+        first.source_generations[PAPER_ACCOUNTS_DATASET_ID]
+        != second.source_generations[PAPER_ACCOUNTS_DATASET_ID]
+    )
+    assert (
+        replay.source_generations[PAPER_ACCOUNTS_DATASET_ID]
+        == second.source_generations[PAPER_ACCOUNTS_DATASET_ID]
+    )
+    authority = ServingSourceAuthorityReader(
+        root=authority_root,
+        expected_producer_commit=COMMIT,
+        expected_dataset_id=PAPER_ACCOUNTS_DATASET_ID,
+        expected_payload_kind="paper_accounts",
+    )(observed_at + timedelta(minutes=2))
+    assert isinstance(authority.payload, PaperAccountsPayload)
+    order_rows = next(
+        item.rows
+        for item in authority.payload.projections
+        if item.table_name == "paper_order_history"
+    )
+    assert order_rows[0]["status"] == PaperOrderStatus.CANCELLED.value
+
+
 def test_existing_account_only_authority_upgrades_to_history_source(tmp_path: Path) -> None:
     _publish_signal(tmp_path)
     from rquant.paper_broker import BrokerCostPolicy, PaperBrokerStore

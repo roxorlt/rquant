@@ -52,6 +52,8 @@ _PRICE_TICK = Decimal("0.0001")
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 _MAX_HISTORY_ORDERS = 200
 _MAX_HISTORY_FILLS = 1_000
+_MAX_HISTORY_CLOSE_ATTESTATION_STEPS = 1_000_000
+_CLOSE_ATTESTATION_PROGRESS_INTERVAL = 1_000
 _LEDGER_UNKNOWN_COLUMNS = (
     "unknown_fill_availability_count",
     "unknown_lot_availability_count",
@@ -218,6 +220,19 @@ class PaperOrderHistorySnapshot(RuntimeContractModel):
         ):
             raise ValueError("paper history contains duplicate or orphan identities")
         return self
+
+
+def _close_event_fingerprint(order: PaperOrder, receipt: PaperExecutionReceipt) -> str:
+    return canonical_sha256(
+        {
+            "version": "order_close_v2",
+            "order": order.model_dump(mode="python"),
+            "last_execution_id": receipt.execution_id,
+            "last_execution_receipt_fingerprint": canonical_sha256(
+                receipt.model_dump(mode="python")
+            ),
+        }
+    )
 
 
 class BrokerCostPolicy(RuntimeContractModel):
@@ -3348,39 +3363,94 @@ class PaperBrokerStore:
                     PaperOrderStatus.PARTIALLY_FILLED,
                 }:
                     raise ValueError(f"order is not open for close: {order.status.value}")
-                _, previous_executed_at, previous_persisted_at = self._incremental_fill_timeline(
-                    connection, order=order
+                next_sequence, previous_executed_at, previous_persisted_at = (
+                    self._incremental_fill_timeline(connection, order=order)
                 )
                 if previous_executed_at is not None and decision_time < previous_executed_at:
                     raise ValueError("close decision cannot precede the latest fill execution")
                 if previous_persisted_at is not None and persistence_time < previous_persisted_at:
                     raise ValueError("close persistence cannot precede latest fill availability")
                 intent_row = connection.execute(
-                    "SELECT payload_json FROM paper_intent WHERE intent_id = ?",
-                    (order.intent_id,),
+                    "SELECT payload_json, initial_execution_id FROM paper_intent "
+                    "WHERE account_id = ? AND intent_id = ?",
+                    (self.account_id, order.intent_id),
                 ).fetchone()
                 if intent_row is None:
                     raise PaperBrokerReconciliationError("paper order is missing its intent")
                 intent = PaperOrderIntent.model_validate_json(intent_row["payload_json"])
+                if (
+                    intent.intent_id != order.intent_id
+                    or intent.account_id != order.account_id
+                    or intent.ts_code != order.ts_code
+                    or intent.side is not order.side
+                    or intent.order_type is not order.order_type
+                    or intent.quantity != order.quantity
+                ):
+                    raise PaperBrokerReconciliationError("paper close intent/order mismatch")
+                last_fill = connection.execute(
+                    "SELECT * FROM paper_fill WHERE order_id = ? "
+                    "ORDER BY sequence DESC, fill_id DESC LIMIT 1",
+                    (order_id,),
+                ).fetchone()
+                if last_fill is not None and int(last_fill["sequence"]) != next_sequence - 1:
+                    raise PaperBrokerReconciliationError(
+                        "paper close last fill sequence is inconsistent"
+                    )
+                execution_id = (
+                    str(last_fill["execution_id"])
+                    if last_fill is not None
+                    else str(intent_row["initial_execution_id"])
+                )
+                last_receipt = self._execution_receipt(connection, execution_id=execution_id)
+                if last_receipt is None or (
+                    last_receipt.intent_id != intent.intent_id
+                    or last_receipt.order != order
+                    or (last_fill is None and last_receipt.fill is not None)
+                    or (
+                        last_fill is not None
+                        and (
+                            last_receipt.fill != self._fill_from_row(last_fill)
+                            or last_receipt.persisted_at
+                            != self._required_ledger_timestamp(
+                                last_fill["persisted_at"],
+                                label=f"order {order_id} last fill persisted_at",
+                            )
+                        )
+                    )
+                ):
+                    raise PaperBrokerReconciliationError(
+                        f"order {order_id} last execution receipt mismatch"
+                    )
                 if status is PaperOrderStatus.EXPIRED and decision_time < intent.expires_at:
                     raise ValueError("order cannot expire before intent expires_at")
                 connection.execute(
                     "UPDATE paper_order SET status = ?, updated_at = ? WHERE order_id = ?",
                     (status.value, _utc_iso(max(order.updated_at, persistence_time)), order_id),
                 )
+                final_row = connection.execute(
+                    "SELECT * FROM paper_order WHERE account_id = ? AND order_id = ?",
+                    (self.account_id, order_id),
+                ).fetchone()
+                assert final_row is not None
+                final_order = self._order_from_row(final_row)
                 self._append_ledger_attestation(
                     connection,
-                    event_kind="order_close",
-                    event_fingerprint=canonical_sha256(
-                        {
-                            "order_id": order_id,
-                            "status": status.value,
-                            "decided_at": decision_time,
-                            "persisted_at": persistence_time,
-                        }
-                    ),
+                    event_kind="order_close_v2",
+                    event_fingerprint=_close_event_fingerprint(final_order, last_receipt),
                     count_deltas={},
                 )
+                close_event = connection.execute(
+                    "SELECT persisted_at FROM paper_ledger_attestation "
+                    "ORDER BY revision DESC LIMIT 1"
+                ).fetchone()
+                assert close_event is not None
+                if (
+                    self._required_ledger_timestamp(
+                        close_event["persisted_at"], label="paper close attestation persisted_at"
+                    )
+                    < final_order.updated_at
+                ):
+                    raise ValueError("paper close has future persistence after attestation")
                 connection.commit()
             except BaseException:
                 if connection.in_transaction:
@@ -4080,6 +4150,117 @@ class PaperBrokerStore:
             ).fetchone()
             return self._order_from_row(row) if row is not None else None
 
+    def _verify_close_attestations(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        closed: Mapping[str, PaperOrder],
+        cutoff: datetime,
+        head: sqlite3.Row,
+    ) -> None:
+        if not closed:
+            return
+        fingerprints = tuple(closed)
+        placeholders = ", ".join("?" for _ in fingerprints)
+        steps = 0
+        exhausted = False
+
+        def stop_unbounded_scan() -> int:
+            nonlocal steps, exhausted
+            steps += _CLOSE_ATTESTATION_PROGRESS_INTERVAL
+            exhausted = steps > _MAX_HISTORY_CLOSE_ATTESTATION_STEPS
+            return int(exhausted)
+
+        connection.set_progress_handler(stop_unbounded_scan, _CLOSE_ATTESTATION_PROGRESS_INTERVAL)
+        try:
+            rows = connection.execute(
+                "SELECT * FROM paper_ledger_attestation "
+                "WHERE event_kind = 'order_close_v2' "
+                f"AND event_fingerprint IN ({placeholders}) AND revision <= ? LIMIT ?",
+                (*fingerprints, int(head["revision"]), len(fingerprints) + 1),
+            ).fetchall()
+        except sqlite3.OperationalError as exc:
+            if exhausted:
+                raise PaperBrokerReconciliationError(
+                    "paper history close attestation scan capacity exceeded"
+                ) from exc
+            raise
+        finally:
+            connection.set_progress_handler(None, 0)
+
+        matched: set[str] = set()
+        for row in rows:
+            fingerprint = str(row["event_fingerprint"])
+            if fingerprint in matched:
+                raise PaperBrokerReconciliationError(
+                    "paper history close attestation is not unique"
+                )
+            matched.add(fingerprint)
+            self._validate_attestation_row(row)
+            marker = connection.execute(
+                "SELECT * FROM paper_ledger_head_marker WHERE revision = ? LIMIT 1",
+                (int(row["revision"]),),
+            ).fetchone()
+            if marker is None:
+                raise PaperBrokerReconciliationError(
+                    "paper history close attestation head marker is missing"
+                )
+            self._validate_head_marker_row(marker)
+            if (
+                int(row["revision"]) < 2
+                or str(row["ledger_generation"]) != str(head["ledger_generation"])
+                or str(row["schema_fingerprint"]) != str(head["schema_fingerprint"])
+                or str(marker["attestation_fingerprint"]) != str(row["attestation_fingerprint"])
+                or str(marker["ledger_generation"]) != str(head["ledger_generation"])
+            ):
+                raise PaperBrokerReconciliationError(
+                    "paper history close attestation is detached from trusted head"
+                )
+            preceding = connection.execute(
+                "SELECT a.attestation_fingerprint, h.head_marker_fingerprint "
+                "FROM paper_ledger_attestation AS a "
+                "JOIN paper_ledger_head_marker AS h ON h.revision = a.revision "
+                "WHERE a.revision = ? LIMIT 1",
+                (int(row["revision"]) - 1,),
+            ).fetchone()
+            if preceding is None or (
+                str(row["previous_attestation_fingerprint"])
+                != str(preceding["attestation_fingerprint"])
+                or str(marker["previous_head_marker_fingerprint"])
+                != str(preceding["head_marker_fingerprint"])
+            ):
+                raise PaperBrokerReconciliationError(
+                    "paper history close attestation predecessor is detached"
+                )
+            if int(row["revision"]) < int(head["revision"]):
+                following = connection.execute(
+                    "SELECT a.previous_attestation_fingerprint, "
+                    "h.previous_head_marker_fingerprint "
+                    "FROM paper_ledger_attestation AS a "
+                    "JOIN paper_ledger_head_marker AS h ON h.revision = a.revision "
+                    "WHERE a.revision = ? LIMIT 1",
+                    (int(row["revision"]) + 1,),
+                ).fetchone()
+                if following is None or (
+                    str(following["previous_attestation_fingerprint"])
+                    != str(row["attestation_fingerprint"])
+                    or str(following["previous_head_marker_fingerprint"])
+                    != str(marker["head_marker_fingerprint"])
+                ):
+                    raise PaperBrokerReconciliationError(
+                        "paper history close attestation successor is detached"
+                    )
+            event_time = self._required_ledger_timestamp(
+                row["persisted_at"], label="paper close attestation persisted_at"
+            )
+            order = closed[fingerprint]
+            if event_time < order.updated_at or event_time > cutoff:
+                raise PaperBrokerReconciliationError(
+                    f"order {order.order_id} has unverifiable close status"
+                )
+        if matched != set(fingerprints):
+            raise PaperBrokerReconciliationError("paper history has unverifiable close status")
+
     def recent_order_history(self, *, as_of: AwareUtcDatetime) -> PaperOrderHistorySnapshot:
         """Read one trusted, bounded account window without mixing writer commits."""
 
@@ -4091,7 +4272,7 @@ class PaperBrokerStore:
             connection.execute("BEGIN")
             self._require_trusted_ledger(connection)
             head = connection.execute(
-                "SELECT revision FROM paper_ledger_head_marker ORDER BY revision DESC LIMIT 1"
+                "SELECT * FROM paper_ledger_head_marker ORDER BY revision DESC LIMIT 1"
             ).fetchone()
             if head is None:
                 raise PaperBrokerReconciliationError("paper history trusted head is missing")
@@ -4209,6 +4390,7 @@ class PaperBrokerStore:
                 if fill.persisted_at > cutoff or fill.executed_at > cutoff:
                     raise PaperBrokerReconciliationError("paper history fill time is inconsistent")
                 by_order[fill.order_id].append(fill)
+            closed: dict[str, PaperOrder] = {}
             for order in orders:
                 parts = by_order[str(order.order_id)]
                 if [fill.sequence for fill in parts] != list(range(1, len(parts) + 1)):
@@ -4234,13 +4416,15 @@ class PaperBrokerStore:
                         "paper history fill summary is inconsistent"
                     )
                 if order.status in {PaperOrderStatus.CANCELLED, PaperOrderStatus.EXPIRED}:
-                    raise PaperBrokerReconciliationError(
-                        f"order {order.order_id} has unverifiable close status"
+                    fingerprint = _close_event_fingerprint(
+                        order, final_receipts[str(order.order_id)]
                     )
-                if order != final_receipts[str(order.order_id)].order:
+                    closed[fingerprint] = order
+                elif order != final_receipts[str(order.order_id)].order:
                     raise PaperBrokerReconciliationError(
                         f"order {order.order_id} final execution receipt mismatch"
                     )
+            self._verify_close_attestations(connection, closed=closed, cutoff=cutoff, head=head)
             return PaperOrderHistorySnapshot(
                 account_id=self.account_id,
                 as_of=cutoff,
