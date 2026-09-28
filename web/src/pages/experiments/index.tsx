@@ -2,6 +2,7 @@ import { useState } from "react";
 import { type ExperimentItem, useExperiments } from "@/api/experiments";
 import { useCurrentMeta } from "@/api/useMeta";
 import { formatCount, formatPercent } from "@/format/number";
+import { formatShanghaiDateTime } from "@/format/time";
 import { type DataColumn, DataTable } from "@/table/DataTable";
 import {
   Button,
@@ -27,6 +28,15 @@ const statusLabel: Record<
   failed: { label: "未完成", kind: "crit" },
   cancelled: { label: "已取消", kind: "idle" },
 };
+
+function coverageStartText(at: string | null): string {
+  if (!at || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(at)) {
+    return "覆盖起点暂不可用";
+  }
+  const date = new Date(at);
+  if (!Number.isFinite(date.getTime())) return "覆盖起点暂不可用";
+  return `最早登记于 ${formatShanghaiDateTime(date).slice(0, 16)}（北京时间）`;
+}
 
 const columns: DataColumn<ExperimentItem>[] = [
   {
@@ -145,13 +155,15 @@ export default function ExperimentsPage() {
           ) : null}
         </Panel>
       ) : (
-        <Panel title="实验记录" sub="参数、夏普和年化尚未发布" flush>
+        <Panel
+          title="实验记录"
+          sub="列表显示研究假设；策略显示名、参数、夏普、年化、备注暂无可信记录"
+          flush
+        >
           {query.data.truncated ? (
             <p className="exp-window" role="status">
-              仅显示最近 {formatCount(query.data.retained_count)} 条实验
-              <Tip content="较早记录暂未纳入本页">
-                <span> · 按登记时间排序</span>
-              </Tip>
+              仅显示最近 {formatCount(query.data.retained_count)} 条实验 ·{" "}
+              {coverageStartText(query.data.oldest_registered_at)}
             </p>
           ) : null}
           <DataTable

@@ -60,7 +60,9 @@ describe("实验记录", () => {
     expect(within(table).getByText("均线研究")).toBeVisible();
     expect(within(table).getByText("+7.50%")).toBeVisible();
     expect(within(table).getByText("12")).toBeVisible();
-    expect(screen.getByText(/参数、夏普和年化尚未发布/)).toBeVisible();
+    expect(
+      screen.getByText("列表显示研究假设；策略显示名、参数、夏普、年化、备注暂无可信记录"),
+    ).toBeVisible();
     expect(screen.queryByRole("button", { name: "新建实验" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "对比所选" })).not.toBeInTheDocument();
     expect(container.querySelector("main")?.textContent).not.toContain(first.experiment_id);
@@ -129,6 +131,31 @@ describe("实验记录", () => {
       ),
     );
     renderApp("/experiments");
-    expect(await screen.findByText("仅显示最近 500 条实验")).toBeVisible();
+    expect(await screen.findByText(/仅显示最近 500 条实验/)).toHaveTextContent(
+      "仅显示最近 500 条实验 · 最早登记于 2026-09-24 15:20（北京时间）",
+    );
+  });
+
+  it("覆盖起点无效时不显示错误日期", async () => {
+    server.use(
+      http.get("*/api/v1/experiments", () =>
+        HttpResponse.json({
+          data: {
+            available: true,
+            items: [first],
+            retained_count: 500,
+            truncated: true,
+            oldest_registered_at: "invalid-time",
+            next_cursor: null,
+          },
+          serving,
+        }),
+      ),
+    );
+    renderApp("/experiments");
+    expect(await screen.findByText(/仅显示最近 500 条实验/)).toHaveTextContent(
+      "仅显示最近 500 条实验 · 覆盖起点暂不可用",
+    );
+    expect(screen.queryByText(/Invalid Date|NaN/)).not.toBeInTheDocument();
   });
 });

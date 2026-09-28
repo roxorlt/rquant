@@ -43,7 +43,12 @@ test("实验记录在桌面和手机可读，键盘分页且仅提供真实操�
   const table = page.getByRole("table", { name: "实验记录" });
   await expect(table.getByText("均线研究")).toBeVisible();
   await expect(table.getByText("+7.50%")).toBeVisible();
-  await expect(page.getByText("仅显示最近 500 条实验")).toBeVisible();
+  await expect(page.locator(".exp-window")).toContainText(
+    "仅显示最近 500 条实验 · 最早登记于 2026-09-23 15:20（北京时间）",
+  );
+  await expect(
+    page.getByText("列表显示研究假设；策略显示名、参数、夏普、年化、备注暂无可信记录"),
+  ).toBeVisible();
   await expect(page.getByRole("button", { name: "新建实验" })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "对比所选" })).toHaveCount(0);
   expect(findJargon(await page.locator("main").innerText())).toEqual([]);
