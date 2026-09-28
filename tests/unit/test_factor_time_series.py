@@ -283,15 +283,12 @@ def test_invalid_arithmetic_returns_stable_missing_reason(
 @pytest.mark.parametrize(
     "expression",
     [
-        "cs_rank(close)",
-        "cs_zscore(close)",
-        "cs_winsorize(close, 3)",
         "industry_neutralize(close)",
         "size_neutralize(close)",
-        "close + cs_rank(volume)",
+        "close + industry_neutralize(volume)",
     ],
 )
-def test_cross_sectional_operators_reject_entire_evaluation(expression: str) -> None:
+def test_neutralization_operators_reject_entire_evaluation(expression: str) -> None:
     from rquant.factor.time_series import FactorTimeSeriesError
 
     data = _input(expression, (_DAYS[0],), _base_observations()[:2])

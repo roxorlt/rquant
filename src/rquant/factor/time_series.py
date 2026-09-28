@@ -1,4 +1,4 @@
-"""Pure daily time-series evaluation of validated factor expressions."""
+"""Pure daily evaluation of validated factor expressions."""
 
 from __future__ import annotations
 
@@ -23,13 +23,11 @@ MAX_RESULT_POINTS = 100_000
 _MARKET_TZ = timezone(timedelta(hours=8))
 _UNSUPPORTED_FUNCTIONS = frozenset(
     {
-        "cs_rank",
-        "cs_zscore",
-        "cs_winsorize",
         "industry_neutralize",
         "size_neutralize",
     }
 )
+_CROSS_SECTIONAL_FUNCTIONS = frozenset({"cs_rank", "cs_zscore", "cs_winsorize"})
 
 FiniteValue = Annotated[float, Field(strict=True, allow_inf_nan=False)]
 MissingReason = Literal[
@@ -221,6 +219,29 @@ def _literal_integer(node: ast.AST) -> int:
     return sign * node.value
 
 
+def _literal_number(node: ast.AST) -> float:
+    sign = 1
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+        sign = -1 if isinstance(node.op, ast.USub) else 1
+        node = node.operand
+    if not isinstance(node, ast.Constant) or type(node.value) not in (int, float):
+        raise FactorTimeSeriesError("invalid_definition")
+    return sign * float(node.value)
+
+
+def _median(values: list[float]) -> float:
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    left, right = ordered[middle - 1], ordered[middle]
+    if left == right:
+        return left
+    if (left < 0) == (right < 0):
+        return left + (right - left) / 2
+    return left / 2 + right / 2
+
+
 def _scaled_mean(values: list[float]) -> float:
     scale = max(abs(value) for value in values)
     if scale == 0:
@@ -263,12 +284,16 @@ class _SeriesEvaluator:
     def __init__(
         self,
         stock_code: str,
+        universe: tuple[str, ...],
         trading_days: tuple[date, ...],
         observations: dict[tuple[str, date, str], FeatureObservation],
+        cross_cache: dict[tuple[int, int], dict[str, _Cell]],
     ) -> None:
         self.stock_code = stock_code
+        self.universe = universe
         self.trading_days = trading_days
         self.observations = observations
+        self.cross_cache = cross_cache
         self.cache: dict[tuple[int, int], _Cell] = {}
 
     def evaluate(self, node: ast.AST, day_index: int) -> _Cell:
@@ -384,6 +409,8 @@ class _SeriesEvaluator:
         name = node.func.id
         if name in _UNSUPPORTED_FUNCTIONS:
             raise FactorTimeSeriesError("unsupported_operator")
+        if name in _CROSS_SECTIONAL_FUNCTIONS:
+            return self._cross_section(node, day_index, name)
         if name == "ref":
             offset = _literal_integer(node.args[1])
             if day_index < offset:
@@ -436,6 +463,95 @@ class _SeriesEvaluator:
             return _missing("zero_variance")
         return _present(coefficient, _latest(first + second))
 
+    def _cross_section(self, node: ast.Call, day_index: int, name: str) -> _Cell:
+        key = (id(node), day_index)
+        if key not in self.cross_cache:
+            inputs = {
+                stock: (
+                    self
+                    if stock == self.stock_code
+                    else _SeriesEvaluator(
+                        stock, self.universe, self.trading_days, self.observations, self.cross_cache
+                    )
+                ).evaluate(node.args[0], day_index)
+                for stock in self.universe
+            }
+            valid = [(stock, cell) for stock, cell in inputs.items() if cell.value is not None]
+            latest = _latest([cell for _, cell in valid])
+            results = inputs.copy()
+            if name == "cs_rank":
+                ordered = sorted(valid, key=lambda item: item[1].value)
+                index = 0
+                while index < len(ordered):
+                    end = index + 1
+                    while end < len(ordered) and ordered[end][1].value == ordered[index][1].value:
+                        end += 1
+                    rank = (index + 1 + end) / (2 * len(ordered))
+                    for stock, _ in ordered[index:end]:
+                        results[stock] = _present(rank, latest)
+                    index = end
+            elif name == "cs_zscore":
+                self._cross_zscore(valid, latest, results)
+            else:
+                self._cross_winsorize(valid, latest, results, _literal_number(node.args[1]))
+            self.cross_cache[key] = results
+        return self.cross_cache[key][self.stock_code]
+
+    @staticmethod
+    def _cross_zscore(
+        valid: list[tuple[str, _Cell]], latest: datetime | None, results: dict[str, _Cell]
+    ) -> None:
+        values = [cell.value for _, cell in valid if cell.value is not None]
+        if len(values) < 2:
+            outcome = _missing("insufficient_samples")
+            for stock, _ in valid:
+                results[stock] = outcome
+            return
+        if len(set(values)) == 1:
+            outcome = _missing("zero_variance")
+            for stock, _ in valid:
+                results[stock] = outcome
+            return
+        scale = max(abs(value) for value in values)
+        scaled = [value / scale for value in values]
+        center = math.fsum(scaled) / len(scaled)
+        variance = math.fsum((value - center) ** 2 for value in scaled) / len(scaled)
+        if variance == 0:
+            outcome = _missing("precision_limit")
+            for stock, _ in valid:
+                results[stock] = outcome
+            return
+        deviation = math.sqrt(variance)
+        for (stock, _), value in zip(valid, scaled, strict=True):
+            results[stock] = _present((value - center) / deviation, latest)
+
+    @staticmethod
+    def _cross_winsorize(
+        valid: list[tuple[str, _Cell]],
+        latest: datetime | None,
+        results: dict[str, _Cell],
+        multiple: float,
+    ) -> None:
+        if not valid:
+            return
+        values = [cell.value for _, cell in valid if cell.value is not None]
+        center = _median(values)
+        deviations = [abs(value - center) for value in values]
+        if not all(math.isfinite(value) for value in deviations):
+            outcome = _missing("non_finite_result")
+        else:
+            mad = _median(deviations)
+            spread = multiple * 1.4826 * mad
+            lower, upper = center - spread, center + spread
+            if not all(math.isfinite(value) for value in (spread, lower, upper)):
+                outcome = _missing("non_finite_result")
+            else:
+                for (stock, _), value in zip(valid, values, strict=True):
+                    results[stock] = _present(max(lower, min(value, upper)), latest)
+                return
+        for stock, _ in valid:
+            results[stock] = outcome
+
 
 def evaluate_factor_time_series(data: FactorTimeSeriesInput) -> FactorTimeSeriesResult:
     """Evaluate each stock at each decision date without external I/O."""
@@ -454,9 +570,12 @@ def evaluate_factor_time_series(data: FactorTimeSeriesInput) -> FactorTimeSeries
     observations = {
         (row.stock_code, row.trade_date, row.column): row for row in checked.observations
     }
+    cross_cache: dict[tuple[int, int], dict[str, _Cell]] = {}
     by_day: list[list[FactorTimeSeriesValue]] = [[] for _ in checked.trading_days]
     for stock_code in checked.universe:
-        evaluator = _SeriesEvaluator(stock_code, checked.trading_days, observations)
+        evaluator = _SeriesEvaluator(
+            stock_code, checked.universe, checked.trading_days, observations, cross_cache
+        )
         for index, trade_date in enumerate(checked.trading_days):
             cell = (
                 _missing("before_available_date")
