@@ -37,6 +37,7 @@ UNIT_LOG_MANIFEST_ENV_VAR = "RQUANT_WEB_UNIT_LOG_MANIFEST"
 UNIT_LOG_PUBLIC_KEY_ENV_VAR = "RQUANT_WEB_UNIT_LOG_PUBLIC_KEY"
 UNIT_LOG_EXPECTED_HOST_ENV_VAR = "RQUANT_WEB_UNIT_LOG_EXPECTED_HOST"
 UNIT_LOG_VERIFIED_UNITS_ENV_VAR = "RQUANT_WEB_UNIT_LOG_VERIFIED_UNITS"
+UNIT_LOG_AUDIT_DIR_ENV_VAR = "RQUANT_WEB_UNIT_LOG_AUDIT_DIR"
 _ADMIN_USER_PATTERN = re.compile(r"^[A-Za-z0-9._@-]{1,64}$")
 _HOST_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,252}$")
 _INITIAL_STRUCTURED_LOG_UNITS = frozenset({"rquant-daily.service", "rquant-backup.service"})
@@ -99,6 +100,7 @@ class WebSettings(BaseModel):
     unit_log_public_key_path: Path | None = None
     unit_log_expected_host: str | None = None
     unit_log_verified_units: frozenset[str] = frozenset()
+    unit_log_audit_dir: Path | None = None
 
     @model_validator(mode="after")
     def validate_sources_and_ingress(self) -> Self:
@@ -124,7 +126,7 @@ class WebSettings(BaseModel):
         ):
             raise ValueError("service log settings must be configured together")
         if all(value is None for value in log_fields):
-            if self.unit_log_verified_units:
+            if self.unit_log_verified_units or self.unit_log_audit_dir is not None:
                 raise ValueError("verified service logs require the full private configuration")
             return self
         if self.ingress_socket_path is None or not self.log_admin_users:
@@ -136,6 +138,15 @@ class WebSettings(BaseModel):
             self.ack_admission_socket_path.parent if self.ack_admission_socket_path else None,
         }:
             raise ValueError("service logs need a separate private socket directory")
+        if self.unit_log_audit_dir is not None and self.unit_log_audit_dir in {
+            self.serving_root,
+            self.ingress_socket_path.parent,
+            self.ack_admission_socket_path.parent if self.ack_admission_socket_path else None,
+            self.unit_log_socket_path.parent if self.unit_log_socket_path else None,
+            self.unit_log_manifest_path.parent if self.unit_log_manifest_path else None,
+            self.unit_log_public_key_path.parent if self.unit_log_public_key_path else None,
+        }:
+            raise ValueError("service log audit needs a dedicated directory")
         return self
 
     @field_validator("bind")
@@ -177,6 +188,13 @@ class WebSettings(BaseModel):
     def validate_unit_log_path(cls, value: Path | None) -> Path | None:
         if value is not None and (not value.is_absolute() or ".." in value.parts):
             raise ValueError("service log paths must be absolute and canonical")
+        return value
+
+    @field_validator("unit_log_audit_dir")
+    @classmethod
+    def validate_unit_log_audit_dir(cls, value: Path | None) -> Path | None:
+        if value is not None and (not value.is_absolute() or ".." in value.parts):
+            raise ValueError("service log audit directory must be absolute and canonical")
         return value
 
     @field_validator("unit_log_service_uid", "unit_log_web_group_gid")
@@ -279,4 +297,7 @@ class WebSettings(BaseModel):
             if any(not unit for unit in names) or len(set(names)) != len(names):
                 raise ValueError("verified service logs must be distinct exact units")
             values["unit_log_verified_units"] = frozenset(names)
+        audit_dir = source.get(UNIT_LOG_AUDIT_DIR_ENV_VAR, "").strip()
+        if audit_dir:
+            values["unit_log_audit_dir"] = Path(audit_dir)
         return cls.model_validate(values)

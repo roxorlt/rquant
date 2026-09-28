@@ -69,7 +69,12 @@ def main(argv: Sequence[str]) -> int:
 
     import uvicorn
 
-    app = create_app(settings)
+    unit_log_access_audit = None
+    if settings.unit_log_audit_dir is not None:
+        from rquant.web.service_log_access_audit import JsonlServiceLogAccessAudit
+
+        unit_log_access_audit = JsonlServiceLogAccessAudit(settings.unit_log_audit_dir)
+    app = create_app(settings, unit_log_access_audit=unit_log_access_audit)
     options = dict(
         workers=1,
         proxy_headers=False,
