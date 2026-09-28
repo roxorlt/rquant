@@ -78,6 +78,7 @@ from rquant.web.settings import WebSettings
 
 if TYPE_CHECKING:
     from rquant.alert_ack_admission import AckAdmissionClient
+    from rquant.watchlist_admission import WatchlistAdmissionClient
 
 API_TITLE = "rQuant Web API"
 #: Version of the HTTP contract, bumped by hand; not the package version, so that a
@@ -88,6 +89,7 @@ _WRITE_BODY_LIMITS = {
     "/api/v1/pools/editor/commands": pool_editor.MAX_REQUEST_BYTES,
     "/api/v1/pools/editor/nl-preview": pool_editor.MAX_NL_REQUEST_BYTES,
     "/api/v1/monitor/ack": monitor.MAX_ACK_REQUEST_BYTES,
+    "/api/v1/watchlist/commands": manual_watchlist.MAX_COMMAND_REQUEST_BYTES,
     "/api/v1/data/backfill-plans/commands": backfill_plan_commands.MAX_REQUEST_BYTES,
     "/api/v1/data/audit-report/commands": data_audit_report_commands.MAX_REQUEST_BYTES,
     "/api/v1/screen/tdx/market/commands": formula_market_commands.MAX_REQUEST_BYTES,
@@ -113,6 +115,7 @@ class WebContext:
     nl_rate_limiter: PoolNlRateLimiter
     ack_lookup: AckLookupGateway
     ack_admission: AckAdmissionClient | None
+    watchlist_admission: WatchlistAdmissionClient | None
     unit_log_client: UnitLogClient | None
     unit_log_access_audit: ServiceLogAccessAudit | None
     unit_log_gate: threading.BoundedSemaphore
@@ -131,6 +134,7 @@ def create_app(
     nl_parser: ScreenPlanParser | None = None,
     ack_lookup_transport: AckLookupTransport | None = None,
     ack_admission_client: AckAdmissionClient | None = None,
+    watchlist_admission_client: WatchlistAdmissionClient | None = None,
     unit_log_client: UnitLogClient | None = None,
     unit_log_access_audit: ServiceLogAccessAudit | None = None,
     backfill_plan_command_transport: BackfillPlanCommandTransport | None = None,
@@ -191,6 +195,15 @@ def create_app(
             if ack_admission_client is not None
             else AckAdmissionClient(settings.ack_admission_socket_path)
         )
+    configured_watchlist_admission = None
+    if settings.watchlist_admission_socket_path is not None:
+        from rquant.watchlist_admission import WatchlistAdmissionClient
+
+        configured_watchlist_admission = (
+            watchlist_admission_client
+            if watchlist_admission_client is not None
+            else WatchlistAdmissionClient(settings.watchlist_admission_socket_path)
+        )
     configured_unit_log = None
     if settings.unit_log_socket_path is not None:
         assert settings.unit_log_service_uid is not None
@@ -235,6 +248,7 @@ def create_app(
             transport=ack_lookup_transport,
         ),
         ack_admission=configured_ack_admission,
+        watchlist_admission=configured_watchlist_admission,
         unit_log_client=configured_unit_log,
         unit_log_access_audit=unit_log_access_audit,
         unit_log_gate=threading.BoundedSemaphore(1),
@@ -307,6 +321,8 @@ def create_app(
             return JSONResponse(status_code=422, content={"detail": "修改描述有误，请检查后重试。"})
         if request.url.path == "/api/v1/monitor/ack":
             return JSONResponse(status_code=422, content={"detail": "确认请求有误，请刷新后重试。"})
+        if request.url.path == "/api/v1/watchlist/commands":
+            return JSONResponse(status_code=422, content={"detail": "名单请求有误，请检查后重试。"})
         if request.url.path == "/api/v1/data/backfill-plans/commands":
             return JSONResponse(status_code=422, content={"detail": "计划日期有误，请检查后重试。"})
         if request.url.path == "/api/v1/data/audit-report/commands":

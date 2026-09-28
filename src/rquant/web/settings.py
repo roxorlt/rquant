@@ -40,6 +40,7 @@ CATALOG_SAMPLES_ENV_VAR = "RQUANT_WEB_CATALOG_SAMPLES_FILE"
 NL_OPENAI_API_KEY_ENV_VAR = "RQUANT_WEB_NL_OPENAI_API_KEY"
 NL_OPENAI_MODEL_ENV_VAR = "RQUANT_WEB_NL_OPENAI_MODEL"
 ACK_ADMISSION_SOCKET_ENV_VAR = "RQUANT_WEB_ACK_ADMISSION_SOCKET"
+WATCHLIST_ADMISSION_SOCKET_ENV_VAR = "RQUANT_WEB_WATCHLIST_ADMISSION_SOCKET"
 INGRESS_SOCKET_ENV_VAR = "RQUANT_WEB_INGRESS_SOCKET"
 LOG_ADMIN_USERS_ENV_VAR = "RQUANT_WEB_LOG_ADMIN_USERS"
 UNIT_LOG_SOCKET_ENV_VAR = "RQUANT_WEB_UNIT_LOG_SOCKET"
@@ -107,6 +108,7 @@ class WebSettings(BaseModel):
     nl_openai_api_key: SecretStr | None = None
     nl_openai_model: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
     ack_admission_socket_path: Path | None = None
+    watchlist_admission_socket_path: Path | None = None
     ingress_socket_path: Path | None = None
     log_admin_users: frozenset[str] = frozenset()
     unit_log_socket_path: Path | None = None
@@ -133,6 +135,16 @@ class WebSettings(BaseModel):
                 raise ValueError("ack admission requires private Web ingress")
             if self.ingress_socket_path.parent == self.ack_admission_socket_path.parent:
                 raise ValueError("private Web ingress and ack admission need separate directories")
+        if self.watchlist_admission_socket_path is not None:
+            if self.ingress_socket_path is None:
+                raise ValueError("watchlist admission requires private Web ingress")
+            if not self.watchlist_admission_socket_path.is_absolute():
+                raise ValueError("watchlist admission socket path must be absolute")
+            reserved = {self.ingress_socket_path.parent}
+            if self.ack_admission_socket_path is not None:
+                reserved.add(self.ack_admission_socket_path.parent)
+            if self.watchlist_admission_socket_path.parent in reserved:
+                raise ValueError("watchlist admission socket needs a separate directory")
         log_fields = (
             self.unit_log_socket_path,
             self.unit_log_service_uid,
@@ -300,6 +312,9 @@ class WebSettings(BaseModel):
         admission_socket = source.get(ACK_ADMISSION_SOCKET_ENV_VAR, "").strip()
         if admission_socket:
             values["ack_admission_socket_path"] = Path(admission_socket)
+        watchlist_socket = source.get(WATCHLIST_ADMISSION_SOCKET_ENV_VAR, "").strip()
+        if watchlist_socket:
+            values["watchlist_admission_socket_path"] = Path(watchlist_socket)
         ingress_socket = source.get(INGRESS_SOCKET_ENV_VAR, "").strip()
         if ingress_socket:
             if bind is not None or source.get(BIND_ENV_VAR, "").strip():

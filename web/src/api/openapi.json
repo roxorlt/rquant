@@ -6022,6 +6022,162 @@
         "title": "LogCapabilities",
         "type": "object"
       },
+      "ManualWatchlistCommandReceipt": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "enum": [
+              "add",
+              "remove"
+            ],
+            "title": "Action",
+            "type": "string"
+          },
+          "command_id": {
+            "title": "Command Id",
+            "type": "string"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "pending",
+              "processing",
+              "saved_syncing",
+              "published",
+              "conflict",
+              "capacity",
+              "failed",
+              "uncertain"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "ts_code": {
+            "pattern": "^[0-9]{6}\\.(?:SH|SZ|BJ)$",
+            "title": "Ts Code",
+            "type": "string"
+          },
+          "version": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Version"
+          }
+        },
+        "required": [
+          "command_id",
+          "ts_code",
+          "action",
+          "status",
+          "message"
+        ],
+        "title": "ManualWatchlistCommandReceipt",
+        "type": "object"
+      },
+      "ManualWatchlistCommandRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "enum": [
+              "add",
+              "remove"
+            ],
+            "title": "Action",
+            "type": "string"
+          },
+          "command_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Command Id",
+            "type": "string"
+          },
+          "expected_version": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Version"
+          },
+          "expires_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires At"
+          },
+          "generation_id": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Generation Id",
+            "type": "string"
+          },
+          "price_levels": {
+            "default": [],
+            "items": {
+              "anyOf": [
+                {
+                  "exclusiveMinimum": 0.0,
+                  "type": "number"
+                },
+                {
+                  "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                  "type": "string"
+                }
+              ]
+            },
+            "maxItems": 8,
+            "title": "Price Levels",
+            "type": "array"
+          },
+          "requested_at": {
+            "format": "date-time",
+            "title": "Requested At",
+            "type": "string"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WatchlistSource"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "ts_code": {
+            "pattern": "^[0-9]{6}\\.(?:SH|SZ|BJ)$",
+            "title": "Ts Code",
+            "type": "string"
+          }
+        },
+        "required": [
+          "command_id",
+          "requested_at",
+          "generation_id",
+          "ts_code",
+          "action"
+        ],
+        "title": "ManualWatchlistCommandRequest",
+        "type": "object"
+      },
       "ManualWatchlistExactData": {
         "additionalProperties": false,
         "properties": {
@@ -14510,6 +14666,47 @@
           }
         },
         "summary": "我的盯盘名单",
+        "tags": [
+          "watchlist"
+        ]
+      }
+    },
+    "/api/v1/watchlist/commands": {
+      "post": {
+        "operationId": "submit_manual_watchlist_command_api_v1_watchlist_commands_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ManualWatchlistCommandRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ManualWatchlistCommandReceipt"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "加入或移出我的盯盘名单",
         "tags": [
           "watchlist"
         ]

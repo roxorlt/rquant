@@ -888,6 +888,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/watchlist/commands": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 加入或移出我的盯盘名单 */
+        post: operations["submit_manual_watchlist_command_api_v1_watchlist_commands_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/watchlist/{ts_code}": {
         parameters: {
             query?: never;
@@ -2928,6 +2945,56 @@ export interface components {
              * @default []
              */
             units: string[];
+        };
+        /** ManualWatchlistCommandReceipt */
+        ManualWatchlistCommandReceipt: {
+            /**
+             * Action
+             * @enum {string}
+             */
+            action: "add" | "remove";
+            /** Command Id */
+            command_id: string;
+            /** Message */
+            message: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "pending" | "processing" | "saved_syncing" | "published" | "conflict" | "capacity" | "failed" | "uncertain";
+            /** Ts Code */
+            ts_code: string;
+            /** Version */
+            version?: number | null;
+        };
+        /** ManualWatchlistCommandRequest */
+        ManualWatchlistCommandRequest: {
+            /**
+             * Action
+             * @enum {string}
+             */
+            action: "add" | "remove";
+            /** Command Id */
+            command_id: string;
+            /** Expected Version */
+            expected_version?: number | null;
+            /** Expires At */
+            expires_at?: string | null;
+            /** Generation Id */
+            generation_id: string;
+            /**
+             * Price Levels
+             * @default []
+             */
+            price_levels: (number | string)[];
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+            source?: components["schemas"]["WatchlistSource"] | null;
+            /** Ts Code */
+            ts_code: string;
         };
         /** ManualWatchlistExactData */
         ManualWatchlistExactData: {
@@ -6362,6 +6429,39 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_ManualWatchlistListData_"];
+                };
+            };
+        };
+    };
+    submit_manual_watchlist_command_api_v1_watchlist_commands_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ManualWatchlistCommandRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManualWatchlistCommandReceipt"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };

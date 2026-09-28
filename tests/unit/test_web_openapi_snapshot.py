@@ -37,6 +37,7 @@ def test_every_api_path_is_versioned_and_only_defined_mutations_use_post() -> No
                 "/api/v1/pools/editor/commands",
                 "/api/v1/pools/editor/nl-preview",
                 "/api/v1/monitor/ack",
+                "/api/v1/watchlist/commands",
                 "/api/v1/data/backfill-plans/commands",
                 "/api/v1/data/audit-report/commands",
                 "/api/v1/screen/tdx/market/commands",
