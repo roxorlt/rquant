@@ -28,6 +28,7 @@ from rquant.experiment_registry import (
     PromotionStage,
     TerminalExperimentError,
 )
+from rquant.promotions_serving_authority import PromotionsSourceReader
 
 _HASH_A = "a" * 64
 _HASH_B = "b" * 64
@@ -1012,6 +1013,65 @@ def test_readonly_attempt_page_orders_equal_times_and_filters_exact_family(
     )
     assert completed.status is ExperimentStatus.SUCCEEDED
     assert completed.outcome == outcome
+
+
+def test_readonly_serving_snapshot_reads_ordered_attempts_and_marks_recent_window(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "experiments.sqlite3"
+    registry = ExperimentRegistry(path, managed_trust_root=tmp_path)
+    specs = [_spec(seed=seed) for seed in (1, 2)]
+    _register_family(registry, specs)
+    for index, spec in enumerate(specs):
+        registry.register_attempt(spec, registered_at=_NOW + timedelta(minutes=index))
+    _succeed(registry, specs[0], _outcome(specs[0], attempted=2, rank=1, raw_p="0.01"))
+    reader = ExperimentRegistryReadonlyReader(path, managed_trust_root=tmp_path)
+
+    snapshot = reader.read_serving_snapshot(observed_at=_NOW + timedelta(hours=2), attempt_limit=2)
+    assert [item.spec.experiment_id for item in snapshot.attempts] == [
+        specs[1].experiment_id,
+        specs[0].experiment_id,
+    ]
+    assert snapshot.attempts[1].status is ExperimentStatus.SUCCEEDED
+    assert snapshot.attempts[1].outcome is not None
+    assert snapshot.sequence >= 2
+    assert snapshot.truncated is False
+
+    recent = reader.read_serving_snapshot(observed_at=_NOW + timedelta(hours=2), attempt_limit=1)
+    assert recent.truncated is True
+    assert [item.spec.experiment_id for item in recent.attempts] == [specs[1].experiment_id]
+    assert recent.oldest_registered_at == _NOW + timedelta(minutes=1)
+
+    source = PromotionsSourceReader(registry=reader, include_experiments=True)(
+        _NOW + timedelta(hours=2)
+    )
+    attempt_projection, window_projection = source.payload.projections
+    assert [row["experiment_id"] for row in attempt_projection.rows] == [
+        spec.experiment_id for spec in reversed(specs)
+    ]
+    assert attempt_projection.rows[1]["net_return_pct"] is not None
+    assert "parameter_fingerprint" not in attempt_projection.rows[1]
+    assert window_projection.rows[0]["retained_count"] == 2
+
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "UPDATE experiment_attempt SET status = 'succeeded' WHERE experiment_id = ?",
+            (specs[1].experiment_id,),
+        )
+    with pytest.raises(ExperimentRegistryError, match="attempt evidence"):
+        reader.read_serving_snapshot(observed_at=_NOW + timedelta(hours=2), attempt_limit=2)
+
+
+def test_readonly_serving_snapshot_rejects_status_after_observed_time(tmp_path: Path) -> None:
+    path = tmp_path / "experiments.sqlite3"
+    registry = ExperimentRegistry(path, managed_trust_root=tmp_path)
+    spec = _spec()
+    _register_family(registry, [spec])
+    _succeed(registry, spec, _outcome(spec, attempted=1, rank=1, raw_p="0.01"))
+
+    reader = ExperimentRegistryReadonlyReader(path, managed_trust_root=tmp_path)
+    with pytest.raises(ExperimentRegistryError, match="future evidence"):
+        reader.read_serving_snapshot(observed_at=_NOW + timedelta(seconds=30))
 
 
 def test_readonly_attempt_cursor_preserves_scope_and_rejects_invalid_inputs(

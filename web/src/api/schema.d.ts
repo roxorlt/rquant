@@ -225,6 +225,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/experiments": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 实验记录 */
+        get: operations["list_experiments_api_v1_experiments_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/health": {
         parameters: {
             query?: never;
@@ -2309,6 +2326,11 @@ export interface components {
             data: components["schemas"]["DataAuditReportData"];
             serving: components["schemas"]["ServingMeta"];
         };
+        /** Envelope[ExperimentListData] */
+        Envelope_ExperimentListData_: {
+            data: components["schemas"]["ExperimentListData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
         /** Envelope[FormulaMarketJobDetailData] */
         Envelope_FormulaMarketJobDetailData_: {
             data: components["schemas"]["FormulaMarketJobDetailData"];
@@ -2451,6 +2473,48 @@ export interface components {
             service_id: string;
             /** Summary */
             summary: string;
+        };
+        /** ExperimentItem */
+        ExperimentItem: {
+            /** Completed At */
+            completed_at: string | null;
+            /** Experiment Id */
+            experiment_id: string;
+            /** Hypothesis Family */
+            hypothesis_family: string;
+            /** Max Drawdown Pct */
+            max_drawdown_pct: number | null;
+            /** Net Return Pct */
+            net_return_pct: number | null;
+            /**
+             * Registered At
+             * Format: date-time
+             */
+            registered_at: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "registered" | "running" | "executed" | "succeeded" | "failed" | "cancelled";
+            /** Trade Count */
+            trade_count: number | null;
+            /** Win Rate Pct */
+            win_rate_pct: number | null;
+        };
+        /** ExperimentListData */
+        ExperimentListData: {
+            /** Available */
+            available: boolean;
+            /** Items */
+            items: components["schemas"]["ExperimentItem"][];
+            /** Next Cursor */
+            next_cursor: string | null;
+            /** Oldest Registered At */
+            oldest_registered_at: string | null;
+            /** Retained Count */
+            retained_count: number;
+            /** Truncated */
+            truncated: boolean;
         };
         /** FieldExpr */
         FieldExpr: {
@@ -5296,6 +5360,39 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_DataAuditReportData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_experiments_api_v1_experiments_get: {
+        parameters: {
+            query?: {
+                limit?: number;
+                generation_id?: string | null;
+                cursor?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_ExperimentListData_"];
                 };
             };
             /** @description Validation Error */

@@ -37,6 +37,7 @@ Probability = Annotated[Decimal, Field(ge=0, le=1, allow_inf_nan=False)]
 FiniteDecimal = Annotated[Decimal, Field(allow_inf_nan=False)]
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 EXPERIMENT_ATTEMPT_PAGE_SIZE_MAX = 100
+EXPERIMENT_SERVING_ATTEMPT_LIMIT = 500
 
 
 class ExperimentStatus(StrEnum):
@@ -468,6 +469,17 @@ class PromotionDecisionReadSnapshot(RuntimeContractModel):
     event_time: AwareUtcDatetime | None = None
 
 
+class ExperimentServingReadSnapshot(RuntimeContractModel):
+    """One verified SQLite snapshot for a bounded recent Serving attempt window."""
+
+    promotions: PromotionDecisionReadSnapshot
+    attempts: tuple[ExperimentAttempt, ...] = ()
+    sequence: int = Field(ge=0)
+    event_time: AwareUtcDatetime | None = None
+    truncated: bool = False
+    oldest_registered_at: AwareUtcDatetime | None = None
+
+
 def _validate_readonly_registry_schema(connection: sqlite3.Connection) -> None:
     row = connection.execute(
         "SELECT type FROM sqlite_master WHERE name = 'promotion_decision'"
@@ -608,27 +620,36 @@ class ExperimentRegistryReadonlyReader:
         observed = normalize_aware_utc(observed_at)
         if limit < 1:
             raise ValueError("limit must be positive")
-        cutoff = _utc_iso(observed)
         with self._read_snapshot() as connection:
-            metadata = connection.execute(
-                """
-                SELECT COALESCE(MAX(rowid), 0) AS sequence,
-                       MAX(decided_at) AS event_time
-                FROM promotion_decision
-                WHERE decided_at <= ?
-                """,
-                (cutoff,),
-            ).fetchone()
-            rows = connection.execute(
-                """
-                SELECT rowid, decision_id, stage, approved, decided_at, payload_json
-                FROM promotion_decision
-                WHERE decided_at <= ?
-                ORDER BY decided_at DESC, decision_id DESC
-                LIMIT ?
-                """,
-                (cutoff, limit),
-            ).fetchall()
+            return self._promotion_decisions_in_snapshot(connection, observed=observed, limit=limit)
+
+    @staticmethod
+    def _promotion_decisions_in_snapshot(
+        connection: sqlite3.Connection,
+        *,
+        observed: datetime,
+        limit: int,
+    ) -> PromotionDecisionReadSnapshot:
+        cutoff = _utc_iso(observed)
+        metadata = connection.execute(
+            """
+            SELECT COALESCE(MAX(rowid), 0) AS sequence,
+                   MAX(decided_at) AS event_time
+            FROM promotion_decision
+            WHERE decided_at <= ?
+            """,
+            (cutoff,),
+        ).fetchone()
+        rows = connection.execute(
+            """
+            SELECT rowid, decision_id, stage, approved, decided_at, payload_json
+            FROM promotion_decision
+            WHERE decided_at <= ?
+            ORDER BY decided_at DESC, decision_id DESC
+            LIMIT ?
+            """,
+            (cutoff, limit),
+        ).fetchall()
 
         decisions: list[PromotionDecision] = []
         for row in rows:
@@ -658,6 +679,59 @@ class ExperimentRegistryReadonlyReader:
             decisions=tuple(decisions),
             sequence=int(metadata["sequence"]),
             event_time=event_time,
+        )
+
+    def read_serving_snapshot(
+        self,
+        *,
+        observed_at: datetime,
+        decision_limit: int = 1_000,
+        attempt_limit: int = EXPERIMENT_SERVING_ATTEMPT_LIMIT,
+    ) -> ExperimentServingReadSnapshot:
+        """Read a recent attempt window and its current evidence in one verified transaction."""
+
+        observed = normalize_aware_utc(observed_at)
+        if (
+            isinstance(decision_limit, bool)
+            or not isinstance(decision_limit, int)
+            or decision_limit < 1
+        ):
+            raise ValueError("decision_limit must be positive")
+        if (
+            isinstance(attempt_limit, bool)
+            or not isinstance(attempt_limit, int)
+            or not 1 <= attempt_limit <= EXPERIMENT_SERVING_ATTEMPT_LIMIT
+        ):
+            raise ValueError("attempt_limit must be from 1 through 500")
+        with self._read_snapshot() as connection:
+            promotions = self._promotion_decisions_in_snapshot(
+                connection, observed=observed, limit=decision_limit
+            )
+            rows = connection.execute(
+                "SELECT rowid, * FROM experiment_attempt "
+                "INDEXED BY experiment_attempt_registered_keyset_idx "
+                "WHERE registered_at <= ? "
+                "ORDER BY registered_at DESC, experiment_id DESC LIMIT ?",
+                (_utc_iso(observed), attempt_limit + 1),
+            ).fetchall()
+            attempts = tuple(
+                self._validated_attempt_from_row(connection, row, observed=observed)
+                for row in rows[:attempt_limit]
+            )
+
+        times = [promotions.event_time] if promotions.event_time is not None else []
+        for attempt in attempts:
+            times.append(attempt.completed_at or attempt.started_at or attempt.registered_at)
+        event_time = max(times) if times else None
+        if event_time is not None and event_time > observed:
+            raise ExperimentRegistryError("experiment attempt contains future evidence")
+        return ExperimentServingReadSnapshot(
+            promotions=promotions,
+            attempts=attempts,
+            sequence=promotions.sequence + max((int(row["rowid"]) for row in rows), default=0),
+            event_time=event_time,
+            truncated=len(rows) > attempt_limit,
+            oldest_registered_at=attempts[-1].registered_at if attempts else None,
         )
 
     def list_promotion_decisions(
@@ -741,23 +815,9 @@ class ExperimentRegistryReadonlyReader:
             ).fetchall()
             attempts: list[ExperimentAttempt] = []
             for row in rows:
-                try:
-                    attempt = ExperimentRegistry._attempt_from_row(connection, row)
-                    if (
-                        attempt.spec.experiment_id != row["experiment_id"]
-                        or attempt.spec.hypothesis_family != row["hypothesis_family"]
-                        or _utc_iso(attempt.registered_at) != row["registered_at"]
-                        or attempt.registered_at > visible_at
-                        or (
-                            attempt.outcome is not None
-                            and attempt.outcome.experiment_id != attempt.spec.experiment_id
-                        )
-                    ):
-                        raise ValueError("attempt payload does not match indexed evidence")
-                    self._validate_attempt_outcome_index(connection, row, attempt)
-                except (TypeError, ValueError, IndexError) as exc:
-                    raise ExperimentRegistryError("experiment attempt evidence is invalid") from exc
-                attempts.append(attempt)
+                attempts.append(
+                    self._validated_attempt_from_row(connection, row, observed=visible_at)
+                )
 
         visible = tuple(attempts[:page_size])
         next_cursor = (
@@ -778,6 +838,33 @@ class ExperimentRegistryReadonlyReader:
             registration_high_water=registration_high_water,
             next_cursor=next_cursor,
         )
+
+    @staticmethod
+    def _validated_attempt_from_row(
+        connection: sqlite3.Connection,
+        row: sqlite3.Row,
+        *,
+        observed: datetime,
+    ) -> ExperimentAttempt:
+        try:
+            attempt = ExperimentRegistry._attempt_from_row(connection, row)
+            if (
+                attempt.spec.experiment_id != row["experiment_id"]
+                or attempt.spec.hypothesis_family != row["hypothesis_family"]
+                or _utc_iso(attempt.registered_at) != row["registered_at"]
+                or attempt.registered_at > observed
+                or (
+                    attempt.outcome is not None
+                    and attempt.outcome.experiment_id != attempt.spec.experiment_id
+                )
+            ):
+                raise ValueError("attempt payload does not match indexed evidence")
+            ExperimentRegistryReadonlyReader._validate_attempt_outcome_index(
+                connection, row, attempt
+            )
+        except (TypeError, ValueError, IndexError) as exc:
+            raise ExperimentRegistryError("experiment attempt evidence is invalid") from exc
+        return attempt
 
     @staticmethod
     def _validate_attempt_outcome_index(

@@ -1141,6 +1141,7 @@ def build_web_fixture(
     backfill_plan_projections: tuple[ServingProjectionPayload, ...] = (),
     audit: bool = False,
     signal_projections: tuple[ServingProjectionPayload, ...] = (),
+    promotion_projections: tuple[ServingProjectionPayload, ...] = (),
     calendar_projection: ServingProjectionPayload | None = None,
 ) -> ServingGenerationManifest:
     """Publish generation ``sequence`` of ``scenario`` into ``root`` and select it."""
@@ -1281,6 +1282,14 @@ def build_web_fixture(
             *formula_market_projections,
             *backfill_plan_projections,
         )
+    )
+    projections += tuple(
+        ServingProjectionInput.bind(
+            item,
+            owner_dataset_id="promotions",
+            owner_generation_id=generations["promotions"],
+        )
+        for item in promotion_projections
     )
     if event_projections is not None:
         if {item.table_name for item in event_projections} != {"monitor_event", "surge_event"}:

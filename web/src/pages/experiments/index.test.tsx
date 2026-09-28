@@ -1,0 +1,134 @@
+import { screen, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { HttpResponse, http } from "msw";
+import type { Schemas } from "@/api/client";
+import { metaEnvelope } from "@/test/fixtures";
+import { findJargon } from "@/test/jargon";
+import { renderApp } from "@/test/render";
+import { server } from "@/test/server";
+
+const serving = metaEnvelope().serving;
+const first: Schemas["ExperimentItem"] = {
+  experiment_id: "a".repeat(64),
+  hypothesis_family: "均线研究",
+  registered_at: "2026-09-24T07:20:00Z",
+  status: "succeeded",
+  completed_at: "2026-09-24T07:25:00Z",
+  trade_count: 12,
+  net_return_pct: 7.5,
+  max_drawdown_pct: 3.25,
+  win_rate_pct: 60,
+};
+const second: Schemas["ExperimentItem"] = {
+  experiment_id: "b".repeat(64),
+  hypothesis_family: "突破研究",
+  registered_at: "2026-09-23T07:20:00Z",
+  status: "registered",
+  completed_at: null,
+  trade_count: null,
+  net_return_pct: null,
+  max_drawdown_pct: null,
+  win_rate_pct: null,
+};
+
+describe("实验记录", () => {
+  it("展示真实结果、未发布字段和稳定分页，不把内部编号放进正文", async () => {
+    const requests: string[] = [];
+    server.use(
+      http.get("*/api/v1/experiments", ({ request }) => {
+        const url = new URL(request.url);
+        requests.push(url.search);
+        const later = url.searchParams.has("cursor");
+        return HttpResponse.json({
+          data: {
+            available: true,
+            items: later ? [second] : [first],
+            retained_count: 2,
+            truncated: false,
+            oldest_registered_at: second.registered_at,
+            next_cursor: later ? null : "opaque-next",
+          },
+          serving,
+        });
+      }),
+    );
+    const user = userEvent.setup();
+    const { container } = renderApp("/experiments");
+
+    expect(await screen.findByRole("heading", { name: "实验记录", level: 1 })).toBeVisible();
+    const table = await screen.findByRole("table", { name: "实验记录" });
+    expect(within(table).getByText("均线研究")).toBeVisible();
+    expect(within(table).getByText("+7.50%")).toBeVisible();
+    expect(within(table).getByText("12")).toBeVisible();
+    expect(screen.getByText(/参数、夏普和年化尚未发布/)).toBeVisible();
+    expect(screen.queryByRole("button", { name: "新建实验" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "对比所选" })).not.toBeInTheDocument();
+    expect(container.querySelector("main")?.textContent).not.toContain(first.experiment_id);
+    expect(findJargon(container.querySelector("main")?.textContent ?? "")).toEqual([]);
+
+    await user.click(screen.getByRole("button", { name: "下一页" }));
+    expect(await screen.findByText("突破研究")).toBeVisible();
+    expect(screen.queryByText("均线研究")).not.toBeInTheDocument();
+    expect(requests.at(-1)).toContain("cursor=opaque-next");
+    await user.click(screen.getByRole("button", { name: "上一页" }));
+    expect(await screen.findByText("均线研究")).toBeVisible();
+  });
+
+  it("区分未发布、可信空记录和最近窗口截断", async () => {
+    server.use(
+      http.get("*/api/v1/experiments", () =>
+        HttpResponse.json({
+          data: {
+            available: false,
+            items: [],
+            retained_count: 0,
+            truncated: false,
+            oldest_registered_at: null,
+            next_cursor: null,
+          },
+          serving,
+        }),
+      ),
+    );
+    const { unmount } = renderApp("/experiments");
+    expect(await screen.findByText("实验记录暂时读不到")).toBeVisible();
+    unmount();
+
+    server.use(
+      http.get("*/api/v1/experiments", () =>
+        HttpResponse.json({
+          data: {
+            available: true,
+            items: [],
+            retained_count: 0,
+            truncated: false,
+            oldest_registered_at: null,
+            next_cursor: null,
+          },
+          serving,
+        }),
+      ),
+    );
+    const empty = renderApp("/experiments");
+    expect(await screen.findByText("还没有登记的实验")).toBeVisible();
+    empty.unmount();
+
+    server.use(
+      http.get("*/api/v1/experiments", () =>
+        HttpResponse.json({
+          data: {
+            available: true,
+            items: [first],
+            retained_count: 500,
+            truncated: true,
+            oldest_registered_at: first.registered_at,
+            next_cursor: null,
+          },
+          serving,
+        }),
+      ),
+    );
+    renderApp("/experiments");
+    expect(await screen.findByText("仅显示最近 500 条实验")).toBeVisible();
+  });
+});
