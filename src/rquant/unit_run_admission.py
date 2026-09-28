@@ -14,6 +14,7 @@ from rquant.runtime_contracts import AwareUtcDatetime, RuntimeContractModel
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 _TRADING_WRITE_START = time(9, 15)
 _TRADING_WRITE_END = time(15, 10)
+_MAX_MIN_INTERVAL_SECONDS = 366 * 24 * 60 * 60
 
 
 class UnitEffect(StrEnum):
@@ -46,7 +47,7 @@ class UnitRunPolicy(RuntimeContractModel):
     effect: UnitEffect
     window_start: time
     window_end: time
-    min_interval_seconds: int = Field(strict=True, gt=0)
+    min_interval_seconds: int = Field(strict=True, gt=0, le=_MAX_MIN_INTERVAL_SECONDS)
 
     @model_validator(mode="after")
     def validate_window(self) -> Self:

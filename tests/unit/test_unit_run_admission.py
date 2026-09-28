@@ -186,11 +186,19 @@ def test_known_nontrading_day_still_obeys_own_window() -> None:
         {"window_start": time(8, tzinfo=SHANGHAI)},
         {"min_interval_seconds": 0},
         {"min_interval_seconds": True},
+        {"min_interval_seconds": 366 * 24 * 60 * 60 + 1},
+        {"min_interval_seconds": 2**63 - 1},
     ],
 )
 def test_policy_rejects_unbounded_or_invalid_terms(updates: dict[str, object]) -> None:
     with pytest.raises(ValidationError):
         _policy(**updates)
+
+
+def test_maximum_supported_interval_returns_closed_refusal() -> None:
+    policy = _policy(min_interval_seconds=366 * 24 * 60 * 60)
+
+    assert admit_unit_run(_snapshot(policy=policy)).reason is UnitRunRefusal.MIN_INTERVAL
 
 
 def test_snapshot_rejects_naive_clock_and_policy_cannot_be_mutated() -> None:
