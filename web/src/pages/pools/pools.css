@@ -1,6 +1,70 @@
 .pools-page {
   min-width: 0;
 }
+.formula-pool-list-entry .pools-list-item > span:first-child,
+.formula-pool-detail h3,
+.formula-pool-definition {
+  overflow-wrap: anywhere;
+}
+.formula-pool-detail {
+  display: grid;
+  gap: 14px;
+  min-width: 0;
+}
+.formula-pool-detail h3 {
+  margin: 0 0 10px;
+  font-size: 16px;
+}
+.formula-pool-definition {
+  display: block;
+  padding: 12px;
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  background: var(--sunken);
+  white-space: pre-wrap;
+  font-size: 12px;
+  line-height: 1.6;
+}
+.formula-pool-counts,
+.formula-pool-pagination {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 18px;
+  margin-top: 12px;
+}
+.formula-pool-counts strong {
+  font-size: 16px;
+}
+.formula-pool-unknown {
+  display: grid;
+  gap: 5px;
+  padding: 0;
+  margin: 12px 0;
+  list-style: none;
+}
+.formula-pool-unknown li {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--ink-2);
+  font-size: 12px;
+}
+.formula-pool-members {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+  gap: 7px;
+  padding: 0;
+  margin: 0;
+  list-style: none;
+}
+.formula-pool-members .btn {
+  justify-content: space-between;
+  width: 100%;
+}
+.formula-pool-member-state .btn {
+  margin-top: 8px;
+}
 .pools-toolbar {
   display: flex;
   align-items: center;

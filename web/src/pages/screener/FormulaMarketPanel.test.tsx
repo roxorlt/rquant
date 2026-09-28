@@ -57,9 +57,11 @@ function setupSource(): void {
   );
 }
 
-function renderPreview() {
+function renderPreview(seedMeta = false) {
+  const queryClient = testQueryClient();
+  if (seedMeta) queryClient.setQueryData(["meta"], metaEnvelope());
   return render(
-    <AppProviders queryClient={testQueryClient()}>
+    <AppProviders queryClient={queryClient}>
       <FormulaPreviewDialog onClose={() => undefined} />
     </AppProviders>,
   );
@@ -377,5 +379,104 @@ describe("全市场公式选股", () => {
     expect(await within(drawer).findByRole("button", { name: /600002.SH/ })).toBeVisible();
     expect(within(drawer).getByText("第 1 页")).toBeVisible();
     expect(cursors).toEqual([null, "page-2", null]);
+  });
+
+  it("保存状态不明时跨页面保留原命令；成功后等精确版本发布才提示可查看", async () => {
+    setupSource();
+    const submitted: Schemas["FormulaPoolSaveCommandRequest"][] = [];
+    let published = false;
+    server.use(
+      http.get("*/api/v1/screen/tdx/market/jobs", () =>
+        HttpResponse.json({
+          data: {
+            availability: "ready",
+            available_at: "2026-09-24T07:32:00Z",
+            has_older_tasks: false,
+            jobs: [job],
+            message: "",
+            total_task_count: 1,
+          },
+          serving,
+        }),
+      ),
+      http.get(`*/api/v1/screen/tdx/market/jobs/${taskId}`, () =>
+        HttpResponse.json({ data: { job, summary }, serving }),
+      ),
+      http.get(`*/api/v1/screen/tdx/market/jobs/${taskId}/matches`, () =>
+        HttpResponse.json({
+          data: {
+            task_id: taskId,
+            total: 51,
+            offset: 0,
+            match_codes: ["600001.SH"],
+            next_cursor: null,
+          },
+          serving,
+        }),
+      ),
+      http.get("*/api/v1/pools/formula", () =>
+        HttpResponse.json({
+          data: {
+            availability: published ? "ready" : "empty",
+            available_at: null,
+            message: "",
+            pools: published
+              ? [
+                  {
+                    pool_name: "user/趋势池",
+                    display_name: "趋势池",
+                    formula,
+                    syntax_version: "tdx-v1",
+                    created_at: "2026-09-24T07:31:00Z",
+                    status_label: "尚未运行",
+                    latest_result: null,
+                    version: "f".repeat(64),
+                  },
+                ]
+              : [],
+          },
+          serving,
+        }),
+      ),
+      http.post("*/api/v1/pools/formula/commands", async ({ request }) => {
+        expect(request.headers.get("X-Rquant-Csrf")).toBe("1");
+        submitted.push((await request.json()) as Schemas["FormulaPoolSaveCommandRequest"]);
+        if (submitted.length === 1)
+          return HttpResponse.json({ detail: "请重试原请求" }, { status: 503 });
+        return HttpResponse.json({
+          command_id: submitted[0]?.command_id,
+          status: "succeeded",
+          pool_name: "user/趋势池",
+          version: "f".repeat(64),
+          message: "已保存",
+        });
+      }),
+    );
+    const user = userEvent.setup();
+    const view = renderPreview(true);
+    const drawer = await screen.findByRole("dialog", { name: "公式预览" });
+    await user.click(await within(drawer).findByRole("button", { name: /CLOSE>MA/ }));
+    expect(await within(drawer).findByRole("region", { name: "市场结果" })).toBeVisible();
+    await user.type(within(drawer).getByRole("textbox", { name: "池子名称" }), "趋势池");
+    await user.click(within(drawer).getByRole("button", { name: "保存为池子" }));
+    expect(await within(drawer).findByText("保存状态待确认")).toBeVisible();
+    expect(submitted[0]).toMatchObject({
+      base_name: "趋势池",
+      display_name: "趋势池",
+      task_id: taskId,
+      expected_version: null,
+    });
+    view.unmount();
+
+    renderPreview(true);
+    const restored = await screen.findByRole("dialog", { name: "公式预览" });
+    expect(await within(restored).findByText("保存状态待确认")).toBeVisible();
+    await user.click(within(restored).getByRole("button", { name: "继续核对" }));
+    expect(await within(restored).findByText("已保存，等待池子发布")).toBeVisible();
+    expect(submitted[1]).toEqual(submitted[0]);
+    published = true;
+    await user.click(within(restored).getByRole("button", { name: "检查发布" }));
+    expect(await within(restored).findByText("已保存，可在池子画布查看")).toBeVisible();
+    expect(findJargon(restored.textContent ?? "")).toEqual([]);
   });
 });

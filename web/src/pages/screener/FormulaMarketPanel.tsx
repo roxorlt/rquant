@@ -13,6 +13,7 @@ import { StockDrawer } from "@/app/StockDrawer";
 import { formatCount } from "@/format/number";
 import { formatAge, formatShanghaiDateTime, formatShanghaiTime, shanghaiDate } from "@/format/time";
 import { Button, ConfirmDialog, EmptyState, RelativeTime, Tip, useNow } from "@/ui";
+import { FormulaPoolSave, readFormulaPoolSaveTaskId } from "./FormulaPoolSave";
 
 const JOURNAL_KEY = "rquant-formula-market-command-v1";
 
@@ -91,7 +92,9 @@ function jobTone(job: FormulaMarketJobItem): string {
 export function FormulaMarketPanel({ formula, checked }: { formula: string; checked: boolean }) {
   const [tradeDate, setTradeDate] = useState("");
   const [journal, setJournal] = useState<Journal | null>(readJournal);
-  const [selectedId, setSelectedId] = useState<string | null>(() => readJournal()?.taskId ?? null);
+  const [selectedId, setSelectedId] = useState<string | null>(
+    () => readJournal()?.taskId ?? readFormulaPoolSaveTaskId(),
+  );
   const [confirmDraft, setConfirmDraft] = useState<RunDraft | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
@@ -518,6 +521,17 @@ export function FormulaMarketPanel({ formula, checked }: { formula: string; chec
                   )}
                 </>
               )}
+              {job.status === "succeeded" && job.result_available && currentDetail?.summary ? (
+                <FormulaPoolSave
+                  taskId={job.task_id}
+                  formula={job.formula}
+                  tradeDate={job.trade_date}
+                  matchCount={currentDetail.summary.match_count}
+                  unknownCount={currentDetail.summary.unknown_count}
+                  resultReady={resultReady === true}
+                  onSelectTask={selectJob}
+                />
+              ) : null}
             </>
           )}
         </section>

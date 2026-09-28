@@ -127,6 +127,154 @@ function respond(data: Schemas["PoolsData"] = base) {
   server.use(http.get("*/api/v1/pools", () => HttpResponse.json({ data, serving })));
 }
 
+function respondFormula(
+  latestResult: Schemas["FormulaPoolLatestResult"] | null,
+  generation = serving.generation_id,
+) {
+  server.use(
+    http.get("*/api/v1/pools/formula", () =>
+      HttpResponse.json({
+        data: {
+          availability: "ready",
+          available_at: "2026-09-24T07:31:00Z",
+          message: "",
+          pools: [
+            {
+              pool_name: "user/趋势池",
+              display_name: "趋势池",
+              formula: "CLOSE>MA(CLOSE,2)",
+              syntax_version: "tdx-v1",
+              created_at: "2026-09-24T07:31:00Z",
+              status_label: latestResult ? "已有结果" : "尚未运行",
+              latest_result: latestResult,
+              version: "f".repeat(64),
+            },
+          ],
+        },
+        serving: { ...serving, generation_id: generation },
+      }),
+    ),
+  );
+}
+
+const formulaResult: Schemas["FormulaPoolLatestResult"] = {
+  trade_date: "2026-09-24",
+  market_total: 100,
+  match_count: 51,
+  no_match_count: 40,
+  unknown_count: 9,
+  unknown_reasons: [{ reason: "missing", label: "行情字段缺失", count: 9 }],
+};
+
+it("在全部池子显示公式定义、真实运行日和同代分页成员，且不打开规则编辑", async () => {
+  respond({ ...base, canvases: [], pools: [] });
+  respondFormula(formulaResult);
+  const cursors: (string | null)[] = [];
+  server.use(
+    http.get("*/api/v1/pools/formula/*/members", ({ request }) => {
+      const cursor = new URL(request.url).searchParams.get("cursor");
+      cursors.push(cursor);
+      return HttpResponse.json({
+        data: {
+          pool_name: "user/趋势池",
+          trade_date: "2026-09-24",
+          total: 51,
+          offset: cursor ? 50 : 0,
+          match_codes: [cursor ? "600051.SH" : "600001.SH"],
+          next_cursor: cursor ? null : "page-2",
+        },
+        serving,
+      });
+    }),
+    http.get("*/api/v1/stocks/600001.SH/summary", () =>
+      HttpResponse.json({
+        data: { ts_code: "600001.SH", name: "样本01", price: 11, as_of: null, pools: [] },
+        serving,
+      }),
+    ),
+    http.get("*/api/v1/panorama/stocks/600001.SH/daily", () =>
+      HttpResponse.json({
+        data: { ts_code: "600001.SH", name: "样本01", bars: [] },
+        serving,
+      }),
+    ),
+  );
+  const user = userEvent.setup();
+  const { container } = renderApp("/pools");
+  const list = await screen.findByRole("group", { name: "池子列表" });
+  const formulaButton = await within(list).findByRole("button", { name: "查看 趋势池公式池" });
+  act(() => formulaButton.focus());
+  await user.keyboard("{Enter}");
+  const detail = screen.getByRole("region", { name: "池子详情" });
+  expect(within(detail).getByText("CLOSE>MA(CLOSE,2)")).toBeVisible();
+  expect(within(detail).getByText(/选股日期 · 2026-09-24/)).toBeVisible();
+  expect(within(detail).getByText("行情字段缺失")).toBeVisible();
+  expect(within(detail).queryByRole("button", { name: "编辑规则" })).toBeNull();
+  await user.click(await within(detail).findByRole("button", { name: /600001.SH/ }));
+  expect(await screen.findByRole("dialog")).toHaveTextContent("样本01");
+  await user.click(within(screen.getByRole("dialog")).getByRole("button", { name: "关闭" }));
+  await user.click(within(detail).getByRole("button", { name: "下一页" }));
+  expect(await within(detail).findByRole("button", { name: /600051.SH/ })).toBeVisible();
+  expect(cursors).toEqual([null, "page-2"]);
+  expect(findJargon(container.textContent ?? "")).toEqual([]);
+});
+
+it("公式池区分尚未运行、可信零命中和旧数据代", async () => {
+  respond({ ...base, canvases: [], pools: [] });
+  respondFormula(null);
+  const view = renderApp("/pools");
+  expect((await screen.findAllByText("尚未运行")).length).toBeGreaterThan(0);
+  expect(screen.queryByRole("region", { name: "公式池成员" })).toBeNull();
+  view.unmount();
+
+  respondFormula({ ...formulaResult, match_count: 0, no_match_count: 91 });
+  const zero = renderApp("/pools");
+  expect(await screen.findByText("本次没有命中股票")).toBeVisible();
+  expect(screen.queryByRole("region", { name: "公式池成员" })).toBeNull();
+  zero.unmount();
+
+  respondFormula(formulaResult, "new-generation");
+  renderApp("/pools");
+  expect(await screen.findByText("公式池数据正在更新，稍后查看。")).toBeVisible();
+  expect(screen.queryByRole("button", { name: "查看 趋势池公式池" })).toBeNull();
+});
+
+it("坏成员不进入列表，游标失效后从第一页重新读取", async () => {
+  respond({ ...base, canvases: [], pools: [] });
+  respondFormula(formulaResult);
+  let firstReads = 0;
+  server.use(
+    http.get("*/api/v1/pools/formula/*/members", ({ request }) => {
+      const cursor = new URL(request.url).searchParams.get("cursor");
+      if (cursor) return HttpResponse.json({ detail: "结果已更新" }, { status: 409 });
+      firstReads += 1;
+      return HttpResponse.json({
+        data: {
+          pool_name: "user/趋势池",
+          trade_date: "2026-09-24",
+          total: 51,
+          offset: 0,
+          match_codes: [firstReads === 1 ? "bad-code" : "600001.SH"],
+          next_cursor: "next-page",
+        },
+        serving,
+      });
+    }),
+  );
+  const user = userEvent.setup();
+  renderApp("/pools");
+  const detail = await screen.findByRole("region", { name: "池子详情" });
+  expect(await within(detail).findByText("成员暂时无法读取")).toBeVisible();
+  expect(within(detail).queryByRole("button", { name: /bad-code/ })).toBeNull();
+  await user.click(within(detail).getByRole("button", { name: "重试读取" }));
+  expect(await within(detail).findByRole("button", { name: /600001.SH/ })).toBeVisible();
+  await user.click(within(detail).getByRole("button", { name: "下一页" }));
+  expect(await within(detail).findByText("结果已更新")).toBeVisible();
+  await user.click(within(detail).getByRole("button", { name: "从第一页重看" }));
+  expect(await within(detail).findByRole("button", { name: /600001.SH/ })).toBeVisible();
+  expect(firstReads).toBe(3);
+});
+
 it("selects a published pool by keyboard and opens a member's stock drawer", async () => {
   respond();
   server.use(

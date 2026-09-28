@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { type PoolMember, type PublishedPool, usePools } from "@/api/endpoints";
+import { useFormulaPools } from "@/api/formulaPools";
 import {
   type BuiltinPoolCopySource,
   type EditablePool,
@@ -19,6 +20,7 @@ import { canvasPublicationStage } from "./canvasPublication";
 import { publicationStage } from "./editorPublication";
 import { PoolEditorSession } from "./editorSession";
 import { FirstPoolAction } from "./FirstPoolAction";
+import { FormulaPoolDetail } from "./FormulaPoolDetail";
 import { PoolEditorForm } from "./PoolEditorForm";
 import "./pools.css";
 
@@ -324,6 +326,7 @@ function browserStorage(): Storage {
 
 export default function PoolsPage() {
   const query = usePools();
+  const formulaQuery = useFormulaPools();
   const editorQuery = usePoolEditor();
   const meta = useMeta();
   const [editorSession] = useState(
@@ -459,6 +462,21 @@ export default function PoolsPage() {
   const shown = canvas
     ? canvas.pool_keys.flatMap((key) => data?.pools.find((pool) => pool.key === key) ?? [])
     : (data?.pools ?? []);
+  const formulaShown =
+    !canvas &&
+    !changing &&
+    formulaQuery.serving?.generation_id === visibleGeneration &&
+    formulaQuery.data?.availability === "ready"
+      ? formulaQuery.data.pools
+      : [];
+  const selectedFormulaKey = selectionId?.startsWith("formula-definition:")
+    ? selectionId.slice("formula-definition:".length)
+    : selectionId?.startsWith("formula:")
+      ? selectionId.slice("formula:".length)
+      : shown.length === 0
+        ? formulaShown[0]?.pool_name
+        : undefined;
+  const selectedFormula = formulaShown.find((pool) => pool.pool_name === selectedFormulaKey);
   const selectedKey = selectionId?.startsWith("condition:")
     ? selectionId.slice("condition:".length)
     : selectionId;
@@ -534,6 +552,24 @@ export default function PoolsPage() {
       height: 82,
     },
   ]);
+  if (!canvas) {
+    graphNodes.push(
+      ...formulaShown.flatMap((pool) => [
+        {
+          id: `formula-definition:${pool.pool_name}`,
+          label: `${pool.display_name}\n公式条件`,
+          width: 190,
+          height: 82,
+        },
+        {
+          id: `formula:${pool.pool_name}`,
+          label: `${pool.display_name}\n${pool.latest_result ? `${pool.latest_result.trade_date} · ${formatCount(pool.latest_result.match_count)} 只` : "尚未运行"}`,
+          width: 190,
+          height: 82,
+        },
+      ]),
+    );
+  }
   const graphEdges: FlowGraphEdge[] = graphPools.flatMap((pool) => {
     if (pool.definition?.state !== "available") return [];
     const edges: FlowGraphEdge[] = [{ source: `condition:${pool.key}`, target: pool.key }];
@@ -543,6 +579,14 @@ export default function PoolsPage() {
     }
     return edges;
   });
+  if (!canvas) {
+    graphEdges.push(
+      ...formulaShown.map((pool) => ({
+        source: `formula-definition:${pool.pool_name}`,
+        target: `formula:${pool.pool_name}`,
+      })),
+    );
+  }
   const hasRules = graphPools.some((pool) => pool.definition?.state === "available");
 
   return (
@@ -743,7 +787,7 @@ export default function PoolsPage() {
                     setSelectionId(null);
                   }}
                 >
-                  <option value="">全部已发布池子</option>
+                  <option value="">全部池子</option>
                   {data.canvases.map((item) => (
                     <option key={item.name} value={item.name}>
                       {item.name}
@@ -807,6 +851,21 @@ export default function PoolsPage() {
           {!data.definitions_available ? (
             <p className="pools-note">保存的画布暂不可用，显示已发布池子。</p>
           ) : null}
+          {!canvas && (formulaQuery.error || formulaQuery.data?.availability === "unavailable") ? (
+            <p className="pools-note" role="status">
+              公式池暂时无法读取，请稍后刷新。
+            </p>
+          ) : !canvas &&
+            formulaQuery.data &&
+            formulaQuery.serving?.generation_id !== visibleGeneration ? (
+            <p className="pools-note" role="status">
+              公式池数据正在更新，稍后查看。
+            </p>
+          ) : !canvas && formulaQuery.data?.availability === "not_published" ? (
+            <p className="pools-note" role="status">
+              公式池等待发布。
+            </p>
+          ) : null}
           {data.canvases_truncated || data.pools_truncated || canvas?.refs_truncated ? (
             <p className="pools-note" role="status">
               内容较多，仅显示前一部分池子或画布。
@@ -814,7 +873,7 @@ export default function PoolsPage() {
           ) : null}
           {canvas && shown.length === 0 ? (
             <EmptyState title="这张画布还是空的" hint="创建首只池子后，这里会显示条件和结果。" />
-          ) : !canvas && data.pools.length === 0 ? (
+          ) : !canvas && data.pools.length === 0 && formulaShown.length === 0 ? (
             <EmptyState
               title={data.state === "unavailable" ? "池子结果暂不可用" : "还没有已发布的池子"}
               hint={
@@ -885,10 +944,41 @@ export default function PoolsPage() {
                       )}
                     </div>
                   ))}
+                  {formulaShown.map((pool) => (
+                    <div className="pools-list-entry formula-pool-list-entry" key={pool.pool_name}>
+                      <button
+                        type="button"
+                        className="pools-list-item"
+                        aria-label={`查看 ${pool.display_name}公式池`}
+                        aria-pressed={selectedFormula?.pool_name === pool.pool_name}
+                        onClick={() => setSelectionId(`formula:${pool.pool_name}`)}
+                      >
+                        <span>{pool.display_name}</span>
+                        <small>公式池</small>
+                        <small>
+                          {pool.latest_result
+                            ? `${pool.latest_result.trade_date} · ${formatCount(pool.latest_result.match_count)} 只`
+                            : "尚未运行"}
+                        </small>
+                      </button>
+                    </div>
+                  ))}
                 </fieldset>
               </Panel>
               <section className="pools-detail" aria-label="池子详情">
-                {selected ? (
+                {selectedFormula ? (
+                  <FormulaPoolDetail
+                    pool={selectedFormula}
+                    generation={visibleGeneration}
+                    onSelectStock={(code) =>
+                      setStockSelection({
+                        code,
+                        poolKey: selectedFormula.pool_name,
+                        generationId: visibleGeneration ?? null,
+                      })
+                    }
+                  />
+                ) : selected ? (
                   selectedKind === "condition" ? (
                     <>
                       <div className="pools-detail-actions">
