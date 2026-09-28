@@ -530,3 +530,102 @@ def test_new_catalog_entry_during_first_full_read_refuses_cache_binding(
     with pytest.raises(PageProjectionSourceIntegrityError, match="changed while binding"):
         step()
     assert not (authority / "current.json").exists()
+
+
+def _revoke_formula_save_in_page_control_wal(path: Path) -> sqlite3.Connection:
+    connection = sqlite3.connect(path)
+    assert connection.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    connection.execute("PRAGMA wal_autocheckpoint=0")
+    connection.execute(
+        "DELETE FROM page_control_effect WHERE command_id IN "
+        "(SELECT command_id FROM page_control_command WHERE command_kind='save_formula_pool_v1')"
+    )
+    connection.commit()
+    assert Path(f"{path}-wal").stat().st_size > 0
+    assert Path(f"{path}-shm").is_file()
+    return connection
+
+
+def test_page_control_wal_revocation_blocks_new_daily_authority(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    service, admission, definitions, version, data_dir = _saved(source)
+    config = _config(admission, data_dir)
+    _runner(admission, definitions, data_dir).run_one("research", version, DAY)
+    observed = datetime.now(UTC) + timedelta(minutes=2)
+    clock = [observed]
+    step, authority = _notifier_step(
+        tmp_path,
+        observed=observed,
+        config=config,
+        audit_path=service.outbox.path,
+        clock=lambda: clock[0],
+    )
+    step()
+    old = _read_authority(authority, clock[0]).generation_id
+    audit_writer = _revoke_formula_save_in_page_control_wal(service.outbox.path)
+    try:
+        _publish_market_day(config.universe_root, DAY2)
+        _publish_history_day2(config.projection_root)
+        _runner(admission, definitions, data_dir).run_one("research", version, DAY2)
+        clock[0] += timedelta(seconds=2)
+
+        with pytest.raises(PageProjectionSourceIntegrityError, match="PageControl.*sidecar"):
+            step()
+        assert _read_authority(authority, clock[0]).generation_id == old
+    finally:
+        audit_writer.close()
+
+
+def test_preexisting_page_control_wal_refuses_first_formula_pool_binding(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    service, admission, _definitions, _version, data_dir = _saved(source)
+    config = _config(admission, data_dir)
+    audit_writer = _revoke_formula_save_in_page_control_wal(service.outbox.path)
+    try:
+        with pytest.raises(PageProjectionSourceIntegrityError, match="PageControl.*sidecar"):
+            _notifier_step(
+                tmp_path,
+                observed=datetime.now(UTC) + timedelta(minutes=2),
+                config=config,
+                audit_path=service.outbox.path,
+            )
+        assert not (tmp_path / "runtime" / "signals-authority" / "current.json").exists()
+    finally:
+        audit_writer.close()
+
+
+@pytest.mark.parametrize("sidecar", ("-wal", "-shm"))
+def test_page_control_sidecar_appearing_during_full_read_refuses_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sidecar: str
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    service, admission, definitions, version, data_dir = _saved(source)
+    config = _config(admission, data_dir)
+    _runner(admission, definitions, data_dir).run_one("research", version, DAY)
+    original = source_module.SignalPageProjectionSnapshot.create
+
+    def create_sidecar_after_build(*args: object, **kwargs: object) -> object:
+        snapshot = original(*args, **kwargs)
+        target = source / "sidecar-target"
+        target.write_bytes(b"unexpected")
+        Path(f"{service.outbox.path}{sidecar}").symlink_to(target)
+        return snapshot
+
+    monkeypatch.setattr(
+        source_module.SignalPageProjectionSnapshot, "create", create_sidecar_after_build
+    )
+    step, authority = _notifier_step(
+        tmp_path,
+        observed=datetime.now(UTC) + timedelta(minutes=2),
+        config=config,
+        audit_path=service.outbox.path,
+    )
+
+    with pytest.raises(PageProjectionSourceIntegrityError, match="PageControl.*sidecar"):
+        step()
+    assert not (authority / "current.json").exists()
