@@ -106,7 +106,7 @@ test("中文条件筛选、翻页和个股详情在桌面与手机宽度可用",
   await page.getByRole("button", { name: "关闭" }).click();
 
   await page.getByRole("button", { name: "下一页" }).click();
-  await expect(page.getByText("第 2 页")).toBeVisible();
+  await expect(page.locator(".screen-pages .hint")).toContainText("第 2 页");
   await expect(table.locator("tbody tr:not(.pad)")).toHaveCount(7);
   expect(findJargon(await page.locator("main").innerText())).toEqual([]);
   await expectNoHorizontalOverflow(page, "screener desktop");
@@ -296,7 +296,7 @@ test("排名条件可编辑、折算并按分数稳定翻页，手机上可修�
   await expect(table.getByRole("columnheader", { name: "排名分" })).toBeVisible();
   await expect(table.locator("tbody tr:not(.pad)")).toHaveCount(20);
   await page.getByRole("button", { name: "下一页" }).click();
-  await expect(page.getByText("第 2 页")).toBeVisible();
+  await expect(page.locator(".screen-pages .hint")).toContainText("第 2 页");
   await expect(table.locator("tbody tr:not(.pad)")).toHaveCount(5);
   await expectNoHorizontalOverflow(page, "ranked screener desktop");
 

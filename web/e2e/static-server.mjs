@@ -58,9 +58,10 @@ function proxy(clientRequest, clientResponse, path) {
       upstreamResponse.pipe(clientResponse);
     },
   );
-  upstream.on("error", () =>
-    send(clientResponse, 502, { "content-type": "text/plain" }, "bad gateway"),
-  );
+  upstream.on("error", (error) => {
+    console.error(`e2e API proxy failed for ${path}: ${error.code ?? error.message}`);
+    send(clientResponse, 502, { "content-type": "text/plain" }, "bad gateway");
+  });
   clientRequest.pipe(upstream);
 }
 
