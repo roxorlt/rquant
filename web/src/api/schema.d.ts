@@ -871,6 +871,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/watchlist": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 我的盯盘名单 */
+        get: operations["list_manual_watchlist_api_v1_watchlist_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/watchlist/{ts_code}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 盯盘状态 */
+        get: operations["get_manual_watchlist_item_api_v1_watchlist__ts_code__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -2293,6 +2327,16 @@ export interface components {
             data: components["schemas"]["IntradayData"];
             serving: components["schemas"]["ServingMeta"];
         };
+        /** Envelope[ManualWatchlistExactData] */
+        Envelope_ManualWatchlistExactData_: {
+            data: components["schemas"]["ManualWatchlistExactData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[ManualWatchlistListData] */
+        Envelope_ManualWatchlistListData_: {
+            data: components["schemas"]["ManualWatchlistListData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
         /** Envelope[MembersData] */
         Envelope_MembersData_: {
             data: components["schemas"]["MembersData"];
@@ -2884,6 +2928,62 @@ export interface components {
              * @default []
              */
             units: string[];
+        };
+        /** ManualWatchlistExactData */
+        ManualWatchlistExactData: {
+            /**
+             * Availability
+             * @enum {string}
+             */
+            availability: "ready" | "unavailable";
+            /** Available At */
+            available_at: string | null;
+            /** Expires At */
+            expires_at: string | null;
+            /** Message */
+            message: string;
+            /** Price Levels */
+            price_levels: string[];
+            source: components["schemas"]["WatchlistSource"] | null;
+            /** Status */
+            status: ("active" | "expired" | "deleted" | "absent") | null;
+            /** Ts Code */
+            ts_code: string;
+            /** Updated At */
+            updated_at: string | null;
+            /** Version */
+            version: number | null;
+        };
+        /** ManualWatchlistItemData */
+        ManualWatchlistItemData: {
+            /** Expires At */
+            expires_at: string | null;
+            /** Price Levels */
+            price_levels: string[];
+            source: components["schemas"]["WatchlistSource"];
+            /** Ts Code */
+            ts_code: string;
+            /**
+             * Updated At
+             * Format: date-time
+             */
+            updated_at: string;
+            /** Version */
+            version: number;
+        };
+        /** ManualWatchlistListData */
+        ManualWatchlistListData: {
+            /**
+             * Availability
+             * @enum {string}
+             */
+            availability: "ready" | "unavailable";
+            /** Available At */
+            available_at: string | null;
+            /** Items */
+            items: components["schemas"]["ManualWatchlistItemData"][];
+            /** Message */
+            message: string;
         };
         /** MarketInfo */
         MarketInfo: {
@@ -4733,6 +4833,11 @@ export interface components {
             /** Error Type */
             type: string;
         };
+        /**
+         * WatchlistSource
+         * @enum {string}
+         */
+        WatchlistSource: "detail" | "screen_result" | "pool_member";
     };
     responses: never;
     parameters: never;
@@ -6228,6 +6333,57 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["JournalPage"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_manual_watchlist_api_v1_watchlist_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_ManualWatchlistListData_"];
+                };
+            };
+        };
+    };
+    get_manual_watchlist_item_api_v1_watchlist__ts_code__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                ts_code: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_ManualWatchlistExactData_"];
                 };
             };
             /** @description Validation Error */

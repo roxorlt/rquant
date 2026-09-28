@@ -58,6 +58,7 @@ from rquant.web.routes import (
     formula_pool_save_commands,
     fundamentals,
     health,
+    manual_watchlist,
     meta,
     monitor,
     overview,
@@ -318,6 +319,8 @@ def create_app(
             return JSONResponse(
                 status_code=422, content={"detail": "保存信息有误，请检查名称和任务。"}
             )
+        if request.url.path.startswith("/api/v1/watchlist/"):
+            return JSONResponse(status_code=422, content={"detail": "股票代码有误，请检查后重试。"})
         return await request_validation_exception_handler(request, error)
 
     app.include_router(meta.router, prefix="/api/v1", tags=["meta"])
@@ -326,6 +329,7 @@ def create_app(
     app.include_router(pool_editor.router, prefix="/api/v1", tags=["pools"])
     app.include_router(paper.router, prefix="/api/v1", tags=["paper"])
     app.include_router(monitor.router, prefix="/api/v1", tags=["monitor"])
+    app.include_router(manual_watchlist.router, prefix="/api/v1", tags=["watchlist"])
     app.include_router(tasks.router, prefix="/api/v1", tags=["tasks"])
     app.include_router(service_logs.router, prefix="/api/v1", tags=["tasks"])
     app.include_router(backtests.router, prefix="/api/v1", tags=["backtests"])

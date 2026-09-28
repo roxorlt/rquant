@@ -4219,6 +4219,38 @@
         "title": "Envelope[IntradayData]",
         "type": "object"
       },
+      "Envelope_ManualWatchlistExactData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/ManualWatchlistExactData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[ManualWatchlistExactData]",
+        "type": "object"
+      },
+      "Envelope_ManualWatchlistListData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/ManualWatchlistListData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[ManualWatchlistListData]",
+        "type": "object"
+      },
       "Envelope_MembersData_": {
         "properties": {
           "data": {
@@ -5988,6 +6020,220 @@
           }
         },
         "title": "LogCapabilities",
+        "type": "object"
+      },
+      "ManualWatchlistExactData": {
+        "additionalProperties": false,
+        "properties": {
+          "availability": {
+            "enum": [
+              "ready",
+              "unavailable"
+            ],
+            "title": "Availability",
+            "type": "string"
+          },
+          "available_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Available At"
+          },
+          "expires_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires At"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "price_levels": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 8,
+            "title": "Price Levels",
+            "type": "array"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WatchlistSource"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "status": {
+            "anyOf": [
+              {
+                "enum": [
+                  "active",
+                  "expired",
+                  "deleted",
+                  "absent"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status"
+          },
+          "ts_code": {
+            "title": "Ts Code",
+            "type": "string"
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At"
+          },
+          "version": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Version"
+          }
+        },
+        "required": [
+          "availability",
+          "message",
+          "available_at",
+          "ts_code",
+          "status",
+          "version",
+          "source",
+          "price_levels",
+          "expires_at",
+          "updated_at"
+        ],
+        "title": "ManualWatchlistExactData",
+        "type": "object"
+      },
+      "ManualWatchlistItemData": {
+        "additionalProperties": false,
+        "properties": {
+          "expires_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires At"
+          },
+          "price_levels": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 8,
+            "title": "Price Levels",
+            "type": "array"
+          },
+          "source": {
+            "$ref": "#/components/schemas/WatchlistSource"
+          },
+          "ts_code": {
+            "title": "Ts Code",
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
+            "type": "string"
+          },
+          "version": {
+            "minimum": 1.0,
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "ts_code",
+          "version",
+          "source",
+          "price_levels",
+          "expires_at",
+          "updated_at"
+        ],
+        "title": "ManualWatchlistItemData",
+        "type": "object"
+      },
+      "ManualWatchlistListData": {
+        "additionalProperties": false,
+        "properties": {
+          "availability": {
+            "enum": [
+              "ready",
+              "unavailable"
+            ],
+            "title": "Availability",
+            "type": "string"
+          },
+          "available_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Available At"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/ManualWatchlistItemData"
+            },
+            "maxItems": 500,
+            "title": "Items",
+            "type": "array"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          }
+        },
+        "required": [
+          "availability",
+          "message",
+          "available_at",
+          "items"
+        ],
+        "title": "ManualWatchlistListData",
         "type": "object"
       },
       "MarketInfo": {
@@ -11906,6 +12152,15 @@
         ],
         "title": "ValidationError",
         "type": "object"
+      },
+      "WatchlistSource": {
+        "enum": [
+          "detail",
+          "screen_result",
+          "pool_member"
+        ],
+        "title": "WatchlistSource",
+        "type": "string"
       }
     }
   },
@@ -14236,6 +14491,72 @@
         "summary": "服务运行日志",
         "tags": [
           "tasks"
+        ]
+      }
+    },
+    "/api/v1/watchlist": {
+      "get": {
+        "operationId": "list_manual_watchlist_api_v1_watchlist_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_ManualWatchlistListData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "我的盯盘名单",
+        "tags": [
+          "watchlist"
+        ]
+      }
+    },
+    "/api/v1/watchlist/{ts_code}": {
+      "get": {
+        "operationId": "get_manual_watchlist_item_api_v1_watchlist__ts_code__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "ts_code",
+            "required": true,
+            "schema": {
+              "maxLength": 9,
+              "minLength": 9,
+              "pattern": "^[0-9]{6}\\.(?:SH|SZ|BJ)$",
+              "title": "Ts Code",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_ManualWatchlistExactData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "盯盘状态",
+        "tags": [
+          "watchlist"
         ]
       }
     }
