@@ -9,16 +9,23 @@ import duckdb
 import pytest
 
 from rquant.backtest.calendar_source import CalendarSourceError
+from rquant.backtest.equal_candidates import (
+    EqualCandidateRankingError,
+    build_equal_weight_ranking,
+)
 from rquant.backtest.screen_calendar_source import (
     ScreenCalendarSourceError,
+    VerifiedScreenCalendarCandidates,
     load_screen_calendar_candidates,
     verify_screen_calendar_candidates,
 )
 from rquant.backtest.screen_source import (
     ScreenCandidateSourceError,
+    VerifiedScreenCandidate,
     verify_screen_candidates,
 )
 from rquant.pool_result_receipt import ScreenRunReceipt, member_price_digest, member_set_digest
+from rquant.portfolio.weights import PortfolioWeightRule
 from rquant.storage.schema import (
     SCREEN_RESULT_DDL,
     SCREEN_RUN_PRICE_RECEIPT_MIGRATION_DDLS,
@@ -280,3 +287,104 @@ def test_invalid_input_fails_before_opening_missing_file(tmp_path: Path) -> None
             preset_name="pool",
         )
     assert not missing.exists()
+
+
+def test_verified_receipt_becomes_equal_all_ranking_without_invented_scores(
+    tmp_path: Path,
+) -> None:
+    evidence = _load(_frozen_file(tmp_path / "equal-candidates.duckdb"))
+
+    ranking = build_equal_weight_ranking(
+        evidence, PortfolioWeightRule(method="equal", max_positions=2)
+    )
+
+    assert ranking.source_trade_date == SOURCE
+    assert ranking.observed_at == evidence.screen.receipt.completed_at
+    assert [candidate.ts_code for candidate in ranking.candidates] == [
+        "000001.SZ",
+        "600000.SH",
+    ]
+    assert all(candidate.rank_score == 0 for candidate in ranking.candidates)
+    assert all(candidate.industry_l1 is None for candidate in ranking.candidates)
+    assert len(ranking.source_identity) == 64
+    assert (
+        ranking.source_identity
+        == build_equal_weight_ranking(
+            evidence, PortfolioWeightRule(method="equal", max_positions=2)
+        ).source_identity
+    )
+    assert evidence.screen.candidates[0].previous_close == 8.25
+
+
+@pytest.mark.parametrize(
+    ("rule", "message"),
+    [
+        (PortfolioWeightRule(method="rank_score", max_positions=2), "equal"),
+        (PortfolioWeightRule(method="equal", max_positions=1), "all candidates"),
+    ],
+)
+def test_equal_all_adapter_rejects_unproved_ranking_or_top_n(
+    tmp_path: Path, rule: PortfolioWeightRule, message: str
+) -> None:
+    evidence = _load(_frozen_file(tmp_path / "rank-rule.duckdb"))
+
+    with pytest.raises(EqualCandidateRankingError, match=message):
+        build_equal_weight_ranking(evidence, rule)
+
+
+def test_equal_all_adapter_requires_receipt_v2_and_its_exact_candidate_prices(
+    tmp_path: Path,
+) -> None:
+    evidence = _load(_frozen_file(tmp_path / "verified-v2.duckdb"))
+    rule = PortfolioWeightRule(method="equal", max_positions=2)
+    legacy_receipt = ScreenRunReceipt.model_validate(
+        {
+            **evidence.screen.receipt.model_dump(mode="python", exclude={"result_version"}),
+            "contract": "screen-run-receipt/v1",
+            "price_digest": None,
+        }
+    )
+    legacy = VerifiedScreenCalendarCandidates(
+        screen=evidence.screen.model_copy(update={"receipt": legacy_receipt}),
+        calendar=evidence.calendar,
+    )
+    with pytest.raises(EqualCandidateRankingError, match="v2"):
+        build_equal_weight_ranking(legacy, rule)
+
+    changed = VerifiedScreenCalendarCandidates(
+        screen=evidence.screen.model_copy(
+            update={
+                "candidates": (
+                    VerifiedScreenCandidate(ts_code="000001.SZ", previous_close=8.5),
+                    evidence.screen.candidates[1],
+                )
+            }
+        ),
+        calendar=evidence.calendar,
+    )
+    with pytest.raises(EqualCandidateRankingError, match="price digest"):
+        build_equal_weight_ranking(changed, rule)
+
+
+def test_equal_all_adapter_does_not_rewrite_receipted_stock_codes(tmp_path: Path) -> None:
+    evidence = _load(_frozen_file(tmp_path / "raw-code.duckdb"))
+    candidates = (
+        VerifiedScreenCandidate(ts_code="000001.sz", previous_close=8.25),
+        evidence.screen.candidates[1],
+    )
+    receipt = ScreenRunReceipt.model_validate(
+        {
+            **evidence.screen.receipt.model_dump(mode="python", exclude={"result_version"}),
+            "member_digest": member_set_digest([item.ts_code for item in candidates]),
+            "price_digest": member_price_digest(
+                [(item.ts_code, item.previous_close) for item in candidates]
+            ),
+        }
+    )
+    changed = VerifiedScreenCalendarCandidates(
+        screen=evidence.screen.model_copy(update={"receipt": receipt, "candidates": candidates}),
+        calendar=evidence.calendar,
+    )
+
+    with pytest.raises(EqualCandidateRankingError, match="canonical code"):
+        build_equal_weight_ranking(changed, PortfolioWeightRule(method="equal", max_positions=2))
