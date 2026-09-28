@@ -3,6 +3,11 @@ import { submitAlertAckCommand } from "@/api/alertAckCommand";
 import { ApiError } from "@/api/client";
 import { type MonitorTimelineItem, useMonitorChannels, useMonitorTimeline } from "@/api/endpoints";
 import { type ManualWatchlistItem, useManualWatchlist } from "@/api/manualWatchlist";
+import {
+  publishedSuperseded,
+  useManualWatchlistCommand,
+  useUnresolvedManualWatchlistCodes,
+} from "@/api/manualWatchlistCommand";
 import { useCurrentMeta } from "@/api/useMeta";
 import { StockDrawer } from "@/app/StockDrawer";
 import { formatCount, formatPrice } from "@/format/number";
@@ -52,8 +57,158 @@ const WATCHLIST_SOURCE = {
   pool_member: "来自池子结果",
 } as const satisfies Record<ManualWatchlistItem["source"], string>;
 
+function ManualWatchlistRow({
+  item,
+  viewer,
+  generationId,
+  onStock,
+  refresh,
+}: {
+  item: ManualWatchlistItem;
+  viewer: string | null;
+  generationId: string | null;
+  onStock: (code: string) => void;
+  refresh: () => void;
+}) {
+  const command = useManualWatchlistCommand(viewer, item.ts_code, generationId);
+  const confirmedAdd =
+    command.record?.body.action === "add" &&
+    command.record.status === "published" &&
+    generationId !== null &&
+    generationId !== command.record.body.generation_id &&
+    item.version === command.record.version;
+  const superseded =
+    command.record !== null &&
+    publishedSuperseded(command.record, { generationId, version: item.version });
+  const record = confirmedAdd || superseded ? null : command.record;
+  const unresolved =
+    record !== null &&
+    ["pending", "processing", "unknown", "uncertain", "saved_syncing", "published"].includes(
+      record.status,
+    );
+  const failure = record !== null && ["conflict", "capacity", "failed"].includes(record.status);
+  const label =
+    record?.status === "saved_syncing" || record?.status === "published"
+      ? "已保存，正在同步"
+      : record?.status === "unknown" || record?.status === "uncertain"
+        ? "状态待核对"
+        : record?.status === "pending" || record?.status === "processing"
+          ? "正在处理"
+          : failure
+            ? "未移出"
+            : "已加入";
+  return (
+    <li>
+      <button
+        className="manual-watchlist-stock"
+        type="button"
+        onClick={() => onStock(item.ts_code)}
+        aria-label={`查看 ${item.ts_code} 详情`}
+      >
+        {item.ts_code}
+      </button>
+      <span className="hint">{WATCHLIST_SOURCE[item.source]}</span>
+      <Pill kind={unresolved ? "acc" : failure ? "warn" : "ok"}>{label}</Pill>
+      {unresolved ? (
+        <Button
+          size="sm"
+          variant="ghost"
+          disabled={command.busy}
+          onClick={() => {
+            if (record?.status === "published") refresh();
+            else void command.session.advance();
+          }}
+        >
+          继续核对
+        </Button>
+      ) : (
+        <Button
+          size="sm"
+          variant="ghost"
+          disabled={
+            !command.storageAvailable ||
+            command.busy ||
+            generationId === null ||
+            (failure && record.body.generation_id === generationId)
+          }
+          aria-label={`移出 ${item.ts_code}`}
+          onClick={() => {
+            if (generationId)
+              void command.session.start({
+                action: "remove",
+                generationId,
+                expectedVersion: item.version,
+                observedStatus: "active",
+              });
+          }}
+        >
+          移出
+        </Button>
+      )}
+      {failure ? (
+        <Button size="sm" variant="ghost" onClick={refresh}>
+          刷新名单
+        </Button>
+      ) : null}
+    </li>
+  );
+}
+
+function ManualWatchlistRecoveryRow({
+  tsCode,
+  viewer,
+  generationId,
+  onStock,
+}: {
+  tsCode: string;
+  viewer: string;
+  generationId: string | null;
+  onStock: (code: string) => void;
+}) {
+  const command = useManualWatchlistCommand(viewer, tsCode, generationId);
+  const record = command.record;
+  if (
+    record === null ||
+    !["pending", "processing", "saved_syncing", "uncertain", "unknown"].includes(record.status)
+  )
+    return null;
+  const label =
+    record.status === "saved_syncing"
+      ? "已保存，正在同步"
+      : record.status === "pending" || record.status === "processing"
+        ? "正在处理"
+        : "状态待核对";
+  return (
+    <li>
+      <button
+        className="manual-watchlist-stock"
+        type="button"
+        onClick={() => onStock(tsCode)}
+        aria-label={`查看 ${tsCode} 详情`}
+      >
+        {tsCode}
+      </button>
+      <span className="hint">{record.body.action === "add" ? "加入" : "移出"}</span>
+      <Pill kind="acc">{label}</Pill>
+      <Button
+        size="sm"
+        variant="ghost"
+        aria-label={`继续核对 ${tsCode}`}
+        disabled={command.busy || !command.storageAvailable}
+        onClick={() => void command.session.advance()}
+      >
+        继续核对
+      </Button>
+    </li>
+  );
+}
+
 function ManualWatchlistPanel({ onStock }: { onStock: (code: string) => void }) {
   const watchlist = useManualWatchlist();
+  const viewer = watchlist.viewer;
+  const unresolved = useUnresolvedManualWatchlistCodes(viewer).filter(
+    (code) => !watchlist.items.some((item) => item.ts_code === code),
+  );
   return (
     <Panel title="手动盯盘" label="手动盯盘" sub="手动加入 · 与自动策略分开">
       {watchlist.state === "loading" ? (
@@ -72,21 +227,33 @@ function ManualWatchlistPanel({ onStock }: { onStock: (code: string) => void }) 
       ) : (
         <ul className="manual-watchlist" aria-label="手动盯盘名单">
           {watchlist.items.map((item) => (
-            <li key={item.ts_code}>
-              <button
-                className="manual-watchlist-stock"
-                type="button"
-                onClick={() => onStock(item.ts_code)}
-                aria-label={`查看 ${item.ts_code} 详情`}
-              >
-                {item.ts_code}
-              </button>
-              <span className="hint">{WATCHLIST_SOURCE[item.source]}</span>
-              <Pill kind="ok">已加入</Pill>
-            </li>
+            <ManualWatchlistRow
+              key={item.ts_code}
+              item={item}
+              viewer={watchlist.viewer}
+              generationId={watchlist.generationId}
+              onStock={onStock}
+              refresh={watchlist.refreshMeta}
+            />
           ))}
         </ul>
       )}
+      {viewer !== null && unresolved.length > 0 ? (
+        <div className="manual-watchlist-recovery">
+          <p className="hint">待核对操作</p>
+          <ul className="manual-watchlist" aria-label="待核对操作">
+            {unresolved.map((code) => (
+              <ManualWatchlistRecoveryRow
+                key={code}
+                tsCode={code}
+                viewer={viewer}
+                generationId={watchlist.generationId}
+                onStock={onStock}
+              />
+            ))}
+          </ul>
+        </div>
+      ) : null}
     </Panel>
   );
 }

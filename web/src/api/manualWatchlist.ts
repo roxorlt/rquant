@@ -129,8 +129,10 @@ export function useManualWatchlistExact(tsCode: string | null) {
   return {
     status,
     version,
+    viewer: scope.viewer,
     generationId: status === "loading" || status === "unavailable" ? null : scope.generationId,
     message: status === "unavailable" ? UNAVAILABLE : null,
+    refreshMeta: () => void scope.meta.refetch(),
     retry: () => {
       if (scope.viewer === null) void scope.meta.refetch();
       else void query.refetch();
@@ -177,7 +179,9 @@ export function useManualWatchlist() {
   return {
     state,
     items,
+    viewer: scope.viewer,
     generationId: ready ? scope.generationId : null,
+    refreshMeta: () => void scope.meta.refetch(),
     retry: () => {
       if (scope.viewer === null) void scope.meta.refetch();
       else void query.refetch();

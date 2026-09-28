@@ -6,7 +6,7 @@ type List = Schemas["Envelope_ManualWatchlistListData_"];
 type Exact = Schemas["Envelope_ManualWatchlistExactData_"];
 
 for (const width of [1440, 390]) {
-  test(`手动名单与抽屉只读状态 ${width}px`, async ({ page }, testInfo) => {
+  test(`手动名单单股移出等待同步 ${width}px`, async ({ page }, testInfo) => {
     await page.setViewportSize({ width, height: 844 });
     const watcher = watch(page);
     const response = await page.request.get("api/v1/meta");
@@ -47,6 +47,20 @@ for (const width of [1440, 390]) {
     };
     await page.route("**/api/v1/watchlist", (route) => route.fulfill({ json: list }));
     await page.route("**/api/v1/watchlist/600001.SH", (route) => route.fulfill({ json: exact }));
+    let sent: Record<string, unknown> | null = null;
+    await page.route("**/api/v1/watchlist/commands", (route) => {
+      sent = route.request().postDataJSON() as Record<string, unknown>;
+      return route.fulfill({
+        json: {
+          command_id: sent.command_id,
+          ts_code: "600001.SH",
+          action: "remove",
+          status: "saved_syncing",
+          version: 3,
+          message: "已保存，正在同步。",
+        },
+      });
+    });
     await page.goto("./#/monitor");
     const section = page.getByRole("region", { name: "手动盯盘" });
     await expect(section).toContainText("600001.SH");
@@ -64,8 +78,20 @@ for (const width of [1440, 390]) {
     }
     const drawer = page.getByRole("dialog", { name: /600001\.SH/ });
     await expect(drawer).toContainText("已加入盯盘");
-    await expect(drawer.getByRole("button", { name: "加入盯盘" })).toHaveCount(0);
-    await expect(drawer.getByRole("button", { name: "移出盯盘" })).toHaveCount(0);
+    const remove = drawer.getByRole("button", { name: "移出盯盘" });
+    await expect(remove).toBeEnabled();
+    if (width === 1440) {
+      await remove.focus();
+      await expect(remove).toBeFocused();
+      await remove.press("Space");
+    } else {
+      await remove.click();
+    }
+    await expect(drawer).toContainText("已保存，正在同步");
+    await expect(drawer).not.toContainText("已移出盯盘");
+    expect(sent).toMatchObject({ ts_code: "600001.SH", action: "remove", expected_version: 2 });
+    expect(sent).not.toHaveProperty("source");
+    expect(sent).not.toHaveProperty("price_levels");
     await expectNoHorizontalOverflow(page, `manual stock detail ${width}px`);
     await testInfo.attach(`manual-watchlist-${width}px`, {
       body: await page.screenshot({ fullPage: true }),

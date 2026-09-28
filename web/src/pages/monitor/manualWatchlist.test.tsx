@@ -1,11 +1,21 @@
-import { act, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { HttpResponse, http } from "msw";
 import type { Schemas } from "@/api/client";
+import { MANUAL_WATCHLIST_JOURNAL_KEY } from "@/api/manualWatchlistCommand";
 import { metaEnvelope } from "@/test/fixtures";
 import { renderApp } from "@/test/render";
 import { metaHandler, server } from "@/test/server";
 
 type List = Schemas["Envelope_ManualWatchlistListData_"];
+
+beforeEach(() => {
+  Object.defineProperty(navigator, "locks", {
+    configurable: true,
+    value: {
+      request: async (_name: string, _options: unknown, task: () => Promise<void>) => task(),
+    },
+  });
+});
 
 function list(): List {
   return {
@@ -118,5 +128,167 @@ describe("盯盘页手动名单", () => {
       timeout: 2500,
     });
     expect(within(section).getByText("暂无手动盯盘股票")).toBeInTheDocument();
+  });
+
+  it("手动成员可直接移出，先用同代单股 GET 核对版本且不提前宣称完成", async () => {
+    server.use(http.get("*/api/v1/watchlist", () => HttpResponse.json(list())));
+    server.use(
+      http.get("*/api/v1/watchlist/:code", () =>
+        HttpResponse.json({
+          serving: metaEnvelope().serving,
+          data: {
+            availability: "ready",
+            available_at: "2026-09-24T07:31:00Z",
+            message: "",
+            ts_code: "600001.SH",
+            status: "active",
+            version: 2,
+            source: "detail",
+            price_levels: ["10.00"],
+            expires_at: null,
+            updated_at: "2026-09-24T07:30:00Z",
+          },
+        }),
+      ),
+    );
+    let sent: unknown;
+    server.use(
+      http.post("*/api/v1/watchlist/commands", async ({ request }) => {
+        sent = await request.json();
+        const body = sent as { command_id: string };
+        return HttpResponse.json({
+          command_id: body.command_id,
+          ts_code: "600001.SH",
+          action: "remove",
+          status: "saved_syncing",
+          version: 3,
+          message: "已保存，正在同步。",
+        });
+      }),
+    );
+    renderApp("/monitor");
+    const section = await screen.findByRole("region", { name: "手动盯盘" });
+    fireEvent.click(await within(section).findByRole("button", { name: "移出 600001.SH" }));
+    expect(await within(section).findByText("已保存，正在同步")).toBeInTheDocument();
+    expect(within(section).queryByText("已移出盯盘")).toBeNull();
+    expect(sent).toMatchObject({ action: "remove", expected_version: 2, ts_code: "600001.SH" });
+    expect(sent).not.toHaveProperty("price_levels");
+    expect(sent).not.toHaveProperty("source");
+  });
+
+  it("从详情加入已发布且本代名单证实后，列表允许移出", async () => {
+    const body = {
+      action: "add",
+      command_id: "web-prior",
+      requested_at: "2026-09-24T07:30:00.000Z",
+      generation_id: "b".repeat(64),
+      ts_code: "600001.SH",
+      expected_version: null,
+      source: "detail",
+      price_levels: [],
+    };
+    window.localStorage.setItem(
+      `${MANUAL_WATCHLIST_JOURNAL_KEY}:tester:600001.SH`,
+      JSON.stringify({ schema: 1, body, status: "published", version: 2 }),
+    );
+    server.use(http.get("*/api/v1/watchlist", () => HttpResponse.json(list())));
+    renderApp("/monitor");
+    const section = await screen.findByRole("region", { name: "手动盯盘" });
+    expect(await within(section).findByRole("button", { name: "移出 600001.SH" })).toBeEnabled();
+    expect(within(section).getByText("已加入")).toBeInTheDocument();
+    expect(within(section).queryByText("已保存，正在同步")).toBeNull();
+  });
+
+  it.each(["add", "remove"] as const)(
+    "名单行消失后仍可续查原 %s 命令，且只显示当前用户",
+    async (action) => {
+      const empty = list();
+      empty.data.items = [];
+      server.use(http.get("*/api/v1/watchlist", () => HttpResponse.json(empty)));
+      const body = {
+        action,
+        command_id: `web-recover-${action}`,
+        requested_at: "2026-09-24T07:30:00.000Z",
+        generation_id: "b".repeat(64),
+        ts_code: "600003.SH",
+        expected_version: action === "add" ? null : 2,
+        ...(action === "add" ? { source: "detail", price_levels: [] } : {}),
+      };
+      window.localStorage.setItem(
+        `${MANUAL_WATCHLIST_JOURNAL_KEY}:tester:600003.SH`,
+        JSON.stringify({ schema: 1, body, status: "unknown", version: null }),
+      );
+      window.localStorage.setItem(
+        `${MANUAL_WATCHLIST_JOURNAL_KEY}:other-user:600004.SH`,
+        JSON.stringify({
+          schema: 1,
+          body: { ...body, ts_code: "600004.SH" },
+          status: "unknown",
+          version: null,
+        }),
+      );
+      window.localStorage.setItem(`${MANUAL_WATCHLIST_JOURNAL_KEY}:tester:600005.SH`, "{invalid");
+      const sent: unknown[] = [];
+      server.use(
+        http.post("*/api/v1/watchlist/commands", async ({ request }) => {
+          const requestBody = await request.json();
+          sent.push(requestBody);
+          return HttpResponse.json({
+            command_id: body.command_id,
+            ts_code: body.ts_code,
+            action,
+            status: "pending",
+            version: null,
+            message: "正在处理",
+          });
+        }),
+      );
+      const view = renderApp("/monitor");
+      const section = await screen.findByRole("region", { name: "手动盯盘" });
+      const recovery = await within(section).findByRole("list", { name: "待核对操作" });
+      expect(within(recovery).getByText("600003.SH")).toBeInTheDocument();
+      expect(within(section).queryByText("600004.SH")).toBeNull();
+      await waitFor(() => expect(sent).toHaveLength(1));
+      fireEvent.click(within(recovery).getByRole("button", { name: "继续核对 600003.SH" }));
+      await waitFor(() => expect(sent).toHaveLength(2));
+      expect(sent).toEqual([body, body]);
+      expect(within(section).getByText("暂无手动盯盘股票")).toBeInTheDocument();
+      await waitFor(() => expect(view.queryClient.isFetching({ queryKey: ["meta"] })).toBe(0));
+      server.use(metaHandler(metaEnvelope({ viewer: "other-user" })));
+      act(() => {
+        view.queryClient.setQueryData(["meta"], metaEnvelope({ viewer: "other-user" }));
+      });
+      await waitFor(() => expect(within(section).queryByText("600003.SH")).toBeNull());
+      expect(await within(section).findByText("600004.SH")).toBeInTheDocument();
+    },
+  );
+
+  it("旧已发布移出被当前更高版本覆盖时，名单行按当前状态允许再次移出", async () => {
+    const current = list();
+    const item = current.data.items[0];
+    if (!item) throw new Error("missing test stock");
+    item.version = 4;
+    window.localStorage.setItem(
+      `${MANUAL_WATCHLIST_JOURNAL_KEY}:tester:600001.SH`,
+      JSON.stringify({
+        schema: 1,
+        body: {
+          action: "remove",
+          command_id: "web-prior",
+          requested_at: "2026-09-24T07:30:00.000Z",
+          generation_id: "b".repeat(64),
+          ts_code: "600001.SH",
+          expected_version: 2,
+        },
+        status: "published",
+        version: 3,
+      }),
+    );
+    server.use(http.get("*/api/v1/watchlist", () => HttpResponse.json(current)));
+    renderApp("/monitor");
+    const section = await screen.findByRole("region", { name: "手动盯盘" });
+    expect(await within(section).findByText("已加入")).toBeInTheDocument();
+    expect(within(section).getByRole("button", { name: "移出 600001.SH" })).toBeEnabled();
+    expect(within(section).queryByText("已保存，正在同步")).toBeNull();
   });
 });

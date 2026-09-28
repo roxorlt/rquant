@@ -20,6 +20,15 @@
   list-style: none;
 }
 
+.manual-watchlist-recovery {
+  margin-top: 12px;
+}
+
+.manual-watchlist-recovery > .hint {
+  display: block;
+  margin-bottom: 8px;
+}
+
 .manual-watchlist li {
   display: flex;
   align-items: center;

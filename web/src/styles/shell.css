@@ -265,6 +265,16 @@
   gap: 8px;
   min-width: 0;
 }
+.stock-watchlist-feedback {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  flex-basis: 100%;
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
 .stock-chart-title {
   margin: 0;
   font-size: 14px;
