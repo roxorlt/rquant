@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
-import { type PoolMember, type PublishedPool, usePools } from "@/api/endpoints";
+import { type PoolMember, type PoolsData, type PublishedPool, usePools } from "@/api/endpoints";
 import { useFormulaPools } from "@/api/formulaPools";
 import {
   type BuiltinPoolCopySource,
@@ -92,6 +92,17 @@ const MEMBER_COLUMNS: DataColumn<PoolMember>[] = [
     secondary: true,
   },
 ];
+
+const EMPTY_RULE_POOLS: PoolsData = {
+  state: "unavailable",
+  latest_trade_date: null,
+  definitions_available: false,
+  rules_available: false,
+  canvases: [],
+  canvases_truncated: false,
+  pools: [],
+  pools_truncated: false,
+};
 
 function poolStatus(pool: PublishedPool): string {
   if (pool.state === "unpublished") return "尚无已发布结果";
@@ -375,7 +386,7 @@ export default function PoolsPage() {
     poolKey: string;
     generationId: string | null;
   } | null>(null);
-  const data = query.data;
+  const data = query.data ?? EMPTY_RULE_POOLS;
   const newest = meta.data?.serving.generation_id;
   const visibleGeneration = query.serving?.generation_id;
   const changing =
@@ -456,16 +467,19 @@ export default function PoolsPage() {
   }, [canCreateCanvas, canvasCreateSession, canvasCreateSnapshot]);
 
   const canvas =
-    canvasName === ""
+    changing || canvasName === ""
       ? undefined
-      : (data?.canvases.find((item) => item.name === canvasName) ?? data?.canvases[0]);
-  const shown = canvas
-    ? canvas.pool_keys.flatMap((key) => data?.pools.find((pool) => pool.key === key) ?? [])
-    : (data?.pools ?? []);
+      : (data.canvases.find((item) => item.name === canvasName) ?? data.canvases[0]);
+  const shown = changing
+    ? []
+    : canvas
+      ? canvas.pool_keys.flatMap((key) => data.pools.find((pool) => pool.key === key) ?? [])
+      : data.pools;
   const formulaShown =
     !canvas &&
-    !changing &&
-    formulaQuery.serving?.generation_id === visibleGeneration &&
+    !meta.isError &&
+    newest != null &&
+    formulaQuery.serving?.generation_id === newest &&
     formulaQuery.data?.availability === "ready"
       ? formulaQuery.data.pools
       : [];
@@ -536,6 +550,7 @@ export default function PoolsPage() {
       ? [
           {
             id: `condition:${pool.key}`,
+            kind: "condition" as const,
             label:
               pool.key === savedKey && stage !== "published" && stage !== "result"
                 ? `${pool.name}\n新规则等待发布`
@@ -547,6 +562,7 @@ export default function PoolsPage() {
       : []),
     {
       id: pool.key,
+      kind: "pool" as const,
       label: `${pool.name}\n${pool.key === savedKey && stage !== "result" ? "等待新规则选股" : pool.result.status_label}`,
       width: 190,
       height: 82,
@@ -557,12 +573,14 @@ export default function PoolsPage() {
       ...formulaShown.flatMap((pool) => [
         {
           id: `formula-definition:${pool.pool_name}`,
+          kind: "condition" as const,
           label: `${pool.display_name}\n公式条件`,
           width: 190,
           height: 82,
         },
         {
           id: `formula:${pool.pool_name}`,
+          kind: "pool" as const,
           label: `${pool.display_name}\n${pool.latest_result ? `${pool.latest_result.trade_date} · ${formatCount(pool.latest_result.match_count)} 只` : "尚未运行"}`,
           width: 190,
           height: 82,
@@ -587,6 +605,15 @@ export default function PoolsPage() {
       })),
     );
   }
+  const selectedGraphId = graphNodes.some((node) => node.id === selectionId)
+    ? selectionId
+    : selected
+      ? selectedKind === "condition"
+        ? `condition:${selected.key}`
+        : selected.key
+      : selectedFormula
+        ? `formula:${selectedFormula.pool_name}`
+        : null;
   const hasRules = graphPools.some((pool) => pool.definition?.state === "available");
 
   return (
@@ -765,9 +792,9 @@ export default function PoolsPage() {
           </div>
         ) : null,
       )}
-      {query.isLoading ? (
+      {query.isLoading && formulaShown.length === 0 ? (
         <PageSkeleton />
-      ) : query.error || changing ? (
+      ) : (query.error || changing) && formulaShown.length === 0 ? (
         <EmptyState title="池子数据正在更新" hint="稍后刷新页面再查看。" />
       ) : data &&
         (data.state === "ready" ||
@@ -777,7 +804,7 @@ export default function PoolsPage() {
           editorReady) ? (
         <div className="pools-page">
           <div className="pools-toolbar">
-            {data.canvases.length > 0 ? (
+            {!changing && data.canvases.length > 0 ? (
               <label className="pools-canvas-picker">
                 <span>画布</span>
                 <select
@@ -851,16 +878,14 @@ export default function PoolsPage() {
               {editorNotice}
             </p>
           ) : null}
-          {!data.definitions_available ? (
+          {!data.definitions_available && shown.length > 0 ? (
             <p className="pools-note">保存的画布暂不可用，显示已发布池子。</p>
           ) : null}
           {!canvas && (formulaQuery.error || formulaQuery.data?.availability === "unavailable") ? (
             <p className="pools-note" role="status">
               公式池暂时无法读取，请稍后刷新。
             </p>
-          ) : !canvas &&
-            formulaQuery.data &&
-            formulaQuery.serving?.generation_id !== visibleGeneration ? (
+          ) : !canvas && formulaQuery.data && formulaQuery.serving?.generation_id !== newest ? (
             <p className="pools-note" role="status">
               公式池数据正在更新，稍后查看。
             </p>
@@ -893,6 +918,7 @@ export default function PoolsPage() {
                     nodes={graphNodes}
                     edges={graphEdges}
                     label={hasRules ? "已发布规则与池子" : "已发布池子；关系尚未发布"}
+                    selectedId={selectedGraphId}
                     onSelect={setSelectionId}
                   />
                 ) : (
@@ -972,12 +998,12 @@ export default function PoolsPage() {
                 {selectedFormula ? (
                   <FormulaPoolDetail
                     pool={selectedFormula}
-                    generation={visibleGeneration}
+                    generation={formulaQuery.serving?.generation_id}
                     onSelectStock={(code) =>
                       setStockSelection({
                         code,
                         poolKey: selectedFormula.pool_name,
-                        generationId: visibleGeneration ?? null,
+                        generationId: formulaQuery.serving?.generation_id ?? null,
                       })
                     }
                   />

@@ -422,31 +422,9 @@
 }
 .pools-list-item:focus-visible,
 .pools-rule-button:focus-visible,
-.pools-canvas-picker select:focus-visible,
-.pools-page .react-flow__node:focus-visible {
+.pools-canvas-picker select:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
-}
-.pools-page .react-flow__node[data-id^="condition:"] {
-  background: var(--accent-weak);
-  color: var(--accent-t);
-  border: 1px dashed var(--accent);
-  border-radius: 10px;
-  font-weight: 600;
-}
-.pools-page .react-flow__node-default {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  white-space: pre-line;
-  overflow-wrap: anywhere;
-  line-height: 1.35;
-  font-size: 12px;
-  padding: 8px;
-}
-.pools-page .react-flow__edge-path {
-  stroke: var(--accent);
-  stroke-width: 1.5;
 }
 .pools-rule-body {
   display: grid;

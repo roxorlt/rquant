@@ -239,6 +239,17 @@ it("公式池区分尚未运行、可信零命中和旧数据代", async () => {
   expect(screen.queryByRole("button", { name: "查看 趋势池公式池" })).toBeNull();
 });
 
+it("规则池接口暂不可用时仍能查看同代公式池定义", async () => {
+  server.use(
+    http.get("*/api/v1/pools", () => HttpResponse.json({ detail: "暂不可用" }, { status: 503 })),
+  );
+  respondFormula(null);
+  renderApp("/pools");
+  const button = await screen.findByRole("button", { name: "查看 趋势池公式池" });
+  await userEvent.setup().click(button);
+  expect(screen.getByRole("region", { name: "公式条件" })).toHaveTextContent("CLOSE>MA(CLOSE,2)");
+});
+
 it("坏成员不进入列表，游标失效后从第一页重新读取", async () => {
   respond({ ...base, canvases: [], pools: [] });
   respondFormula(formulaResult);
@@ -299,7 +310,7 @@ it("selects a published pool by keyboard and opens a member's stock drawer", asy
   ).toBeGreaterThan(0);
   expect(screen.getByText("最终命中")).toBeInTheDocument();
   expect(screen.getByText(/仅显示前 1 只/)).toBeInTheDocument();
-  expect(container.querySelectorAll(".react-flow__edge")).toHaveLength(0);
+  expect(container.querySelectorAll(".flow-graph-edge")).toHaveLength(0);
   expect(findJargon(container.textContent ?? "")).toEqual([]);
   await user.click(screen.getByRole("row", { name: /样本01/ }));
   expect(await screen.findByRole("dialog")).toHaveTextContent("样本01");
@@ -754,11 +765,13 @@ it("draws published dependencies through condition nodes and opens rules by keyb
   const user = userEvent.setup();
   const { container } = renderApp("/pools");
   const graph = await screen.findByRole("group", { name: "已发布规则与池子" });
-  expect(graph.querySelectorAll(".react-flow__node")).toHaveLength(4);
+  expect(graph.querySelectorAll(".flow-graph-node")).toHaveLength(4);
+  expect(graph.querySelector('[data-id="n-shape-pool1"]')).toHaveAttribute("aria-pressed", "true");
   const condition = graph.querySelector<HTMLElement>('[data-id="condition:n-shape-pool2"]');
   expect(condition).toBeTruthy();
   act(() => condition?.focus());
   await user.keyboard("{Enter}");
+  expect(condition).toHaveAttribute("aria-pressed", "true");
   expect(screen.getByRole("region", { name: "规则详情" })).toHaveTextContent("明显下影线");
   expect(screen.getByRole("region", { name: "规则详情" })).toHaveTextContent("最小振幅（%）2%");
   expect(screen.getByRole("region", { name: "规则详情" })).toHaveTextContent("N 形态一池");
@@ -817,7 +830,7 @@ it("does not invent a parent line when the parent is hidden by the list limit", 
   const user = userEvent.setup();
   const { container } = renderApp("/pools");
   const graph = await screen.findByRole("group", { name: "已发布规则与池子" });
-  expect(graph.querySelectorAll(".react-flow__node")).toHaveLength(2);
+  expect(graph.querySelectorAll(".flow-graph-node")).toHaveLength(2);
   await user.click(screen.getByRole("button", { name: "查看 观察池条件" }));
   expect(screen.getByRole("region", { name: "规则详情" })).toHaveTextContent(
     "父池未显示，列表已达上限",

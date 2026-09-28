@@ -27,7 +27,7 @@ export interface FlowPosition {
 /**
  * Automatic layout for pool and condition nodes with published dependency edges.
  * Positions are computed, never stored, so nothing about the layout has to be
- * written back to the server. Returns top-left corners, as React Flow expects.
+ * written back to the server. Returns top-left corners for the read-only map.
  */
 export function layoutFlow(
   nodes: readonly FlowLayoutNode[],
