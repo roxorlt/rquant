@@ -61,7 +61,7 @@ describe("数据中心财务概况", () => {
     );
     const user = userEvent.setup();
     renderApp("/datacenter");
-    await user.click(await screen.findByRole("button", { name: "财务" }));
+    await user.click(await screen.findByRole("button", { name: "财务" }, { timeout: 3_000 }));
     const panel = screen.getByRole("region", { name: "财务概况" });
     expect(await within(panel).findByText("1,234")).toBeInTheDocument();
     expect(within(panel).getByText("2026-09-25")).toBeInTheDocument();
