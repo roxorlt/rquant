@@ -91,13 +91,8 @@ canonical JSON；nodeid 文件部分只能指向仓库内非符号链接的 `tes
 - **不测第三方库**：tushare / duckdb / pandas 的行为不归我们测
 - **Mock 边界**：mock 外部 HTTP / 文件系统边界，不 mock 自己代码内部
 
-## 分层覆盖目标（MVP 阶段）
+## 当前验证重点
 
-| 模块 | 强度 | 说明 |
-|---|---|---|
-| adapter/ | 单测 + 集成测 | 上游 API 变更最常见的事故源 |
-| indicator/（Week 2 加） | 单测必须 | 纯函数，bug 直接影响选股结果 |
-| rule/（Week 3 加） | 单测必须 | 同上 |
-| scheduler/（Week 4 加） | smoke test | 主要靠 APScheduler 自己 |
-| notifier/（Week 6 加） | smoke test | 挂了不会死人 |
-| UI（Week 7 加） | 不测 | 手动点 |
+- 领域计算、数据适配、调度和通知改动先运行直接相关的 Python 聚焦测试；跨层合同变化再补对应集成验证。
+- React 页面改动运行 `pnpm -C web check`；影响构建产物时运行 `build` 与 `verify:dist`，关键交互按影响面运行 `e2e` 和桌面、窄屏浏览器检查。
+- 全量 Python 测试按仓库门禁或实际影响面运行，不因阶段名称重复跑；跳过、未选中和环境受限的用例不得记为通过。详见项目 `AGENTS.md` 的验证规范。
