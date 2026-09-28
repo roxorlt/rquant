@@ -4,6 +4,7 @@ import os
 from datetime import datetime, time, timedelta
 from decimal import Decimal
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 from fastapi.testclient import TestClient as RawTestClient
@@ -31,6 +32,7 @@ from rquant.serving_price_alert_rule_projection import (
     build_price_alert_rule_projections,
 )
 from rquant.web.price_alert_rule_read import read_price_alert_rules
+from rquant.web.routes import price_alert_rules
 from rquant.web.serving import BorrowedGeneration, GenerationTracker
 from rquant.web.settings import WebSettings
 from tests.support.web_proxy_identity import ProofTestClient, create_proof_test_app
@@ -107,6 +109,8 @@ def _publish(
     rules: tuple[PriceAlertRuleProjectionRow, ...] = (),
     members: tuple[ManualWatchlistProjectionRow, ...] = (),
     activated: bool = True,
+    member_activated: bool = True,
+    rule_unavailable: bool = False,
 ) -> None:
     activated_at = FIXTURE_BUILT_AT - timedelta(days=1)
     rule_snapshot = (
@@ -114,8 +118,10 @@ def _publish(
         if activated
         else None
     )
-    member_snapshot = ManualWatchlistAuthoritySnapshot.create(
-        activated_at=activated_at, rows=members
+    member_snapshot = (
+        ManualWatchlistAuthoritySnapshot.create(activated_at=activated_at, rows=members)
+        if member_activated
+        else None
     )
     build_web_fixture(
         root,
@@ -126,7 +132,9 @@ def _publish(
                 member_snapshot, observed_at=FIXTURE_BUILT_AT + timedelta(minutes=sequence)
             ),
             *build_price_alert_rule_projections(
-                rule_snapshot, observed_at=FIXTURE_BUILT_AT + timedelta(minutes=sequence)
+                rule_snapshot,
+                observed_at=FIXTURE_BUILT_AT + timedelta(minutes=sequence),
+                unavailable=rule_unavailable,
             ),
         ),
     )
@@ -316,6 +324,89 @@ def test_private_read_requires_proof_and_never_guesses_empty_from_unknown(tmp_pa
         create_proof_test_app(WebSettings(serving_root=root), clock=lambda: NOW, background=False)
     ) as client:
         assert client.get(PATH, headers=HEADERS).status_code == 503
+
+
+def test_unactivated_rule_does_not_require_watchlist_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    errors = Mock()
+    monkeypatch.setattr(price_alert_rules, "logger", errors)
+    unactivated = tmp_path / "unactivated"
+    _publish(unactivated, activated=False, member_activated=False)
+    with _client(unactivated) as client:
+        data = client.get(PATH, headers=HEADERS).json()["data"]
+    assert data["availability"] == "not_ready"
+    assert data["items"] == []
+    errors.exception.assert_not_called()
+
+    rule_ready = tmp_path / "rule-ready"
+    _publish(rule_ready, member_activated=False)
+    with _client(rule_ready) as client:
+        data = client.get(PATH, headers=HEADERS).json()["data"]
+    assert data["availability"] == "unavailable"
+    assert data["items"] == []
+    errors.exception.assert_called_once_with("Private price rule list read failed")
+
+
+def test_known_unavailable_rule_does_not_log_read_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "serving"
+    _publish(root, activated=False, member_activated=False, rule_unavailable=True)
+    errors = Mock()
+    monkeypatch.setattr(price_alert_rules, "logger", errors)
+    admission = _Admission()
+    with _client(root, admission) as client:
+        for _ in range(2):
+            envelope = client.get(PATH, headers=HEADERS).json()
+            data = envelope["data"]
+            assert data["availability"] == "unavailable"
+            assert data["items"] == []
+        denied = client.post(
+            COMMAND_PATH,
+            json=_save_body(envelope["serving"]["generation_id"]),
+            headers=WRITE_HEADERS,
+        )
+        assert denied.status_code == 503
+        assert admission.submitted == []
+    errors.exception.assert_not_called()
+
+
+def test_missing_rule_projections_are_quietly_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "serving"
+    build_web_fixture(root, "baseline")
+    tracker = GenerationTracker(root)
+    tracker.refresh()
+    try:
+        with tracker.borrow() as borrowed:
+            assert borrowed is not None
+            marks = borrowed.cursor.execute(
+                "SELECT available, row_count, owner_generation_id, available_at "
+                "FROM projection_status WHERE table_name IN "
+                "('price_alert_rule', 'price_alert_rule_state') ORDER BY table_name"
+            ).fetchall()
+            assert marks == [(False, 0, None, None), (False, 0, None, None)]
+    finally:
+        tracker.close()
+
+    errors = Mock()
+    monkeypatch.setattr(price_alert_rules, "logger", errors)
+    admission = _Admission()
+    with _client(root, admission) as client:
+        for _ in range(2):
+            envelope = client.get(PATH, headers=HEADERS).json()
+            assert envelope["data"]["availability"] == "unavailable"
+            assert envelope["data"]["items"] == []
+        denied = client.post(
+            COMMAND_PATH,
+            json=_save_body(envelope["serving"]["generation_id"]),
+            headers=WRITE_HEADERS,
+        )
+        assert denied.status_code == 503
+        assert admission.submitted == []
+    errors.exception.assert_not_called()
 
 
 def test_price_rule_socket_requires_explicit_distinct_private_identity(tmp_path: Path) -> None:

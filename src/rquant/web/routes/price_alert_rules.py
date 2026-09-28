@@ -121,6 +121,16 @@ def list_price_alert_rules(
                         ),
                         serving=meta,
                     )
+                if read.availability == "unavailable":
+                    return Envelope(
+                        data=PriceAlertRuleListData(
+                            availability="unavailable",
+                            message=_UNAVAILABLE,
+                            available_at=None,
+                            items=[],
+                        ),
+                        serving=meta,
+                    )
                 members = {(row.owner_id, row.ts_code): row for row in read.members}
                 items = [
                     PriceAlertRuleItemData(

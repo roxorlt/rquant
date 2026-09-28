@@ -31,7 +31,7 @@ _MEMBER_COLUMNS = (
 
 @dataclass(frozen=True)
 class PriceRuleRead:
-    availability: Literal["ready", "not_ready"]
+    availability: Literal["ready", "not_ready", "unavailable"]
     available_at: datetime | None
     rules: tuple[PriceAlertRuleProjectionRow, ...]
     members: tuple[ManualWatchlistProjectionRow, ...]
@@ -78,6 +78,37 @@ def read_price_alert_rules(borrowed: BorrowedGeneration, *, now: datetime) -> Pr
         elif generation is not None or available_at is not None or count != 0:
             raise ValueError("unpublished price rule projection carries rows")
 
+    facts_mark, state_mark = marks
+    if not state_mark[1]:
+        if facts_mark[1]:
+            raise ValueError("price rule facts lack authority state")
+        return PriceRuleRead("unavailable", None, (), ())
+    if state_mark[2] != 1:
+        raise ValueError("price rule state is unavailable")
+    raw_state = cursor.execute(
+        "SELECT snapshot_key, state, activated_at, row_count, rows_sha256 "
+        "FROM price_alert_rule_state LIMIT 2"
+    ).fetchall()
+    if len(raw_state) != 1 or raw_state[0][0] != "current":
+        raise ValueError("price rule state is malformed")
+    _key, state, activated_at, row_count, digest = raw_state[0]
+    if state in {"not_activated", "unavailable"}:
+        if facts_mark[1] or any(value is not None for value in (activated_at, row_count, digest)):
+            raise ValueError("unready price rule state carries facts")
+        if state == "not_activated":
+            return PriceRuleRead("not_ready", None, (), ())
+        return PriceRuleRead("unavailable", None, (), ())
+    if state != "ready" or not facts_mark[1]:
+        raise ValueError("ready price rule state lacks facts")
+    if (
+        state_mark[5] != facts_mark[5]
+        or type(row_count) is not int
+        or row_count != facts_mark[2]
+        or not isinstance(digest, str)
+        or not isinstance(activated_at, datetime)
+        or normalize_aware_utc(activated_at) > normalize_aware_utc(state_mark[5])
+    ):
+        raise ValueError("price rule state and facts disagree")
     member_authority = read_manual_watchlist_authority(manifest, cursor)
     if member_authority is None or member_authority.source_generation_id != source_generation:
         raise ValueError("manual watchlist authority is unavailable")
@@ -104,34 +135,6 @@ def read_price_alert_rules(borrowed: BorrowedGeneration, *, now: datetime) -> Pr
         for row in members
     ):
         raise ValueError("manual watchlist source time precedes a member")
-
-    facts_mark, state_mark = marks
-    if not state_mark[1] or state_mark[2] != 1:
-        raise ValueError("price rule state is unavailable")
-    raw_state = cursor.execute(
-        "SELECT snapshot_key, state, activated_at, row_count, rows_sha256 "
-        "FROM price_alert_rule_state LIMIT 2"
-    ).fetchall()
-    if len(raw_state) != 1 or raw_state[0][0] != "current":
-        raise ValueError("price rule state is malformed")
-    _key, state, activated_at, row_count, digest = raw_state[0]
-    if state in {"not_activated", "unavailable"}:
-        if facts_mark[1] or any(value is not None for value in (activated_at, row_count, digest)):
-            raise ValueError("unready price rule state carries facts")
-        if state == "not_activated":
-            return PriceRuleRead("not_ready", None, (), ())
-        raise ValueError("price rule authority is unavailable")
-    if state != "ready" or not facts_mark[1]:
-        raise ValueError("ready price rule state lacks facts")
-    if (
-        state_mark[5] != facts_mark[5]
-        or type(row_count) is not int
-        or row_count != facts_mark[2]
-        or not isinstance(digest, str)
-        or not isinstance(activated_at, datetime)
-        or normalize_aware_utc(activated_at) > normalize_aware_utc(state_mark[5])
-    ):
-        raise ValueError("price rule state and facts disagree")
     raw_rules = cursor.execute(
         f"SELECT {_RULE_COLUMNS} FROM price_alert_rule ORDER BY owner_id, rule_id LIMIT ?",
         (MAX_PRICE_ALERT_RULE_ROWS + 1,),
