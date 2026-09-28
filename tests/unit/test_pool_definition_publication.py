@@ -577,8 +577,9 @@ def test_invalid_next_source_revokes_previously_published_pool_rules(tmp_path: P
     (root / "breakout.json").unlink()
     (root / "breakout.json").symlink_to(target)
 
-    producer.publish(NOW)
-    latest = store.serving_snapshot(observed_at=NOW, history_limit=1)
+    next_iteration = NOW + timedelta(microseconds=1)
+    producer.publish(next_iteration)
+    latest = store.serving_snapshot(observed_at=next_iteration, history_limit=1)
     assert "pool_definition" not in {item.table_name for item in latest.payload.projections}
 
 

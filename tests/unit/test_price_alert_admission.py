@@ -235,7 +235,12 @@ def test_real_same_uid_peer_is_rejected_before_body_parse(
                         + b"Content-Type: application/json\r\n\r\n"
                         + payload
                     )
-                assert connection.recv(1) == b""
+                try:
+                    response = connection.recv(1)
+                except ConnectionResetError:
+                    # Linux may reset a rejected peer with unread request bytes.
+                    response = b""
+                assert response == b""
             assert service.outbox.receipt("price-1") is None
         finally:
             _stop(server, worker)

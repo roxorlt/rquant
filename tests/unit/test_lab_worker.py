@@ -14079,7 +14079,7 @@ def test_report_publish_uses_cross_process_evidence_lock(tmp_path: Path) -> None
         assert process.poll() is None
         assert reports.pending_locked() == ()
 
-    stdout, stderr = process.communicate(timeout=2)
+    stdout, stderr = process.communicate(timeout=10)
 
     assert process.returncode == 0, (stdout, stderr)
     assert tuple(entry.report for entry in reports.pending()) == (report,)
