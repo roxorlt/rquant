@@ -209,6 +209,53 @@ def test_auto_cycle_rejects_formula_pool_task_from_other_source(tmp_path: Path) 
         cycle.run(DAY, max_worker_calls=1)
 
 
+def test_auto_cycle_rejects_pool_key_with_different_saved_formula(tmp_path: Path) -> None:
+    batch, _, _ = _fixture(tmp_path)
+    cycle = _cycle(batch.config)
+    definition = batch.definitions.read("alpha")
+    universe, projection, _ = cycle.coordinator.runner._sources(DAY)
+    forged = cycle.coordinator.runner.task_store.submit(
+        FormulaMarketJobRequest(
+            idempotency_key=_run_identity(
+                definition.pool_name, definition.version, DAY, universe, projection
+            ),
+            formula="CLOSE>999",
+            trade_date=DAY,
+            decision_at=NOW,
+            universe_root=batch.config.market.universe_root,
+            projection_root=batch.config.market.projection_root,
+            expected_universe_sha256=universe,
+            expected_projection_identity=projection,
+        )
+    )
+    with pytest.raises(ValueError, match="formula|identity"):
+        cycle.run(DAY, max_worker_calls=1)
+    assert cycle.coordinator.runner.task_store.status(forged.task_id).status == "succeeded"
+
+
+def test_auto_cycle_rejects_pool_key_with_untrusted_source_roots(tmp_path: Path) -> None:
+    batch, _, _ = _fixture(tmp_path)
+    cycle = _cycle(batch.config)
+    definition = batch.definitions.read("alpha")
+    universe, projection, _ = cycle.coordinator.runner._sources(DAY)
+    cycle.coordinator.runner.task_store.submit(
+        FormulaMarketJobRequest(
+            idempotency_key=_run_identity(
+                definition.pool_name, definition.version, DAY, universe, projection
+            ),
+            formula=definition.formula,
+            trade_date=DAY,
+            decision_at=NOW,
+            universe_root=tmp_path / "untrusted-universe",
+            projection_root=batch.config.market.projection_root,
+            expected_universe_sha256=universe,
+            expected_projection_identity=projection,
+        )
+    )
+    with pytest.raises(ValueError, match="identity"):
+        cycle.run(DAY, max_worker_calls=1)
+
+
 def test_auto_cycle_concurrent_calls_keep_canonical_daily_results(tmp_path: Path) -> None:
     batch, _, _ = _fixture(tmp_path)
     cycles = (_cycle(batch.config), _cycle(batch.config))

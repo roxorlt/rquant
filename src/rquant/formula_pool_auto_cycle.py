@@ -14,6 +14,7 @@ from pydantic import Field, model_validator
 from rquant.formula_pool_batch import (
     FormulaPoolBatchCoordinator,
     FormulaPoolBatchDayResult,
+    FormulaPoolBatchItem,
     FormulaPoolBatchPrivateConfig,
     load_private_formula_pool_batch_config,
 )
@@ -84,20 +85,19 @@ class FormulaPoolAutoCycle:
         )
 
     @staticmethod
-    def _is_pool_request(
+    def _matching_pool_item(
         day: FormulaPoolBatchDayResult, request: FormulaMarketJobRequest
-    ) -> bool:
-        return any(
-            request.idempotency_key
-            == _run_identity(
+    ) -> FormulaPoolBatchItem | None:
+        for item in day.pools:
+            if request.idempotency_key == _run_identity(
                 item.pool_name,
                 item.definition_version,
                 request.trade_date,
                 request.expected_universe_sha256,
                 request.expected_projection_identity,
-            )
-            for item in day.pools
-        )
+            ):
+                return item
+        return None
 
     def _require_receipt_identity(
         self,
@@ -106,15 +106,22 @@ class FormulaPoolAutoCycle:
         initial: FormulaPoolBatchDayResult,
     ) -> None:
         request = self.worker.store.read_request(receipt.task_id)
-        if not self._is_pool_request(initial, request):
+        item = self._matching_pool_item(initial, request)
+        if item is None:
             return
+        definition = self.coordinator.definitions.read(
+            item.pool_name.removeprefix("user/"), expected_version=item.definition_version
+        )
         if (
             request.trade_date != initial.trade_date
             or request.expected_universe_sha256 != initial.universe_identity
             or request.expected_projection_identity != initial.projection_identity
+            or request.universe_root != self.config.market.universe_root
+            or request.projection_root != self.config.market.projection_root
+            or request.formula != definition.formula
             or receipt.error_code == "source_changed"
         ):
-            raise ValueError("formula pool worker task source identity changed")
+            raise ValueError("formula pool worker task identity changed")
 
     def run(
         self, trade_date: date, *, max_worker_calls: int = _MAX_WORKER_CALLS
