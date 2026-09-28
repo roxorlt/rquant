@@ -8,6 +8,7 @@ export interface SelectedTask {
   jobId: string;
   name: string;
   generationId: string;
+  viewer: string;
 }
 
 function requestError(error: Error): string {

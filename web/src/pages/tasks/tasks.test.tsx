@@ -414,6 +414,63 @@ describe("研究任务进展", () => {
     await waitFor(() => expect(screen.queryByText("任务已开始")).toBeNull());
     expect(screen.queryByRole("button", { name: "查看动量参数搜索的进展" })).toBeNull();
     expect(screen.getByText("当前无法查看任务进展。")).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole("button", { name: "刷新" })).toHaveFocus());
+  });
+
+  it.each(["other-viewer", null])(
+    "drops private progress and refetches overview when meta viewer becomes %s in the same generation",
+    async (nextViewer) => {
+      let overviewRequests = 0;
+      server.use(
+        http.get("*/api/v1/tasks/overview", () => {
+          overviewRequests += 1;
+          return HttpResponse.json(
+            overviewEnvelope({ can_view_research_logs: overviewRequests === 1 }),
+          );
+        }),
+        http.get("*/api/v1/tasks/jobs/:jobId/events", () => HttpResponse.json(eventsData())),
+      );
+      const user = userEvent.setup();
+      const { queryClient } = renderApp("/tasks");
+      await user.click(await screen.findByRole("button", { name: "查看动量参数搜索的进展" }));
+      expect(await screen.findByText("任务已开始")).toBeInTheDocument();
+      queryClient.setQueryData(["meta"], metaEnvelope({ viewer: nextViewer }));
+      await waitFor(() => expect(screen.queryByText("任务已开始")).toBeNull());
+      expect(screen.getByText("当前身份已变化，任务进展已关闭。")).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "查看动量参数搜索的进展" })).toBeNull();
+      await waitFor(() => expect(overviewRequests).toBeGreaterThan(1));
+      await waitFor(() => expect(screen.getByRole("button", { name: "刷新" })).toHaveFocus());
+      await screen.findByRole("table", { name: "研究任务队列" });
+      expect(screen.queryByRole("button", { name: "查看动量参数搜索的进展" })).toBeNull();
+    },
+  );
+
+  it("drops private progress on meta failure and refetches overview after recovery", async () => {
+    let overviewRequests = 0;
+    server.use(
+      http.get("*/api/v1/tasks/overview", () => {
+        overviewRequests += 1;
+        return HttpResponse.json(overviewEnvelope({ can_view_research_logs: true }));
+      }),
+      http.get("*/api/v1/tasks/jobs/:jobId/events", () => HttpResponse.json(eventsData())),
+    );
+    const user = userEvent.setup();
+    const { queryClient } = renderApp("/tasks");
+    await user.click(await screen.findByRole("button", { name: "查看动量参数搜索的进展" }));
+    expect(await screen.findByText("任务已开始")).toBeInTheDocument();
+    server.use(http.get("*/api/v1/meta", () => HttpResponse.error()));
+    await queryClient.invalidateQueries({ queryKey: ["meta"] });
+    await waitFor(() => expect(screen.queryByText("任务已开始")).toBeNull());
+    expect(screen.getByText("当前身份暂无法确认，任务进展已关闭。")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "查看动量参数搜索的进展" })).toBeNull();
+    expect(screen.getByText("当前身份暂无法确认")).toBeInTheDocument();
+    expect(overviewRequests).toBe(1);
+    server.use(http.get("*/api/v1/meta", () => HttpResponse.json(metaEnvelope())));
+    await user.click(screen.getByRole("button", { name: "刷新" }));
+    await waitFor(() => expect(overviewRequests).toBeGreaterThan(1));
+    expect(
+      await screen.findByRole("button", { name: "查看动量参数搜索的进展" }),
+    ).toBeInTheDocument();
   });
 
   it("closes the stale drawer on 409 and never renders an older response", async () => {
@@ -426,9 +483,70 @@ describe("研究任务进展", () => {
     const user = userEvent.setup();
     renderApp("/tasks");
     await user.click(await screen.findByRole("button", { name: "查看动量参数搜索的进展" }));
-    expect(await screen.findByText("数据已更新，请重新打开任务进展。")).toBeInTheDocument();
+    expect(
+      await screen.findByText("数据已更新。新数据发布后点「刷新」，再打开任务进展。"),
+    ).toBeInTheDocument();
     expect(screen.queryByRole("dialog", { name: /任务进展/ })).toBeNull();
     expect(document.body).not.toHaveTextContent("stale-internal-id");
+  });
+
+  it("blocks repeated 409 requests until a newer overview generation succeeds", async () => {
+    let generation = tasksEnvelope().serving.generation_id;
+    let eventRequests = 0;
+    let overviewRequests = 0;
+    const nextGeneration = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    server.use(
+      http.get("*/api/v1/tasks/overview", () => {
+        overviewRequests += 1;
+        return HttpResponse.json({
+          ...overviewEnvelope({ can_view_research_logs: true }),
+          serving: { ...tasksEnvelope().serving, generation_id: generation },
+        });
+      }),
+      http.get("*/api/v1/tasks/jobs/:jobId/events", () => {
+        eventRequests += 1;
+        return generation === nextGeneration
+          ? HttpResponse.json(eventsData({ generation_id: nextGeneration }))
+          : HttpResponse.json({ detail: "stale-internal-id" }, { status: 409 });
+      }),
+    );
+    const user = userEvent.setup();
+    const { queryClient } = renderApp("/tasks");
+    await user.click(await screen.findByRole("button", { name: "查看动量参数搜索的进展" }));
+    expect(await screen.findByText(/新数据发布后点「刷新」/)).toBeInTheDocument();
+    await waitFor(() => expect(overviewRequests).toBeGreaterThan(1));
+    expect(screen.queryByRole("button", { name: "查看动量参数搜索的进展" })).toBeNull();
+    await user.click(screen.getByRole("button", { name: "刷新" }));
+    expect(eventRequests).toBe(1);
+    expect(screen.queryByRole("button", { name: "查看动量参数搜索的进展" })).toBeNull();
+    generation = nextGeneration;
+    queryClient.setQueryData(["meta"], metaEnvelope({ generationId: nextGeneration }));
+    await user.click(await screen.findByRole("button", { name: "查看动量参数搜索的进展" }));
+    expect(await screen.findByText("任务已开始")).toBeInTheDocument();
+    expect(eventRequests).toBe(2);
+  });
+
+  it("returns focus to page refresh when the selected row leaves the current overview", async () => {
+    let items = tasksEnvelope().data.items;
+    server.use(
+      http.get("*/api/v1/tasks/overview", () =>
+        HttpResponse.json(
+          overviewEnvelope({
+            can_view_research_logs: true,
+            research: { ...tasksEnvelope().data, items },
+          }),
+        ),
+      ),
+      http.get("*/api/v1/tasks/jobs/:jobId/events", () => HttpResponse.json(eventsData())),
+    );
+    const user = userEvent.setup();
+    const { queryClient } = renderApp("/tasks");
+    await user.click(await screen.findByRole("button", { name: "查看动量参数搜索的进展" }));
+    expect(await screen.findByText("任务已开始")).toBeInTheDocument();
+    items = [second];
+    await queryClient.invalidateQueries({ queryKey: ["tasks", "overview"] });
+    await waitFor(() => expect(screen.queryByText("任务已开始")).toBeNull());
+    await waitFor(() => expect(screen.getByRole("button", { name: "刷新" })).toHaveFocus());
   });
 
   it("closes a 200 response that names another data generation", async () => {
@@ -441,7 +559,9 @@ describe("研究任务进展", () => {
     const user = userEvent.setup();
     renderApp("/tasks");
     await user.click(await screen.findByRole("button", { name: "查看动量参数搜索的进展" }));
-    expect(await screen.findByText("数据已更新，请重新打开任务进展。")).toBeInTheDocument();
+    expect(
+      await screen.findByText("数据已更新。新数据发布后点「刷新」，再打开任务进展。"),
+    ).toBeInTheDocument();
     expect(screen.queryByRole("dialog", { name: /任务进展/ })).toBeNull();
   });
 

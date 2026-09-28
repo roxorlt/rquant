@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ApiError } from "@/api/client";
 import { type ResearchJobItem, type ResearchJobsData, useTaskOverview } from "@/api/endpoints";
-import { useCurrentGeneration } from "@/api/useMeta";
+import { useCurrentMeta } from "@/api/useMeta";
 import { formatCount, formatPercent } from "@/format/number";
 import { formatShanghaiDateTime, formatShanghaiTime } from "@/format/time";
 import { type DataColumn, DataTable } from "@/table/DataTable";
@@ -165,10 +165,21 @@ export default function TasksPage() {
   const [, setClockPulse] = useState(0);
   const [selected, setSelected] = useState<SelectedTask | null>(null);
   const [progressNotice, setProgressNotice] = useState<string | null>(null);
+  const [blockedGeneration, setBlockedGeneration] = useState<string | null>(null);
   const returnFocus = useRef<HTMLButtonElement | null>(null);
+  const refreshAction = useRef<HTMLSpanElement | null>(null);
+  const meta = useCurrentMeta();
+  const viewer = meta.isError ? null : (meta.data?.data.viewer ?? null);
+  const [identity, setIdentity] = useState({ viewer, failed: meta.isError });
+  const identityChanged = identity.viewer !== viewer || identity.failed !== meta.isError;
+  const trustedViewer = !identityChanged && !meta.isError ? viewer : null;
   const pageIndex = cursors.length - 1;
-  const result = useTaskOverview(cursors[pageIndex] ?? null, refreshKey);
-  const currentGeneration = useCurrentGeneration();
+  const result = useTaskOverview(
+    cursors[pageIndex] ?? null,
+    refreshKey,
+    meta.data !== undefined && !meta.isError && !identityChanged,
+  );
+  const currentGeneration = meta.data?.data.generation?.generation_id;
   const snapshot = result.data;
   const data = snapshot?.overview;
   const generationId = result.serving?.generation_id ?? null;
@@ -176,14 +187,17 @@ export default function TasksPage() {
   const changed = result.error instanceof ApiError && result.error.status === 409;
   const canViewProgress =
     !outdated &&
+    trustedViewer !== null &&
     result.error === null &&
     generationId !== null &&
+    generationId !== blockedGeneration &&
     data?.can_view_research_logs === true &&
     data.research.source_state === "ready" &&
     data.research.items.length > 0;
   const staleSelection =
     selected !== null &&
     (selected.generationId !== generationId ||
+      selected.viewer !== trustedViewer ||
       outdated ||
       result.error !== null ||
       data?.can_view_research_logs !== true ||
@@ -204,12 +218,17 @@ export default function TasksPage() {
 
   const openProgress = useCallback(
     (row: ResearchJobItem, trigger: HTMLButtonElement) => {
-      if (!canViewProgress || generationId === null) return;
+      if (!canViewProgress || generationId === null || trustedViewer === null) return;
       returnFocus.current = trigger;
       setProgressNotice(null);
-      setSelected({ jobId: row.job_id, name: row.strategy_name, generationId });
+      setSelected({
+        jobId: row.job_id,
+        name: row.strategy_name,
+        generationId,
+        viewer: trustedViewer,
+      });
     },
-    [canViewProgress, generationId],
+    [canViewProgress, generationId, trustedViewer],
   );
   const columns = useMemo(
     () =>
@@ -227,24 +246,58 @@ export default function TasksPage() {
   );
   const closeProgress = useCallback(() => setSelected(null), []);
   const invalidateProgress = useCallback(() => {
+    if (selected !== null) setBlockedGeneration(selected.generationId);
     setSelected(null);
-    setProgressNotice("数据已更新，请重新打开任务进展。");
-  }, []);
+    setCursors([null]);
+    setRefreshKey((value) => value + 1);
+    setProgressNotice("数据已更新。新数据发布后点「刷新」，再打开任务进展。");
+  }, [selected]);
 
   useEffect(() => {
-    if (!staleSelection) return;
+    if (!identityChanged) return;
+    setIdentity({ viewer, failed: meta.isError });
+    setCursors([null]);
+    setRefreshKey((value) => value + 1);
+    if (selected !== null) {
+      setSelected(null);
+      setProgressNotice(
+        meta.isError ? "当前身份暂无法确认，任务进展已关闭。" : "当前身份已变化，任务进展已关闭。",
+      );
+    }
+  }, [identityChanged, viewer, meta.isError, selected]);
+
+  useEffect(() => {
+    if (!staleSelection || identityChanged || selected?.viewer !== viewer || meta.isError) return;
     setSelected(null);
     setProgressNotice(
       selected?.generationId !== generationId || outdated || changed
         ? "数据已更新，请重新打开任务进展。"
         : "当前无法查看任务进展。",
     );
-  }, [staleSelection, selected, generationId, outdated, changed]);
+  }, [
+    staleSelection,
+    identityChanged,
+    selected,
+    viewer,
+    meta.isError,
+    generationId,
+    outdated,
+    changed,
+  ]);
 
   useEffect(() => {
-    if (selected !== null || !returnFocus.current?.isConnected) return;
+    if (selected !== null || returnFocus.current === null) return;
     const trigger = returnFocus.current;
-    const frame = window.requestAnimationFrame(() => trigger.focus());
+    returnFocus.current = null;
+    const frame = window.requestAnimationFrame(() => {
+      if (trigger.isConnected && !trigger.disabled) {
+        trigger.focus();
+      } else {
+        const refresh = refreshAction.current?.querySelector("button");
+        if (refresh && !refresh.disabled) refresh.focus();
+        else refreshAction.current?.focus();
+      }
+    });
     return () => window.cancelAnimationFrame(frame);
   }, [selected]);
 
@@ -288,6 +341,7 @@ export default function TasksPage() {
   }, []);
 
   function refresh() {
+    if (meta.isError || meta.data === undefined) void meta.refetch();
     setCursors([null]);
     setRefreshKey((value) => value + 1);
   }
@@ -299,9 +353,12 @@ export default function TasksPage() {
         title="任务与调度"
         note="定时任务、运行服务、资源和研究队列"
         actions={
-          <Button size="sm" variant="ghost" onClick={refresh} disabled={result.isFetching}>
-            刷新
-          </Button>
+          // biome-ignore lint/a11y/useSemanticElements: this is a focus fallback around one action, not a form fieldset.
+          <span ref={refreshAction} role="group" tabIndex={-1} aria-label="任务总览刷新">
+            <Button size="sm" variant="ghost" onClick={refresh} disabled={result.isFetching}>
+              刷新
+            </Button>
+          </span>
         }
       />
       {progressNotice ? (
@@ -309,7 +366,14 @@ export default function TasksPage() {
           {progressNotice}
         </p>
       ) : null}
-      {result.isLoading || (outdated && !result.error) || (changed && pageIndex > 0) ? (
+      {meta.isError ? (
+        <Panel title="任务总览">
+          <EmptyState title="当前身份暂无法确认" hint="请稍后点「刷新」重试。" />
+        </Panel>
+      ) : result.isLoading ||
+        identityChanged ||
+        (outdated && !result.error) ||
+        (changed && pageIndex > 0) ? (
         <PageSkeleton label="任务总览加载中" />
       ) : result.error ? (
         <Panel title="任务总览">

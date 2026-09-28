@@ -148,41 +148,46 @@ export function pinnedTaskDeadline(
 export function useTaskOverview(
   cursor: string | null,
   refreshKey: number,
+  enabled = true,
 ): ServingQueryResult<TimedTaskOverview> {
   const budgets = useRef<
     Record<"scheduled" | "resources", { key: string; deadline: number } | null>
   >({ scheduled: null, resources: null });
-  return useServingQuery(["tasks", "overview", cursor, refreshKey], async () => {
-    const startedAt = performance.now();
-    const { data, response } = await apiClient().GET("/api/v1/tasks/overview", {
-      params: { query: cursor ? { page_size: 20, cursor } : { page_size: 20 } },
-    });
-    const envelope = unwrap(data, response);
-    const receivedAt = performance.now();
-    const pin = (section: "scheduled" | "resources"): number | null => {
-      const source = envelope.data[section];
-      const deadline = deadlineFromRemaining(
-        source.source_state,
-        source.remaining_seconds,
-        startedAt,
-        receivedAt,
-      );
-      if (deadline === null) return null;
-      const key = `${envelope.serving.generation_id}:${source.source_updated_at}:${source.expires_at}`;
-      const previous = budgets.current[section];
-      const pinned = pinnedTaskDeadline(previous, key, deadline);
-      budgets.current[section] = { key, deadline: pinned };
-      return pinned;
-    };
-    return {
-      data: {
-        overview: envelope.data,
-        scheduledDeadline: pin("scheduled"),
-        resourcesDeadline: pin("resources"),
-      },
-      serving: envelope.serving,
-    };
-  });
+  return useServingQuery(
+    ["tasks", "overview", cursor, refreshKey],
+    async () => {
+      const startedAt = performance.now();
+      const { data, response } = await apiClient().GET("/api/v1/tasks/overview", {
+        params: { query: cursor ? { page_size: 20, cursor } : { page_size: 20 } },
+      });
+      const envelope = unwrap(data, response);
+      const receivedAt = performance.now();
+      const pin = (section: "scheduled" | "resources"): number | null => {
+        const source = envelope.data[section];
+        const deadline = deadlineFromRemaining(
+          source.source_state,
+          source.remaining_seconds,
+          startedAt,
+          receivedAt,
+        );
+        if (deadline === null) return null;
+        const key = `${envelope.serving.generation_id}:${source.source_updated_at}:${source.expires_at}`;
+        const previous = budgets.current[section];
+        const pinned = pinnedTaskDeadline(previous, key, deadline);
+        budgets.current[section] = { key, deadline: pinned };
+        return pinned;
+      };
+      return {
+        data: {
+          overview: envelope.data,
+          scheduledDeadline: pin("scheduled"),
+          resourcesDeadline: pin("resources"),
+        },
+        serving: envelope.serving,
+      };
+    },
+    { enabled },
+  );
 }
 
 export function usePaperAccounts(): ServingQueryResult<PaperAccountsData> {
