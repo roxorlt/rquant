@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import os
+import time
 from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
+from loguru import logger
 from pydantic import Field, StrictBool, StrictInt, field_validator, model_validator
 
 from rquant.delivery_contracts import DeliveryChannel, OutboxStatus
@@ -68,6 +70,7 @@ if TYPE_CHECKING:
     from rquant.serving_page_projection_source import SignalPageProjectionProducer
 
 _MAX_BATCH_LIMIT = 1_000
+_BUS_PREFIX_LINK_MIN_INTERVAL_SECONDS = 60.0
 _SIGNALS_DATASET_ID = "signals"
 _ACTIVE_OUTBOX_STATUSES = frozenset({OutboxStatus.PENDING, OutboxStatus.RETRY, OutboxStatus.LEASED})
 
@@ -689,6 +692,7 @@ def signal_router_builder(
     source_loader: SignalSourceLoader | None = None,
     target_resolver: TargetResolver | None = None,
     clock: Callable[[], datetime],
+    monotonic_clock: Callable[[], float] = time.monotonic,
     runtime_root: Path | None = None,
 ) -> RuntimeServiceBuilder:
     if (source_loader is None) != (target_resolver is None):
@@ -796,7 +800,10 @@ def signal_router_builder(
         if resolved_source_loader is None or resolved_target_resolver is None:
             raise RuntimeError("signal router dependencies are unavailable")
 
+        last_prefix_attempt_tick: float | None = None
+
         def step() -> RuntimeStepResult:
+            nonlocal last_prefix_attempt_tick
             before_publish = publish_signal_bus_prefix(
                 bus=bus,
                 spool=signal_spool,
@@ -924,6 +931,18 @@ def signal_router_builder(
                 spool=signal_spool,
                 limit=settings.batch_limit,
             )
+            if published.published_high_watermark >= published.source_high_watermark:
+                try:
+                    tick = monotonic_clock()
+                    if (
+                        last_prefix_attempt_tick is None
+                        or tick < last_prefix_attempt_tick
+                        or tick - last_prefix_attempt_tick >= _BUS_PREFIX_LINK_MIN_INTERVAL_SECONDS
+                    ):
+                        last_prefix_attempt_tick = tick
+                        signal_spool.publish_bus_prefix_link(bus=bus, observed_at=observed_at)
+                except Exception as exc:
+                    logger.warning("signal bus prefix link unavailable: {}", exc)
             return RuntimeStepResult(
                 input_sequence=input_sequence,
                 output_sequence=output_sequence,
