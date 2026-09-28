@@ -9,7 +9,8 @@ import { useCurrentGeneration, useCurrentMeta } from "@/api/useMeta";
 import { formatCount } from "@/format/number";
 import { Button } from "@/ui";
 
-const JOURNAL_KEY = "rquant-formula-pool-save-v1";
+const LEGACY_JOURNAL_KEY = "rquant-formula-pool-save-v1";
+const JOURNAL_KEY_PREFIX = "rquant-formula-pool-save-v2:";
 const SAFE_NAME = /^[\w\u4e00-\u9fff-]+$/u;
 
 type Journal = {
@@ -20,9 +21,8 @@ type Journal = {
   version: string | null;
 };
 
-function readJournal(): Journal | null {
+function parseJournal(raw: string | null): Journal | null {
   try {
-    const raw = window.localStorage.getItem(JOURNAL_KEY);
     if (!raw) return null;
     const value: unknown = JSON.parse(raw);
     if (typeof value !== "object" || value === null || !("request" in value)) return null;
@@ -70,18 +70,36 @@ function readJournal(): Journal | null {
   }
 }
 
-function writeJournal(journal: Journal | null): void {
+function journalKey(viewer: string): string {
+  return `${JOURNAL_KEY_PREFIX}${encodeURIComponent(viewer)}`;
+}
+
+function readJournal(viewer: string | null): Journal | null {
+  if (viewer === null) return null;
   try {
-    if (journal) window.localStorage.setItem(JOURNAL_KEY, JSON.stringify(journal));
-    else window.localStorage.removeItem(JOURNAL_KEY);
+    const current = parseJournal(window.localStorage.getItem(journalKey(viewer)));
+    if (current?.viewer === viewer) return current;
+    const legacy = parseJournal(window.localStorage.getItem(LEGACY_JOURNAL_KEY));
+    return legacy?.viewer === viewer ? legacy : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeJournal(viewer: string, journal: Journal | null): void {
+  try {
+    if (journal) window.localStorage.setItem(journalKey(viewer), JSON.stringify(journal));
+    else window.localStorage.removeItem(journalKey(viewer));
+    if (parseJournal(window.localStorage.getItem(LEGACY_JOURNAL_KEY))?.viewer === viewer) {
+      window.localStorage.removeItem(LEGACY_JOURNAL_KEY);
+    }
   } catch {
     // The open page retains the request when browser storage is disabled.
   }
 }
 
 export function readFormulaPoolSaveTaskId(viewer: string | null): string | null {
-  const journal = readJournal();
-  return viewer !== null && journal?.viewer === viewer ? journal.request.task_id : null;
+  return readJournal(viewer)?.request.task_id ?? null;
 }
 
 type SaveCandidate = {
@@ -98,7 +116,7 @@ export function FormulaPoolSave({ candidate }: { candidate: SaveCandidate | null
   const viewer = meta.data?.data.viewer ?? null;
   const pools = useFormulaPools();
   const [name, setName] = useState("");
-  const [journal, setJournal] = useState<Journal | null>(readJournal);
+  const [journal, setJournal] = useState<Journal | null>(() => readJournal(viewer));
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const active = viewer !== null && journal?.viewer === viewer ? journal : null;
@@ -125,7 +143,8 @@ export function FormulaPoolSave({ candidate }: { candidate: SaveCandidate | null
 
   function remember(value: Journal | null): void {
     setJournal(value);
-    writeJournal(value);
+    const owner = value?.viewer ?? viewer;
+    if (owner !== null) writeJournal(owner, value);
   }
 
   async function submit(value: Journal): Promise<void> {
@@ -192,7 +211,7 @@ export function FormulaPoolSave({ candidate }: { candidate: SaveCandidate | null
     });
   }
 
-  if (active === null && candidate === null) return null;
+  if (active === null && candidate === null && notice === null) return null;
 
   return (
     <section className="formula-pool-save" aria-label="保存公式池">
@@ -274,9 +293,14 @@ export function FormulaPoolSave({ candidate }: { candidate: SaveCandidate | null
         </>
       ) : null}
       {notice ? (
-        <p className="formula-market-notice" role="status">
-          {notice}
-        </p>
+        <>
+          <p className="formula-market-notice" role="status">
+            {notice}
+          </p>
+          {active === null && candidate === null ? (
+            <p className="hint">刷新最近运行，结果可读后可重新保存。</p>
+          ) : null}
+        </>
       ) : null}
     </section>
   );

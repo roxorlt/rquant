@@ -531,6 +531,7 @@ export function FormulaMarketPanel({ formula, checked }: { formula: string; chec
         </section>
       ) : null}
       <FormulaPoolSave
+        key={viewer ?? "unknown"}
         candidate={
           job?.status === "succeeded" &&
           job.result_available &&

@@ -211,14 +211,15 @@ test("公式全市场运行从确认到历史结果，桌面与手机均可恢�
   await drawer.getByRole("region", { name: "保存公式池" }).scrollIntoViewIfNeeded();
   await page.screenshot({ path: "/private/tmp/rquant-formula-save-recovery-phone.png" });
   const saves: Schemas["FormulaPoolSaveCommandRequest"][] = [];
+  let terminal = false;
   await page.route("**/api/v1/pools/formula/commands", async (route) => {
     const request = route.request().postDataJSON() as Schemas["FormulaPoolSaveCommandRequest"];
     saves.push(request);
     await route.fulfill({
       json: {
         command_id: request.command_id,
-        status: "pending",
-        message: "保存状态待确认，请继续核对。",
+        status: terminal ? "failed" : "pending",
+        message: terminal ? "保存失败，请稍后重试。" : "保存状态待确认，请继续核对。",
       } satisfies Schemas["FormulaPoolSaveCommandReceipt"],
     });
   });
@@ -243,6 +244,24 @@ test("公式全市场运行从确认到历史结果，桌面与手机均可恢�
   await expectNoHorizontalOverflow(page, "formula pool recovery desktop");
   await drawer.getByRole("region", { name: "保存公式池" }).scrollIntoViewIfNeeded();
   await page.screenshot({ path: "/private/tmp/rquant-formula-save-recovery-desktop.png" });
+  resultReadable = false;
+  terminal = true;
+  await page.setViewportSize({ width: 390, height: 844 });
+  await drawer
+    .getByRole("heading", { name: "最近运行" })
+    .locator("..")
+    .getByRole("button", { name: "刷新" })
+    .click();
+  await expect(drawer.getByText("结果暂时无法读取")).toBeVisible();
+  await drawer.getByRole("button", { name: "继续核对" }).focus();
+  await page.keyboard.press("Enter");
+  await expect(drawer.getByText("保存失败，请稍后重试。")).toBeVisible();
+  await expect(drawer.getByText("刷新最近运行，结果可读后可重新保存。")).toBeVisible();
+  await expect(drawer.getByRole("region", { name: "保存公式池" })).toHaveCount(1);
+  await expectNoHorizontalOverflow(page, "formula pool terminal recovery phone");
+  expect(saves[2]).toEqual(saves[0]);
+  await drawer.getByRole("region", { name: "保存公式池" }).scrollIntoViewIfNeeded();
+  await page.screenshot({ path: "/private/tmp/rquant-formula-save-terminal-phone.png" });
   expect(
     watcher.problems.filter(
       (problem) =>
