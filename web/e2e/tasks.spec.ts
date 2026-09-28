@@ -136,6 +136,12 @@ for (const viewport of [
 
     test("four overview sections stay readable at this width", async ({ page }, testInfo) => {
       const watcher = watch(page);
+      await page.route("**/api/v1/meta", async (route) => {
+        const response = await route.fetch();
+        const payload = await response.json();
+        payload.data.generation.generation_id = OVERVIEW_ENVELOPE.serving.generation_id;
+        await route.fulfill({ json: payload });
+      });
       await page.route("**/api/v1/tasks/overview**", async (route) => {
         await route.fulfill({ json: OVERVIEW_ENVELOPE });
       });

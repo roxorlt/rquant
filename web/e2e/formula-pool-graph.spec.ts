@@ -2,7 +2,7 @@ import { expect, test } from "@playwright/test";
 import { metaEnvelope } from "../src/test/fixtures.ts";
 import { expectNoHorizontalOverflow } from "./watch.ts";
 
-test("read-only pool map keeps nodes operable on desktop and phone", async ({ page }) => {
+test("read-only pool map keeps nodes operable on desktop and phone", async ({ page }, testInfo) => {
   const serving = metaEnvelope().serving;
   const formula = "CLOSE>MA(CLOSE,2)";
   let poolCount = 1;
@@ -57,7 +57,7 @@ test("read-only pool map keeps nodes operable on desktop and phone", async ({ pa
   await expect(page.locator(".react-flow__attribution")).toHaveCount(0);
   await expectNoHorizontalOverflow(page, "formula pool map desktop");
   await page.screenshot({
-    path: "/private/tmp/rquant-formula-pool-map-desktop.png",
+    path: testInfo.outputPath("rquant-formula-pool-map-desktop.png"),
     fullPage: true,
   });
   await page.setViewportSize({ width: 390, height: 844 });
@@ -69,7 +69,10 @@ test("read-only pool map keeps nodes operable on desktop and phone", async ({ pa
   await phoneNode.click();
   await expect(page.getByRole("region", { name: "公式条件" })).toContainText(formula);
   await expectNoHorizontalOverflow(page, "formula pool map phone");
-  await page.screenshot({ path: "/private/tmp/rquant-formula-pool-map-phone.png", fullPage: true });
+  await page.screenshot({
+    path: testInfo.outputPath("rquant-formula-pool-map-phone.png"),
+    fullPage: true,
+  });
 
   poolCount = 8;
   await page.reload();

@@ -111,7 +111,7 @@ async function installPlans(page: Page) {
 }
 
 for (const width of [1440, 390]) {
-  test(`backfill plan is readable at ${width}px`, async ({ page }) => {
+  test(`backfill plan is readable at ${width}px`, async ({ page }, testInfo) => {
     const observer = watch(page);
     await page.setViewportSize({ width, height: width === 390 ? 844 : 900 });
     await installPlans(page);
@@ -134,7 +134,7 @@ for (const width of [1440, 390]) {
     await expectNoHorizontalOverflow(page, "backfill plan");
     await page
       .locator(".dc-plan-layout")
-      .screenshot({ path: `/private/tmp/rquant-backfill-plan-${width}.png` });
+      .screenshot({ path: testInfo.outputPath(`rquant-backfill-plan-${width}.png`) });
 
     const details = preview.getByText("核对信息").locator("..");
     await details.focus();
@@ -143,7 +143,9 @@ for (const width of [1440, 390]) {
   });
 }
 
-test("keyboard confirmation queues a read-only plan and survives reload", async ({ page }) => {
+test("keyboard confirmation queues a read-only plan and survives reload", async ({
+  page,
+}, testInfo) => {
   await installPlans(page);
   let posted: Schemas["BackfillPlanCommandRequest"] | null = null;
   let calls = 0;
@@ -167,7 +169,7 @@ test("keyboard confirmation queues a read-only plan and survives reload", async 
   await page.keyboard.press("Enter");
   const form = page.getByRole("region", { name: "生成回补计划" });
   await expect(form.getByLabel("开始日期")).toHaveValue("2024-09-01");
-  await form.screenshot({ path: "/private/tmp/rquant-backfill-command-desktop.png" });
+  await form.screenshot({ path: testInfo.outputPath("rquant-backfill-command-desktop.png") });
   await form.getByRole("button", { name: "核对并生成" }).click();
   const dialog = page.getByRole("dialog", { name: "生成回补计划" });
   await expect(dialog).toContainText("只读核对");
@@ -200,7 +202,7 @@ test.describe("390px touch backfill plan", () => {
     await expectNoHorizontalOverflow(page, "touch backfill plan");
   });
 
-  test("tap can open and confirm the plan request", async ({ page }) => {
+  test("tap can open and confirm the plan request", async ({ page }, testInfo) => {
     await installPlans(page);
     await page.route("**/api/v1/data/backfill-plans/commands", async (route) => {
       const body = route.request().postDataJSON() as Schemas["BackfillPlanCommandRequest"];
@@ -220,7 +222,7 @@ test.describe("390px touch backfill plan", () => {
     await expectNoHorizontalOverflow(page, "touch plan form");
     await page
       .getByRole("region", { name: "生成回补计划" })
-      .screenshot({ path: "/private/tmp/rquant-backfill-command-390.png" });
+      .screenshot({ path: testInfo.outputPath("rquant-backfill-command-390.png") });
     await page
       .getByRole("region", { name: "生成回补计划" })
       .getByRole("button", { name: "核对并生成" })

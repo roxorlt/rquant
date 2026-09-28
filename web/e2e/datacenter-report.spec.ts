@@ -166,7 +166,7 @@ async function installAuditRun(page: Page) {
 }
 
 for (const width of [1440, 390]) {
-  test(`daily-bar report shows only proven facts at ${width}px`, async ({ page }) => {
+  test(`daily-bar report shows only proven facts at ${width}px`, async ({ page }, testInfo) => {
     const observer = watch(page);
     await page.setViewportSize({ width, height: width === 390 ? 844 : 900 });
     const metaResponse = await page.request.get("./api/v1/meta");
@@ -220,7 +220,7 @@ for (const width of [1440, 390]) {
     );
     await expectNoHorizontalOverflow(page, "expanded history");
     await page.addStyleTag({ content: ".topbar,.tabbar{visibility:hidden!important}" });
-    await panel.screenshot({ path: `/private/tmp/rquant-audit-report-${width}.png` });
+    await panel.screenshot({ path: testInfo.outputPath(`rquant-audit-report-${width}.png`) });
     expect(observer.problems).toEqual([]);
   });
 }
@@ -281,7 +281,7 @@ test.describe("390px touch report", () => {
 for (const width of [1440, 390]) {
   test(`read-only audit command works at ${width}px and stays recorded after reload`, async ({
     page,
-  }) => {
+  }, testInfo) => {
     const observer = watch(page);
     await page.setViewportSize({ width, height: width === 390 ? 844 : 900 });
     await installAuditRun(page);
@@ -317,7 +317,7 @@ for (const width of [1440, 390]) {
     expect(bodies).toHaveLength(1);
     expect(bodies[0]?.observed_through).toBe("2026-09-23");
     await expectNoHorizontalOverflow(page, "audit command");
-    await panel.screenshot({ path: `/private/tmp/rquant-audit-run-${width}.png` });
+    await panel.screenshot({ path: testInfo.outputPath(`rquant-audit-run-${width}.png`) });
     await page.reload();
     if (width === 390) await page.getByRole("button", { name: /股票日线/ }).click();
     await expect(panel.getByText("本次请求已排队")).toBeVisible();

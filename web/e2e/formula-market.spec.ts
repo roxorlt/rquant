@@ -4,7 +4,7 @@ import { metaEnvelope } from "../src/test/fixtures.ts";
 import { findJargon } from "../src/test/jargon.ts";
 import { expectNoHorizontalOverflow, watch } from "./watch.ts";
 
-test("公式全市场运行从确认到历史结果，桌面与手机均可恢复和翻页", async ({ page }) => {
+test("公式全市场运行从确认到历史结果，桌面与手机均可恢复和翻页", async ({ page }, testInfo) => {
   const watcher = watch(page);
   const serving = metaEnvelope().serving;
   const taskId = "a".repeat(32);
@@ -155,11 +155,13 @@ test("公式全市场运行从确认到历史结果，桌面与手机均可恢�
   await expect(drawer.getByRole("textbox", { name: "池子名称" })).toBeVisible();
   await expectNoHorizontalOverflow(page, "formula market desktop");
   await page.screenshot({
-    path: "/private/tmp/rquant-formula-market-react-desktop.png",
+    path: testInfo.outputPath("rquant-formula-market-react-desktop.png"),
     fullPage: true,
   });
   await drawer.getByRole("region", { name: "市场结果" }).scrollIntoViewIfNeeded();
-  await page.screenshot({ path: "/private/tmp/rquant-formula-market-react-desktop-result.png" });
+  await page.screenshot({
+    path: testInfo.outputPath("rquant-formula-market-react-desktop-result.png"),
+  });
   await drawer.getByRole("button", { name: "下一页" }).click();
   await expect(drawer.getByText("结果已更新")).toBeVisible({ timeout: 15_000 });
   await drawer.getByRole("button", { name: "从第一页重看" }).click();
@@ -185,11 +187,13 @@ test("公式全市场运行从确认到历史结果，桌面与手机均可恢�
   await expect(drawer.getByRole("region", { name: "市场结果" })).toContainText("51");
   await expectNoHorizontalOverflow(page, "formula market phone");
   await page.screenshot({
-    path: "/private/tmp/rquant-formula-market-react-phone.png",
+    path: testInfo.outputPath("rquant-formula-market-react-phone.png"),
     fullPage: true,
   });
   await drawer.getByRole("region", { name: "市场结果" }).scrollIntoViewIfNeeded();
-  await page.screenshot({ path: "/private/tmp/rquant-formula-market-react-phone-result.png" });
+  await page.screenshot({
+    path: testInfo.outputPath("rquant-formula-market-react-phone-result.png"),
+  });
   resultReadable = false;
   await drawer
     .getByRole("heading", { name: "最近运行" })
@@ -209,7 +213,7 @@ test("公式全市场运行从确认到历史结果，桌面与手机均可恢�
   await expect(drawer.getByRole("region", { name: "保存公式池" })).toHaveCount(1);
   expect(findJargon(await drawer.innerText())).toEqual([]);
   await drawer.getByRole("region", { name: "保存公式池" }).scrollIntoViewIfNeeded();
-  await page.screenshot({ path: "/private/tmp/rquant-formula-save-recovery-phone.png" });
+  await page.screenshot({ path: testInfo.outputPath("rquant-formula-save-recovery-phone.png") });
   const saves: Schemas["FormulaPoolSaveCommandRequest"][] = [];
   let terminal = false;
   await page.route("**/api/v1/pools/formula/commands", async (route) => {
@@ -243,7 +247,7 @@ test("公式全市场运行从确认到历史结果，桌面与手机均可恢�
   await expect(drawer.getByRole("region", { name: "保存公式池" })).toHaveCount(1);
   await expectNoHorizontalOverflow(page, "formula pool recovery desktop");
   await drawer.getByRole("region", { name: "保存公式池" }).scrollIntoViewIfNeeded();
-  await page.screenshot({ path: "/private/tmp/rquant-formula-save-recovery-desktop.png" });
+  await page.screenshot({ path: testInfo.outputPath("rquant-formula-save-recovery-desktop.png") });
   resultReadable = false;
   terminal = true;
   await page.setViewportSize({ width: 390, height: 844 });
@@ -261,7 +265,7 @@ test("公式全市场运行从确认到历史结果，桌面与手机均可恢�
   await expectNoHorizontalOverflow(page, "formula pool terminal recovery phone");
   expect(saves[2]).toEqual(saves[0]);
   await drawer.getByRole("region", { name: "保存公式池" }).scrollIntoViewIfNeeded();
-  await page.screenshot({ path: "/private/tmp/rquant-formula-save-terminal-phone.png" });
+  await page.screenshot({ path: testInfo.outputPath("rquant-formula-save-terminal-phone.png") });
   expect(
     watcher.problems.filter(
       (problem) =>
