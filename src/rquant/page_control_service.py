@@ -312,6 +312,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="owner-private local formula admission config; absent means disabled",
     )
+    parser.add_argument(
+        "--watchlist-socket",
+        type=Path,
+        help="owner-private local watchlist admission socket; absent means disabled",
+    )
     return parser
 
 
@@ -322,6 +327,7 @@ def main(
     expected_commit: str | None = None,
     ack_socket_path: Path | None = None,
     ack_serving_root: Path | None = None,
+    watchlist_socket_path: Path | None = None,
     formula_market_config_path: Path | None = None,
 ) -> None:
     """Entry point. `argv` is what the runtime wrapper derived; keywords are for tests."""
@@ -332,11 +338,15 @@ def main(
         if formula_market_config_path is not None and arguments.formula_market_config is not None:
             raise ValueError("formula market config was supplied twice")
         formula_market_config_path = formula_market_config_path or arguments.formula_market_config
+        if watchlist_socket_path is not None and arguments.watchlist_socket is not None:
+            raise ValueError("watchlist socket was supplied twice")
+        watchlist_socket_path = watchlist_socket_path or arguments.watchlist_socket
     return _serve(
         runtime_root=runtime_root,
         expected_commit=expected_commit,
         ack_socket_path=ack_socket_path,
         ack_serving_root=ack_serving_root,
+        watchlist_socket_path=watchlist_socket_path,
         formula_market_config_path=formula_market_config_path,
     )
 
@@ -347,6 +357,7 @@ def _serve(
     expected_commit: str | None = None,
     ack_socket_path: Path | None = None,
     ack_serving_root: Path | None = None,
+    watchlist_socket_path: Path | None = None,
     formula_market_config_path: Path | None = None,
 ) -> None:
     from rquant.runtime_deployment_profile import (
@@ -472,20 +483,41 @@ def _serve(
             )
         except Exception:
             logger.exception("AckAlert admission listener disabled during startup")
+    watchlist_server = None
+    if watchlist_socket_path is not None:
+        try:
+            from rquant.watchlist_admission import (
+                WatchlistAdmission,
+                build_watchlist_admission_server,
+            )
+
+            watchlist_server = build_watchlist_admission_server(
+                WatchlistAdmission(service), socket_path=watchlist_socket_path
+            )
+        except Exception:
+            logger.exception("Watchlist admission listener disabled during startup")
     server_class = _server_class_for_host(host)
     try:
         server = server_class((host, port), handler_for(service))
     except Exception:
         if ack_server is not None:
             ack_server.server_close()
+        if watchlist_server is not None:
+            watchlist_server.server_close()
         raise
     ack_thread = None
     ack_started = False
+    watchlist_thread = None
+    watchlist_started = False
     try:
         if ack_server is not None:
             ack_thread = threading.Thread(target=ack_server.serve_forever, daemon=True)
             ack_thread.start()
             ack_started = True
+        if watchlist_server is not None:
+            watchlist_thread = threading.Thread(target=watchlist_server.serve_forever, daemon=True)
+            watchlist_thread.start()
+            watchlist_started = True
         server.serve_forever()
     finally:
         server.server_close()
@@ -494,6 +526,11 @@ def _serve(
                 ack_server.shutdown()
                 ack_thread.join()
             ack_server.server_close()
+        if watchlist_server is not None:
+            if watchlist_started and watchlist_thread is not None:
+                watchlist_server.shutdown()
+                watchlist_thread.join()
+            watchlist_server.server_close()
 
 
 if __name__ == "__main__":
