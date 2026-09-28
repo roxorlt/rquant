@@ -6264,6 +6264,9 @@
             "title": "Accounts",
             "type": "array"
           },
+          "history": {
+            "$ref": "#/components/schemas/PaperHistoryData"
+          },
           "source_note": {
             "anyOf": [
               {
@@ -6314,9 +6317,200 @@
           "source_updated_at",
           "source_note",
           "valuation_note",
-          "accounts"
+          "accounts",
+          "history"
         ],
         "title": "PaperAccountsData",
+        "type": "object"
+      },
+      "PaperFillItem": {
+        "properties": {
+          "commission": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Commission",
+            "type": "string"
+          },
+          "executed_at": {
+            "format": "date-time",
+            "title": "Executed At",
+            "type": "string"
+          },
+          "fill_id": {
+            "title": "Fill Id",
+            "type": "string"
+          },
+          "persisted_at": {
+            "format": "date-time",
+            "title": "Persisted At",
+            "type": "string"
+          },
+          "price": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Price",
+            "type": "string"
+          },
+          "quantity": {
+            "exclusiveMinimum": 0.0,
+            "title": "Quantity",
+            "type": "integer"
+          },
+          "sequence": {
+            "minimum": 1.0,
+            "title": "Sequence",
+            "type": "integer"
+          },
+          "tax": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Tax",
+            "type": "string"
+          },
+          "total_fees": {
+            "anyOf": [
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Total Fees"
+          },
+          "transfer_fee": {
+            "anyOf": [
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Transfer Fee"
+          }
+        },
+        "required": [
+          "fill_id",
+          "sequence",
+          "quantity",
+          "price",
+          "commission",
+          "transfer_fee",
+          "tax",
+          "total_fees",
+          "executed_at",
+          "persisted_at"
+        ],
+        "title": "PaperFillItem",
+        "type": "object"
+      },
+      "PaperHistoryData": {
+        "properties": {
+          "account_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Account Id"
+          },
+          "has_more": {
+            "title": "Has More",
+            "type": "boolean"
+          },
+          "newest_updated_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Newest Updated At"
+          },
+          "oldest_updated_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Oldest Updated At"
+          },
+          "orders": {
+            "items": {
+              "$ref": "#/components/schemas/PaperOrderItem"
+            },
+            "maxItems": 200,
+            "title": "Orders",
+            "type": "array"
+          },
+          "source_note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Note"
+          },
+          "source_state": {
+            "enum": [
+              "ready",
+              "empty",
+              "not_published",
+              "unavailable"
+            ],
+            "title": "Source State",
+            "type": "string"
+          },
+          "source_updated_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Updated At"
+          },
+          "total_orders": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Total Orders"
+          }
+        },
+        "required": [
+          "source_state",
+          "source_updated_at",
+          "source_note",
+          "account_id",
+          "total_orders",
+          "has_more",
+          "newest_updated_at",
+          "oldest_updated_at",
+          "orders"
+        ],
+        "title": "PaperHistoryData",
         "type": "object"
       },
       "PaperHoldingItem": {
@@ -6390,6 +6584,170 @@
         ],
         "title": "PaperHoldingItem",
         "type": "object"
+      },
+      "PaperOrderItem": {
+        "properties": {
+          "average_fill_price": {
+            "anyOf": [
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Average Fill Price"
+          },
+          "code": {
+            "title": "Code",
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "filled_quantity": {
+            "minimum": 0.0,
+            "title": "Filled Quantity",
+            "type": "integer"
+          },
+          "fills": {
+            "items": {
+              "$ref": "#/components/schemas/PaperFillItem"
+            },
+            "maxItems": 1000,
+            "title": "Fills",
+            "type": "array"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "order_id": {
+            "title": "Order Id",
+            "type": "string"
+          },
+          "order_type": {
+            "$ref": "#/components/schemas/PaperOrderType"
+          },
+          "quantity": {
+            "exclusiveMinimum": 0.0,
+            "title": "Quantity",
+            "type": "integer"
+          },
+          "reject_message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reject Message"
+          },
+          "reject_reason": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PaperRejectReason"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "side": {
+            "$ref": "#/components/schemas/PaperSide"
+          },
+          "side_label": {
+            "title": "Side Label",
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/PaperOrderStatus"
+          },
+          "status_label": {
+            "title": "Status Label",
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "order_id",
+          "code",
+          "name",
+          "side",
+          "side_label",
+          "order_type",
+          "quantity",
+          "filled_quantity",
+          "average_fill_price",
+          "status",
+          "status_label",
+          "reject_reason",
+          "reject_message",
+          "created_at",
+          "updated_at",
+          "fills"
+        ],
+        "title": "PaperOrderItem",
+        "type": "object"
+      },
+      "PaperOrderStatus": {
+        "enum": [
+          "PENDING",
+          "ACCEPTED",
+          "PARTIALLY_FILLED",
+          "FILLED",
+          "REJECTED",
+          "CANCELLED",
+          "EXPIRED"
+        ],
+        "title": "PaperOrderStatus",
+        "type": "string"
+      },
+      "PaperOrderType": {
+        "enum": [
+          "MARKET",
+          "LIMIT"
+        ],
+        "title": "PaperOrderType",
+        "type": "string"
+      },
+      "PaperRejectReason": {
+        "enum": [
+          "T_PLUS_ONE",
+          "SUSPENDED",
+          "LIMIT_LOCKED",
+          "INSUFFICIENT_CASH",
+          "INSUFFICIENT_POSITION",
+          "INVALID_LOT",
+          "EXPIRED",
+          "RISK_REJECTED"
+        ],
+        "title": "PaperRejectReason",
+        "type": "string"
+      },
+      "PaperSide": {
+        "enum": [
+          "BUY",
+          "SELL"
+        ],
+        "title": "PaperSide",
+        "type": "string"
       },
       "PaperSummary": {
         "properties": {

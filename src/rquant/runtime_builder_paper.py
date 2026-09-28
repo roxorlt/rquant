@@ -333,6 +333,7 @@ def paper_broker_builder(
         def publish_account_authority(observed_at: datetime) -> str | None:
             if authority_publisher is None:
                 return None
+            from rquant.paper_history_serving import paper_history_projections
             from rquant.runtime_serving_snapshot import (
                 PaperAccountsPayload,
                 SourceReadResult,
@@ -345,22 +346,55 @@ def paper_broker_builder(
                 market_prices=marks,
                 producer_commit=manifest.producer_commit,
             )
+            history = broker.recent_order_history(as_of=observed_at)
             account = authority_state.snapshot
             reason = "paper account marks use last execution prices" if account.holdings else None
+            projections = paper_history_projections(history)
             values: dict[str, object] = {
                 "dataset_id": "paper_accounts",
-                "sequence": authority_state.revision,
-                "event_time": account.as_of_time,
-                "published_at": account.as_of_time,
+                "sequence": history.ledger_revision,
+                "event_time": observed_at,
+                "published_at": observed_at,
                 "status": (
                     FreshnessStatus.DEGRADED if reason is not None else FreshnessStatus.FRESH
                 ),
                 "reason": reason,
-                "payload": PaperAccountsPayload(paper_accounts=(account,)),
+                "payload": PaperAccountsPayload(
+                    paper_accounts=(account,),
+                    projections=projections,
+                ),
             }
             values["generation_id"] = canonical_sha256(values)
-            pointer = authority_publisher.publish(SourceReadResult.model_validate(values))
-            return pointer.generation_id
+
+            def unchanged_identity(read: SourceReadResult) -> str:
+                payload = read.payload
+                if not isinstance(payload, PaperAccountsPayload):
+                    raise ValueError("paper authority payload is inconsistent")
+                tables = {item.table_name: item for item in payload.projections}
+                if set(tables) != {
+                    "paper_order_window",
+                    "paper_order_history",
+                    "paper_fill_history",
+                }:
+                    return canonical_sha256({"legacy_paper_payload": payload})
+                window = tables["paper_order_window"].rows[0]
+                return canonical_sha256(
+                    {
+                        "status": read.status,
+                        "reason": read.reason,
+                        "accounts": payload.paper_accounts,
+                        "window": {
+                            key: value for key, value in window.items() if key != "as_of_time"
+                        },
+                        "orders": tables["paper_order_history"].rows,
+                        "fills": tables["paper_fill_history"].rows,
+                    }
+                )
+
+            publication = authority_publisher.publish_if_changed(
+                SourceReadResult.model_validate(values), unchanged_identity=unchanged_identity
+            )
+            return publication.pointer.generation_id
 
         def step() -> RuntimeStepResult:
             observed_at = clock()

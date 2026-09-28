@@ -1132,6 +1132,8 @@ def build_web_fixture(
     event_projections: tuple[ServingProjectionPayload, ...] | None = None,
     lab_jobs: tuple[ServingLabJobRecord, ...] = (),
     paper_accounts: tuple[PaperAccountSnapshot, ...] | None = None,
+    paper_history_projections: tuple[ServingProjectionPayload, ...] = (),
+    legacy_paper_schema: bool = False,
     lab_page_projections: tuple[ServingProjectionPayload, ...] | None = None,
     audit_report_projections: tuple[ServingProjectionPayload, ...] = (),
     backfill_plan_projections: tuple[ServingProjectionPayload, ...] = (),
@@ -1208,6 +1210,15 @@ def build_web_fixture(
                 )
             lab_page_projections = DuckDBLabPageProjectionSource(research)(built_at).projections
     projections = _projections(scenario, built_at=built_at, generations=generations)
+    if paper_history_projections:
+        projections += tuple(
+            ServingProjectionInput.bind(
+                item,
+                owner_dataset_id="paper_accounts",
+                owner_generation_id=generations["paper_accounts"],
+            )
+            for item in paper_history_projections
+        )
     if calendar_projection is not None:
         if calendar_projection.table_name != "trade_calendar":
             raise ValueError("calendar fixture override must be trade_calendar")
@@ -1282,14 +1293,29 @@ def build_web_fixture(
         lab_jobs=lab_jobs,
         projections=projections,
     )
+    tables = dict(build_serving_read_models(source))
+    specs = dict(SERVING_TABLE_SPECS)
+    if legacy_paper_schema:
+        historical_tables = {
+            "paper_order_window",
+            "paper_order_history",
+            "paper_fill_history",
+        }
+        for table in historical_tables:
+            tables.pop(table)
+            specs.pop(table)
+        projection_status = tables["projection_status"]
+        tables["projection_status"] = projection_status.loc[
+            ~projection_status["table_name"].isin(historical_tables)
+        ].reset_index(drop=True)
     publisher = ServingPublisher(
         root,
         producer_commit=FIXTURE_PRODUCER_COMMIT,
         schema_version=FIXTURE_SCHEMA_VERSION,
-        table_specs=SERVING_TABLE_SPECS,
+        table_specs=specs,
     )
     return publisher.publish(
-        build_serving_read_models(source),
+        tables,
         watermarks=_watermarks(
             scenario, built_at=built_at, generations=generations, sequence=sequence
         ),

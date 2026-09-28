@@ -2783,6 +2783,7 @@ export interface components {
         PaperAccountsData: {
             /** Accounts */
             accounts: components["schemas"]["PaperAccountItem"][];
+            history: components["schemas"]["PaperHistoryData"];
             /** Source Note */
             source_note: string | null;
             /**
@@ -2794,6 +2795,59 @@ export interface components {
             source_updated_at: string | null;
             /** Valuation Note */
             valuation_note: string | null;
+        };
+        /** PaperFillItem */
+        PaperFillItem: {
+            /** Commission */
+            commission: string;
+            /**
+             * Executed At
+             * Format: date-time
+             */
+            executed_at: string;
+            /** Fill Id */
+            fill_id: string;
+            /**
+             * Persisted At
+             * Format: date-time
+             */
+            persisted_at: string;
+            /** Price */
+            price: string;
+            /** Quantity */
+            quantity: number;
+            /** Sequence */
+            sequence: number;
+            /** Tax */
+            tax: string;
+            /** Total Fees */
+            total_fees: string | null;
+            /** Transfer Fee */
+            transfer_fee: string | null;
+        };
+        /** PaperHistoryData */
+        PaperHistoryData: {
+            /** Account Id */
+            account_id: string | null;
+            /** Has More */
+            has_more: boolean;
+            /** Newest Updated At */
+            newest_updated_at: string | null;
+            /** Oldest Updated At */
+            oldest_updated_at: string | null;
+            /** Orders */
+            orders: components["schemas"]["PaperOrderItem"][];
+            /** Source Note */
+            source_note: string | null;
+            /**
+             * Source State
+             * @enum {string}
+             */
+            source_state: "ready" | "empty" | "not_published" | "unavailable";
+            /** Source Updated At */
+            source_updated_at: string | null;
+            /** Total Orders */
+            total_orders: number | null;
         };
         /** PaperHoldingItem */
         PaperHoldingItem: {
@@ -2816,6 +2870,63 @@ export interface components {
             /** Unrealized Pnl */
             unrealized_pnl: number;
         };
+        /** PaperOrderItem */
+        PaperOrderItem: {
+            /** Average Fill Price */
+            average_fill_price: string | null;
+            /** Code */
+            code: string;
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /** Filled Quantity */
+            filled_quantity: number;
+            /** Fills */
+            fills: components["schemas"]["PaperFillItem"][];
+            /** Name */
+            name: string | null;
+            /** Order Id */
+            order_id: string;
+            order_type: components["schemas"]["PaperOrderType"];
+            /** Quantity */
+            quantity: number;
+            /** Reject Message */
+            reject_message: string | null;
+            reject_reason: components["schemas"]["PaperRejectReason"] | null;
+            side: components["schemas"]["PaperSide"];
+            /** Side Label */
+            side_label: string;
+            status: components["schemas"]["PaperOrderStatus"];
+            /** Status Label */
+            status_label: string;
+            /**
+             * Updated At
+             * Format: date-time
+             */
+            updated_at: string;
+        };
+        /**
+         * PaperOrderStatus
+         * @enum {string}
+         */
+        PaperOrderStatus: "PENDING" | "ACCEPTED" | "PARTIALLY_FILLED" | "FILLED" | "REJECTED" | "CANCELLED" | "EXPIRED";
+        /**
+         * PaperOrderType
+         * @enum {string}
+         */
+        PaperOrderType: "MARKET" | "LIMIT";
+        /**
+         * PaperRejectReason
+         * @enum {string}
+         */
+        PaperRejectReason: "T_PLUS_ONE" | "SUSPENDED" | "LIMIT_LOCKED" | "INSUFFICIENT_CASH" | "INSUFFICIENT_POSITION" | "INVALID_LOT" | "EXPIRED" | "RISK_REJECTED";
+        /**
+         * PaperSide
+         * @enum {string}
+         */
+        PaperSide: "BUY" | "SELL";
         /** PaperSummary */
         PaperSummary: {
             /** Account Id */

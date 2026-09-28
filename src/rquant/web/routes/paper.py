@@ -15,6 +15,7 @@ from rquant.serving_publisher import ServingQueryError
 from rquant.web import readers
 from rquant.web.envelope import Envelope
 from rquant.web.models.paper import PaperAccountItem, PaperAccountsData, PaperHoldingItem
+from rquant.web.paper_history import empty_history, read_paper_history
 from rquant.web.security import current_user
 from rquant.web.serving import BorrowedGeneration, serving_meta
 from rquant.web.status import PAPER_VALUATION_NOTE
@@ -43,6 +44,7 @@ def _empty(state: Literal["not_published", "unavailable"]) -> PaperAccountsData:
         source_note=None,
         valuation_note=None,
         accounts=[],
+        history=empty_history(state),
     )
 
 
@@ -149,6 +151,7 @@ def _read(borrowed: BorrowedGeneration, mark: ServingDatasetWatermark) -> PaperA
                     holdings=items,
                 )
             )
+        history = read_paper_history(borrowed, mark, account_ids)
     except (
         ServingQueryError,
         ValidationError,
@@ -177,6 +180,7 @@ def _read(borrowed: BorrowedGeneration, mark: ServingDatasetWatermark) -> PaperA
         source_note=note,
         valuation_note=valuation,
         accounts=accounts,
+        history=history,
     )
 
 
