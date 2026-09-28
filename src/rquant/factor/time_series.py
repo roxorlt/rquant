@@ -17,17 +17,14 @@ from rquant.factor.expression import parse_factor_expression
 
 MAX_STOCKS = 5_000
 MAX_OBSERVATIONS = 50_000
+MAX_CONTEXT_OBSERVATIONS = 50_000
 MAX_TRADE_DAYS = 1_024
 MAX_RESULT_POINTS = 100_000
 
 _MARKET_TZ = timezone(timedelta(hours=8))
-_UNSUPPORTED_FUNCTIONS = frozenset(
-    {
-        "industry_neutralize",
-        "size_neutralize",
-    }
+_CROSS_SECTIONAL_FUNCTIONS = frozenset(
+    {"cs_rank", "cs_zscore", "cs_winsorize", "industry_neutralize", "size_neutralize"}
 )
-_CROSS_SECTIONAL_FUNCTIONS = frozenset({"cs_rank", "cs_zscore", "cs_winsorize"})
 
 FiniteValue = Annotated[float, Field(strict=True, allow_inf_nan=False)]
 MissingReason = Literal[
@@ -40,6 +37,7 @@ MissingReason = Literal[
     "insufficient_samples",
     "non_finite_result",
     "precision_limit",
+    "missing_context",
 ]
 EvaluationErrorReason = Literal["unsupported_operator", "invalid_definition"]
 
@@ -92,6 +90,62 @@ class FeatureObservation(BaseModel):
         return value
 
 
+class IndustryObservation(BaseModel):
+    """Industry membership first visible for one stock and trade date."""
+
+    model_config = ConfigDict(
+        extra="forbid", frozen=True, strict=True, revalidate_instances="always"
+    )
+
+    stock_code: str
+    trade_date: date
+    industry: str | None
+    first_visible_at: AwareDatetime
+
+    @field_validator("stock_code")
+    @classmethod
+    def _stock_code(cls, value: str) -> str:
+        if not value or value.strip() != value or not value.isprintable():
+            raise PydanticCustomError("factor_invalid_identifier", "identifier is invalid")
+        return value
+
+    @field_validator("industry")
+    @classmethod
+    def _industry(cls, value: str | None) -> str | None:
+        if value is not None and (
+            not value or len(value) > 64 or value.strip() != value or not value.isprintable()
+        ):
+            raise PydanticCustomError("factor_invalid_industry", "industry is invalid")
+        return value
+
+
+class MarketCapObservation(BaseModel):
+    """Positive market cap first visible for one stock and trade date."""
+
+    model_config = ConfigDict(
+        extra="forbid", frozen=True, strict=True, revalidate_instances="always"
+    )
+
+    stock_code: str
+    trade_date: date
+    market_cap: FiniteValue | None
+    first_visible_at: AwareDatetime
+
+    @field_validator("stock_code")
+    @classmethod
+    def _stock_code(cls, value: str) -> str:
+        if not value or value.strip() != value or not value.isprintable():
+            raise PydanticCustomError("factor_invalid_identifier", "identifier is invalid")
+        return value
+
+    @field_validator("market_cap")
+    @classmethod
+    def _positive_cap(cls, value: float | None) -> float | None:
+        if value is not None and value <= 0:
+            raise PydanticCustomError("factor_invalid_market_cap", "market cap must be positive")
+        return value
+
+
 class FactorTimeSeriesInput(BaseModel):
     """All dates, stocks, cutoffs, and observations needed for an offline run."""
 
@@ -104,6 +158,8 @@ class FactorTimeSeriesInput(BaseModel):
     trading_days: tuple[date, ...]
     decision_times: tuple[DecisionTime, ...]
     observations: tuple[FeatureObservation, ...]
+    industry_observations: tuple[IndustryObservation, ...] = ()
+    market_cap_observations: tuple[MarketCapObservation, ...] = ()
 
     @model_validator(mode="after")
     def _validate_batch(self) -> FactorTimeSeriesInput:
@@ -113,6 +169,8 @@ class FactorTimeSeriesInput(BaseModel):
             or len(self.universe) > MAX_STOCKS
             or len(self.trading_days) > MAX_TRADE_DAYS
             or len(self.observations) > MAX_OBSERVATIONS
+            or len(self.industry_observations) + len(self.market_cap_observations)
+            > MAX_CONTEXT_OBSERVATIONS
             or len(self.universe) * len(self.trading_days) > MAX_RESULT_POINTS
         ):
             raise PydanticCustomError("factor_input_too_large", "factor input exceeds its bound")
@@ -154,6 +212,30 @@ class FactorTimeSeriesInput(BaseModel):
                 raise PydanticCustomError(
                     "factor_future_observation", "observation is not visible at decision"
                 )
+        for label, rows in (
+            ("industry", self.industry_observations),
+            ("market_cap", self.market_cap_observations),
+        ):
+            seen_context: set[tuple[str, date]] = set()
+            for row in rows:
+                if row.stock_code not in stock_set:
+                    raise PydanticCustomError(
+                        "factor_unknown_stock", "context stock is outside pool"
+                    )
+                if row.trade_date not in date_to_decision:
+                    raise PydanticCustomError(
+                        "factor_unknown_trade_date", "context date is outside calendar"
+                    )
+                key = (row.stock_code, row.trade_date)
+                if key in seen_context:
+                    raise PydanticCustomError(
+                        f"factor_duplicate_{label}", "context key is duplicate"
+                    )
+                seen_context.add(key)
+                if row.first_visible_at > date_to_decision[row.trade_date]:
+                    raise PydanticCustomError(
+                        "factor_future_context", "context is not visible at decision"
+                    )
         return self
 
 
@@ -249,6 +331,13 @@ def _scaled_mean(values: list[float]) -> float:
     return math.fsum(value / scale for value in values) / len(values) * scale
 
 
+def _log_cap_ratio(cap: float, pivot: float) -> float:
+    ratio = cap / pivot
+    if math.isfinite(ratio) and 0.5 <= ratio <= 2:
+        return math.log1p((cap - pivot) / pivot)
+    return math.log(cap) - math.log(pivot)
+
+
 def _sample_std(values: list[float]) -> float:
     if len(set(values)) == 1:
         return 0.0
@@ -287,12 +376,16 @@ class _SeriesEvaluator:
         universe: tuple[str, ...],
         trading_days: tuple[date, ...],
         observations: dict[tuple[str, date, str], FeatureObservation],
+        industries: dict[tuple[str, date], IndustryObservation],
+        market_caps: dict[tuple[str, date], MarketCapObservation],
         cross_cache: dict[tuple[int, int], dict[str, _Cell]],
     ) -> None:
         self.stock_code = stock_code
         self.universe = universe
         self.trading_days = trading_days
         self.observations = observations
+        self.industries = industries
+        self.market_caps = market_caps
         self.cross_cache = cross_cache
         self.cache: dict[tuple[int, int], _Cell] = {}
 
@@ -407,8 +500,6 @@ class _SeriesEvaluator:
         if not isinstance(node.func, ast.Name):
             raise FactorTimeSeriesError("invalid_definition")
         name = node.func.id
-        if name in _UNSUPPORTED_FUNCTIONS:
-            raise FactorTimeSeriesError("unsupported_operator")
         if name in _CROSS_SECTIONAL_FUNCTIONS:
             return self._cross_section(node, day_index, name)
         if name == "ref":
@@ -471,7 +562,13 @@ class _SeriesEvaluator:
                     self
                     if stock == self.stock_code
                     else _SeriesEvaluator(
-                        stock, self.universe, self.trading_days, self.observations, self.cross_cache
+                        stock,
+                        self.universe,
+                        self.trading_days,
+                        self.observations,
+                        self.industries,
+                        self.market_caps,
+                        self.cross_cache,
                     )
                 ).evaluate(node.args[0], day_index)
                 for stock in self.universe
@@ -492,10 +589,103 @@ class _SeriesEvaluator:
                     index = end
             elif name == "cs_zscore":
                 self._cross_zscore(valid, latest, results)
-            else:
+            elif name == "cs_winsorize":
                 self._cross_winsorize(valid, latest, results, _literal_number(node.args[1]))
+            elif name == "industry_neutralize":
+                self._cross_industry(day_index, valid, results)
+            elif name == "size_neutralize":
+                self._cross_size(day_index, valid, results)
+            else:
+                raise FactorTimeSeriesError("invalid_definition")
             self.cross_cache[key] = results
         return self.cross_cache[key][self.stock_code]
+
+    def _cross_industry(
+        self, day_index: int, valid: list[tuple[str, _Cell]], results: dict[str, _Cell]
+    ) -> None:
+        trade_date = self.trading_days[day_index]
+        groups: dict[str, list[tuple[str, _Cell, IndustryObservation]]] = {}
+        for stock, cell in valid:
+            context = self.industries.get((stock, trade_date))
+            if context is None or context.industry is None:
+                results[stock] = _missing("missing_context")
+            else:
+                groups.setdefault(context.industry, []).append((stock, cell, context))
+        for members in groups.values():
+            if len(members) < 2:
+                results[members[0][0]] = _missing("insufficient_samples")
+                continue
+            values = [cell.value for _, cell, _ in members if cell.value is not None]
+            center = _scaled_mean(values)
+            latest = max(
+                instant
+                for _, cell, context in members
+                for instant in (cell.latest_visible_at, context.first_visible_at)
+                if instant is not None
+            )
+            for stock, cell, _ in members:
+                assert cell.value is not None
+                residual = cell.value - center
+                if (center != 0 and residual == cell.value) or (
+                    cell.value != 0 and residual == -center
+                ):
+                    results[stock] = _missing("precision_limit")
+                else:
+                    results[stock] = _present(residual, latest)
+
+    def _cross_size(
+        self, day_index: int, valid: list[tuple[str, _Cell]], results: dict[str, _Cell]
+    ) -> None:
+        trade_date = self.trading_days[day_index]
+        samples: list[tuple[str, _Cell, MarketCapObservation]] = []
+        for stock, cell in valid:
+            context = self.market_caps.get((stock, trade_date))
+            if context is None or context.market_cap is None:
+                results[stock] = _missing("missing_context")
+            else:
+                samples.append((stock, cell, context))
+        if len(samples) < 3:
+            for stock, _, _ in samples:
+                results[stock] = _missing("insufficient_samples")
+            return
+        caps = [context.market_cap for _, _, context in samples]
+        if len(set(caps)) == 1:
+            for stock, _, _ in samples:
+                results[stock] = _missing("zero_variance")
+            return
+        pivot = caps[0]
+        assert pivot is not None
+        offsets = [_log_cap_ratio(cap, pivot) for cap in caps if cap is not None]
+        if len(set(offsets)) == 1:
+            for stock, _, _ in samples:
+                results[stock] = _missing("precision_limit")
+            return
+        x_mean = math.fsum(offsets) / len(offsets)
+        centered_x = [value - x_mean for value in offsets]
+        denominator = math.fsum(value * value for value in centered_x)
+        if denominator == 0:
+            for stock, _, _ in samples:
+                results[stock] = _missing("precision_limit")
+            return
+        values = [cell.value for _, cell, _ in samples]
+        scale = max(abs(value) for value in values if value is not None) or 1.0
+        scaled_y = [value / scale for value in values if value is not None]
+        y_mean = math.fsum(scaled_y) / len(scaled_y)
+        centered_y = [value - y_mean for value in scaled_y]
+        slope = math.fsum(x * y for x, y in zip(centered_x, centered_y, strict=True)) / denominator
+        latest = max(
+            instant
+            for _, cell, context in samples
+            for instant in (cell.latest_visible_at, context.first_visible_at)
+            if instant is not None
+        )
+        for (stock, _, _), x, y in zip(samples, centered_x, centered_y, strict=True):
+            prediction = slope * x
+            if not math.isfinite(prediction):
+                results[stock] = _missing("non_finite_result")
+                continue
+            residual = math.fsum((y, -prediction)) * scale
+            results[stock] = _present(residual, latest)
 
     @staticmethod
     def _cross_zscore(
@@ -560,21 +750,22 @@ def evaluate_factor_time_series(data: FactorTimeSeriesInput) -> FactorTimeSeries
         checked.definition.expression, checked.definition.feature_catalog
     )
     tree = ast.parse(parsed.expression, mode="eval")
-    if any(
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id in _UNSUPPORTED_FUNCTIONS
-        for node in ast.walk(tree)
-    ):
-        raise FactorTimeSeriesError("unsupported_operator")
     observations = {
         (row.stock_code, row.trade_date, row.column): row for row in checked.observations
     }
+    industries = {(row.stock_code, row.trade_date): row for row in checked.industry_observations}
+    market_caps = {(row.stock_code, row.trade_date): row for row in checked.market_cap_observations}
     cross_cache: dict[tuple[int, int], dict[str, _Cell]] = {}
     by_day: list[list[FactorTimeSeriesValue]] = [[] for _ in checked.trading_days]
     for stock_code in checked.universe:
         evaluator = _SeriesEvaluator(
-            stock_code, checked.universe, checked.trading_days, observations, cross_cache
+            stock_code,
+            checked.universe,
+            checked.trading_days,
+            observations,
+            industries,
+            market_caps,
+            cross_cache,
         )
         for index, trade_date in enumerate(checked.trading_days):
             cell = (
