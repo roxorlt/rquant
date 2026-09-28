@@ -2982,11 +2982,8 @@ export interface components {
             expires_at?: string | null;
             /** Generation Id */
             generation_id: string;
-            /**
-             * Price Levels
-             * @default []
-             */
-            price_levels: (number | string)[];
+            /** Price Levels */
+            price_levels?: (number | string)[] | null;
             /**
              * Requested At
              * Format: date-time

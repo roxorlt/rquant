@@ -52,7 +52,7 @@ class ManualWatchlistCommandRequest(_PrivateModel):
     action: Literal["add", "remove"]
     expected_version: StrictInt | None = Field(default=None, ge=1)
     source: WatchlistSource | None = None
-    price_levels: tuple[PriceLevel, ...] = Field(default=(), max_length=8)
+    price_levels: tuple[PriceLevel, ...] | None = Field(default=None, max_length=8)
     expires_at: AwareUtcDatetime | None = None
 
     @model_validator(mode="after")
@@ -63,6 +63,9 @@ class ManualWatchlistCommandRequest(_PrivateModel):
                 or {"source", "price_levels", "expires_at"} & self.model_fields_set
             ):
                 raise ValueError("remove requires a version and no add-only fields")
+        elif self.price_levels is None:
+            if "price_levels" in self.model_fields_set:
+                raise ValueError("price levels cannot be null")
         elif any(
             left >= right
             for left, right in zip(self.price_levels, self.price_levels[1:], strict=False)

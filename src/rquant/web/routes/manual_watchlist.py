@@ -182,7 +182,7 @@ def _command(
                 ts_code=body.ts_code,
                 expected_version=body.expected_version,
                 source=body.source or WatchlistSource.DETAIL,
-                price_levels=body.price_levels,
+                price_levels=body.price_levels or (),
                 expires_at=body.expires_at,
             ),
         )

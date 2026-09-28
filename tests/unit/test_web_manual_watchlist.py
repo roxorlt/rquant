@@ -257,6 +257,15 @@ def test_watchlist_command_requires_private_ingress_and_independent_socket(
     assert configured.watchlist_admission_socket_path == socket_path
 
 
+def test_optional_price_levels_have_no_array_default_in_openapi() -> None:
+    app = create_app(WebSettings(serving_root=Path("data/runtime/serving")), background=False)
+    schema = app.openapi()["components"]["schemas"]["ManualWatchlistCommandRequest"]
+    field = schema["properties"]["price_levels"]
+    assert "price_levels" not in schema["required"]
+    assert "default" not in field
+    assert {variant.get("type") for variant in field["anyOf"]} == {"array", "null"}
+
+
 class _RecordingAdmission:
     def __init__(
         self,
@@ -387,6 +396,47 @@ def test_new_command_injects_authenticated_owner_and_reports_saved_syncing(
     command, owner = admission.submitted[0]
     assert owner == command.item.owner_id == "alice"
     assert tuple(str(level) for level in command.item.price_levels) == ("10.00", "12.35")
+
+
+def test_add_omitted_levels_are_empty_and_remove_forbids_explicit_levels(tmp_path: Path) -> None:
+    root = tmp_path / "serving"
+    _publish(root)
+    add_admission = _RecordingAdmission()
+    with _command_client(root, add_admission) as client:
+        generation = client.get(PATH, headers=HEADERS).json()["serving"]["generation_id"]
+        add = _command_body(generation)
+        add.pop("price_levels")
+        assert client.post(COMMAND_PATH, json=add, headers=WRITE_HEADERS).status_code == 200
+        assert (
+            client.post(
+                COMMAND_PATH, json=add | {"price_levels": None}, headers=WRITE_HEADERS
+            ).status_code
+            == 422
+        )
+    assert add_admission.submitted[0][0].item.price_levels == ()
+
+    _publish(root, sequence=1, rows=(_row("alice", "600001.SH", 1),))
+    remove_admission = _RecordingAdmission()
+    with _command_client(root, remove_admission, now=NOW + timedelta(minutes=1)) as client:
+        generation = client.get(PATH, headers=HEADERS).json()["serving"]["generation_id"]
+        remove = _command_body(generation) | {
+            "command_id": "watchlist-remove",
+            "action": "remove",
+            "expected_version": 1,
+        }
+        remove.pop("source")
+        remove.pop("price_levels")
+        assert client.post(COMMAND_PATH, json=remove, headers=WRITE_HEADERS).status_code == 200
+        for levels in ([], None):
+            assert (
+                client.post(
+                    COMMAND_PATH,
+                    json=remove | {"price_levels": levels},
+                    headers=WRITE_HEADERS,
+                ).status_code
+                == 422
+            )
+    assert len(remove_admission.submitted) == 1
 
 
 def test_watchlist_post_requires_private_socket_login_csrf_and_bounded_json(tmp_path: Path) -> None:

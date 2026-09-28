@@ -6130,22 +6130,28 @@
             "type": "string"
           },
           "price_levels": {
-            "default": [],
-            "items": {
-              "anyOf": [
-                {
-                  "exclusiveMinimum": 0.0,
-                  "type": "number"
+            "anyOf": [
+              {
+                "items": {
+                  "anyOf": [
+                    {
+                      "exclusiveMinimum": 0.0,
+                      "type": "number"
+                    },
+                    {
+                      "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                      "type": "string"
+                    }
+                  ]
                 },
-                {
-                  "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
-                  "type": "string"
-                }
-              ]
-            },
-            "maxItems": 8,
-            "title": "Price Levels",
-            "type": "array"
+                "maxItems": 8,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Price Levels"
           },
           "requested_at": {
             "format": "date-time",
