@@ -188,7 +188,7 @@ Web 数据审计提交接口已在本地合入：仅登录且同源、带 CSRF �
 
 2026-09-27 的只读检查确认 `/home/lighthouse/rquant/data/runtime/serving/current.json` 不存在，`serving/generations` 为空。Serving 发布器心跳显示它从未成功发布，直接原因是 `paper_accounts` 权威数据缺失；模拟账户服务因执行约束当前指针缺失而持续失败；执行约束发布器等待可见的分钟行情批次。分钟行情源心跳正在运行、无当前错误，但其批次目录为空。运行时从 9 月 25 日启动，正式交易日历将 9 月 25–27 日标为休市，下一交易日为 9 月 28 日；目前没有证据表明分钟行情源在应当采集的时段失败。当前线上版本在休市期间仍无法生成首个 Serving 数据代；本地可选模拟账户来源改动尚未发布，且已安装运行时清单的可选来源设置需要受控核验/更新，单纯发布 Python 代码不会改写旧清单。服务处于运行状态不能作为前端可切流的证据；下一交易日须验证上游数据、正式 Serving 数据代和页面实际使用路径。涉及生产数据、服务配置或切流的动作按项目单独授权规则执行。
 
-2026-09-28 10:07（上海时间）再次只读核对：Serving 当前指针仍不存在，`/home/lighthouse/rquant-web/current` 不存在，`rquant-web.service` 未运行。`rquant-runtime-serving@…` 虽显示运行，其最近日志反复在加载 schema rollout 状态库时触发 `sqlite3.OperationalError: unable to open database file`，调用栈位于 `SchemaRolloutStore._connect()` 的 `PRAGMA journal_mode = WAL`。这是比“等待首个行情批次”更靠前的实际发布阻断；现有证据尚不能判定是部署代码版本、路径权限还是 sandbox 挂载导致，须在获准的发布路径中核实。检查未写生产文件或重启服务。
+2026-09-28 10:07（上海时间）再次只读核对：Serving 当前指针仍不存在，`/home/lighthouse/rquant-web/current` 不存在，`rquant-web.service` 未运行。`rquant-runtime-serving@…` 虽显示运行，其最近日志反复在加载 schema rollout 状态库时触发 `sqlite3.OperationalError: unable to open database file`，调用栈位于 `SchemaRolloutStore._connect()` 的 `PRAGMA journal_mode = WAL`。已只读核对安装在 runtime authority 代中的代码：它逐一以可写方式打开全部历史 rollout 状态库；`origin/main` 已改为先按目标代过滤，再只读打开相关状态库。这是比“等待首个行情批次”更靠前的实际发布阻断。让修复进入已安装 runtime authority 代、验证旧状态兼容及服务启动，须走仓库现有的受控发布与单独授权边界；本次检查未写生产文件或重启服务。
 
 ## 最终能力台账
 
