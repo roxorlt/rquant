@@ -97,6 +97,20 @@ export const manualWatchlistExactUnavailableHandler = () =>
     }),
   );
 
+export const priceRulesUnavailableHandler = () =>
+  http.get("*/api/v1/monitor/rules", () =>
+    HttpResponse.json({
+      data: {
+        availability: "not_ready",
+        available_at: null,
+        evaluation_running: false,
+        items: [],
+        message: "价格规则尚未就绪。",
+      },
+      serving: metaEnvelope().serving,
+    }),
+  );
+
 /** MSW server for component tests; every test starts with ready responses. */
 export const server = setupServer(
   metaHandler(),
@@ -112,4 +126,5 @@ export const server = setupServer(
   formulaPoolsHandler(),
   manualWatchlistUnavailableHandler(),
   manualWatchlistExactUnavailableHandler(),
+  priceRulesUnavailableHandler(),
 );

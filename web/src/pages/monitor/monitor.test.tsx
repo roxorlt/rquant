@@ -193,9 +193,8 @@ describe("盯盘与告警", () => {
     expect(screen.getByText("今天休市，显示历史告警")).toBeInTheDocument();
     expect(screen.getByText("新信号通知")).toBeInTheDocument();
     expect(screen.queryByText("已送达")).not.toBeInTheDocument();
-    expect(
-      screen.queryByRole("button", { name: /确认|新建规则|发测试推送/ }),
-    ).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /确认|发测试推送/ })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "新建规则" })).toBeDisabled();
     expect(findJargon(document.body.textContent ?? "")).toEqual([]);
 
     await user.click(within(timeline).getByRole("button", { name: "查看天威视讯详情" }));
