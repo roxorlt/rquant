@@ -39,6 +39,14 @@ from rquant.canvas_publication_receipt import (
 from rquant.data_audit_contracts import MAX_AUDIT_DAYS
 from rquant.lab_job_protocol import LabCommand
 from rquant.llm.schemas import RuleCall
+from rquant.manual_watchlist import (
+    ManualWatchlistDelete,
+    ManualWatchlistKey,
+    ManualWatchlistRepository,
+    ManualWatchlistUpsert,
+    WatchlistCapacityError,
+    WatchlistVersionConflictError,
+)
 from rquant.runtime_contracts import (
     AwareUtcDatetime,
     RuntimeContractModel,
@@ -58,6 +66,9 @@ DEFAULT_PAGE_CONTROL_SERVICE_ID = "rquant-page-control"
 _CONSUMER_MUTEX_SUFFIX = ".consumer.lock"
 _SAFE_EFFECT_JOURNAL_MARKER = "safe-effect-journal-v2"
 _SAFE_EFFECT_JOURNAL_VERSION = 2
+_MANUAL_WATCHLIST_MARKER = "manual-watchlist/v1"
+_MANUAL_WATCHLIST_VERSION = 1
+_MANUAL_WATCHLIST_KINDS = frozenset({"add_watchlist_item", "remove_watchlist_item"})
 _LOCAL_FILESYSTEM_FENCE_SCHEMA_VERSION = 1
 _CANVAS_HEAD_CONTRACT = "canvas-current-head/v1"
 _CANVAS_HEAD_SOURCE = "canvas_current_head"
@@ -83,6 +94,16 @@ class AckAlert(PageControlCommand):
     generation_id: str = Field(pattern=r"^[0-9a-f]{64}$")
     alert_id: str = Field(pattern=r"^[0-9a-f]{64}$")
     actor_id: str = Field(min_length=1, max_length=256)
+
+
+class AddWatchlistItem(PageControlCommand):
+    kind: Literal["add_watchlist_item"] = "add_watchlist_item"
+    item: ManualWatchlistUpsert
+
+
+class RemoveWatchlistItem(PageControlCommand):
+    kind: Literal["remove_watchlist_item"] = "remove_watchlist_item"
+    item: ManualWatchlistDelete
 
 
 class SaveCanvas(PageControlCommand):
@@ -376,6 +397,8 @@ class FormulaPoolPageControlBackend(Protocol):
 
 PageControlCommandValue = Annotated[
     AckAlert
+    | AddWatchlistItem
+    | RemoveWatchlistItem
     | SaveCanvas
     | CreateCanvas
     | DeleteCanvas
@@ -833,6 +856,8 @@ class PageControlOutbox:
     def enqueue(self, command: PageControlCommandValue) -> PageControlReceipt:
         if isinstance(command, AckAlert):
             raise ValueError("ack_alert requires verified Serving eligibility")
+        if isinstance(command, (AddWatchlistItem, RemoveWatchlistItem)):
+            raise ValueError("watchlist commands require trusted submission")
         return self._enqueue(command)
 
     def enqueue_verified_ack(self, command: AckAlert) -> PageControlReceipt:
@@ -841,12 +866,28 @@ class PageControlOutbox:
             raise ValueError("alert acknowledgment is not activated")
         return self._enqueue(command)
 
-    def _enqueue(self, command: PageControlCommandValue) -> PageControlReceipt:
+    def enqueue_trusted_watchlist(
+        self, command: AddWatchlistItem | RemoveWatchlistItem
+    ) -> PageControlReceipt:
+        if not isinstance(command, (AddWatchlistItem, RemoveWatchlistItem)):
+            raise TypeError("trusted watchlist submission requires a watchlist command")
+        return self._enqueue(command, require_watchlist_activation=True)
+
+    def _enqueue(
+        self, command: PageControlCommandValue, *, require_watchlist_activation: bool = False
+    ) -> PageControlReceipt:
+        if (
+            isinstance(command, (AddWatchlistItem, RemoveWatchlistItem))
+            != require_watchlist_activation
+        ):
+            raise ValueError("watchlist commands require trusted submission")
         payload = command.model_dump_json()
         command_hash = _command_hash(command)
         enqueued_at = command.requested_at.isoformat(timespec="microseconds")
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            if require_watchlist_activation and not self._manual_watchlist_activated(connection):
+                raise ValueError("manual watchlist is not activated")
             existing = connection.execute(
                 "SELECT * FROM page_control_command WHERE command_id = ?",
                 (command.command_id,),
@@ -876,6 +917,57 @@ class PageControlOutbox:
         receipt = self.receipt(command.command_id)
         assert receipt is not None
         return receipt
+
+    @staticmethod
+    def _manual_watchlist_activated(connection: sqlite3.Connection) -> bool:
+        marker = connection.execute(
+            "SELECT protocol_version FROM page_control_protocol_activation WHERE marker_name = ?",
+            (_MANUAL_WATCHLIST_MARKER,),
+        ).fetchone()
+        return marker is not None and marker["protocol_version"] == _MANUAL_WATCHLIST_VERSION
+
+    def activate_manual_watchlist(self, activated_at: datetime) -> datetime:
+        frozen = _normalize_utc(activated_at).isoformat(timespec="microseconds")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT protocol_version, activated_at FROM page_control_protocol_activation "
+                "WHERE marker_name = ?",
+                (_MANUAL_WATCHLIST_MARKER,),
+            ).fetchone()
+            if existing is None:
+                ManualWatchlistRepository(connection).install_schema()
+                connection.execute(
+                    "INSERT INTO page_control_protocol_activation "
+                    "(marker_name, protocol_version, activated_at) VALUES (?, ?, ?)",
+                    (_MANUAL_WATCHLIST_MARKER, _MANUAL_WATCHLIST_VERSION, frozen),
+                )
+            elif (
+                existing["protocol_version"] != _MANUAL_WATCHLIST_VERSION
+                or existing["activated_at"] != frozen
+            ):
+                raise ValueError("manual watchlist was already activated differently")
+            elif (
+                connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'manual_watchlist'"
+                ).fetchone()
+                is None
+            ):
+                raise RuntimeError("manual watchlist activation exists without its state table")
+        return datetime.fromisoformat(frozen)
+
+    def manual_watchlist_activated_at(self) -> datetime | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT protocol_version, activated_at FROM page_control_protocol_activation "
+                "WHERE marker_name = ?",
+                (_MANUAL_WATCHLIST_MARKER,),
+            ).fetchone()
+        if row is None:
+            return None
+        if row["protocol_version"] != _MANUAL_WATCHLIST_VERSION:
+            raise RuntimeError("manual watchlist activation version is unsupported")
+        return datetime.fromisoformat(row["activated_at"])
 
     def activate_alert_ack(self, activated_at: datetime) -> datetime:
         frozen = _normalize_utc(activated_at).isoformat(timespec="microseconds")
@@ -1030,6 +1122,138 @@ class PageControlOutbox:
             assert completed is not None
         return self._receipt(completed)
 
+    def complete_watchlist(self, claim: PageControlClaim, *, now: datetime) -> PageControlReceipt:
+        """Commit a watchlist CAS, effect, and terminal receipt in one transaction."""
+        command = claim.command
+        if not isinstance(command, (AddWatchlistItem, RemoveWatchlistItem)):
+            raise TypeError("complete_watchlist requires a watchlist claim")
+        observed = _normalize_utc(now)
+        completed_at = observed.isoformat(timespec="microseconds")
+        command_hash = _command_hash(command)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM page_control_command WHERE command_id = ?",
+                (command.command_id,),
+            ).fetchone()
+            if (
+                row is None
+                or row["command_kind"] != command.kind
+                or row["command_hash"] != command_hash
+            ):
+                raise ValueError("watchlist command content changed")
+            stored = _COMMAND_ADAPTER.validate_json(row["payload_json"])
+            if stored != command or _command_hash(stored) != command_hash:
+                raise ValueError("stored watchlist command conflicts with its hash")
+            if (
+                row["status"] != PageControlStatus.PROCESSING.value
+                or row["processing_owner"] != claim.owner_id
+                or row["claim_token"] != claim.claim_token
+                or row["lease_expires_at"] is None
+                or row["lease_expires_at"] <= completed_at
+            ):
+                raise RuntimeError("stale or expired watchlist claim cannot complete")
+            if not self._manual_watchlist_activated(connection):
+                raise ValueError("manual watchlist is not activated")
+
+            action: Literal["add", "remove"] = (
+                "add" if isinstance(command, AddWatchlistItem) else "remove"
+            )
+            error: str | None = None
+            status = PageControlStatus.SUCCEEDED
+            if command.requested_at > observed + _MAX_REQUEST_FUTURE_SKEW:
+                status = PageControlStatus.FAILED
+                error = "watchlist command requested_at exceeds allowed future clock skew"
+                result: JsonValue = {
+                    "ts_code": command.item.ts_code,
+                    "action": action,
+                    "code": "future_request",
+                }
+            else:
+                repository = ManualWatchlistRepository(connection)
+                try:
+                    entry = (
+                        repository.upsert(command.item, now=observed)
+                        if isinstance(command, AddWatchlistItem)
+                        else repository.delete(command.item, now=observed)
+                    )
+                except WatchlistVersionConflictError:
+                    status = PageControlStatus.FAILED
+                    error = "watchlist version conflict"
+                    result = {
+                        "ts_code": command.item.ts_code,
+                        "action": action,
+                        "code": "version_conflict",
+                    }
+                except WatchlistCapacityError:
+                    status = PageControlStatus.FAILED
+                    error = "watchlist capacity exceeded"
+                    result = {
+                        "ts_code": command.item.ts_code,
+                        "action": action,
+                        "code": "capacity_exceeded",
+                    }
+                else:
+                    result = {
+                        "ts_code": entry.ts_code,
+                        "action": action,
+                        "version": entry.version,
+                        "state": entry.status,
+                    }
+            result_json = json.dumps(result, ensure_ascii=True)
+            connection.execute(
+                """
+                INSERT INTO page_control_effect(
+                    command_id, command_hash, effect_kind, status,
+                    owner_id, claim_token, started_at, completed_at, result_json, error
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    command.command_id,
+                    command_hash,
+                    command.kind,
+                    (
+                        PageControlEffectStatus.SUCCEEDED.value
+                        if status is PageControlStatus.SUCCEEDED
+                        else PageControlEffectStatus.FAILED.value
+                    ),
+                    claim.owner_id,
+                    claim.claim_token,
+                    completed_at,
+                    completed_at,
+                    result_json,
+                    error,
+                ),
+            )
+            changed = connection.execute(
+                """
+                UPDATE page_control_command
+                SET status = ?, completed_at = ?, result_json = ?, error = ?,
+                    processing_owner = NULL, lease_expires_at = NULL, claim_token = NULL
+                WHERE command_id = ? AND status = ? AND processing_owner = ?
+                  AND claim_token = ? AND lease_expires_at > ?
+                """,
+                (
+                    status.value,
+                    completed_at,
+                    result_json,
+                    error,
+                    command.command_id,
+                    PageControlStatus.PROCESSING.value,
+                    claim.owner_id,
+                    claim.claim_token,
+                    completed_at,
+                ),
+            ).rowcount
+            if changed != 1:
+                raise RuntimeError("watchlist claim changed during completion")
+            completed = connection.execute(
+                "SELECT * FROM page_control_command WHERE command_id = ?",
+                (command.command_id,),
+            ).fetchone()
+            assert completed is not None
+        return self._receipt(completed)
+
     @staticmethod
     def _acknowledgment(row: sqlite3.Row) -> AlertAcknowledgment:
         return AlertAcknowledgment(
@@ -1160,6 +1384,12 @@ class PageControlOutbox:
             owner_predicate = " AND processing_owner = ? AND claim_token = ?"
             owner_values = (owner_id, claim_token)
         with self._connect() as connection:
+            kind = connection.execute(
+                "SELECT command_kind FROM page_control_command WHERE command_id = ?",
+                (command_id,),
+            ).fetchone()
+            if kind is not None and kind["command_kind"] in _MANUAL_WATCHLIST_KINDS:
+                raise ValueError("watchlist command requires atomic completion")
             changed = connection.execute(
                 f"""
                 UPDATE page_control_command
@@ -1241,6 +1471,8 @@ class PageControlOutbox:
         claim_token: str,
         now: datetime | None = None,
     ) -> tuple[PageControlEffectRecord, bool]:
+        if isinstance(command, (AddWatchlistItem, RemoveWatchlistItem)):
+            raise ValueError("watchlist command requires atomic completion")
         command_hash = _command_hash(command)
         observed_at = _normalize_utc(now or datetime.now(UTC)).isoformat(timespec="microseconds")
         with self._connect() as connection:
@@ -1535,6 +1767,9 @@ class PageControlConsumer:
             lease_seconds=self.lease_seconds,
             now=self.clock(),
         ):
+            if isinstance(claim.command, (AddWatchlistItem, RemoveWatchlistItem)):
+                receipts.append(self.outbox.complete_watchlist(claim, now=self.clock()))
+                continue
             if isinstance(claim.command, AckAlert):
                 try:
                     self._assert_command_time(claim.command)
@@ -3256,6 +3491,8 @@ class PageControlService:
         self.consumer = consumer
 
     def submit(self, command: PageControlCommandValue) -> PageControlReceipt:
+        if isinstance(command, (AddWatchlistItem, RemoveWatchlistItem)):
+            raise ValueError("watchlist commands require trusted submission")
         if isinstance(command, AckAlert):
             receipt = self.lookup_ack_command(command)
             if receipt is None:
@@ -3267,6 +3504,23 @@ class PageControlService:
     def _submit_verified_ack(self, command: AckAlert) -> PageControlReceipt:
         """Called only after the local Serving admission checks succeed."""
         return self._settle(command, self.outbox.enqueue_verified_ack(command))
+
+    def _submit_trusted_watchlist(
+        self,
+        command: AddWatchlistItem | RemoveWatchlistItem,
+        *,
+        authenticated_owner_id: str,
+    ) -> PageControlReceipt:
+        """Internal entry point; a future protected boundary supplies the authenticated owner."""
+        if not isinstance(command, (AddWatchlistItem, RemoveWatchlistItem)):
+            raise TypeError("trusted watchlist submission requires a watchlist command")
+        identity = ManualWatchlistKey(
+            owner_id=authenticated_owner_id,
+            ts_code=command.item.ts_code,
+        )
+        if identity.owner_id != command.item.owner_id:
+            raise ValueError("authenticated owner does not match watchlist command owner")
+        return self._settle(command, self.outbox.enqueue_trusted_watchlist(command))
 
     def _settle(
         self, command: PageControlCommandValue, receipt: PageControlReceipt
@@ -3316,6 +3570,8 @@ class PageControlClient:
         self.timeout_seconds = timeout_seconds
 
     def submit(self, command: PageControlCommandValue) -> PageControlReceipt:
+        if isinstance(command, (AddWatchlistItem, RemoveWatchlistItem)):
+            raise ValueError("watchlist commands require trusted submission")
         try:
             response = self.transport(command.model_dump(mode="json"))
         except (OSError, TimeoutError, urllib.error.URLError) as exc:
@@ -3936,6 +4192,7 @@ def parse_page_control_command(payload: object) -> PageControlCommandValue:
 
 __all__ = [
     "AckAlert",
+    "AddWatchlistItem",
     "AddPoolToCanvas",
     "AlertAcknowledgment",
     "AppendNlQueryLog",
@@ -3963,6 +4220,7 @@ __all__ = [
     "PageControlStatus",
     "PageControlUnavailableError",
     "parse_page_control_command",
+    "RemoveWatchlistItem",
     "SaveCanvas",
     "SaveFormulaPoolV1",
     "SaveNlPreset",
