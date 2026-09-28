@@ -151,6 +151,8 @@ test("公式全市场运行从确认到历史结果，桌面与手机均可恢�
   await expect(drawer.getByRole("region", { name: "市场结果" })).toContainText("51");
   await expect(drawer.getByText("行情字段缺失")).toBeVisible();
   await expect(drawer.getByRole("button", { name: /600001.SH/ })).toBeVisible();
+  await expect(drawer.getByRole("region", { name: "保存公式池" })).toHaveCount(1);
+  await expect(drawer.getByRole("textbox", { name: "池子名称" })).toBeVisible();
   await expectNoHorizontalOverflow(page, "formula market desktop");
   await page.screenshot({
     path: "/private/tmp/rquant-formula-market-react-desktop.png",
@@ -204,7 +206,43 @@ test("公式全市场运行从确认到历史结果，桌面与手机均可恢�
     .getByRole("button", { name: "刷新" })
     .click();
   await expect(drawer.getByRole("region", { name: "市场结果" })).toContainText("51");
+  await expect(drawer.getByRole("region", { name: "保存公式池" })).toHaveCount(1);
   expect(findJargon(await drawer.innerText())).toEqual([]);
+  await drawer.getByRole("region", { name: "保存公式池" }).scrollIntoViewIfNeeded();
+  await page.screenshot({ path: "/private/tmp/rquant-formula-save-recovery-phone.png" });
+  const saves: Schemas["FormulaPoolSaveCommandRequest"][] = [];
+  await page.route("**/api/v1/pools/formula/commands", async (route) => {
+    const request = route.request().postDataJSON() as Schemas["FormulaPoolSaveCommandRequest"];
+    saves.push(request);
+    await route.fulfill({
+      json: {
+        command_id: request.command_id,
+        status: "pending",
+        message: "保存状态待确认，请继续核对。",
+      } satisfies Schemas["FormulaPoolSaveCommandReceipt"],
+    });
+  });
+  const poolName = drawer.getByRole("textbox", { name: "池子名称" });
+  await poolName.focus();
+  await page.keyboard.type("趋势池");
+  await drawer.getByRole("button", { name: "保存为池子" }).focus();
+  await page.keyboard.press("Enter");
+  await expect(drawer.getByText("保存状态待确认")).toBeVisible();
+  await expect(drawer.getByRole("region", { name: "保存公式池" })).toHaveCount(1);
+  expect(saves).toHaveLength(1);
+  await drawer.getByRole("button", { name: "关闭" }).click();
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.getByRole("button", { name: "导入公式" }).click();
+  drawer = page.getByRole("dialog", { name: "公式预览" });
+  await expect(drawer.getByText("保存状态待确认")).toBeVisible();
+  await drawer.getByRole("button", { name: "继续核对" }).focus();
+  await page.keyboard.press("Enter");
+  await expect.poll(() => saves.length).toBe(2);
+  expect(saves[1]).toEqual(saves[0]);
+  await expect(drawer.getByRole("region", { name: "保存公式池" })).toHaveCount(1);
+  await expectNoHorizontalOverflow(page, "formula pool recovery desktop");
+  await drawer.getByRole("region", { name: "保存公式池" }).scrollIntoViewIfNeeded();
+  await page.screenshot({ path: "/private/tmp/rquant-formula-save-recovery-desktop.png" });
   expect(
     watcher.problems.filter(
       (problem) =>

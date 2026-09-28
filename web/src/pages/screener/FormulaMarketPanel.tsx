@@ -107,9 +107,6 @@ export function FormulaMarketPanel({ formula, checked }: { formula: string; chec
   const jobList =
     generation === undefined || jobs.serving?.generation_id === generation ? jobs.data : undefined;
   const selectedListJob = jobList?.jobs.find((job) => job.task_id === selectedId);
-  const savedPoolTaskId = readFormulaPoolSaveTaskId(viewer);
-  const showSaveRecovery =
-    savedPoolTaskId !== null && !jobList?.jobs.some((job) => job.task_id === savedPoolTaskId);
   const unreadableTaskId =
     selectedListJob?.status === "succeeded" && !selectedListJob.result_available
       ? selectedListJob.task_id
@@ -359,10 +356,6 @@ export function FormulaMarketPanel({ formula, checked }: { formula: string; chec
         </>
       )}
 
-      {showSaveRecovery && savedPoolTaskId !== null ? (
-        <FormulaPoolSave taskId={savedPoolTaskId} onSelectTask={selectJob} recoveryOnly />
-      ) : null}
-
       {selectedListJob !== undefined ? (
         <section className="formula-market-detail" aria-label="运行详情">
           <div className="formula-market-recent-heading">
@@ -533,21 +526,26 @@ export function FormulaMarketPanel({ formula, checked }: { formula: string; chec
                   )}
                 </>
               )}
-              {job.status === "succeeded" && job.result_available && currentDetail?.summary ? (
-                <FormulaPoolSave
-                  taskId={job.task_id}
-                  formula={job.formula}
-                  tradeDate={job.trade_date}
-                  matchCount={currentDetail.summary.match_count}
-                  unknownCount={currentDetail.summary.unknown_count}
-                  resultReady={resultReady === true}
-                  onSelectTask={selectJob}
-                />
-              ) : null}
             </>
           )}
         </section>
       ) : null}
+      <FormulaPoolSave
+        candidate={
+          job?.status === "succeeded" &&
+          job.result_available &&
+          currentDetail?.summary &&
+          resultReady === true
+            ? {
+                taskId: job.task_id,
+                formula: job.formula,
+                tradeDate: job.trade_date,
+                matchCount: currentDetail.summary.match_count,
+                unknownCount: currentDetail.summary.unknown_count,
+              }
+            : null
+        }
+      />
       <ConfirmDialog
         open={confirmDraft !== null}
         level="heavy"

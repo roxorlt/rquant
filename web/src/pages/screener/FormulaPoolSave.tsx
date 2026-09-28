@@ -84,24 +84,15 @@ export function readFormulaPoolSaveTaskId(viewer: string | null): string | null 
   return viewer !== null && journal?.viewer === viewer ? journal.request.task_id : null;
 }
 
-type FormulaPoolSaveProps = {
+type SaveCandidate = {
   taskId: string;
-  onSelectTask: (taskId: string) => void;
-} & (
-  | { recoveryOnly: true }
-  | {
-      recoveryOnly?: false;
-      formula: string;
-      tradeDate: string;
-      matchCount: number;
-      unknownCount: number;
-      resultReady: boolean;
-    }
-);
+  formula: string;
+  tradeDate: string;
+  matchCount: number;
+  unknownCount: number;
+};
 
-export function FormulaPoolSave(props: FormulaPoolSaveProps) {
-  const { taskId, onSelectTask } = props;
-  const resultReady = !props.recoveryOnly && props.resultReady;
+export function FormulaPoolSave({ candidate }: { candidate: SaveCandidate | null }) {
   const meta = useCurrentMeta();
   const generation = useCurrentGeneration();
   const viewer = meta.data?.data.viewer ?? null;
@@ -110,15 +101,9 @@ export function FormulaPoolSave(props: FormulaPoolSaveProps) {
   const [journal, setJournal] = useState<Journal | null>(readJournal);
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
-  const active =
-    viewer !== null &&
-    journal?.viewer === viewer &&
-    (journal.status === "pending" || journal.request.task_id === taskId)
-      ? journal
-      : null;
+  const active = viewer !== null && journal?.viewer === viewer ? journal : null;
   const pending = active?.status === "pending";
   const saved = active?.status === "succeeded";
-  const sameTask = active?.request.task_id === taskId;
   const validName =
     name.trim().length >= 1 && name.trim().length <= 80 && SAFE_NAME.test(name.trim());
   const visible =
@@ -163,11 +148,9 @@ export function FormulaPoolSave(props: FormulaPoolSaveProps) {
           version: receipt.version,
         });
         pools.refetch();
-      } else if (["pending", "processing", "ambiguous"].includes(receipt.status)) {
-        setNotice("保存状态待确认，请继续核对。");
       } else if (receipt.status === "succeeded") {
         setNotice("保存回执暂不完整，请用原请求核对。");
-      } else {
+      } else if (!["pending", "processing", "ambiguous"].includes(receipt.status)) {
         remember(null);
         setName(value.request.display_name);
         setNotice(
@@ -184,8 +167,6 @@ export function FormulaPoolSave(props: FormulaPoolSaveProps) {
         remember(null);
         setName(value.request.display_name);
         setNotice(caught.status === 409 ? "这个名称已被使用，请换一个名称。" : caught.message);
-      } else {
-        setNotice("保存状态待确认，请继续核对。");
       }
     } finally {
       setBusy(false);
@@ -193,14 +174,14 @@ export function FormulaPoolSave(props: FormulaPoolSaveProps) {
   }
 
   function save(): void {
-    if (!resultReady || !viewer || !validName || active || busy) return;
+    if (candidate === null || !viewer || !validName || active || busy) return;
     const trimmed = name.trim();
     void submit({
       viewer,
       request: {
         base_name: trimmed,
         display_name: trimmed,
-        task_id: taskId,
+        task_id: candidate.taskId,
         expected_version: null,
         command_id: crypto.randomUUID(),
         requested_at: new Date().toISOString(),
@@ -211,14 +192,14 @@ export function FormulaPoolSave(props: FormulaPoolSaveProps) {
     });
   }
 
-  if (props.recoveryOnly && active === null && notice === null) return null;
+  if (active === null && candidate === null) return null;
 
   return (
     <section className="formula-pool-save" aria-label="保存公式池">
       <div className="formula-market-recent-heading">
         <h4>保存为池子</h4>
-        {!props.recoveryOnly ? (
-          <span className="formula-pool-save-date num">{props.tradeDate}</span>
+        {active === null && candidate !== null ? (
+          <span className="formula-pool-save-date num">{candidate.tradeDate}</span>
         ) : null}
       </div>
       {active ? (
@@ -234,15 +215,8 @@ export function FormulaPoolSave(props: FormulaPoolSaveProps) {
           </strong>
           <span>{active.request.display_name}</span>
           {pending ? (
-            <Button
-              size="sm"
-              disabled={busy}
-              onClick={() => {
-                if (sameTask) void submit(active);
-                else onSelectTask(active.request.task_id);
-              }}
-            >
-              {busy ? "正在核对…" : sameTask ? "继续核对" : "查看待确认任务"}
+            <Button size="sm" disabled={busy} onClick={() => void submit(active)}>
+              {busy ? "正在核对…" : "继续核对"}
             </Button>
           ) : !visible ? (
             <Button size="sm" onClick={() => pools.refetch()} disabled={pools.isFetching}>
@@ -256,19 +230,20 @@ export function FormulaPoolSave(props: FormulaPoolSaveProps) {
               onClick={() => {
                 remember(null);
                 setName("");
+                setNotice(null);
               }}
             >
               保存另一个
             </Button>
           ) : null}
         </div>
-      ) : !props.recoveryOnly ? (
+      ) : candidate !== null ? (
         <>
           <div className="formula-pool-save-proof">
-            <code className="mono">{props.formula}</code>
+            <code className="mono">{candidate.formula}</code>
             <span>
-              命中 <b className="num">{formatCount(props.matchCount)}</b> · 未能判断{" "}
-              <b className="num">{formatCount(props.unknownCount)}</b>
+              命中 <b className="num">{formatCount(candidate.matchCount)}</b> · 未能判断{" "}
+              <b className="num">{formatCount(candidate.unknownCount)}</b>
             </span>
           </div>
           <div className="formula-pool-save-compose">
@@ -287,11 +262,9 @@ export function FormulaPoolSave(props: FormulaPoolSaveProps) {
               disabledReason={
                 !viewer
                   ? "请先登录"
-                  : !resultReady
-                    ? "结果暂不可用"
-                    : !validName
-                      ? "请输入 1–80 个汉字、字母、数字、横线或下划线"
-                      : undefined
+                  : !validName
+                    ? "请输入 1–80 个汉字、字母、数字、横线或下划线"
+                    : undefined
               }
               onClick={save}
             >

@@ -504,4 +504,147 @@ describe("全市场公式选股", () => {
     expect(within(restored).queryByRole("region", { name: "保存公式池" })).toBeNull();
     expect(findJargon(restored.textContent ?? "")).toEqual([]);
   });
+
+  it("待确认的池子任务仍在列表但结果不可读时，可用原命令继续核对", async () => {
+    setupSource();
+    const request: Schemas["FormulaPoolSaveCommandRequest"] = {
+      base_name: "趋势池",
+      display_name: "趋势池",
+      task_id: taskId,
+      expected_version: null,
+      command_id: "c".repeat(32),
+      requested_at: "2026-09-24T07:34:00Z",
+    };
+    window.localStorage.setItem(
+      "rquant-formula-pool-save-v1",
+      JSON.stringify({
+        viewer: "tester",
+        request,
+        status: "pending",
+        poolName: null,
+        version: null,
+      }),
+    );
+    const submitted: Schemas["FormulaPoolSaveCommandRequest"][] = [];
+    server.use(
+      http.get("*/api/v1/screen/tdx/market/jobs", () =>
+        HttpResponse.json({
+          data: {
+            availability: "ready",
+            available_at: "2026-09-24T07:32:00Z",
+            has_older_tasks: false,
+            jobs: [{ ...job, result_available: false }],
+            message: "",
+            total_task_count: 1,
+          },
+          serving,
+        }),
+      ),
+      http.post("*/api/v1/pools/formula/commands", async ({ request: received }) => {
+        submitted.push((await received.json()) as Schemas["FormulaPoolSaveCommandRequest"]);
+        return HttpResponse.json({ detail: "请使用原请求重试。" }, { status: 503 });
+      }),
+    );
+    const user = userEvent.setup();
+    renderPreview(true);
+    const drawer = await screen.findByRole("dialog", { name: "公式预览" });
+    expect(await within(drawer).findByText("结果暂时无法读取")).toBeVisible();
+    expect(within(drawer).getAllByRole("region", { name: "保存公式池" })).toHaveLength(1);
+    await user.click(within(drawer).getByRole("button", { name: "继续核对" }));
+    await waitFor(() => {
+      expect(submitted).toEqual([request]);
+      expect(within(drawer).getByRole("button", { name: "继续核对" })).toBeEnabled();
+    });
+    expect(within(drawer).getAllByRole("region", { name: "保存公式池" })).toHaveLength(1);
+    expect(within(drawer).queryByText("保存状态待确认，请继续核对。")).toBeNull();
+  });
+
+  it("选看另一个任务时待确认保存只出现一次，结束后立即显示所选任务表单", async () => {
+    setupSource();
+    const otherTaskId = "b".repeat(32);
+    const otherJob: Schemas["FormulaMarketJobItem"] = {
+      ...job,
+      task_id: otherTaskId,
+      formula: "OPEN>0",
+    };
+    const request: Schemas["FormulaPoolSaveCommandRequest"] = {
+      base_name: "趋势池",
+      display_name: "趋势池",
+      task_id: taskId,
+      expected_version: null,
+      command_id: "c".repeat(32),
+      requested_at: "2026-09-24T07:34:00Z",
+    };
+    window.localStorage.setItem(
+      "rquant-formula-pool-save-v1",
+      JSON.stringify({
+        viewer: "tester",
+        request,
+        status: "pending",
+        poolName: null,
+        version: null,
+      }),
+    );
+    const submitted: Schemas["FormulaPoolSaveCommandRequest"][] = [];
+    server.use(
+      http.get("*/api/v1/screen/tdx/market/jobs", () =>
+        HttpResponse.json({
+          data: {
+            availability: "ready",
+            available_at: "2026-09-24T07:32:00Z",
+            has_older_tasks: true,
+            jobs: [otherJob],
+            message: "",
+            total_task_count: 2,
+          },
+          serving,
+        }),
+      ),
+      http.get(`*/api/v1/screen/tdx/market/jobs/${otherTaskId}`, () =>
+        HttpResponse.json({ data: { job: otherJob, summary }, serving }),
+      ),
+      http.get(`*/api/v1/screen/tdx/market/jobs/${otherTaskId}/matches`, () =>
+        HttpResponse.json({
+          data: {
+            task_id: otherTaskId,
+            total: 51,
+            offset: 0,
+            match_codes: ["600001.SH"],
+            next_cursor: null,
+          },
+          serving,
+        }),
+      ),
+      http.get("*/api/v1/pools/formula", () =>
+        HttpResponse.json({
+          data: { availability: "empty", available_at: null, message: "", pools: [] },
+          serving,
+        }),
+      ),
+      http.post("*/api/v1/pools/formula/commands", async ({ request: received }) => {
+        submitted.push((await received.json()) as Schemas["FormulaPoolSaveCommandRequest"]);
+        return HttpResponse.json({
+          command_id: request.command_id,
+          status: "succeeded",
+          pool_name: "user/趋势池",
+          version: "f".repeat(64),
+          message: "已保存",
+        });
+      }),
+    );
+    const user = userEvent.setup();
+    renderPreview(true);
+    const drawer = await screen.findByRole("dialog", { name: "公式预览" });
+    await user.click(await within(drawer).findByRole("button", { name: /OPEN>0/ }));
+    expect(await within(drawer).findByRole("region", { name: "市场结果" })).toBeVisible();
+    expect(within(drawer).getAllByRole("region", { name: "保存公式池" })).toHaveLength(1);
+    expect(within(drawer).getByText("保存状态待确认")).toBeVisible();
+    expect(within(drawer).queryByRole("textbox", { name: "池子名称" })).toBeNull();
+    await user.click(within(drawer).getByRole("button", { name: "继续核对" }));
+    await waitFor(() => expect(submitted).toEqual([request]));
+    await user.click(await within(drawer).findByRole("button", { name: "保存另一个" }));
+    expect(within(drawer).getAllByRole("region", { name: "保存公式池" })).toHaveLength(1);
+    expect(within(drawer).getByRole("textbox", { name: "池子名称" })).toBeVisible();
+    expect(within(drawer).queryByText("保存状态待确认")).toBeNull();
+  });
 });
