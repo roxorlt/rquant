@@ -10,6 +10,7 @@ import re
 import sqlite3
 import stat
 import uuid
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -30,6 +31,7 @@ from rquant.screen.tdx.evaluate import (
 MAX_MANIFEST_BYTES = 16 * 1024
 MAX_SQLITE_STEPS = 1_000_000
 MAX_CATALOG_STOCKS = MAX_STOCKS
+_MARKET_LISTING_BATCH_SIZE = 400
 _FILE_NAME = re.compile(r"[0-9a-f]{32}\.sqlite\Z")
 _SZ_A_PREFIXES = ("000", "001", "002", "003", "300", "301")
 _SH_A_PREFIXES = ("600", "601", "603", "605", "688", "689")
@@ -294,6 +296,98 @@ class VerifiedFormulaHistoryProjection:
             )
         except sqlite3.Error as error:
             raise FormulaProjectionUnavailableError("history catalog query failed") from error
+        finally:
+            connection.close()
+            os.close(descriptor)
+
+    def listing_snapshot_for_codes(
+        self,
+        trade_date: date,
+        codes: tuple[str, ...],
+        *,
+        expected_identity: str,
+        check_deadline: Callable[[], None],
+    ) -> FormulaCatalogSnapshot:
+        """Read only the captured market's listings from one pinned history generation."""
+        if type(trade_date) is not date:
+            raise FormulaProjectionDateError("date is invalid")
+        if len(codes) > MAX_STOCKS:
+            raise FormulaProjectionBudgetError("market listing lookup exceeds the allowed range")
+        if len(codes) != len(set(codes)) or any(
+            not isinstance(code, str) or _A_SHARE_CODE.fullmatch(code) is None
+            for code in codes
+        ):
+            raise FormulaProjectionUnavailableError("market listing request is invalid")
+        connection, descriptor, generation = self._open()
+        try:
+            if generation.identity != expected_identity:
+                raise FormulaProjectionChangedError("history changed")
+            calendar_day = connection.execute(
+                "SELECT is_open FROM calendar WHERE exchange='SSE' AND cal_date=?",
+                (trade_date.isoformat(),),
+            ).fetchone()
+            if calendar_day is None or calendar_day[0] != 1:
+                raise FormulaProjectionDateError("date is not an open SSE day")
+            steps = 0
+
+            def count_steps() -> int:
+                nonlocal steps
+                steps += 1000
+                return int(steps > MAX_SQLITE_STEPS)
+
+            entries: list[FormulaCatalogEntry] = []
+            seen: set[str] = set()
+            connection.set_progress_handler(count_steps, 1000)
+            try:
+                for start in range(0, len(codes), _MARKET_LISTING_BATCH_SIZE):
+                    check_deadline()
+                    batch = codes[start : start + _MARKET_LISTING_BATCH_SIZE]
+                    requested = set(batch)
+                    placeholders = ",".join("?" for _ in batch)
+                    rows = connection.execute(
+                        "SELECT ts_code,list_date FROM listing WHERE ts_code IN ("
+                        + placeholders + ") ORDER BY ts_code LIMIT ?",
+                        (*batch, len(batch) + 1),
+                    ).fetchall()
+                    for code, raw_listing in rows:
+                        if (
+                            not isinstance(code, str)
+                            or code not in requested
+                            or _A_SHARE_CODE.fullmatch(code) is None
+                            or code in seen
+                        ):
+                            raise FormulaProjectionUnavailableError(
+                                "market listing record is invalid or repeated"
+                            )
+                        seen.add(code)
+                        listing = None
+                        if raw_listing is not None:
+                            if not isinstance(raw_listing, str):
+                                raise FormulaProjectionUnavailableError(
+                                    "history listing date is invalid"
+                                )
+                            try:
+                                listing = date.fromisoformat(raw_listing)
+                            except ValueError as error:
+                                raise FormulaProjectionUnavailableError(
+                                    "history listing date is invalid"
+                                ) from error
+                            if listing.isoformat() != raw_listing:
+                                raise FormulaProjectionUnavailableError(
+                                    "history listing date is invalid"
+                                )
+                        entries.append(FormulaCatalogEntry(code, listing))
+                check_deadline()
+            finally:
+                connection.set_progress_handler(None, 0)
+            self._finish(descriptor, generation)
+            return FormulaCatalogSnapshot(
+                identity=generation.identity,
+                updated_at=generation.manifest.source_updated_at,
+                entries=tuple(entries),
+            )
+        except sqlite3.Error as error:
+            raise FormulaProjectionUnavailableError("market listing query failed") from error
         finally:
             connection.close()
             os.close(descriptor)
