@@ -22,13 +22,35 @@ from rquant.screen.replica_source import VerifiedReplicaScreenSource
 from rquant.screen.tdx.evaluate import (
     MAX_BARS_PER_STOCK,
     MAX_HISTORY_SPAN_DAYS,
+    MAX_STOCKS,
     HistoricalBar,
     StockHistory,
 )
 
 MAX_MANIFEST_BYTES = 16 * 1024
 MAX_SQLITE_STEPS = 1_000_000
+MAX_CATALOG_STOCKS = MAX_STOCKS
 _FILE_NAME = re.compile(r"[0-9a-f]{32}\.sqlite\Z")
+_SZ_A_PREFIXES = ("000", "001", "002", "003", "300", "301")
+_SH_A_PREFIXES = ("600", "601", "603", "605", "688", "689")
+_BJ_A_PREFIXES = ("4", "8", "9")
+_A_SHARE_CODE = re.compile(
+    r"(?:"
+    rf"(?:{'|'.join(_SZ_A_PREFIXES)})[0-9]{{3}}\.SZ|"
+    rf"(?:{'|'.join(_SH_A_PREFIXES)})[0-9]{{3}}\.SH|"
+    rf"(?:{'|'.join(_BJ_A_PREFIXES)})[0-9]{{5}}\.BJ"
+    r")\Z"
+)
+_A_SHARE_LISTING_SQL = (
+    "SELECT ts_code,list_date FROM listing WHERE "
+    "(substr(ts_code,1,3) IN (" + ",".join("?" for _ in _SZ_A_PREFIXES)
+    + ") AND ts_code LIKE '%.SZ') OR "
+    "(substr(ts_code,1,3) IN (" + ",".join("?" for _ in _SH_A_PREFIXES)
+    + ") AND ts_code LIKE '%.SH') OR "
+    "(substr(ts_code,1,1) IN (" + ",".join("?" for _ in _BJ_A_PREFIXES)
+    + ") AND ts_code LIKE '%.BJ') "
+    "ORDER BY ts_code LIMIT ?"
+)
 _BARS_SQL = (
     "SELECT trade_date, open, high, low, close, vol, amount "
     "FROM bars INDEXED BY sqlite_autoindex_bars_1 "
@@ -85,6 +107,19 @@ class FormulaHistorySnapshot:
     ] | None
     identity: str
     updated_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class FormulaCatalogEntry:
+    stock_code: str
+    list_date: date | None
+
+
+@dataclass(frozen=True, slots=True)
+class FormulaCatalogSnapshot:
+    identity: str
+    updated_at: datetime
+    entries: tuple[FormulaCatalogEntry, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -198,6 +233,70 @@ class VerifiedFormulaHistoryProjection:
     def _finish(self, descriptor: int, before: _PinnedGeneration) -> None:
         if _identity(os.fstat(descriptor)) != before.file_stat or self._verify() != before:
             raise FormulaProjectionChangedError("history changed during request")
+
+    def catalog_snapshot(
+        self, trade_date: date, *, expected_identity: str,
+    ) -> FormulaCatalogSnapshot:
+        if type(trade_date) is not date:
+            raise FormulaProjectionDateError("date is invalid")
+        connection, descriptor, generation = self._open()
+        try:
+            if generation.identity != expected_identity:
+                raise FormulaProjectionChangedError("history changed")
+            calendar_day = connection.execute(
+                "SELECT is_open FROM calendar WHERE exchange='SSE' AND cal_date=?",
+                (trade_date.isoformat(),),
+            ).fetchone()
+            if calendar_day is None or calendar_day[0] != 1:
+                raise FormulaProjectionDateError("date is not an open SSE day")
+            steps = 0
+
+            def count_steps() -> int:
+                nonlocal steps
+                steps += 1000
+                return int(steps > MAX_SQLITE_STEPS)
+
+            connection.set_progress_handler(count_steps, 1000)
+            try:
+                rows = connection.execute(
+                    _A_SHARE_LISTING_SQL,
+                    (*_SZ_A_PREFIXES, *_SH_A_PREFIXES, *_BJ_A_PREFIXES,
+                     MAX_CATALOG_STOCKS + 1),
+                ).fetchall()
+            finally:
+                connection.set_progress_handler(None, 0)
+            if len(rows) > MAX_CATALOG_STOCKS:
+                raise FormulaProjectionBudgetError("history catalog exceeds the allowed range")
+            entries: list[FormulaCatalogEntry] = []
+            seen: set[str] = set()
+            for code, raw_listing in rows:
+                if not isinstance(code, str) or not _A_SHARE_CODE.fullmatch(code) or code in seen:
+                    raise FormulaProjectionUnavailableError("history catalog code is invalid")
+                seen.add(code)
+                listing = None
+                if raw_listing is not None:
+                    if not isinstance(raw_listing, str):
+                        raise FormulaProjectionUnavailableError("history listing date is invalid")
+                    try:
+                        listing = date.fromisoformat(raw_listing)
+                    except ValueError as error:
+                        raise FormulaProjectionUnavailableError(
+                            "history listing date is invalid"
+                        ) from error
+                    if listing.isoformat() != raw_listing:
+                        raise FormulaProjectionUnavailableError("history listing date is invalid")
+                entries.append(FormulaCatalogEntry(code, listing))
+            self._finish(descriptor, generation)
+            return FormulaCatalogSnapshot(
+                identity=generation.identity,
+                updated_at=generation.manifest.source_updated_at,
+                entries=tuple(entries),
+            )
+        except sqlite3.Error as error:
+            raise FormulaProjectionUnavailableError("history catalog query failed") from error
+        finally:
+            connection.close()
+            os.close(descriptor)
 
     def formula_history(
         self, trade_date: date, stock_code: str, *, expected_identity: str,
