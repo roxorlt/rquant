@@ -129,7 +129,9 @@ function ServiceLogContent({
     setEntries([]);
     setNextCursor(null);
     setCursor(null);
+    setLoading(true);
     setError(null);
+    setHalted(false);
     setFilter((current) => ({ ...current, range: value, since: sinceFor(value) }));
   }
 
@@ -137,7 +139,9 @@ function ServiceLogContent({
     setEntries([]);
     setNextCursor(null);
     setCursor(null);
+    setLoading(true);
     setError(null);
+    setHalted(false);
     setFilter((current) => ({ ...current, level: value, since: sinceFor(current.range) }));
   }
 
