@@ -190,12 +190,14 @@ def test_list_distinguishes_unavailable_old_empty_unrun_and_success(tmp_path: Pa
         no_members = client.get(f"{PATH}/research/members", headers=HEADERS)
     assert unrun.json()["data"]["pools"][0]["latest_result"] is None
     assert unrun.json()["data"]["pools"][0]["status_label"] == "尚未运行"
+    assert unrun.json()["data"]["pools"][0]["version"] == VERSION
     assert no_members.status_code == 409
     _publish(serving, sequence=3)
     with _client(serving) as client:
         ready = client.get(PATH, headers=HEADERS)
     assert ready.status_code == 200
     row = ready.json()["data"]["pools"][0]
+    assert row["version"] == VERSION
     assert row["latest_result"]["trade_date"] == DAY.isoformat()
     assert row["latest_result"]["unknown_reasons"] == [
         {"reason": "missing_date", "label": "缺少当日行情", "count": 1}
@@ -377,13 +379,31 @@ def test_unavailable_status_with_only_one_zero_row_physical_table_is_incomplete(
         tracker.close()
 
 
-def test_chinese_pool_name_matches_save_contract_and_members_read(tmp_path: Path) -> None:
+def test_long_chinese_pool_name_members_cursor_can_be_reused(tmp_path: Path) -> None:
     serving, root = tmp_path / "serving", tmp_path / "daily"
-    daily = _daily(base_name="研究池")
-    _publish(serving, sequence=0, daily=daily, base_name="研究池")
+    base_name = "研" * 80
+    daily = _daily(base_name=base_name)
+    _publish(serving, sequence=0, daily=daily, base_name=base_name)
     _file(root, daily)
     with _client(serving, root) as client:
-        response = client.get(f"{PATH}/研究池/members", headers=HEADERS)
-    assert response.status_code == 200
-    assert response.json()["data"]["pool_name"] == "user/研究池"
-    assert response.json()["data"]["match_codes"] == list(CODES)
+        first = client.get(f"{PATH}/{base_name}/members", params={"page_size": 1}, headers=HEADERS)
+        assert first.status_code == 200
+        cursor = first.json()["data"]["next_cursor"]
+        assert len(cursor) > 512
+        assert len(cursor) <= 2048
+        second = client.get(
+            f"{PATH}/{base_name}/members",
+            params={"page_size": 1, "cursor": cursor},
+            headers=HEADERS,
+        )
+        invalid = ("A" if cursor[0] != "A" else "B") + cursor[1:]
+        tampered = client.get(
+            f"{PATH}/{base_name}/members",
+            params={"page_size": 1, "cursor": invalid},
+            headers=HEADERS,
+        )
+    assert first.json()["data"]["pool_name"] == f"user/{base_name}"
+    assert first.json()["data"]["match_codes"] == [CODES[0]]
+    assert second.status_code == 200
+    assert second.json()["data"]["match_codes"] == [CODES[1]]
+    assert tampered.status_code == 409

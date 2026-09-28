@@ -2534,6 +2534,8 @@ export interface components {
             status_label: string;
             /** Syntax Version */
             syntax_version: string;
+            /** Version */
+            version: string;
         };
         /** FormulaPoolLatestResult */
         FormulaPoolLatestResult: {
