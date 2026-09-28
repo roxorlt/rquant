@@ -25,7 +25,7 @@ data/rquant.duckdb。盘中本地 monitor 持旧 inode 写分钟线，文件被�
   d) trade_calendar 按 updated_at 单调合并，等时事实冲突整表回滚
   灾后恢复（restore_research_tables）改用 INSERT OR IGNORE：只补本地
   缺失的行，主键冲突时保留本地现值，绝不用旧副本覆盖本地已更新的行
-- LOCAL_ONLY_TABLES：只描述本机状态，不从云端备份导入
+- LOCAL_ONLY_TABLES：本机权威状态或本地观察证据，不从云端备份导入
 
 错误语义：顶层失败（备份缺失 / 主库打不开 / ATTACH 失败）不抛异常，
 转成 has_errors 的报告返回——告警由 sync-from-cloud.sh 统一推，避免
@@ -133,6 +133,14 @@ LOCAL_ONLY_TABLES: tuple[str, ...] = (
     "data_audit_run",
     "data_repair_audit",
     "limit_up_pool_write_guard",
+    # 财务 PIT 首次观察、导入游标与基本面版本 head 均以本地主库为权威。
+    "financial_observation",
+    "financial_import_batch",
+    "financial_import_cursor",
+    "daily_basic_valuation_observation",
+    "daily_basic_valuation_batch",
+    "fundamental_daily_version",
+    "fundamental_daily_head",
 )
 
 DATA_METADATA_TABLES: tuple[str, ...] = (
