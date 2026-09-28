@@ -527,7 +527,10 @@ class FormulaMarketJobStore:
                 "stored formula result cannot be verified"
             ) from exc
 
-    def read_result(self, task_id: str) -> FormulaMarketJobResult:
+    def read_succeeded_task(
+        self, task_id: str
+    ) -> tuple[FormulaMarketJobRequest, FormulaMarketJobResult]:
+        """Read one successful request and its sealed result from the same task row."""
         row = self._row(task_id)
         receipt = self._receipt(row)
         if receipt.status != "succeeded":
@@ -538,7 +541,10 @@ class FormulaMarketJobStore:
             raise FormulaMarketArtifactUnavailableError(
                 "stored formula request is invalid"
             ) from exc
-        return self._load_result(receipt, request, row["request_sha256"])
+        return request, self._load_result(receipt, request, row["request_sha256"])
+
+    def read_result(self, task_id: str) -> FormulaMarketJobResult:
+        return self.read_succeeded_task(task_id)[1]
 
     def _claim(self) -> _Claim | None:
         now = _now(self.clock)

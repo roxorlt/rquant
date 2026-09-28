@@ -165,6 +165,7 @@ def test_real_entrypoint_is_disabled_by_default_and_opt_in_queues(
     assert enabled_receipt.result["outcome"] == "task_queued"
     service = next(item for item in observed if isinstance(item, PageControlService))
     assert service.consumer.formula_market_backend is not None
+    assert service.consumer.formula_pool_backend is not None
     assert (
         service.consumer.formula_market_backend.store.status(
             enabled_receipt.result["task_id"]
