@@ -24,6 +24,16 @@ from rquant.factor.portfolio import (
     PortfolioGroupPoint,
     evaluate_factor_portfolios,
 )
+from rquant.factor.result import (
+    FactorDayCoverage,
+    FactorForwardReturn,
+    FactorMissingCount,
+    FactorResearchDay,
+    FactorResearchRequest,
+    FactorResearchResult,
+    ReturnMissingCount,
+    assemble_factor_research_result,
+)
 from rquant.factor.summary import FactorICSummary, ICSeriesSummary, summarize_factor_ic
 from rquant.factor.time_series import (
     DecisionTime,
@@ -47,6 +57,12 @@ __all__ = [
     "FactorSample",
     "FactorPortfolioDay",
     "FactorPortfolioDiagnostics",
+    "FactorDayCoverage",
+    "FactorForwardReturn",
+    "FactorMissingCount",
+    "FactorResearchDay",
+    "FactorResearchRequest",
+    "FactorResearchResult",
     "FactorTimeSeriesError",
     "FactorTimeSeriesInput",
     "FactorTimeSeriesResult",
@@ -63,6 +79,8 @@ __all__ = [
     "ParsedFactorExpression",
     "PortfolioGroupPoint",
     "PortfolioGroupingDay",
+    "ReturnMissingCount",
+    "assemble_factor_research_result",
     "build_factor_definition",
     "evaluate_factor",
     "evaluate_factor_portfolios",
