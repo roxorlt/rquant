@@ -1144,6 +1144,7 @@ def build_web_fixture(
     promotion_projections: tuple[ServingProjectionPayload, ...] = (),
     calendar_projection: ServingProjectionPayload | None = None,
     strategy_catalog_projections: tuple[ServingProjectionPayload, ...] = (),
+    factor_definition_projections: tuple[ServingProjectionPayload, ...] = (),
 ) -> ServingGenerationManifest:
     """Publish generation ``sequence`` of ``scenario`` into ``root`` and select it."""
 
@@ -1298,6 +1299,7 @@ def build_web_fixture(
             *audit_report_projections,
             *formula_market_projections,
             *backfill_plan_projections,
+            *factor_definition_projections,
         )
     )
     projections += tuple(

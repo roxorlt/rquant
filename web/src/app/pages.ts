@@ -87,8 +87,8 @@ export const PAGES: readonly PageDef[] = [
     path: "/factors",
     title: "因子研究",
     group: "研究",
-    ready: false,
-    summary: "检验一个因子好不好用：IC、分组收益、衰减和换手。",
+    ready: true,
+    summary: "查看已发布因子的当前定义。",
   },
   {
     id: "strategies",

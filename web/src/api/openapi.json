@@ -4123,6 +4123,22 @@
         "title": "Envelope[ExperimentListData]",
         "type": "object"
       },
+      "Envelope_FactorCatalogData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/FactorCatalogData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[FactorCatalogData]",
+        "type": "object"
+      },
       "Envelope_FormulaMarketJobDetailData_": {
         "properties": {
           "data": {
@@ -4760,6 +4776,122 @@
           "next_cursor"
         ],
         "title": "ExperimentListData",
+        "type": "object"
+      },
+      "FactorCatalogData": {
+        "properties": {
+          "availability": {
+            "enum": [
+              "unavailable",
+              "empty",
+              "populated"
+            ],
+            "title": "Availability",
+            "type": "string"
+          },
+          "available_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Available At"
+          },
+          "definitions": {
+            "items": {
+              "$ref": "#/components/schemas/FactorDefinitionItem"
+            },
+            "title": "Definitions",
+            "type": "array"
+          }
+        },
+        "required": [
+          "availability",
+          "available_at",
+          "definitions"
+        ],
+        "title": "FactorCatalogData",
+        "type": "object"
+      },
+      "FactorDefinitionItem": {
+        "properties": {
+          "archived": {
+            "title": "Archived",
+            "type": "boolean"
+          },
+          "category_label": {
+            "title": "Category Label",
+            "type": "string"
+          },
+          "content_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Content Sha256",
+            "type": "string"
+          },
+          "dependency_columns": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Dependency Columns",
+            "type": "array"
+          },
+          "direction": {
+            "enum": [
+              "higher_is_better",
+              "lower_is_better"
+            ],
+            "title": "Direction",
+            "type": "string"
+          },
+          "direction_label": {
+            "title": "Direction Label",
+            "type": "string"
+          },
+          "earliest_available_date": {
+            "format": "date",
+            "title": "Earliest Available Date",
+            "type": "string"
+          },
+          "expression": {
+            "title": "Expression",
+            "type": "string"
+          },
+          "factor_id": {
+            "title": "Factor Id",
+            "type": "string"
+          },
+          "max_history_window": {
+            "title": "Max History Window",
+            "type": "integer"
+          },
+          "name_zh": {
+            "title": "Name Zh",
+            "type": "string"
+          },
+          "version": {
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "factor_id",
+          "content_sha256",
+          "name_zh",
+          "category_label",
+          "direction",
+          "direction_label",
+          "version",
+          "earliest_available_date",
+          "archived",
+          "expression",
+          "dependency_columns",
+          "max_history_window"
+        ],
+        "title": "FactorDefinitionItem",
         "type": "object"
       },
       "FieldExpr": {
@@ -13525,6 +13657,56 @@
         "summary": "实验记录",
         "tags": [
           "experiments"
+        ]
+      }
+    },
+    "/api/v1/factors/definitions": {
+      "get": {
+        "operationId": "list_factor_definitions_api_v1_factors_definitions_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "generation_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "pattern": "^[0-9a-f]{64}$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Generation Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_FactorCatalogData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "因子定义目录",
+        "tags": [
+          "factors"
         ]
       }
     },

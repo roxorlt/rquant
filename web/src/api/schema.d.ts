@@ -242,6 +242,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/factors/definitions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 因子定义目录 */
+        get: operations["list_factor_definitions_api_v1_factors_definitions_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/health": {
         parameters: {
             query?: never;
@@ -2382,6 +2399,11 @@ export interface components {
             data: components["schemas"]["ExperimentListData"];
             serving: components["schemas"]["ServingMeta"];
         };
+        /** Envelope[FactorCatalogData] */
+        Envelope_FactorCatalogData_: {
+            data: components["schemas"]["FactorCatalogData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
         /** Envelope[FormulaMarketJobDetailData] */
         Envelope_FormulaMarketJobDetailData_: {
             data: components["schemas"]["FormulaMarketJobDetailData"];
@@ -2571,6 +2593,51 @@ export interface components {
             retained_count: number;
             /** Truncated */
             truncated: boolean;
+        };
+        /** FactorCatalogData */
+        FactorCatalogData: {
+            /**
+             * Availability
+             * @enum {string}
+             */
+            availability: "unavailable" | "empty" | "populated";
+            /** Available At */
+            available_at: string | null;
+            /** Definitions */
+            definitions: components["schemas"]["FactorDefinitionItem"][];
+        };
+        /** FactorDefinitionItem */
+        FactorDefinitionItem: {
+            /** Archived */
+            archived: boolean;
+            /** Category Label */
+            category_label: string;
+            /** Content Sha256 */
+            content_sha256: string;
+            /** Dependency Columns */
+            dependency_columns: string[];
+            /**
+             * Direction
+             * @enum {string}
+             */
+            direction: "higher_is_better" | "lower_is_better";
+            /** Direction Label */
+            direction_label: string;
+            /**
+             * Earliest Available Date
+             * Format: date
+             */
+            earliest_available_date: string;
+            /** Expression */
+            expression: string;
+            /** Factor Id */
+            factor_id: string;
+            /** Max History Window */
+            max_history_window: number;
+            /** Name Zh */
+            name_zh: string;
+            /** Version */
+            version: number;
         };
         /** FieldExpr */
         FieldExpr: {
@@ -5535,6 +5602,37 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_ExperimentListData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_factor_definitions_api_v1_factors_definitions_get: {
+        parameters: {
+            query?: {
+                generation_id?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_FactorCatalogData_"];
                 };
             };
             /** @description Validation Error */
