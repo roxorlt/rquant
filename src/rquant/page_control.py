@@ -46,6 +46,8 @@ from rquant.canvas_publication_receipt import (
     build_canvas_publication_claims,
 )
 from rquant.data_audit_contracts import MAX_AUDIT_DAYS
+from rquant.factor.definition import FactorDefinition
+from rquant.factor.registry import FactorHeadRef, FactorRegistryIdentity
 from rquant.lab_job_protocol import LabCommand
 from rquant.llm.schemas import RuleCall
 from rquant.manual_watchlist import (
@@ -95,6 +97,8 @@ _PRICE_RULE_VERSION = 1
 _PRICE_RULE_KINDS = frozenset(
     {"save_price_alert_rule", "set_price_alert_rule_enabled", "delete_price_alert_rule"}
 )
+_FACTOR_DEFINITION_KINDS = frozenset({"save_factor_definition", "archive_factor"})
+_FACTOR_REGISTRY_EFFECT_IDENTITY = "factor-registry-identity/v1"
 _LOCAL_FILESYSTEM_FENCE_SCHEMA_VERSION = 1
 _CANVAS_HEAD_CONTRACT = "canvas-current-head/v1"
 _CANVAS_HEAD_SOURCE = "canvas_current_head"
@@ -184,6 +188,46 @@ def _owned_price_rule_command(
         raise TypeError("trusted price rule submission requires an ownerless request")
     return model.model_validate(
         {**command.model_dump(mode="python"), "owner_id": authenticated_owner_id}
+    )
+
+
+class SaveFactorDefinition(PageControlCommand):
+    kind: Literal["save_factor_definition"] = "save_factor_definition"
+    command_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+    definition: FactorDefinition
+    expected_head: FactorHeadRef | None
+
+
+class ArchiveFactor(PageControlCommand):
+    kind: Literal["archive_factor"] = "archive_factor"
+    command_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+    factor_id: str = Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")
+    expected_head: FactorHeadRef
+
+
+class _OwnedSaveFactorDefinition(SaveFactorDefinition):
+    actor_id: OwnerId
+
+
+class _OwnedArchiveFactor(ArchiveFactor):
+    actor_id: OwnerId
+
+
+FactorDefinitionRequestValue = SaveFactorDefinition | ArchiveFactor
+_OwnedFactorDefinitionValue = _OwnedSaveFactorDefinition | _OwnedArchiveFactor
+
+
+def _owned_factor_definition_command(
+    command: FactorDefinitionRequestValue, *, authenticated_actor_id: str
+) -> _OwnedFactorDefinitionValue:
+    if type(command) is SaveFactorDefinition:
+        model = _OwnedSaveFactorDefinition
+    elif type(command) is ArchiveFactor:
+        model = _OwnedArchiveFactor
+    else:
+        raise TypeError("trusted factor submission requires an ownerless request")
+    return model.model_validate(
+        {**command.model_dump(mode="python"), "actor_id": authenticated_actor_id}
     )
 
 
@@ -476,6 +520,24 @@ class FormulaPoolPageControlBackend(Protocol):
     def recover(self, command: SaveFormulaPoolV1) -> JsonValue | None: ...
 
 
+class FactorDefinitionPageControlBackend(Protocol):
+    def identity(self) -> FactorRegistryIdentity: ...
+
+    def submit(
+        self,
+        command: FactorDefinitionRequestValue,
+        *,
+        expected_identity: FactorRegistryIdentity,
+    ) -> JsonValue: ...
+
+    def recover(
+        self,
+        command: FactorDefinitionRequestValue,
+        *,
+        expected_identity: FactorRegistryIdentity,
+    ) -> JsonValue | None: ...
+
+
 PageControlCommandValue = Annotated[
     AckAlert
     | AddWatchlistItem
@@ -483,6 +545,8 @@ PageControlCommandValue = Annotated[
     | _OwnedSavePriceAlertRule
     | _OwnedSetPriceAlertRuleEnabled
     | _OwnedDeletePriceAlertRule
+    | _OwnedSaveFactorDefinition
+    | _OwnedArchiveFactor
     | SaveCanvas
     | CreateCanvas
     | DeleteCanvas
@@ -946,6 +1010,8 @@ class PageControlOutbox:
             command, (SavePriceAlertRule, SetPriceAlertRuleEnabled, DeletePriceAlertRule)
         ):
             raise ValueError("price rule commands require trusted submission")
+        if isinstance(command, (SaveFactorDefinition, ArchiveFactor)):
+            raise ValueError("factor commands require trusted submission")
         return self._enqueue(command)
 
     def enqueue_verified_ack(self, command: AckAlert) -> PageControlReceipt:
@@ -969,12 +1035,20 @@ class PageControlOutbox:
             raise TypeError("trusted price rule submission requires an owned command")
         return self._enqueue(command, require_price_rule_activation=True)
 
+    def enqueue_trusted_factor_definition(
+        self, command: _OwnedFactorDefinitionValue
+    ) -> PageControlReceipt:
+        if not isinstance(command, (_OwnedSaveFactorDefinition, _OwnedArchiveFactor)):
+            raise TypeError("trusted factor submission requires an owned command")
+        return self._enqueue(command, require_factor_definition_trust=True)
+
     def _enqueue(
         self,
         command: PageControlCommandValue,
         *,
         require_watchlist_activation: bool = False,
         require_price_rule_activation: bool = False,
+        require_factor_definition_trust: bool = False,
     ) -> PageControlReceipt:
         if (
             isinstance(command, (AddWatchlistItem, RemoveWatchlistItem))
@@ -992,6 +1066,12 @@ class PageControlOutbox:
             require_price_rule_activation and not is_owned_price_rule
         ):
             raise ValueError("price rule commands require trusted submission")
+        is_factor = isinstance(command, (SaveFactorDefinition, ArchiveFactor))
+        is_owned_factor = isinstance(command, (_OwnedSaveFactorDefinition, _OwnedArchiveFactor))
+        if is_factor != require_factor_definition_trust or (
+            require_factor_definition_trust and not is_owned_factor
+        ):
+            raise ValueError("factor commands require trusted submission")
         payload = command.model_dump_json()
         command_hash = _command_hash(command)
         enqueued_at = command.requested_at.isoformat(timespec="microseconds")
@@ -1018,7 +1098,7 @@ class PageControlOutbox:
                     raise PageControlCommandConflictError(
                         "command_id already exists with different payload"
                     )
-                if require_price_rule_activation:
+                if require_price_rule_activation or require_factor_definition_trust:
                     stored = _COMMAND_ADAPTER.validate_json(existing["payload_json"])
                     if (
                         stored != command
@@ -1722,7 +1802,7 @@ class PageControlOutbox:
                     try:
                         parsed_command = _COMMAND_ADAPTER.validate_json(row["payload_json"])
                     except ValueError:
-                        if row["command_kind"] in _PRICE_RULE_KINDS:
+                        if row["command_kind"] in _PRICE_RULE_KINDS | _FACTOR_DEFINITION_KINDS:
                             continue
                         raise
                     if isinstance(
@@ -1744,6 +1824,17 @@ class PageControlOutbox:
                         except (ValueError, RuntimeError, sqlite3.Error):
                             continue
                     elif row["command_kind"] in _PRICE_RULE_KINDS:
+                        continue
+                    elif isinstance(
+                        parsed_command, (_OwnedSaveFactorDefinition, _OwnedArchiveFactor)
+                    ):
+                        if (
+                            parsed_command.kind != row["command_kind"]
+                            or parsed_command.command_id != row["command_id"]
+                            or _command_hash(parsed_command) != row["command_hash"]
+                        ):
+                            continue
+                    elif row["command_kind"] in _FACTOR_DEFINITION_KINDS:
                         continue
                     eligible.append(row)
                     if len(eligible) == limit:
@@ -2161,6 +2252,7 @@ class PageControlConsumer:
         data_audit_report_backend: DataAuditReportPageControlBackend | None = None,
         formula_market_backend: FormulaMarketPageControlBackend | None = None,
         formula_pool_backend: FormulaPoolPageControlBackend | None = None,
+        factor_definition_backend: FactorDefinitionPageControlBackend | None = None,
         clock: Callable[[], datetime] | None = None,
         lease_seconds: int = _DEFAULT_LEASE_SECONDS,
         consumer_id: str | None = None,
@@ -2179,6 +2271,7 @@ class PageControlConsumer:
         self.data_audit_report_backend = data_audit_report_backend
         self.formula_market_backend = formula_market_backend
         self.formula_pool_backend = formula_pool_backend
+        self.factor_definition_backend = factor_definition_backend
         self.clock = clock or (lambda: datetime.now(UTC))
         self.lease_seconds = lease_seconds
         self.consumer_service_id = consumer_service_id
@@ -2303,6 +2396,41 @@ class PageControlConsumer:
         terminal = self._outcome_from_effect(effect)
         if terminal is not None:
             return terminal
+        if isinstance(command, (_OwnedSaveFactorDefinition, _OwnedArchiveFactor)):
+            if effect.result is None:
+                try:
+                    identity = self._factor_definition_backend().identity()
+                    effect = self.outbox.record_started_effect_result(
+                        command.command_id,
+                        result={
+                            "contract": _FACTOR_REGISTRY_EFFECT_IDENTITY,
+                            "identity": identity.model_dump(mode="json"),
+                        },
+                        owner_id=claim.owner_id,
+                        claim_token=claim.claim_token,
+                    )
+                except Exception as exc:
+                    if self._must_recover_before_failure(command, created=created):
+                        raise _RetryableUncertainEffectError(
+                            f"factor registry identity cannot be recorded: {exc}"
+                        ) from exc
+                    effect = self.outbox.finish_effect(
+                        command.command_id,
+                        status=PageControlEffectStatus.FAILED,
+                        error=f"{type(exc).__name__}: {exc}",
+                        owner_id=claim.owner_id,
+                        claim_token=claim.claim_token,
+                    )
+                    outcome = self._outcome_from_effect(effect)
+                    assert outcome is not None
+                    return outcome
+            else:
+                try:
+                    self._factor_effect_identity(effect)
+                except Exception as exc:
+                    raise _RetryableUncertainEffectError(
+                        f"factor registry effect identity is invalid: {exc}"
+                    ) from exc
         local_fence_targets = self._local_effect_fence_targets(command)
         if created and local_fence_targets:
             try:
@@ -2377,7 +2505,7 @@ class PageControlConsumer:
         created: bool,
     ) -> _ExecutionOutcome:
         command = claim.command
-        if not created:
+        if not created or isinstance(command, (_OwnedSaveFactorDefinition, _OwnedArchiveFactor)):
             try:
                 recovered = self._recover_started_effect(command)
             except Exception as exc:
@@ -2526,6 +2654,8 @@ class PageControlConsumer:
     def _must_recover_before_failure(
         self, command: PageControlCommandValue, *, created: bool
     ) -> bool:
+        if isinstance(command, (_OwnedSaveFactorDefinition, _OwnedArchiveFactor)):
+            return not created or self.factor_definition_backend is not None
         if isinstance(command, SubmitDataAuditReport):
             # A started command may have queued a task before its receipt was lost.
             # A first attempt without a configured backend cannot have done so.
@@ -2588,6 +2718,10 @@ class PageControlConsumer:
         return _ExecutionOutcome(PageControlStatus.FAILED, effect.result, effect.error)
 
     def _execute(self, command: PageControlCommandValue) -> JsonValue:
+        if isinstance(command, (_OwnedSaveFactorDefinition, _OwnedArchiveFactor)):
+            return self._factor_definition_backend().submit(
+                command, expected_identity=self._expected_factor_identity(command.command_id)
+            )
         if isinstance(command, CreateCanvas):
             return self._create_canvas(command)
         if isinstance(command, SaveCanvas):
@@ -2689,6 +2823,28 @@ class PageControlConsumer:
         if self.formula_pool_backend is None:
             raise RuntimeError("formula pool backend is unavailable")
         return self.formula_pool_backend
+
+    def _factor_definition_backend(self) -> FactorDefinitionPageControlBackend:
+        if self.factor_definition_backend is None:
+            raise RuntimeError("factor definition backend is unavailable")
+        return self.factor_definition_backend
+
+    @staticmethod
+    def _factor_effect_identity(effect: PageControlEffectRecord) -> FactorRegistryIdentity:
+        result = effect.result
+        if (
+            not isinstance(result, dict)
+            or set(result) != {"contract", "identity"}
+            or result.get("contract") != _FACTOR_REGISTRY_EFFECT_IDENTITY
+        ):
+            raise ValueError("factor registry effect identity is unavailable")
+        return FactorRegistryIdentity.model_validate(result["identity"])
+
+    def _expected_factor_identity(self, command_id: str) -> FactorRegistryIdentity:
+        effect = self.outbox.effect(command_id)
+        if effect is None or effect.status is not PageControlEffectStatus.STARTED:
+            raise RuntimeError("factor registry effect is not started")
+        return self._factor_effect_identity(effect)
 
     def _local_effect_fence_targets(
         self,
@@ -2898,6 +3054,10 @@ class PageControlConsumer:
         return None
 
     def _recover_started_effect(self, command: PageControlCommandValue) -> JsonValue | None:
+        if isinstance(command, (_OwnedSaveFactorDefinition, _OwnedArchiveFactor)):
+            return self._factor_definition_backend().recover(
+                command, expected_identity=self._expected_factor_identity(command.command_id)
+            )
         if isinstance(command, SubmitBackfillPlan):
             return self._backfill_plan_backend().recover(command)
         if isinstance(command, SubmitDataAuditReport):
@@ -3962,6 +4122,8 @@ class PageControlService:
             command, (SavePriceAlertRule, SetPriceAlertRuleEnabled, DeletePriceAlertRule)
         ):
             raise ValueError("price rule commands require trusted submission")
+        if isinstance(command, (SaveFactorDefinition, ArchiveFactor)):
+            raise ValueError("factor commands require trusted submission")
         if isinstance(command, AckAlert):
             receipt = self.lookup_ack_command(command)
             if receipt is None:
@@ -3998,6 +4160,14 @@ class PageControlService:
         return self._settle(
             owned, self.outbox.enqueue_trusted_price_rule(owned), price_rule_command=owned
         )
+
+    def _submit_trusted_factor_definition(
+        self, command: FactorDefinitionRequestValue, *, authenticated_actor_id: str
+    ) -> PageControlReceipt:
+        owned = _owned_factor_definition_command(
+            command, authenticated_actor_id=authenticated_actor_id
+        )
+        return self._settle(owned, self.outbox.enqueue_trusted_factor_definition(owned))
 
     def _lookup_trusted_price_rule(
         self, command: PriceAlertRuleRequestValue, *, authenticated_owner_id: str
@@ -4076,6 +4246,8 @@ class PageControlClient:
             command, (SavePriceAlertRule, SetPriceAlertRuleEnabled, DeletePriceAlertRule)
         ):
             raise ValueError("price rule commands require trusted submission")
+        if isinstance(command, (SaveFactorDefinition, ArchiveFactor)):
+            raise ValueError("factor commands require trusted submission")
         try:
             response = self.transport(command.model_dump(mode="json"))
         except (OSError, TimeoutError, urllib.error.URLError) as exc:
@@ -4697,10 +4869,14 @@ def _fsync_descriptor(descriptor: int) -> None:
 
 
 def parse_page_control_command(payload: object) -> PageControlCommandValue:
+    if isinstance(payload, (SaveFactorDefinition, ArchiveFactor)):
+        raise ValueError("factor commands require trusted submission")
     if isinstance(payload, Mapping):
         kind = payload.get("kind")
         if isinstance(kind, str) and kind in _PRICE_RULE_KINDS:
             raise ValueError("price rule commands require trusted submission")
+        if isinstance(kind, str) and kind in _FACTOR_DEFINITION_KINDS:
+            raise ValueError("factor commands require trusted submission")
     return _COMMAND_ADAPTER.validate_python(payload)
 
 
@@ -4710,6 +4886,7 @@ __all__ = [
     "AddPoolToCanvas",
     "AlertAcknowledgment",
     "AppendNlQueryLog",
+    "ArchiveFactor",
     "CreateCanvas",
     "DEFAULT_PAGE_CONTROL_SERVICE_ID",
     "DeleteCanvas",
@@ -4725,6 +4902,8 @@ __all__ = [
     "DataAuditReportPageControlBackend",
     "FormulaMarketPageControlBackend",
     "FormulaPoolPageControlBackend",
+    "FactorDefinitionPageControlBackend",
+    "FactorDefinitionRequestValue",
     "PageControlCommandValue",
     "PageControlClient",
     "PageControlCommandConflictError",
@@ -4737,6 +4916,7 @@ __all__ = [
     "parse_page_control_command",
     "RemoveWatchlistItem",
     "SaveCanvas",
+    "SaveFactorDefinition",
     "SavePriceAlertRule",
     "SaveFormulaPoolV1",
     "SaveNlPreset",
