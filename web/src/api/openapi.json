@@ -3304,6 +3304,48 @@
         "title": "CatalogSummary",
         "type": "object"
       },
+      "CorrelationResult": {
+        "additionalProperties": false,
+        "description": "One cross-sectional correlation, including an explicit unavailable state.",
+        "properties": {
+          "effective_sample_count": {
+            "title": "Effective Sample Count",
+            "type": "integer"
+          },
+          "source_sample_count": {
+            "title": "Source Sample Count",
+            "type": "integer"
+          },
+          "status": {
+            "enum": [
+              "ok",
+              "insufficient_samples",
+              "zero_variance"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "value": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Value"
+          }
+        },
+        "required": [
+          "status",
+          "value",
+          "source_sample_count",
+          "effective_sample_count"
+        ],
+        "title": "CorrelationResult",
+        "type": "object"
+      },
       "CreateCanvasCommand": {
         "additionalProperties": false,
         "properties": {
@@ -4155,6 +4197,38 @@
         "title": "Envelope[FactorCatalogData]",
         "type": "object"
       },
+      "Envelope_FactorResultDetailData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/FactorResultDetailData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[FactorResultDetailData]",
+        "type": "object"
+      },
+      "Envelope_FactorResultListData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/FactorResultListData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[FactorResultListData]",
+        "type": "object"
+      },
       "Envelope_FormulaMarketJobDetailData_": {
         "properties": {
           "data": {
@@ -4921,6 +4995,56 @@
         "title": "FactorCatalogData",
         "type": "object"
       },
+      "FactorDayCoverage": {
+        "additionalProperties": false,
+        "description": "Paired sample coverage; factor and return absences can overlap.",
+        "properties": {
+          "expected_count": {
+            "minimum": 1.0,
+            "title": "Expected Count",
+            "type": "integer"
+          },
+          "factor_missing_by_reason": {
+            "items": {
+              "$ref": "#/components/schemas/FactorMissingCount"
+            },
+            "title": "Factor Missing By Reason",
+            "type": "array"
+          },
+          "factor_missing_count": {
+            "minimum": 0.0,
+            "title": "Factor Missing Count",
+            "type": "integer"
+          },
+          "return_missing_by_reason": {
+            "items": {
+              "$ref": "#/components/schemas/ReturnMissingCount"
+            },
+            "title": "Return Missing By Reason",
+            "type": "array"
+          },
+          "return_missing_count": {
+            "minimum": 0.0,
+            "title": "Return Missing Count",
+            "type": "integer"
+          },
+          "valid_count": {
+            "minimum": 0.0,
+            "title": "Valid Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "expected_count",
+          "valid_count",
+          "factor_missing_count",
+          "return_missing_count",
+          "factor_missing_by_reason",
+          "return_missing_by_reason"
+        ],
+        "title": "FactorDayCoverage",
+        "type": "object"
+      },
       "FactorDefinitionItem": {
         "properties": {
           "archived": {
@@ -4998,6 +5122,144 @@
         "title": "FactorDefinitionItem",
         "type": "object"
       },
+      "FactorDisplayCoverageDay": {
+        "additionalProperties": false,
+        "properties": {
+          "coverage": {
+            "$ref": "#/components/schemas/FactorDayCoverage"
+          },
+          "decision_date": {
+            "format": "date",
+            "title": "Decision Date",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "evaluated",
+              "no_samples"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "decision_date",
+          "status",
+          "coverage"
+        ],
+        "title": "FactorDisplayCoverageDay",
+        "type": "object"
+      },
+      "FactorDisplayDecayPeriod": {
+        "additionalProperties": false,
+        "properties": {
+          "ic_summary": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FactorICSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "lag": {
+            "maximum": 10.0,
+            "minimum": 1.0,
+            "title": "Lag",
+            "type": "integer"
+          },
+          "source_day_count": {
+            "minimum": 0.0,
+            "title": "Source Day Count",
+            "type": "integer"
+          },
+          "status": {
+            "enum": [
+              "evaluated",
+              "no_valid_days",
+              "no_target_period"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "valid_pair_count": {
+            "minimum": 0.0,
+            "title": "Valid Pair Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "lag",
+          "status",
+          "source_day_count",
+          "valid_pair_count",
+          "ic_summary"
+        ],
+        "title": "FactorDisplayDecayPeriod",
+        "type": "object"
+      },
+      "FactorDisplayICPoint": {
+        "additionalProperties": false,
+        "properties": {
+          "decision_date": {
+            "format": "date",
+            "title": "Decision Date",
+            "type": "string"
+          },
+          "normal_ic": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CorrelationResult"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "normal_ic_cumulative_sum": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Normal Ic Cumulative Sum"
+          },
+          "rank_ic": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CorrelationResult"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "rank_ic_cumulative_sum": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rank Ic Cumulative Sum"
+          }
+        },
+        "required": [
+          "decision_date",
+          "normal_ic",
+          "rank_ic",
+          "normal_ic_cumulative_sum",
+          "rank_ic_cumulative_sum"
+        ],
+        "title": "FactorDisplayICPoint",
+        "type": "object"
+      },
       "FactorHeadRef": {
         "additionalProperties": false,
         "properties": {
@@ -5017,6 +5279,401 @@
           "content_sha256"
         ],
         "title": "FactorHeadRef",
+        "type": "object"
+      },
+      "FactorICSummary": {
+        "additionalProperties": false,
+        "description": "Separate NormalIC and RankIC long-window summaries.",
+        "properties": {
+          "normal_ic": {
+            "$ref": "#/components/schemas/ICSeriesSummary"
+          },
+          "rank_ic": {
+            "$ref": "#/components/schemas/ICSeriesSummary"
+          }
+        },
+        "required": [
+          "normal_ic",
+          "rank_ic"
+        ],
+        "title": "FactorICSummary",
+        "type": "object"
+      },
+      "FactorMissingCount": {
+        "additionalProperties": false,
+        "properties": {
+          "count": {
+            "minimum": 1.0,
+            "title": "Count",
+            "type": "integer"
+          },
+          "reason": {
+            "enum": [
+              "before_available_date",
+              "insufficient_history",
+              "missing_observation",
+              "missing_value",
+              "zero_division",
+              "zero_variance",
+              "insufficient_samples",
+              "non_finite_result",
+              "precision_limit",
+              "missing_context"
+            ],
+            "title": "Reason",
+            "type": "string"
+          }
+        },
+        "required": [
+          "reason",
+          "count"
+        ],
+        "title": "FactorMissingCount",
+        "type": "object"
+      },
+      "FactorPortfolioDay": {
+        "additionalProperties": false,
+        "description": "Completed common return window and its portfolio diagnostics.",
+        "properties": {
+          "decision_at": {
+            "format": "date-time",
+            "title": "Decision At",
+            "type": "string"
+          },
+          "decision_date": {
+            "format": "date",
+            "title": "Decision Date",
+            "type": "string"
+          },
+          "effective_sample_count": {
+            "title": "Effective Sample Count",
+            "type": "integer"
+          },
+          "groupings": {
+            "items": {
+              "$ref": "#/components/schemas/PortfolioGroupingDay"
+            },
+            "title": "Groupings",
+            "type": "array"
+          },
+          "return_end_at": {
+            "format": "date-time",
+            "title": "Return End At",
+            "type": "string"
+          },
+          "source_sample_count": {
+            "title": "Source Sample Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "decision_date",
+          "decision_at",
+          "return_end_at",
+          "source_sample_count",
+          "effective_sample_count",
+          "groupings"
+        ],
+        "title": "FactorPortfolioDay",
+        "type": "object"
+      },
+      "FactorResearchDisplay": {
+        "additionalProperties": false,
+        "properties": {
+          "basis_label": {
+            "title": "Basis Label",
+            "type": "string"
+          },
+          "coverage_days": {
+            "items": {
+              "$ref": "#/components/schemas/FactorDisplayCoverageDay"
+            },
+            "title": "Coverage Days",
+            "type": "array"
+          },
+          "decay_periods": {
+            "items": {
+              "$ref": "#/components/schemas/FactorDisplayDecayPeriod"
+            },
+            "title": "Decay Periods",
+            "type": "array"
+          },
+          "holding_sessions": {
+            "enum": [
+              1,
+              5,
+              10,
+              20
+            ],
+            "title": "Holding Sessions",
+            "type": "integer"
+          },
+          "ic_points": {
+            "items": {
+              "$ref": "#/components/schemas/FactorDisplayICPoint"
+            },
+            "title": "Ic Points",
+            "type": "array"
+          },
+          "ic_summary": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FactorICSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "pool_label": {
+            "const": "固定样本",
+            "title": "Pool Label",
+            "type": "string"
+          },
+          "portfolio_days": {
+            "items": {
+              "$ref": "#/components/schemas/FactorPortfolioDay"
+            },
+            "title": "Portfolio Days",
+            "type": "array"
+          },
+          "portfolio_status": {
+            "enum": [
+              "available",
+              "available_partial",
+              "insufficient_data"
+            ],
+            "title": "Portfolio Status",
+            "type": "string"
+          },
+          "return_price_basis": {
+            "enum": [
+              "raw",
+              "forward_adjusted",
+              "backward_adjusted"
+            ],
+            "title": "Return Price Basis",
+            "type": "string"
+          },
+          "summary_status": {
+            "enum": [
+              "evaluated",
+              "no_samples"
+            ],
+            "title": "Summary Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "basis_label",
+          "pool_label",
+          "return_price_basis",
+          "holding_sessions",
+          "summary_status",
+          "ic_summary",
+          "ic_points",
+          "decay_periods",
+          "portfolio_status",
+          "portfolio_days",
+          "coverage_days"
+        ],
+        "title": "FactorResearchDisplay",
+        "type": "object"
+      },
+      "FactorResultDetailData": {
+        "additionalProperties": false,
+        "properties": {
+          "availability": {
+            "enum": [
+              "unavailable",
+              "empty",
+              "not_found",
+              "ready"
+            ],
+            "title": "Availability",
+            "type": "string"
+          },
+          "available_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Available At"
+          },
+          "research": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FactorResearchDisplay"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "result": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FactorResultItem"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "availability",
+          "available_at",
+          "result",
+          "research"
+        ],
+        "title": "FactorResultDetailData",
+        "type": "object"
+      },
+      "FactorResultItem": {
+        "additionalProperties": false,
+        "properties": {
+          "as_of_time": {
+            "format": "date-time",
+            "title": "As Of Time",
+            "type": "string"
+          },
+          "definition_status": {
+            "enum": [
+              "current",
+              "historical_unavailable"
+            ],
+            "title": "Definition Status",
+            "type": "string"
+          },
+          "display_message": {
+            "title": "Display Message",
+            "type": "string"
+          },
+          "display_status": {
+            "enum": [
+              "not_ready",
+              "display_unavailable",
+              "not_published",
+              "available"
+            ],
+            "title": "Display Status",
+            "type": "string"
+          },
+          "factor_id": {
+            "title": "Factor Id",
+            "type": "string"
+          },
+          "factor_name_zh": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Factor Name Zh"
+          },
+          "factor_version": {
+            "title": "Factor Version",
+            "type": "integer"
+          },
+          "failure_message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failure Message"
+          },
+          "job_id": {
+            "title": "Job Id",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "queued",
+              "running",
+              "succeeded",
+              "failed"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "status_label": {
+            "title": "Status Label",
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "job_id",
+          "factor_id",
+          "factor_version",
+          "factor_name_zh",
+          "definition_status",
+          "status",
+          "status_label",
+          "failure_message",
+          "updated_at",
+          "as_of_time",
+          "display_status",
+          "display_message"
+        ],
+        "title": "FactorResultItem",
+        "type": "object"
+      },
+      "FactorResultListData": {
+        "additionalProperties": false,
+        "properties": {
+          "availability": {
+            "enum": [
+              "unavailable",
+              "empty",
+              "populated"
+            ],
+            "title": "Availability",
+            "type": "string"
+          },
+          "available_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Available At"
+          },
+          "results": {
+            "items": {
+              "$ref": "#/components/schemas/FactorResultItem"
+            },
+            "title": "Results",
+            "type": "array"
+          }
+        },
+        "required": [
+          "availability",
+          "available_at",
+          "results"
+        ],
+        "title": "FactorResultListData",
         "type": "object"
       },
       "FieldExpr": {
@@ -6257,6 +6914,160 @@
           "unrealized_pct"
         ],
         "title": "HoldingItem",
+        "type": "object"
+      },
+      "ICSeriesSummary": {
+        "additionalProperties": false,
+        "description": "Statistics for one IC definition across an ordered set of decision dates.",
+        "properties": {
+          "excess_kurtosis": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Excess Kurtosis"
+          },
+          "insufficient_day_count": {
+            "minimum": 0.0,
+            "title": "Insufficient Day Count",
+            "type": "integer"
+          },
+          "ir": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ir"
+          },
+          "mean": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mean"
+          },
+          "p_value": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "P Value"
+          },
+          "positive_rate": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Positive Rate"
+          },
+          "sample_std": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sample Std"
+          },
+          "skewness": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Skewness"
+          },
+          "source_day_count": {
+            "minimum": 0.0,
+            "title": "Source Day Count",
+            "type": "integer"
+          },
+          "status": {
+            "enum": [
+              "ok",
+              "no_valid_days",
+              "insufficient_samples",
+              "zero_variance",
+              "precision_limit"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "strong_signal_rate": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Strong Signal Rate"
+          },
+          "t_value": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "T Value"
+          },
+          "valid_day_count": {
+            "minimum": 0.0,
+            "title": "Valid Day Count",
+            "type": "integer"
+          },
+          "zero_variance_day_count": {
+            "minimum": 0.0,
+            "title": "Zero Variance Day Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "status",
+          "source_day_count",
+          "valid_day_count",
+          "insufficient_day_count",
+          "zero_variance_day_count",
+          "mean",
+          "sample_std",
+          "ir",
+          "positive_rate",
+          "strong_signal_rate",
+          "t_value",
+          "p_value",
+          "skewness",
+          "excess_kurtosis"
+        ],
+        "title": "ICSeriesSummary",
         "type": "object"
       },
       "IntradayData": {
@@ -9500,6 +10311,114 @@
         "title": "PoolsData",
         "type": "object"
       },
+      "PortfolioGroupPoint": {
+        "additionalProperties": false,
+        "description": "One group's completed return, compounded return and target-weight change.",
+        "properties": {
+          "cumulative_return": {
+            "title": "Cumulative Return",
+            "type": "number"
+          },
+          "group_number": {
+            "title": "Group Number",
+            "type": "integer"
+          },
+          "member_count": {
+            "title": "Member Count",
+            "type": "integer"
+          },
+          "period_return": {
+            "title": "Period Return",
+            "type": "number"
+          },
+          "target_weight_turnover": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Target Weight Turnover"
+          }
+        },
+        "required": [
+          "group_number",
+          "member_count",
+          "period_return",
+          "cumulative_return",
+          "target_weight_turnover"
+        ],
+        "title": "PortfolioGroupPoint",
+        "type": "object"
+      },
+      "PortfolioGroupingDay": {
+        "additionalProperties": false,
+        "description": "Period spread and the difference of compounded group sleeve returns.",
+        "properties": {
+          "effective_sample_count": {
+            "title": "Effective Sample Count",
+            "type": "integer"
+          },
+          "group_count": {
+            "title": "Group Count",
+            "type": "integer"
+          },
+          "groups": {
+            "items": {
+              "$ref": "#/components/schemas/PortfolioGroupPoint"
+            },
+            "title": "Groups",
+            "type": "array"
+          },
+          "long_short_cumulative_spread": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Long Short Cumulative Spread"
+          },
+          "long_short_return": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Long Short Return"
+          },
+          "source_sample_count": {
+            "title": "Source Sample Count",
+            "type": "integer"
+          },
+          "status": {
+            "enum": [
+              "ok",
+              "insufficient_samples"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "group_count",
+          "status",
+          "source_sample_count",
+          "effective_sample_count",
+          "groups",
+          "long_short_return",
+          "long_short_cumulative_spread"
+        ],
+        "title": "PortfolioGroupingDay",
+        "type": "object"
+      },
       "ProjectionInfo": {
         "properties": {
           "available": {
@@ -10445,6 +11364,33 @@
           "cpu_note"
         ],
         "title": "ResourcesData",
+        "type": "object"
+      },
+      "ReturnMissingCount": {
+        "additionalProperties": false,
+        "properties": {
+          "count": {
+            "minimum": 1.0,
+            "title": "Count",
+            "type": "integer"
+          },
+          "reason": {
+            "enum": [
+              "window_unfinished",
+              "visibility_pending",
+              "missing_price",
+              "suspended",
+              "source_unavailable"
+            ],
+            "title": "Reason",
+            "type": "string"
+          }
+        },
+        "required": [
+          "reason",
+          "count"
+        ],
+        "title": "ReturnMissingCount",
         "type": "object"
       },
       "RuntimeServiceItem": {
@@ -13936,6 +14882,116 @@
           }
         },
         "summary": "续查原归档命令",
+        "tags": [
+          "factors"
+        ]
+      }
+    },
+    "/api/v1/factors/results": {
+      "get": {
+        "operationId": "list_factor_results_api_v1_factors_results_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "generation_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "pattern": "^[0-9a-f]{64}$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Generation Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_FactorResultListData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "因子检验结果",
+        "tags": [
+          "factors"
+        ]
+      }
+    },
+    "/api/v1/factors/results/{job_id}": {
+      "get": {
+        "operationId": "get_factor_result_api_v1_factors_results__job_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "pattern": "^[0-9a-f]{32}$",
+              "title": "Job Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "generation_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "pattern": "^[0-9a-f]{64}$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Generation Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_FactorResultDetailData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "因子检验详情",
         "tags": [
           "factors"
         ]

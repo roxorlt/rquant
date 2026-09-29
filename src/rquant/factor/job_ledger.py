@@ -932,3 +932,18 @@ class FactorEvaluationJobLedger:
                 for row in identifiers
                 if (state := self._load_job(connection, row["job_id"])) is not None
             )
+
+    def list_recent_updated(self, *, limit: int = 50) -> tuple[FactorJobRecord, ...]:
+        """Read the bounded latest-changing jobs for a stable result publication."""
+        if type(limit) is not int or not 1 <= limit <= _MAX_LIST:
+            raise ValueError("factor job list limit is invalid")
+        with self._reader() as connection:
+            identifiers = connection.execute(
+                "SELECT job_id FROM factor_jobs ORDER BY updated_at DESC, job_id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+            return tuple(
+                state.public()
+                for row in identifiers
+                if (state := self._load_job(connection, row["job_id"])) is not None
+            )

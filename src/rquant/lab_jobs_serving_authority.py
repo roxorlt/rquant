@@ -11,6 +11,7 @@ import stat
 from collections.abc import Callable
 from datetime import UTC, date, datetime
 from pathlib import Path
+from typing import Protocol
 from urllib.parse import quote
 from uuid import UUID
 from zoneinfo import ZoneInfo
@@ -67,6 +68,16 @@ StrategyProjectionReader = Callable[
     tuple[ServingProjectionPayload, ...],
 ]
 PageProjectionReader = Callable[[datetime], tuple[ServingProjectionPayload, ...]]
+
+
+class FactorResultProjectionReader(Protocol):
+    def __call__(
+        self,
+        observed_at: datetime,
+        *,
+        other_projections: tuple[ServingProjectionPayload, ...],
+    ) -> tuple[ServingProjectionPayload, ...]: ...
+
 
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 _MAX_PROJECTED_PARQUET_BYTES = 64 * 1024 * 1024
@@ -799,6 +810,7 @@ class LabJobsServingSourceReader:
         eta_completed_limit: int = LAB_ETA_COMPLETED_LIMIT_MAX,
         strategy_projection_reader: StrategyProjectionReader | None = None,
         page_projection_reader: PageProjectionReader | None = None,
+        factor_result_projection_reader: FactorResultProjectionReader | None = None,
     ) -> None:
         if not isinstance(reader, LabJobReader):
             raise TypeError("reader must be LabJobReader")
@@ -813,6 +825,7 @@ class LabJobsServingSourceReader:
         self.eta_completed_limit = eta_completed_limit
         self.strategy_projection_reader = strategy_projection_reader
         self.page_projection_reader = page_projection_reader
+        self.factor_result_projection_reader = factor_result_projection_reader
 
     def __call__(self, observed_at: datetime, /) -> SourceReadResult:
         observed = normalize_aware_utc(observed_at)
@@ -840,11 +853,17 @@ class LabJobsServingSourceReader:
         page_projections = (
             self.page_projection_reader(observed) if self.page_projection_reader is not None else ()
         )
-        projections = (
+        base_projections = (
             *_event_projections(first, observed_at=observed),
             *strategy_projections,
             *page_projections,
         )
+        factor_result_projections = (
+            self.factor_result_projection_reader(observed, other_projections=base_projections)
+            if self.factor_result_projection_reader is not None
+            else ()
+        )
+        projections = (*base_projections, *factor_result_projections)
 
         second = self.reader.list_published_jobs_with_events(limit=self.max_jobs)
         second_page = second.page
@@ -872,6 +891,19 @@ class LabJobsServingSourceReader:
             raise LabJobsServingAuthorityIntegrityError(
                 "page projection authority changed while building serving source"
             )
+        if self.factor_result_projection_reader is not None:
+            repeated_factor_results = self.factor_result_projection_reader(
+                observed,
+                other_projections=(
+                    *_event_projections(second, observed_at=observed),
+                    *repeated_strategy_projections,
+                    *repeated_page_projections,
+                ),
+            )
+            if repeated_factor_results != factor_result_projections:
+                raise LabJobsServingAuthorityIntegrityError(
+                    "factor result projection authority changed while building serving source"
+                )
 
         payload = LabJobsPayload(
             lab_jobs=tuple(
@@ -933,9 +965,7 @@ def _event_projections(
     observed_at: datetime,
 ) -> tuple[ServingProjectionPayload, ServingProjectionPayload]:
     if any(
-        event.created_at > observed_at
-        for window in snapshot.windows
-        for event in window.events
+        event.created_at > observed_at for window in snapshot.windows for event in window.events
     ):
         raise LabPublishedEventIntegrityError("lab event contains future evidence")
     window_rows = tuple(
@@ -1028,6 +1058,14 @@ def lab_jobs_state_identity(result: SourceReadResult) -> str:
             }:
                 projection.pop("available_at", None)
                 if projection["table_name"] == "factor_definition_state":
+                    projection["rows"][0].pop("snapshot_sha256")
+            if isinstance(projection, dict) and projection.get("table_name") in {
+                "factor_result_state",
+                "factor_result_index",
+                "factor_result_display",
+            }:
+                projection.pop("available_at", None)
+                if projection["table_name"] == "factor_result_state":
                     projection["rows"][0].pop("snapshot_sha256")
     return canonical_sha256({"contract": "lab-jobs-state/v1", "state": state})
 
