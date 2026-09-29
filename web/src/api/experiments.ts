@@ -13,11 +13,14 @@ export function useExperiments(
   return useServingQuery(
     ["experiments", cursor, generationId, refreshKey],
     async (): Promise<ExperimentEnvelope> => {
+      if (generationId === null) {
+        throw new Error("实验记录暂时无法核对，请稍后重试。");
+      }
       const { data, response } = await apiClient().GET("/api/v1/experiments", {
         params: {
           query: {
             limit: 20,
-            generation_id: generationId ?? undefined,
+            generation_id: generationId,
             cursor: cursor ?? undefined,
           },
         },
@@ -32,5 +35,6 @@ export function useExperiments(
       }
       return data;
     },
+    { enabled: typeof generationId === "string" },
   );
 }
