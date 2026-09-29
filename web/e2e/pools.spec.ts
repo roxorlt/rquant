@@ -78,6 +78,7 @@ for (const viewport of [
       await pool.press("Enter");
       await expect(pool).toHaveAttribute("aria-pressed", "true");
       await expect(page.getByRole("region", { name: "池子详情" })).toContainText("3 只");
+      await expect(page.getByText("暂无可信排名", { exact: true })).toHaveCount(1);
       const graph = page.getByRole("group", { name: "已发布规则与池子" });
       await expect(graph.locator('.flow-graph-node[data-id^="condition:"]')).toHaveCount(2);
       await expect(graph.locator(".flow-graph-edge")).toHaveCount(3);

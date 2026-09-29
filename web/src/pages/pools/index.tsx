@@ -248,6 +248,17 @@ function ResultsDetail({
   awaitingNewResult?: boolean;
 }) {
   const resultDate = pool.result.trade_date ?? pool.trade_date;
+  const hasPublishedRanking =
+    pool.result.state === "current_rules" &&
+    pool.members.length > 0 &&
+    pool.members.every((member) => member.rank_position != null && member.ranking_score != null);
+  const displayMembers = hasPublishedRanking
+    ? pool.members
+    : pool.members.map((member) => ({
+        ...member,
+        rank_position: null,
+        ranking_score: null,
+      }));
   return (
     <>
       <Panel title="上次选股结果" sub={pool.result.status_label} label="上次选股结果">
@@ -333,8 +344,13 @@ function ResultsDetail({
           label="池子成员"
           flush
         >
+          {!hasPublishedRanking ? (
+            <p className="pools-ranking-state" role="status">
+              暂无可信排名
+            </p>
+          ) : null}
           <DataTable
-            rows={pool.members}
+            rows={displayMembers}
             columns={MEMBER_COLUMNS}
             rowKey={(row) => row.code}
             label="池子成员"

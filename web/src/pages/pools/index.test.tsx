@@ -156,6 +156,39 @@ it("按已核验名次显示成员和评分，未知事实保留空值", async (
   expect(within(table).getByRole("columnheader", { name: "名次" })).toBeVisible();
   expect(within(table).getByRole("columnheader", { name: "评分" })).toBeVisible();
   expect(within(table).getByRole("row", { name: /第一名/ })).toHaveTextContent("97.25");
+  expect(screen.queryByText("暂无可信排名")).not.toBeInTheDocument();
+  expect(findJargon(container.textContent ?? "")).toEqual([]);
+});
+
+it.each([
+  ["旧 v2", "current_rules"],
+  ["坏 v3", "unverified"],
+] as const)("%s 有成员但无整组排名时只提示一次", async (_name, state) => {
+  const pool = base.pools[0];
+  const member = pool?.members[0];
+  if (!pool || !member) throw new Error("pool fixture is incomplete");
+  respond({
+    ...base,
+    pools: [
+      {
+        ...pool,
+        members: [{ ...member, rank_position: null, ranking_score: null }],
+        result:
+          state === "current_rules"
+            ? {
+                state,
+                status_label: "结果已按当前规则更新",
+                trade_date: "2026-09-23",
+                hit_count: 1,
+              }
+            : pool.result,
+      },
+    ],
+  });
+  const { container } = renderApp("/pools");
+  const table = await screen.findByRole("table", { name: "池子成员" });
+  expect(within(table).getByRole("row", { name: /样本01/ })).toBeVisible();
+  expect(screen.getAllByText("暂无可信排名")).toHaveLength(1);
   expect(findJargon(container.textContent ?? "")).toEqual([]);
 });
 
