@@ -293,6 +293,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/factors/results": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 因子检验结果 */
+        get: operations["list_factor_results_api_v1_factors_results_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/factors/results/{job_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 因子检验详情 */
+        get: operations["get_factor_result_api_v1_factors_results__job_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/health": {
         parameters: {
             query?: never;
@@ -2153,6 +2187,23 @@ export interface components {
             /** Sources */
             sources: string[];
         };
+        /**
+         * CorrelationResult
+         * @description One cross-sectional correlation, including an explicit unavailable state.
+         */
+        CorrelationResult: {
+            /** Effective Sample Count */
+            effective_sample_count: number;
+            /** Source Sample Count */
+            source_sample_count: number;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "ok" | "insufficient_samples" | "zero_variance";
+            /** Value */
+            value: number | null;
+        };
         /** CreateCanvasCommand */
         CreateCanvasCommand: {
             /** Command Id */
@@ -2443,6 +2494,16 @@ export interface components {
             data: components["schemas"]["FactorCatalogData"];
             serving: components["schemas"]["ServingMeta"];
         };
+        /** Envelope[FactorResultDetailData] */
+        Envelope_FactorResultDetailData_: {
+            data: components["schemas"]["FactorResultDetailData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[FactorResultListData] */
+        Envelope_FactorResultListData_: {
+            data: components["schemas"]["FactorResultListData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
         /** Envelope[FormulaMarketJobDetailData] */
         Envelope_FormulaMarketJobDetailData_: {
             data: components["schemas"]["FormulaMarketJobDetailData"];
@@ -2686,6 +2747,24 @@ export interface components {
             /** Definitions */
             definitions: components["schemas"]["FactorDefinitionItem"][];
         };
+        /**
+         * FactorDayCoverage
+         * @description Paired sample coverage; factor and return absences can overlap.
+         */
+        FactorDayCoverage: {
+            /** Expected Count */
+            expected_count: number;
+            /** Factor Missing By Reason */
+            factor_missing_by_reason: components["schemas"]["FactorMissingCount"][];
+            /** Factor Missing Count */
+            factor_missing_count: number;
+            /** Return Missing By Reason */
+            return_missing_by_reason: components["schemas"]["ReturnMissingCount"][];
+            /** Return Missing Count */
+            return_missing_count: number;
+            /** Valid Count */
+            valid_count: number;
+        };
         /** FactorDefinitionItem */
         FactorDefinitionItem: {
             /** Archived */
@@ -2719,12 +2798,205 @@ export interface components {
             /** Version */
             version: number;
         };
+        /** FactorDisplayCoverageDay */
+        FactorDisplayCoverageDay: {
+            coverage: components["schemas"]["FactorDayCoverage"];
+            /**
+             * Decision Date
+             * Format: date
+             */
+            decision_date: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "evaluated" | "no_samples";
+        };
+        /** FactorDisplayDecayPeriod */
+        FactorDisplayDecayPeriod: {
+            ic_summary: components["schemas"]["FactorICSummary"] | null;
+            /** Lag */
+            lag: number;
+            /** Source Day Count */
+            source_day_count: number;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "evaluated" | "no_valid_days" | "no_target_period";
+            /** Valid Pair Count */
+            valid_pair_count: number;
+        };
+        /** FactorDisplayICPoint */
+        FactorDisplayICPoint: {
+            /**
+             * Decision Date
+             * Format: date
+             */
+            decision_date: string;
+            normal_ic: components["schemas"]["CorrelationResult"] | null;
+            /** Normal Ic Cumulative Sum */
+            normal_ic_cumulative_sum: number | null;
+            rank_ic: components["schemas"]["CorrelationResult"] | null;
+            /** Rank Ic Cumulative Sum */
+            rank_ic_cumulative_sum: number | null;
+        };
         /** FactorHeadRef */
         FactorHeadRef: {
             /** Content Sha256 */
             content_sha256: string;
             /** Version */
             version: number;
+        };
+        /**
+         * FactorICSummary
+         * @description Separate NormalIC and RankIC long-window summaries.
+         */
+        FactorICSummary: {
+            normal_ic: components["schemas"]["ICSeriesSummary"];
+            rank_ic: components["schemas"]["ICSeriesSummary"];
+        };
+        /** FactorMissingCount */
+        FactorMissingCount: {
+            /** Count */
+            count: number;
+            /**
+             * Reason
+             * @enum {string}
+             */
+            reason: "before_available_date" | "insufficient_history" | "missing_observation" | "missing_value" | "zero_division" | "zero_variance" | "insufficient_samples" | "non_finite_result" | "precision_limit" | "missing_context";
+        };
+        /**
+         * FactorPortfolioDay
+         * @description Completed common return window and its portfolio diagnostics.
+         */
+        FactorPortfolioDay: {
+            /**
+             * Decision At
+             * Format: date-time
+             */
+            decision_at: string;
+            /**
+             * Decision Date
+             * Format: date
+             */
+            decision_date: string;
+            /** Effective Sample Count */
+            effective_sample_count: number;
+            /** Groupings */
+            groupings: components["schemas"]["PortfolioGroupingDay"][];
+            /**
+             * Return End At
+             * Format: date-time
+             */
+            return_end_at: string;
+            /** Source Sample Count */
+            source_sample_count: number;
+        };
+        /** FactorResearchDisplay */
+        FactorResearchDisplay: {
+            /** Basis Label */
+            basis_label: string;
+            /** Coverage Days */
+            coverage_days: components["schemas"]["FactorDisplayCoverageDay"][];
+            /** Decay Periods */
+            decay_periods: components["schemas"]["FactorDisplayDecayPeriod"][];
+            /**
+             * Holding Sessions
+             * @enum {integer}
+             */
+            holding_sessions: 1 | 5 | 10 | 20;
+            /** Ic Points */
+            ic_points: components["schemas"]["FactorDisplayICPoint"][];
+            ic_summary: components["schemas"]["FactorICSummary"] | null;
+            /**
+             * Pool Label
+             * @constant
+             */
+            pool_label: "固定样本";
+            /** Portfolio Days */
+            portfolio_days: components["schemas"]["FactorPortfolioDay"][];
+            /**
+             * Portfolio Status
+             * @enum {string}
+             */
+            portfolio_status: "available" | "available_partial" | "insufficient_data";
+            /**
+             * Return Price Basis
+             * @enum {string}
+             */
+            return_price_basis: "raw" | "forward_adjusted" | "backward_adjusted";
+            /**
+             * Summary Status
+             * @enum {string}
+             */
+            summary_status: "evaluated" | "no_samples";
+        };
+        /** FactorResultDetailData */
+        FactorResultDetailData: {
+            /**
+             * Availability
+             * @enum {string}
+             */
+            availability: "unavailable" | "empty" | "not_found" | "ready";
+            /** Available At */
+            available_at: string | null;
+            research: components["schemas"]["FactorResearchDisplay"] | null;
+            result: components["schemas"]["FactorResultItem"] | null;
+        };
+        /** FactorResultItem */
+        FactorResultItem: {
+            /**
+             * As Of Time
+             * Format: date-time
+             */
+            as_of_time: string;
+            /**
+             * Definition Status
+             * @enum {string}
+             */
+            definition_status: "current" | "historical_unavailable";
+            /** Display Message */
+            display_message: string;
+            /**
+             * Display Status
+             * @enum {string}
+             */
+            display_status: "not_ready" | "display_unavailable" | "not_published" | "available";
+            /** Factor Id */
+            factor_id: string;
+            /** Factor Name Zh */
+            factor_name_zh: string | null;
+            /** Factor Version */
+            factor_version: number;
+            /** Failure Message */
+            failure_message: string | null;
+            /** Job Id */
+            job_id: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "queued" | "running" | "succeeded" | "failed";
+            /** Status Label */
+            status_label: string;
+            /**
+             * Updated At
+             * Format: date-time
+             */
+            updated_at: string;
+        };
+        /** FactorResultListData */
+        FactorResultListData: {
+            /**
+             * Availability
+             * @enum {string}
+             */
+            availability: "unavailable" | "empty" | "populated";
+            /** Available At */
+            available_at: string | null;
+            /** Results */
+            results: components["schemas"]["FactorResultItem"][];
         };
         /** FieldExpr */
         FieldExpr: {
@@ -3137,6 +3409,43 @@ export interface components {
             unrealized_pct: number | null;
             /** Unrealized Pnl */
             unrealized_pnl: number;
+        };
+        /**
+         * ICSeriesSummary
+         * @description Statistics for one IC definition across an ordered set of decision dates.
+         */
+        ICSeriesSummary: {
+            /** Excess Kurtosis */
+            excess_kurtosis: number | null;
+            /** Insufficient Day Count */
+            insufficient_day_count: number;
+            /** Ir */
+            ir: number | null;
+            /** Mean */
+            mean: number | null;
+            /** P Value */
+            p_value: number | null;
+            /** Positive Rate */
+            positive_rate: number | null;
+            /** Sample Std */
+            sample_std: number | null;
+            /** Skewness */
+            skewness: number | null;
+            /** Source Day Count */
+            source_day_count: number;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "ok" | "no_valid_days" | "insufficient_samples" | "zero_variance" | "precision_limit";
+            /** Strong Signal Rate */
+            strong_signal_rate: number | null;
+            /** T Value */
+            t_value: number | null;
+            /** Valid Day Count */
+            valid_day_count: number;
+            /** Zero Variance Day Count */
+            zero_variance_day_count: number;
         };
         /** IntradayData */
         IntradayData: {
@@ -4163,6 +4472,45 @@ export interface components {
              */
             state: "ready" | "no_data" | "unavailable";
         };
+        /**
+         * PortfolioGroupPoint
+         * @description One group's completed return, compounded return and target-weight change.
+         */
+        PortfolioGroupPoint: {
+            /** Cumulative Return */
+            cumulative_return: number;
+            /** Group Number */
+            group_number: number;
+            /** Member Count */
+            member_count: number;
+            /** Period Return */
+            period_return: number;
+            /** Target Weight Turnover */
+            target_weight_turnover: number | null;
+        };
+        /**
+         * PortfolioGroupingDay
+         * @description Period spread and the difference of compounded group sleeve returns.
+         */
+        PortfolioGroupingDay: {
+            /** Effective Sample Count */
+            effective_sample_count: number;
+            /** Group Count */
+            group_count: number;
+            /** Groups */
+            groups: components["schemas"]["PortfolioGroupPoint"][];
+            /** Long Short Cumulative Spread */
+            long_short_cumulative_spread: number | null;
+            /** Long Short Return */
+            long_short_return: number | null;
+            /** Source Sample Count */
+            source_sample_count: number;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "ok" | "insufficient_samples";
+        };
         /** ProjectionInfo */
         ProjectionInfo: {
             /** Available */
@@ -4399,6 +4747,16 @@ export interface components {
             source_state: "ready" | "unavailable";
             /** Source Updated At */
             source_updated_at: string | null;
+        };
+        /** ReturnMissingCount */
+        ReturnMissingCount: {
+            /** Count */
+            count: number;
+            /**
+             * Reason
+             * @enum {string}
+             */
+            reason: "window_unfinished" | "visibility_pending" | "missing_price" | "suspended" | "source_unavailable";
         };
         /** RuntimeServiceItem */
         RuntimeServiceItem: {
@@ -5790,6 +6148,70 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_FactorArchiveCommandData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_factor_results_api_v1_factors_results_get: {
+        parameters: {
+            query?: {
+                generation_id?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_FactorResultListData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_factor_result_api_v1_factors_results__job_id__get: {
+        parameters: {
+            query?: {
+                generation_id?: string | null;
+            };
+            header?: never;
+            path: {
+                job_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_FactorResultDetailData_"];
                 };
             };
             /** @description Validation Error */

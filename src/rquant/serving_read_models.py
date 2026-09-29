@@ -985,6 +985,58 @@ PAGE_PROJECTION_CONTRACTS: Mapping[str, ServingProjectionContract] = MappingProx
             max_rows=1,
             max_bytes=2 * 1024,
         ),
+        "factor_result_state": _contract(
+            "lab_jobs",
+            (
+                ("status_key", "string"),
+                ("status", "string"),
+                ("job_count", "int"),
+                ("ledger_instance_id", "string"),
+                ("snapshot_sha256", "string"),
+            ),
+            ("status_key",),
+            max_rows=1,
+            max_bytes=2 * 1024,
+        ),
+        "factor_result_index": _contract(
+            "lab_jobs",
+            (
+                ("job_id", "string"),
+                ("spec_sha256", "string"),
+                ("factor_id", "string"),
+                ("factor_version", "int"),
+                ("definition_content_sha256", "string"),
+                ("status", "string"),
+                ("failure_code", "string"),
+                ("updated_at", "timestamp"),
+                ("as_of_time", "timestamp"),
+                ("code_revision", "string"),
+                ("source_sha256", "string"),
+                ("result_sha256", "string"),
+                ("full_artifact_sha256", "string"),
+                ("display_artifact_sha256", "string"),
+                ("display_byte_count", "int"),
+                ("completion_sha256", "string"),
+                ("display_status", "string"),
+            ),
+            ("job_id",),
+            max_rows=50,
+            max_bytes=256 * 1024,
+            event_time_columns=("updated_at", "as_of_time"),
+        ),
+        "factor_result_display": _contract(
+            "lab_jobs",
+            (
+                ("job_id", "string"),
+                ("chunk_index", "int"),
+                ("chunk_count", "int"),
+                ("file_sha256", "string"),
+                ("data_b64", "string"),
+            ),
+            ("job_id", "chunk_index"),
+            max_rows=512,
+            max_bytes=6 * 1024 * 1024,
+        ),
         "factor_definition": _contract(
             "lab_jobs",
             (
@@ -1866,6 +1918,17 @@ class ServingReadModelInput(RuntimeContractModel):
             from rquant.factor.serving_projection import validate_factor_definition_projections
 
             validate_factor_definition_projections(
+                {projection.table_name: projection for projection in self.projections}
+            )
+
+        if any(
+            projection.table_name
+            in {"factor_result_state", "factor_result_index", "factor_result_display"}
+            for projection in self.projections
+        ):
+            from rquant.factor.result_serving import validate_factor_result_projections
+
+            validate_factor_result_projections(
                 {projection.table_name: projection for projection in self.projections}
             )
 

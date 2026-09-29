@@ -56,6 +56,7 @@ from rquant.web.routes import (
     data_audit_report_calendar,
     data_audit_report_commands,
     experiments,
+    factor_results,
     factors,
     formula_market_commands,
     formula_market_read,
@@ -408,6 +409,9 @@ def create_app(
         strategies.router, prefix="/api/v1", tags=["strategies"], dependencies=private
     )
     app.include_router(factors.router, prefix="/api/v1", tags=["factors"], dependencies=private)
+    app.include_router(
+        factor_results.router, prefix="/api/v1", tags=["factors"], dependencies=private
+    )
     app.include_router(health.router, prefix="/api/v1", tags=["health"])
     app.include_router(panorama.router, prefix="/api/v1", tags=["panorama"])
     app.include_router(screen.router, prefix="/api/v1", tags=["screen"])

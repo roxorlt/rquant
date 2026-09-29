@@ -5242,6 +5242,11 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
 
     @model_validator(mode="after")
     def validate_snapshot(self) -> Self:
+        from rquant.factor.result_serving import (
+            FACTOR_RESULT_PROJECTION_TABLES,
+            validate_factor_result_projections,
+        )
+
         names = {item.table_name for item in self.projections}
         required = {"data_audit_issue", "data_audit_status", "research_gate_metadata"}
         optional_groups = (
@@ -5250,6 +5255,7 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
             BACKFILL_PLAN_PROJECTION_TABLES,
             FORMULA_MARKET_PROJECTION_TABLES,
             FACTOR_DEFINITION_PROJECTION_TABLES,
+            FACTOR_RESULT_PROJECTION_TABLES,
         )
         if (
             not required.issubset(names)
@@ -5264,6 +5270,8 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
             validate_formula_market_projections(projections)
         if names >= FACTOR_DEFINITION_PROJECTION_TABLES:
             validate_factor_definition_projections(projections)
+        if names >= FACTOR_RESULT_PROJECTION_TABLES:
+            validate_factor_result_projections(projections)
         status = projections["data_audit_status"].rows
         issues = projections["data_audit_issue"].rows
         if len(status) != 1 or len(issues) != status[0]["finding_count"]:
@@ -5435,7 +5443,10 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
         backfill_plan_projections: tuple[ServingProjectionPayload, ...] = (),
         formula_market_projections: tuple[ServingProjectionPayload, ...] = (),
         factor_definition_projections: tuple[ServingProjectionPayload, ...] = (),
+        factor_result_projections: tuple[ServingProjectionPayload, ...] = (),
     ) -> LabPageProjectionSnapshot:
+        from rquant.factor.result_serving import FACTOR_RESULT_PROJECTION_TABLES
+
         available = normalize_aware_utc(available_at)
         status = audit_status or DataAuditStatusProjectionRow(
             latest_status="never_run", finding_count=0, p0_count=0
@@ -5485,6 +5496,12 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
             != FACTOR_DEFINITION_PROJECTION_TABLES
         ):
             raise ValueError("factor definition projections must be complete")
+        if (
+            factor_result_projections
+            and {item.table_name for item in factor_result_projections}
+            != FACTOR_RESULT_PROJECTION_TABLES
+        ):
+            raise ValueError("factor result projections must be complete")
         projections = tuple(
             sorted(
                 (
@@ -5494,6 +5511,7 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
                     *backfill_plan_projections,
                     *formula_market_projections,
                     *factor_definition_projections,
+                    *factor_result_projections,
                 ),
                 key=lambda item: item.table_name,
             )
