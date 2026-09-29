@@ -11,6 +11,7 @@ from typing import Annotated, Literal
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from rquant.factor.definition import FactorDefinition
 from rquant.factor.evaluate import (
     DailyFactorResult,
     FactorEvaluationInput,
@@ -185,6 +186,7 @@ class FactorResearchResult(BaseModel):
 
     model_config = _IMMUTABLE
 
+    definition: FactorDefinition
     factor_id: str
     factor_version: int
     factor_source_id: str
@@ -291,6 +293,7 @@ def assemble_factor_research_result(request: FactorResearchRequest) -> FactorRes
         else None
     )
     fields: dict[str, object] = {
+        "definition": checked.factor_input.definition,
         "factor_id": factor_values.factor_id,
         "factor_version": factor_values.version,
         "factor_source_id": checked.factor_source_id,

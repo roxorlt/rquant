@@ -81,11 +81,11 @@ def test_three_stock_two_period_curves_are_compounded_in_time_order() -> None:
     assert [point.cumulative_return for point in later.groups] == pytest.approx([-0.01, 0.05, 0.32])
     assert [point.target_weight_turnover for point in early.groups] == [None, None, None]
     assert [point.target_weight_turnover for point in later.groups] == pytest.approx([1, 1, 1])
-    assert (early.long_short_return, early.long_short_cumulative_return) == pytest.approx(
+    assert (early.long_short_return, early.long_short_cumulative_spread) == pytest.approx(
         (0.1, 0.1)
     )
-    assert (later.long_short_return, later.long_short_cumulative_return) == pytest.approx(
-        (0.2, 0.32)
+    assert (later.long_short_return, later.long_short_cumulative_spread) == pytest.approx(
+        (0.2, 0.33)
     )
     assert all(group.status == "insufficient_samples" for group in first.groupings[1:])
     assert all(
@@ -223,7 +223,6 @@ def test_cumulative_curve_rejects_incomplete_or_inconsistent_windows(
     ("returns", "message"),
     [
         ((0, 0, -1.01), "below -100%"),
-        ((1, 0, -1), "long-short.*below -100%"),
     ],
 )
 def test_return_below_minus_one_cannot_be_compounded(
@@ -237,6 +236,21 @@ def test_return_below_minus_one_cannot_be_compounded(
     )
     with pytest.raises(ValueError, match=message):
         evaluate_factor_portfolios(_input(samples))
+
+
+def test_long_short_spread_below_minus_one_is_a_diagnostic_not_compounded_nav() -> None:
+    from rquant.factor.portfolio import evaluate_factor_portfolios
+
+    samples = tuple(
+        _sample(code, factor, returned)
+        for factor, (code, returned) in enumerate(
+            zip(("A", "B", "C"), (1.0, 0.0, -1.0), strict=True), 1
+        )
+    )
+    group = evaluate_factor_portfolios(_input(samples)).days[0].groupings[0]
+
+    assert group.long_short_return == pytest.approx(-2.0)
+    assert group.long_short_cumulative_spread == pytest.approx(-2.0)
 
 
 def test_compounding_overflow_is_rejected_instead_of_emitting_infinity() -> None:

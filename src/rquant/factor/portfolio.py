@@ -1,4 +1,4 @@
-"""Pure quantile portfolio curves from complete, non-overlapping factor observations."""
+"""Pure quantile research curves from complete, non-overlapping observations."""
 
 from __future__ import annotations
 
@@ -33,7 +33,7 @@ class PortfolioGroupPoint(BaseModel):
 
 
 class PortfolioGroupingDay(BaseModel):
-    """One requested grouping count on one decision date."""
+    """Period spread and the difference of compounded group sleeve returns."""
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
@@ -43,7 +43,7 @@ class PortfolioGroupingDay(BaseModel):
     effective_sample_count: int
     groups: tuple[PortfolioGroupPoint, ...]
     long_short_return: FiniteFloat | None
-    long_short_cumulative_return: FiniteFloat | None
+    long_short_cumulative_spread: FiniteFloat | None
 
 
 class FactorPortfolioDay(BaseModel):
@@ -103,7 +103,7 @@ def _common_window(samples: list[FactorSample], universe: set[str]) -> tuple[dat
 
 
 def evaluate_factor_portfolios(data: FactorEvaluationInput) -> FactorPortfolioDiagnostics:
-    """Compound complete quantile returns and compare adjacent equal-weight targets."""
+    """Compound group sleeves; their cumulative spread is not a tradable NAV."""
     data = FactorEvaluationInput.model_validate(data)
     universe = set(data.universe)
     by_date: dict[date, list[FactorSample]] = {}
@@ -113,7 +113,6 @@ def evaluate_factor_portfolios(data: FactorEvaluationInput) -> FactorPortfolioDi
     previous_end: datetime | None = None
     previous_members: dict[int, tuple[tuple[str, ...], ...]] = {}
     group_gross: dict[int, tuple[float, ...]] = {}
-    long_short_gross: dict[int, float] = {}
     days: list[FactorPortfolioDay] = []
 
     for decision_date in sorted(by_date):
@@ -135,7 +134,7 @@ def evaluate_factor_portfolios(data: FactorEvaluationInput) -> FactorPortfolioDi
                         effective_sample_count=len(samples),
                         groups=(),
                         long_short_return=None,
-                        long_short_cumulative_return=None,
+                        long_short_cumulative_spread=None,
                     )
                 )
                 continue
@@ -166,10 +165,10 @@ def evaluate_factor_portfolios(data: FactorEvaluationInput) -> FactorPortfolioDi
                 )
             spread = groups[-1].period_return - groups[0].period_return
             if not isfinite(spread):
-                raise ValueError("non-finite long-short return")
-            if spread < -1:
-                raise ValueError("long-short return below -100% cannot be compounded")
-            spread_gross = _compound(long_short_gross.get(group_count, 1.0), spread)
+                raise ValueError("non-finite long-short period spread")
+            cumulative_spread = groups[-1].cumulative_return - groups[0].cumulative_return
+            if not isfinite(cumulative_spread):
+                raise ValueError("non-finite long-short cumulative spread")
             groupings.append(
                 PortfolioGroupingDay(
                     group_count=group_count,
@@ -178,11 +177,10 @@ def evaluate_factor_portfolios(data: FactorEvaluationInput) -> FactorPortfolioDi
                     effective_sample_count=len(samples),
                     groups=tuple(groups),
                     long_short_return=spread,
-                    long_short_cumulative_return=spread_gross - 1,
+                    long_short_cumulative_spread=cumulative_spread,
                 )
             )
             group_gross[group_count] = tuple(current_gross)
-            long_short_gross[group_count] = spread_gross
             previous_members[group_count] = current_members
         days.append(
             FactorPortfolioDay(

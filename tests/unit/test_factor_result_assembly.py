@@ -69,6 +69,7 @@ def _request(
     forward_returns: tuple[FactorForwardReturn, ...] | None = None,
     observations: tuple[FeatureObservation, ...] | None = None,
     version: int = 1,
+    expression: str = "close",
     factor_source_id: str = "feature-snapshot-a",
     return_source_id: str = "adjusted-price-snapshot-a",
     return_price_basis: str = "forward_adjusted",
@@ -84,7 +85,7 @@ def _request(
             direction="higher_is_better",
             version=version,
             earliest_available_date=_DAYS[0],
-            expression="close",
+            expression=expression,
             feature_catalog=FeatureCatalog(columns=("close",)),
         ),
         universe=_STOCKS,
@@ -367,3 +368,47 @@ def test_content_digest_binds_definition_source_basis_and_return_values() -> Non
         ),
     )
     assert all(assemble_factor_research_result(item).sha256 != base.sha256 for item in alternatives)
+
+
+def test_legal_return_spread_below_minus_100_percent_keeps_complete_result() -> None:
+    from rquant.factor import assemble_factor_research_result
+
+    rows = _forward_returns()
+    altered = (
+        rows[0].model_copy(update={"value": 1.0}),
+        rows[1],
+        rows[2].model_copy(update={"value": -0.2}),
+    ) + rows[3:]
+
+    result = assemble_factor_research_result(_request(forward_returns=altered))
+
+    assert [day.coverage.valid_count for day in result.days] == [3, 3]
+    assert result.ic_summary is not None
+    assert result.portfolio_status == "available"
+    assert result.portfolio_diagnostics is not None
+    first, second = result.portfolio_diagnostics.days
+    first_three = first.groupings[0]
+    second_three = second.groupings[0]
+    assert [group.cumulative_return for group in first_three.groups] == pytest.approx(
+        [1.0, 0.0, -0.2]
+    )
+    assert first_three.long_short_return == pytest.approx(-1.2)
+    assert first_three.long_short_cumulative_spread == pytest.approx(-1.2)
+    assert second_three.long_short_return == pytest.approx(0.2)
+    assert second_three.long_short_cumulative_spread == pytest.approx(-0.92)
+
+
+def test_result_carries_full_definition_when_expression_changes_under_same_identity() -> None:
+    from rquant.factor import assemble_factor_research_result
+
+    original = assemble_factor_research_result(_request())
+    changed = assemble_factor_research_result(_request(expression="close * 2"))
+
+    assert original.factor_id == changed.factor_id == "price_factor"
+    assert original.factor_version == changed.factor_version == 1
+    assert original.factor_source_id == changed.factor_source_id
+    assert original.definition.expression == "close"
+    assert changed.definition.expression == "close * 2"
+    assert changed.definition.dependency_columns == ("close",)
+    assert changed.definition.feature_catalog.columns == ("close",)
+    assert changed.sha256 != original.sha256
