@@ -17,6 +17,14 @@ from rquant.factor.expression import (
     ParsedFactorExpression,
     parse_factor_expression,
 )
+from rquant.factor.historical_adapter import (
+    HistoricalFactorAdaptation,
+    HistoricalFactorAdapterRequest,
+    HistoricalFactorResearch,
+    HistoricalFactorSourceReceipt,
+    adapt_historical_factor_source,
+    assemble_historical_factor_research,
+)
 from rquant.factor.portfolio import (
     FactorPortfolioDay,
     FactorPortfolioDiagnostics,
@@ -73,6 +81,10 @@ __all__ = [
     "IndustryObservation",
     "MarketCapObservation",
     "FactorICSummary",
+    "HistoricalFactorAdaptation",
+    "HistoricalFactorAdapterRequest",
+    "HistoricalFactorResearch",
+    "HistoricalFactorSourceReceipt",
     "GroupReturn",
     "GroupingResult",
     "ICSeriesSummary",
@@ -81,6 +93,8 @@ __all__ = [
     "PortfolioGroupingDay",
     "ReturnMissingCount",
     "assemble_factor_research_result",
+    "adapt_historical_factor_source",
+    "assemble_historical_factor_research",
     "build_factor_definition",
     "evaluate_factor",
     "evaluate_factor_portfolios",
