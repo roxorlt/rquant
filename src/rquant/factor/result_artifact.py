@@ -301,8 +301,10 @@ def publish_factor_research_artifact(
         os.close(root_fd)
 
 
-def load_factor_research_artifact(root: Path, sha256: str) -> FactorResearchArtifactV1:
-    """Read only a digest-derived direct child of a verified physical root."""
+def _load_factor_research_artifact_with_identity(
+    root: Path, sha256: str
+) -> tuple[FactorResearchArtifactV1, tuple[int, int], tuple[int, ...]]:
+    """Read one verified original and retain its physical generation for the ledger."""
     if re.fullmatch(r"[0-9a-f]{64}", sha256) is None:
         raise ValueError("factor artifact identity must be a lowercase SHA-256")
     root = _root_path(root)
@@ -316,8 +318,14 @@ def load_factor_research_artifact(root: Path, sha256: str) -> FactorResearchArti
             current = _require_named_regular(root_fd, f"{_PREFIX}{sha256}.json", descriptor)
             if _file_identity(current) != _file_identity(verified_stat):
                 raise ValueError("factor artifact changed after read")
-            return artifact
+            return artifact, _root_identity(os.fstat(root_fd)), _file_identity(verified_stat)
         finally:
             os.close(descriptor)
     finally:
         os.close(root_fd)
+
+
+def load_factor_research_artifact(root: Path, sha256: str) -> FactorResearchArtifactV1:
+    """Read only a digest-derived direct child of a verified physical root."""
+    artifact, _, _ = _load_factor_research_artifact_with_identity(root, sha256)
+    return artifact
