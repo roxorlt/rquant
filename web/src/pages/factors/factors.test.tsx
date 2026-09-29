@@ -1,4 +1,4 @@
-import { act, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { HttpResponse, http } from "msw";
 import { metaEnvelope } from "@/test/fixtures";
@@ -67,6 +67,143 @@ function publish(
 }
 
 describe("因子库", () => {
+  it("清除被拒绝的命令后，延迟的目录刷新不续查旧命令", async () => {
+    publish();
+    let releaseMeta = () => {};
+    const metaGate = new Promise<void>((resolve) => {
+      releaseMeta = resolve;
+    });
+    let metaRequests = 0;
+    let resumeRequests = 0;
+    server.use(
+      http.get("*/api/v1/meta", async () => {
+        metaRequests += 1;
+        if (metaRequests > 1) await metaGate;
+        return HttpResponse.json(metaEnvelope());
+      }),
+      http.post("*/api/v1/factors/definitions/price_volume_factor/archive", async ({ request }) => {
+        const body = (await request.json()) as { command_id: string };
+        return HttpResponse.json({
+          data: {
+            status: "rejected",
+            command_id: body.command_id,
+            factor_id: "price_volume_factor",
+            version: 2,
+            content_sha256: "a".repeat(64),
+            current_head_updated: false,
+            message: "归档未受理，请刷新后重试。",
+          },
+          serving: metaEnvelope().serving,
+        });
+      }),
+      http.post("*/api/v1/factors/definitions/price_volume_factor/archive/resume", () => {
+        resumeRequests += 1;
+        return HttpResponse.json({ data: { status: "rejected" }, serving: metaEnvelope().serving });
+      }),
+    );
+    renderApp("/factors");
+    await screen.findByRole("button", { name: "归档" });
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "归档" }));
+    await user.click(screen.getByRole("button", { name: "确认归档" }));
+    await screen.findByText("归档未受理，请刷新后重试。");
+    await user.click(screen.getByRole("button", { name: "刷新当前版本" }));
+    await waitFor(() => expect(metaRequests).toBe(2));
+    await act(async () => releaseMeta());
+    await waitFor(() => expect(screen.getByRole("button", { name: "归档" })).toBeVisible());
+    expect(resumeRequests).toBe(0);
+  });
+
+  it("旧续查响应晚于新命令时不能覆盖新状态或清掉新命令", async () => {
+    publish();
+    let releaseMeta = () => {};
+    const metaGate = new Promise<void>((resolve) => {
+      releaseMeta = resolve;
+    });
+    let metaRequests = 0;
+    let releaseOldResponse = () => {};
+    const oldResponseGate = new Promise<void>((resolve) => {
+      releaseOldResponse = resolve;
+    });
+    let submitRequests = 0;
+    let resumeRequests = 0;
+    server.use(
+      http.get("*/api/v1/meta", async () => {
+        metaRequests += 1;
+        if (metaRequests > 1) await metaGate;
+        return HttpResponse.json(metaEnvelope());
+      }),
+      http.post("*/api/v1/factors/definitions/price_volume_factor/archive", async ({ request }) => {
+        submitRequests += 1;
+        const body = (await request.json()) as { command_id: string };
+        return HttpResponse.json({
+          data: {
+            status: "pending",
+            command_id: body.command_id,
+            factor_id: "price_volume_factor",
+            version: 2,
+            content_sha256: "a".repeat(64),
+            current_head_updated: false,
+            message: submitRequests === 1 ? "归档正在处理，请稍后查看。" : "新命令正在处理。",
+          },
+          serving: metaEnvelope().serving,
+        });
+      }),
+      http.post(
+        "*/api/v1/factors/definitions/price_volume_factor/archive/resume",
+        async ({ request }) => {
+          resumeRequests += 1;
+          if (resumeRequests === 2) await oldResponseGate;
+          const body = (await request.json()) as { command_id: string };
+          return HttpResponse.json({
+            data: {
+              status: "rejected",
+              command_id: body.command_id,
+              factor_id: "price_volume_factor",
+              version: 2,
+              content_sha256: "a".repeat(64),
+              current_head_updated: false,
+              message: "归档未受理，请刷新后重试。",
+            },
+            serving: metaEnvelope().serving,
+          });
+        },
+      ),
+    );
+    renderApp("/factors");
+    await screen.findByRole("button", { name: "归档" });
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "归档" }));
+    await user.click(screen.getByRole("button", { name: "确认归档" }));
+    await screen.findByText("归档正在处理，请稍后查看。");
+    const refresh = screen.getByRole("button", { name: "刷新状态" });
+    await act(async () => {
+      fireEvent.click(refresh);
+      fireEvent.click(refresh);
+    });
+    await waitFor(() => expect(resumeRequests).toBe(2));
+    await screen.findByText("归档未受理，请刷新后重试。");
+    await user.click(screen.getByRole("button", { name: "刷新当前版本" }));
+    await waitFor(() => expect(metaRequests).toBe(2));
+    await user.click(screen.getByRole("button", { name: "归档" }));
+    await user.click(screen.getByRole("button", { name: "确认归档" }));
+    await screen.findByText("新命令正在处理。");
+    const newCommand = JSON.parse(
+      window.localStorage.getItem("rquant.factor.archive-command.v1") ?? "{}",
+    ) as {
+      command: { command_id: string };
+    };
+    await act(async () => releaseOldResponse());
+    expect(screen.getByText("新命令正在处理。")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "刷新当前版本" })).toBeNull();
+    expect(
+      JSON.parse(window.localStorage.getItem("rquant.factor.archive-command.v1") ?? "{}") as {
+        command: { command_id: string };
+      },
+    ).toEqual(newCommand);
+    await act(async () => releaseMeta());
+  });
+
   it("确认当前版本归档后保留原命令并续查发布", async () => {
     publish();
     const ids: string[] = [];

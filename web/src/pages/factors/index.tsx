@@ -24,6 +24,16 @@ const ARCHIVE_STORAGE_KEY = "rquant.factor.archive-command.v1";
 
 type StoredArchive = { factorId: string; command: FactorArchiveCommandRequest };
 
+function sameArchive(current: StoredArchive | null, candidate: StoredArchive): boolean {
+  return (
+    current !== null &&
+    current.factorId === candidate.factorId &&
+    current.command.command_id === candidate.command.command_id &&
+    current.command.generation_id === candidate.command.generation_id &&
+    current.command.requested_at === candidate.command.requested_at
+  );
+}
+
 function storedArchive(): StoredArchive | null {
   try {
     const raw = window.localStorage.getItem(ARCHIVE_STORAGE_KEY);
@@ -83,6 +93,8 @@ export default function FactorsPage() {
   const [archiveError, setArchiveError] = useState<string | null>(null);
   const [archiveBusy, setArchiveBusy] = useState(false);
   const [confirmArchive, setConfirmArchive] = useState(false);
+  const archiveCommandRef = useRef(archiveCommand);
+  const archiveBusyRef = useRef(false);
   const restoredCommand = useRef(false);
   const selectedId =
     selection !== null && selection.generationId === currentGeneration ? selection.factorId : null;
@@ -101,27 +113,35 @@ export default function FactorsPage() {
     catalog.data?.availability !== "unavailable" &&
     !catalog.isFetching;
   const runArchive = async (record: StoredArchive, resume: boolean) => {
+    if (!sameArchive(archiveCommandRef.current, record)) return;
+    archiveBusyRef.current = true;
     setArchiveBusy(true);
     setArchiveError(null);
     try {
       const result = await postFactorArchive(record.factorId, record.command, resume);
+      if (!sameArchive(archiveCommandRef.current, record)) return;
       setArchiveResult(result);
       if (result.status === "published") {
         await meta.refetch();
       }
     } catch (error) {
-      setArchiveError(
-        error instanceof Error ? error.message : "归档状态暂不可用，请用原命令继续查看。",
-      );
+      if (sameArchive(archiveCommandRef.current, record)) {
+        setArchiveError(
+          error instanceof Error ? error.message : "归档状态暂不可用，请用原命令继续查看。",
+        );
+      }
     } finally {
-      setArchiveBusy(false);
+      if (sameArchive(archiveCommandRef.current, record)) {
+        archiveBusyRef.current = false;
+        setArchiveBusy(false);
+      }
     }
   };
 
   useEffect(() => {
     if (restoredCommand.current) return;
     restoredCommand.current = true;
-    const record = storedArchive();
+    const record = archiveCommandRef.current;
     if (record !== null) void runArchive(record, true);
   });
 
@@ -140,6 +160,7 @@ export default function FactorsPage() {
       },
     };
     window.localStorage.setItem(ARCHIVE_STORAGE_KEY, JSON.stringify(record));
+    archiveCommandRef.current = record;
     setArchiveCommand(record);
     setArchiveResult(null);
     setConfirmArchive(false);
@@ -147,24 +168,32 @@ export default function FactorsPage() {
   };
 
   const clearRejectedArchive = () => {
+    archiveCommandRef.current = null;
+    archiveBusyRef.current = false;
     window.localStorage.removeItem(ARCHIVE_STORAGE_KEY);
     setArchiveCommand(null);
     setArchiveResult(null);
     setArchiveError(null);
-    void refreshDefinitions();
+    setArchiveBusy(false);
+    void refreshDefinitions(false);
   };
 
   const finishArchive = () => {
     if (!canFinishArchive) return;
+    archiveCommandRef.current = null;
+    archiveBusyRef.current = false;
     window.localStorage.removeItem(ARCHIVE_STORAGE_KEY);
     setArchiveCommand(null);
     setArchiveResult(null);
     setArchiveError(null);
+    setArchiveBusy(false);
   };
 
-  const refreshDefinitions = async () => {
+  const refreshDefinitions = async (resumeArchive = true) => {
     const refreshed = await meta.refetch();
-    if (archiveCommand !== null && !archiveBusy) void runArchive(archiveCommand, true);
+    const activeCommand = archiveCommandRef.current;
+    if (resumeArchive && activeCommand !== null && !archiveBusyRef.current)
+      void runArchive(activeCommand, true);
     if (refreshed.isError || refreshed.data === undefined) return;
     const nextGeneration = refreshed.data.data.generation?.generation_id ?? null;
     if (nextGeneration !== currentGeneration) {
