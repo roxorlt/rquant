@@ -370,6 +370,46 @@ def test_historical_adapter_rejects_incomplete_or_inconsistent_sse_calendar(
 
 
 @pytest.mark.parametrize(
+    "pretrade_date",
+    [None, _FIRST, _FIRST + timedelta(days=1)],
+    ids=["null", "self", "inside_range"],
+)
+def test_historical_adapter_rejects_invalid_first_open_predecessor(
+    tmp_path: Path, pretrade_date: date | None
+) -> None:
+    from rquant.factor.historical_adapter import (
+        HistoricalFactorAdapterRequest,
+        adapt_historical_factor_source,
+    )
+
+    def alter(store: DuckDBStore) -> None:
+        store._conn.execute(
+            "UPDATE trade_calendar SET pretrade_date = ? WHERE cal_date = ?",
+            [pretrade_date, _FIRST],
+        )
+
+    with _admitted(tmp_path, before_binding=alter) as (
+        _store,
+        lease,
+        decision,
+        _snapshot,
+        _binding,
+    ):
+        request = HistoricalFactorAdapterRequest(
+            definition=_definition(),
+            stock_codes=_STOCKS,
+            pool_basis="explicit_fixed_list",
+            evaluation_days=_EVALUATION_DAYS,
+            query_start_date=_FIRST,
+            query_end_date=_LAST,
+            holding_sessions=5,
+            as_of=_at(_LAST, 9, 25),
+        )
+        with pytest.raises(ValueError, match="pretrade_date"):
+            adapt_historical_factor_source(lease, decision, request)
+
+
+@pytest.mark.parametrize(
     "evaluation_days,expression,query_end,holding_sessions,expected",
     [
         ((date(2026, 7, 13),), "close", _LAST, 1, "preceding panel"),

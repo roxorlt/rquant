@@ -352,6 +352,13 @@ def _open_days(
         if row is None:
             raise ValueError(f"SSE calendar is incomplete at {day.isoformat()}")
         if row.is_open:
+            if not opened and (
+                row.pretrade_date is None or row.pretrade_date >= request.query_start_date
+            ):
+                raise ValueError(
+                    "SSE calendar first pretrade_date must precede query start "
+                    f"at {day.isoformat()}"
+                )
             if opened and row.pretrade_date != opened[-1]:
                 raise ValueError(f"SSE calendar pretrade_date differs at {day.isoformat()}")
             opened.append(day)
