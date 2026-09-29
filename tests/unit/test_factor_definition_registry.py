@@ -369,6 +369,36 @@ def test_every_read_fails_closed_on_damaged_history(tmp_path: Path, damage: str)
             read()
 
 
+def test_reads_reject_old_version_rewritten_with_matching_row_digest(tmp_path: Path) -> None:
+    path = tmp_path / "factors.sqlite3"
+    registry = FactorDefinitionRegistry(path)
+    original = _save(registry, "first", _definition())
+    _save(registry, "second", _definition(version=2), _ref(registry))
+    replacement = _definition(name="改写的旧版")
+    payload = json.dumps(
+        replacement.model_dump(mode="json", round_trip=True),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    replacement_digest = hashlib.sha256(payload.encode()).hexdigest()
+    assert replacement_digest != original.content_sha256
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "UPDATE factor_versions SET definition_json = ?, content_sha256 = ? "
+            "WHERE factor_id = ? AND version = 1",
+            (payload, replacement_digest, replacement.factor_id),
+        )
+    reopened = FactorDefinitionRegistry(path)
+    for read in (
+        lambda: reopened.get_version(replacement.factor_id, 1),
+        lambda: reopened.get_head(replacement.factor_id),
+        lambda: reopened.list_current(),
+    ):
+        with pytest.raises(FactorIntegrityError):
+            read()
+
+
 def test_list_is_sorted_bounded_and_validates_hidden_archived_rows(tmp_path: Path) -> None:
     path = tmp_path / "factors.sqlite3"
     registry = FactorDefinitionRegistry(path)

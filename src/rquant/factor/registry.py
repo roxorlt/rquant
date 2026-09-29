@@ -21,6 +21,7 @@ _DIGEST_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 _TABLE_NAMES = frozenset(
     {"factor_versions", "factor_heads", "factor_commands", "factor_archive_events"}
 )
+_SCHEMA_VERSION = 2
 _MAX_LIST_LIMIT = 1000
 
 
@@ -162,18 +163,28 @@ class FactorDefinitionRegistry:
                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
             )
         }
-        if version != 1 or not _TABLE_NAMES.issubset(tables):
+        if version != _SCHEMA_VERSION or not _TABLE_NAMES.issubset(tables):
             raise FactorIntegrityError("factor registry schema is incomplete")
 
     @staticmethod
     def _initialize_schema(connection: sqlite3.Connection) -> None:
         for statement in (
+            """CREATE TABLE factor_commands (
+                command_id TEXT NOT NULL PRIMARY KEY,
+                action TEXT NOT NULL CHECK (action IN ('save', 'archive')),
+                request_sha256 TEXT NOT NULL,
+                receipt_json TEXT NOT NULL,
+                receipt_sha256 TEXT NOT NULL
+            )""",
             """CREATE TABLE factor_versions (
                 factor_id TEXT NOT NULL,
                 version INTEGER NOT NULL CHECK (version >= 1),
                 definition_json TEXT NOT NULL,
                 content_sha256 TEXT NOT NULL,
-                PRIMARY KEY (factor_id, version)
+                save_command_id TEXT NOT NULL UNIQUE,
+                PRIMARY KEY (factor_id, version),
+                FOREIGN KEY (save_command_id) REFERENCES factor_commands(command_id)
+                    DEFERRABLE INITIALLY DEFERRED
             )""",
             """CREATE TABLE factor_heads (
                 factor_id TEXT NOT NULL PRIMARY KEY,
@@ -181,13 +192,6 @@ class FactorDefinitionRegistry:
                 content_sha256 TEXT NOT NULL,
                 archived INTEGER NOT NULL CHECK (archived IN (0, 1)),
                 FOREIGN KEY (factor_id, version) REFERENCES factor_versions(factor_id, version)
-            )""",
-            """CREATE TABLE factor_commands (
-                command_id TEXT NOT NULL PRIMARY KEY,
-                action TEXT NOT NULL CHECK (action IN ('save', 'archive')),
-                request_sha256 TEXT NOT NULL,
-                receipt_json TEXT NOT NULL,
-                receipt_sha256 TEXT NOT NULL
             )""",
             """CREATE TABLE factor_archive_events (
                 command_id TEXT NOT NULL PRIMARY KEY REFERENCES factor_commands(command_id)
@@ -198,7 +202,7 @@ class FactorDefinitionRegistry:
                 UNIQUE (factor_id, version),
                 FOREIGN KEY (factor_id, version) REFERENCES factor_versions(factor_id, version)
             )""",
-            "PRAGMA user_version = 1",
+            f"PRAGMA user_version = {_SCHEMA_VERSION}",
         ):
             connection.execute(statement)
 
@@ -319,8 +323,13 @@ class FactorDefinitionRegistry:
             (factor_id,),
         ).fetchone()
         version_rows = connection.execute(
-            "SELECT version, definition_json, content_sha256 FROM factor_versions "
-            "WHERE factor_id = ? ORDER BY version",
+            "SELECT v.version, v.definition_json, v.content_sha256, v.save_command_id, "
+            "c.action AS command_action, c.request_sha256 AS command_request_sha256, "
+            "c.receipt_json AS command_receipt_json, "
+            "c.receipt_sha256 AS command_receipt_sha256 "
+            "FROM factor_versions AS v LEFT JOIN factor_commands AS c "
+            "ON c.command_id = v.save_command_id "
+            "WHERE v.factor_id = ? ORDER BY v.version",
             (factor_id,),
         ).fetchall()
         if head_row is None:
@@ -358,6 +367,42 @@ class FactorDefinitionRegistry:
             definition = _decode_definition(payload)
             if definition.factor_id != factor_id or definition.version != allocated_version:
                 raise FactorIntegrityError("factor definition identity differs from row key")
+            save_command_id = row["save_command_id"]
+            command_receipt_json = row["command_receipt_json"]
+            if (
+                not isinstance(save_command_id, str)
+                or _COMMAND_ID_PATTERN.fullmatch(save_command_id) is None
+                or row["command_action"] != "save"
+                or not isinstance(command_receipt_json, str)
+                or _sha256(command_receipt_json) != row["command_receipt_sha256"]
+            ):
+                raise FactorIntegrityError("factor save command anchor is invalid")
+            save_receipt = _decode_receipt(command_receipt_json)
+            expected_receipt = FactorDefinitionReceipt(
+                command_id=save_command_id,
+                action="save",
+                factor_id=factor_id,
+                version=allocated_version,
+                content_sha256=digest,
+                archived=False,
+            )
+            prior = records[-1] if records else None
+            expected_request = SaveFactorDefinitionRequest(
+                command_id=save_command_id,
+                definition=definition,
+                expected_head=(
+                    FactorHeadRef(
+                        version=prior.definition.version,
+                        content_sha256=prior.content_sha256,
+                    )
+                    if prior is not None
+                    else None
+                ),
+            )
+            if save_receipt != expected_receipt or row["command_request_sha256"] != _request_sha256(
+                "save", expected_request
+            ):
+                raise FactorIntegrityError("factor version differs from save command anchor")
             records.append(
                 FactorDefinitionRecord(
                     definition=definition,
@@ -409,8 +454,9 @@ class FactorDefinitionRegistry:
             digest = _sha256(payload)
             connection.execute(
                 "INSERT INTO factor_versions "
-                "(factor_id, version, definition_json, content_sha256) VALUES (?, ?, ?, ?)",
-                (definition.factor_id, definition.version, payload, digest),
+                "(factor_id, version, definition_json, content_sha256, save_command_id) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (definition.factor_id, definition.version, payload, digest, request.command_id),
             )
             connection.execute(
                 "INSERT INTO factor_heads (factor_id, version, content_sha256, archived) "
