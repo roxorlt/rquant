@@ -44,6 +44,16 @@ export default function FactorsPage() {
     currentGeneration !== catalog.serving.generation_id;
   const rows = changed ? [] : (catalog.data?.definitions ?? []);
   const selected = rows.find((row) => row.factor_id === selectedId) ?? rows[0] ?? null;
+  const refreshDefinitions = async () => {
+    const refreshed = await meta.refetch();
+    if (refreshed.isError || refreshed.data === undefined) return;
+    const nextGeneration = refreshed.data.data.generation?.generation_id ?? null;
+    if (nextGeneration !== currentGeneration) {
+      setSelection(null);
+    } else if (typeof nextGeneration === "string") {
+      catalog.refetch();
+    }
+  };
 
   return (
     <>
@@ -54,7 +64,7 @@ export default function FactorsPage() {
         actions={
           <Button
             size="sm"
-            onClick={catalog.refetch}
+            onClick={() => void refreshDefinitions()}
             disabled={
               currentGeneration === null || currentGeneration === undefined || catalog.isFetching
             }
@@ -82,7 +92,7 @@ export default function FactorsPage() {
         <Panel>
           <div className="factor-state" role="alert">
             <p>{changed ? "数据已更新，请重新查看因子。" : catalog.error?.message}</p>
-            <Button size="sm" onClick={catalog.refetch}>
+            <Button size="sm" onClick={() => void refreshDefinitions()}>
               重新加载
             </Button>
           </div>

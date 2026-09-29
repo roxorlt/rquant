@@ -122,6 +122,58 @@ describe("因子库", () => {
     expect(screen.getByRole("region", { name: "因子详情" })).not.toHaveTextContent("成交变化");
   });
 
+  it.each(["重新加载", "刷新"])("因子 GET 409 后点击%s先核对新数据代并恢复列表", async (action) => {
+    let servingGeneration = firstGeneration;
+    const requested: string[] = [];
+    const nextDefinitions = definitions.map((item, index) =>
+      index === 0
+        ? { ...item, name_zh: "新版价量动量", expression: "ts_mean(close, 8)" }
+        : { ...item, name_zh: "新版成交变化" },
+    );
+    server.use(
+      http.get("*/api/v1/meta", () => {
+        requested.push(`meta:${servingGeneration}`);
+        return HttpResponse.json(metaEnvelope({ generationId: servingGeneration }));
+      }),
+      http.get("*/api/v1/factors/definitions", ({ request }) => {
+        const requestedGeneration = new URL(request.url).searchParams.get("generation_id");
+        requested.push(`catalog:${requestedGeneration}`);
+        if (requestedGeneration !== servingGeneration) {
+          return new HttpResponse(null, { status: 409 });
+        }
+        return HttpResponse.json(
+          catalog(
+            servingGeneration === firstGeneration ? definitions : nextDefinitions,
+            servingGeneration,
+          ),
+        );
+      }),
+    );
+    const user = userEvent.setup();
+    const view = renderApp("/factors");
+    const list = await screen.findByRole("table", { name: "因子列表" });
+    await user.click(within(list).getByRole("row", { name: /成交变化/ }));
+    expect(screen.getByRole("region", { name: "因子详情" })).toHaveTextContent("成交变化");
+
+    servingGeneration = nextGeneration;
+    await act(async () => {
+      await view.queryClient.invalidateQueries({ queryKey: ["factors", "definitions"] });
+    });
+    expect(await screen.findByText("数据已更新，请重新查看因子。")).toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "因子详情" })).toBeNull();
+    const beforeRetry = requested.length;
+    await user.click(screen.getByRole("button", { name: action }));
+    await waitFor(() =>
+      expect(screen.getByRole("region", { name: "因子详情" })).toHaveTextContent("新版价量动量"),
+    );
+    expect(screen.getByRole("region", { name: "因子详情" })).not.toHaveTextContent("新版成交变化");
+    expect(requested.slice(beforeRetry)[0]).toBe(`meta:${nextGeneration}`);
+    expect(requested.slice(beforeRetry).filter((entry) => entry.startsWith("catalog:"))).toEqual(
+      expect.arrayContaining([`catalog:${nextGeneration}`]),
+    );
+    expect(requested.slice(beforeRetry)).not.toContain(`catalog:${firstGeneration}`);
+  });
+
   it("未发布、可信空库和错误分别给出可操作反馈", async () => {
     publish([], "unavailable");
     const user = userEvent.setup();
