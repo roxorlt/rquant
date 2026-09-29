@@ -17,6 +17,8 @@ from rquant.runtime_service_entrypoint import RuntimeServiceKind
 from rquant.runtime_serving_authority import (
     ServingSourceAuthorityPointer,
     ServingSourceAuthorityPublisher,
+    ServingSourceAuthorityReader,
+    ServingSourceAuthorityUnavailableError,
 )
 from rquant.runtime_serving_snapshot import (
     STRATEGY_CATALOG_DATASET_ID,
@@ -259,4 +261,51 @@ class StrategyCatalogAuthorityPublisher:
         return self.publisher.publish(result)
 
 
-__all__ = ["StrategyCatalogAuthorityPublisher", "StrategyCatalogSourceReader"]
+class CurrentStrategyCatalogAuthorityReader:
+    """Use a published catalog only while its verified runtime generation is current."""
+
+    def __init__(
+        self,
+        *,
+        reader: ServingSourceAuthorityReader,
+        runtime_root: Path,
+    ) -> None:
+        if reader.expected_dataset_id != STRATEGY_CATALOG_DATASET_ID:
+            raise ValueError("reader must own the strategy catalog dataset")
+        if reader.expected_payload_kind != "strategy_catalog":
+            raise ValueError("reader must own the strategy catalog payload")
+        self.reader = reader
+        self.runtime_root = StrategyCatalogSourceReader(runtime_root=runtime_root).runtime_root
+
+    def __call__(self, observed_at: datetime, /) -> SourceReadResult:
+        result = self.reader(observed_at)
+        payload = result.payload
+        if not isinstance(payload, StrategyCatalogPayload) or payload.runtime_generation_id is None:
+            raise ServingSourceAuthorityUnavailableError("strategy catalog has no runtime binding")
+        try:
+            tree = load_runtime_generation_tree(self.runtime_root)
+            if tree.current_generation_id != payload.runtime_generation_id:
+                raise ValueError("strategy catalog runtime generation changed")
+            for strategy_id in _EXPECTED_IDS:
+                manifest = tree.lineage(f"strategy.{strategy_id}.v1").current.manifest
+                if (
+                    manifest.service_kind is not RuntimeServiceKind.STRATEGY_LIVE
+                    or manifest.plane is not RuntimeServicePlane.LIVE
+                ):
+                    raise ValueError("strategy catalog current service identity changed")
+            if load_runtime_generation_tree(self.runtime_root).current_generation_id != (
+                payload.runtime_generation_id
+            ):
+                raise ValueError("strategy catalog runtime generation changed")
+        except ValueError as exc:
+            raise ServingSourceAuthorityUnavailableError(
+                "current strategy runtime generation is unavailable"
+            ) from exc
+        return result
+
+
+__all__ = [
+    "CurrentStrategyCatalogAuthorityReader",
+    "StrategyCatalogAuthorityPublisher",
+    "StrategyCatalogSourceReader",
+]

@@ -20,6 +20,7 @@ from rquant.runtime_serving_authority import (
     ServingSourceAuthorityPublisher,
     ServingSourceAuthorityReader,
 )
+from rquant.serving_contracts import FreshnessStatus
 from rquant.serving_publisher import ServingReader
 from rquant.strategy_catalog_source import (
     StrategyCatalogAuthorityPublisher,
@@ -192,9 +193,9 @@ def test_catalog_source_projects_into_one_serving_generation(tmp_path: Path) -> 
     settings["source_authorities"].append(
         {"dataset_id": "strategy_catalog", "root": str(source_root)}
     )
-    step = serving_publisher_builder(snapshot_loader=None, clock=lambda: NOW)(
-        _serving_manifest(tmp_path, settings=settings)
-    )
+    step = serving_publisher_builder(
+        snapshot_loader=None, clock=lambda: NOW, runtime_root=runtime_root
+    )(_serving_manifest(tmp_path, settings=settings))
     result = step()
     assert result.generation_published is True
     with ServingReader(tmp_path / "serving").acquire_generation() as lease:
@@ -209,6 +210,63 @@ def test_catalog_source_projects_into_one_serving_generation(tmp_path: Path) -> 
         assert lease.connection.execute(
             "SELECT count(*) FROM strategy_catalog_parameter"
         ).fetchone() == (19,)
+
+
+def test_serving_drops_old_catalog_after_current_runtime_removes_strategy(tmp_path: Path) -> None:
+    runtime_root = _install_catalog(tmp_path)
+    settings, _roots = _authority_settings(tmp_path)
+    source_root = tmp_path / "authorities" / "strategy_catalog"
+    source_reader = StrategyCatalogSourceReader(runtime_root=runtime_root)
+    source_publisher = ServingSourceAuthorityPublisher(
+        root=source_root,
+        producer_commit=COMMIT,
+        dataset_id="strategy_catalog",
+        payload_kind="strategy_catalog",
+        clock=lambda: NOW,
+    )
+    StrategyCatalogAuthorityPublisher(reader=source_reader, publisher=source_publisher).publish(NOW)
+    settings["source_authorities"].append(
+        {"dataset_id": "strategy_catalog", "root": str(source_root)}
+    )
+    step = serving_publisher_builder(
+        snapshot_loader=None, clock=lambda: NOW, runtime_root=runtime_root
+    )(_serving_manifest(tmp_path, settings=settings))
+    first = step()
+    assert first.generation_published is True
+
+    tree = load_runtime_generation_tree(runtime_root)
+    retained = tuple(
+        tree.lineage(f"strategy.{strategy_id}.v1").current.manifest
+        for strategy_id in ("auction_gap", "growth_board_surge")
+    )
+    install_runtime_deployment_bundle(
+        runtime_root,
+        producer_commit=COMMIT,
+        manifests=retained,
+        capability_env={manifest.service_id: {} for manifest in retained},
+    )
+    with pytest.raises(ValueError):
+        source_reader(NOW)
+    old_source = ServingSourceAuthorityReader(
+        root=source_root,
+        expected_producer_commit=COMMIT,
+        expected_dataset_id="strategy_catalog",
+        expected_payload_kind="strategy_catalog",
+    )(NOW)
+    assert len(old_source.payload.projections[0].rows) == 3
+
+    second = step()
+    assert second.generation_published is True
+    assert any(
+        reason.startswith("serving:strategy_catalog:unavailable:")
+        for reason in second.degraded_reasons
+    )
+    with ServingReader(tmp_path / "serving").acquire_generation() as lease:
+        assert lease.connection.execute("SELECT COUNT(*) FROM strategy_catalog").fetchone() == (0,)
+        mark = next(
+            item for item in lease.manifest.watermarks if item.dataset_id == "strategy_catalog"
+        )
+        assert mark.status is FreshnessStatus.UNAVAILABLE
 
 
 def test_catalog_rejects_current_pointer_switch_during_read(

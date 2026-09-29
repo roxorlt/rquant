@@ -308,9 +308,7 @@ def serving_publisher_builder(
                     expected_dataset_id=authority.dataset_id,
                     expected_payload_kind=_SOURCE_PAYLOAD_KINDS[authority.dataset_id],
                     max_bytes=authority.max_bytes,
-                    previous_generation_of_producer_commit=(
-                        previous_generation_of_producer_commit
-                    ),
+                    previous_generation_of_producer_commit=(previous_generation_of_producer_commit),
                 )
                 for authority in settings.source_authorities
             }
@@ -322,6 +320,15 @@ def serving_publisher_builder(
                 )
                 if event is not None
             )
+            if "strategy_catalog" in readers:
+                if runtime_root is None:
+                    raise ValueError("strategy catalog requires the current runtime root")
+                from rquant.strategy_catalog_source import CurrentStrategyCatalogAuthorityReader
+
+                readers["strategy_catalog"] = CurrentStrategyCatalogAuthorityReader(
+                    reader=readers["strategy_catalog"],
+                    runtime_root=runtime_root,
+                )
             assembler = ServingSnapshotAssembler(
                 signal_reader=readers["signals"],
                 paper_accounts_reader=readers["paper_accounts"],
