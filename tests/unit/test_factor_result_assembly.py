@@ -311,6 +311,182 @@ def test_complete_two_period_result_reuses_ic_and_compounds_research_groups() ->
     assert result.sha256 == hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
+def test_result_carries_required_decay_from_the_same_research_request() -> None:
+    from rquant.factor import assemble_factor_research_result
+    from rquant.factor.decay import FactorICDecayResult
+    from rquant.factor.result import FactorResearchResult
+
+    request = _request()
+    result = assemble_factor_research_result(request)
+    decay = result.ic_decay
+
+    assert isinstance(decay, FactorICDecayResult)
+    assert FactorResearchResult.model_fields["ic_decay"].is_required()
+    assert (decay.factor_id, decay.factor_version) == (result.factor_id, result.factor_version)
+    assert (decay.factor_source_id, decay.return_source_id) == (
+        result.factor_source_id,
+        result.return_source_id,
+    )
+    assert (decay.return_price_basis, decay.holding_sessions) == (
+        result.return_price_basis,
+        result.holding_sessions,
+    )
+    assert (decay.universe, decay.evaluation_days, decay.as_of) == (
+        result.universe,
+        result.trading_days,
+        result.as_of,
+    )
+    assert len(decay.input_sha256) == 64
+    assert [(day.normal_ic, day.rank_ic) for day in decay.periods[0].days] == [
+        (day.evaluation.normal_ic, day.evaluation.rank_ic) for day in result.days
+    ]
+    assert decay.periods[1].days[0].base_date == _DAYS[0]
+    assert decay.periods[1].days[0].target_date == _DAYS[1]
+    assert decay.periods[1].days[0].rank_ic.value == pytest.approx(-0.5)
+    assert decay.periods[2].status == "no_target_period"
+    assert decay.periods[2].ic_summary is None
+    assert result == assemble_factor_research_result(request)
+    assert "ic_decay" in result.model_dump()
+    with pytest.raises(ValidationError, match="ic_decay"):
+        FactorResearchResult.model_validate(result.model_dump(exclude={"ic_decay"}))
+
+
+def test_reordered_research_facts_keep_one_input_identity_and_content_digest() -> None:
+    from rquant.factor import assemble_factor_research_result
+    from rquant.factor.result import FactorResearchRequest
+
+    request = _request()
+    reordered = FactorResearchRequest.model_validate(
+        request.model_copy(
+            update={
+                "factor_input": request.factor_input.model_copy(
+                    update={"observations": tuple(reversed(request.factor_input.observations))}
+                ),
+                "forward_returns": tuple(reversed(request.forward_returns)),
+            }
+        )
+    )
+    original_result = assemble_factor_research_result(request)
+    reordered_result = assemble_factor_research_result(reordered)
+
+    assert original_result.input_sha256 == original_result.ic_decay.input_sha256
+    assert reordered_result.input_sha256 == reordered_result.ic_decay.input_sha256
+    assert reordered_result.input_sha256 == original_result.input_sha256
+    assert reordered_result.sha256 == original_result.sha256
+    assert reordered_result == original_result
+
+
+def test_public_request_identity_canonicalizes_all_fact_row_types() -> None:
+    from rquant.factor import (
+        IndustryObservation,
+        MarketCapObservation,
+        factor_research_request_sha256,
+    )
+    from rquant.factor.result import FactorResearchRequest
+
+    request = _request()
+    industries = (
+        IndustryObservation(
+            stock_code="A",
+            trade_date=_DAYS[0],
+            industry="科技",
+            first_visible_at=_DECISIONS[0] - timedelta(minutes=1),
+        ),
+        IndustryObservation(
+            stock_code="B",
+            trade_date=_DAYS[1],
+            industry="工业",
+            first_visible_at=_DECISIONS[1] - timedelta(minutes=1),
+        ),
+    )
+    market_caps = (
+        MarketCapObservation(
+            stock_code="A",
+            trade_date=_DAYS[0],
+            market_cap=100.0,
+            first_visible_at=_DECISIONS[0] - timedelta(minutes=1),
+        ),
+        MarketCapObservation(
+            stock_code="B",
+            trade_date=_DAYS[1],
+            market_cap=200.0,
+            first_visible_at=_DECISIONS[1] - timedelta(minutes=1),
+        ),
+    )
+    with_context = FactorResearchRequest.model_validate(
+        request.model_copy(
+            update={
+                "factor_input": request.factor_input.model_copy(
+                    update={
+                        "industry_observations": industries,
+                        "market_cap_observations": market_caps,
+                    }
+                )
+            }
+        )
+    )
+    reordered = FactorResearchRequest.model_validate(
+        with_context.model_copy(
+            update={
+                "factor_input": with_context.factor_input.model_copy(
+                    update={
+                        "observations": tuple(reversed(with_context.factor_input.observations)),
+                        "industry_observations": tuple(reversed(industries)),
+                        "market_cap_observations": tuple(reversed(market_caps)),
+                    }
+                ),
+                "forward_returns": tuple(reversed(with_context.forward_returns)),
+            }
+        )
+    )
+
+    assert factor_research_request_sha256(with_context) == factor_research_request_sha256(reordered)
+
+
+def test_later_decay_and_content_digest_follow_target_return_facts() -> None:
+    from rquant.factor import assemble_factor_research_result
+
+    original_rows = _forward_returns()
+    changed_rows = (
+        original_rows[:3]
+        + (original_rows[3].model_copy(update={"value": -0.2}),)
+        + original_rows[4:]
+    )
+    original = assemble_factor_research_result(_request())
+    changed = assemble_factor_research_result(_request(forward_returns=changed_rows))
+
+    assert original.days[0].evaluation == changed.days[0].evaluation
+    assert original.ic_decay.periods[1].days[0].rank_ic.value == pytest.approx(-0.5)
+    assert changed.ic_decay.periods[1].days[0].rank_ic.value == pytest.approx(1.0)
+    assert original.sha256 != changed.sha256
+
+
+def test_decay_preserves_missing_and_unmatured_return_states() -> None:
+    from rquant.factor import assemble_factor_research_result
+
+    all_missing = assemble_factor_research_result(
+        _request(forward_returns=tuple(_missing_return(row) for row in _forward_returns()))
+    )
+    assert all_missing.summary_status == "no_samples"
+    assert all_missing.ic_decay.periods[0].status == "no_valid_days"
+    assert all_missing.ic_decay.periods[0].valid_pair_count == 0
+    assert all_missing.ic_decay.periods[0].ic_summary.normal_ic.mean is None
+    assert all_missing.ic_decay.periods[2].status == "no_target_period"
+
+    unfinished = assemble_factor_research_result(
+        _visibility_request(
+            as_of=_VISIBILITY_END - timedelta(minutes=1),
+            forward_returns=_visibility_returns(
+                missing_reason="window_unfinished", first_available_at=None
+            ),
+        )
+    )
+    assert unfinished.ic_decay.periods[0].status == "no_valid_days"
+    assert unfinished.ic_decay.periods[0].valid_pair_count == 0
+    assert unfinished.ic_decay.periods[0].days[0].normal_ic.value is None
+    assert unfinished.ic_decay.periods[1].status == "no_target_period"
+
+
 def test_partial_pairs_keep_missing_reasons_and_disable_portfolio_curve() -> None:
     from rquant.factor import assemble_factor_research_result
 

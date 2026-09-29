@@ -11,6 +11,7 @@ from typing import Annotated, Literal
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from rquant.factor.decay import FactorICDecayResult, evaluate_factor_ic_decay
 from rquant.factor.definition import FactorDefinition
 from rquant.factor.evaluate import (
     DailyFactorResult,
@@ -244,6 +245,7 @@ class FactorResearchResult(BaseModel):
     days: tuple[FactorResearchDay, ...]
     summary_status: ResearchSummaryStatus
     ic_summary: FactorICSummary | None
+    ic_decay: FactorICDecayResult
     portfolio_status: ResearchPortfolioStatus
     portfolio_diagnostics: FactorPortfolioDiagnostics | None
     sha256: Sha256
@@ -253,6 +255,43 @@ def _digest(value: BaseModel | dict[str, object]) -> str:
     payload = value.model_dump(mode="json") if isinstance(value, BaseModel) else value
     serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def factor_research_request_sha256(request: FactorResearchRequest) -> str:
+    """Hash one validated request independently of unordered fact-row presentation."""
+    checked = FactorResearchRequest.model_validate(request)
+    factor_input = checked.factor_input
+    ordered_input = factor_input.model_copy(
+        update={
+            "observations": tuple(
+                sorted(
+                    factor_input.observations,
+                    key=lambda row: (row.trade_date, row.stock_code, row.column),
+                )
+            ),
+            "industry_observations": tuple(
+                sorted(
+                    factor_input.industry_observations,
+                    key=lambda row: (row.trade_date, row.stock_code),
+                )
+            ),
+            "market_cap_observations": tuple(
+                sorted(
+                    factor_input.market_cap_observations,
+                    key=lambda row: (row.trade_date, row.stock_code),
+                )
+            ),
+        }
+    )
+    ordered_request = checked.model_copy(
+        update={
+            "factor_input": ordered_input,
+            "forward_returns": tuple(
+                sorted(checked.forward_returns, key=lambda row: (row.decision_date, row.stock_code))
+            ),
+        }
+    )
+    return _digest(ordered_request)
 
 
 def assemble_factor_research_result(request: FactorResearchRequest) -> FactorResearchResult:
@@ -337,6 +376,7 @@ def assemble_factor_research_result(request: FactorResearchRequest) -> FactorRes
         for day, coverage in zip(evaluation_days, coverages, strict=True)
     )
     summary = summarize_factor_ic(evaluation) if evaluation is not None else None
+    decay = evaluate_factor_ic_decay(checked)
     complete = all(coverage.valid_count == coverage.expected_count for coverage in coverages)
     portfolio = (
         evaluate_factor_portfolios(evaluation_input)
@@ -354,10 +394,11 @@ def assemble_factor_research_result(request: FactorResearchRequest) -> FactorRes
         "universe": checked.factor_input.universe,
         "trading_days": evaluation_days,
         "as_of": checked.as_of,
-        "input_sha256": _digest(checked),
+        "input_sha256": factor_research_request_sha256(checked),
         "days": days,
         "summary_status": "evaluated" if evaluation is not None else "no_samples",
         "ic_summary": summary,
+        "ic_decay": decay,
         "portfolio_status": "available" if portfolio is not None else "insufficient_data",
         "portfolio_diagnostics": portfolio,
     }

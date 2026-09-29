@@ -732,7 +732,7 @@ def test_historical_adapter_request_rejects_duplicate_oversized_or_ambiguous_inp
             HistoricalFactorAdapterRequest(**{**common, **update})
 
 
-def test_paired_historical_result_rejects_a_result_for_another_input(tmp_path: Path) -> None:
+def test_paired_historical_result_rejects_tampered_result_digests(tmp_path: Path) -> None:
     from rquant.factor.historical_adapter import (
         HistoricalFactorAdapterRequest,
         HistoricalFactorResearch,
@@ -757,3 +757,157 @@ def test_paired_historical_result_rejects_a_result_for_another_input(tmp_path: P
     changed = paired.result.model_copy(update={"input_sha256": "f" * 64})
     with pytest.raises(ValidationError, match="input"):
         HistoricalFactorResearch(receipt=paired.receipt, request=paired.request, result=changed)
+    changed = paired.result.model_copy(update={"sha256": "f" * 64})
+    with pytest.raises(ValidationError, match="content digest"):
+        HistoricalFactorResearch(receipt=paired.receipt, request=paired.request, result=changed)
+
+
+def test_paired_historical_result_accepts_reordered_valid_fact_rows(tmp_path: Path) -> None:
+    from rquant.factor.historical_adapter import (
+        HistoricalFactorAdapterRequest,
+        HistoricalFactorResearch,
+        assemble_historical_factor_research,
+    )
+    from rquant.factor.result import FactorResearchRequest, assemble_factor_research_result
+
+    with _admitted(tmp_path) as (_store, lease, decision, _snapshot, _binding):
+        paired = assemble_historical_factor_research(
+            lease,
+            decision,
+            HistoricalFactorAdapterRequest(
+                definition=_definition(),
+                stock_codes=_STOCKS,
+                pool_basis="explicit_fixed_list",
+                evaluation_days=_EVALUATION_DAYS,
+                query_start_date=_FIRST,
+                query_end_date=_LAST,
+                holding_sessions=5,
+                as_of=_at(_LAST, 9, 25),
+            ),
+        )
+
+    reordered = FactorResearchRequest.model_validate(
+        paired.request.model_copy(
+            update={
+                "factor_input": paired.request.factor_input.model_copy(
+                    update={
+                        "observations": tuple(reversed(paired.request.factor_input.observations))
+                    }
+                ),
+                "forward_returns": tuple(reversed(paired.request.forward_returns)),
+            }
+        )
+    )
+    reordered_result = assemble_factor_research_result(reordered)
+    assert reordered_result.input_sha256 == paired.result.input_sha256
+    assert reordered_result.sha256 == paired.result.sha256
+    validated = HistoricalFactorResearch(
+        receipt=paired.receipt, request=reordered, result=reordered_result
+    )
+    assert validated.result == paired.result
+
+
+def test_paired_historical_result_rejects_changed_factor_or_return_fact(tmp_path: Path) -> None:
+    from rquant.factor.historical_adapter import (
+        HistoricalFactorAdapterRequest,
+        HistoricalFactorResearch,
+        assemble_historical_factor_research,
+    )
+    from rquant.factor.result import FactorResearchRequest, assemble_factor_research_result
+
+    with _admitted(tmp_path) as (_store, lease, decision, _snapshot, _binding):
+        paired = assemble_historical_factor_research(
+            lease,
+            decision,
+            HistoricalFactorAdapterRequest(
+                definition=_definition(),
+                stock_codes=_STOCKS,
+                pool_basis="explicit_fixed_list",
+                evaluation_days=_EVALUATION_DAYS,
+                query_start_date=_FIRST,
+                query_end_date=_LAST,
+                holding_sessions=5,
+                as_of=_at(_LAST, 9, 25),
+            ),
+        )
+
+    observations = paired.request.factor_input.observations
+    assert observations[0].value is not None
+    changed_factor = FactorResearchRequest.model_validate(
+        paired.request.model_copy(
+            update={
+                "factor_input": paired.request.factor_input.model_copy(
+                    update={
+                        "observations": (
+                            observations[0].model_copy(update={"value": observations[0].value + 1}),
+                        )
+                        + observations[1:]
+                    }
+                )
+            }
+        )
+    )
+    returns = paired.request.forward_returns
+    assert returns[0].value is not None
+    changed_return = FactorResearchRequest.model_validate(
+        paired.request.model_copy(
+            update={
+                "forward_returns": (
+                    returns[0].model_copy(update={"value": returns[0].value + 0.01}),
+                )
+                + returns[1:]
+            }
+        )
+    )
+    for changed_request in (changed_factor, changed_return):
+        changed_result = assemble_factor_research_result(changed_request)
+        assert changed_result.input_sha256 != paired.result.input_sha256
+        with pytest.raises(ValidationError, match="input"):
+            HistoricalFactorResearch(
+                receipt=paired.receipt, request=paired.request, result=changed_result
+            )
+
+
+def test_paired_historical_result_rejects_other_admitted_source_receipt(tmp_path: Path) -> None:
+    from rquant.factor.historical_adapter import (
+        HistoricalFactorAdapterRequest,
+        HistoricalFactorResearch,
+        adapt_historical_factor_source,
+        assemble_historical_factor_research,
+    )
+
+    request = HistoricalFactorAdapterRequest(
+        definition=_definition(),
+        stock_codes=_STOCKS,
+        pool_basis="explicit_fixed_list",
+        evaluation_days=_EVALUATION_DAYS,
+        query_start_date=_FIRST,
+        query_end_date=_LAST,
+        holding_sessions=5,
+        as_of=_at(_LAST, 9, 25),
+    )
+    with _admitted(tmp_path) as (_store, lease, decision, _snapshot, _binding):
+        paired = assemble_historical_factor_research(lease, decision, request)
+
+    def alter(store: DuckDBStore) -> None:
+        store._conn.execute(
+            "UPDATE daily_bar SET close = close + 1 WHERE ts_code = ? AND trade_date = ?",
+            [_STOCKS[0], _FIRST],
+        )
+
+    alternate_root = tmp_path / "alternate"
+    alternate_root.mkdir()
+    with _admitted(alternate_root, before_binding=alter) as (
+        _store,
+        lease,
+        decision,
+        _snapshot,
+        _binding,
+    ):
+        other_receipt = adapt_historical_factor_source(lease, decision, request).receipt
+
+    assert other_receipt.source_sha256 != paired.receipt.source_sha256
+    with pytest.raises(ValidationError, match="historical source"):
+        HistoricalFactorResearch(
+            receipt=other_receipt, request=paired.request, result=paired.result
+        )
