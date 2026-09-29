@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from rquant.factor.historical_adapter import (
     HistoricalFactorAdapterRequest,
@@ -109,8 +110,16 @@ def _sealed(tmp_path: Path) -> tuple[FactorEvaluationJobSpec, Path, FactorEvalua
     return spec, root, completion
 
 
-def _ledger(tmp_path: Path) -> FactorEvaluationJobLedger:
-    ledger = FactorEvaluationJobLedger(tmp_path / "factor-jobs.sqlite3")
+class _Clock:
+    def __init__(self, instant: datetime = NOW) -> None:
+        self.instant = instant
+
+    def __call__(self) -> datetime:
+        return self.instant
+
+
+def _ledger(tmp_path: Path, *, clock: _Clock | None = None) -> FactorEvaluationJobLedger:
+    ledger = FactorEvaluationJobLedger(tmp_path / "factor-jobs.sqlite3", clock=clock or _Clock())
     ledger.initialize()
     return ledger
 
@@ -119,27 +128,29 @@ def test_round_trip_idempotent_submit_complete_and_reopen_with_external_identity
     tmp_path: Path,
 ) -> None:
     spec, root, completion = _sealed(tmp_path)
-    ledger = FactorEvaluationJobLedger(tmp_path / "factor-jobs.sqlite3")
+    clock = _Clock()
+    ledger = FactorEvaluationJobLedger(tmp_path / "factor-jobs.sqlite3", clock=clock)
     identity = ledger.initialize()
-    first = ledger.submit("request-1", spec, NOW)
+    first = ledger.submit("request-1", spec)
     assert first.status == "queued"
     assert first.spec_sha256 == spec.spec_sha256
-    assert ledger.submit("request-1", spec, NOW) == first
-    assert ledger.submit("request-2", spec, NOW).job_id == first.job_id
-    lease = ledger.claim(NOW, lease_seconds=60)
+    assert ledger.submit("request-1", spec) == first
+    assert ledger.submit("request-2", spec).job_id == first.job_id
+    lease = ledger.claim(lease_seconds=60)
     assert lease is not None and lease.job.job_id == first.job_id
     assert lease.job.status == "running" and lease.job.attempts == 1
-    extended = ledger.heartbeat(first.job_id, lease.lease_token, lease.version, NOW, 120)
+    extended = ledger.heartbeat(first.job_id, lease.lease_token, lease.version, 120)
     assert extended.expires_at == NOW + timedelta(seconds=120)
     success = ledger.complete(
-        first.job_id, extended.lease_token, extended.version, completion, root, NOW
+        first.job_id, extended.lease_token, extended.version, completion, root
     )
     assert success.status == "succeeded"
     assert success.completion == completion
-    assert ledger.submit("request-3", spec, NOW).job_id == first.job_id
-    assert ledger.submit("request-4", spec, spec.deadline).job_id == first.job_id
-    assert ledger.claim(NOW, lease_seconds=60) is None
-    reopened = FactorEvaluationJobLedger.open_existing(identity)
+    assert ledger.submit("request-3", spec).job_id == first.job_id
+    assert ledger.claim(lease_seconds=60) is None
+    clock.instant = spec.deadline
+    reopened = FactorEvaluationJobLedger.open_existing(identity, clock=clock)
+    assert reopened.submit("request-4", spec).job_id == first.job_id
     assert reopened.get(first.job_id) == success
     assert reopened.list_recent(limit=10) == (success,)
     with sqlite3.connect(identity.path) as connection:
@@ -150,12 +161,12 @@ def test_round_trip_idempotent_submit_complete_and_reopen_with_external_identity
 def test_command_conflict_and_two_workers_claim_once(tmp_path: Path) -> None:
     ledger = _ledger(tmp_path)
     _, spec = _research_and_spec()
-    first = ledger.submit("request-1", spec, NOW)
+    first = ledger.submit("request-1", spec)
     changed = spec.model_copy(update={"code_revision": "d" * 40})
     with pytest.raises(FactorLedgerConflictError):
-        ledger.submit("request-1", changed, NOW)
+        ledger.submit("request-1", changed)
     with ThreadPoolExecutor(max_workers=2) as workers:
-        leases = tuple(workers.map(lambda _: ledger.claim(NOW, lease_seconds=60), range(2)))
+        leases = tuple(workers.map(lambda _: ledger.claim(lease_seconds=60), range(2)))
     active = [lease for lease in leases if lease is not None]
     assert len(active) == 1
     assert active[0].job.job_id == first.job_id
@@ -164,41 +175,44 @@ def test_command_conflict_and_two_workers_claim_once(tmp_path: Path) -> None:
 
 def test_expired_lease_rotates_token_and_old_worker_cannot_finish(tmp_path: Path) -> None:
     spec, root, completion = _sealed(tmp_path)
-    ledger = _ledger(tmp_path)
-    job = ledger.submit("request-1", spec, NOW)
-    first = ledger.claim(NOW, lease_seconds=10)
+    clock = _Clock()
+    ledger = _ledger(tmp_path, clock=clock)
+    job = ledger.submit("request-1", spec)
+    first = ledger.claim(lease_seconds=10)
     assert first is not None
-    later = NOW + timedelta(seconds=11)
-    second = ledger.claim(later, lease_seconds=60)
+    clock.instant = NOW + timedelta(seconds=11)
+    second = ledger.claim(lease_seconds=60)
     assert second is not None
     assert second.lease_token != first.lease_token
     assert second.job.attempts == 2 and second.version > first.version
     with pytest.raises(FactorLedgerLeaseError):
-        ledger.heartbeat(job.job_id, first.lease_token, first.version, later, 60)
+        ledger.heartbeat(job.job_id, first.lease_token, first.version, 60)
     with pytest.raises(FactorLedgerLeaseError):
-        ledger.complete(job.job_id, first.lease_token, first.version, completion, root, later)
+        ledger.complete(job.job_id, first.lease_token, first.version, completion, root)
     with pytest.raises(FactorLedgerLeaseError):
-        ledger.fail(job.job_id, first.lease_token, first.version, "evaluation_failed", later)
+        ledger.fail(job.job_id, first.lease_token, first.version, "evaluation_failed")
     assert (
-        ledger.complete(
-            job.job_id, second.lease_token, second.version, completion, root, later
-        ).status
+        ledger.complete(job.job_id, second.lease_token, second.version, completion, root).status
         == "succeeded"
     )
 
 
 def test_expired_spec_fails_without_claim_and_lease_is_capped(tmp_path: Path) -> None:
-    ledger = _ledger(tmp_path)
+    clock = _Clock()
+    ledger = _ledger(tmp_path, clock=clock)
     _, spec = _research_and_spec()
     near = spec.model_copy(update={"deadline": NOW + timedelta(seconds=5)})
+    clock.instant = near.deadline
     with pytest.raises(FactorLedgerConflictError):
-        ledger.submit("too-late", near, near.deadline)
-    job = ledger.submit("near", near, NOW)
-    lease = ledger.claim(NOW, lease_seconds=60)
+        ledger.submit("too-late", near)
+    clock.instant = NOW
+    job = ledger.submit("near", near)
+    lease = ledger.claim(lease_seconds=60)
     assert lease is not None and lease.expires_at == near.deadline
+    clock.instant = near.deadline
     with pytest.raises(FactorLedgerLeaseError):
-        ledger.heartbeat(job.job_id, lease.lease_token, lease.version, near.deadline, 60)
-    assert ledger.claim(near.deadline, lease_seconds=60) is None
+        ledger.heartbeat(job.job_id, lease.lease_token, lease.version, 60)
+    assert ledger.claim(lease_seconds=60) is None
     failed = ledger.get(job.job_id)
     assert failed.status == "failed" and failed.failure_code == "deadline_expired"
     assert failed.completion is None
@@ -222,8 +236,8 @@ def test_completion_must_match_sealed_content_and_spec(
 ) -> None:
     spec, root, completion = _sealed(tmp_path)
     ledger = _ledger(tmp_path)
-    job = ledger.submit("request-1", spec, NOW)
-    lease = ledger.claim(NOW, lease_seconds=60)
+    job = ledger.submit("request-1", spec)
+    lease = ledger.claim(lease_seconds=60)
     assert lease is not None
     with pytest.raises(FactorLedgerCompletionError):
         ledger.complete(
@@ -232,27 +246,88 @@ def test_completion_must_match_sealed_content_and_spec(
             lease.version,
             completion.model_copy(update=changed),
             root,
-            NOW,
         )
     assert ledger.get(job.job_id).status == "running"
     assert (root / completion.artifact_filename).is_file()
 
 
+def test_wider_admission_cannot_borrow_a_narrower_sealed_artifact(tmp_path: Path) -> None:
+    spec, root, completion = _sealed(tmp_path)
+    widened = spec.admission_request.model_copy(
+        update={"start_date": spec.adapter_request.query_start_date - timedelta(days=1)}
+    )
+    forged = FactorEvaluationJobSpec.model_construct(
+        **{**spec.__dict__, "admission_request": widened}
+    )
+    forged_completion = completion.model_copy(update={"spec_sha256": forged.spec_sha256})
+    assert forged_completion.spec_sha256 != completion.spec_sha256
+    assert forged_completion.artifact_sha256 == completion.artifact_sha256
+    assert (root / completion.artifact_filename).is_file()
+    ledger = _ledger(tmp_path)
+    with pytest.raises(ValidationError, match="admission"):
+        ledger.submit("wider-admission", forged)
+
+
+def test_ledger_clock_fences_expired_worker_despite_old_completion_time(tmp_path: Path) -> None:
+    spec, root, completion = _sealed(tmp_path)
+    clock = _Clock()
+    ledger = FactorEvaluationJobLedger(tmp_path / "factor-jobs.sqlite3", clock=clock)
+    identity = ledger.initialize()
+    job = ledger.submit("request-1", spec)
+    lease = ledger.claim(lease_seconds=5)
+    assert lease is not None
+    clock.instant = NOW + timedelta(seconds=6)
+    reopened = FactorEvaluationJobLedger.open_existing(identity, clock=clock)
+    with pytest.raises(TypeError):
+        reopened.complete(job.job_id, lease.lease_token, lease.version, completion, root, now=NOW)
+    with pytest.raises(FactorLedgerLeaseError):
+        reopened.complete(job.job_id, lease.lease_token, lease.version, completion, root)
+    with pytest.raises(FactorLedgerLeaseError):
+        reopened.heartbeat(job.job_id, lease.lease_token, lease.version, lease_seconds=30)
+    with pytest.raises(FactorLedgerLeaseError):
+        reopened.fail(job.job_id, lease.lease_token, lease.version, "evaluation_failed")
+    replacement = reopened.claim(lease_seconds=30)
+    assert replacement is not None and replacement.lease_token != lease.lease_token
+
+
+def test_completion_rechecks_clock_after_artifact_binding_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rquant.factor import job_ledger as module
+
+    spec, root, completion = _sealed(tmp_path)
+    clock = _Clock()
+    ledger = _ledger(tmp_path, clock=clock)
+    job = ledger.submit("request-1", spec)
+    lease = ledger.claim(lease_seconds=5)
+    assert lease is not None
+    original = module._checked_completion
+
+    def advance_after_validation(*args: object, **kwargs: object) -> None:
+        original(*args, **kwargs)
+        clock.instant = NOW + timedelta(seconds=6)
+
+    monkeypatch.setattr(module, "_checked_completion", advance_after_validation)
+    with pytest.raises(FactorLedgerLeaseError):
+        ledger.complete(job.job_id, lease.lease_token, lease.version, completion, root)
+    assert ledger.get(job.job_id).status == "running"
+
+
 def test_missing_or_damaged_artifact_cannot_mark_success(tmp_path: Path) -> None:
     spec, root, completion = _sealed(tmp_path)
     ledger = _ledger(tmp_path)
-    job = ledger.submit("request-1", spec, NOW)
-    lease = ledger.claim(NOW, lease_seconds=60)
+    job = ledger.submit("request-1", spec)
+    lease = ledger.claim(lease_seconds=60)
     assert lease is not None
     target = root / completion.artifact_filename
     data = target.read_bytes()
     target.unlink()
     with pytest.raises(FactorLedgerCompletionError):
-        ledger.complete(job.job_id, lease.lease_token, lease.version, completion, root, NOW)
+        ledger.complete(job.job_id, lease.lease_token, lease.version, completion, root)
     target.write_bytes(data[:20])
     target.chmod(0o600)
     with pytest.raises(FactorLedgerCompletionError):
-        ledger.complete(job.job_id, lease.lease_token, lease.version, completion, root, NOW)
+        ledger.complete(job.job_id, lease.lease_token, lease.version, completion, root)
     assert ledger.get(job.job_id).status == "running"
 
 
@@ -262,9 +337,10 @@ def test_sealed_artifact_survives_transaction_failure_then_reclaim(
     from rquant.factor import job_ledger as module
 
     spec, root, completion = _sealed(tmp_path)
-    ledger = _ledger(tmp_path)
-    job = ledger.submit("request-1", spec, NOW)
-    first = ledger.claim(NOW, lease_seconds=5)
+    clock = _Clock()
+    ledger = _ledger(tmp_path, clock=clock)
+    job = ledger.submit("request-1", spec)
+    first = ledger.claim(lease_seconds=5)
     assert first is not None
     original = module.FactorEvaluationJobLedger._store_job
 
@@ -273,11 +349,12 @@ def test_sealed_artifact_survives_transaction_failure_then_reclaim(
 
     monkeypatch.setattr(module.FactorEvaluationJobLedger, "_store_job", fail_once)
     with pytest.raises(RuntimeError, match="injected transaction failure"):
-        ledger.complete(job.job_id, first.lease_token, first.version, completion, root, NOW)
+        ledger.complete(job.job_id, first.lease_token, first.version, completion, root)
     monkeypatch.setattr(module.FactorEvaluationJobLedger, "_store_job", staticmethod(original))
     assert ledger.get(job.job_id).status == "running"
     assert (root / completion.artifact_filename).is_file()
-    second = ledger.claim(NOW + timedelta(seconds=6), lease_seconds=60)
+    clock.instant = NOW + timedelta(seconds=6)
+    second = ledger.claim(lease_seconds=60)
     assert second is not None and second.lease_token != first.lease_token
     assert (
         ledger.complete(
@@ -286,7 +363,6 @@ def test_sealed_artifact_survives_transaction_failure_then_reclaim(
             second.version,
             completion,
             root,
-            NOW + timedelta(seconds=6),
         ).status
         == "succeeded"
     )
@@ -294,10 +370,10 @@ def test_sealed_artifact_survives_transaction_failure_then_reclaim(
 
 def test_external_identity_rejects_replaced_file_on_reopen_and_live_access(tmp_path: Path) -> None:
     path = tmp_path / "factor-jobs.sqlite3"
-    ledger = FactorEvaluationJobLedger(path)
+    ledger = FactorEvaluationJobLedger(path, clock=_Clock())
     identity = ledger.initialize()
     _, spec = _research_and_spec()
-    job = ledger.submit("request-1", spec, NOW)
+    job = ledger.submit("request-1", spec)
     path.rename(tmp_path / "old.sqlite3")
     replacement = FactorEvaluationJobLedger(path)
     replacement.initialize()
@@ -306,7 +382,7 @@ def test_external_identity_rejects_replaced_file_on_reopen_and_live_access(tmp_p
     with pytest.raises(FactorLedgerIdentityError):
         ledger.get(job.job_id)
     with pytest.raises(FactorLedgerIdentityError):
-        ledger.submit("request-2", spec, NOW)
+        ledger.submit("request-2", spec)
     assert replacement.list_recent(limit=10) == ()
 
 
@@ -343,7 +419,7 @@ def test_tampered_state_spec_or_command_is_not_trusted(tmp_path: Path) -> None:
         root.mkdir(mode=0o700)
         ledger = _ledger(root)
         _, spec = _research_and_spec()
-        job = ledger.submit("request-1", spec, NOW)
+        job = ledger.submit("request-1", spec)
         with sqlite3.connect(ledger.path) as connection:
             connection.execute(
                 f"UPDATE factor_jobs SET {column} = ? WHERE job_id = ?", (value, job.job_id)
@@ -353,31 +429,31 @@ def test_tampered_state_spec_or_command_is_not_trusted(tmp_path: Path) -> None:
         with pytest.raises(FactorLedgerIntegrityError):
             ledger.list_recent(limit=10)
         with pytest.raises(FactorLedgerIntegrityError):
-            ledger.submit("request-1", spec, NOW)
+            ledger.submit("request-1", spec)
 
 
 def test_tampered_command_type_is_rejected_as_integrity_failure(tmp_path: Path) -> None:
     ledger = _ledger(tmp_path)
     _, spec = _research_and_spec()
-    ledger.submit("request-1", spec, NOW)
+    ledger.submit("request-1", spec)
     with sqlite3.connect(ledger.path) as connection:
         connection.execute(
             "UPDATE factor_commands SET spec_sha256 = ? WHERE command_id = ?",
             (sqlite3.Binary(b"f" * 64), "request-1"),
         )
     with pytest.raises(FactorLedgerIntegrityError):
-        ledger.submit("request-1", spec, NOW)
+        ledger.submit("request-1", spec)
 
 
 def test_failure_reason_and_list_budget_are_bounded(tmp_path: Path) -> None:
     ledger = _ledger(tmp_path)
     _, spec = _research_and_spec()
-    job = ledger.submit("request-1", spec, NOW)
-    lease = ledger.claim(NOW, lease_seconds=60)
+    job = ledger.submit("request-1", spec)
+    lease = ledger.claim(lease_seconds=60)
     assert lease is not None
     with pytest.raises(ValueError):
-        ledger.fail(job.job_id, lease.lease_token, lease.version, "/private/secret", NOW)
-    failed = ledger.fail(job.job_id, lease.lease_token, lease.version, "evaluation_failed", NOW)
+        ledger.fail(job.job_id, lease.lease_token, lease.version, "/private/secret")
+    failed = ledger.fail(job.job_id, lease.lease_token, lease.version, "evaluation_failed")
     assert failed.status == "failed" and failed.failure_code == "evaluation_failed"
     assert failed.completion is None
     for limit in (0, 201):

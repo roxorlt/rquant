@@ -8,7 +8,7 @@ import re
 import secrets
 import sqlite3
 import stat
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -195,6 +195,10 @@ def _utc(now: datetime) -> datetime:
     return now.astimezone(UTC)
 
 
+def _system_utc() -> datetime:
+    return datetime.now(UTC)
+
+
 def _time(value: datetime | None) -> str | None:
     return None if value is None else _utc(value).isoformat(timespec="microseconds")
 
@@ -359,12 +363,18 @@ def _checked_completion(
 class FactorEvaluationJobLedger:
     """Explicitly initialized ledger pinned to an out-of-band physical identity."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, clock: Callable[[], datetime] = _system_utc) -> None:
         raw = os.fspath(path)
         if not isinstance(raw, str) or not raw.startswith("/") or os.path.normpath(raw) != raw:
             raise ValueError("factor ledger path must be canonical and absolute")
+        if not callable(clock):
+            raise TypeError("factor ledger requires a callable UTC clock")
         self.path = Path(raw)
+        self._clock = clock
         self._expected: FactorLedgerIdentity | None = None
+
+    def _now(self) -> datetime:
+        return _utc(self._clock())
 
     @staticmethod
     def _private_parent(path: Path) -> None:
@@ -499,10 +509,15 @@ class FactorEvaluationJobLedger:
         return identity
 
     @classmethod
-    def open_existing(cls, expected_identity: FactorLedgerIdentity) -> FactorEvaluationJobLedger:
+    def open_existing(
+        cls,
+        expected_identity: FactorLedgerIdentity,
+        *,
+        clock: Callable[[], datetime] = _system_utc,
+    ) -> FactorEvaluationJobLedger:
         """Open only with the saved external instance and physical file identity."""
         checked = FactorLedgerIdentity.model_validate(expected_identity.model_dump(mode="python"))
-        ledger = cls(Path(checked.path))
+        ledger = cls(Path(checked.path), clock=clock)
         ledger._expected = checked
         with ledger._reader():
             pass
@@ -602,16 +617,14 @@ class FactorEvaluationJobLedger:
         if updated.rowcount != 1:
             raise FactorLedgerIntegrityError("factor job vanished during update")
 
-    def submit(
-        self, command_id: str, spec: FactorEvaluationJobSpec, now: datetime
-    ) -> FactorJobRecord:
+    def submit(self, command_id: str, spec: FactorEvaluationJobSpec) -> FactorJobRecord:
         if not isinstance(command_id, str) or _COMMAND_PATTERN.fullmatch(command_id) is None:
             raise ValueError("factor command ID is invalid")
         checked = FactorEvaluationJobSpec.model_validate(
             spec.model_dump(mode="python", round_trip=True)
         )
-        current = _utc(now)
         with self._writer() as connection:
+            current = self._now()
             command = connection.execute(
                 "SELECT * FROM factor_commands WHERE command_id = ?", (command_id,)
             ).fetchone()
@@ -660,11 +673,11 @@ class FactorEvaluationJobLedger:
             )
             return state.public()
 
-    def claim(self, now: datetime, *, lease_seconds: int) -> FactorJobLease | None:
-        current = _utc(now)
+    def claim(self, *, lease_seconds: int) -> FactorJobLease | None:
         if type(lease_seconds) is not int or not 1 <= lease_seconds <= _MAX_LEASE_SECONDS:
             raise ValueError("factor lease duration is invalid")
         with self._writer() as connection:
+            current = self._now()
             while True:
                 candidate = connection.execute(
                     "SELECT job_id FROM factor_jobs WHERE status = 'queued' OR "
@@ -733,13 +746,12 @@ class FactorEvaluationJobLedger:
         job_id: str,
         lease_token: str,
         expected_version: int,
-        now: datetime,
         lease_seconds: int,
     ) -> FactorJobLease:
-        current = _utc(now)
         if type(lease_seconds) is not int or not 1 <= lease_seconds <= _MAX_LEASE_SECONDS:
             raise ValueError("factor lease duration is invalid")
         with self._writer() as connection:
+            current = self._now()
             state = self._load_job(connection, job_id)
             if state is None:
                 raise FactorLedgerLeaseError("factor job does not exist")
@@ -764,9 +776,7 @@ class FactorEvaluationJobLedger:
         expected_version: int,
         completion: FactorEvaluationCompletion,
         artifact_root: Path,
-        now: datetime,
     ) -> FactorJobRecord:
-        current = _utc(now)
         try:
             checked_completion = FactorEvaluationCompletion.model_validate(
                 completion.model_dump(mode="python")
@@ -777,11 +787,16 @@ class FactorEvaluationJobLedger:
         except (OSError, TypeError, ValueError, ValidationError) as exc:
             raise FactorLedgerCompletionError("factor result artifact cannot be verified") from exc
         with self._writer() as connection:
+            current = self._now()
             state = self._load_job(connection, job_id)
             if state is None:
                 raise FactorLedgerLeaseError("factor job does not exist")
             self._live_lease(state, lease_token, expected_version, current)
             _checked_completion(checked_completion, artifact, state.spec, current)
+            current = self._now()
+            self._live_lease(state, lease_token, expected_version, current)
+            if checked_completion.completed_at > current:
+                raise FactorLedgerCompletionError("factor completion time exceeds ledger time")
             succeeded = state.model_copy(
                 update={
                     "status": "succeeded",
@@ -802,7 +817,6 @@ class FactorEvaluationJobLedger:
         lease_token: str,
         expected_version: int,
         reason_code: FactorJobFailureCode,
-        now: datetime,
     ) -> FactorJobRecord:
         if reason_code not in (
             "source_unavailable",
@@ -811,8 +825,8 @@ class FactorEvaluationJobLedger:
             "internal_error",
         ):
             raise ValueError("factor failure reason is not allowed")
-        current = _utc(now)
         with self._writer() as connection:
+            current = self._now()
             state = self._load_job(connection, job_id)
             if state is None:
                 raise FactorLedgerLeaseError("factor job does not exist")

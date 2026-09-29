@@ -55,10 +55,10 @@ class FactorEvaluationJobSpec(BaseModel):
         admission = self.admission_request
         adapter = self.adapter_request
         if (
-            admission.start_date > adapter.query_start_date
-            or admission.end_date < adapter.query_end_date
+            admission.start_date != adapter.query_start_date
+            or admission.end_date != adapter.query_end_date
         ):
-            raise ValueError("factor admission must cover the adapter query range")
+            raise ValueError("factor admission must match the adapter query range")
         if self.deadline <= adapter.as_of:
             raise ValueError("factor deadline must follow the research as_of")
         if self.definition_content_sha256 != _definition_sha256(adapter.definition):
