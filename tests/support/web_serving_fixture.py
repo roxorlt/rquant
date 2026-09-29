@@ -1143,6 +1143,7 @@ def build_web_fixture(
     signal_projections: tuple[ServingProjectionPayload, ...] = (),
     promotion_projections: tuple[ServingProjectionPayload, ...] = (),
     calendar_projection: ServingProjectionPayload | None = None,
+    strategy_catalog_projections: tuple[ServingProjectionPayload, ...] = (),
 ) -> ServingGenerationManifest:
     """Publish generation ``sequence`` of ``scenario`` into ``root`` and select it."""
 
@@ -1152,6 +1153,14 @@ def build_web_fixture(
         raise ValueError("sequence must be a non-negative integer")
     built_at = fixture_built_at(sequence)
     generations = _generation_ids(scenario, sequence)
+    if strategy_catalog_projections:
+        if {item.table_name for item in strategy_catalog_projections} != {
+            "strategy_catalog", "strategy_catalog_parameter"
+        }:
+            raise ValueError("strategy catalog fixture requires both projections")
+        generations["strategy_catalog"] = _digest(
+            "web-fixture", scenario, "strategy_catalog", sequence
+        )
     signals, routes, deliveries = _signal_bundle(built_at)
     if audit:
         if lab_page_projections is not None:
@@ -1213,6 +1222,14 @@ def build_web_fixture(
                 )
             lab_page_projections = DuckDBLabPageProjectionSource(research)(built_at).projections
     projections = _projections(scenario, built_at=built_at, generations=generations)
+    projections += tuple(
+        ServingProjectionInput.bind(
+            item,
+            owner_dataset_id="strategy_catalog",
+            owner_generation_id=generations["strategy_catalog"],
+        )
+        for item in strategy_catalog_projections
+    )
     if paper_history_projections:
         projections += tuple(
             ServingProjectionInput.bind(
@@ -1337,11 +1354,23 @@ def build_web_fixture(
         schema_version=FIXTURE_SCHEMA_VERSION,
         table_specs=specs,
     )
+    watermarks = _watermarks(
+        scenario, built_at=built_at, generations=generations, sequence=sequence
+    )
+    if strategy_catalog_projections:
+        watermarks += (
+            ServingDatasetWatermark(
+                dataset_id="strategy_catalog",
+                generation_id=generations["strategy_catalog"],
+                event_time=built_at - timedelta(seconds=40),
+                published_at=built_at - timedelta(seconds=20),
+                sequence=sequence + 1,
+                status=FreshnessStatus.FRESH,
+            ),
+        )
     return publisher.publish(
         tables,
-        watermarks=_watermarks(
-            scenario, built_at=built_at, generations=generations, sequence=sequence
-        ),
+        watermarks=watermarks,
         source_generations=generations,
         built_at=built_at,
     )

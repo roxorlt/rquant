@@ -228,4 +228,41 @@ describe("实验记录", () => {
     await waitFor(() => expect(screen.getByRole("button", { name: "对比所选" })).toBeDisabled());
     expect(screen.queryByRole("region", { name: "实验对比" })).not.toBeInTheDocument();
   });
+
+  it("元数据首次成功后轮询失败时隐藏旧实验对比，恢复后可重新加载", async () => {
+    server.use(
+      http.get("*/api/v1/experiments", () =>
+        HttpResponse.json({
+          data: {
+            available: true,
+            items: [first, second],
+            retained_count: 2,
+            truncated: false,
+            oldest_registered_at: second.registered_at,
+            next_cursor: null,
+          },
+          serving,
+        }),
+      ),
+    );
+    const user = userEvent.setup();
+    const { queryClient } = renderApp("/experiments");
+    const table = await screen.findByRole("table", { name: "实验记录" });
+    await user.click(within(table).getByRole("checkbox", { name: "选择均线研究" }));
+    await user.click(within(table).getByRole("checkbox", { name: "选择突破研究" }));
+    await user.click(screen.getByRole("button", { name: "对比所选" }));
+    expect(screen.getByRole("region", { name: "实验对比" })).toBeVisible();
+
+    server.use(http.get("*/api/v1/meta", () => new HttpResponse(null, { status: 503 })));
+    await act(async () => {
+      await queryClient.invalidateQueries({ queryKey: META_QUERY_KEY });
+    });
+    expect(await screen.findByText("实验记录暂时无法核对，请稍后重试。")).toBeVisible();
+    expect(screen.queryByRole("table", { name: "实验记录" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "实验对比" })).not.toBeInTheDocument();
+
+    server.use(metaHandler(metaEnvelope()));
+    await user.click(screen.getByRole("button", { name: "重新加载" }));
+    expect(await screen.findByRole("table", { name: "实验记录" })).toBeVisible();
+  });
 });

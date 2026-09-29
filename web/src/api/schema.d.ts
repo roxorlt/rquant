@@ -803,6 +803,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/strategies": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 已核验策略定义 */
+        get: operations["list_strategies_api_v1_strategies_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/tasks/jobs": {
         parameters: {
             query?: never;
@@ -2444,6 +2461,11 @@ export interface components {
         /** Envelope[StockSummaryData] */
         Envelope_StockSummaryData_: {
             data: components["schemas"]["StockSummaryData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[StrategyCatalogData] */
+        Envelope_StrategyCatalogData_: {
+            data: components["schemas"]["StrategyCatalogData"];
             serving: components["schemas"]["ServingMeta"];
         };
         /** Envelope[SurgeData] */
@@ -4701,6 +4723,38 @@ export interface components {
             /** Ts Code */
             ts_code: string;
         };
+        /** StrategyCatalogData */
+        StrategyCatalogData: {
+            /** Available */
+            available: boolean;
+            /** Strategies */
+            strategies: components["schemas"]["StrategyCatalogItem"][];
+        };
+        /** StrategyCatalogItem */
+        StrategyCatalogItem: {
+            /** Name */
+            name: string;
+            /** Parameters */
+            parameters: components["schemas"]["StrategyParameter"][];
+            /**
+             * Registered At
+             * Format: date-time
+             */
+            registered_at: string;
+            /** Strategy Id */
+            strategy_id: string;
+            /** Version */
+            version: number;
+        };
+        /** StrategyParameter */
+        StrategyParameter: {
+            /** Display Value */
+            display_value: string;
+            /** Key */
+            key: string;
+            /** Label */
+            label: string;
+        };
         /** SurgeConfig */
         SurgeConfig: {
             /** Boards */
@@ -6341,6 +6395,37 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_StockSummaryData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_strategies_api_v1_strategies_get: {
+        parameters: {
+            query?: {
+                generation_id?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_StrategyCatalogData_"];
                 };
             };
             /** @description Validation Error */

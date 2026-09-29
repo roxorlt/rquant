@@ -71,6 +71,7 @@ from rquant.web.routes import (
     screen,
     service_logs,
     stocks,
+    strategies,
     tasks,
 )
 from rquant.web.screen_service import ScreenApplicationService
@@ -361,6 +362,9 @@ def create_app(
     app.include_router(backtests.router, prefix="/api/v1", tags=["backtests"], dependencies=private)
     app.include_router(
         experiments.router, prefix="/api/v1", tags=["experiments"], dependencies=private
+    )
+    app.include_router(
+        strategies.router, prefix="/api/v1", tags=["strategies"], dependencies=private
     )
     app.include_router(health.router, prefix="/api/v1", tags=["health"])
     app.include_router(panorama.router, prefix="/api/v1", tags=["panorama"])

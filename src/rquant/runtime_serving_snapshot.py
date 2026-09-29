@@ -54,6 +54,7 @@ PAPER_ACCOUNTS_DATASET_ID = "paper_accounts"
 RUNTIME_HEALTH_DATASET_ID = "runtime_health"
 LAB_JOBS_DATASET_ID = "lab_jobs"
 PROMOTIONS_DATASET_ID = "promotions"
+STRATEGY_CATALOG_DATASET_ID = "strategy_catalog"
 OPS_STATUS_DATASET_ID = "ops_status"
 REFERENCE_SLOW_AUTHORITY_DATASET_ID = "reference_slow_authority"
 REFERENCE_SLOW_DATASET_ID = "reference_slow"
@@ -328,6 +329,24 @@ class ReferenceSlowPayload(ServingReferenceSlowEvidence):
     projections: tuple[ServingProjectionPayload, ...] = ()
 
 
+class StrategyCatalogPayload(RuntimeContractModel):
+    payload_kind: Literal["strategy_catalog"] = "strategy_catalog"
+    source_digest: GenerationId | None = None
+    runtime_generation_id: GenerationId | None = None
+    projections: tuple[ServingProjectionPayload, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_projection_pair(self) -> StrategyCatalogPayload:
+        names = tuple(projection.table_name for projection in self.projections)
+        if self.source_digest is None and self.runtime_generation_id is None and not names:
+            return self
+        if self.source_digest is None or self.runtime_generation_id is None or set(names) != {
+            "strategy_catalog", "strategy_catalog_parameter"
+        } or len(names) != 2:
+            raise ValueError("strategy catalog requires a complete source and projection pair")
+        return self
+
+
 SourcePayload = Annotated[
     SignalDeliveryReadPayload
     | PaperAccountsPayload
@@ -335,6 +354,7 @@ SourcePayload = Annotated[
     | LabJobsPayload
     | PromotionsPayload
     | OpsStatusPayload
+    | StrategyCatalogPayload
     | ReferenceSlowPayload,
     Field(discriminator="payload_kind"),
 ]
@@ -417,6 +437,12 @@ def _payload_is_empty(payload: SourcePayload) -> bool:
         return not payload.promotions and not payload.projections
     if isinstance(payload, OpsStatusPayload):
         return payload.snapshot is None and not payload.projections
+    if isinstance(payload, StrategyCatalogPayload):
+        return (
+            payload.source_digest is None
+            and payload.runtime_generation_id is None
+            and not payload.projections
+        )
     return False
 
 
@@ -429,6 +455,12 @@ def _missing_ops_status(_as_of: AwareUtcDatetime) -> SourceReadResult:
     from rquant.runtime_serving_authority import ServingSourceAuthorityUnavailableError
 
     raise ServingSourceAuthorityUnavailableError("ops status collector is not installed")
+
+
+def _missing_strategy_catalog(_as_of: AwareUtcDatetime) -> SourceReadResult:
+    from rquant.runtime_serving_authority import ServingSourceAuthorityUnavailableError
+
+    raise ServingSourceAuthorityUnavailableError("strategy catalog source is not installed")
 
 
 class ServingSnapshotAssembler:
@@ -444,11 +476,17 @@ class ServingSnapshotAssembler:
         promotions_reader: PromotionsReader,
         reference_slow_reader: ReferenceSlowReader,
         ops_status_reader: OpsStatusReader | None = None,
+        strategy_catalog_reader: SourceReader | None = None,
         expected_ops_manifest_digest: GenerationId | None = None,
         optional_datasets: frozenset[str] = DEFAULT_OPTIONAL_SOURCE_DATASETS,
     ) -> None:
         selected_ops_reader = (
             _missing_ops_status if ops_status_reader is None else ops_status_reader
+        )
+        selected_catalog_reader = (
+            _missing_strategy_catalog
+            if strategy_catalog_reader is None
+            else strategy_catalog_reader
         )
         readers = (
             signal_reader,
@@ -458,6 +496,7 @@ class ServingSnapshotAssembler:
             promotions_reader,
             reference_slow_reader,
             selected_ops_reader,
+            selected_catalog_reader,
         )
         if any(not callable(reader) for reader in readers):
             raise TypeError("all serving source readers must be callable")
@@ -482,6 +521,7 @@ class ServingSnapshotAssembler:
         self.lab_jobs_reader = lab_jobs_reader
         self.promotions_reader = promotions_reader
         self.ops_status_reader = selected_ops_reader
+        self.strategy_catalog_reader = selected_catalog_reader
         self.expected_ops_manifest_digest = expected_ops_manifest_digest
         self.reference_slow_reader = reference_slow_reader
         self.optional_datasets = optional_datasets
@@ -504,6 +544,11 @@ class ServingSnapshotAssembler:
             (LAB_JOBS_DATASET_ID, self.lab_jobs_reader, LabJobsPayload),
             (PROMOTIONS_DATASET_ID, self.promotions_reader, PromotionsPayload),
             (OPS_STATUS_DATASET_ID, self.ops_status_reader, OpsStatusPayload),
+            (
+                STRATEGY_CATALOG_DATASET_ID,
+                self.strategy_catalog_reader,
+                StrategyCatalogPayload,
+            ),
             (
                 REFERENCE_SLOW_AUTHORITY_DATASET_ID,
                 self.reference_slow_reader,
@@ -713,7 +758,7 @@ class ServingSnapshotAssembler:
             )
 
             classified = isinstance(error, ServingSourceAuthorityUnavailableError) or (
-                dataset_id == OPS_STATUS_DATASET_ID
+                dataset_id in {OPS_STATUS_DATASET_ID, STRATEGY_CATALOG_DATASET_ID}
                 and isinstance(error, ServingSourceAuthorityIntegrityError)
             )
             if (

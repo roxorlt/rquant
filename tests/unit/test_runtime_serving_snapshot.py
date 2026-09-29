@@ -30,6 +30,7 @@ from rquant.runtime_serving_snapshot import (
     RUNTIME_HEALTH_DATASET_ID,
     SIGNALS_DATASET_ID,
     SOURCE_DATASET_IDS,
+    STRATEGY_CATALOG_DATASET_ID,
     UNAVAILABLE_EVIDENCE_INSTANT,
     LabJobsPayload,
     OpsStatusPayload,
@@ -722,7 +723,8 @@ def test_the_seven_owner_datasets_are_named_in_one_place() -> None:
         OPS_STATUS_DATASET_ID,
         PROMOTIONS_DATASET_ID,
         REFERENCE_SLOW_AUTHORITY_DATASET_ID,
-    } == SOURCE_DATASET_IDS
+    } == SOURCE_DATASET_IDS - {STRATEGY_CATALOG_DATASET_ID}
+    assert STRATEGY_CATALOG_DATASET_ID in SOURCE_DATASET_IDS
     assert DEFAULT_OPTIONAL_SOURCE_DATASETS < SOURCE_DATASET_IDS
 
 

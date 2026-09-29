@@ -165,7 +165,16 @@ export default function ExperimentsPage() {
   return (
     <>
       <PageHeader eyebrow="策略与验证" title="实验记录" note="查看已登记实验和已有结果" />
-      {query.isLoading ? (
+      {meta.isError ? (
+        <Panel>
+          <div className="exp-message" role="alert">
+            <p>实验记录暂时无法核对，请稍后重试。</p>
+            <Button size="sm" onClick={() => void meta.refetch()}>
+              重新加载
+            </Button>
+          </div>
+        </Panel>
+      ) : query.isLoading ? (
         <PageSkeleton label="正在加载实验记录" />
       ) : query.error ? (
         <Panel>
