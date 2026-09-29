@@ -17,7 +17,9 @@ from rquant.data_metadata import (
     DatasetSnapshotFinalization,
 )
 from rquant.factor import FeatureCatalog, build_factor_definition
+from rquant.factor.capability import HISTORICAL_DAILY_V1
 from rquant.factor.definition import FactorDefinition
+from rquant.factor.time_series import evaluate_factor_time_series
 from rquant.factor_snapshot_admission import (
     FactorSnapshotAdmissionDecision,
     FactorSnapshotAdmissionRequest,
@@ -241,6 +243,73 @@ def test_historical_adapter_builds_manual_adjusted_returns_and_paired_result(
     assert paired.result.days[0].evaluation.normal_ic.value == pytest.approx(1.0)
 
 
+def test_daily_capability_fields_all_evaluate_from_one_frozen_source(tmp_path: Path) -> None:
+    from rquant.factor.historical_adapter import (
+        HistoricalFactorAdapterRequest,
+        adapt_historical_factor_source,
+    )
+
+    expected = {
+        "open": 12.0,
+        "high": 13.0,
+        "low": 11.0,
+        "close": 12.0,
+        "vol": 100.0,
+        "amount": 1000.0,
+    }
+    assert set(expected) == {field.column for field in HISTORICAL_DAILY_V1.fields}
+    with _admitted(tmp_path) as (_store, lease, decision, _snapshot, _binding):
+        for column, value in expected.items():
+            definition = build_factor_definition(
+                factor_id=f"daily_{column}",
+                name_zh="日线字段因子",
+                category="technical",
+                direction="higher_is_better",
+                version=1,
+                earliest_available_date=_FIRST,
+                expression=column,
+                feature_catalog=HISTORICAL_DAILY_V1.feature_catalog(),
+            )
+            adapted = adapt_historical_factor_source(
+                lease,
+                decision,
+                HistoricalFactorAdapterRequest(
+                    definition=definition,
+                    stock_codes=_STOCKS,
+                    pool_basis="explicit_fixed_list",
+                    evaluation_days=_EVALUATION_DAYS,
+                    query_start_date=_FIRST,
+                    query_end_date=_LAST,
+                    holding_sessions=5,
+                    as_of=_at(_LAST, 9, 25),
+                ),
+            )
+            assert adapted.receipt.feature_columns == (column,)
+            assert adapted.receipt.allowed_columns == tuple(
+                sorted(
+                    (
+                        *(f"daily_bar.{field.column}" for field in HISTORICAL_DAILY_V1.fields),
+                        "daily_bar.ts_code",
+                        "daily_bar.trade_date",
+                        "adj_factor.ts_code",
+                        "adj_factor.trade_date",
+                        "adj_factor.adj_factor",
+                        "trade_calendar.cal_date",
+                        "trade_calendar.is_open",
+                        "trade_calendar.pretrade_date",
+                    )
+                )
+            )
+            values = evaluate_factor_time_series(adapted.request.factor_input).values
+            point = next(
+                point
+                for point in values
+                if point.stock_code == _STOCKS[0] and point.trade_date == _EVALUATION_DAYS[0]
+            )
+            assert point.value == value
+            assert point.missing_reason is None
+
+
 def test_historical_adapter_friday_return_waits_until_monday_0925(tmp_path: Path) -> None:
     from rquant.factor.historical_adapter import (
         HistoricalFactorAdapterRequest,
@@ -449,6 +518,7 @@ def test_historical_adapter_rejects_missing_predecessor_warmup_maturity_or_overl
 
 def test_historical_adapter_rejects_unknown_catalog_context_and_market_claim(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from rquant.factor.historical_adapter import (
         HistoricalFactorAdapterRequest,
@@ -456,6 +526,11 @@ def test_historical_adapter_rejects_unknown_catalog_context_and_market_claim(
     )
 
     with _admitted(tmp_path) as (_store, lease, decision, _snapshot, _binding):
+
+        def unexpected_source_read(_lease: FactorReadLease, _query: object) -> None:
+            pytest.fail("unsupported definition queried the frozen source")
+
+        monkeypatch.setattr(FactorReadLease, "query_sse_calendar", unexpected_source_read)
         for definition in (
             build_factor_definition(
                 factor_id="unknown_financial",
@@ -468,6 +543,7 @@ def test_historical_adapter_rejects_unknown_catalog_context_and_market_claim(
                 feature_catalog=FeatureCatalog(columns=("pe",)),
             ),
             _definition("industry_neutralize(close)"),
+            _definition("size_neutralize(close)"),
         ):
             request = HistoricalFactorAdapterRequest(
                 definition=definition,
