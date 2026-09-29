@@ -23,6 +23,7 @@ from rquant.web.market import shanghai_trade_date
 from rquant.web.models.common import StatusInfo
 from rquant.web.models.tasks import (
     JobCounts,
+    ResearchJobAction,
     ResearchJobItem,
     ResearchJobsData,
     ResearchTaskEvent,
@@ -55,12 +56,8 @@ _PAGE_COLUMNS = (
     "progress_fraction, terminal_shards, total_shards, eta_status, "
     "eta_finish_low, eta_finish_center, eta_finish_high, updated_at"
 )
-_PAGE_FIRST = f"SELECT {_PAGE_COLUMNS} FROM lab_jobs ORDER BY updated_at DESC, job_id ASC LIMIT ?"
-_PAGE_AFTER = (
-    f"SELECT {_PAGE_COLUMNS} FROM lab_jobs "
-    "WHERE updated_at < ? OR (updated_at = ? AND job_id > ?) "
-    "ORDER BY updated_at DESC, job_id ASC LIMIT ?"
-)
+_CONTROL_COLUMNS = ("job_version", "can_pause", "can_resume", "can_cancel", "can_retry")
+_CONTROL_NAMES: tuple[ResearchJobAction, ...] = ("pause", "resume", "cancel", "retry")
 _CHANGED = "任务数据已更新，请从第一页重新查看。"
 _UNREADABLE = "研究任务数据暂时无法读取，请稍后重试。"
 _EVENT_CHANGED = "任务进展已更新，请重新打开查看。"
@@ -159,7 +156,9 @@ def _eta_label(status: str, intent: str) -> str:
     return "暂无法预计"
 
 
-def _item(row: tuple[Any, ...], *, name_limit: int | None = None) -> ResearchJobItem:
+def _item(
+    row: tuple[Any, ...], *, name_limit: int | None = None, show_controls: bool = False
+) -> ResearchJobItem:
     (
         job_id,
         name,
@@ -175,7 +174,21 @@ def _item(row: tuple[Any, ...], *, name_limit: int | None = None) -> ResearchJob
         eta_center,
         eta_high,
         updated_at,
-    ) = row
+    ) = row[:14]
+    version: int | None = None
+    actions: list[ResearchJobAction] | None = None
+    if show_controls and len(row) == 19:
+        raw_version, *availability = row[14:]
+        if (
+            type(raw_version) is not int
+            or raw_version < 0
+            or any(type(value) is not bool for value in availability)
+        ):
+            raise ValueError("published Lab control evidence is invalid")
+        version = raw_version
+        actions = [
+            name for name, enabled in zip(_CONTROL_NAMES, availability, strict=True) if enabled
+        ]
     raw_status = str(status)
     raw_intent = str(intent)
     show_eta = (
@@ -198,6 +211,8 @@ def _item(row: tuple[Any, ...], *, name_limit: int | None = None) -> ResearchJob
         eta_high=eta_high if show_eta else None,
         eta_label="预计结束" if show_eta else _eta_label(raw_status, raw_intent),
         updated_at=updated_at,
+        job_version=version,
+        available_actions=actions,
     )
 
 
@@ -213,6 +228,16 @@ def _can_view_research_logs(viewer: str | None, request: Request) -> bool:
         settings.ingress_socket_path is not None
         and viewer is not None
         and viewer in settings.log_admin_users
+    )
+
+
+def _can_control_research_jobs(viewer: str | None, request: Request) -> bool:
+    settings = request.app.state.web.settings
+    return (
+        settings.ingress_socket_path is not None
+        and request.app.state.web.proxy_identity is not None
+        and viewer is not None
+        and viewer in settings.lab_control_users
     )
 
 
@@ -390,8 +415,18 @@ def _page(
     after: _Cursor | None,
     key: bytes,
     cursor_kind: Literal["research_jobs_v1", "task_overview_v1"] = "research_jobs_v1",
+    show_controls: bool = False,
 ) -> ResearchJobsData:
     try:
+        columns = {
+            entry[0]
+            for entry in borrowed.cursor.execute("SELECT * FROM lab_jobs LIMIT 0").description
+        }
+        present = columns.intersection(_CONTROL_COLUMNS)
+        if present and present != set(_CONTROL_COLUMNS):
+            raise ValueError("published Lab control columns are incomplete")
+        has_controls = show_controls and len(present) == len(_CONTROL_COLUMNS)
+        page_columns = _PAGE_COLUMNS + (", " + ", ".join(_CONTROL_COLUMNS) if has_controls else "")
         count_values = borrowed.cursor.execute(_COUNTS_SQL).fetchone()
         if count_values is None:
             raise ValueError("job counts are missing")
@@ -402,15 +437,24 @@ def _page(
         if sum(count_values[1:]) != total:
             raise ValueError("job status counts differ from total")
         if after is None:
-            rows = borrowed.cursor.execute(_PAGE_FIRST, (page_size + 1,)).fetchall()
+            rows = borrowed.cursor.execute(
+                f"SELECT {page_columns} FROM lab_jobs ORDER BY updated_at DESC, job_id ASC LIMIT ?",
+                (page_size + 1,),
+            ).fetchall()
         else:
             rows = borrowed.cursor.execute(
-                _PAGE_AFTER,
+                f"SELECT {page_columns} FROM lab_jobs "
+                "WHERE updated_at < ? OR (updated_at = ? AND job_id > ?) "
+                "ORDER BY updated_at DESC, job_id ASC LIMIT ?",
                 (after.last_at, after.last_at, str(after.last_id), page_size + 1),
             ).fetchall()
         selected = rows[:page_size]
         items = [
-            _item(row, name_limit=80 if cursor_kind == "task_overview_v1" else None)
+            _item(
+                row,
+                name_limit=80 if cursor_kind == "task_overview_v1" else None,
+                show_controls=has_controls,
+            )
             for row in selected
         ]
     except (ServingQueryError, ValueError, TypeError, ValidationError) as error:
@@ -453,7 +497,7 @@ def _page(
 def get_jobs(
     request: Request,
     response: Response,
-    _viewer: Annotated[str | None, Depends(current_user)],
+    viewer: Annotated[str | None, Depends(current_user)],
     page_size: Annotated[int, Query(ge=1, le=50)] = 20,
     cursor: Annotated[str | None, Query(max_length=512)] = None,
 ) -> Envelope[ResearchJobsData]:
@@ -484,7 +528,12 @@ def get_jobs(
                 data = _empty("not_published", page_size)
             else:
                 data = _page(
-                    borrowed, mark=mark, page_size=page_size, after=decoded, key=web.cursor_key
+                    borrowed,
+                    mark=mark,
+                    page_size=page_size,
+                    after=decoded,
+                    key=web.cursor_key,
+                    show_controls=_can_control_research_jobs(viewer, request),
                 )
     return Envelope[ResearchJobsData](data=data, serving=meta)
 
@@ -577,6 +626,7 @@ def get_overview(
                     after=decoded,
                     key=web.cursor_key,
                     cursor_kind="task_overview_v1",
+                    show_controls=_can_control_research_jobs(viewer, request),
                 )
     return Envelope[TaskOverviewData](
         data=TaskOverviewData(
@@ -585,6 +635,7 @@ def get_overview(
             resources=resources,
             research=research,
             can_view_research_logs=_can_view_research_logs(viewer, request),
+            can_control_research_jobs=_can_control_research_jobs(viewer, request),
         ),
         serving=meta,
     )

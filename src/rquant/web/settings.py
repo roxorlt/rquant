@@ -45,6 +45,7 @@ WATCHLIST_ADMISSION_SOCKET_ENV_VAR = "RQUANT_WEB_WATCHLIST_ADMISSION_SOCKET"
 INGRESS_SOCKET_ENV_VAR = "RQUANT_WEB_INGRESS_SOCKET"
 PROXY_PROOF_FILE_ENV_VAR = "RQUANT_WEB_PROXY_PROOF_FILE"
 LOG_ADMIN_USERS_ENV_VAR = "RQUANT_WEB_LOG_ADMIN_USERS"
+LAB_CONTROL_USERS_ENV_VAR = "RQUANT_WEB_LAB_CONTROL_USERS"
 UNIT_LOG_SOCKET_ENV_VAR = "RQUANT_WEB_UNIT_LOG_SOCKET"
 UNIT_LOG_SERVICE_UID_ENV_VAR = "RQUANT_WEB_UNIT_LOG_SERVICE_UID"
 UNIT_LOG_WEB_GROUP_GID_ENV_VAR = "RQUANT_WEB_UNIT_LOG_WEB_GROUP_GID"
@@ -114,6 +115,7 @@ class WebSettings(BaseModel):
     ingress_socket_path: Path | None = None
     proxy_proof_file: Path | None = None
     log_admin_users: frozenset[str] = frozenset()
+    lab_control_users: frozenset[str] = frozenset()
     unit_log_socket_path: Path | None = None
     unit_log_service_uid: StrictInt | None = None
     unit_log_web_group_gid: StrictInt | None = None
@@ -135,6 +137,8 @@ class WebSettings(BaseModel):
             raise ValueError("private Web ingress cannot also configure a TCP bind")
         if self.proxy_proof_file is not None and self.ingress_socket_path is None:
             raise ValueError("proxy proof requires private Web ingress")
+        if self.lab_control_users and self.ingress_socket_path is None:
+            raise ValueError("Lab control requires private Web ingress")
         if self.ack_admission_socket_path is not None:
             if self.ingress_socket_path is None:
                 raise ValueError("ack admission requires private Web ingress")
@@ -220,11 +224,11 @@ class WebSettings(BaseModel):
             raise ValueError("proxy proof file path must be absolute and canonical")
         return value
 
-    @field_validator("log_admin_users")
+    @field_validator("log_admin_users", "lab_control_users")
     @classmethod
-    def validate_log_admin_users(cls, value: frozenset[str]) -> frozenset[str]:
+    def validate_operator_users(cls, value: frozenset[str]) -> frozenset[str]:
         if len(value) > 16 or any(_ADMIN_USER_PATTERN.fullmatch(user) is None for user in value):
-            raise ValueError("log admins must be a bounded list of exact user names")
+            raise ValueError("operator users must be a bounded list of exact user names")
         return value
 
     @field_validator("formula_market_result_root", "formula_pool_daily_result_root")
@@ -341,6 +345,12 @@ class WebSettings(BaseModel):
             if any(not name for name in names) or len(set(names)) != len(names):
                 raise ValueError("log admins must be distinct nonempty user names")
             values["log_admin_users"] = frozenset(names)
+        lab_users = source.get(LAB_CONTROL_USERS_ENV_VAR, "").strip()
+        if lab_users:
+            names = tuple(user.strip() for user in lab_users.split(","))
+            if any(not name for name in names) or len(set(names)) != len(names):
+                raise ValueError("Lab control users must be distinct nonempty names")
+            values["lab_control_users"] = frozenset(names)
         log_paths = (
             (UNIT_LOG_SOCKET_ENV_VAR, "unit_log_socket_path"),
             (UNIT_LOG_MANIFEST_ENV_VAR, "unit_log_manifest_path"),

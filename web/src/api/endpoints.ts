@@ -20,6 +20,8 @@ export type MonitorTimelineItem = MonitorTimelineData["items"][number];
 export type MonitorChannelsData = Schemas["MonitorChannelsData"];
 export type ResearchJobsData = Schemas["ResearchJobsData"];
 export type ResearchJobItem = Schemas["ResearchJobItem"];
+export type LabControlRequest = Schemas["LabControlRequest"];
+export type LabControlReceipt = Schemas["LabControlReceipt"];
 export type ResearchTaskEventsData = Schemas["ResearchTaskEventsData"];
 export type TaskOverviewData = Schemas["TaskOverviewData"];
 export type ScheduledTaskItem = Schemas["ScheduledTaskItem"];
@@ -114,6 +116,52 @@ export function useResearchJobs(
     });
     return unwrap(data, response);
   });
+}
+
+/** A fresh private grant, separate from the delayed Serving job snapshot. */
+export function useLabControlCapabilities(viewer: string | null) {
+  return useQuery({
+    queryKey: ["tasks", "lab-control-capabilities", viewer],
+    enabled: viewer !== null,
+    gcTime: 0,
+    staleTime: 0,
+    retry: false,
+    refetchInterval: 15_000,
+    refetchIntervalInBackground: false,
+    refetchOnWindowFocus: "always",
+    queryFn: async (): Promise<Schemas["LabControlCapabilities"]> => {
+      const { data, response } = await apiClient().GET("/api/v1/tasks/jobs/control-capabilities");
+      return unwrap(data, response);
+    },
+  });
+}
+
+export async function submitLabControl(body: LabControlRequest): Promise<LabControlReceipt> {
+  const { data, error, response } = await apiClient()
+    .POST("/api/v1/tasks/jobs/commands", {
+      body,
+      headers: { "X-Rquant-Csrf": "1" },
+      signal: AbortSignal.timeout(12_000),
+    })
+    .catch(() => {
+      throw new ApiError(503, "提交状态待确认，请查询或重试原请求。");
+    });
+  const receipt = data ?? error;
+  if (
+    receipt &&
+    typeof receipt === "object" &&
+    "command_id" in receipt &&
+    receipt.command_id === body.command_id &&
+    "status" in receipt &&
+    ["submitted", "pending", "processing", "unknown", "conflict", "failed"].includes(
+      String(receipt.status),
+    ) &&
+    "message" in receipt &&
+    typeof receipt.message === "string"
+  ) {
+    return receipt as LabControlReceipt;
+  }
+  throw new ApiError(response.status, "提交状态待确认，请查询或重试原请求。");
 }
 
 /** Private task progress is keyed to the exact overview generation and opens on demand. */

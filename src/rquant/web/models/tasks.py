@@ -10,6 +10,7 @@ from rquant.runtime_contracts import AwareUtcDatetime
 from rquant.web.models.common import StatusInfo
 
 JobSourceState = Literal["ready", "empty", "not_published", "unavailable"]
+ResearchJobAction = Literal["pause", "resume", "cancel", "retry"]
 
 
 class JobCounts(BaseModel):
@@ -40,6 +41,8 @@ class ResearchJobItem(BaseModel):
     eta_high: AwareUtcDatetime | None
     eta_label: str
     updated_at: AwareUtcDatetime
+    job_version: int | None = Field(default=None, ge=0)
+    available_actions: list[ResearchJobAction] | None = None
 
 
 class ResearchJobsData(BaseModel):
@@ -181,3 +184,4 @@ class TaskOverviewData(BaseModel):
     resources: ResourcesData
     research: ResearchJobsData
     can_view_research_logs: bool = False
+    can_control_research_jobs: bool = False
