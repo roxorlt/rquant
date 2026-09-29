@@ -55,7 +55,6 @@ def _save_preflight(
     draft: FactorSaveDraft,
     *,
     actor: str,
-    require_original_generation: bool,
 ) -> str:
     web = request.app.state.web
     web.tracker.refresh()
@@ -68,7 +67,7 @@ def _save_preflight(
         )
         if borrowed is None or meta.state is not ServingState.READY:
             raise HTTPException(status_code=503, detail=_UNREADABLE)
-        if require_original_generation and meta.generation_id != draft.generation_id:
+        if meta.generation_id != draft.generation_id:
             raise HTTPException(status_code=409, detail="数据已更新，请刷新因子后重试。")
         catalog = _read_catalog(borrowed)
         if catalog.availability not in {"empty", "populated"}:
@@ -255,7 +254,7 @@ def save_factor_draft(
     actor: Annotated[str, Depends(_save_editor)],
     _csrf: Annotated[None, Depends(require_csrf)],
 ) -> Envelope[FactorSaveCommandData]:
-    instance_id = _save_preflight(request, body, actor=actor, require_original_generation=True)
+    instance_id = _save_preflight(request, body, actor=actor)
     try:
         result = request.app.state.web.factor_admission.submit_save(
             body,
@@ -320,7 +319,7 @@ def retry_original_factor_save(
             return _save_response(request, body, None, actor=actor)
         return _save_response(request, body, found, actor=actor)
     try:
-        instance_id = _save_preflight(request, body, actor=actor, require_original_generation=False)
+        instance_id = _save_preflight(request, body, actor=actor)
         result = client.submit_save(
             body,
             authenticated_actor_id=actor,

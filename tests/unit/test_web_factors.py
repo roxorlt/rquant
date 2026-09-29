@@ -703,3 +703,230 @@ def test_web_save_lookup_miss_remains_uncertain_and_retry_reuses_original_id(
         assert retried.status_code == 200, retried.text
         assert retried.json()["data"]["command_id"] == body["command_id"]
         assert len(registry.list_current(expected_identity=registry.identity())) == 1
+
+
+def test_save_retry_miss_cannot_rebase_original_request_to_another_registry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "serving"
+    build_web_fixture(
+        root, "baseline", factor_definition_projections=_pair(tmp_path, populated=False)
+    )
+    original_registry = FactorDefinitionRegistry(tmp_path / "factor-fixture.sqlite3")
+    outbox = PageControlOutbox(tmp_path / "control.sqlite3")
+    service = PageControlService(
+        outbox=outbox,
+        consumer=PageControlConsumer(
+            outbox=outbox,
+            data_dir=tmp_path / "data",
+            log_dir=tmp_path / "logs",
+            factor_definition_backend=FactorDefinitionPageControlBackend(original_registry),
+            clock=lambda: FIXTURE_BUILT_AT + timedelta(seconds=30),
+        ),
+    )
+    admission = FactorDefinitionAdmission(
+        service, editor_users=frozenset({"researcher"}), save_enabled=True
+    )
+    app = create_app(
+        WebSettings(
+            serving_root=root,
+            stale_after_seconds=1e9,
+            factor_editor_users=frozenset({"researcher"}),
+            factor_save_enabled=True,
+            factor_admission_socket_path=tmp_path / "factor-private" / "factor.sock",
+            factor_admission_service_uid=501,
+            factor_admission_shared_gid=20,
+            ingress_socket_path=tmp_path / "web-private" / "web.sock",
+        ),
+        factor_admission_client=admission,
+        clock=lambda: FIXTURE_BUILT_AT + timedelta(minutes=2),
+        background=False,
+    )
+    path = "/api/v1/factors/definitions/save"
+    headers = {"x-rquant-csrf": "1"}
+    with ResearcherTestClient(app) as client:
+        original_generation = client.get("/api/v1/factors/definitions").json()["serving"][
+            "generation_id"
+        ]
+        body = {
+            "generation_id": original_generation,
+            "command_id": "lost-before-enqueue",
+            "requested_at": (FIXTURE_BUILT_AT + timedelta(seconds=30)).isoformat(),
+            "mode": "create",
+            "factor_id": None,
+            "expected_head": None,
+            "name_zh": "失联因子",
+            "category": "technical",
+            "direction": "higher_is_better",
+            "expression": "close",
+        }
+        original_submit = admission.submit_save
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                admission,
+                "submit_save",
+                lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                    FactorDefinitionAdmissionUnavailableError("lost before enqueue")
+                ),
+            )
+            lost = client.post(path, json=body, headers=headers)
+        assert lost.status_code == 200, lost.text
+        assert lost.json()["data"]["status"] == "uncertain"
+        assert outbox.receipt(body["command_id"]) is None
+
+        replacement = tmp_path / "replacement"
+        replacement.mkdir()
+        build_web_fixture(
+            root,
+            "baseline",
+            sequence=1,
+            factor_definition_projections=_pair(replacement, populated=False),
+        )
+        replacement_registry = FactorDefinitionRegistry(replacement / "factor-fixture.sqlite3")
+        assert replacement_registry.identity() != original_registry.identity()
+        service.consumer.factor_definition_backend = FactorDefinitionPageControlBackend(
+            replacement_registry
+        )
+        app.state.web.tracker.refresh()
+        assert (
+            client.get("/api/v1/factors/definitions").json()["serving"]["generation_id"]
+            != original_generation
+        )
+
+        stale_retry = client.post(f"{path}/retry", json=body, headers=headers)
+        assert stale_retry.status_code == 200, stale_retry.text
+        assert stale_retry.json()["data"]["status"] == "uncertain"
+        assert stale_retry.json()["data"]["command_id"] == body["command_id"]
+        assert outbox.receipt(body["command_id"]) is None
+        assert (
+            replacement_registry.list_current(expected_identity=replacement_registry.identity())
+            == ()
+        )
+
+        invented = {**body, "command_id": "invented-generation", "generation_id": "f" * 64}
+        assert client.post(path, json=invented, headers=headers).status_code == 409
+        invented_retry = client.post(f"{path}/retry", json=invented, headers=headers)
+        assert invented_retry.status_code == 200, invented_retry.text
+        assert invented_retry.json()["data"]["status"] == "uncertain"
+        assert outbox.receipt(invented["command_id"]) is None
+        assert (
+            replacement_registry.list_current(expected_identity=replacement_registry.identity())
+            == ()
+        )
+
+        service.consumer.factor_definition_backend = FactorDefinitionPageControlBackend(
+            original_registry
+        )
+        draft = FactorSaveDraft.model_validate(body)
+        late = original_submit(
+            draft,
+            authenticated_actor_id="researcher",
+            verified_registry_instance_id=original_registry.identity().instance_id,
+        )
+        assert late.receipt.status.value == "succeeded"
+        service.consumer.factor_definition_backend = FactorDefinitionPageControlBackend(
+            replacement_registry
+        )
+        resumed = client.post(f"{path}/resume", json=body, headers=headers)
+        assert resumed.status_code == 200, resumed.text
+        assert resumed.json()["data"]["status"] == "succeeded_waiting_publication"
+        assert resumed.json()["data"]["command_id"] == body["command_id"]
+        assert (
+            len(original_registry.list_current(expected_identity=original_registry.identity())) == 1
+        )
+        assert (
+            replacement_registry.list_current(expected_identity=replacement_registry.identity())
+            == ()
+        )
+
+
+def test_save_retry_same_generation_reuses_original_command_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "serving"
+    build_web_fixture(
+        root, "baseline", factor_definition_projections=_pair(tmp_path, populated=False)
+    )
+    registry = FactorDefinitionRegistry(tmp_path / "factor-fixture.sqlite3")
+    outbox = PageControlOutbox(tmp_path / "control.sqlite3")
+    service = PageControlService(
+        outbox=outbox,
+        consumer=PageControlConsumer(
+            outbox=outbox,
+            data_dir=tmp_path / "data",
+            log_dir=tmp_path / "logs",
+            factor_definition_backend=FactorDefinitionPageControlBackend(registry),
+            clock=lambda: FIXTURE_BUILT_AT + timedelta(seconds=30),
+        ),
+    )
+    admission = FactorDefinitionAdmission(
+        service, editor_users=frozenset({"researcher"}), save_enabled=True
+    )
+    app = create_app(
+        WebSettings(
+            serving_root=root,
+            stale_after_seconds=1e9,
+            factor_editor_users=frozenset({"researcher"}),
+            factor_save_enabled=True,
+            factor_admission_socket_path=tmp_path / "factor-private" / "factor.sock",
+            factor_admission_service_uid=501,
+            factor_admission_shared_gid=20,
+            ingress_socket_path=tmp_path / "web-private" / "web.sock",
+        ),
+        factor_admission_client=admission,
+        clock=lambda: FIXTURE_BUILT_AT + timedelta(minutes=2),
+        background=False,
+    )
+    with ResearcherTestClient(app) as client:
+        generation = client.get("/api/v1/factors/definitions").json()["serving"]["generation_id"]
+        body = {
+            "generation_id": generation,
+            "command_id": "same-generation-retry",
+            "requested_at": (FIXTURE_BUILT_AT + timedelta(seconds=30)).isoformat(),
+            "mode": "create",
+            "factor_id": None,
+            "expected_head": None,
+            "name_zh": "重试因子",
+            "category": "technical",
+            "direction": "higher_is_better",
+            "expression": "close",
+        }
+        original_submit = admission.submit_save
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                admission,
+                "submit_save",
+                lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                    FactorDefinitionAdmissionUnavailableError("late original submit")
+                ),
+            )
+            lost = client.post(
+                "/api/v1/factors/definitions/save",
+                json=body,
+                headers={"x-rquant-csrf": "1"},
+            )
+        assert lost.status_code == 200, lost.text
+        assert lost.json()["data"]["status"] == "uncertain"
+        assert outbox.receipt(body["command_id"]) is None
+        first = client.post(
+            "/api/v1/factors/definitions/save/retry",
+            json=body,
+            headers={"x-rquant-csrf": "1"},
+        )
+        second = client.post(
+            "/api/v1/factors/definitions/save/retry",
+            json=body,
+            headers={"x-rquant-csrf": "1"},
+        )
+        assert first.status_code == 200, first.text
+        assert second.status_code == 200, second.text
+        assert first.json()["data"]["status"] == "succeeded_waiting_publication"
+        assert second.json()["data"]["status"] == "succeeded_waiting_publication"
+        delayed = original_submit(
+            FactorSaveDraft.model_validate(body),
+            authenticated_actor_id="researcher",
+            verified_registry_instance_id=registry.identity().instance_id,
+        )
+        assert delayed.receipt.status.value == "succeeded"
+        assert len(registry.list_current(expected_identity=registry.identity())) == 1
+        assert outbox.receipt(body["command_id"]) is not None
