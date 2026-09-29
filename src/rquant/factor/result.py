@@ -32,7 +32,7 @@ _MARKET_TZ = timezone(timedelta(hours=8))
 _IMMUTABLE = ConfigDict(extra="forbid", frozen=True, strict=True, revalidate_instances="always")
 
 ReturnMissingReason = Literal[
-    "window_unfinished", "missing_price", "suspended", "source_unavailable"
+    "window_unfinished", "visibility_pending", "missing_price", "suspended", "source_unavailable"
 ]
 ReturnPriceBasis = Literal["raw", "forward_adjusted", "backward_adjusted"]
 HoldingSessions = Literal[1, 5, 10, 20]
@@ -54,6 +54,7 @@ class FactorForwardReturn(BaseModel):
     value: FiniteValue | None
     missing_reason: ReturnMissingReason | None
     first_available_at: AwareDatetime | None
+    expected_available_at: AwareDatetime | None = None
 
     @field_validator("stock_code")
     @classmethod
@@ -80,6 +81,13 @@ class FactorForwardReturn(BaseModel):
                 raise ValueError("present return needs first_available_at")
             if self.first_available_at < self.return_end_at:
                 raise ValueError("first_available_at must not precede return_end_at")
+        if self.missing_reason == "visibility_pending":
+            if self.expected_available_at is None:
+                raise ValueError("visibility_pending requires expected_available_at")
+            if self.expected_available_at <= self.return_end_at:
+                raise ValueError("expected_available_at must follow return_end_at")
+        elif self.expected_available_at is not None:
+            raise ValueError("expected_available_at is only for visibility_pending")
         return self
 
 
@@ -164,6 +172,10 @@ class FactorResearchRequest(BaseModel):
                     raise ValueError("unmatured return must use window_unfinished")
             elif row.missing_reason == "window_unfinished":
                 raise ValueError("window_unfinished requires return_end_at after as_of")
+            elif row.missing_reason == "visibility_pending" and (
+                row.expected_available_at is None or self.as_of >= row.expected_available_at
+            ):
+                raise ValueError("visibility_pending requires as_of before expected_available_at")
         if len(seen) != len(universe) * len(decision_by_date):
             raise ValueError("forward returns must cover the complete requested grid")
         evaluation_decisions = tuple(

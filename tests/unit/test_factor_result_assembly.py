@@ -47,6 +47,10 @@ _WINDOW_ENDS = (
 )
 _WINDOW_CLOSES = ((1.0, 3.0, 5.0), (2.0, 4.0, 6.0), (3.0, 5.0, 7.0), (4.0, 6.0, 8.0))
 _WINDOW_RETURNS = ((0.1, 0.2, 0.3), (0.1, 0.2, 0.3), (0.1, 0.2, 0.3), (0.3, 0.2, 0.1))
+_VISIBILITY_DAY = date(2026, 7, 17)
+_VISIBILITY_DECISION = datetime(2026, 7, 17, 9, 25, tzinfo=_TZ)
+_VISIBILITY_END = datetime(2026, 7, 17, 15, tzinfo=_TZ)
+_VISIBILITY_READY = datetime(2026, 7, 20, 9, 25, tzinfo=_TZ)
 
 
 def _observations() -> tuple[FeatureObservation, ...]:
@@ -192,6 +196,72 @@ def _window_request(
         return_source_id="forward-returns-a",
         return_price_basis="forward_adjusted",
         holding_sessions=holding_sessions,
+    )
+
+
+def _visibility_returns(
+    *,
+    missing_reason: str | None = None,
+    first_available_at: datetime | None = _VISIBILITY_READY,
+    expected_available_at: datetime | None = None,
+) -> tuple[FactorForwardReturn, ...]:
+    from rquant.factor.result import FactorForwardReturn
+
+    return tuple(
+        FactorForwardReturn(
+            stock_code=stock,
+            decision_date=_VISIBILITY_DAY,
+            decision_at=_VISIBILITY_DECISION,
+            return_end_at=_VISIBILITY_END,
+            value=None if missing_reason is not None else (index + 1) / 10,
+            missing_reason=missing_reason,
+            first_available_at=first_available_at,
+            expected_available_at=expected_available_at,
+        )
+        for index, stock in enumerate(_STOCKS)
+    )
+
+
+def _visibility_request(
+    *, as_of: datetime, forward_returns: tuple[FactorForwardReturn, ...]
+) -> FactorResearchRequest:
+    from rquant.factor.result import FactorResearchRequest
+
+    factor_input = FactorTimeSeriesInput(
+        definition=build_factor_definition(
+            factor_id="visibility_factor",
+            name_zh="可见性因子",
+            category="technical",
+            direction="higher_is_better",
+            version=1,
+            earliest_available_date=_VISIBILITY_DAY,
+            expression="close",
+            feature_catalog=FeatureCatalog(columns=("close",)),
+        ),
+        universe=_STOCKS,
+        trading_days=(_VISIBILITY_DAY,),
+        decision_times=(
+            DecisionTime(trade_date=_VISIBILITY_DAY, decision_at=_VISIBILITY_DECISION),
+        ),
+        observations=tuple(
+            FeatureObservation(
+                stock_code=stock,
+                trade_date=_VISIBILITY_DAY,
+                column="close",
+                value=float(index + 1),
+                first_visible_at=_VISIBILITY_DECISION - timedelta(minutes=1),
+            )
+            for index, stock in enumerate(_STOCKS)
+        ),
+    )
+    return FactorResearchRequest(
+        factor_input=factor_input,
+        forward_returns=forward_returns,
+        as_of=as_of,
+        factor_source_id="friday-feature-snapshot",
+        return_source_id="friday-price-snapshot",
+        return_price_basis="forward_adjusted",
+        holding_sessions=1,
     )
 
 
@@ -691,3 +761,175 @@ def test_legacy_calendar_labels_cannot_claim_exact_sessions(frequency: str) -> N
     legacy_data["rebalance_frequency"] = frequency
     with pytest.raises(ValidationError, match="exact holding_sessions"):
         FactorResearchRequest.model_validate(legacy_data)
+
+
+@pytest.mark.parametrize(
+    "as_of",
+    [
+        _VISIBILITY_END,
+        datetime(2026, 7, 18, 12, tzinfo=_TZ),
+        _VISIBILITY_READY - timedelta(minutes=1),
+    ],
+)
+def test_completed_friday_window_remains_pending_until_monday_0925(as_of: datetime) -> None:
+    from rquant.factor import assemble_factor_research_result
+
+    rows = _visibility_returns(
+        missing_reason="visibility_pending",
+        first_available_at=None,
+        expected_available_at=_VISIBILITY_READY,
+    )
+    result = assemble_factor_research_result(_visibility_request(as_of=as_of, forward_returns=rows))
+
+    assert result.days[0].status == "no_samples"
+    assert result.days[0].coverage.expected_count == len(_STOCKS)
+    assert result.days[0].coverage.valid_count == 0
+    assert result.days[0].coverage.factor_missing_count == 0
+    assert result.days[0].coverage.return_missing_count == len(_STOCKS)
+    assert [
+        (item.reason, item.count) for item in result.days[0].coverage.return_missing_by_reason
+    ] == [("visibility_pending", len(_STOCKS))]
+    assert result.summary_status == "no_samples"
+    assert result.ic_summary is None
+    assert result.portfolio_status == "insufficient_data"
+    assert result.portfolio_diagnostics is None
+    assert (
+        result.input_sha256
+        != assemble_factor_research_result(
+            _visibility_request(
+                as_of=as_of,
+                forward_returns=_visibility_returns(
+                    missing_reason="visibility_pending",
+                    first_available_at=None,
+                    expected_available_at=_VISIBILITY_READY + timedelta(minutes=1),
+                ),
+            )
+        ).input_sha256
+    )
+
+
+def test_pending_is_rejected_at_expected_visibility_time() -> None:
+    from rquant.factor.result import FactorResearchRequest
+
+    rows = _visibility_returns(
+        missing_reason="visibility_pending",
+        first_available_at=None,
+        expected_available_at=_VISIBILITY_READY,
+    )
+    request = _visibility_request(
+        as_of=_VISIBILITY_READY - timedelta(minutes=1), forward_returns=rows
+    )
+    with pytest.raises(ValidationError, match="visibility_pending"):
+        FactorResearchRequest.model_validate({**request.model_dump(), "as_of": _VISIBILITY_READY})
+
+
+def test_visible_return_enters_ic_and_groups_at_monday_0925() -> None:
+    from rquant.factor import assemble_factor_research_result
+
+    rows = _visibility_returns()
+    result = assemble_factor_research_result(
+        _visibility_request(as_of=_VISIBILITY_READY, forward_returns=rows)
+    )
+
+    assert result.days[0].coverage.valid_count == len(_STOCKS)
+    assert result.days[0].evaluation is not None
+    assert result.days[0].evaluation.normal_ic.value == pytest.approx(1.0)
+    assert result.portfolio_status == "available"
+    assert result.portfolio_diagnostics is not None
+    assert [
+        group.period_return for group in result.portfolio_diagnostics.days[0].groupings[0].groups
+    ] == pytest.approx([0.1, 0.2, 0.3])
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        (
+            {"value": None, "missing_reason": "visibility_pending", "first_available_at": None},
+            "expected_available_at",
+        ),
+        (
+            {
+                "value": None,
+                "missing_reason": "visibility_pending",
+                "first_available_at": None,
+                "expected_available_at": _VISIBILITY_END,
+            },
+            "return_end_at",
+        ),
+        ({"expected_available_at": _VISIBILITY_READY}, "only.*visibility_pending"),
+        (
+            {
+                "value": None,
+                "missing_reason": "source_unavailable",
+                "first_available_at": None,
+                "expected_available_at": _VISIBILITY_READY,
+            },
+            "only.*visibility_pending",
+        ),
+    ],
+)
+def test_expected_availability_is_exclusive_to_valid_pending_returns(
+    overrides: dict[str, object], message: str
+) -> None:
+    from rquant.factor.result import FactorForwardReturn
+
+    base = _visibility_returns()[0]
+    with pytest.raises(ValidationError, match=message):
+        FactorForwardReturn.model_validate({**base.model_dump(), **overrides})
+
+
+def test_pending_requires_the_price_window_to_have_ended() -> None:
+    from rquant.factor.result import FactorResearchRequest
+
+    rows = _visibility_returns(
+        missing_reason="visibility_pending",
+        first_available_at=None,
+        expected_available_at=_VISIBILITY_READY,
+    )
+    request = _visibility_request(as_of=_VISIBILITY_END, forward_returns=rows)
+    with pytest.raises(ValidationError, match="window_unfinished"):
+        FactorResearchRequest.model_validate(
+            {**request.model_dump(), "as_of": _VISIBILITY_END - timedelta(minutes=1)}
+        )
+
+
+def test_present_return_cannot_arrive_before_its_first_available_at() -> None:
+    from rquant.factor.result import FactorResearchRequest
+
+    request = _visibility_request(as_of=_VISIBILITY_READY, forward_returns=_visibility_returns())
+    with pytest.raises(ValidationError, match="as_of"):
+        FactorResearchRequest.model_validate(
+            {**request.model_dump(), "as_of": _VISIBILITY_READY - timedelta(minutes=1)}
+        )
+
+
+def test_window_unfinished_before_friday_close_remains_valid() -> None:
+    from rquant.factor import assemble_factor_research_result
+    from rquant.factor.result import FactorResearchRequest
+
+    request = _visibility_request(
+        as_of=_VISIBILITY_END - timedelta(minutes=1),
+        forward_returns=_visibility_returns(
+            missing_reason="window_unfinished", first_available_at=None
+        ),
+    )
+    result = assemble_factor_research_result(request)
+    assert result.days[0].coverage.return_missing_by_reason[0].reason == "window_unfinished"
+    with pytest.raises(ValidationError, match="window_unfinished"):
+        FactorResearchRequest.model_validate({**request.model_dump(), "as_of": _VISIBILITY_END})
+
+
+@pytest.mark.parametrize("missing_reason", ["missing_price", "suspended", "source_unavailable"])
+def test_real_missing_return_remains_valid_after_visibility_time(missing_reason: str) -> None:
+    from rquant.factor import assemble_factor_research_result
+
+    result = assemble_factor_research_result(
+        _visibility_request(
+            as_of=_VISIBILITY_READY,
+            forward_returns=_visibility_returns(
+                missing_reason=missing_reason, first_available_at=None
+            ),
+        )
+    )
+    assert result.days[0].coverage.return_missing_by_reason[0].reason == missing_reason
