@@ -30,6 +30,23 @@ _ENDS = (_DECISIONS[1], _DECISIONS[1] + timedelta(days=1))
 _AS_OF = _ENDS[1] + timedelta(hours=1)
 _FACTORS = ((1.0, 2.0, 3.0), (3.0, 1.0, 2.0))
 _RETURNS = ((0.1, 0.0, 0.2), (0.1, -0.1, 0.05))
+_WINDOW_DAYS = (
+    date(2026, 7, 14),
+    date(2026, 7, 15),
+    date(2026, 7, 16),
+    date(2026, 7, 17),
+)
+_WINDOW_DECISIONS = tuple(
+    datetime(day.year, day.month, day.day, 9, 25, tzinfo=_TZ) for day in _WINDOW_DAYS
+)
+_WINDOW_ENDS = (
+    _WINDOW_DECISIONS[1],
+    _WINDOW_DECISIONS[2],
+    _WINDOW_DECISIONS[3],
+    datetime(2026, 7, 20, 9, 25, tzinfo=_TZ),
+)
+_WINDOW_CLOSES = ((1.0, 3.0, 5.0), (2.0, 4.0, 6.0), (3.0, 5.0, 7.0), (4.0, 6.0, 8.0))
+_WINDOW_RETURNS = ((0.1, 0.2, 0.3), (0.1, 0.2, 0.3), (0.1, 0.2, 0.3), (0.3, 0.2, 0.1))
 
 
 def _observations() -> tuple[FeatureObservation, ...]:
@@ -113,6 +130,71 @@ def _missing_return(row: FactorForwardReturn, reason: str = "missing_price") -> 
     )
 
 
+def _window_request(
+    *,
+    evaluation_days: tuple[date, ...] = _WINDOW_DAYS[2:],
+    first_a_close: float = 1.0,
+    expression: str = "ts_mean(close, 3)",
+    holding_sessions: int = 1,
+) -> FactorResearchRequest:
+    from rquant.factor.result import FactorForwardReturn, FactorResearchRequest
+
+    observations = tuple(
+        FeatureObservation(
+            stock_code=stock,
+            trade_date=day,
+            column="close",
+            value=first_a_close if (day_index, stock_index) == (0, 0) else value,
+            first_visible_at=_WINDOW_DECISIONS[day_index] - timedelta(minutes=1),
+        )
+        for day_index, (day, closes) in enumerate(zip(_WINDOW_DAYS, _WINDOW_CLOSES, strict=True))
+        for stock_index, (stock, value) in enumerate(zip(_STOCKS, closes, strict=True))
+    )
+    factor_input = FactorTimeSeriesInput(
+        definition=build_factor_definition(
+            factor_id="rolling_price_factor",
+            name_zh="滚动价格因子",
+            category="technical",
+            direction="higher_is_better",
+            version=1,
+            earliest_available_date=_WINDOW_DAYS[0],
+            expression=expression,
+            feature_catalog=FeatureCatalog(columns=("close",)),
+        ),
+        universe=_STOCKS,
+        trading_days=_WINDOW_DAYS,
+        decision_times=tuple(
+            DecisionTime(trade_date=day, decision_at=decision)
+            for day, decision in zip(_WINDOW_DAYS, _WINDOW_DECISIONS, strict=True)
+        ),
+        observations=observations,
+    )
+    returns = tuple(
+        FactorForwardReturn(
+            stock_code=stock,
+            decision_date=day,
+            decision_at=_WINDOW_DECISIONS[day_index],
+            return_end_at=_WINDOW_ENDS[day_index],
+            value=_WINDOW_RETURNS[day_index][stock_index],
+            missing_reason=None,
+            first_available_at=_WINDOW_ENDS[day_index],
+        )
+        for day_index, day in enumerate(_WINDOW_DAYS)
+        if day in evaluation_days
+        for stock_index, stock in enumerate(_STOCKS)
+    )
+    return FactorResearchRequest(
+        factor_input=factor_input,
+        evaluation_days=evaluation_days,
+        forward_returns=returns,
+        as_of=_WINDOW_ENDS[-1] + timedelta(hours=1),
+        factor_source_id="close-history-a",
+        return_source_id="forward-returns-a",
+        return_price_basis="forward_adjusted",
+        holding_sessions=holding_sessions,
+    )
+
+
 def test_complete_two_period_result_reuses_ic_and_compounds_research_groups() -> None:
     from rquant.factor import assemble_factor_research_result
 
@@ -124,7 +206,8 @@ def test_complete_two_period_result_reuses_ic_and_compounds_research_groups() ->
     assert result.factor_source_id == "feature-snapshot-a"
     assert result.return_source_id == "adjusted-price-snapshot-a"
     assert result.return_price_basis == "forward_adjusted"
-    assert result.rebalance_frequency == "daily"
+    assert result.holding_sessions == 1
+    assert "rebalance_frequency" not in result.model_dump()
     assert [day.coverage.valid_count for day in result.days] == [3, 3]
     assert all(day.coverage.expected_count == 3 for day in result.days)
     assert all(day.status == "evaluated" for day in result.days)
@@ -412,3 +495,199 @@ def test_result_carries_full_definition_when_expression_changes_under_same_ident
     assert changed.definition.dependency_columns == ("close",)
     assert changed.definition.feature_catalog.columns == ("close",)
     assert changed.sha256 != original.sha256
+
+
+def test_warmup_history_feeds_first_evaluation_day_without_return_rows() -> None:
+    from rquant.factor import assemble_factor_research_result, evaluate_factor_time_series
+
+    request = _window_request()
+    factors = evaluate_factor_time_series(request.factor_input)
+    first_values = [point.value for point in factors.values if point.trade_date == _WINDOW_DAYS[2]]
+    result = assemble_factor_research_result(request)
+
+    assert first_values == pytest.approx([2.0, 4.0, 6.0])
+    assert len(request.forward_returns) == 2 * len(_STOCKS)
+    assert result.trading_days == _WINDOW_DAYS[2:]
+    assert [day.decision_date for day in result.days] == list(_WINDOW_DAYS[2:])
+    assert [day.coverage.valid_count for day in result.days] == [3, 3]
+    assert all(day.coverage.expected_count == 3 for day in result.days)
+    assert result.days[0].evaluation is not None
+    assert result.days[0].evaluation.normal_ic.value == pytest.approx(1.0)
+    assert result.days[1].evaluation is not None
+    assert result.days[1].evaluation.normal_ic.value == pytest.approx(-1.0)
+    assert result.ic_summary is not None
+    assert result.ic_summary.normal_ic.source_day_count == 2
+    assert result.portfolio_status == "available"
+    assert result.portfolio_diagnostics is not None
+    first, second = result.portfolio_diagnostics.days
+    assert [day.decision_date for day in result.portfolio_diagnostics.days] == list(
+        _WINDOW_DAYS[2:]
+    )
+    assert [group.period_return for group in first.groupings[0].groups] == pytest.approx(
+        [0.1, 0.2, 0.3]
+    )
+    assert [group.cumulative_return for group in second.groupings[0].groups] == pytest.approx(
+        [0.43, 0.44, 0.43]
+    )
+    assert result == assemble_factor_research_result(request)
+
+
+def test_changing_warmup_history_changes_first_evaluation_and_digest() -> None:
+    from rquant.factor import assemble_factor_research_result, evaluate_factor_time_series
+
+    original_request = _window_request()
+    altered_request = _window_request(first_a_close=10.0)
+    original = assemble_factor_research_result(original_request)
+    altered = assemble_factor_research_result(altered_request)
+    altered_values = evaluate_factor_time_series(altered_request.factor_input).values
+
+    assert next(
+        point.value
+        for point in altered_values
+        if (point.trade_date, point.stock_code) == (_WINDOW_DAYS[2], "A")
+    ) == pytest.approx(5.0)
+    assert original.days[0].evaluation is not None
+    assert altered.days[0].evaluation is not None
+    assert original.days[0].evaluation.rank_ic.value != altered.days[0].evaluation.rank_ic.value
+    assert original.input_sha256 != altered.input_sha256
+    assert original.sha256 != altered.sha256
+
+
+def test_calculation_calendar_may_contain_gap_between_evaluation_days() -> None:
+    from rquant.factor import assemble_factor_research_result
+
+    evaluation_days = (_WINDOW_DAYS[0], _WINDOW_DAYS[2])
+    request = _window_request(evaluation_days=evaluation_days, expression="close")
+    result = assemble_factor_research_result(request)
+
+    assert len(request.forward_returns) == 2 * len(_STOCKS)
+    assert result.trading_days == evaluation_days
+    assert [day.decision_date for day in result.days] == list(evaluation_days)
+    assert [day.coverage.valid_count for day in result.days] == [3, 3]
+    assert result.portfolio_status == "available"
+    assert (
+        result.input_sha256
+        != assemble_factor_research_result(_window_request(expression="close")).input_sha256
+    )
+
+
+@pytest.mark.parametrize(
+    ("evaluation_days", "message"),
+    [
+        ((), "nonempty"),
+        ((_WINDOW_DAYS[2], _WINDOW_DAYS[2]), "ascend"),
+        ((_WINDOW_DAYS[3], _WINDOW_DAYS[2]), "ascend"),
+        ((date(2026, 7, 13),), "subset"),
+    ],
+)
+def test_request_rejects_invalid_evaluation_days(
+    evaluation_days: tuple[date, ...], message: str
+) -> None:
+    from rquant.factor.result import FactorResearchRequest
+
+    with pytest.raises(ValidationError, match=message):
+        FactorResearchRequest.model_validate(
+            {**_window_request().model_dump(), "evaluation_days": evaluation_days}
+        )
+
+
+def test_evaluation_return_grid_rejects_missing_and_warmup_rows() -> None:
+    from rquant.factor.result import FactorForwardReturn, FactorResearchRequest
+
+    request = _window_request()
+    rows = request.forward_returns
+    with pytest.raises(ValidationError, match="complete"):
+        FactorResearchRequest.model_validate({**request.model_dump(), "forward_returns": rows[:-1]})
+
+    warmup_row = FactorForwardReturn(
+        stock_code="A",
+        decision_date=_WINDOW_DAYS[0],
+        decision_at=_WINDOW_DECISIONS[0],
+        return_end_at=_WINDOW_ENDS[0],
+        value=0.1,
+        missing_reason=None,
+        first_available_at=_WINDOW_ENDS[0],
+    )
+    with pytest.raises(ValidationError, match="outside requested grid"):
+        FactorResearchRequest.model_validate(
+            {**request.model_dump(), "forward_returns": rows + (warmup_row,)}
+        )
+
+
+def test_evaluation_return_windows_remain_nonoverlapping() -> None:
+    from rquant.factor.result import FactorResearchRequest
+
+    request = _window_request()
+    rows = tuple(
+        row.model_copy(
+            update={
+                "return_end_at": _WINDOW_DECISIONS[3] + timedelta(minutes=1),
+                "first_available_at": _WINDOW_DECISIONS[3] + timedelta(minutes=1),
+            }
+        )
+        if row.decision_date == _WINDOW_DAYS[2]
+        else row
+        for row in request.forward_returns
+    )
+    with pytest.raises(ValidationError, match="overlap"):
+        FactorResearchRequest.model_validate({**request.model_dump(), "forward_returns": rows})
+
+
+def test_as_of_still_covers_the_full_calculation_calendar() -> None:
+    from rquant.factor.result import FactorResearchRequest
+
+    request = _window_request(evaluation_days=(_WINDOW_DAYS[0],), expression="close")
+    with pytest.raises(ValidationError, match="as_of"):
+        FactorResearchRequest.model_validate(
+            {**request.model_dump(), "as_of": _WINDOW_DECISIONS[2] + timedelta(hours=1)}
+        )
+
+
+@pytest.mark.parametrize("holding_sessions", [1, 5, 10, 20])
+def test_holding_sessions_are_exact_and_saved_in_request_and_result(holding_sessions: int) -> None:
+    from rquant.factor import assemble_factor_research_result
+
+    request = _window_request(holding_sessions=holding_sessions)
+    result = assemble_factor_research_result(request)
+
+    assert request.holding_sessions == holding_sessions
+    assert result.holding_sessions == holding_sessions
+    assert result.model_dump()["holding_sessions"] == holding_sessions
+    assert "rebalance_frequency" not in result.model_dump()
+    if holding_sessions != 1:
+        assert (
+            result.input_sha256 != assemble_factor_research_result(_window_request()).input_sha256
+        )
+
+
+@pytest.mark.parametrize("holding_sessions", [0, 2, 6, 21, "weekly"])
+def test_holding_sessions_reject_unsupported_values(holding_sessions: int | str) -> None:
+    from rquant.factor.result import FactorResearchRequest
+
+    with pytest.raises(ValidationError, match="holding_sessions"):
+        FactorResearchRequest.model_validate(
+            {**_window_request().model_dump(), "holding_sessions": holding_sessions}
+        )
+
+
+def test_legacy_daily_input_maps_to_one_session_without_a_frequency_label() -> None:
+    from rquant.factor import assemble_factor_research_result
+
+    request = _request()
+    result = assemble_factor_research_result(request)
+
+    assert request.evaluation_days is None
+    assert request.holding_sessions == result.holding_sessions == 1
+    assert "rebalance_frequency" not in request.model_dump()
+    assert "rebalance_frequency" not in result.model_dump()
+
+
+@pytest.mark.parametrize("frequency", ["weekly", "monthly"])
+def test_legacy_calendar_labels_cannot_claim_exact_sessions(frequency: str) -> None:
+    from rquant.factor.result import FactorResearchRequest
+
+    legacy_data = _request().model_dump()
+    legacy_data.pop("holding_sessions")
+    legacy_data["rebalance_frequency"] = frequency
+    with pytest.raises(ValidationError, match="exact holding_sessions"):
+        FactorResearchRequest.model_validate(legacy_data)
