@@ -1,0 +1,123 @@
+.factor-layout {
+  display: grid;
+  grid-template-columns: minmax(300px, 0.9fr) minmax(0, 1.45fr);
+  align-items: start;
+  gap: 16px;
+  min-width: 0;
+}
+
+.factor-layout > * {
+  min-width: 0;
+}
+.factor-name-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.factor-archive {
+  display: inline-block;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: var(--idle-weak);
+  color: var(--idle-t);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.factor-state {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  min-height: 112px;
+  color: var(--crit-t);
+  font-size: 13px;
+}
+.factor-state p {
+  margin: 0;
+}
+.factor-detail {
+  display: grid;
+  gap: 22px;
+  min-width: 0;
+}
+.factor-detail-lead {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.factor-detail-lead span {
+  padding: 4px 8px;
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+}
+.factor-detail-lead .factor-detail-category {
+  color: var(--accent-t);
+  background: var(--accent-weak);
+  border-color: transparent;
+}
+.factor-facts {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 16px;
+  margin: 0;
+}
+.factor-facts div {
+  min-width: 0;
+}
+.factor-facts dt {
+  color: var(--muted);
+  font-size: 12px;
+  margin-bottom: 6px;
+}
+.factor-facts dd {
+  color: var(--ink);
+  margin: 0;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.factor-expression {
+  min-width: 0;
+  border-top: 1px solid var(--rule);
+  padding-top: 18px;
+}
+.factor-expression-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+.factor-expression h3 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+}
+.factor-expression code {
+  display: block;
+  padding: 16px;
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  background: var(--surface-2);
+  color: var(--ink-2);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.65;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+@media (max-width: 900px) {
+  .factor-layout {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 12px;
+  }
+}
+@media (max-width: 540px) {
+  .factor-facts {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
