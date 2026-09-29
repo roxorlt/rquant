@@ -11,6 +11,7 @@ from typing import Annotated, Literal
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from rquant.factor.decay import FactorICDecayResult, evaluate_factor_ic_decay
 from rquant.factor.definition import FactorDefinition
 from rquant.factor.evaluate import (
     DailyFactorResult,
@@ -244,6 +245,7 @@ class FactorResearchResult(BaseModel):
     days: tuple[FactorResearchDay, ...]
     summary_status: ResearchSummaryStatus
     ic_summary: FactorICSummary | None
+    ic_decay: FactorICDecayResult
     portfolio_status: ResearchPortfolioStatus
     portfolio_diagnostics: FactorPortfolioDiagnostics | None
     sha256: Sha256
@@ -337,6 +339,7 @@ def assemble_factor_research_result(request: FactorResearchRequest) -> FactorRes
         for day, coverage in zip(evaluation_days, coverages, strict=True)
     )
     summary = summarize_factor_ic(evaluation) if evaluation is not None else None
+    decay = evaluate_factor_ic_decay(checked)
     complete = all(coverage.valid_count == coverage.expected_count for coverage in coverages)
     portfolio = (
         evaluate_factor_portfolios(evaluation_input)
@@ -358,6 +361,7 @@ def assemble_factor_research_result(request: FactorResearchRequest) -> FactorRes
         "days": days,
         "summary_status": "evaluated" if evaluation is not None else "no_samples",
         "ic_summary": summary,
+        "ic_decay": decay,
         "portfolio_status": "available" if portfolio is not None else "insufficient_data",
         "portfolio_diagnostics": portfolio,
     }
