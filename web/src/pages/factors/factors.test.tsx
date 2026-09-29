@@ -1,10 +1,16 @@
 import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { HttpResponse, http } from "msw";
+import { vi } from "vitest";
+import type { Schemas } from "@/api/client";
 import { metaEnvelope } from "@/test/fixtures";
 import { findJargon } from "@/test/jargon";
 import { renderApp } from "@/test/render";
 import { metaHandler, server } from "@/test/server";
+
+vi.mock("@/charts/EChart", () => ({
+  EChart: ({ label }: { label: string }) => <div role="img" aria-label={label} />,
+}));
 
 const firstGeneration = metaEnvelope().serving.generation_id ?? "a".repeat(64);
 const nextGeneration = "b".repeat(64);
@@ -39,6 +45,163 @@ const definitions = [
   },
 ];
 
+type ResultItem = Schemas["FactorResultItem"];
+type Research = Schemas["FactorResearchDisplay"];
+
+const icSummary: Schemas["ICSeriesSummary"] = {
+  status: "ok",
+  mean: 0.0312,
+  sample_std: 0.11,
+  ir: 0.2836,
+  positive_rate: 0.5,
+  strong_signal_rate: 0.5,
+  t_value: 0.4,
+  p_value: 0.72,
+  skewness: null,
+  excess_kurtosis: null,
+  source_day_count: 2,
+  valid_day_count: 1,
+  insufficient_day_count: 1,
+  zero_variance_day_count: 0,
+};
+
+const research: Research = {
+  basis_label: "收盘价到下一次调仓收盘价",
+  pool_label: "固定样本",
+  return_price_basis: "raw",
+  holding_sessions: 5,
+  summary_status: "evaluated",
+  ic_summary: { normal_ic: icSummary, rank_ic: { ...icSummary, mean: -0.0142 } },
+  coverage_days: [
+    {
+      decision_date: "2026-09-21",
+      status: "evaluated",
+      coverage: {
+        expected_count: 4,
+        valid_count: 3,
+        factor_missing_count: 1,
+        return_missing_count: 0,
+        factor_missing_by_reason: [{ reason: "insufficient_history", count: 1 }],
+        return_missing_by_reason: [],
+      },
+    },
+    {
+      decision_date: "2026-09-22",
+      status: "no_samples",
+      coverage: {
+        expected_count: 4,
+        valid_count: 0,
+        factor_missing_count: 4,
+        return_missing_count: 0,
+        factor_missing_by_reason: [{ reason: "insufficient_history", count: 4 }],
+        return_missing_by_reason: [],
+      },
+    },
+  ],
+  decay_periods: Array.from({ length: 10 }, (_, index) => ({
+    lag: index + 1,
+    status: index === 1 ? ("no_valid_days" as const) : ("evaluated" as const),
+    ic_summary: index === 1 ? null : { normal_ic: icSummary, rank_ic: icSummary },
+    source_day_count: 2,
+    valid_pair_count: index === 1 ? 0 : 3,
+  })),
+  ic_points: [
+    {
+      decision_date: "2026-09-21",
+      normal_ic: { status: "ok", value: 0.0312, source_sample_count: 4, effective_sample_count: 3 },
+      rank_ic: { status: "ok", value: -0.0142, source_sample_count: 4, effective_sample_count: 3 },
+      normal_ic_cumulative_sum: 0.0312,
+      rank_ic_cumulative_sum: -0.0142,
+    },
+    {
+      decision_date: "2026-09-22",
+      normal_ic: {
+        status: "insufficient_samples",
+        value: null,
+        source_sample_count: 4,
+        effective_sample_count: 0,
+      },
+      rank_ic: {
+        status: "insufficient_samples",
+        value: null,
+        source_sample_count: 4,
+        effective_sample_count: 0,
+      },
+      normal_ic_cumulative_sum: null,
+      rank_ic_cumulative_sum: null,
+    },
+  ],
+  portfolio_status: "available_partial",
+  portfolio_days: [
+    {
+      decision_at: "2026-09-21T07:00:00Z",
+      decision_date: "2026-09-21",
+      return_end_at: "2026-09-28T07:00:00Z",
+      source_sample_count: 4,
+      effective_sample_count: 3,
+      groupings: [3, 5].map((count) => ({
+        group_count: count,
+        status: "ok" as const,
+        source_sample_count: 4,
+        effective_sample_count: 3,
+        long_short_return: 0.02,
+        long_short_cumulative_spread: 0.02,
+        groups: Array.from({ length: count }, (_, index) => ({
+          group_number: index + 1,
+          member_count: 1,
+          period_return: index * 0.01,
+          cumulative_return: index * 0.01,
+          target_weight_turnover: index === 1 ? null : 0.25,
+        })),
+      })),
+    },
+  ],
+};
+
+function result(jobId: string, overrides: Partial<ResultItem> = {}): ResultItem {
+  return {
+    job_id: jobId,
+    factor_id: "price_volume_factor",
+    factor_version: 2,
+    factor_name_zh: "价量动量",
+    definition_status: "current",
+    status: "succeeded",
+    status_label: "已完成",
+    failure_message: null,
+    updated_at: "2026-09-29T07:00:00Z",
+    as_of_time: "2026-09-28T07:00:00Z",
+    display_status: "available",
+    display_message: "结果已发布。",
+    ...overrides,
+  };
+}
+
+function publishResults(
+  items: ResultItem[],
+  detailResearch: Research | null = research,
+  generationId = firstGeneration,
+) {
+  server.use(
+    http.get("*/api/v1/factors/results", () =>
+      HttpResponse.json({
+        data: { availability: "populated", available_at: "2026-09-29T07:00:00Z", results: items },
+        serving: metaEnvelope({ generationId }).serving,
+      }),
+    ),
+    http.get("*/api/v1/factors/results/:jobId", ({ params }) =>
+      HttpResponse.json({
+        data: {
+          availability: "ready",
+          available_at: "2026-09-29T07:00:00Z",
+          result: items.find((item) => item.job_id === params.jobId) ?? null,
+          research: detailResearch,
+        },
+        serving: metaEnvelope({ generationId }).serving,
+      }),
+    ),
+  );
+}
+
 function catalog(
   rows = definitions,
   generationId = firstGeneration,
@@ -67,6 +230,132 @@ function publish(
 }
 
 describe("因子库", () => {
+  it("只展示当前定义的最近成功检验，切换 IC 和分组并展开真实缺值", async () => {
+    publish();
+    const older = result("1".repeat(32), { updated_at: "2026-09-25T07:00:00Z" });
+    const newest = result("2".repeat(32));
+    publishResults([
+      result("3".repeat(32), { factor_version: 1, updated_at: "2026-09-30T07:00:00Z" }),
+      result("4".repeat(32), {
+        definition_status: "historical_unavailable",
+        updated_at: "2026-09-30T08:00:00Z",
+      }),
+      older,
+      newest,
+    ]);
+    const { container } = renderApp("/factors");
+    const area = await screen.findByRole("region", { name: "检验结果" });
+    await waitFor(() => expect(area).toHaveTextContent("+0.0312"));
+    expect(area).toHaveTextContent("历史回溯研究");
+    expect(area).toHaveTextContent("固定样本");
+    expect(area).toHaveTextContent("2026-09-21");
+    expect(area).toHaveTextContent("5 个交易日");
+    expect(area).toHaveTextContent("+0.0312");
+    expect(within(area).getByText("标准差").nextElementSibling).toHaveTextContent("0.1100");
+    expect(within(area).getByText("标准差").nextElementSibling).not.toHaveTextContent("+");
+    expect(area).toHaveTextContent("部分日期可计算");
+    expect(within(area).getByRole("img", { name: "IC 时序与累计 IC" })).toBeInTheDocument();
+    expect(within(area).getByRole("img", { name: "分组累计收益" })).toBeInTheDocument();
+    expect(within(area).getByRole("button", { name: "NormalIC" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    const user = userEvent.setup();
+    await user.click(within(area).getByRole("button", { name: "RankIC" }));
+    expect(area).toHaveTextContent("−0.0142");
+    await user.click(within(area).getByRole("button", { name: "5 组" }));
+    expect(within(area).getByRole("button", { name: "5 组" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    const icDisclosure = within(area).getByText("查看 IC 明细");
+    await user.click(icDisclosure);
+    expect(within(area).getByRole("table", { name: "IC 明细" })).toHaveTextContent("—");
+    expect(findJargon(container.querySelector("main")?.textContent ?? "")).toEqual([]);
+    expect(area).not.toHaveTextContent("有效（");
+    expect(area).not.toHaveTextContent("偏弱");
+    expect(area).not.toHaveTextContent(newest.job_id);
+  });
+
+  it("可切换同一当前定义的历史检验；换因子和换代立即清空旧图", async () => {
+    publish();
+    const older = result("1".repeat(32), { updated_at: "2026-09-25T07:00:00Z" });
+    const newest = result("2".repeat(32));
+    publishResults([older, newest]);
+    const view = renderApp("/factors");
+    const area = await screen.findByRole("region", { name: "检验结果" });
+    await waitFor(() => expect(area).toHaveTextContent("+0.0312"));
+    const user = userEvent.setup();
+    const runs = within(area).getByRole("table", { name: "最近检验" });
+    const olderRow = within(runs).getAllByRole("row")[2];
+    if (!olderRow) throw new Error("旧检验记录未显示");
+    await user.click(olderRow);
+    expect(olderRow).toHaveAttribute("aria-selected", "true");
+    await user.click(screen.getByRole("row", { name: /成交变化/ }));
+    expect(area).not.toHaveTextContent("+0.0312");
+    expect(area).toHaveTextContent("还没有检验记录");
+    await user.click(screen.getByRole("row", { name: /价量动量/ }));
+    await waitFor(() => expect(area).toHaveTextContent("+0.0312"));
+    server.use(metaHandler(metaEnvelope({ generationId: nextGeneration })));
+    act(() =>
+      view.queryClient.setQueryData(["meta"], metaEnvelope({ generationId: nextGeneration })),
+    );
+    await waitFor(() => expect(screen.queryAllByText("+0.0312")).toHaveLength(0));
+  });
+
+  it("结果详情来自另一数据代时不沿用旧统计，并给出重新加载", async () => {
+    publish();
+    const item = result("1".repeat(32));
+    publishResults([item], research, nextGeneration);
+    renderApp("/factors");
+    const area = await screen.findByRole("region", { name: "检验结果" });
+    await within(area).findByText("数据已更新");
+    expect(area).not.toHaveTextContent("0.0312");
+    expect(within(area).getByRole("button", { name: "重新加载结果" })).toBeInTheDocument();
+  });
+
+  it.each([
+    ["queued", "not_ready", "检验进行中"],
+    ["running", "not_ready", "检验进行中"],
+    ["failed", "not_ready", "本次检验未完成"],
+    ["succeeded", "display_unavailable", "这次检验没有可展示的图表"],
+    ["succeeded", "not_published", "这次结果尚未收录图表"],
+  ] as const)("%s / %s 显示独立状态，不沿用图表", async (status, displayStatus, message) => {
+    publish();
+    publishResults([result("1".repeat(32), { status, display_status: displayStatus })]);
+    const view = renderApp("/factors");
+    const area = await screen.findByRole("region", { name: "检验结果" });
+    await within(area).findByText(message);
+    expect(within(area).queryByRole("img", { name: "IC 时序与累计 IC" })).toBeNull();
+    expect(view.container.querySelector("main")?.textContent).not.toContain("1".repeat(32));
+  });
+
+  it("普通加载错误与同代但任务不匹配的详情均不显示旧统计", async () => {
+    publish();
+    const item = result("1".repeat(32));
+    server.use(http.get("*/api/v1/factors/results", () => new HttpResponse(null, { status: 503 })));
+    const view = renderApp("/factors");
+    const area = await screen.findByRole("region", { name: "检验结果" });
+    await within(area).findByText("检验结果暂时无法加载，请稍后重试。");
+    publishResults([item]);
+    server.use(
+      http.get("*/api/v1/factors/results/:jobId", () =>
+        HttpResponse.json({
+          data: {
+            availability: "ready",
+            available_at: "2026-09-29T07:00:00Z",
+            result: result("2".repeat(32)),
+            research,
+          },
+          serving: metaEnvelope().serving,
+        }),
+      ),
+    );
+    await act(async () => view.queryClient.invalidateQueries({ queryKey: ["factors", "results"] }));
+    await within(area).findByText("检验详情暂不可用");
+    expect(within(area).queryByRole("img", { name: "IC 时序与累计 IC" })).toBeNull();
+  });
+
   it("清除被拒绝的命令后，延迟的目录刷新不续查旧命令", async () => {
     publish();
     let releaseMeta = () => {};
