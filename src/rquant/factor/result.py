@@ -357,7 +357,7 @@ def assemble_factor_research_result(request: FactorResearchRequest) -> FactorRes
         "universe": checked.factor_input.universe,
         "trading_days": evaluation_days,
         "as_of": checked.as_of,
-        "input_sha256": _digest(checked),
+        "input_sha256": decay.input_sha256,
         "days": days,
         "summary_status": "evaluated" if evaluation is not None else "no_samples",
         "ic_summary": summary,

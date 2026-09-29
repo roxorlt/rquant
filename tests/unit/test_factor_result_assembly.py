@@ -351,6 +351,31 @@ def test_result_carries_required_decay_from_the_same_research_request() -> None:
         FactorResearchResult.model_validate(result.model_dump(exclude={"ic_decay"}))
 
 
+def test_reordered_research_facts_keep_one_input_identity_and_content_digest() -> None:
+    from rquant.factor import assemble_factor_research_result
+    from rquant.factor.result import FactorResearchRequest
+
+    request = _request()
+    reordered = FactorResearchRequest.model_validate(
+        request.model_copy(
+            update={
+                "factor_input": request.factor_input.model_copy(
+                    update={"observations": tuple(reversed(request.factor_input.observations))}
+                ),
+                "forward_returns": tuple(reversed(request.forward_returns)),
+            }
+        )
+    )
+    original_result = assemble_factor_research_result(request)
+    reordered_result = assemble_factor_research_result(reordered)
+
+    assert original_result.input_sha256 == original_result.ic_decay.input_sha256
+    assert reordered_result.input_sha256 == reordered_result.ic_decay.input_sha256
+    assert reordered_result.input_sha256 == original_result.input_sha256
+    assert reordered_result.sha256 == original_result.sha256
+    assert reordered_result == original_result
+
+
 def test_later_decay_and_content_digest_follow_target_return_facts() -> None:
     from rquant.factor import assemble_factor_research_result
 
