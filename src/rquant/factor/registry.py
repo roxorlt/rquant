@@ -32,6 +32,7 @@ _TABLE_NAMES = frozenset(
 )
 _SCHEMA_VERSION = 3
 _MAX_LIST_LIMIT = 1000
+_MAX_CURRENT_HEADS = 512
 
 
 class FactorRegistryError(RuntimeError):
@@ -601,8 +602,12 @@ class FactorDefinitionRegistry:
             if head is None:
                 if request.expected_head is not None or definition.version != 1:
                     raise FactorConflictError("first factor version requires an empty head")
+                count = connection.execute("SELECT COUNT(*) FROM factor_heads").fetchone()[0]
+                if type(count) is not int or count >= _MAX_CURRENT_HEADS:
+                    raise FactorConflictError("factor registry has reached its head capacity")
             elif (
-                request.expected_head is None
+                head.archived
+                or request.expected_head is None
                 or request.expected_head.version != head.version
                 or request.expected_head.content_sha256 != head.content_sha256
                 or definition.version != head.version + 1

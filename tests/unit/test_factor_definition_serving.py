@@ -16,6 +16,7 @@ from rquant.factor.definition import FactorDefinition, build_factor_definition
 from rquant.factor.expression import FeatureCatalog
 from rquant.factor.registry import (
     ArchiveFactorRequest,
+    FactorConflictError,
     FactorDefinitionReceipt,
     FactorDefinitionRegistry,
     FactorHeadRef,
@@ -150,7 +151,9 @@ def test_current_heads_include_archived_and_latest_version_in_order(tmp_path: Pa
     )
 
 
-def test_513th_current_factor_rejects_entire_snapshot_without_truncation(tmp_path: Path) -> None:
+def test_513th_current_factor_is_rejected_before_snapshot_without_truncation(
+    tmp_path: Path,
+) -> None:
     from rquant.factor.definition_serving import project_factor_definition_serving_snapshot
 
     registry, identity = _registry(tmp_path / "factors.sqlite3")
@@ -160,11 +163,12 @@ def test_513th_current_factor_rejects_entire_snapshot_without_truncation(tmp_pat
         registry, expected_identity=identity, available_at=_AT
     )
     assert full.state.definition_count == len(full.definitions) == 512
-    _save(registry, identity, "save-512", _definition("factor_512"))
-    with pytest.raises(ValueError, match="512"):
-        project_factor_definition_serving_snapshot(
-            registry, expected_identity=identity, available_at=_AT
-        )
+    with pytest.raises(FactorConflictError, match="capacity"):
+        _save(registry, identity, "save-512", _definition("factor_512"))
+    still_full = project_factor_definition_serving_snapshot(
+        registry, expected_identity=identity, available_at=_AT
+    )
+    assert still_full.state.definition_count == len(still_full.definitions) == 512
 
 
 @pytest.mark.parametrize("damage", ["missing", "replaced", "instance", "old_schema"])
@@ -263,13 +267,49 @@ def test_projection_rejects_corrupt_current_or_historical_archive_command(
     )
     registry.archive(archive_request, expected_identity=identity)
     if reactivated:
-        _save(
-            registry,
-            identity,
-            "save-v2",
-            _definition("factor_a", version=2),
-            archive_request.expected_head,
+        # Earlier registries allowed reactivation; retain coverage for that stored history.
+        definition = _definition("factor_a", version=2)
+        request = SaveFactorDefinitionRequest(
+            command_id="save-v2", definition=definition, expected_head=archive_request.expected_head
         )
+        definition_json = canonical_json_bytes(
+            definition.model_dump(mode="json", round_trip=True)
+        ).decode()
+        digest = hashlib.sha256(definition_json.encode()).hexdigest()
+        receipt = FactorDefinitionReceipt(
+            command_id="save-v2",
+            action="save",
+            factor_id="factor_a",
+            version=2,
+            content_sha256=digest,
+            archived=False,
+        )
+        receipt_json = canonical_json_bytes(receipt.model_dump(mode="json")).decode()
+        request_digest = hashlib.sha256(
+            canonical_json_bytes(
+                {"action": "save", "request": request.model_dump(mode="json", round_trip=True)}
+            )
+        ).hexdigest()
+        with sqlite3.connect(path) as connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute(
+                "INSERT INTO factor_commands VALUES (?, 'save', ?, ?, ?)",
+                (
+                    "save-v2",
+                    request_digest,
+                    receipt_json,
+                    hashlib.sha256(receipt_json.encode()).hexdigest(),
+                ),
+            )
+            connection.execute(
+                "INSERT INTO factor_versions VALUES (?, ?, ?, ?, ?)",
+                ("factor_a", 2, definition_json, digest, "save-v2"),
+            )
+            connection.execute(
+                "UPDATE factor_heads SET version = 2, content_sha256 = ?, archived = 0 "
+                "WHERE factor_id = 'factor_a'",
+                (digest,),
+            )
     baseline = project_factor_definition_serving_snapshot(
         registry, expected_identity=identity, available_at=_AT
     )

@@ -46,6 +46,7 @@ FACTOR_ADMISSION_SOCKET_ENV_VAR = "RQUANT_WEB_FACTOR_ADMISSION_SOCKET"
 FACTOR_ADMISSION_SERVICE_UID_ENV_VAR = "RQUANT_WEB_FACTOR_ADMISSION_SERVICE_UID"
 FACTOR_ADMISSION_SHARED_GID_ENV_VAR = "RQUANT_WEB_FACTOR_ADMISSION_SHARED_GID"
 FACTOR_EDITOR_USERS_ENV_VAR = "RQUANT_WEB_FACTOR_EDITOR_USERS"
+FACTOR_SAVE_ENABLED_ENV_VAR = "RQUANT_WEB_FACTOR_SAVE_ENABLED"
 INGRESS_SOCKET_ENV_VAR = "RQUANT_WEB_INGRESS_SOCKET"
 PROXY_PROOF_FILE_ENV_VAR = "RQUANT_WEB_PROXY_PROOF_FILE"
 LOG_ADMIN_USERS_ENV_VAR = "RQUANT_WEB_LOG_ADMIN_USERS"
@@ -120,6 +121,7 @@ class WebSettings(BaseModel):
     factor_admission_service_uid: StrictInt | None = None
     factor_admission_shared_gid: StrictInt | None = None
     factor_editor_users: frozenset[str] = frozenset()
+    factor_save_enabled: bool = False
     ingress_socket_path: Path | None = None
     proxy_proof_file: Path | None = None
     log_admin_users: frozenset[str] = frozenset()
@@ -183,6 +185,10 @@ class WebSettings(BaseModel):
                 reserved.add(self.watchlist_admission_socket_path.parent)
             if self.factor_admission_socket_path.parent in reserved:
                 raise ValueError("factor archive socket needs a separate private directory")
+        if self.factor_save_enabled and (
+            self.factor_admission_socket_path is None or not self.factor_editor_users
+        ):
+            raise ValueError("factor save requires a configured private factor admission")
         log_fields = (
             self.unit_log_socket_path,
             self.unit_log_service_uid,
@@ -390,6 +396,11 @@ class WebSettings(BaseModel):
             if any(not name for name in names) or len(set(names)) != len(names):
                 raise ValueError("factor editors must be distinct nonempty names")
             values["factor_editor_users"] = frozenset(names)
+        save_enabled = source.get(FACTOR_SAVE_ENABLED_ENV_VAR, "").strip().lower()
+        if save_enabled:
+            if save_enabled not in {"true", "false"}:
+                raise ValueError("factor save enablement must be true or false")
+            values["factor_save_enabled"] = save_enabled == "true"
         ingress_socket = source.get(INGRESS_SOCKET_ENV_VAR, "").strip()
         if ingress_socket:
             if bind is not None or source.get(BIND_ENV_VAR, "").strip():

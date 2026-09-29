@@ -3509,6 +3509,36 @@
         "title": "DailyData",
         "type": "object"
       },
+      "DailyFactorField": {
+        "additionalProperties": false,
+        "properties": {
+          "column": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Column",
+            "type": "string"
+          },
+          "description_zh": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Description Zh",
+            "type": "string"
+          },
+          "name_zh": {
+            "maxLength": 32,
+            "minLength": 1,
+            "title": "Name Zh",
+            "type": "string"
+          }
+        },
+        "required": [
+          "column",
+          "name_zh",
+          "description_zh"
+        ],
+        "title": "DailyFactorField",
+        "type": "object"
+      },
       "DataAuditHealthData": {
         "additionalProperties": false,
         "properties": {
@@ -4181,6 +4211,22 @@
         "title": "Envelope[FactorArchiveCommandData]",
         "type": "object"
       },
+      "Envelope_FactorCapabilitiesData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/FactorCapabilitiesData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[FactorCapabilitiesData]",
+        "type": "object"
+      },
       "Envelope_FactorCatalogData_": {
         "properties": {
           "data": {
@@ -4227,6 +4273,22 @@
           "serving"
         ],
         "title": "Envelope[FactorResultListData]",
+        "type": "object"
+      },
+      "Envelope_FactorSaveCommandData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/FactorSaveCommandData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[FactorSaveCommandData]",
         "type": "object"
       },
       "Envelope_FormulaMarketJobDetailData_": {
@@ -4951,6 +5013,63 @@
         "title": "FactorArchiveCommandRequest",
         "type": "object"
       },
+      "FactorCapabilitiesData": {
+        "additionalProperties": false,
+        "properties": {
+          "can_save": {
+            "default": false,
+            "title": "Can Save",
+            "type": "boolean"
+          },
+          "coverage_note_zh": {
+            "default": "字段和算子支持不代表历史数据已覆盖。",
+            "title": "Coverage Note Zh",
+            "type": "string"
+          },
+          "fields": {
+            "items": {
+              "$ref": "#/components/schemas/DailyFactorField"
+            },
+            "minItems": 1,
+            "title": "Fields",
+            "type": "array"
+          },
+          "runnable_operators": {
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1,
+            "title": "Runnable Operators",
+            "type": "array"
+          },
+          "source_mode": {
+            "const": "historical_retrospective",
+            "title": "Source Mode",
+            "type": "string"
+          },
+          "unavailable_operators": {
+            "items": {
+              "$ref": "#/components/schemas/UnavailableFactorOperator"
+            },
+            "title": "Unavailable Operators",
+            "type": "array"
+          },
+          "version": {
+            "const": "daily_v1",
+            "title": "Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "version",
+          "source_mode",
+          "fields",
+          "runnable_operators",
+          "unavailable_operators"
+        ],
+        "title": "FactorCapabilitiesData",
+        "type": "object"
+      },
       "FactorCatalogData": {
         "properties": {
           "availability": {
@@ -4977,6 +5096,11 @@
           "can_archive": {
             "default": false,
             "title": "Can Archive",
+            "type": "boolean"
+          },
+          "can_save": {
+            "default": false,
+            "title": "Can Save",
             "type": "boolean"
           },
           "definitions": {
@@ -5051,6 +5175,10 @@
             "title": "Archived",
             "type": "boolean"
           },
+          "category": {
+            "title": "Category",
+            "type": "string"
+          },
           "category_label": {
             "title": "Category Label",
             "type": "string"
@@ -5116,6 +5244,7 @@
           "factor_id",
           "content_sha256",
           "name_zh",
+          "category",
           "category_label",
           "direction",
           "direction_label",
@@ -5681,6 +5810,167 @@
           "results"
         ],
         "title": "FactorResultListData",
+        "type": "object"
+      },
+      "FactorSaveCommandData": {
+        "additionalProperties": false,
+        "properties": {
+          "command_id": {
+            "title": "Command Id",
+            "type": "string"
+          },
+          "content_sha256": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Content Sha256"
+          },
+          "current_head_updated": {
+            "default": false,
+            "title": "Current Head Updated",
+            "type": "boolean"
+          },
+          "factor_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Factor Id"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "rejected",
+              "pending",
+              "succeeded_waiting_publication",
+              "published",
+              "uncertain"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "version": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Version"
+          }
+        },
+        "required": [
+          "status",
+          "command_id",
+          "message"
+        ],
+        "title": "FactorSaveCommandData",
+        "type": "object"
+      },
+      "FactorSaveDraft": {
+        "additionalProperties": false,
+        "description": "The complete original browser request; no derived definition fields are accepted.",
+        "properties": {
+          "category": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Category",
+            "type": "string"
+          },
+          "command_id": {
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+            "title": "Command Id",
+            "type": "string"
+          },
+          "direction": {
+            "enum": [
+              "higher_is_better",
+              "lower_is_better"
+            ],
+            "title": "Direction",
+            "type": "string"
+          },
+          "expected_head": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FactorHeadRef"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "expression": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "title": "Expression",
+            "type": "string"
+          },
+          "factor_id": {
+            "anyOf": [
+              {
+                "pattern": "^[a-z][a-z0-9_]{0,63}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Factor Id"
+          },
+          "generation_id": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Generation Id",
+            "type": "string"
+          },
+          "mode": {
+            "enum": [
+              "create",
+              "edit"
+            ],
+            "title": "Mode",
+            "type": "string"
+          },
+          "name_zh": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Name Zh",
+            "type": "string"
+          },
+          "requested_at": {
+            "format": "date-time",
+            "title": "Requested At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "generation_id",
+          "command_id",
+          "requested_at",
+          "mode",
+          "factor_id",
+          "expected_head",
+          "name_zh",
+          "category",
+          "direction",
+          "expression"
+        ],
+        "title": "FactorSaveDraft",
         "type": "object"
       },
       "FieldExpr": {
@@ -13851,6 +14141,29 @@
         "title": "UnaryExpr",
         "type": "object"
       },
+      "UnavailableFactorOperator": {
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "reason_zh": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Reason Zh",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "reason_zh"
+        ],
+        "title": "UnavailableFactorOperator",
+        "type": "object"
+      },
       "UnsupportedItem": {
         "additionalProperties": false,
         "properties": {
@@ -14738,6 +15051,27 @@
         ]
       }
     },
+    "/api/v1/factors/capabilities": {
+      "get": {
+        "operationId": "factor_capabilities_api_v1_factors_capabilities_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_FactorCapabilitiesData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "可用因子字段与算子",
+        "tags": [
+          "factors"
+        ]
+      }
+    },
     "/api/v1/factors/definitions": {
       "get": {
         "operationId": "list_factor_definitions_api_v1_factors_definitions_get",
@@ -14783,6 +15117,129 @@
           }
         },
         "summary": "因子定义目录",
+        "tags": [
+          "factors"
+        ]
+      }
+    },
+    "/api/v1/factors/definitions/save": {
+      "post": {
+        "operationId": "save_factor_draft_api_v1_factors_definitions_save_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FactorSaveDraft"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_FactorSaveCommandData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "保存因子草稿",
+        "tags": [
+          "factors"
+        ]
+      }
+    },
+    "/api/v1/factors/definitions/save/resume": {
+      "post": {
+        "operationId": "resume_factor_save_api_v1_factors_definitions_save_resume_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FactorSaveDraft"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_FactorSaveCommandData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "续查原保存命令",
+        "tags": [
+          "factors"
+        ]
+      }
+    },
+    "/api/v1/factors/definitions/save/retry": {
+      "post": {
+        "operationId": "retry_original_factor_save_api_v1_factors_definitions_save_retry_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FactorSaveDraft"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_FactorSaveCommandData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "重试原保存命令",
         "tags": [
           "factors"
         ]

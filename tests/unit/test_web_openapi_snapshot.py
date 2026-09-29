@@ -45,6 +45,9 @@ def test_every_api_path_is_versioned_and_only_defined_mutations_use_post() -> No
                 "/api/v1/tasks/jobs/commands",
                 "/api/v1/factors/definitions/{factor_id}/archive",
                 "/api/v1/factors/definitions/{factor_id}/archive/resume",
+                "/api/v1/factors/definitions/save",
+                "/api/v1/factors/definitions/save/resume",
+                "/api/v1/factors/definitions/save/retry",
             }
             else {"get"}
         )
