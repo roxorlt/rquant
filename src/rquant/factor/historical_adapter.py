@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ast
 import hashlib
 import json
 import math
@@ -14,6 +13,7 @@ from typing import Annotated, Literal
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from rquant.factor.capability import HISTORICAL_DAILY_V1
 from rquant.factor.definition import FactorDefinition
 from rquant.factor.result import (
     FactorForwardReturn,
@@ -48,11 +48,17 @@ from rquant.research_snapshot import (
 _IMMUTABLE = ConfigDict(extra="forbid", frozen=True, strict=True, revalidate_instances="always")
 _MARKET_TZ = timezone(timedelta(hours=8))
 _STOCK_PATTERN = re.compile(r"[0-9]{6}\.(?:SZ|SH|BJ)\Z")
-_DAILY_COLUMNS = frozenset({"open", "high", "low", "close", "vol", "amount"})
 _SOURCE_COLUMNS = tuple(
     sorted(
         (
-            *(f"daily_bar.{column}" for column in ("ts_code", "trade_date", *_DAILY_COLUMNS)),
+            *(
+                f"daily_bar.{column}"
+                for column in (
+                    "ts_code",
+                    "trade_date",
+                    *HISTORICAL_DAILY_V1.feature_catalog().columns,
+                )
+            ),
             "adj_factor.ts_code",
             "adj_factor.trade_date",
             "adj_factor.adj_factor",
@@ -62,7 +68,6 @@ _SOURCE_COLUMNS = tuple(
         )
     )
 )
-_CONTEXT_FUNCTIONS = frozenset({"industry_neutralize", "size_neutralize"})
 _MAX_STOCKS = 500
 _MAX_QUERY_DAYS = 366
 _MAX_QUERY_ROWS = 100_000
@@ -367,22 +372,6 @@ def _open_days(
     return tuple(opened)
 
 
-def _validate_definition(definition: FactorDefinition) -> None:
-    if (
-        not set(definition.feature_catalog.columns) <= _DAILY_COLUMNS
-        or not set(definition.dependency_columns) <= _DAILY_COLUMNS
-    ):
-        raise ValueError("factor definition requires a column without a historical daily contract")
-    tree = ast.parse(definition.expression, mode="eval")
-    if any(
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id in _CONTEXT_FUNCTIONS
-        for node in ast.walk(tree)
-    ):
-        raise ValueError("factor definition requires unavailable industry or size context")
-
-
 def _missing_return(
     *,
     code: str,
@@ -503,7 +492,7 @@ def adapt_historical_factor_source(
         or admitted.source_read_boundary != "single_snapshot_transaction"
     ):
         raise ValueError("factor historical source requires one admitted read lease")
-    _validate_definition(checked.definition)
+    HISTORICAL_DAILY_V1.require_runnable_definition(checked.definition)
     calendar = _read_calendar(lease, admitted, checked)
     open_days = _open_days(checked, calendar)
     open_index = {day: index for index, day in enumerate(open_days)}

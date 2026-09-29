@@ -1,5 +1,11 @@
 """Pure factor research calculations."""
 
+from rquant.factor.capability import (
+    HISTORICAL_DAILY_V1,
+    DailyFactorCapabilities,
+    DailyFactorField,
+    UnavailableFactorOperator,
+)
 from rquant.factor.definition import FactorDefinition, build_factor_definition
 from rquant.factor.evaluate import (
     CorrelationResult,
@@ -59,6 +65,8 @@ from rquant.factor.time_series import (
 __all__ = [
     "CorrelationResult",
     "DailyFactorResult",
+    "DailyFactorCapabilities",
+    "DailyFactorField",
     "DecisionTime",
     "FactorDefinition",
     "FactorEvaluation",
@@ -86,6 +94,7 @@ __all__ = [
     "HistoricalFactorAdapterRequest",
     "HistoricalFactorResearch",
     "HistoricalFactorSourceReceipt",
+    "HISTORICAL_DAILY_V1",
     "GroupReturn",
     "GroupingResult",
     "ICSeriesSummary",
@@ -93,6 +102,7 @@ __all__ = [
     "PortfolioGroupPoint",
     "PortfolioGroupingDay",
     "ReturnMissingCount",
+    "UnavailableFactorOperator",
     "assemble_factor_research_result",
     "factor_research_request_sha256",
     "adapt_historical_factor_source",
