@@ -4,12 +4,15 @@ import {
   decayOption,
   decaySeries,
   groupCounts,
+  groupOption,
   groupSeries,
   icOption,
   icSeries,
+  turnoverOption,
 } from "./factorCharts";
 
 const research = {
+  coverage_days: [{ decision_date: "2026-09-21" }, { decision_date: "2026-09-22" }],
   ic_points: [
     {
       decision_date: "2026-09-21",
@@ -110,4 +113,54 @@ it("IC 双轴和衰减轴能区分相近的小数刻度", () => {
     expect(axis.axisLabel.formatter(0.0451)).toBe("0.0451");
     expect(axis.axisLabel.formatter(-0.0142)).toBe("-0.0142");
   }
+});
+
+it("分组收益与换手沿完整评价日期轴保留中间无样本日的 null 断点", () => {
+  const withGap = {
+    ...research,
+    coverage_days: [
+      { decision_date: "2026-09-21" },
+      { decision_date: "2026-09-22" },
+      { decision_date: "2026-09-23" },
+    ],
+    portfolio_days: [
+      {
+        decision_date: "2026-09-21",
+        groupings: [
+          {
+            status: "ok",
+            group_count: 3,
+            groups: [{ group_number: 1, cumulative_return: 0.01, target_weight_turnover: 0.2 }],
+          },
+        ],
+      },
+      {
+        decision_date: "2026-09-23",
+        groupings: [
+          {
+            status: "ok",
+            group_count: 3,
+            groups: [{ group_number: 1, cumulative_return: 0.03, target_weight_turnover: 0.3 }],
+          },
+        ],
+      },
+    ],
+  } as FactorResearchDisplay;
+  expect(groupSeries(withGap, 3).map((point) => point.date)).toEqual([
+    "2026-09-21",
+    "2026-09-22",
+    "2026-09-23",
+  ]);
+  expect(groupSeries(withGap, 3)[1]?.groups).toEqual([]);
+  const groups = groupOption(withGap, 3, colors);
+  const turnover = turnoverOption(withGap, 3, colors);
+  const groupXAxis = groups.xAxis as { data: string[] };
+  const turnoverXAxis = turnover.xAxis as { data: string[] };
+  const groupLines = groups.series as Array<{ data: (number | null)[]; connectNulls?: boolean }>;
+  const turnoverBars = turnover.series as Array<{ data: (number | null)[] }>;
+  expect(groupXAxis.data).toEqual(["2026-09-21", "2026-09-22", "2026-09-23"]);
+  expect(turnoverXAxis.data).toEqual(groupXAxis.data);
+  expect(groupLines[0]?.data).toEqual([0.01, null, 0.03]);
+  expect(groupLines[0]?.connectNulls).toBe(false);
+  expect(turnoverBars[0]?.data).toEqual([0.2, null, 0.3]);
 });

@@ -314,6 +314,47 @@ describe("因子库", () => {
     expect(within(area).getByRole("button", { name: "重新加载结果" })).toBeInTheDocument();
   });
 
+  it("分组收益与换手明细在中间无样本日保留日期和缺值", async () => {
+    publish();
+    const firstDay = research.portfolio_days[0];
+    const firstCoverage = research.coverage_days[0];
+    if (!firstDay || !firstCoverage) throw new Error("缺少合成检验基准日");
+    const withGap: Research = {
+      ...research,
+      coverage_days: [...research.coverage_days, { ...firstCoverage, decision_date: "2026-09-23" }],
+      portfolio_days: [
+        firstDay,
+        {
+          ...firstDay,
+          decision_date: "2026-09-23",
+          groupings: firstDay.groupings.map((grouping) => ({
+            ...grouping,
+            groups: grouping.groups.map((group) => ({
+              ...group,
+              cumulative_return: group.cumulative_return + 0.01,
+              target_weight_turnover: 0.35,
+            })),
+          })),
+        },
+      ],
+    };
+    publishResults([result("1".repeat(32))], withGap);
+    renderApp("/factors");
+    const area = await screen.findByRole("region", { name: "检验结果" });
+    await within(area).findByRole("img", { name: "分组累计收益" });
+    const user = userEvent.setup();
+    await user.click(within(area).getByText("查看分组收益明细"));
+    await user.click(within(area).getByText("查看换手明细"));
+    const returns = within(area).getByRole("table", { name: "分组收益明细" });
+    const turnover = within(area).getByRole("table", { name: "换手明细" });
+    const missingReturn = within(returns).getByRole("row", { name: /2026-09-22/ });
+    const missingTurnover = within(turnover).getByRole("row", { name: /2026-09-22/ });
+    expect(missingReturn).toHaveTextContent("—");
+    expect(missingTurnover).toHaveTextContent("—");
+    expect(within(returns).getAllByRole("row")).toHaveLength(4);
+    expect(within(turnover).getAllByRole("row")).toHaveLength(4);
+  });
+
   it.each([
     ["queued", "not_ready", "检验进行中"],
     ["running", "not_ready", "检验进行中"],

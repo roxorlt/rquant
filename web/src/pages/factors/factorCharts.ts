@@ -39,10 +39,13 @@ export function groupCounts(research: FactorResearchDisplay): number[] {
 }
 
 export function groupSeries(research: FactorResearchDisplay, count: number) {
-  return research.portfolio_days.map((day) => ({
+  const portfolioByDate = new Map(research.portfolio_days.map((day) => [day.decision_date, day]));
+  return research.coverage_days.map((day) => ({
     date: day.decision_date,
     groups:
-      day.groupings.find((grouping) => grouping.group_count === count && grouping.status === "ok")
+      portfolioByDate
+        .get(day.decision_date)
+        ?.groupings.find((grouping) => grouping.group_count === count && grouping.status === "ok")
         ?.groups ?? [],
   }));
 }
