@@ -18,6 +18,7 @@ import {
   RelativeTime,
   Tip,
 } from "@/ui";
+import { FactorResults } from "./FactorResults";
 import "./factors.css";
 
 const ARCHIVE_STORAGE_KEY = "rquant.factor.archive-command.v1";
@@ -208,7 +209,7 @@ export default function FactorsPage() {
       <PageHeader
         eyebrow="研究"
         title="因子研究"
-        note="查看已发布因子的当前定义"
+        note="查看已发布因子与历史检验"
         actions={
           <Button
             size="sm"
@@ -307,54 +308,63 @@ export default function FactorsPage() {
             />
           </Panel>
           {selected ? (
-            <Panel
-              title={selected.name_zh}
-              label="因子详情"
-              sub={
-                <span>
-                  第 {selected.version} 版{selected.archived ? " · 已归档" : ""}
-                </span>
-              }
-            >
-              <div className="factor-detail">
-                <div className="factor-detail-lead">
-                  <span className="factor-detail-category">{selected.category_label}</span>
-                  <span>{selected.direction_label}</span>
+            <div className="factor-main">
+              <Panel
+                title={selected.name_zh}
+                label="因子详情"
+                sub={
+                  <span>
+                    第 {selected.version} 版{selected.archived ? " · 已归档" : ""}
+                  </span>
+                }
+              >
+                <div className="factor-detail">
+                  <div className="factor-detail-lead">
+                    <span className="factor-detail-category">{selected.category_label}</span>
+                    <span>{selected.direction_label}</span>
+                  </div>
+                  <dl className="factor-facts">
+                    <div>
+                      <dt>最早可用</dt>
+                      <dd>{selected.earliest_available_date}</dd>
+                    </div>
+                    <div>
+                      <dt>历史窗口</dt>
+                      <dd>{selected.max_history_window} 个交易日</dd>
+                    </div>
+                    <div>
+                      <dt>使用字段</dt>
+                      <dd>{selected.dependency_columns.join("、") || "无"}</dd>
+                    </div>
+                  </dl>
+                  <div className="factor-expression">
+                    <div className="factor-expression-head">
+                      <h3>计算表达式</h3>
+                      <Tip content={`因子标识：${selected.factor_id}`}>查看标识</Tip>
+                    </div>
+                    <code>{selected.expression}</code>
+                  </div>
+                  {catalog.data?.can_archive && !selected.archived && archiveCommand === null ? (
+                    <div className="factor-detail-actions">
+                      <Button
+                        size="sm"
+                        disabled={archiveBusy}
+                        onClick={() => setConfirmArchive(true)}
+                      >
+                        归档
+                      </Button>
+                    </div>
+                  ) : null}
                 </div>
-                <dl className="factor-facts">
-                  <div>
-                    <dt>最早可用</dt>
-                    <dd>{selected.earliest_available_date}</dd>
-                  </div>
-                  <div>
-                    <dt>历史窗口</dt>
-                    <dd>{selected.max_history_window} 个交易日</dd>
-                  </div>
-                  <div>
-                    <dt>使用字段</dt>
-                    <dd>{selected.dependency_columns.join("、") || "无"}</dd>
-                  </div>
-                </dl>
-                <div className="factor-expression">
-                  <div className="factor-expression-head">
-                    <h3>计算表达式</h3>
-                    <Tip content={`因子标识：${selected.factor_id}`}>查看标识</Tip>
-                  </div>
-                  <code>{selected.expression}</code>
-                </div>
-                {catalog.data?.can_archive && !selected.archived && archiveCommand === null ? (
-                  <div className="factor-detail-actions">
-                    <Button
-                      size="sm"
-                      disabled={archiveBusy}
-                      onClick={() => setConfirmArchive(true)}
-                    >
-                      归档
-                    </Button>
-                  </div>
-                ) : null}
-              </div>
-            </Panel>
+              </Panel>
+              {typeof currentGeneration === "string" ? (
+                <FactorResults
+                  factor={selected}
+                  generationId={currentGeneration}
+                  onRefresh={() => void refreshDefinitions()}
+                />
+              ) : null}
+            </div>
           ) : null}
         </div>
       )}

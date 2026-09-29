@@ -65,6 +65,14 @@ export const formulaPoolsHandler = () =>
     }),
   );
 
+export const factorResultsUnavailableHandler = () =>
+  http.get("*/api/v1/factors/results", () =>
+    HttpResponse.json({
+      data: { availability: "unavailable", available_at: null, results: [] },
+      serving: metaEnvelope().serving,
+    }),
+  );
+
 export const manualWatchlistUnavailableHandler = () =>
   http.get("*/api/v1/watchlist", () =>
     HttpResponse.json({
@@ -110,6 +118,7 @@ export const server = setupServer(
   poolEditorHandler(),
   formulaMarketJobsHandler(),
   formulaPoolsHandler(),
+  factorResultsUnavailableHandler(),
   manualWatchlistUnavailableHandler(),
   manualWatchlistExactUnavailableHandler(),
 );
