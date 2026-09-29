@@ -82,6 +82,13 @@ class _ReturnRow:
     entry_line_price: float | None
 
 
+@dataclass(frozen=True)
+class _RankClaim:
+    position: int
+    score: float
+    result_version: str
+
+
 def _available(tables: dict[str, readers.TableState], name: str) -> bool:
     table = tables.get(name)
     return table is not None and table.available
@@ -249,6 +256,65 @@ def _return_rows(cursor: Any, tables: dict[str, readers.TableState]) -> dict[str
             )
         )
     return by_pool
+
+
+def _rank_claim(payload: dict[str, object]) -> _RankClaim | None:
+    position = payload.get("rank_position")
+    score = payload.get("ranking_score")
+    result_version = payload.get("rank_result_version")
+    if (
+        type(position) is not int
+        or position < 1
+        or isinstance(score, bool)
+        or not isinstance(score, (int, float))
+        or not math.isfinite(score)
+        or not 0 <= score <= 100
+        or not isinstance(result_version, str)
+    ):
+        return None
+    return _RankClaim(position=position, score=float(score), result_version=result_version)
+
+
+def _ranked_members(
+    members: list[PoolMember],
+    claims: dict[str, _RankClaim | None],
+    *,
+    receipt: _RunReceipt | None,
+    result: PoolResultView,
+    latest: date | None,
+    complete_group: bool,
+) -> list[PoolMember] | None:
+    if (
+        receipt is None
+        or receipt.result_version is None
+        or result.state != "current_rules"
+        or latest is None
+        or receipt.trade_date != latest
+        or not complete_group
+        or len(members) != receipt.hit_count
+        or len(claims) != receipt.hit_count
+        or len({member.code for member in members}) != receipt.hit_count
+    ):
+        return None
+    positions: set[int] = set()
+    ranked: list[PoolMember] = []
+    for member in members:
+        claim = claims.get(member.code)
+        if (
+            claim is None
+            or claim.result_version != receipt.result_version
+            or claim.position in positions
+        ):
+            return None
+        positions.add(claim.position)
+        ranked.append(
+            member.model_copy(
+                update={"rank_position": claim.position, "ranking_score": claim.score}
+            )
+        )
+    if positions != set(range(1, receipt.hit_count + 1)):
+        return None
+    return sorted(ranked, key=lambda member: member.rank_position or 0)
 
 
 def _entry_evidence(row: _MembershipRow, *, result_date: date) -> _EntryEvidence:
@@ -490,19 +556,21 @@ def build_pools(borrowed: BorrowedGeneration | None, *, today: date) -> PoolsDat
             ).fetchall()
         }
     hits: dict[str, list[PoolMember]] = defaultdict(list)
+    rank_claims: dict[str, dict[str, _RankClaim | None]] = defaultdict(dict)
     hit_codes: dict[str, set[str]] = defaultdict(set)
     counts: dict[str, int] = defaultdict(int)
+    complete_hits = True
     if latest is not None:
-        for key, code, row_json in cursor.execute(
+        hit_rows = cursor.execute(
             "SELECT preset_name, ts_code, row_json FROM canvas_hit "
             "WHERE trade_date = ? ORDER BY preset_name, ts_code LIMIT 20001",
             (latest,),
-        ).fetchall():
+        ).fetchall()
+        complete_hits = len(hit_rows) <= 20_000
+        for key, code, row_json in hit_rows:
             pool_key = str(key)
             counts[pool_key] += 1
             hit_codes[pool_key].add(str(code))
-            if len(hits[pool_key]) >= _MAX_MEMBERS:
-                continue
             try:
                 payload = json.loads(row_json) if row_json else {}
             except (TypeError, ValueError):
@@ -510,6 +578,7 @@ def build_pools(borrowed: BorrowedGeneration | None, *, today: date) -> PoolsDat
             if not isinstance(payload, dict):
                 payload = {}
             name = payload.get("name")
+            rank_claims[pool_key][str(code)] = _rank_claim(payload)
             hits[pool_key].append(
                 PoolMember(
                     code=str(code),
@@ -677,6 +746,15 @@ def build_pools(borrowed: BorrowedGeneration | None, *, today: date) -> PoolsDat
             else member
             for member in hits[key]
         ]
+        ranked_members = _ranked_members(
+            visible_members,
+            rank_claims[key],
+            receipt=receipt,
+            result=result_view,
+            latest=latest,
+            complete_group=complete_hits and counts[key] == len(hits[key]),
+        )
+        display_members = ranked_members if ranked_members is not None else visible_members
         pools.append(
             PublishedPool(
                 key=key,
@@ -691,7 +769,7 @@ def build_pools(borrowed: BorrowedGeneration | None, *, today: date) -> PoolsDat
                 gain_sample_avg_pct=sample_avg if member_returns else None,
                 steps=pool_steps if state == "current" else [],
                 steps_truncated=state == "current" and step_counts[key] > _MAX_STEPS,
-                members=visible_members if state == "current" else [],
+                members=display_members[:_MAX_MEMBERS] if state == "current" else [],
                 members_truncated=counts[key] > _MAX_MEMBERS,
                 definition=rule_definitions.get(key),
                 result=result_view,

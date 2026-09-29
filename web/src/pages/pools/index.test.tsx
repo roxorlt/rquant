@@ -127,6 +127,38 @@ function respond(data: Schemas["PoolsData"] = base) {
   server.use(http.get("*/api/v1/pools", () => HttpResponse.json({ data, serving })));
 }
 
+it("按已核验名次显示成员和评分，未知事实保留空值", async () => {
+  const pool = base.pools[0];
+  const member = pool?.members[0];
+  if (!pool || !member) throw new Error("pool fixture is incomplete");
+  respond({
+    ...base,
+    pools: [
+      {
+        ...pool,
+        member_count: 2,
+        members_truncated: false,
+        members: [
+          { ...member, code: "600002.SH", name: "第二名", rank_position: 2, ranking_score: 88.5 },
+          { ...member, code: "600001.SH", name: "第一名", rank_position: 1, ranking_score: 97.25 },
+        ],
+        result: {
+          state: "current_rules",
+          status_label: "结果已按当前规则更新",
+          trade_date: "2026-09-23",
+          hit_count: 2,
+        },
+      },
+    ],
+  });
+  const { container } = renderApp("/pools");
+  const table = await screen.findByRole("table", { name: "池子成员" });
+  expect(within(table).getByRole("columnheader", { name: "名次" })).toBeVisible();
+  expect(within(table).getByRole("columnheader", { name: "评分" })).toBeVisible();
+  expect(within(table).getByRole("row", { name: /第一名/ })).toHaveTextContent("97.25");
+  expect(findJargon(container.textContent ?? "")).toEqual([]);
+});
+
 function respondFormula(
   latestResult: Schemas["FormulaPoolLatestResult"] | null,
   generation = serving.generation_id,

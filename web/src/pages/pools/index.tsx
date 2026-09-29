@@ -10,7 +10,7 @@ import {
 import { useMeta } from "@/api/useMeta";
 import { StockDrawer } from "@/app/StockDrawer";
 import { FlowGraph, type FlowGraphEdge, type FlowGraphNode } from "@/charts/FlowGraph";
-import { formatCount, formatPrice } from "@/format/number";
+import { formatCount, formatNumber, formatPrice } from "@/format/number";
 import { formatTradeDate, weekdayOf } from "@/format/time";
 import { type DataColumn, DataTable } from "@/table/DataTable";
 import { Button, ChangeText, EmptyState, PageHeader, PageSkeleton, Panel, Tip } from "@/ui";
@@ -26,15 +26,33 @@ import "./pools.css";
 
 const MEMBER_COLUMNS: DataColumn<PoolMember>[] = [
   {
+    id: "rank",
+    header: "名次",
+    value: (row) => row.rank_position ?? null,
+    cell: (row) => <span className="num pool-rank">{formatCount(row.rank_position)}</span>,
+    numeric: true,
+    sortable: true,
+  },
+  {
     id: "name",
     header: "股票",
     value: (row) => row.name ?? row.code,
     cell: (row) => (
       <span>
         {row.name ?? row.code} <span className="mono pool-code">{row.code}</span>
+        <span className="pool-score-phone num">评分 {formatNumber(row.ranking_score)}</span>
       </span>
     ),
     sortable: true,
+  },
+  {
+    id: "score",
+    header: "评分",
+    value: (row) => row.ranking_score ?? null,
+    cell: (row) => <span className="num">{formatNumber(row.ranking_score)}</span>,
+    numeric: true,
+    sortable: true,
+    secondary: true,
   },
   {
     id: "entry_date",
@@ -320,6 +338,7 @@ function ResultsDetail({
             columns={MEMBER_COLUMNS}
             rowKey={(row) => row.code}
             label="池子成员"
+            initialSort={{ id: "rank", desc: false }}
             onSelect={(row) => onSelectStock(row, pool.key)}
             emptyText="本次没有成员"
           />

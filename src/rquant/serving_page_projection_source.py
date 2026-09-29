@@ -110,7 +110,12 @@ from rquant.page_control import (
 from rquant.pool_definition_projection import PoolMutation, build_pool_definition_rows
 from rquant.pool_member_return import calculate_adjusted_pool_return
 from rquant.pool_membership import PoolDayEvidence, PoolMemberClose, compute_pool_membership
-from rquant.pool_result_receipt import ScreenRunReceipt, member_price_digest, member_set_digest
+from rquant.pool_result_receipt import (
+    ScreenRunReceipt,
+    member_price_digest,
+    member_rank_digest,
+    member_set_digest,
+)
 from rquant.price_alert_rule_store import _SCHEMA_COLUMNS, PriceAlertRuleRepository
 from rquant.readside_replica_gate import (
     UNLIMITED_READ_PROFILE,
@@ -194,6 +199,7 @@ _RUN_RECEIPT_COLUMNS = (
     "result_version",
 )
 _RUN_PRICE_RECEIPT_COLUMNS = ("contract", "price_digest")
+_RUN_RANK_RECEIPT_COLUMN = "rank_digest"
 _MAX_RESEARCH_GATES = 512
 _MAX_AUDIT_FINDING_LIST_BYTES = 32 * 1024
 _MAX_PULSE_ROWS = 512
@@ -1671,6 +1677,7 @@ class _VerifiedRunReceipts:
     latest: tuple[ScreenRunReceipt, ...]
     lineage: tuple[ScreenRunReceipt, ...]
     price_digest_verified: frozenset[str]
+    rank_rows_verified: Mapping[str, tuple[tuple[str, int, float], ...]]
     newest_candidate_day: date | None
     newest_candidate_at: datetime | None
     exact_parent_steps: tuple[tuple[str, int], ...]
@@ -1738,11 +1745,17 @@ def _read_verified_run_receipts(
     price_columns = set(_RUN_PRICE_RECEIPT_COLUMNS)
     if columns & price_columns and not price_columns <= columns:
         raise PageProjectionSourceIntegrityError("screen run price receipt columns are incomplete")
-    receipt_columns = (
+    receipt_columns: tuple[str, ...] = (
         _RUN_RECEIPT_COLUMNS + _RUN_PRICE_RECEIPT_COLUMNS
         if price_columns <= columns
         else _RUN_RECEIPT_COLUMNS
     )
+    if _RUN_RANK_RECEIPT_COLUMN in columns:
+        receipt_columns += (_RUN_RANK_RECEIPT_COLUMN,)
+    result_columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info('screen_result')").fetchall()
+    }
+    has_rank_columns = {"rank_position", "ranking_score"} <= result_columns
     receipt_select = ", ".join(receipt_columns)
     candidate_rows = connection.execute(
         f"""
@@ -1772,6 +1785,7 @@ def _read_verified_run_receipts(
     newest_at = max((_database_timestamp(row[8]) for row in candidate_rows), default=None)
     verified: dict[tuple[date, str], ScreenRunReceipt | None] = {}
     price_digest_verified: set[str] = set()
+    rank_rows_verified: dict[str, tuple[tuple[str, int, float], ...]] = {}
     member_total = 0
 
     def verify(raw: tuple[object, ...]) -> ScreenRunReceipt | None:
@@ -1788,9 +1802,16 @@ def _read_verified_run_receipts(
             return None
         if receipt.trade_date > cutoff.date() or receipt.completed_at > observed:
             return None
+        if receipt.contract == "screen-run-receipt/v3" and not has_rank_columns:
+            return None
+        selected = (
+            "ts_code, close, rank_position, ranking_score"
+            if receipt.contract == "screen-run-receipt/v3"
+            else "ts_code, close"
+        )
         member_rows = connection.execute(
-            """
-            SELECT ts_code, close FROM screen_result
+            f"""
+            SELECT {selected} FROM screen_result
             WHERE trade_date = ? AND preset_name = ? AND created_at <= ?
             ORDER BY ts_code LIMIT ?
             """,
@@ -1830,13 +1851,27 @@ def _read_verified_run_receipts(
                 or parent.lineage_complete != receipt.lineage_complete
             ):
                 return None
-        if (
-            receipt.contract == "screen-run-receipt/v2"
-            and receipt.price_digest
-            == member_price_digest([(str(code), close) for code, close in member_rows])
-        ):
-            assert receipt.result_version is not None
-            price_digest_verified.add(receipt.result_version)
+        if receipt.contract in {"screen-run-receipt/v2", "screen-run-receipt/v3"}:
+            try:
+                price_matches = receipt.price_digest == member_price_digest(
+                    [(str(row[0]), row[1]) for row in member_rows]
+                )
+            except ValueError:
+                price_matches = False
+            if receipt.contract == "screen-run-receipt/v3":
+                if not price_matches:
+                    return None
+                rank_rows = tuple((str(row[0]), row[2], row[3]) for row in member_rows)
+                try:
+                    if receipt.rank_digest != member_rank_digest(rank_rows):
+                        return None
+                except ValueError:
+                    return None
+                assert receipt.result_version is not None
+                rank_rows_verified[receipt.result_version] = rank_rows
+            if price_matches:
+                assert receipt.result_version is not None
+                price_digest_verified.add(receipt.result_version)
         verified[key] = receipt
         return receipt
 
@@ -1883,6 +1918,7 @@ def _read_verified_run_receipts(
         latest=latest,
         lineage=lineage,
         price_digest_verified=frozenset(price_digest_verified),
+        rank_rows_verified=MappingProxyType(rank_rows_verified),
         newest_candidate_day=newest,
         newest_candidate_at=newest_at,
         exact_parent_steps=tuple(exact_parent_steps),
@@ -2348,7 +2384,7 @@ def _return_projection(
             or status["result_version"] != current.result_version
             or member["trade_date"] != status["trade_date"]
             or member["result_version"] != current.result_version
-            or current.contract != "screen-run-receipt/v2"
+            or current.contract not in {"screen-run-receipt/v2", "screen-run-receipt/v3"}
             or current.result_version not in receipts.price_digest_verified
         ):
             continue
@@ -2362,7 +2398,7 @@ def _return_projection(
         if (
             entry is None
             or entry.result_version != entry_version
-            or entry.contract != "screen-run-receipt/v2"
+            or entry.contract not in {"screen-run-receipt/v2", "screen-run-receipt/v3"}
             or entry.result_version not in receipts.price_digest_verified
         ):
             continue
@@ -2925,6 +2961,17 @@ class DuckDBSignalPageProjectionSource:
                     )
                     for preset, count in diagnostic_rows
                 )
+                ranked_by_pool: dict[str, tuple[str, dict[str, tuple[int, float]]]] = {}
+                if run_receipts is not None:
+                    for receipt in run_receipts.latest:
+                        if receipt.trade_date != latest_date or receipt.result_version is None:
+                            continue
+                        ranks = run_receipts.rank_rows_verified.get(receipt.result_version)
+                        if ranks is not None:
+                            ranked_by_pool[receipt.preset_name] = (
+                                receipt.result_version,
+                                {code: (position, score) for code, position, score in ranks},
+                            )
                 hit_rows = connection.execute(
                     """
                     SELECT preset_name, ts_code, name, close, pct_chg
@@ -2939,25 +2986,33 @@ class DuckDBSignalPageProjectionSource:
                     raise PageProjectionSourceIntegrityError(
                         "canvas hits exceed the bounded projection limit"
                     )
-                hits = tuple(
-                    CanvasHitProjectionRow(
-                        trade_date=latest_date,
-                        preset_name=str(preset),
-                        ts_code=str(ts_code),
-                        row_json=json.dumps(
-                            {
-                                "close": close,
-                                "name": name,
-                                "pct_chg": pct_chg,
-                                "ts_code": ts_code,
-                            },
-                            ensure_ascii=True,
-                            separators=(",", ":"),
-                            sort_keys=True,
-                        ),
+                hit_projection: list[CanvasHitProjectionRow] = []
+                for preset, ts_code, name, close, pct_chg in hit_rows:
+                    payload: dict[str, object] = {
+                        "close": close,
+                        "name": name,
+                        "pct_chg": pct_chg,
+                        "ts_code": ts_code,
+                    }
+                    rank_group = ranked_by_pool.get(str(preset))
+                    rank = None if rank_group is None else rank_group[1].get(str(ts_code))
+                    if rank_group is not None and rank is not None:
+                        payload.update(
+                            rank_position=rank[0],
+                            ranking_score=rank[1],
+                            rank_result_version=rank_group[0],
+                        )
+                    hit_projection.append(
+                        CanvasHitProjectionRow(
+                            trade_date=latest_date,
+                            preset_name=str(preset),
+                            ts_code=str(ts_code),
+                            row_json=json.dumps(
+                                payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True
+                            ),
+                        )
                     )
-                    for preset, ts_code, name, close, pct_chg in hit_rows
-                )
+                hits = tuple(hit_projection)
             available_row = connection.execute(
                 """
                 SELECT MAX(created_at) FROM (

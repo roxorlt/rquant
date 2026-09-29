@@ -12,6 +12,47 @@ for (const viewport of [
   test.describe(`${viewport.name} published pools`, () => {
     test.use({ viewport: { width: viewport.width, height: viewport.height } });
 
+    test("keeps verified rank order and score readable with keyboard", async ({ page }) => {
+      const watcher = watch(page);
+      let firstCode = "";
+      await page.route("**/api/v1/pools", async (route) => {
+        const upstream = await route.fetch();
+        const body = (await upstream.json()) as Schemas["Envelope_PoolsData_"];
+        const pool = body.data.pools.find((item) => item.key === "n-shape-pool1");
+        if (!pool || pool.members.length !== 3) throw new Error("synthetic pool is incomplete");
+        firstCode = pool.members[2]?.code ?? "";
+        pool.members = pool.members.map((member, index) => ({
+          ...member,
+          rank_position: 3 - index,
+          ranking_score: 85 + index * 5,
+        }));
+        pool.result = {
+          state: "current_rules",
+          status_label: "结果已按当前规则更新",
+          trade_date: "2026-09-23",
+          hit_count: pool.member_count,
+        };
+        await route.fulfill({ response: upstream, body: JSON.stringify(body) });
+      });
+      await page.goto("./#/pools");
+      const table = page.getByRole("table", { name: "池子成员" });
+      await expect(table.getByRole("columnheader", { name: "名次" })).toBeVisible();
+      if (viewport.name === "desktop") {
+        await expect(table.getByRole("columnheader", { name: "评分" })).toBeVisible();
+      }
+      const rows = table.locator("tbody tr");
+      await expect(rows.first()).toContainText(firstCode);
+      await expect(rows.first()).toContainText("95.00");
+      await rows.first().focus();
+      await rows.first().press("ArrowDown");
+      await expect(rows.nth(1)).toBeFocused();
+      await rows.nth(1).press("Enter");
+      await expect(page.getByRole("dialog")).toBeVisible();
+      await expectNoHorizontalOverflow(page, "ranked pool members");
+      expect(findJargon(await page.locator("main").innerText())).toEqual([]);
+      expect(watcher.problems).toEqual([]);
+    });
+
     test("reads published rules and last members with keyboard and fits the page", async ({
       page,
     }) => {

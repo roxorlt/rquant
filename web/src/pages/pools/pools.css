@@ -731,7 +731,20 @@
   font-size: 11px;
   color: var(--muted);
 }
+.pool-rank {
+  font-weight: 700;
+  color: var(--ink);
+}
+.pool-score-phone {
+  display: none;
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 11px;
+}
 @media (max-width: 760px) {
+  .pool-score-phone {
+    display: block;
+  }
   .pools-layout {
     grid-template-columns: minmax(0, 1fr);
   }

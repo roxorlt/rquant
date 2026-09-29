@@ -20,6 +20,8 @@ class PoolMember(BaseModel):
     gain_pct: float | None
     gain_through_date: date | None
     entry_line_price: float | None
+    rank_position: int | None = None
+    ranking_score: float | None = None
 
 
 class PoolStep(BaseModel):

@@ -3706,6 +3706,10 @@ export interface components {
             name: string | null;
             /** Pct Chg */
             pct_chg: number | null;
+            /** Rank Position */
+            rank_position?: number | null;
+            /** Ranking Score */
+            ranking_score?: number | null;
         };
         /** PoolNlPreview */
         PoolNlPreview: {

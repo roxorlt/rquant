@@ -160,6 +160,7 @@ def _receipt_response(
     returns: list[tuple[object, ...]] | None = None,
     bounds: dict[str, str] | None = None,
     latest: str = "2026-09-23",
+    rank_facts: dict[str, tuple[int, float, str]] | None = None,
 ) -> dict:
     """Exercise the HTTP route over one synthetic borrowed generation.
 
@@ -213,8 +214,24 @@ def _receipt_response(
         )
         if hits:
             connection.executemany(
-                "INSERT INTO canvas_hit VALUES (?, ?, ?, '{}')",
-                [(latest, name, code) for name, code in hits],
+                "INSERT INTO canvas_hit VALUES (?, ?, ?, ?)",
+                [
+                    (
+                        latest,
+                        name,
+                        code,
+                        json.dumps(
+                            {
+                                "rank_position": rank_facts[code][0],
+                                "ranking_score": rank_facts[code][1],
+                                "rank_result_version": rank_facts[code][2],
+                            }
+                            if rank_facts is not None and code in rank_facts
+                            else {}
+                        ),
+                    )
+                    for name, code in hits
+                ],
             )
         connection.execute("CREATE TABLE screen_bounds (preset_name VARCHAR, max_date DATE)")
         if bounds:
@@ -321,6 +338,80 @@ def test_verified_receipt_confirms_current_rules_and_zero_hit_day(tmp_path: Path
     }
     assert (zero["state"], zero["trade_date"], zero["member_count"]) == ("current", "2026-09-23", 0)
     assert zero["members"] == [] and zero["steps"] == []
+
+
+def test_ranked_group_selects_top_hundred_after_full_verification(tmp_path: Path) -> None:
+    codes = [f"{600000 + number:06d}.SH" for number in range(101)]
+    top_code = codes[-1]
+    ranks = {
+        code: (1 if code == top_code else index + 2, 100.0 - index / 2, "r" * 64)
+        for index, code in enumerate(codes[:-1])
+    }
+    ranks[top_code] = (1, 100.0, "r" * 64)
+    data = _receipt_response(
+        tmp_path,
+        definitions=[_rule_row("user/排名池")],
+        hits=[("user/排名池", code) for code in codes],
+        receipts=[_receipt_row("user/排名池", count=101)],
+        bounds={"user/排名池": "2026-09-23"},
+        rank_facts=ranks,
+    )["data"]
+    pool = next(item for item in data["pools"] if item["key"] == "user/排名池")
+    assert pool["member_count"] == 101
+    assert pool["members_truncated"] is True
+    assert len(pool["members"]) == 100
+    assert pool["members"][0]["code"] == top_code
+    assert pool["members"][0]["rank_position"] == 1
+    assert pool["members"][0]["ranking_score"] == 100.0
+    assert pool["members"][-1]["rank_position"] == 100
+
+
+@pytest.mark.parametrize("bad_group", ("wrong_version", "duplicate", "gap", "missing", "bad_score"))
+def test_partial_or_wrong_version_rank_group_exposes_no_scores(
+    tmp_path: Path, bad_group: str
+) -> None:
+    codes = ["600001.SH", "600002.SH", "600003.SH"]
+    claims = {
+        codes[0]: (1, 95.0, "r" * 64),
+        codes[1]: (2, 90.0, "r" * 64),
+        codes[2]: (3, 85.0, "r" * 64),
+    }
+    if bad_group == "wrong_version":
+        claims[codes[1]] = (2, 90.0, "x" * 64)
+    elif bad_group == "duplicate":
+        claims[codes[1]] = (1, 90.0, "r" * 64)
+    elif bad_group == "gap":
+        claims[codes[1]] = (4, 90.0, "r" * 64)
+    elif bad_group == "missing":
+        del claims[codes[1]]
+    else:
+        claims[codes[1]] = (2, 101.0, "r" * 64)
+    data = _receipt_response(
+        tmp_path,
+        definitions=[_rule_row("user/排名池")],
+        hits=[("user/排名池", code) for code in codes],
+        receipts=[_receipt_row("user/排名池", count=3)],
+        bounds={"user/排名池": "2026-09-23"},
+        rank_facts=claims,
+    )["data"]
+    pool = next(item for item in data["pools"] if item["key"] == "user/排名池")
+    assert [member["code"] for member in pool["members"]] == codes
+    assert all(member["rank_position"] is None for member in pool["members"])
+    assert all(member["ranking_score"] is None for member in pool["members"])
+
+
+def test_changed_definition_never_shows_rank_claims(tmp_path: Path) -> None:
+    data = _receipt_response(
+        tmp_path,
+        definitions=[_rule_row("user/排名池")],
+        hits=[("user/排名池", "600001.SH")],
+        receipts=[_receipt_row("user/排名池", version="b" * 64)],
+        bounds={"user/排名池": "2026-09-23"},
+        rank_facts={"600001.SH": (1, 95.0, "r" * 64)},
+    )["data"]
+    pool = next(item for item in data["pools"] if item["key"] == "user/排名池")
+    assert pool["result"]["state"] == "rules_changed"
+    assert pool["members"][0]["rank_position"] is None
 
 
 def test_old_serving_pool_definition_without_ranking_column_remains_readable(
