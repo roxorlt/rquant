@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import sqlite3
+import stat
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Literal
+from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -19,9 +22,15 @@ _FACTOR_ID_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
 _COMMAND_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _DIGEST_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 _TABLE_NAMES = frozenset(
-    {"factor_versions", "factor_heads", "factor_commands", "factor_archive_events"}
+    {
+        "factor_versions",
+        "factor_heads",
+        "factor_commands",
+        "factor_archive_events",
+        "factor_registry_identity",
+    }
 )
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 _MAX_LIST_LIMIT = 1000
 
 
@@ -35,6 +44,19 @@ class FactorConflictError(FactorRegistryError):
 
 class FactorIntegrityError(FactorRegistryError):
     """Persisted factor history is incomplete or invalid."""
+
+
+class FactorRegistryIdentityError(FactorRegistryError):
+    """The fixed registry file is missing or has a different identity."""
+
+
+class FactorRegistryIdentity(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    instance_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    path: str
+    st_dev: int = Field(ge=0, strict=True)
+    st_ino: int = Field(gt=0, strict=True)
 
 
 class FactorHeadRef(BaseModel):
@@ -154,6 +176,94 @@ class FactorDefinitionRegistry:
     def __init__(self, path: Path) -> None:
         self.path = Path(path).absolute()
 
+    def _file_identity(self) -> tuple[int, int]:
+        try:
+            observed = os.stat(self.path, follow_symlinks=False)
+        except FileNotFoundError as error:
+            raise FactorRegistryIdentityError("factor registry file is missing") from error
+        if not stat.S_ISREG(observed.st_mode):
+            raise FactorRegistryIdentityError("factor registry path is not a regular file")
+        return observed.st_dev, observed.st_ino
+
+    def _require_expected_path(self, expected_identity: FactorRegistryIdentity) -> None:
+        if expected_identity.path != str(self.path) or self._file_identity() != (
+            expected_identity.st_dev,
+            expected_identity.st_ino,
+        ):
+            raise FactorRegistryIdentityError("factor registry file identity changed")
+
+    @staticmethod
+    def _instance_id(connection: sqlite3.Connection) -> str:
+        row = connection.execute(
+            "SELECT instance_id FROM factor_registry_identity WHERE singleton = 1"
+        ).fetchone()
+        if (
+            row is None
+            or not isinstance(row["instance_id"], str)
+            or re.fullmatch(r"[0-9a-f]{32}", row["instance_id"]) is None
+        ):
+            raise FactorIntegrityError("factor registry instance ID is invalid")
+        return row["instance_id"]
+
+    def _require_expected_identity(
+        self, connection: sqlite3.Connection, expected_identity: FactorRegistryIdentity
+    ) -> None:
+        self._require_expected_path(expected_identity)
+        if self._instance_id(connection) != expected_identity.instance_id:
+            raise FactorRegistryIdentityError("factor registry instance changed")
+
+    def initialize(self) -> FactorRegistryIdentity:
+        """Create a new empty registry explicitly; existing files are never migrated."""
+        if self.path.exists() or self.path.is_symlink():
+            raise FactorRegistryIdentityError("factor registry already exists")
+        connection = sqlite3.connect(str(self.path), timeout=10, isolation_level=None)
+        connection.row_factory = sqlite3.Row
+        try:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("BEGIN IMMEDIATE")
+            tables = connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+            ).fetchall()
+            if tables:
+                raise FactorRegistryIdentityError("factor registry already contains schema")
+            self._initialize_schema(connection)
+            connection.execute(
+                "INSERT INTO factor_registry_identity (singleton, instance_id) VALUES (1, ?)",
+                (uuid4().hex,),
+            )
+            connection.execute("COMMIT")
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+        return self.identity()
+
+    def identity(self) -> FactorRegistryIdentity:
+        st_dev, st_ino = self._file_identity()
+        try:
+            connection = sqlite3.connect(
+                f"{self.path.as_uri()}?mode=ro", uri=True, timeout=10, isolation_level=None
+            )
+            connection.row_factory = sqlite3.Row
+            try:
+                connection.execute("BEGIN")
+                self._require_schema(connection)
+                instance_id = self._instance_id(connection)
+            finally:
+                connection.close()
+        except sqlite3.DatabaseError as error:
+            raise FactorIntegrityError("factor registry identity cannot be read") from error
+        if self._file_identity() != (st_dev, st_ino):
+            raise FactorRegistryIdentityError("factor registry changed while reading identity")
+        return FactorRegistryIdentity(
+            instance_id=instance_id,
+            path=str(self.path),
+            st_dev=st_dev,
+            st_ino=st_ino,
+        )
+
     @staticmethod
     def _require_schema(connection: sqlite3.Connection) -> None:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
@@ -169,6 +279,10 @@ class FactorDefinitionRegistry:
     @staticmethod
     def _initialize_schema(connection: sqlite3.Connection) -> None:
         for statement in (
+            """CREATE TABLE factor_registry_identity (
+                singleton INTEGER NOT NULL PRIMARY KEY CHECK (singleton = 1),
+                instance_id TEXT NOT NULL
+            )""",
             """CREATE TABLE factor_commands (
                 command_id TEXT NOT NULL PRIMARY KEY,
                 action TEXT NOT NULL CHECK (action IN ('save', 'archive')),
@@ -207,23 +321,21 @@ class FactorDefinitionRegistry:
             connection.execute(statement)
 
     @contextmanager
-    def _writer(self) -> Iterator[sqlite3.Connection]:
-        existed = self.path.exists()
-        connection = sqlite3.connect(str(self.path), timeout=10, isolation_level=None)
+    def _writer(self, expected_identity: FactorRegistryIdentity) -> Iterator[sqlite3.Connection]:
+        self._require_expected_path(expected_identity)
+        connection = sqlite3.connect(
+            f"{self.path.as_uri()}?mode=rw", uri=True, timeout=10, isolation_level=None
+        )
         connection.row_factory = sqlite3.Row
         try:
             connection.execute("PRAGMA foreign_keys = ON")
             connection.execute("BEGIN IMMEDIATE")
-            tables = connection.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
-            ).fetchall()
-            if not tables and not existed:
-                self._initialize_schema(connection)
-                connection.execute("COMMIT")
-                connection.execute("BEGIN IMMEDIATE")
             self._require_schema(connection)
+            self._require_expected_identity(connection, expected_identity)
             yield connection
+            self._require_expected_identity(connection, expected_identity)
             connection.execute("COMMIT")
+            self._require_expected_path(expected_identity)
         except BaseException:
             if connection.in_transaction:
                 connection.execute("ROLLBACK")
@@ -232,12 +344,8 @@ class FactorDefinitionRegistry:
             connection.close()
 
     @contextmanager
-    def _reader(self) -> Iterator[sqlite3.Connection | None]:
-        if not self.path.exists():
-            yield None
-            return
-        if not self.path.is_file():
-            raise FactorIntegrityError("factor registry path is not a file")
+    def _reader(self, expected_identity: FactorRegistryIdentity) -> Iterator[sqlite3.Connection]:
+        self._require_expected_path(expected_identity)
         try:
             connection = sqlite3.connect(
                 f"{self.path.as_uri()}?mode=ro", uri=True, timeout=10, isolation_level=None
@@ -246,7 +354,9 @@ class FactorDefinitionRegistry:
             try:
                 connection.execute("BEGIN")
                 self._require_schema(connection)
+                self._require_expected_identity(connection, expected_identity)
                 yield connection
+                self._require_expected_path(expected_identity)
             finally:
                 connection.close()
         except sqlite3.DatabaseError as error:
@@ -425,11 +535,16 @@ class FactorDefinitionRegistry:
             raise FactorIntegrityError("factor archive state differs from archive event")
         return head, tuple(records)
 
-    def save(self, request: SaveFactorDefinitionRequest) -> FactorDefinitionReceipt:
+    def save(
+        self,
+        request: SaveFactorDefinitionRequest,
+        *,
+        expected_identity: FactorRegistryIdentity,
+    ) -> FactorDefinitionReceipt:
         request = SaveFactorDefinitionRequest.model_validate(request)
         definition = request.definition
         request_digest = _request_sha256("save", request)
-        with self._writer() as connection:
+        with self._writer(expected_identity) as connection:
             replay = self._replay(
                 connection,
                 command_id=request.command_id,
@@ -476,10 +591,15 @@ class FactorDefinitionRegistry:
             self._record_command(connection, receipt=receipt, request_sha256=request_digest)
             return receipt
 
-    def archive(self, request: ArchiveFactorRequest) -> FactorDefinitionReceipt:
+    def archive(
+        self,
+        request: ArchiveFactorRequest,
+        *,
+        expected_identity: FactorRegistryIdentity,
+    ) -> FactorDefinitionReceipt:
         request = ArchiveFactorRequest.model_validate(request)
         request_digest = _request_sha256("archive", request)
-        with self._writer() as connection:
+        with self._writer(expected_identity) as connection:
             replay = self._replay(
                 connection,
                 command_id=request.command_id,
@@ -517,32 +637,62 @@ class FactorDefinitionRegistry:
             self._record_command(connection, receipt=receipt, request_sha256=request_digest)
             return receipt
 
-    def get_head(self, factor_id: str) -> FactorDefinitionRecord | None:
+    def lookup_command(
+        self,
+        request: SaveFactorDefinitionRequest | ArchiveFactorRequest,
+        *,
+        expected_identity: FactorRegistryIdentity,
+    ) -> FactorDefinitionReceipt | None:
+        if isinstance(request, SaveFactorDefinitionRequest):
+            request = SaveFactorDefinitionRequest.model_validate(request)
+            action: Literal["save", "archive"] = "save"
+            factor_id = request.definition.factor_id
+        elif isinstance(request, ArchiveFactorRequest):
+            request = ArchiveFactorRequest.model_validate(request)
+            action = "archive"
+            factor_id = request.factor_id
+        else:
+            raise TypeError("factor command lookup requires a typed request")
+        with self._reader(expected_identity) as connection:
+            receipt = self._replay(
+                connection,
+                command_id=request.command_id,
+                action=action,
+                factor_id=factor_id,
+                request_sha256=_request_sha256(action, request),
+            )
+            if receipt is None:
+                self._load_factor(connection, factor_id)
+            return receipt
+
+    def get_head(
+        self, factor_id: str, *, expected_identity: FactorRegistryIdentity
+    ) -> FactorDefinitionRecord | None:
         factor_id = _checked_factor_id(factor_id)
-        with self._reader() as connection:
-            if connection is None:
-                return None
+        with self._reader(expected_identity) as connection:
             _, records = self._load_factor(connection, factor_id)
             return records[-1] if records else None
 
-    def get_version(self, factor_id: str, version: int) -> FactorDefinitionRecord | None:
+    def get_version(
+        self, factor_id: str, version: int, *, expected_identity: FactorRegistryIdentity
+    ) -> FactorDefinitionRecord | None:
         factor_id = _checked_factor_id(factor_id)
         if type(version) is not int or version < 1:
             raise ValueError("factor version is invalid")
-        with self._reader() as connection:
-            if connection is None:
-                return None
+        with self._reader(expected_identity) as connection:
             _, records = self._load_factor(connection, factor_id)
             return records[version - 1] if version <= len(records) else None
 
     def list_current(
-        self, *, include_archived: bool = False, limit: int = 100
+        self,
+        *,
+        expected_identity: FactorRegistryIdentity,
+        include_archived: bool = False,
+        limit: int = 100,
     ) -> tuple[FactorDefinitionRecord, ...]:
         if type(limit) is not int or not 1 <= limit <= _MAX_LIST_LIMIT:
             raise ValueError("factor list limit is invalid")
-        with self._reader() as connection:
-            if connection is None:
-                return ()
+        with self._reader(expected_identity) as connection:
             factor_ids = connection.execute(
                 "SELECT factor_id FROM factor_heads UNION "
                 "SELECT factor_id FROM factor_versions ORDER BY factor_id"

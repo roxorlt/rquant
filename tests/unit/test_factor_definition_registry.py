@@ -19,9 +19,11 @@ from rquant.factor.registry import (
     ArchiveFactorRequest,
     FactorConflictError,
     FactorDefinitionReceipt,
+    FactorDefinitionRecord,
     FactorDefinitionRegistry,
     FactorHeadRef,
     FactorIntegrityError,
+    FactorRegistryIdentityError,
     SaveFactorDefinitionRequest,
 )
 
@@ -41,20 +43,58 @@ def _definition(
     )
 
 
-def test_first_save_survives_reopen_with_exact_definition(tmp_path: Path) -> None:
-    path = tmp_path / "factors.sqlite3"
+def _store(path: Path) -> FactorDefinitionRegistry:
     registry = FactorDefinitionRegistry(path)
-    definition = _definition()
+    if not path.exists():
+        registry.initialize()
+    return registry
 
-    receipt = registry.save(
-        SaveFactorDefinitionRequest(
-            command_id="save-first", definition=definition, expected_head=None
-        )
+
+def _save_request(
+    registry: FactorDefinitionRegistry, request: SaveFactorDefinitionRequest
+) -> FactorDefinitionReceipt:
+    return registry.save(request, expected_identity=registry.identity())
+
+
+def _archive_request(
+    registry: FactorDefinitionRegistry, request: ArchiveFactorRequest
+) -> FactorDefinitionReceipt:
+    return registry.archive(request, expected_identity=registry.identity())
+
+
+def _head(registry: FactorDefinitionRegistry, factor_id: str) -> FactorDefinitionRecord | None:
+    return registry.get_head(factor_id, expected_identity=registry.identity())
+
+
+def _version(
+    registry: FactorDefinitionRegistry, factor_id: str, version: int
+) -> FactorDefinitionRecord | None:
+    return registry.get_version(factor_id, version, expected_identity=registry.identity())
+
+
+def _list(
+    registry: FactorDefinitionRegistry, *, include_archived: bool = False, limit: int = 100
+) -> tuple[FactorDefinitionRecord, ...]:
+    return registry.list_current(
+        expected_identity=registry.identity(), include_archived=include_archived, limit=limit
     )
 
-    reopened = FactorDefinitionRegistry(path)
-    head = reopened.get_head(definition.factor_id)
-    version = reopened.get_version(definition.factor_id, 1)
+
+def test_first_save_survives_reopen_with_exact_definition(tmp_path: Path) -> None:
+    path = tmp_path / "factors.sqlite3"
+    registry = _store(path)
+    definition = _definition()
+
+    receipt = _save_request(
+        registry,
+        SaveFactorDefinitionRequest(
+            command_id="save-first", definition=definition, expected_head=None
+        ),
+    )
+
+    reopened = _store(path)
+    head = _head(reopened, definition.factor_id)
+    version = _version(reopened, definition.factor_id, 1)
     assert receipt.version == 1
     assert receipt.content_sha256 == head.content_sha256 == version.content_sha256
     assert head.definition == version.definition == definition
@@ -68,15 +108,16 @@ def _save(
     definition: FactorDefinition,
     expected_head: FactorHeadRef | None = None,
 ) -> FactorDefinitionReceipt:
-    return registry.save(
+    return _save_request(
+        registry,
         SaveFactorDefinitionRequest(
             command_id=command_id, definition=definition, expected_head=expected_head
-        )
+        ),
     )
 
 
 def _ref(registry: FactorDefinitionRegistry, factor_id: str = "price_volume_1") -> FactorHeadRef:
-    head = registry.get_head(factor_id)
+    head = _head(registry, factor_id)
     assert head is not None
     return FactorHeadRef(version=head.definition.version, content_sha256=head.content_sha256)
 
@@ -84,42 +125,43 @@ def _ref(registry: FactorDefinitionRegistry, factor_id: str = "price_volume_1") 
 def test_readonly_missing_store_does_not_create_file(tmp_path: Path) -> None:
     path = tmp_path / "absent.sqlite3"
     registry = FactorDefinitionRegistry(path)
-    assert registry.get_head("price_volume_1") is None
-    assert registry.get_version("price_volume_1", 1) is None
-    assert registry.list_current() == ()
+    with pytest.raises(FactorRegistryIdentityError):
+        registry.identity()
     assert not path.exists()
 
 
 def test_save_cas_replay_after_advance_and_archival_preserves_original_receipt(
     tmp_path: Path,
 ) -> None:
-    registry = FactorDefinitionRegistry(tmp_path / "factors.sqlite3")
+    registry = _store(tmp_path / "factors.sqlite3")
     first = _definition()
     receipt_a = _save(registry, "command-a", first)
     receipt_b = _save(
         registry, "command-b", _definition(version=2, name="改进价量强度"), _ref(registry)
     )
     assert receipt_b.version == 2
-    assert registry.get_version(first.factor_id, 1).definition == first
+    assert _version(registry, first.factor_id, 1).definition == first
     assert _save(registry, "command-a", first) == receipt_a
     assert _save(registry, "command-a", first).model_dump_json() == receipt_a.model_dump_json()
 
-    archived = registry.archive(
+    archived = _archive_request(
+        registry,
         ArchiveFactorRequest(
             command_id="command-c", factor_id=first.factor_id, expected_head=_ref(registry)
-        )
+        ),
     )
     assert archived.archived
-    assert registry.list_current() == ()
-    assert registry.get_version(first.factor_id, 1).definition == first
+    assert _list(registry) == ()
+    assert _version(registry, first.factor_id, 1).definition == first
     assert _save(registry, "command-a", first) == receipt_a
     assert (
-        registry.archive(
+        _archive_request(
+            registry,
             ArchiveFactorRequest(
                 command_id="command-c",
                 factor_id=first.factor_id,
                 expected_head=FactorHeadRef(version=2, content_sha256=receipt_b.content_sha256),
-            )
+            ),
         )
         == archived
     )
@@ -131,11 +173,11 @@ def test_save_cas_replay_after_advance_and_archival_preserves_original_receipt(
     )
     assert reactivated.version == 3
     assert not reactivated.archived
-    assert len(registry.list_current()) == 1
+    assert len(_list(registry)) == 1
 
 
 def test_stale_or_missing_expected_head_rejects_new_command(tmp_path: Path) -> None:
-    registry = FactorDefinitionRegistry(tmp_path / "factors.sqlite3")
+    registry = _store(tmp_path / "factors.sqlite3")
     first = _save(registry, "first", _definition())
     with pytest.raises(FactorConflictError):
         _save(registry, "stale", _definition(version=2))
@@ -149,37 +191,39 @@ def test_stale_or_missing_expected_head_rejects_new_command(tmp_path: Path) -> N
             FactorHeadRef(version=1, content_sha256="0" * 64),
         )
     with pytest.raises(FactorConflictError):
-        registry.archive(
+        _archive_request(
+            registry,
             ArchiveFactorRequest(
                 command_id="bad-archive",
                 factor_id="price_volume_1",
                 expected_head=FactorHeadRef(version=1, content_sha256="0" * 64),
-            )
+            ),
         )
-    assert registry.get_head("price_volume_1").content_sha256 == first.content_sha256
+    assert _head(registry, "price_volume_1").content_sha256 == first.content_sha256
 
 
 def test_archive_replay_after_new_save_returns_original_archive_receipt(tmp_path: Path) -> None:
-    registry = FactorDefinitionRegistry(tmp_path / "factors.sqlite3")
+    registry = _store(tmp_path / "factors.sqlite3")
     _save(registry, "first", _definition())
     request = ArchiveFactorRequest(
         command_id="archive", factor_id="price_volume_1", expected_head=_ref(registry)
     )
-    receipt = registry.archive(request)
+    receipt = _archive_request(registry, request)
     _save(registry, "second", _definition(version=2), _ref(registry))
-    assert registry.archive(request) == receipt
-    assert receipt.archived and not registry.get_head("price_volume_1").head.archived
+    assert _archive_request(registry, request) == receipt
+    assert receipt.archived and not _head(registry, "price_volume_1").head.archived
     with pytest.raises(FactorConflictError):
-        registry.archive(
+        _archive_request(
+            registry,
             ArchiveFactorRequest(
                 command_id="archive", factor_id="price_volume_1", expected_head=_ref(registry)
-            )
+            ),
         )
 
 
 def test_replay_rejects_receipt_that_disagrees_with_committed_version(tmp_path: Path) -> None:
     path = tmp_path / "factors.sqlite3"
-    registry = FactorDefinitionRegistry(path)
+    registry = _store(path)
     definition = _definition()
     _save(registry, "first", definition)
     with sqlite3.connect(path) as connection:
@@ -201,7 +245,7 @@ def test_replay_rejects_receipt_that_disagrees_with_committed_version(tmp_path: 
 
 def test_two_concurrent_saves_on_same_head_have_one_winner(tmp_path: Path) -> None:
     path = tmp_path / "factors.sqlite3"
-    registry = FactorDefinitionRegistry(path)
+    registry = _store(path)
     _save(registry, "first", _definition())
     expected = _ref(registry)
     barrier = Barrier(2)
@@ -222,12 +266,12 @@ def test_two_concurrent_saves_on_same_head_have_one_winner(tmp_path: Path) -> No
     with ThreadPoolExecutor(max_workers=2) as executor:
         results = list(executor.map(lambda arg: attempt(*arg), (("a", "版本甲"), ("b", "版本乙"))))
     assert sorted(results) == ["conflict", "saved"]
-    assert registry.get_head("price_volume_1").definition.version == 2
+    assert _head(registry, "price_volume_1").definition.version == 2
 
 
 def test_archive_and_save_race_has_serializable_outcome(tmp_path: Path) -> None:
     path = tmp_path / "factors.sqlite3"
-    registry = FactorDefinitionRegistry(path)
+    registry = _store(path)
     _save(registry, "first", _definition())
     expected = _ref(registry)
     barrier = Barrier(2)
@@ -235,10 +279,11 @@ def test_archive_and_save_race_has_serializable_outcome(tmp_path: Path) -> None:
     def save() -> str:
         barrier.wait(timeout=5)
         try:
-            FactorDefinitionRegistry(path).save(
+            _save_request(
+                _store(path),
                 SaveFactorDefinitionRequest(
                     command_id="save", definition=_definition(version=2), expected_head=expected
-                )
+                ),
             )
         except FactorConflictError:
             return "conflict"
@@ -247,10 +292,11 @@ def test_archive_and_save_race_has_serializable_outcome(tmp_path: Path) -> None:
     def archive() -> str:
         barrier.wait(timeout=5)
         try:
-            FactorDefinitionRegistry(path).archive(
+            _archive_request(
+                _store(path),
                 ArchiveFactorRequest(
                     command_id="archive", factor_id="price_volume_1", expected_head=expected
-                )
+                ),
             )
         except FactorConflictError:
             return "conflict"
@@ -263,9 +309,9 @@ def test_archive_and_save_race_has_serializable_outcome(tmp_path: Path) -> None:
         ["conflict", "archived"],
         ["saved", "archived"],
     )
-    assert len(registry.list_current(include_archived=True)) == 1
-    assert registry.get_version("price_volume_1", 1).definition == _definition()
-    head = registry.get_head("price_volume_1")
+    assert len(_list(registry, include_archived=True)) == 1
+    assert _version(registry, "price_volume_1", 1).definition == _definition()
+    head = _head(registry, "price_volume_1")
     assert head.definition.version == (2 if results[0] == "saved" else 1)
     assert head.head.archived == (results[0] == "conflict")
 
@@ -275,7 +321,7 @@ def test_failure_after_version_insert_rolls_back_entire_command(
     tmp_path: Path, failure_table: str
 ) -> None:
     path = tmp_path / "factors.sqlite3"
-    registry = FactorDefinitionRegistry(path)
+    registry = _store(path)
     _save(registry, "first", _definition())
     expected = _ref(registry)
     with sqlite3.connect(path) as connection:
@@ -307,7 +353,7 @@ def test_first_write_failure_allows_same_command_to_retry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = tmp_path / "factors.sqlite3"
-    registry = FactorDefinitionRegistry(path)
+    registry = _store(path)
 
     def fail_receipt_insert(
         connection: sqlite3.Connection,
@@ -325,7 +371,7 @@ def test_first_write_failure_allows_same_command_to_retry(
             _save(registry, "first", _definition())
 
     assert _save(FactorDefinitionRegistry(path), "first", _definition()).version == 1
-    assert FactorDefinitionRegistry(path).get_head("price_volume_1").definition == _definition()
+    assert _head(_store(path), "price_volume_1").definition == _definition()
 
 
 @pytest.mark.parametrize(
@@ -340,7 +386,7 @@ def test_first_write_failure_allows_same_command_to_retry(
 )
 def test_every_read_fails_closed_on_damaged_history(tmp_path: Path, damage: str) -> None:
     path = tmp_path / "factors.sqlite3"
-    registry = FactorDefinitionRegistry(path)
+    registry = _store(path)
     _save(registry, "first", _definition())
     _save(registry, "second", _definition(version=2), _ref(registry))
     with sqlite3.connect(path) as connection:
@@ -358,12 +404,12 @@ def test_every_read_fails_closed_on_damaged_history(tmp_path: Path, damage: str)
             connection.execute("DELETE FROM factor_versions WHERE version = 1")
         else:
             connection.execute("DELETE FROM factor_heads")
-    reopened = FactorDefinitionRegistry(path)
+    reopened = _store(path)
     for read in (
-        lambda: reopened.list_current(),
-        lambda: reopened.get_head("price_volume_1"),
-        lambda: reopened.get_version("price_volume_1", 1),
-        lambda: reopened.get_version("price_volume_1", 3),
+        lambda: _list(reopened),
+        lambda: _head(reopened, "price_volume_1"),
+        lambda: _version(reopened, "price_volume_1", 1),
+        lambda: _version(reopened, "price_volume_1", 3),
     ):
         with pytest.raises(FactorIntegrityError):
             read()
@@ -371,7 +417,7 @@ def test_every_read_fails_closed_on_damaged_history(tmp_path: Path, damage: str)
 
 def test_reads_reject_old_version_rewritten_with_matching_row_digest(tmp_path: Path) -> None:
     path = tmp_path / "factors.sqlite3"
-    registry = FactorDefinitionRegistry(path)
+    registry = _store(path)
     original = _save(registry, "first", _definition())
     _save(registry, "second", _definition(version=2), _ref(registry))
     replacement = _definition(name="改写的旧版")
@@ -389,11 +435,11 @@ def test_reads_reject_old_version_rewritten_with_matching_row_digest(tmp_path: P
             "WHERE factor_id = ? AND version = 1",
             (payload, replacement_digest, replacement.factor_id),
         )
-    reopened = FactorDefinitionRegistry(path)
+    reopened = _store(path)
     for read in (
-        lambda: reopened.get_version(replacement.factor_id, 1),
-        lambda: reopened.get_head(replacement.factor_id),
-        lambda: reopened.list_current(),
+        lambda: _version(reopened, replacement.factor_id, 1),
+        lambda: _head(reopened, replacement.factor_id),
+        lambda: _list(reopened),
     ):
         with pytest.raises(FactorIntegrityError):
             read()
@@ -401,35 +447,36 @@ def test_reads_reject_old_version_rewritten_with_matching_row_digest(tmp_path: P
 
 def test_list_is_sorted_bounded_and_validates_hidden_archived_rows(tmp_path: Path) -> None:
     path = tmp_path / "factors.sqlite3"
-    registry = FactorDefinitionRegistry(path)
+    registry = _store(path)
     _save(registry, "z", _definition(factor_id="z_factor"))
     _save(registry, "a", _definition(factor_id="a_factor"))
     _save(registry, "m", _definition(factor_id="m_factor"))
-    registry.archive(
+    _archive_request(
+        registry,
         ArchiveFactorRequest(
             command_id="archive-a", factor_id="a_factor", expected_head=_ref(registry, "a_factor")
-        )
+        ),
     )
-    assert [item.definition.factor_id for item in registry.list_current(limit=1)] == ["m_factor"]
-    assert [item.definition.factor_id for item in registry.list_current(include_archived=True)] == [
+    assert [item.definition.factor_id for item in _list(registry, limit=1)] == ["m_factor"]
+    assert [item.definition.factor_id for item in _list(registry, include_archived=True)] == [
         "a_factor",
         "m_factor",
         "z_factor",
     ]
     with pytest.raises(ValueError):
-        registry.list_current(limit=0)
+        _list(registry, limit=0)
     with sqlite3.connect(path) as connection:
         connection.execute(
             "UPDATE factor_versions SET content_sha256 = ? WHERE factor_id = 'a_factor'",
             ("0" * 64,),
         )
     with pytest.raises(FactorIntegrityError):
-        registry.list_current(limit=1)
+        _list(registry, limit=1)
 
 
 def test_list_rejects_head_with_invalid_identity(tmp_path: Path) -> None:
     path = tmp_path / "factors.sqlite3"
-    registry = FactorDefinitionRegistry(path)
+    registry = _store(path)
     first = _save(registry, "first", _definition())
     with sqlite3.connect(path) as connection:
         connection.execute(
@@ -438,7 +485,7 @@ def test_list_rejects_head_with_invalid_identity(tmp_path: Path) -> None:
             (first.content_sha256,),
         )
     with pytest.raises(FactorIntegrityError):
-        registry.list_current()
+        _list(registry)
 
 
 def test_invalid_command_identity_and_factor_id_are_rejected_by_request_models() -> None:
