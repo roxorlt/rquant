@@ -257,6 +257,43 @@ def _digest(value: BaseModel | dict[str, object]) -> str:
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
+def factor_research_request_sha256(request: FactorResearchRequest) -> str:
+    """Hash one validated request independently of unordered fact-row presentation."""
+    checked = FactorResearchRequest.model_validate(request)
+    factor_input = checked.factor_input
+    ordered_input = factor_input.model_copy(
+        update={
+            "observations": tuple(
+                sorted(
+                    factor_input.observations,
+                    key=lambda row: (row.trade_date, row.stock_code, row.column),
+                )
+            ),
+            "industry_observations": tuple(
+                sorted(
+                    factor_input.industry_observations,
+                    key=lambda row: (row.trade_date, row.stock_code),
+                )
+            ),
+            "market_cap_observations": tuple(
+                sorted(
+                    factor_input.market_cap_observations,
+                    key=lambda row: (row.trade_date, row.stock_code),
+                )
+            ),
+        }
+    )
+    ordered_request = checked.model_copy(
+        update={
+            "factor_input": ordered_input,
+            "forward_returns": tuple(
+                sorted(checked.forward_returns, key=lambda row: (row.decision_date, row.stock_code))
+            ),
+        }
+    )
+    return _digest(ordered_request)
+
+
 def assemble_factor_research_result(request: FactorResearchRequest) -> FactorResearchResult:
     """Validate a complete return grid, then reuse the existing pure factor evaluators."""
     checked = FactorResearchRequest.model_validate(request)
@@ -357,7 +394,7 @@ def assemble_factor_research_result(request: FactorResearchRequest) -> FactorRes
         "universe": checked.factor_input.universe,
         "trading_days": evaluation_days,
         "as_of": checked.as_of,
-        "input_sha256": decay.input_sha256,
+        "input_sha256": factor_research_request_sha256(checked),
         "days": days,
         "summary_status": "evaluated" if evaluation is not None else "no_samples",
         "ic_summary": summary,

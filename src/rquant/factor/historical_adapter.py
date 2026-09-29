@@ -22,6 +22,7 @@ from rquant.factor.result import (
     HoldingSessions,
     ReturnMissingReason,
     assemble_factor_research_result,
+    factor_research_request_sha256,
 )
 from rquant.factor.time_series import (
     MAX_OBSERVATIONS,
@@ -202,7 +203,7 @@ class HistoricalFactorResearch(BaseModel):
 
     @model_validator(mode="after")
     def _same_source(self) -> HistoricalFactorResearch:
-        if self.result.input_sha256 != _digest(self.request.model_dump(mode="json")):
+        if self.result.input_sha256 != factor_research_request_sha256(self.request):
             raise ValueError("historical result input differs from its request")
         if self.result.sha256 != _digest(self.result.model_dump(mode="json", exclude={"sha256"})):
             raise ValueError("historical result content digest differs")

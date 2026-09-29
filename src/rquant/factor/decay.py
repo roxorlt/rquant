@@ -68,43 +68,6 @@ class FactorICDecayResult(BaseModel):
     periods: tuple[FactorICDecayPeriod, ...] = Field(min_length=10, max_length=10)
 
 
-def _request_identity(request: FactorResearchRequest) -> str:
-    from rquant.factor.result import _digest
-
-    factor_input = request.factor_input
-    ordered_input = factor_input.model_copy(
-        update={
-            "observations": tuple(
-                sorted(
-                    factor_input.observations,
-                    key=lambda row: (row.trade_date, row.stock_code, row.column),
-                )
-            ),
-            "industry_observations": tuple(
-                sorted(
-                    factor_input.industry_observations,
-                    key=lambda row: (row.trade_date, row.stock_code),
-                )
-            ),
-            "market_cap_observations": tuple(
-                sorted(
-                    factor_input.market_cap_observations,
-                    key=lambda row: (row.trade_date, row.stock_code),
-                )
-            ),
-        }
-    )
-    ordered_request = request.model_copy(
-        update={
-            "factor_input": ordered_input,
-            "forward_returns": tuple(
-                sorted(request.forward_returns, key=lambda row: (row.decision_date, row.stock_code))
-            ),
-        }
-    )
-    return _digest(ordered_request)
-
-
 def _empty_daily_result(base_date: date) -> DailyFactorResult:
     missing = CorrelationResult(
         status="insufficient_samples",
@@ -124,7 +87,7 @@ def _empty_daily_result(base_date: date) -> DailyFactorResult:
 
 def evaluate_factor_ic_decay(request: FactorResearchRequest) -> FactorICDecayResult:
     """Pair base factors with returns k-1 evaluation dates later, for k=1..10."""
-    from rquant.factor.result import FactorResearchRequest
+    from rquant.factor.result import FactorResearchRequest, factor_research_request_sha256
 
     checked = FactorResearchRequest.model_validate(request)
     factor_values = evaluate_factor_time_series(checked.factor_input)
@@ -233,6 +196,6 @@ def evaluate_factor_ic_decay(request: FactorResearchRequest) -> FactorICDecayRes
         universe=checked.factor_input.universe,
         evaluation_days=evaluation_days,
         as_of=checked.as_of,
-        input_sha256=_request_identity(checked),
+        input_sha256=factor_research_request_sha256(checked),
         periods=tuple(periods),
     )

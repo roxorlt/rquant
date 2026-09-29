@@ -41,6 +41,7 @@ from rquant.factor.result import (
     FactorResearchResult,
     ReturnMissingCount,
     assemble_factor_research_result,
+    factor_research_request_sha256,
 )
 from rquant.factor.summary import FactorICSummary, ICSeriesSummary, summarize_factor_ic
 from rquant.factor.time_series import (
@@ -93,6 +94,7 @@ __all__ = [
     "PortfolioGroupingDay",
     "ReturnMissingCount",
     "assemble_factor_research_result",
+    "factor_research_request_sha256",
     "adapt_historical_factor_source",
     "assemble_historical_factor_research",
     "build_factor_definition",

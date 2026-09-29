@@ -376,6 +376,73 @@ def test_reordered_research_facts_keep_one_input_identity_and_content_digest() -
     assert reordered_result == original_result
 
 
+def test_public_request_identity_canonicalizes_all_fact_row_types() -> None:
+    from rquant.factor import (
+        IndustryObservation,
+        MarketCapObservation,
+        factor_research_request_sha256,
+    )
+    from rquant.factor.result import FactorResearchRequest
+
+    request = _request()
+    industries = (
+        IndustryObservation(
+            stock_code="A",
+            trade_date=_DAYS[0],
+            industry="科技",
+            first_visible_at=_DECISIONS[0] - timedelta(minutes=1),
+        ),
+        IndustryObservation(
+            stock_code="B",
+            trade_date=_DAYS[1],
+            industry="工业",
+            first_visible_at=_DECISIONS[1] - timedelta(minutes=1),
+        ),
+    )
+    market_caps = (
+        MarketCapObservation(
+            stock_code="A",
+            trade_date=_DAYS[0],
+            market_cap=100.0,
+            first_visible_at=_DECISIONS[0] - timedelta(minutes=1),
+        ),
+        MarketCapObservation(
+            stock_code="B",
+            trade_date=_DAYS[1],
+            market_cap=200.0,
+            first_visible_at=_DECISIONS[1] - timedelta(minutes=1),
+        ),
+    )
+    with_context = FactorResearchRequest.model_validate(
+        request.model_copy(
+            update={
+                "factor_input": request.factor_input.model_copy(
+                    update={
+                        "industry_observations": industries,
+                        "market_cap_observations": market_caps,
+                    }
+                )
+            }
+        )
+    )
+    reordered = FactorResearchRequest.model_validate(
+        with_context.model_copy(
+            update={
+                "factor_input": with_context.factor_input.model_copy(
+                    update={
+                        "observations": tuple(reversed(with_context.factor_input.observations)),
+                        "industry_observations": tuple(reversed(industries)),
+                        "market_cap_observations": tuple(reversed(market_caps)),
+                    }
+                ),
+                "forward_returns": tuple(reversed(with_context.forward_returns)),
+            }
+        )
+    )
+
+    assert factor_research_request_sha256(with_context) == factor_research_request_sha256(reordered)
+
+
 def test_later_decay_and_content_digest_follow_target_return_facts() -> None:
     from rquant.factor import assemble_factor_research_result
 
