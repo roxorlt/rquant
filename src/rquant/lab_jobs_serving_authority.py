@@ -1001,6 +1001,9 @@ def lab_jobs_state_identity(result: SourceReadResult) -> str:
     code published.
     """
 
+    if not isinstance(result.payload, LabJobsPayload):
+        raise TypeError("lab_jobs state identity requires LabJobsPayload")
+    LabJobsPayload.model_validate(result.payload)
     state = result.model_dump(mode="json")
     for name in _LAB_JOBS_OBSERVATION_FIELDS:
         state.pop(name, None)
@@ -1019,6 +1022,13 @@ def lab_jobs_state_identity(result: SourceReadResult) -> str:
                 "lab_job_event",
             }:
                 projection.pop("available_at", None)
+            if isinstance(projection, dict) and projection.get("table_name") in {
+                "factor_definition_state",
+                "factor_definition",
+            }:
+                projection.pop("available_at", None)
+                if projection["table_name"] == "factor_definition_state":
+                    projection["rows"][0].pop("snapshot_sha256")
     return canonical_sha256({"contract": "lab-jobs-state/v1", "state": state})
 
 

@@ -229,6 +229,23 @@ class LabJobsPayload(RuntimeContractModel):
 
     @model_validator(mode="after")
     def validate_event_windows(self) -> LabJobsPayload:
+        from rquant.factor.serving_projection import (
+            FACTOR_DEFINITION_PROJECTION_TABLES,
+            validate_factor_definition_projections,
+        )
+
+        factor_projections = tuple(
+            projection
+            for projection in self.projections
+            if projection.table_name in FACTOR_DEFINITION_PROJECTION_TABLES
+        )
+        if len(factor_projections) != len(
+            {projection.table_name for projection in factor_projections}
+        ):
+            raise ValueError("factor definition Lab projections contain duplicate tables")
+        validate_factor_definition_projections(
+            {projection.table_name: projection for projection in factor_projections}
+        )
         event_tables = {
             projection.table_name: projection
             for projection in self.projections

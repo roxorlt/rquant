@@ -81,6 +81,17 @@ from rquant.data_audit_report_job_projection import (
 )
 from rquant.data_audit_report_jobs import DataAuditReportJobEvent
 from rquant.data_audit_report_projection import project_data_audit_report
+from rquant.factor.definition_serving import project_factor_definition_serving_snapshot
+from rquant.factor.registry import (
+    FactorDefinitionRegistry,
+    FactorRegistryError,
+    FactorRegistryIdentity,
+)
+from rquant.factor.serving_projection import (
+    FACTOR_DEFINITION_PROJECTION_TABLES,
+    project_factor_definition_projections,
+    validate_factor_definition_projections,
+)
 from rquant.formula_market_job_projection import (
     FORMULA_MARKET_PROJECTION_TABLES,
     project_formula_market_job,
@@ -3587,6 +3598,8 @@ class DuckDBLabPageProjectionSource:
         formula_market_job_directory: Path | None = None,
         backfill_plan_directory: Path | None = None,
         backfill_plan_job_state_path: Path | None = None,
+        factor_registry: FactorDefinitionRegistry | None = None,
+        factor_registry_identity: FactorRegistryIdentity | None = None,
     ) -> None:
         self.database_path = Path(os.path.abspath(database_path))
         #: this role's own state directory; see `_StableReadonlyDuckDB` (#255)
@@ -3625,6 +3638,18 @@ class DuckDBLabPageProjectionSource:
             if backfill_plan_directory is None:
                 raise ValueError("backfill plan job state requires a plan directory")
         self.backfill_plan_job_state_path = backfill_plan_job_state_path
+        if (factor_registry is None) != (factor_registry_identity is None):
+            raise ValueError("factor registry and fixed identity require paired configuration")
+        if factor_registry is not None and not isinstance(
+            factor_registry, FactorDefinitionRegistry
+        ):
+            raise TypeError("factor registry must be FactorDefinitionRegistry")
+        if factor_registry_identity is not None and not isinstance(
+            factor_registry_identity, FactorRegistryIdentity
+        ):
+            raise TypeError("factor registry identity must be FactorRegistryIdentity")
+        self.factor_registry = factor_registry
+        self.factor_registry_identity = factor_registry_identity
 
     def _backfill_plan_projections(
         self, observed_at: datetime
@@ -3823,6 +3848,23 @@ class DuckDBLabPageProjectionSource:
                 f"formula market job source invalid: {exc}"
             ) from exc
 
+    def _factor_definition_projections(
+        self, observed: datetime
+    ) -> tuple[ServingProjectionPayload, ...]:
+        if self.factor_registry is None or self.factor_registry_identity is None:
+            return ()
+        try:
+            snapshot = project_factor_definition_serving_snapshot(
+                self.factor_registry,
+                expected_identity=self.factor_registry_identity,
+                available_at=observed,
+            )
+            return project_factor_definition_projections(snapshot)
+        except (FactorRegistryError, OSError, sqlite3.Error, ValueError) as exc:
+            raise PageProjectionSourceIntegrityError(
+                f"factor definition source invalid: {exc}"
+            ) from exc
+
     def __call__(self, observed_at: datetime, /) -> LabPageProjectionSnapshot:
         observed = normalize_aware_utc(observed_at)
         stable = _StableReadonlyDuckDB(self.database_path, control_root=self.control_root)
@@ -3944,6 +3986,7 @@ class DuckDBLabPageProjectionSource:
             audit_job_projections=audit_job,
             backfill_plan_projections=self._backfill_plan_projections(observed),
             formula_market_projections=self._formula_market_projections(observed),
+            factor_definition_projections=self._factor_definition_projections(observed),
         )
 
     @staticmethod
@@ -5206,6 +5249,7 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
             REPORT_JOB_PROJECTION_TABLES,
             BACKFILL_PLAN_PROJECTION_TABLES,
             FORMULA_MARKET_PROJECTION_TABLES,
+            FACTOR_DEFINITION_PROJECTION_TABLES,
         )
         if (
             not required.issubset(names)
@@ -5218,6 +5262,8 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
         projections = {item.table_name: item for item in self.projections}
         if names >= FORMULA_MARKET_PROJECTION_TABLES:
             validate_formula_market_projections(projections)
+        if names >= FACTOR_DEFINITION_PROJECTION_TABLES:
+            validate_factor_definition_projections(projections)
         status = projections["data_audit_status"].rows
         issues = projections["data_audit_issue"].rows
         if len(status) != 1 or len(issues) != status[0]["finding_count"]:
@@ -5388,6 +5434,7 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
         audit_job_projections: tuple[ServingProjectionPayload, ...] = (),
         backfill_plan_projections: tuple[ServingProjectionPayload, ...] = (),
         formula_market_projections: tuple[ServingProjectionPayload, ...] = (),
+        factor_definition_projections: tuple[ServingProjectionPayload, ...] = (),
     ) -> LabPageProjectionSnapshot:
         available = normalize_aware_utc(available_at)
         status = audit_status or DataAuditStatusProjectionRow(
@@ -5432,6 +5479,12 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
             != FORMULA_MARKET_PROJECTION_TABLES
         ):
             raise ValueError("formula market projections must be complete")
+        if (
+            factor_definition_projections
+            and {item.table_name for item in factor_definition_projections}
+            != FACTOR_DEFINITION_PROJECTION_TABLES
+        ):
+            raise ValueError("factor definition projections must be complete")
         projections = tuple(
             sorted(
                 (
@@ -5440,6 +5493,7 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
                     *audit_job_projections,
                     *backfill_plan_projections,
                     *formula_market_projections,
+                    *factor_definition_projections,
                 ),
                 key=lambda item: item.table_name,
             )
