@@ -4107,6 +4107,22 @@
         "title": "Envelope[DataAuditReportData]",
         "type": "object"
       },
+      "Envelope_ExperimentListData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/ExperimentListData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[ExperimentListData]",
+        "type": "object"
+      },
       "Envelope_FormulaMarketJobDetailData_": {
         "properties": {
           "data": {
@@ -4562,6 +4578,172 @@
           "message"
         ],
         "title": "ErrorItem",
+        "type": "object"
+      },
+      "ExperimentItem": {
+        "additionalProperties": false,
+        "properties": {
+          "completed_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completed At"
+          },
+          "experiment_id": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Experiment Id",
+            "type": "string"
+          },
+          "hypothesis_family": {
+            "minLength": 1,
+            "title": "Hypothesis Family",
+            "type": "string"
+          },
+          "max_drawdown_pct": {
+            "anyOf": [
+              {
+                "maximum": 100.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Drawdown Pct"
+          },
+          "net_return_pct": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Net Return Pct"
+          },
+          "registered_at": {
+            "format": "date-time",
+            "title": "Registered At",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "registered",
+              "running",
+              "executed",
+              "succeeded",
+              "failed",
+              "cancelled"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "trade_count": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trade Count"
+          },
+          "win_rate_pct": {
+            "anyOf": [
+              {
+                "maximum": 100.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Win Rate Pct"
+          }
+        },
+        "required": [
+          "experiment_id",
+          "hypothesis_family",
+          "registered_at",
+          "status",
+          "completed_at",
+          "trade_count",
+          "net_return_pct",
+          "max_drawdown_pct",
+          "win_rate_pct"
+        ],
+        "title": "ExperimentItem",
+        "type": "object"
+      },
+      "ExperimentListData": {
+        "additionalProperties": false,
+        "properties": {
+          "available": {
+            "title": "Available",
+            "type": "boolean"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/ExperimentItem"
+            },
+            "maxItems": 50,
+            "title": "Items",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          },
+          "oldest_registered_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Oldest Registered At"
+          },
+          "retained_count": {
+            "maximum": 500.0,
+            "minimum": 0.0,
+            "title": "Retained Count",
+            "type": "integer"
+          },
+          "truncated": {
+            "title": "Truncated",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "available",
+          "items",
+          "retained_count",
+          "truncated",
+          "oldest_registered_at",
+          "next_cursor"
+        ],
+        "title": "ExperimentListData",
         "type": "object"
       },
       "FieldExpr": {
@@ -13036,6 +13218,86 @@
         "summary": "日线数据审计报告",
         "tags": [
           "data-audit"
+        ]
+      }
+    },
+    "/api/v1/experiments": {
+      "get": {
+        "operationId": "list_experiments_api_v1_experiments_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "maximum": 50,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "generation_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "pattern": "^[0-9a-f]{64}$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Generation Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 512,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_ExperimentListData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "实验记录",
+        "tags": [
+          "experiments"
         ]
       }
     },

@@ -36,6 +36,8 @@ CommitSha = Annotated[str, Field(pattern=r"^[0-9a-f]{40}$")]
 Probability = Annotated[Decimal, Field(ge=0, le=1, allow_inf_nan=False)]
 FiniteDecimal = Annotated[Decimal, Field(allow_inf_nan=False)]
 SHANGHAI = ZoneInfo("Asia/Shanghai")
+EXPERIMENT_ATTEMPT_PAGE_SIZE_MAX = 100
+EXPERIMENT_SERVING_ATTEMPT_LIMIT = 500
 
 
 class ExperimentStatus(StrEnum):
@@ -297,6 +299,39 @@ class ExperimentAttempt(RuntimeContractModel):
         return self
 
 
+class ExperimentAttemptPageCursor(RuntimeContractModel):
+    """Immutable attempt order boundary bound to one registration view."""
+
+    schema_version: Literal[1] = 1
+    as_of: AwareUtcDatetime
+    hypothesis_family: str | None = None
+    registration_high_water: int = Field(ge=0)
+    registered_at: AwareUtcDatetime
+    experiment_id: Sha256
+
+    @model_validator(mode="after")
+    def validate_boundary(self) -> Self:
+        if self.registered_at > self.as_of:
+            raise ValueError("attempt cursor cannot be newer than its as_of cutoff")
+        if self.hypothesis_family == "":
+            raise ValueError("attempt cursor family cannot be empty")
+        return self
+
+
+class ExperimentAttemptPage(RuntimeContractModel):
+    """Bounded registration view; mutable attempt status is current at each read."""
+
+    items: tuple[ExperimentAttempt, ...]
+    as_of: AwareUtcDatetime
+    hypothesis_family: str | None = None
+    registration_high_water: int = Field(ge=0)
+    next_cursor: ExperimentAttemptPageCursor | None = None
+
+    @property
+    def has_more(self) -> bool:
+        return self.next_cursor is not None
+
+
 class ExperimentSubmissionIntent(RuntimeContractModel):
     """Durable outbox payload atomically owned by an experiment attempt."""
 
@@ -432,6 +467,17 @@ class PromotionDecisionReadSnapshot(RuntimeContractModel):
     decisions: tuple[PromotionDecision, ...] = ()
     sequence: int = Field(ge=0)
     event_time: AwareUtcDatetime | None = None
+
+
+class ExperimentServingReadSnapshot(RuntimeContractModel):
+    """One verified SQLite snapshot for a bounded recent Serving attempt window."""
+
+    promotions: PromotionDecisionReadSnapshot
+    attempts: tuple[ExperimentAttempt, ...] = ()
+    sequence: int = Field(ge=0)
+    event_time: AwareUtcDatetime | None = None
+    truncated: bool = False
+    oldest_registered_at: AwareUtcDatetime | None = None
 
 
 def _validate_readonly_registry_schema(connection: sqlite3.Connection) -> None:
@@ -574,27 +620,36 @@ class ExperimentRegistryReadonlyReader:
         observed = normalize_aware_utc(observed_at)
         if limit < 1:
             raise ValueError("limit must be positive")
-        cutoff = _utc_iso(observed)
         with self._read_snapshot() as connection:
-            metadata = connection.execute(
-                """
-                SELECT COALESCE(MAX(rowid), 0) AS sequence,
-                       MAX(decided_at) AS event_time
-                FROM promotion_decision
-                WHERE decided_at <= ?
-                """,
-                (cutoff,),
-            ).fetchone()
-            rows = connection.execute(
-                """
-                SELECT rowid, decision_id, stage, approved, decided_at, payload_json
-                FROM promotion_decision
-                WHERE decided_at <= ?
-                ORDER BY decided_at DESC, decision_id DESC
-                LIMIT ?
-                """,
-                (cutoff, limit),
-            ).fetchall()
+            return self._promotion_decisions_in_snapshot(connection, observed=observed, limit=limit)
+
+    @staticmethod
+    def _promotion_decisions_in_snapshot(
+        connection: sqlite3.Connection,
+        *,
+        observed: datetime,
+        limit: int,
+    ) -> PromotionDecisionReadSnapshot:
+        cutoff = _utc_iso(observed)
+        metadata = connection.execute(
+            """
+            SELECT COALESCE(MAX(rowid), 0) AS sequence,
+                   MAX(decided_at) AS event_time
+            FROM promotion_decision
+            WHERE decided_at <= ?
+            """,
+            (cutoff,),
+        ).fetchone()
+        rows = connection.execute(
+            """
+            SELECT rowid, decision_id, stage, approved, decided_at, payload_json
+            FROM promotion_decision
+            WHERE decided_at <= ?
+            ORDER BY decided_at DESC, decision_id DESC
+            LIMIT ?
+            """,
+            (cutoff, limit),
+        ).fetchall()
 
         decisions: list[PromotionDecision] = []
         for row in rows:
@@ -626,6 +681,59 @@ class ExperimentRegistryReadonlyReader:
             event_time=event_time,
         )
 
+    def read_serving_snapshot(
+        self,
+        *,
+        observed_at: datetime,
+        decision_limit: int = 1_000,
+        attempt_limit: int = EXPERIMENT_SERVING_ATTEMPT_LIMIT,
+    ) -> ExperimentServingReadSnapshot:
+        """Read a recent attempt window and its current evidence in one verified transaction."""
+
+        observed = normalize_aware_utc(observed_at)
+        if (
+            isinstance(decision_limit, bool)
+            or not isinstance(decision_limit, int)
+            or decision_limit < 1
+        ):
+            raise ValueError("decision_limit must be positive")
+        if (
+            isinstance(attempt_limit, bool)
+            or not isinstance(attempt_limit, int)
+            or not 1 <= attempt_limit <= EXPERIMENT_SERVING_ATTEMPT_LIMIT
+        ):
+            raise ValueError("attempt_limit must be from 1 through 500")
+        with self._read_snapshot() as connection:
+            promotions = self._promotion_decisions_in_snapshot(
+                connection, observed=observed, limit=decision_limit
+            )
+            rows = connection.execute(
+                "SELECT rowid, * FROM experiment_attempt "
+                "INDEXED BY experiment_attempt_registered_keyset_idx "
+                "WHERE registered_at <= ? "
+                "ORDER BY registered_at DESC, experiment_id DESC LIMIT ?",
+                (_utc_iso(observed), attempt_limit + 1),
+            ).fetchall()
+            attempts = tuple(
+                self._validated_attempt_from_row(connection, row, observed=observed)
+                for row in rows[:attempt_limit]
+            )
+
+        times = [promotions.event_time] if promotions.event_time is not None else []
+        for attempt in attempts:
+            times.append(attempt.completed_at or attempt.started_at or attempt.registered_at)
+        event_time = max(times) if times else None
+        if event_time is not None and event_time > observed:
+            raise ExperimentRegistryError("experiment attempt contains future evidence")
+        return ExperimentServingReadSnapshot(
+            promotions=promotions,
+            attempts=attempts,
+            sequence=promotions.sequence + max((int(row["rowid"]) for row in rows), default=0),
+            event_time=event_time,
+            truncated=len(rows) > attempt_limit,
+            oldest_registered_at=attempts[-1].registered_at if attempts else None,
+        )
+
     def list_promotion_decisions(
         self,
         *,
@@ -643,6 +751,177 @@ class ExperimentRegistryReadonlyReader:
         with self._read_snapshot() as connection:
             row = ExperimentRegistry._required_attempt_row(connection, experiment_id)
             return ExperimentRegistry._attempt_from_row(connection, row)
+
+    def list_attempts_page(
+        self,
+        *,
+        as_of: datetime,
+        hypothesis_family: str | None = None,
+        page_size: int = 50,
+        cursor: ExperimentAttemptPageCursor | None = None,
+    ) -> ExperimentAttemptPage:
+        """List a bounded keyset page of attempts visible at the registration cutoff."""
+
+        visible_at = normalize_aware_utc(as_of)
+        if (
+            isinstance(page_size, bool)
+            or not isinstance(page_size, int)
+            or not 1 <= page_size <= EXPERIMENT_ATTEMPT_PAGE_SIZE_MAX
+        ):
+            raise ValueError("attempt page_size must be from 1 through 100")
+        if hypothesis_family is not None and (
+            not isinstance(hypothesis_family, str) or not hypothesis_family
+        ):
+            raise ValueError("attempt hypothesis_family must be a nonempty string")
+        selected_cursor = (
+            ExperimentAttemptPageCursor.model_validate(cursor) if cursor is not None else None
+        )
+        if selected_cursor is not None and (
+            selected_cursor.as_of != visible_at
+            or selected_cursor.hypothesis_family != hypothesis_family
+        ):
+            raise ValueError("attempt cursor does not match the requested family or as_of")
+
+        with self._read_snapshot() as connection:
+            registration_high_water = (
+                selected_cursor.registration_high_water
+                if selected_cursor is not None
+                else int(
+                    connection.execute(
+                        "SELECT COALESCE(MAX(rowid), 0) FROM experiment_attempt"
+                    ).fetchone()[0]
+                )
+            )
+            index = (
+                "experiment_attempt_registered_keyset_idx"
+                if hypothesis_family is None
+                else "experiment_attempt_family_registered_keyset_idx"
+            )
+            clauses = ["registered_at <= ?", "rowid <= ?"]
+            parameters: list[str | int] = [_utc_iso(visible_at), registration_high_water]
+            if hypothesis_family is not None:
+                clauses.insert(0, "hypothesis_family = ?")
+                parameters.insert(0, hypothesis_family)
+            if selected_cursor is not None:
+                clauses.append("(registered_at, experiment_id) < (?, ?)")
+                parameters.extend(
+                    (_utc_iso(selected_cursor.registered_at), selected_cursor.experiment_id)
+                )
+            rows = connection.execute(
+                f"SELECT * FROM experiment_attempt INDEXED BY {index} "
+                f"WHERE {' AND '.join(clauses)} "
+                "ORDER BY registered_at DESC, experiment_id DESC LIMIT ?",
+                (*parameters, page_size + 1),
+            ).fetchall()
+            attempts: list[ExperimentAttempt] = []
+            for row in rows:
+                attempts.append(
+                    self._validated_attempt_from_row(connection, row, observed=visible_at)
+                )
+
+        visible = tuple(attempts[:page_size])
+        next_cursor = (
+            ExperimentAttemptPageCursor(
+                as_of=visible_at,
+                hypothesis_family=hypothesis_family,
+                registration_high_water=registration_high_water,
+                registered_at=visible[-1].registered_at,
+                experiment_id=visible[-1].spec.experiment_id,
+            )
+            if len(attempts) > page_size
+            else None
+        )
+        return ExperimentAttemptPage(
+            items=visible,
+            as_of=visible_at,
+            hypothesis_family=hypothesis_family,
+            registration_high_water=registration_high_water,
+            next_cursor=next_cursor,
+        )
+
+    @staticmethod
+    def _validated_attempt_from_row(
+        connection: sqlite3.Connection,
+        row: sqlite3.Row,
+        *,
+        observed: datetime,
+    ) -> ExperimentAttempt:
+        try:
+            attempt = ExperimentRegistry._attempt_from_row(connection, row)
+            if (
+                attempt.spec.experiment_id != row["experiment_id"]
+                or attempt.spec.hypothesis_family != row["hypothesis_family"]
+                or _utc_iso(attempt.registered_at) != row["registered_at"]
+                or attempt.registered_at > observed
+                or (
+                    attempt.outcome is not None
+                    and attempt.outcome.experiment_id != attempt.spec.experiment_id
+                )
+            ):
+                raise ValueError("attempt payload does not match indexed evidence")
+            ExperimentRegistryReadonlyReader._validate_attempt_outcome_index(
+                connection, row, attempt
+            )
+        except (TypeError, ValueError, IndexError) as exc:
+            raise ExperimentRegistryError("experiment attempt evidence is invalid") from exc
+        return attempt
+
+    @staticmethod
+    def _validate_attempt_outcome_index(
+        connection: sqlite3.Connection,
+        row: sqlite3.Row,
+        attempt: ExperimentAttempt,
+    ) -> None:
+        indexed = connection.execute(
+            """
+            SELECT o.outcome_json, o.attempted_configuration_count,
+                   o.selected_rank, o.raw_p_value,
+                   a.hypothesis_family AS adjustment_family,
+                   a.adjusted_p_value, a.adjusted_at
+            FROM experiment_outcome AS o
+            LEFT JOIN family_adjustment AS a USING(experiment_id)
+            WHERE o.experiment_id = ?
+            """,
+            (row["experiment_id"],),
+        ).fetchone()
+        outcome = attempt.outcome
+        if (indexed is None) != (outcome is None):
+            raise ValueError("attempt outcome index is incomplete")
+        if indexed is None or outcome is None:
+            return
+        payload = ExperimentOutcome.model_validate_json(indexed["outcome_json"])
+        if (
+            payload.adjusted_p_value is not None
+            or payload.model_copy(update={"adjusted_p_value": outcome.adjusted_p_value}) != outcome
+            or type(indexed["attempted_configuration_count"]) is not int
+            or indexed["attempted_configuration_count"] != payload.attempted_configuration_count
+            or type(indexed["selected_rank"]) is not int
+            or indexed["selected_rank"] != payload.selected_rank
+            or indexed["raw_p_value"] != format(payload.raw_p_value, "f")
+        ):
+            raise ValueError("attempt outcome index does not match payload")
+
+        indexed_adjustment = indexed["adjusted_p_value"]
+        if indexed_adjustment is None:
+            if (
+                indexed["adjustment_family"] is not None
+                or indexed["adjusted_at"] is not None
+                or outcome.adjusted_p_value is not None
+            ):
+                raise ValueError("attempt adjustment index is incomplete")
+            return
+        adjusted_at = _parse_utc(indexed["adjusted_at"])
+        if (
+            indexed["adjustment_family"] != row["hypothesis_family"]
+            or outcome.adjusted_p_value is None
+            or not isinstance(indexed_adjustment, str)
+            or indexed_adjustment != format(outcome.adjusted_p_value, "f")
+            or adjusted_at is None
+            or _utc_iso(adjusted_at) != indexed["adjusted_at"]
+            or attempt.completed_at is None
+            or adjusted_at < attempt.completed_at
+        ):
+            raise ValueError("attempt adjustment index is invalid")
 
     def resolve_formal_plan(
         self,
@@ -969,6 +1248,12 @@ class ExperimentRegistry:
                 );
                 CREATE INDEX IF NOT EXISTS experiment_attempt_family_idx
                     ON experiment_attempt(hypothesis_family, experiment_id);
+                CREATE INDEX IF NOT EXISTS experiment_attempt_registered_keyset_idx
+                    ON experiment_attempt(registered_at DESC, experiment_id DESC);
+                CREATE INDEX IF NOT EXISTS experiment_attempt_family_registered_keyset_idx
+                    ON experiment_attempt(
+                        hypothesis_family, registered_at DESC, experiment_id DESC
+                    );
 
                 CREATE TABLE IF NOT EXISTS hypothesis_family_manifest (
                     hypothesis_family TEXT PRIMARY KEY,

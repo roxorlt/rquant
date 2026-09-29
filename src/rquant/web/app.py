@@ -53,6 +53,7 @@ from rquant.web.routes import (
     data_audit_report,
     data_audit_report_calendar,
     data_audit_report_commands,
+    experiments,
     formula_market_commands,
     formula_market_read,
     formula_pool_read,
@@ -358,6 +359,9 @@ def create_app(
     app.include_router(tasks.router, prefix="/api/v1", tags=["tasks"], dependencies=private)
     app.include_router(service_logs.router, prefix="/api/v1", tags=["tasks"])
     app.include_router(backtests.router, prefix="/api/v1", tags=["backtests"], dependencies=private)
+    app.include_router(
+        experiments.router, prefix="/api/v1", tags=["experiments"], dependencies=private
+    )
     app.include_router(health.router, prefix="/api/v1", tags=["health"])
     app.include_router(panorama.router, prefix="/api/v1", tags=["panorama"])
     app.include_router(screen.router, prefix="/api/v1", tags=["screen"])

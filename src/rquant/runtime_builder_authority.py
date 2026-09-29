@@ -428,6 +428,7 @@ def promotions_publisher_builder(
             reader = PromotionsSourceReader(
                 registry=experiment_registry_reader,
                 limit=settings.max_decisions,
+                include_experiments=True,
             )
             publisher = ServingSourceAuthorityPublisher(
                 root=settings.authority_root,

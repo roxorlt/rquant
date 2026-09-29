@@ -163,6 +163,37 @@ def _contract(
 
 PAGE_PROJECTION_CONTRACTS: Mapping[str, ServingProjectionContract] = MappingProxyType(
     {
+        "experiment_attempt": _contract(
+            "promotions",
+            (
+                ("experiment_id", "string"),
+                ("hypothesis_family", "string"),
+                ("registered_at", "timestamp"),
+                ("status", "string"),
+                ("completed_at", "timestamp"),
+                ("trade_count", "int"),
+                ("net_return_pct", "float"),
+                ("max_drawdown_pct", "float"),
+                ("win_rate_pct", "float"),
+            ),
+            ("registered_at", "experiment_id"),
+            max_rows=500,
+            max_bytes=256 * 1024,
+            event_time_columns=("registered_at", "completed_at"),
+        ),
+        "experiment_attempt_window": _contract(
+            "promotions",
+            (
+                ("snapshot_key", "string"),
+                ("retained_count", "int"),
+                ("truncated", "bool"),
+                ("oldest_registered_at", "timestamp"),
+            ),
+            ("snapshot_key",),
+            max_rows=1,
+            max_bytes=2 * 1024,
+            event_time_columns=("oldest_registered_at",),
+        ),
         "paper_order_window": _contract(
             "paper_accounts",
             (

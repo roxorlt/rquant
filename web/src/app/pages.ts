@@ -111,7 +111,7 @@ export const PAGES: readonly PageDef[] = [
     path: "/experiments",
     title: "实验记录",
     group: "策略与验证",
-    ready: false,
+    ready: true,
     summary: "记录每次试验的参数和结果，放在一起比较。",
   },
   {

@@ -1,0 +1,136 @@
+.exp-family {
+  display: block;
+  max-width: 30ch;
+  color: var(--ink-2);
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.exp-window {
+  margin: 0;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--rule);
+  background: var(--warn-weak);
+  color: var(--warn-t);
+  font-size: 12px;
+}
+
+.exp-select-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 16px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--rule);
+}
+
+.exp-selected {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.exp-compare-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.exp-compare-card {
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+}
+
+.exp-compare-heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.exp-compare-heading h3 {
+  margin: 0;
+  font-size: 14px;
+  overflow-wrap: anywhere;
+}
+
+.exp-compare-card dl {
+  display: grid;
+  gap: 8px;
+  margin: 14px 0 0;
+}
+
+.exp-compare-card dl > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  border-top: 1px solid var(--rule);
+  padding-top: 8px;
+}
+
+.exp-compare-card dt {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.exp-compare-card dd {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.exp-compare-note {
+  margin: 12px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.exp-pages,
+.exp-actions,
+.exp-message {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 12px 16px;
+}
+
+.exp-count {
+  margin-right: auto;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.exp-message {
+  flex-wrap: wrap;
+  justify-content: center;
+  min-height: 96px;
+}
+
+.exp-message p {
+  width: 100%;
+  margin: 0;
+  text-align: center;
+}
+
+@media (max-width: 760px) {
+  .exp-select-bar {
+    flex-wrap: wrap;
+  }
+  .exp-compare-grid {
+    grid-template-columns: 1fr;
+  }
+  .exp-pages {
+    flex-wrap: wrap;
+  }
+  .exp-count {
+    width: 100%;
+  }
+}
