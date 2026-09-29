@@ -151,6 +151,34 @@ def test_runner_round_trip_retry_and_single_closed_admission(
             )
 
 
+def test_runner_rejects_wider_admission_before_opening_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rquant.factor import job_runner as module
+
+    with _admitted(tmp_path) as (store, _lease, _decision, snapshot, binding):
+        spec = _spec(snapshot, binding)
+        widened = spec.admission_request.model_copy(
+            update={"start_date": spec.adapter_request.query_start_date - timedelta(days=1)}
+        )
+        forged = FactorEvaluationJobSpec.model_construct(
+            **{**spec.__dict__, "admission_request": widened}
+        )
+
+        def unexpected_open(*_args: object, **_kwargs: object) -> None:
+            pytest.fail("invalid admission opened a snapshot")
+
+        monkeypatch.setattr(module, "open_factor_snapshot_admission", unexpected_open)
+        with pytest.raises(ValidationError, match="admission"):
+            _run(
+                forged,
+                store,
+                tmp_path,
+                artifact_root=_artifact_root(tmp_path),
+                now=snapshot.as_of_time,
+            )
+
+
 @pytest.mark.parametrize("offset", (timedelta(), timedelta(seconds=1)))
 def test_runner_refuses_expired_job_before_admission(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, offset: timedelta

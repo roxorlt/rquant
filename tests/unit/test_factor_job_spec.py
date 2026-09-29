@@ -143,7 +143,10 @@ def test_factor_job_digest_changes_with_every_bound_input() -> None:
         _spec(adapter_request=_adapter(evaluation_days=(date(2026, 7, 17),))),
         _spec(adapter_request=_adapter(holding_sessions=10)),
         _spec(adapter_request=_adapter(as_of=AS_OF + timedelta(hours=1))),
-        _spec(adapter_request=_adapter(query_start_date=START + timedelta(days=1))),
+        _spec(
+            admission_request=_admission(start_date=START + timedelta(days=1)),
+            adapter_request=_adapter(query_start_date=START + timedelta(days=1)),
+        ),
         _spec(code_revision="d" * 40),
         _spec(deadline=DEADLINE + timedelta(days=1)),
     )
@@ -157,9 +160,11 @@ def test_factor_job_digest_changes_with_every_bound_input() -> None:
     (
         _admission(start_date=START + timedelta(days=1)),
         _admission(end_date=END - timedelta(days=1)),
+        _admission(start_date=START - timedelta(days=1)),
+        _admission(end_date=END + timedelta(days=1)),
     ),
 )
-def test_factor_job_rejects_admission_that_does_not_cover_query(
+def test_factor_job_rejects_admission_range_that_differs_from_query(
     admission: FactorSnapshotAdmissionRequest,
 ) -> None:
     with pytest.raises(ValidationError, match="admission"):
