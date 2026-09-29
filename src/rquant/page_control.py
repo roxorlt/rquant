@@ -211,6 +211,7 @@ class _OwnedSaveFactorDefinition(SaveFactorDefinition):
 
 class _OwnedArchiveFactor(ArchiveFactor):
     actor_id: OwnerId
+    registry_identity: FactorRegistryIdentity
 
 
 FactorDefinitionRequestValue = SaveFactorDefinition | ArchiveFactor
@@ -218,17 +219,23 @@ _OwnedFactorDefinitionValue = _OwnedSaveFactorDefinition | _OwnedArchiveFactor
 
 
 def _owned_factor_definition_command(
-    command: FactorDefinitionRequestValue, *, authenticated_actor_id: str
+    command: FactorDefinitionRequestValue,
+    *,
+    authenticated_actor_id: str,
+    registry_identity: FactorRegistryIdentity | None = None,
 ) -> _OwnedFactorDefinitionValue:
     if type(command) is SaveFactorDefinition:
         model = _OwnedSaveFactorDefinition
     elif type(command) is ArchiveFactor:
+        if registry_identity is None:
+            raise ValueError("archive requires a captured factor registry identity")
         model = _OwnedArchiveFactor
     else:
         raise TypeError("trusted factor submission requires an ownerless request")
-    return model.model_validate(
-        {**command.model_dump(mode="python"), "actor_id": authenticated_actor_id}
-    )
+    fields = {**command.model_dump(mode="python"), "actor_id": authenticated_actor_id}
+    if registry_identity is not None:
+        fields["registry_identity"] = registry_identity
+    return model.model_validate(fields)
 
 
 class SaveCanvas(PageControlCommand):
@@ -1309,6 +1316,35 @@ class PageControlOutbox:
             )
         return self._receipt(row)
 
+    def lookup_factor_archive_command(
+        self, command: ArchiveFactor, *, authenticated_actor_id: str
+    ) -> tuple[_OwnedArchiveFactor, PageControlReceipt] | None:
+        """Match the original ownerless request and actor without consulting a new registry."""
+        if type(command) is not ArchiveFactor:
+            raise TypeError("factor archive lookup requires an ownerless archive")
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM page_control_command WHERE command_id = ?",
+                (command.command_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            stored = _COMMAND_ADAPTER.validate_json(row["payload_json"])
+        except ValueError as exc:
+            raise PageControlCommandConflictError("stored archive command is invalid") from exc
+        if (
+            not isinstance(stored, _OwnedArchiveFactor)
+            or row["command_kind"] != command.kind
+            or stored.actor_id != authenticated_actor_id
+            or stored.model_dump(exclude={"actor_id", "registry_identity"}) != command.model_dump()
+            or _command_hash(stored) != row["command_hash"]
+        ):
+            raise PageControlCommandConflictError(
+                "command_id already exists with different payload or actor"
+            )
+        return stored, self._receipt(row)
+
     def acknowledgment(self, alert_id: str) -> AlertAcknowledgment | None:
         with self._connect() as connection:
             row = connection.execute(
@@ -2308,14 +2344,41 @@ class PageControlConsumer:
                 raise PageControlCommandConflictError("price rule command changed before claim")
             return (self.outbox.complete_price_rule(claim, now=self.clock()),)
 
+    def drain_factor_archive_command(
+        self, command: _OwnedArchiveFactor
+    ) -> tuple[PageControlReceipt, ...]:
+        with _PageControlExecutionMutex(self._consumer_mutex_path()) as acquired:
+            if not acquired:
+                return ()
+            claims = self.outbox.claim_records(
+                limit=1,
+                owner_id=self.consumer_id,
+                lease_seconds=self.lease_seconds,
+                now=self.clock(),
+                target_command_id=command.command_id,
+            )
+            if not claims:
+                return ()
+            claim = claims[0]
+            if claim.command != command:
+                raise PageControlCommandConflictError("factor archive changed before claim")
+            return self._complete_claims((claim,))
+
     def _drain_locked(self, *, limit: int) -> tuple[PageControlReceipt, ...]:
+        return self._complete_claims(
+            self.outbox.claim_records(
+                limit=limit,
+                owner_id=self.consumer_id,
+                lease_seconds=self.lease_seconds,
+                now=self.clock(),
+            )
+        )
+
+    def _complete_claims(
+        self, claims: tuple[PageControlClaim, ...]
+    ) -> tuple[PageControlReceipt, ...]:
         receipts: list[PageControlReceipt] = []
-        for claim in self.outbox.claim_records(
-            limit=limit,
-            owner_id=self.consumer_id,
-            lease_seconds=self.lease_seconds,
-            now=self.clock(),
-        ):
+        for claim in claims:
             if isinstance(claim.command, (AddWatchlistItem, RemoveWatchlistItem)):
                 receipts.append(self.outbox.complete_watchlist(claim, now=self.clock()))
                 continue
@@ -2400,6 +2463,10 @@ class PageControlConsumer:
             if effect.result is None:
                 try:
                     identity = self._factor_definition_backend().identity()
+                    if isinstance(command, _OwnedArchiveFactor):
+                        if identity != command.registry_identity:
+                            raise ValueError("factor registry changed after archive admission")
+                        identity = command.registry_identity
                     effect = self.outbox.record_started_effect_result(
                         command.command_id,
                         result={
@@ -4164,10 +4231,57 @@ class PageControlService:
     def _submit_trusted_factor_definition(
         self, command: FactorDefinitionRequestValue, *, authenticated_actor_id: str
     ) -> PageControlReceipt:
+        identity = (
+            self.consumer._factor_definition_backend().identity()
+            if type(command) is ArchiveFactor
+            else None
+        )
         owned = _owned_factor_definition_command(
-            command, authenticated_actor_id=authenticated_actor_id
+            command, authenticated_actor_id=authenticated_actor_id, registry_identity=identity
         )
         return self._settle(owned, self.outbox.enqueue_trusted_factor_definition(owned))
+
+    def _submit_trusted_factor_archive(
+        self,
+        command: ArchiveFactor,
+        *,
+        authenticated_actor_id: str,
+        verified_registry_instance_id: str,
+    ) -> PageControlReceipt:
+        if type(command) is not ArchiveFactor:
+            raise TypeError("factor archive admission accepts ArchiveFactor only")
+        identity = self.consumer._factor_definition_backend().identity()
+        if identity.instance_id != verified_registry_instance_id:
+            raise ValueError("factor registry differs from verified Serving projection")
+        owned = _owned_factor_definition_command(
+            command, authenticated_actor_id=authenticated_actor_id, registry_identity=identity
+        )
+        if self.consumer._factor_definition_backend().identity() != identity:
+            raise ValueError("factor registry changed before archive enqueue")
+        return self._settle(
+            owned,
+            self.outbox.enqueue_trusted_factor_definition(owned),
+            factor_archive_command=owned,
+        )
+
+    def _lookup_trusted_factor_archive(
+        self, command: ArchiveFactor, *, authenticated_actor_id: str
+    ) -> PageControlReceipt | None:
+        matched = self.outbox.lookup_factor_archive_command(
+            command, authenticated_actor_id=authenticated_actor_id
+        )
+        return None if matched is None else matched[1]
+
+    def _resume_trusted_factor_archive(
+        self, command: ArchiveFactor, *, authenticated_actor_id: str
+    ) -> PageControlReceipt:
+        matched = self.outbox.lookup_factor_archive_command(
+            command, authenticated_actor_id=authenticated_actor_id
+        )
+        if matched is None:
+            raise KeyError("factor archive command not found")
+        owned, receipt = matched
+        return self._settle(owned, receipt, factor_archive_command=owned)
 
     def _lookup_trusted_price_rule(
         self, command: PriceAlertRuleRequestValue, *, authenticated_owner_id: str
@@ -4190,15 +4304,17 @@ class PageControlService:
         receipt: PageControlReceipt,
         *,
         price_rule_command: _OwnedPriceAlertRuleValue | None = None,
+        factor_archive_command: _OwnedArchiveFactor | None = None,
     ) -> PageControlReceipt:
         for _ in range(100):
             if receipt.status in _PAGE_CONTROL_TERMINAL_STATUSES:
                 return receipt
-            drained = (
-                self.consumer.drain(limit=100)
-                if price_rule_command is None
-                else self.consumer.drain_price_rule_command(price_rule_command)
-            )
+            if factor_archive_command is not None:
+                drained = self.consumer.drain_factor_archive_command(factor_archive_command)
+            elif price_rule_command is not None:
+                drained = self.consumer.drain_price_rule_command(price_rule_command)
+            else:
+                drained = self.consumer.drain(limit=100)
             observed = self.outbox.receipt(command.command_id)
             if observed is None:
                 raise RuntimeError("page control command disappeared")

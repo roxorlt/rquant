@@ -42,6 +42,24 @@
   gap: 22px;
   min-width: 0;
 }
+.factor-command-state {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  color: var(--ink-2);
+  font-size: 13px;
+}
+.factor-command-state p {
+  margin: 0;
+}
+.factor-detail-actions {
+  display: flex;
+  justify-content: flex-end;
+  border-top: 1px solid var(--rule);
+  padding-top: 14px;
+}
 .factor-detail-lead {
   display: flex;
   flex-wrap: wrap;

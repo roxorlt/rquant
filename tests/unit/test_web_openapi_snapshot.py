@@ -43,6 +43,8 @@ def test_every_api_path_is_versioned_and_only_defined_mutations_use_post() -> No
                 "/api/v1/screen/tdx/market/commands",
                 "/api/v1/pools/formula/commands",
                 "/api/v1/tasks/jobs/commands",
+                "/api/v1/factors/definitions/{factor_id}/archive",
+                "/api/v1/factors/definitions/{factor_id}/archive/resume",
             }
             else {"get"}
         )

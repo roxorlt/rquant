@@ -4123,6 +4123,22 @@
         "title": "Envelope[ExperimentListData]",
         "type": "object"
       },
+      "Envelope_FactorArchiveCommandData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/FactorArchiveCommandData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[FactorArchiveCommandData]",
+        "type": "object"
+      },
       "Envelope_FactorCatalogData_": {
         "properties": {
           "data": {
@@ -4778,6 +4794,89 @@
         "title": "ExperimentListData",
         "type": "object"
       },
+      "FactorArchiveCommandData": {
+        "additionalProperties": false,
+        "properties": {
+          "command_id": {
+            "title": "Command Id",
+            "type": "string"
+          },
+          "content_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Content Sha256",
+            "type": "string"
+          },
+          "current_head_updated": {
+            "default": false,
+            "title": "Current Head Updated",
+            "type": "boolean"
+          },
+          "factor_id": {
+            "title": "Factor Id",
+            "type": "string"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "rejected",
+              "pending",
+              "succeeded_waiting_publication",
+              "published",
+              "unavailable"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "version": {
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "status",
+          "command_id",
+          "factor_id",
+          "version",
+          "content_sha256",
+          "message"
+        ],
+        "title": "FactorArchiveCommandData",
+        "type": "object"
+      },
+      "FactorArchiveCommandRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "command_id": {
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+            "title": "Command Id",
+            "type": "string"
+          },
+          "expected_head": {
+            "$ref": "#/components/schemas/FactorHeadRef"
+          },
+          "generation_id": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Generation Id",
+            "type": "string"
+          },
+          "requested_at": {
+            "format": "date-time",
+            "title": "Requested At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "generation_id",
+          "command_id",
+          "requested_at",
+          "expected_head"
+        ],
+        "title": "FactorArchiveCommandRequest",
+        "type": "object"
+      },
       "FactorCatalogData": {
         "properties": {
           "availability": {
@@ -4800,6 +4899,11 @@
               }
             ],
             "title": "Available At"
+          },
+          "can_archive": {
+            "default": false,
+            "title": "Can Archive",
+            "type": "boolean"
           },
           "definitions": {
             "items": {
@@ -4892,6 +4996,27 @@
           "max_history_window"
         ],
         "title": "FactorDefinitionItem",
+        "type": "object"
+      },
+      "FactorHeadRef": {
+        "additionalProperties": false,
+        "properties": {
+          "content_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Content Sha256",
+            "type": "string"
+          },
+          "version": {
+            "minimum": 1.0,
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "version",
+          "content_sha256"
+        ],
+        "title": "FactorHeadRef",
         "type": "object"
       },
       "FieldExpr": {
@@ -13705,6 +13830,112 @@
           }
         },
         "summary": "因子定义目录",
+        "tags": [
+          "factors"
+        ]
+      }
+    },
+    "/api/v1/factors/definitions/{factor_id}/archive": {
+      "post": {
+        "operationId": "archive_factor_definition_api_v1_factors_definitions__factor_id__archive_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "factor_id",
+            "required": true,
+            "schema": {
+              "pattern": "^[a-z][a-z0-9_]{0,63}$",
+              "title": "Factor Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FactorArchiveCommandRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_FactorArchiveCommandData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "归档当前因子定义",
+        "tags": [
+          "factors"
+        ]
+      }
+    },
+    "/api/v1/factors/definitions/{factor_id}/archive/resume": {
+      "post": {
+        "operationId": "resume_factor_archive_api_v1_factors_definitions__factor_id__archive_resume_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "factor_id",
+            "required": true,
+            "schema": {
+              "pattern": "^[a-z][a-z0-9_]{0,63}$",
+              "title": "Factor Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FactorArchiveCommandRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_FactorArchiveCommandData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "续查原归档命令",
         "tags": [
           "factors"
         ]

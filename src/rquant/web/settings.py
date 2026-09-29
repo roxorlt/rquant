@@ -42,6 +42,10 @@ NL_OPENAI_API_KEY_ENV_VAR = "RQUANT_WEB_NL_OPENAI_API_KEY"
 NL_OPENAI_MODEL_ENV_VAR = "RQUANT_WEB_NL_OPENAI_MODEL"
 ACK_ADMISSION_SOCKET_ENV_VAR = "RQUANT_WEB_ACK_ADMISSION_SOCKET"
 WATCHLIST_ADMISSION_SOCKET_ENV_VAR = "RQUANT_WEB_WATCHLIST_ADMISSION_SOCKET"
+FACTOR_ADMISSION_SOCKET_ENV_VAR = "RQUANT_WEB_FACTOR_ADMISSION_SOCKET"
+FACTOR_ADMISSION_SERVICE_UID_ENV_VAR = "RQUANT_WEB_FACTOR_ADMISSION_SERVICE_UID"
+FACTOR_ADMISSION_SHARED_GID_ENV_VAR = "RQUANT_WEB_FACTOR_ADMISSION_SHARED_GID"
+FACTOR_EDITOR_USERS_ENV_VAR = "RQUANT_WEB_FACTOR_EDITOR_USERS"
 INGRESS_SOCKET_ENV_VAR = "RQUANT_WEB_INGRESS_SOCKET"
 PROXY_PROOF_FILE_ENV_VAR = "RQUANT_WEB_PROXY_PROOF_FILE"
 LOG_ADMIN_USERS_ENV_VAR = "RQUANT_WEB_LOG_ADMIN_USERS"
@@ -112,6 +116,10 @@ class WebSettings(BaseModel):
     nl_openai_model: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
     ack_admission_socket_path: Path | None = None
     watchlist_admission_socket_path: Path | None = None
+    factor_admission_socket_path: Path | None = None
+    factor_admission_service_uid: StrictInt | None = None
+    factor_admission_shared_gid: StrictInt | None = None
+    factor_editor_users: frozenset[str] = frozenset()
     ingress_socket_path: Path | None = None
     proxy_proof_file: Path | None = None
     log_admin_users: frozenset[str] = frozenset()
@@ -154,6 +162,27 @@ class WebSettings(BaseModel):
                 reserved.add(self.ack_admission_socket_path.parent)
             if self.watchlist_admission_socket_path.parent in reserved:
                 raise ValueError("watchlist admission socket needs a separate directory")
+        factor_fields = (
+            self.factor_admission_socket_path,
+            self.factor_admission_service_uid,
+            self.factor_admission_shared_gid,
+        )
+        if any(field is not None for field in factor_fields) or self.factor_editor_users:
+            if (
+                not all(field is not None for field in factor_fields)
+                or not self.factor_editor_users
+                or self.ingress_socket_path is None
+            ):
+                raise ValueError("factor archive requires private ingress, socket, IDs and editors")
+            if self.factor_admission_service_uid == os.geteuid():
+                raise ValueError("factor archive service UID must differ from Web UID")
+            reserved = {self.ingress_socket_path.parent}
+            if self.ack_admission_socket_path is not None:
+                reserved.add(self.ack_admission_socket_path.parent)
+            if self.watchlist_admission_socket_path is not None:
+                reserved.add(self.watchlist_admission_socket_path.parent)
+            if self.factor_admission_socket_path.parent in reserved:
+                raise ValueError("factor archive socket needs a separate private directory")
         log_fields = (
             self.unit_log_socket_path,
             self.unit_log_service_uid,
@@ -224,7 +253,7 @@ class WebSettings(BaseModel):
             raise ValueError("proxy proof file path must be absolute and canonical")
         return value
 
-    @field_validator("log_admin_users", "lab_control_users")
+    @field_validator("log_admin_users", "lab_control_users", "factor_editor_users")
     @classmethod
     def validate_operator_users(cls, value: frozenset[str]) -> frozenset[str]:
         if len(value) > 16 or any(_ADMIN_USER_PATTERN.fullmatch(user) is None for user in value):
@@ -236,6 +265,20 @@ class WebSettings(BaseModel):
     def validate_readonly_result_root(cls, value: Path | None) -> Path | None:
         if value is not None and (not value.is_absolute() or ".." in value.parts):
             raise ValueError("read-only result root must be absolute and canonical")
+        return value
+
+    @field_validator("factor_admission_socket_path")
+    @classmethod
+    def validate_factor_admission_path(cls, value: Path | None) -> Path | None:
+        if value is not None and (not value.is_absolute() or ".." in value.parts):
+            raise ValueError("factor archive socket path must be absolute and canonical")
+        return value
+
+    @field_validator("factor_admission_service_uid", "factor_admission_shared_gid")
+    @classmethod
+    def validate_factor_admission_identity(cls, value: int | None) -> int | None:
+        if value is not None and (type(value) is not int or value < 0):
+            raise ValueError("factor archive IDs must be nonnegative integers")
         return value
 
     @field_validator("unit_log_socket_path", "unit_log_manifest_path", "unit_log_public_key_path")
@@ -331,6 +374,22 @@ class WebSettings(BaseModel):
         watchlist_socket = source.get(WATCHLIST_ADMISSION_SOCKET_ENV_VAR, "").strip()
         if watchlist_socket:
             values["watchlist_admission_socket_path"] = Path(watchlist_socket)
+        factor_socket = source.get(FACTOR_ADMISSION_SOCKET_ENV_VAR, "").strip()
+        if factor_socket:
+            values["factor_admission_socket_path"] = Path(factor_socket)
+        for env_name, field_name in (
+            (FACTOR_ADMISSION_SERVICE_UID_ENV_VAR, "factor_admission_service_uid"),
+            (FACTOR_ADMISSION_SHARED_GID_ENV_VAR, "factor_admission_shared_gid"),
+        ):
+            raw = source.get(env_name, "").strip()
+            if raw:
+                values[field_name] = int(raw)
+        editors = source.get(FACTOR_EDITOR_USERS_ENV_VAR, "").strip()
+        if editors:
+            names = tuple(user.strip() for user in editors.split(","))
+            if any(not name for name in names) or len(set(names)) != len(names):
+                raise ValueError("factor editors must be distinct nonempty names")
+            values["factor_editor_users"] = frozenset(names)
         ingress_socket = source.get(INGRESS_SOCKET_ENV_VAR, "").strip()
         if ingress_socket:
             if bind is not None or source.get(BIND_ENV_VAR, "").strip():

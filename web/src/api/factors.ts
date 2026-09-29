@@ -3,7 +3,39 @@ import { type ServingQueryResult, useServingQuery } from "./useServingQuery";
 
 export type FactorDefinitionItem = Schemas["FactorDefinitionItem"];
 export type FactorCatalogData = Schemas["FactorCatalogData"];
+export type FactorArchiveCommandRequest = Schemas["FactorArchiveCommandRequest"];
+export type FactorArchiveCommandData = Schemas["FactorArchiveCommandData"];
 type FactorCatalogEnvelope = Schemas["Envelope_FactorCatalogData_"];
+
+export async function postFactorArchive(
+  factorId: string,
+  command: FactorArchiveCommandRequest,
+  resume: boolean,
+): Promise<FactorArchiveCommandData> {
+  const client = apiClient();
+  const result = resume
+    ? await client.POST("/api/v1/factors/definitions/{factor_id}/archive/resume", {
+        params: { path: { factor_id: factorId } },
+        body: command,
+        headers: { "X-Rquant-Csrf": "1" },
+      })
+    : await client.POST("/api/v1/factors/definitions/{factor_id}/archive", {
+        params: { path: { factor_id: factorId } },
+        body: command,
+        headers: { "X-Rquant-Csrf": "1" },
+      });
+  if (result.data === undefined) {
+    throw new ApiError(
+      result.response.status,
+      result.response.status === 409
+        ? "因子已变化，请刷新后查看。"
+        : result.response.status === 403
+          ? "当前账号不能归档因子。"
+          : "归档状态暂不可用，请用原命令继续查看。",
+    );
+  }
+  return result.data.data;
+}
 
 export function useFactorCatalog(
   generationId: string | null | undefined,
