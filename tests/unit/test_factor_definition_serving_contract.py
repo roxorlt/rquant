@@ -215,6 +215,20 @@ def test_pair_rejects_missing_rows_digest_order_archive_and_dependencies(tmp_pat
         validate_factor_definition_projections({state.table_name: state})
 
 
+@pytest.mark.parametrize("bad_date", ["2024-1-2", "2024-02-30", "today", 20240102])
+def test_pair_rejects_noncanonical_earliest_date(tmp_path: Path, bad_date: object) -> None:
+    registry = _registry(tmp_path / "factors.sqlite3")
+    _save(registry, "a_factor")
+    state, definitions = _pair(registry)
+    corrupt = _replace_rows(
+        definitions, ({**dict(definitions.rows[0]), "earliest_available_date": bad_date},)
+    )
+    with pytest.raises(ValueError):
+        validate_factor_definition_projections(
+            {state.table_name: state, corrupt.table_name: corrupt}
+        )
+
+
 def test_lab_and_public_serving_input_reject_partial_or_mixed_pair(tmp_path: Path) -> None:
     registry = _registry(tmp_path / "factors.sqlite3")
     _save(registry, "a_factor")

@@ -770,7 +770,8 @@ def evaluate_factor_time_series(data: FactorTimeSeriesInput) -> FactorTimeSeries
         for index, trade_date in enumerate(checked.trading_days):
             cell = (
                 _missing("before_available_date")
-                if trade_date < checked.definition.earliest_available_date
+                if checked.definition.earliest_available_date is not None
+                and trade_date < checked.definition.earliest_available_date
                 else evaluator.evaluate(tree.body, index)
             )
             by_day[index].append(

@@ -40,7 +40,9 @@ from tests.support.web_proxy_identity import create_private_test_app as create_a
 from tests.support.web_serving_fixture import FIXTURE_BUILT_AT, build_web_fixture
 
 
-def _pair(tmp_path: Path, *, populated: bool) -> tuple[ServingProjectionPayload, ...]:
+def _pair(
+    tmp_path: Path, *, populated: bool, unknown_first: bool = False
+) -> tuple[ServingProjectionPayload, ...]:
     registry = FactorDefinitionRegistry(tmp_path / "factor-fixture.sqlite3")
     registry.initialize()
     if populated:
@@ -57,7 +59,9 @@ def _pair(tmp_path: Path, *, populated: bool) -> tuple[ServingProjectionPayload,
                         category="technical",
                         direction="higher_is_better",
                         version=1,
-                        earliest_available_date=date(2024, 1, 2),
+                        earliest_available_date=(
+                            None if unknown_first and factor_id == "a_factor" else date(2024, 1, 2)
+                        ),
                         expression=expression,
                         feature_catalog=FeatureCatalog(columns=("close", "volume")),
                     ),
@@ -90,6 +94,25 @@ def _app(root: Path) -> Any:
         clock=lambda: FIXTURE_BUILT_AT + timedelta(seconds=30),
         background=False,
     )
+
+
+def test_unknown_earliest_date_round_trips_registry_physical_serving_and_web(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "serving"
+    build_web_fixture(
+        root,
+        "baseline",
+        factor_definition_projections=_pair(tmp_path, populated=True, unknown_first=True),
+    )
+    with ResearcherTestClient(_app(root)) as client:
+        response = client.get("/api/v1/factors/definitions")
+        assert response.status_code == 200, response.text
+        first, old = response.json()["data"]["definitions"]
+        assert first["factor_id"] == "a_factor"
+        assert first["earliest_available_date"] is None
+        assert first["dependency_columns"] == ["close", "volume"]
+        assert old["earliest_available_date"] == "2024-01-02"
 
 
 def test_private_catalog_populated_empty_unpublished_and_generation(tmp_path: Path) -> None:

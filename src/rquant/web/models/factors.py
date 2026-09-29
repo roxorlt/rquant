@@ -22,7 +22,7 @@ class FactorDefinitionItem(BaseModel):
     direction: FactorDirection
     direction_label: str
     version: int
-    earliest_available_date: date
+    earliest_available_date: date | None
     archived: bool
     expression: str
     dependency_columns: list[str]

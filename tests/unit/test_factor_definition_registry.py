@@ -102,6 +102,19 @@ def test_first_save_survives_reopen_with_exact_definition(tmp_path: Path) -> Non
     assert not head.head.archived
 
 
+def test_known_date_definition_retains_legacy_content_digest(tmp_path: Path) -> None:
+    registry = _store(tmp_path / "factors.sqlite3")
+    receipt = _save_request(
+        registry,
+        SaveFactorDefinitionRequest(
+            command_id="known-date", definition=_definition(), expected_head=None
+        ),
+    )
+    assert receipt.content_sha256 == (
+        "8d2108b76521105bd731e52873701613b20562de1be47a328a5918ff94f5f213"
+    )
+
+
 def _save(
     registry: FactorDefinitionRegistry,
     command_id: str,

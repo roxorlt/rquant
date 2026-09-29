@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from datetime import date
@@ -188,6 +189,30 @@ def test_definition_binds_catalog_and_declared_dependencies() -> None:
     assert definition.feature_catalog == _catalog()
     with pytest.raises(ValidationError):
         definition.factor_id = "other"
+
+
+def test_unknown_earliest_date_keeps_parsed_dependencies_and_history() -> None:
+    definition = build_factor_definition(
+        factor_id="unknown_start",
+        name_zh="价格均线",
+        category="technical",
+        direction="higher_is_better",
+        version=1,
+        earliest_available_date=None,
+        expression="ts_mean(close, 5)",
+        feature_catalog=_catalog(),
+    )
+    assert definition.earliest_available_date is None
+    assert definition.dependency_columns == ("close",)
+    assert definition.max_history_window == 5
+    assert FactorDefinition.model_validate_json(definition.model_dump_json()) == definition
+
+
+def test_definition_rejects_invalid_earliest_date_in_persisted_json() -> None:
+    payload = _definition().model_dump(mode="json")
+    payload["earliest_available_date"] = "2024-02-30"
+    with pytest.raises(ValidationError):
+        FactorDefinition.model_validate_json(json.dumps(payload))
 
 
 @pytest.mark.parametrize(

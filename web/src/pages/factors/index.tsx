@@ -325,8 +325,14 @@ export default function FactorsPage() {
                   </div>
                   <dl className="factor-facts">
                     <div>
-                      <dt>最早可用</dt>
-                      <dd>{selected.earliest_available_date}</dd>
+                      <dt>记录起日</dt>
+                      <dd>
+                        {selected.earliest_available_date === null ? (
+                          <Tip content="保存公式后，运行检验时核对实际数据起日">待检验</Tip>
+                        ) : (
+                          selected.earliest_available_date
+                        )}
+                      </dd>
                     </div>
                     <div>
                       <dt>历史窗口</dt>

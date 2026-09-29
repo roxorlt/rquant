@@ -38,7 +38,7 @@ class FactorDefinitionServingRow(BaseModel):
     category: str
     direction: FactorDirection
     expression: str
-    earliest_available_date: date
+    earliest_available_date: date | None
     dependency_columns: tuple[str, ...]
     max_history_window: int = Field(ge=1, strict=True)
     archived: bool

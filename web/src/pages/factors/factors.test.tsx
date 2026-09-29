@@ -14,7 +14,7 @@ vi.mock("@/charts/EChart", () => ({
 
 const firstGeneration = metaEnvelope().serving.generation_id ?? "a".repeat(64);
 const nextGeneration = "b".repeat(64);
-const definitions = [
+const definitions: Schemas["FactorDefinitionItem"][] = [
   {
     factor_id: "price_volume_factor",
     content_sha256: "a".repeat(64),
@@ -628,6 +628,24 @@ describe("因子库", () => {
     expect(container.querySelector("main")?.textContent).not.toContain("old_factor");
     expect(screen.queryByRole("button", { name: /运行检验|加入跟踪/ })).toBeNull();
     expect(screen.queryByText(/IC|分组收益|换手/)).toBeNull();
+  });
+
+  it("起日未知时显示待检验，提示保留在悬停层，已知日期标记为记录起日", async () => {
+    publish(
+      definitions.map((row, index) =>
+        index === 0 ? { ...row, earliest_available_date: null } : row,
+      ),
+    );
+    renderApp("/factors");
+    const detail = await screen.findByRole("region", { name: "因子详情" });
+    expect(within(detail).getByText("记录起日")).toBeInTheDocument();
+    const unknown = within(detail).getByText("待检验");
+    const user = userEvent.setup();
+    await user.hover(unknown);
+    expect(await screen.findByText("保存公式后，运行检验时核对实际数据起日")).toBeInTheDocument();
+    await user.click(screen.getByRole("row", { name: /成交变化/ }));
+    expect(within(detail).getByText("2025-03-04")).toBeInTheDocument();
+    expect(within(detail).queryByText("待检验")).toBeNull();
   });
 
   it("先核对数据代再加载，换代后清除旧详情", async () => {

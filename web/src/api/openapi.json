@@ -5080,9 +5080,16 @@
             "type": "string"
           },
           "earliest_available_date": {
-            "format": "date",
-            "title": "Earliest Available Date",
-            "type": "string"
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Earliest Available Date"
           },
           "expression": {
             "title": "Expression",
