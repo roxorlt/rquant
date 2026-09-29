@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import http.client
 import json
 import os
@@ -19,6 +20,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
+from rquant.factor.draft import FactorSaveDraft, build_draft_definition, draft_factor_id
 from rquant.factor.registry import FactorDefinitionReceipt
 from rquant.manual_watchlist import OwnerId
 from rquant.page_control import (
@@ -28,13 +30,16 @@ from rquant.page_control import (
     PageControlService,
     PageControlStatus,
 )
-from rquant.strict_json import strict_json_loads
+from rquant.strict_json import canonical_json_bytes, strict_json_loads
 
 _MAX_COMMAND_BYTES = 8 * 1024
 _MAX_RESPONSE_BYTES = 16 * 1024
 _ROUTE = "/v1/factor-definition-admission"
 _LOOKUP_ROUTE = f"{_ROUTE}/lookup"
 _RESUME_ROUTE = f"{_ROUTE}/resume"
+_SAVE_ROUTE = f"{_ROUTE}/save"
+_SAVE_LOOKUP_ROUTE = f"{_SAVE_ROUTE}/lookup"
+_SAVE_RESUME_ROUTE = f"{_SAVE_ROUTE}/resume"
 _ACTOR_ADAPTER = TypeAdapter(OwnerId)
 _INSTANCE_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 
@@ -52,18 +57,26 @@ class FactorArchiveAdmissionResult(BaseModel):
 
     registry_instance_id: str = Field(pattern=r"^[0-9a-f]{32}$")
     receipt: PageControlReceipt
+    definition_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
 
 class FactorDefinitionAdmission:
     """Authorize one actor and call only the owned, targeted archive paths."""
 
-    def __init__(self, service: PageControlService, *, editor_users: frozenset[str]) -> None:
+    def __init__(
+        self,
+        service: PageControlService,
+        *,
+        editor_users: frozenset[str],
+        save_enabled: bool = False,
+    ) -> None:
         if len(editor_users) > 16:
             raise ValueError("factor editors exceed bounded allowlist")
         for actor in editor_users:
             _ACTOR_ADAPTER.validate_python(actor)
         self.service = service
         self.editor_users = editor_users
+        self.save_enabled = save_enabled
         self._lock = threading.Lock()
 
     def submit(
@@ -123,14 +136,109 @@ class FactorDefinitionAdmission:
         if not self.editor_users or actor_id not in self.editor_users:
             raise FactorDefinitionAdmissionRejectedError("actor_forbidden")
 
+    def submit_save(
+        self,
+        draft: FactorSaveDraft,
+        *,
+        authenticated_actor_id: str,
+        verified_registry_instance_id: str,
+    ) -> FactorArchiveAdmissionResult:
+        self._authorize(authenticated_actor_id)
+        if not self.save_enabled:
+            raise FactorDefinitionAdmissionRejectedError("save_disabled")
+        with self._lock:
+            try:
+                build_draft_definition(draft, authenticated_actor_id=authenticated_actor_id)
+            except ValueError as exc:
+                raise FactorDefinitionAdmissionRejectedError("invalid_draft") from exc
+            try:
+                receipt = self.service._submit_trusted_factor_save(
+                    draft,
+                    authenticated_actor_id=authenticated_actor_id,
+                    verified_registry_instance_id=verified_registry_instance_id,
+                )
+            except PageControlCommandConflictError as exc:
+                raise FactorDefinitionAdmissionRejectedError("command_conflict") from exc
+            return self._bound_save_result(draft, authenticated_actor_id, receipt)
 
-def _public_result(result: FactorArchiveAdmissionResult) -> dict[str, object]:
+    def lookup_save(
+        self, draft: FactorSaveDraft, *, authenticated_actor_id: str
+    ) -> FactorArchiveAdmissionResult | None:
+        self._authorize(authenticated_actor_id)
+        if not self.save_enabled:
+            raise FactorDefinitionAdmissionRejectedError("save_disabled")
+        with self._lock:
+            try:
+                receipt = self.service._lookup_trusted_factor_save(
+                    draft, authenticated_actor_id=authenticated_actor_id
+                )
+            except PageControlCommandConflictError as exc:
+                raise FactorDefinitionAdmissionRejectedError("command_conflict") from exc
+            return (
+                None
+                if receipt is None
+                else self._bound_save_result(draft, authenticated_actor_id, receipt)
+            )
+
+    def resume_save(
+        self, draft: FactorSaveDraft, *, authenticated_actor_id: str
+    ) -> FactorArchiveAdmissionResult:
+        self._authorize(authenticated_actor_id)
+        if not self.save_enabled:
+            raise FactorDefinitionAdmissionRejectedError("save_disabled")
+        with self._lock:
+            try:
+                receipt = self.service._resume_trusted_factor_save(
+                    draft, authenticated_actor_id=authenticated_actor_id
+                )
+            except PageControlCommandConflictError as exc:
+                raise FactorDefinitionAdmissionRejectedError("command_conflict") from exc
+            return self._bound_save_result(draft, authenticated_actor_id, receipt)
+
+    def _bound_save_result(
+        self, draft: FactorSaveDraft, actor_id: str, receipt: PageControlReceipt
+    ) -> FactorArchiveAdmissionResult:
+        matched = self.service.outbox.lookup_factor_save_command(
+            draft, authenticated_actor_id=actor_id
+        )
+        if matched is None or matched[1] != receipt:
+            raise RuntimeError("factor save receipt changed during admission")
+        owned = matched[0]
+        digest = hashlib.sha256(
+            canonical_json_bytes(owned.definition.model_dump(mode="json", round_trip=True))
+        ).hexdigest()
+        if receipt.status is PageControlStatus.SUCCEEDED:
+            effect = FactorDefinitionReceipt.model_validate(receipt.result)
+            if (
+                effect.command_id != owned.command_id
+                or effect.action != "save"
+                or effect.factor_id != owned.definition.factor_id
+                or effect.version != owned.definition.version
+                or effect.content_sha256 != digest
+                or effect.archived
+                or receipt.completed_at is None
+            ):
+                raise RuntimeError("factor save effect differs from original definition")
+        assert owned.registry_identity is not None
+        return FactorArchiveAdmissionResult(
+            registry_instance_id=owned.registry_identity.instance_id,
+            receipt=receipt,
+            definition_sha256=digest,
+        )
+
+
+def _public_result(
+    result: FactorArchiveAdmissionResult, *, action: str = "archive"
+) -> dict[str, object]:
     receipt = result.receipt
     if receipt.status in {PageControlStatus.FAILED, PageControlStatus.AMBIGUOUS}:
-        receipt = receipt.model_copy(update={"result": None, "error": "归档未完成"})
+        receipt = receipt.model_copy(
+            update={"result": None, "error": "保存未完成" if action == "save" else "归档未完成"}
+        )
     return {
         "registry_instance_id": result.registry_instance_id,
         "receipt": receipt.model_dump(mode="json"),
+        "definition_sha256": result.definition_sha256,
     }
 
 
@@ -287,12 +395,41 @@ def _decode_request(body: bytes, *, submit: bool) -> tuple[ArchiveFactor, str, s
     return command, actor, instance_id
 
 
+def _decode_save_request(body: bytes, *, submit: bool) -> tuple[FactorSaveDraft, str, str | None]:
+    payload = strict_json_loads(body, parse_constant=_reject_json_constant)
+    fields = {"authenticated_actor_id", "draft"}
+    if submit:
+        fields.add("verified_registry_instance_id")
+    if not isinstance(payload, dict) or set(payload) != fields:
+        raise ValueError("invalid factor save admission envelope")
+    actor = _ACTOR_ADAPTER.validate_python(payload["authenticated_actor_id"])
+    if not isinstance(payload["draft"], dict):
+        raise ValueError("factor save draft must be an object")
+    draft = FactorSaveDraft.model_validate_json(
+        json.dumps(payload["draft"], ensure_ascii=True, allow_nan=False)
+    )
+    instance_id = payload.get("verified_registry_instance_id")
+    if submit and (
+        not isinstance(instance_id, str) or _INSTANCE_PATTERN.fullmatch(instance_id) is None
+    ):
+        raise ValueError("invalid verified factor registry instance")
+    return draft, actor, instance_id
+
+
 def _handler_for_admission() -> type[BaseHTTPRequestHandler]:
     class FactorDefinitionAdmissionHandler(BaseHTTPRequestHandler):
         server: FactorDefinitionAdmissionServer
 
         def do_POST(self) -> None:  # noqa: N802
-            if self.path not in {_ROUTE, _LOOKUP_ROUTE, _RESUME_ROUTE}:
+            save_route = self.path in {_SAVE_ROUTE, _SAVE_LOOKUP_ROUTE, _SAVE_RESUME_ROUTE}
+            if self.path not in {
+                _ROUTE,
+                _LOOKUP_ROUTE,
+                _RESUME_ROUTE,
+                _SAVE_ROUTE,
+                _SAVE_LOOKUP_ROUTE,
+                _SAVE_RESUME_ROUTE,
+            }:
                 self.send_error(404)
                 return
             self.connection.settimeout(2.0)
@@ -314,11 +451,40 @@ def _handler_for_admission() -> type[BaseHTTPRequestHandler]:
                 body = self.rfile.read(size)
                 if len(body) != size:
                     raise ValueError("truncated factor archive admission body")
-                command, actor, instance_id = _decode_request(body, submit=self.path == _ROUTE)
+                if save_route:
+                    command, actor, instance_id = _decode_save_request(
+                        body, submit=self.path == _SAVE_ROUTE
+                    )
+                else:
+                    command, actor, instance_id = _decode_request(body, submit=self.path == _ROUTE)
             except (OSError, TypeError, ValueError):
                 self._json(400, {"error": "invalid_command"})
                 return
             try:
+                if save_route:
+                    assert isinstance(command, FactorSaveDraft)
+                    if self.path == _SAVE_LOOKUP_ROUTE:
+                        saved = self.server.admission.lookup_save(
+                            command, authenticated_actor_id=actor
+                        )
+                        self._json(
+                            200,
+                            {"found": False}
+                            if saved is None
+                            else {"found": True, "result": _public_result(saved, action="save")},
+                        )
+                        return
+                    saved = (
+                        self.server.admission.resume_save(command, authenticated_actor_id=actor)
+                        if self.path == _SAVE_RESUME_ROUTE
+                        else self.server.admission.submit_save(
+                            command,
+                            authenticated_actor_id=actor,
+                            verified_registry_instance_id=instance_id,
+                        )
+                    )
+                    self._json(200, _public_result(saved, action="save"))
+                    return
                 if self.path == _LOOKUP_ROUTE:
                     receipt = self.server.admission.lookup(command, authenticated_actor_id=actor)
                     self._json(
@@ -343,8 +509,12 @@ def _handler_for_admission() -> type[BaseHTTPRequestHandler]:
             except PageControlCommandConflictError:
                 self._json(409, {"error": "command_conflict"})
                 return
-            except FactorDefinitionAdmissionRejectedError:
-                self._json(403, {"error": "actor_forbidden"})
+            except FactorDefinitionAdmissionRejectedError as exc:
+                reason = str(exc)
+                if reason in {"actor_forbidden", "save_disabled"}:
+                    self._json(403, {"error": "actor_forbidden"})
+                else:
+                    self._json(409, {"error": "invalid_draft"})
                 return
             except ValueError:
                 if self.path == _ROUTE:
@@ -519,6 +689,38 @@ class FactorDefinitionAdmissionClient:
         assert receipt is not None
         return receipt
 
+    def submit_save(
+        self,
+        draft: FactorSaveDraft,
+        *,
+        authenticated_actor_id: str,
+        verified_registry_instance_id: str,
+    ) -> FactorArchiveAdmissionResult:
+        result = self._request(
+            _SAVE_ROUTE,
+            draft,
+            authenticated_actor_id=authenticated_actor_id,
+            verified_registry_instance_id=verified_registry_instance_id,
+        )
+        assert result is not None
+        return result
+
+    def lookup_save(
+        self, draft: FactorSaveDraft, *, authenticated_actor_id: str
+    ) -> FactorArchiveAdmissionResult | None:
+        return self._request(
+            _SAVE_LOOKUP_ROUTE, draft, authenticated_actor_id=authenticated_actor_id
+        )
+
+    def resume_save(
+        self, draft: FactorSaveDraft, *, authenticated_actor_id: str
+    ) -> FactorArchiveAdmissionResult:
+        result = self._request(
+            _SAVE_RESUME_ROUTE, draft, authenticated_actor_id=authenticated_actor_id
+        )
+        assert result is not None
+        return result
+
     def lookup(
         self, command: ArchiveFactor, *, authenticated_actor_id: str
     ) -> FactorArchiveAdmissionResult | None:
@@ -536,21 +738,24 @@ class FactorDefinitionAdmissionClient:
     def _request(
         self,
         route: str,
-        command: ArchiveFactor,
+        command: ArchiveFactor | FactorSaveDraft,
         *,
         authenticated_actor_id: str,
         verified_registry_instance_id: str | None = None,
     ) -> FactorArchiveAdmissionResult | None:
-        if type(command) is not ArchiveFactor:
-            raise TypeError("factor archive admission requires an ownerless factor archive command")
+        save_route = route in {_SAVE_ROUTE, _SAVE_LOOKUP_ROUTE, _SAVE_RESUME_ROUTE}
+        if save_route and type(command) is not FactorSaveDraft:
+            raise TypeError("factor save admission requires a typed original draft")
+        if not save_route and type(command) is not ArchiveFactor:
+            raise TypeError("factor archive admission requires an ownerless archive command")
         if not isinstance(authenticated_actor_id, str):
             raise ValueError("authenticated actor must be a string")
         actor = _ACTOR_ADAPTER.validate_python(authenticated_actor_id)
         envelope: dict[str, object] = {
             "authenticated_actor_id": actor,
-            "command": command.model_dump(mode="json"),
+            "draft" if save_route else "command": command.model_dump(mode="json"),
         }
-        if route == _ROUTE:
+        if route in {_ROUTE, _SAVE_ROUTE}:
             if (
                 not isinstance(verified_registry_instance_id, str)
                 or _INSTANCE_PATTERN.fullmatch(verified_registry_instance_id) is None
@@ -597,7 +802,8 @@ class FactorDefinitionAdmissionClient:
                 response.status in (404, 409)
                 and isinstance(decoded, dict)
                 and set(decoded) == {"error"}
-                and decoded["error"] in {"not_found", "command_conflict", "rejected"}
+                and decoded["error"]
+                in {"not_found", "command_conflict", "rejected", "invalid_draft"}
             ):
                 raise FactorDefinitionAdmissionRejectedError(decoded["error"])
             if response.status == 403 and decoded == {"error": "actor_forbidden"}:
@@ -606,7 +812,7 @@ class FactorDefinitionAdmissionClient:
                 raise FactorDefinitionAdmissionUnavailableError(
                     f"factor archive admission returned HTTP {response.status}"
                 )
-            if route == _LOOKUP_ROUTE:
+            if route in {_LOOKUP_ROUTE, _SAVE_LOOKUP_ROUTE}:
                 if decoded == {"found": False}:
                     return None
                 if (
@@ -622,22 +828,41 @@ class FactorDefinitionAdmissionClient:
                 receipt.command_id != command.command_id
                 or receipt.enqueued_at != command.requested_at
                 or (
-                    route == _ROUTE and result.registry_instance_id != verified_registry_instance_id
+                    route in {_ROUTE, _SAVE_ROUTE}
+                    and result.registry_instance_id != verified_registry_instance_id
                 )
             ):
                 raise ValueError("factor archive admission returned another command")
             if receipt.status is PageControlStatus.SUCCEEDED:
                 effect = FactorDefinitionReceipt.model_validate(receipt.result)
+                if save_route:
+                    assert isinstance(command, FactorSaveDraft)
+                    expected_id = draft_factor_id(command, authenticated_actor_id=actor)
+                    expected_version = (
+                        1 if command.expected_head is None else command.expected_head.version + 1
+                    )
+                    mismatched = (
+                        effect.action != "save"
+                        or effect.factor_id != expected_id
+                        or effect.version != expected_version
+                        or effect.content_sha256 != result.definition_sha256
+                        or effect.archived
+                    )
+                else:
+                    assert isinstance(command, ArchiveFactor)
+                    mismatched = (
+                        effect.action != "archive"
+                        or effect.factor_id != command.factor_id
+                        or effect.version != command.expected_head.version
+                        or effect.content_sha256 != command.expected_head.content_sha256
+                        or effect.archived is not True
+                    )
                 if (
                     effect.command_id != command.command_id
-                    or effect.action != "archive"
-                    or effect.factor_id != command.factor_id
-                    or effect.version != command.expected_head.version
-                    or effect.content_sha256 != command.expected_head.content_sha256
-                    or effect.archived is not True
+                    or mismatched
                     or receipt.completed_at is None
                 ):
-                    raise ValueError("factor archive admission returned mismatched effect")
+                    raise ValueError("factor admission returned mismatched effect")
             elif receipt.status in {PageControlStatus.FAILED, PageControlStatus.AMBIGUOUS}:
                 if receipt.completed_at is None:
                     raise ValueError("factor archive terminal receipt lacks completion time")

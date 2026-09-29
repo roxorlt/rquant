@@ -14,6 +14,7 @@ from rquant.factor.definition_serving import project_factor_definition_serving_s
 from rquant.factor.expression import FeatureCatalog
 from rquant.factor.registry import (
     ArchiveFactorRequest,
+    FactorConflictError,
     FactorDefinitionRegistry,
     FactorHeadRef,
     SaveFactorDefinitionRequest,
@@ -324,7 +325,7 @@ def test_lab_source_optional_pair_and_fixed_identity_fail_closed(tmp_path: Path)
         source(AT)
 
 
-def test_source_rejects_old_schema_and_513th_head_without_truncation(tmp_path: Path) -> None:
+def test_source_rejects_old_schema_and_registry_blocks_513th_head(tmp_path: Path) -> None:
     database = tmp_path / "research_ro.duckdb"
     with DuckDBStore(database):
         pass
@@ -343,10 +344,11 @@ def test_source_rejects_old_schema_and_513th_head_without_truncation(tmp_path: P
     source = DuckDBLabPageProjectionSource(
         database, factor_registry=registry, factor_registry_identity=registry.identity()
     )
-    for index in range(513):
+    for index in range(512):
         _save(registry, f"factor_{index:03d}")
-    with pytest.raises(PageProjectionSourceIntegrityError, match="512"):
-        source(AT)
+    with pytest.raises(FactorConflictError, match="capacity"):
+        _save(registry, "factor_512")
+    assert len(source(AT).projections) > 0
 
 
 def test_physical_definition_byte_budget_rejects_whole_payload(tmp_path: Path) -> None:

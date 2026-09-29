@@ -242,6 +242,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/factors/capabilities": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 可用因子字段与算子 */
+        get: operations["factor_capabilities_api_v1_factors_capabilities_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/factors/definitions": {
         parameters: {
             query?: never;
@@ -253,6 +270,57 @@ export interface paths {
         get: operations["list_factor_definitions_api_v1_factors_definitions_get"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/factors/definitions/save": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 保存因子草稿 */
+        post: operations["save_factor_draft_api_v1_factors_definitions_save_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/factors/definitions/save/resume": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 续查原保存命令 */
+        post: operations["resume_factor_save_api_v1_factors_definitions_save_resume_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/factors/definitions/save/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 重试原保存命令 */
+        post: operations["retry_original_factor_save_api_v1_factors_definitions_save_retry_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2261,6 +2329,15 @@ export interface components {
             /** Ts Code */
             ts_code: string;
         };
+        /** DailyFactorField */
+        DailyFactorField: {
+            /** Column */
+            column: string;
+            /** Description Zh */
+            description_zh: string;
+            /** Name Zh */
+            name_zh: string;
+        };
         /** DataAuditHealthData */
         DataAuditHealthData: {
             latest_attempt: components["schemas"]["AuditAttempt"] | null;
@@ -2489,6 +2566,11 @@ export interface components {
             data: components["schemas"]["FactorArchiveCommandData"];
             serving: components["schemas"]["ServingMeta"];
         };
+        /** Envelope[FactorCapabilitiesData] */
+        Envelope_FactorCapabilitiesData_: {
+            data: components["schemas"]["FactorCapabilitiesData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
         /** Envelope[FactorCatalogData] */
         Envelope_FactorCatalogData_: {
             data: components["schemas"]["FactorCatalogData"];
@@ -2502,6 +2584,11 @@ export interface components {
         /** Envelope[FactorResultListData] */
         Envelope_FactorResultListData_: {
             data: components["schemas"]["FactorResultListData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[FactorSaveCommandData] */
+        Envelope_FactorSaveCommandData_: {
+            data: components["schemas"]["FactorSaveCommandData"];
             serving: components["schemas"]["ServingMeta"];
         };
         /** Envelope[FormulaMarketJobDetailData] */
@@ -2730,6 +2817,35 @@ export interface components {
              */
             requested_at: string;
         };
+        /** FactorCapabilitiesData */
+        FactorCapabilitiesData: {
+            /**
+             * Can Save
+             * @default false
+             */
+            can_save: boolean;
+            /**
+             * Coverage Note Zh
+             * @default 字段和算子支持不代表历史数据已覆盖。
+             */
+            coverage_note_zh: string;
+            /** Fields */
+            fields: components["schemas"]["DailyFactorField"][];
+            /** Runnable Operators */
+            runnable_operators: string[];
+            /**
+             * Source Mode
+             * @constant
+             */
+            source_mode: "historical_retrospective";
+            /** Unavailable Operators */
+            unavailable_operators: components["schemas"]["UnavailableFactorOperator"][];
+            /**
+             * Version
+             * @constant
+             */
+            version: "daily_v1";
+        };
         /** FactorCatalogData */
         FactorCatalogData: {
             /**
@@ -2744,6 +2860,11 @@ export interface components {
              * @default false
              */
             can_archive: boolean;
+            /**
+             * Can Save
+             * @default false
+             */
+            can_save: boolean;
             /** Definitions */
             definitions: components["schemas"]["FactorDefinitionItem"][];
         };
@@ -2769,6 +2890,8 @@ export interface components {
         FactorDefinitionItem: {
             /** Archived */
             archived: boolean;
+            /** Category */
+            category: string;
             /** Category Label */
             category_label: string;
             /** Content Sha256 */
@@ -2994,6 +3117,63 @@ export interface components {
             available_at: string | null;
             /** Results */
             results: components["schemas"]["FactorResultItem"][];
+        };
+        /** FactorSaveCommandData */
+        FactorSaveCommandData: {
+            /** Command Id */
+            command_id: string;
+            /** Content Sha256 */
+            content_sha256?: string | null;
+            /**
+             * Current Head Updated
+             * @default false
+             */
+            current_head_updated: boolean;
+            /** Factor Id */
+            factor_id?: string | null;
+            /** Message */
+            message: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "rejected" | "pending" | "succeeded_waiting_publication" | "published" | "uncertain";
+            /** Version */
+            version?: number | null;
+        };
+        /**
+         * FactorSaveDraft
+         * @description The complete original browser request; no derived definition fields are accepted.
+         */
+        FactorSaveDraft: {
+            /** Category */
+            category: string;
+            /** Command Id */
+            command_id: string;
+            /**
+             * Direction
+             * @enum {string}
+             */
+            direction: "higher_is_better" | "lower_is_better";
+            expected_head: components["schemas"]["FactorHeadRef"] | null;
+            /** Expression */
+            expression: string;
+            /** Factor Id */
+            factor_id: string | null;
+            /** Generation Id */
+            generation_id: string;
+            /**
+             * Mode
+             * @enum {string}
+             */
+            mode: "create" | "edit";
+            /** Name Zh */
+            name_zh: string;
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
         };
         /** FieldExpr */
         FieldExpr: {
@@ -5581,6 +5761,13 @@ export interface components {
             /** Operand */
             operand: components["schemas"]["NumberExpr"] | components["schemas"]["FieldExpr"] | components["schemas"]["LocalExpr"] | components["schemas"]["UnaryExpr"] | components["schemas"]["BinaryExpr"] | components["schemas"]["CallExpr"];
         };
+        /** UnavailableFactorOperator */
+        UnavailableFactorOperator: {
+            /** Name */
+            name: string;
+            /** Reason Zh */
+            reason_zh: string;
+        };
         /** UnsupportedItem */
         UnsupportedItem: {
             /**
@@ -6057,6 +6244,26 @@ export interface operations {
             };
         };
     };
+    factor_capabilities_api_v1_factors_capabilities_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_FactorCapabilitiesData_"];
+                };
+            };
+        };
+    };
     list_factor_definitions_api_v1_factors_definitions_get: {
         parameters: {
             query?: {
@@ -6075,6 +6282,105 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_FactorCatalogData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    save_factor_draft_api_v1_factors_definitions_save_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["FactorSaveDraft"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_FactorSaveCommandData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    resume_factor_save_api_v1_factors_definitions_save_resume_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["FactorSaveDraft"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_FactorSaveCommandData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    retry_original_factor_save_api_v1_factors_definitions_save_retry_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["FactorSaveDraft"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_FactorSaveCommandData_"];
                 };
             };
             /** @description Validation Error */

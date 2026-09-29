@@ -119,6 +119,7 @@ def _read_catalog(borrowed: BorrowedGeneration | None) -> FactorCatalogData:
                     factor_id=row.factor_id,
                     content_sha256=row.content_sha256,
                     name_zh=row.name_zh,
+                    category=row.category,
                     category_label=_CATEGORY_LABELS.get(
                         row.category,
                         row.category
@@ -166,7 +167,14 @@ def list_factor_definitions(
                     and web.factor_admission is not None
                     and meta.state is ServingState.READY
                     and data.availability == "populated"
-                )
+                ),
+                "can_save": (
+                    viewer in web.settings.factor_editor_users
+                    and web.settings.factor_save_enabled
+                    and web.factor_admission is not None
+                    and meta.state is ServingState.READY
+                    and data.availability in {"empty", "populated"}
+                ),
             }
         )
     if meta.generation_id is not None:

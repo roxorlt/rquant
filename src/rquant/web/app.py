@@ -57,6 +57,7 @@ from rquant.web.routes import (
     data_audit_report_commands,
     experiments,
     factor_results,
+    factor_saves,
     factors,
     formula_market_commands,
     formula_market_read,
@@ -109,6 +110,7 @@ _WRITE_BODY_LIMITS = {
 _FACTOR_ARCHIVE_WRITE = re.compile(
     r"^/api/v1/factors/definitions/[a-z][a-z0-9_]{0,63}/archive(?:/resume)?$"
 )
+_FACTOR_SAVE_WRITE = re.compile(r"^/api/v1/factors/definitions/save(?:/(?:resume|retry))?$")
 
 
 def _utc_now() -> datetime:
@@ -314,6 +316,8 @@ def create_app(
         body_limit = _WRITE_BODY_LIMITS.get(request.url.path)
         if body_limit is None and _FACTOR_ARCHIVE_WRITE.fullmatch(request.url.path):
             body_limit = factors.MAX_ARCHIVE_REQUEST_BYTES
+        if body_limit is None and _FACTOR_SAVE_WRITE.fullmatch(request.url.path):
+            body_limit = factor_saves.MAX_SAVE_REQUEST_BYTES
         if request.method == "POST" and body_limit is not None:
             content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
             if content_type != "application/json":
@@ -409,6 +413,9 @@ def create_app(
         strategies.router, prefix="/api/v1", tags=["strategies"], dependencies=private
     )
     app.include_router(factors.router, prefix="/api/v1", tags=["factors"], dependencies=private)
+    app.include_router(
+        factor_saves.router, prefix="/api/v1", tags=["factors"], dependencies=private
+    )
     app.include_router(
         factor_results.router, prefix="/api/v1", tags=["factors"], dependencies=private
     )

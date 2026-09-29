@@ -47,6 +47,7 @@ from rquant.canvas_publication_receipt import (
 )
 from rquant.data_audit_contracts import MAX_AUDIT_DAYS
 from rquant.factor.definition import FactorDefinition
+from rquant.factor.draft import FactorSaveDraft, build_draft_definition, draft_sha256
 from rquant.factor.registry import FactorHeadRef, FactorRegistryIdentity
 from rquant.lab_job_protocol import LabCommand
 from rquant.llm.schemas import RuleCall
@@ -207,6 +208,10 @@ class ArchiveFactor(PageControlCommand):
 
 class _OwnedSaveFactorDefinition(SaveFactorDefinition):
     actor_id: OwnerId
+    # Optional only so pre-existing trusted local save payloads keep their original meaning.
+    registry_identity: FactorRegistryIdentity | None = None
+    original_request_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    original_generation_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
 
 class _OwnedArchiveFactor(ArchiveFactor):
@@ -1345,6 +1350,38 @@ class PageControlOutbox:
             )
         return stored, self._receipt(row)
 
+    def lookup_factor_save_command(
+        self, draft: FactorSaveDraft, *, authenticated_actor_id: str
+    ) -> tuple[_OwnedSaveFactorDefinition, PageControlReceipt] | None:
+        """Find only a save with this actor and complete original browser request."""
+        checked = FactorSaveDraft.model_validate(draft)
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM page_control_command WHERE command_id = ?",
+                (checked.command_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            stored = _COMMAND_ADAPTER.validate_json(row["payload_json"])
+        except ValueError as exc:
+            raise PageControlCommandConflictError("stored factor save command is invalid") from exc
+        if (
+            not isinstance(stored, _OwnedSaveFactorDefinition)
+            or row["command_kind"] != stored.kind
+            or stored.registry_identity is None
+            or stored.original_request_sha256 != draft_sha256(checked)
+            or stored.original_generation_id != checked.generation_id
+            or stored.actor_id != authenticated_actor_id
+            or stored.command_id != checked.command_id
+            or stored.requested_at != checked.requested_at
+            or _command_hash(stored) != row["command_hash"]
+        ):
+            raise PageControlCommandConflictError(
+                "command_id already exists with different payload or actor"
+            )
+        return stored, self._receipt(row)
+
     def acknowledgment(self, alert_id: str) -> AlertAcknowledgment | None:
         with self._connect() as connection:
             row = connection.execute(
@@ -2347,6 +2384,11 @@ class PageControlConsumer:
     def drain_factor_archive_command(
         self, command: _OwnedArchiveFactor
     ) -> tuple[PageControlReceipt, ...]:
+        return self.drain_factor_definition_command(command)
+
+    def drain_factor_definition_command(
+        self, command: _OwnedFactorDefinitionValue
+    ) -> tuple[PageControlReceipt, ...]:
         with _PageControlExecutionMutex(self._consumer_mutex_path()) as acquired:
             if not acquired:
                 return ()
@@ -2361,7 +2403,7 @@ class PageControlConsumer:
                 return ()
             claim = claims[0]
             if claim.command != command:
-                raise PageControlCommandConflictError("factor archive changed before claim")
+                raise PageControlCommandConflictError("factor command changed before claim")
             return self._complete_claims((claim,))
 
     def _drain_locked(self, *, limit: int) -> tuple[PageControlReceipt, ...]:
@@ -2463,9 +2505,9 @@ class PageControlConsumer:
             if effect.result is None:
                 try:
                     identity = self._factor_definition_backend().identity()
-                    if isinstance(command, _OwnedArchiveFactor):
+                    if command.registry_identity is not None:
                         if identity != command.registry_identity:
-                            raise ValueError("factor registry changed after archive admission")
+                            raise ValueError("factor registry changed after admission")
                         identity = command.registry_identity
                     effect = self.outbox.record_started_effect_result(
                         command.command_id,
@@ -4264,6 +4306,62 @@ class PageControlService:
             factor_archive_command=owned,
         )
 
+    def _submit_trusted_factor_save(
+        self,
+        draft: FactorSaveDraft,
+        *,
+        authenticated_actor_id: str,
+        verified_registry_instance_id: str,
+    ) -> PageControlReceipt:
+        checked = FactorSaveDraft.model_validate(draft)
+        identity = self.consumer._factor_definition_backend().identity()
+        if identity.instance_id != verified_registry_instance_id:
+            raise ValueError("factor registry differs from verified Serving projection")
+        command = SaveFactorDefinition(
+            command_id=checked.command_id,
+            requested_at=checked.requested_at,
+            definition=build_draft_definition(
+                checked, authenticated_actor_id=authenticated_actor_id
+            ),
+            expected_head=checked.expected_head,
+        )
+        owned = _owned_factor_definition_command(
+            command, authenticated_actor_id=authenticated_actor_id, registry_identity=identity
+        )
+        assert isinstance(owned, _OwnedSaveFactorDefinition)
+        owned = owned.model_copy(
+            update={
+                "original_request_sha256": draft_sha256(checked),
+                "original_generation_id": checked.generation_id,
+            }
+        )
+        if self.consumer._factor_definition_backend().identity() != identity:
+            raise ValueError("factor registry changed before save enqueue")
+        return self._settle(
+            owned,
+            self.outbox.enqueue_trusted_factor_definition(owned),
+            factor_archive_command=owned,
+        )
+
+    def _lookup_trusted_factor_save(
+        self, draft: FactorSaveDraft, *, authenticated_actor_id: str
+    ) -> PageControlReceipt | None:
+        matched = self.outbox.lookup_factor_save_command(
+            draft, authenticated_actor_id=authenticated_actor_id
+        )
+        return None if matched is None else matched[1]
+
+    def _resume_trusted_factor_save(
+        self, draft: FactorSaveDraft, *, authenticated_actor_id: str
+    ) -> PageControlReceipt:
+        matched = self.outbox.lookup_factor_save_command(
+            draft, authenticated_actor_id=authenticated_actor_id
+        )
+        if matched is None:
+            raise KeyError("factor save command not found")
+        owned, receipt = matched
+        return self._settle(owned, receipt, factor_archive_command=owned)
+
     def _lookup_trusted_factor_archive(
         self, command: ArchiveFactor, *, authenticated_actor_id: str
     ) -> PageControlReceipt | None:
@@ -4304,13 +4402,13 @@ class PageControlService:
         receipt: PageControlReceipt,
         *,
         price_rule_command: _OwnedPriceAlertRuleValue | None = None,
-        factor_archive_command: _OwnedArchiveFactor | None = None,
+        factor_archive_command: _OwnedFactorDefinitionValue | None = None,
     ) -> PageControlReceipt:
         for _ in range(100):
             if receipt.status in _PAGE_CONTROL_TERMINAL_STATUSES:
                 return receipt
             if factor_archive_command is not None:
-                drained = self.consumer.drain_factor_archive_command(factor_archive_command)
+                drained = self.consumer.drain_factor_definition_command(factor_archive_command)
             elif price_rule_command is not None:
                 drained = self.consumer.drain_price_rule_command(price_rule_command)
             else:

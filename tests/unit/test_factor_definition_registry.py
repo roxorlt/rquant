@@ -115,6 +115,72 @@ def test_known_date_definition_retains_legacy_content_digest(tmp_path: Path) -> 
     )
 
 
+def test_new_head_capacity_is_enforced_in_save_transaction_and_edit_remains_allowed(
+    tmp_path: Path,
+) -> None:
+    registry = _store(tmp_path / "bounded.sqlite3")
+    identity = registry.identity()
+    for index in range(512):
+        registry.save(
+            SaveFactorDefinitionRequest(
+                command_id=f"bounded-{index}",
+                definition=_definition(factor_id=f"factor_{index}"),
+                expected_head=None,
+            ),
+            expected_identity=identity,
+        )
+    with pytest.raises(FactorConflictError):
+        registry.save(
+            SaveFactorDefinitionRequest(
+                command_id="bounded-513",
+                definition=_definition(factor_id="factor_512"),
+                expected_head=None,
+            ),
+            expected_identity=identity,
+        )
+    assert registry.get_head("factor_512", expected_identity=identity) is None
+    original = registry.get_head("factor_0", expected_identity=identity)
+    assert original is not None
+    edited = registry.save(
+        SaveFactorDefinitionRequest(
+            command_id="bounded-edit",
+            definition=_definition(factor_id="factor_0", version=2),
+            expected_head=FactorHeadRef(version=1, content_sha256=original.content_sha256),
+        ),
+        expected_identity=identity,
+    )
+    assert edited.version == 2
+
+
+def test_archived_head_cannot_be_edited_back_into_current_status(tmp_path: Path) -> None:
+    registry = _store(tmp_path / "archived.sqlite3")
+    identity = registry.identity()
+    first = registry.save(
+        SaveFactorDefinitionRequest(
+            command_id="archived-first", definition=_definition(), expected_head=None
+        ),
+        expected_identity=identity,
+    )
+    ref = FactorHeadRef(version=1, content_sha256=first.content_sha256)
+    registry.archive(
+        ArchiveFactorRequest(
+            command_id="archived-event", factor_id="price_volume_1", expected_head=ref
+        ),
+        expected_identity=identity,
+    )
+    with pytest.raises(FactorConflictError):
+        registry.save(
+            SaveFactorDefinitionRequest(
+                command_id="archived-edit",
+                definition=_definition(version=2),
+                expected_head=ref,
+            ),
+            expected_identity=identity,
+        )
+    head = registry.get_head("price_volume_1", expected_identity=identity)
+    assert head is not None and head.head.archived and head.definition.version == 1
+
+
 def _save(
     registry: FactorDefinitionRegistry,
     command_id: str,
@@ -181,12 +247,9 @@ def test_save_cas_replay_after_advance_and_archival_preserves_original_receipt(
     with pytest.raises(FactorConflictError):
         _save(registry, "command-a", _definition(name="重放异载荷"))
 
-    reactivated = _save(
-        registry, "command-d", _definition(version=3, name="重新启用"), _ref(registry)
-    )
-    assert reactivated.version == 3
-    assert not reactivated.archived
-    assert len(_list(registry)) == 1
+    with pytest.raises(FactorConflictError):
+        _save(registry, "command-d", _definition(version=3, name="重新启用"), _ref(registry))
+    assert _list(registry) == ()
 
 
 def test_stale_or_missing_expected_head_rejects_new_command(tmp_path: Path) -> None:
@@ -215,21 +278,25 @@ def test_stale_or_missing_expected_head_rejects_new_command(tmp_path: Path) -> N
     assert _head(registry, "price_volume_1").content_sha256 == first.content_sha256
 
 
-def test_archive_replay_after_new_save_returns_original_archive_receipt(tmp_path: Path) -> None:
+def test_archive_replay_after_other_factor_save_returns_original_archive_receipt(
+    tmp_path: Path,
+) -> None:
     registry = _store(tmp_path / "factors.sqlite3")
     _save(registry, "first", _definition())
     request = ArchiveFactorRequest(
         command_id="archive", factor_id="price_volume_1", expected_head=_ref(registry)
     )
     receipt = _archive_request(registry, request)
-    _save(registry, "second", _definition(version=2), _ref(registry))
+    _save(registry, "second", _definition(factor_id="other_factor"))
     assert _archive_request(registry, request) == receipt
-    assert receipt.archived and not _head(registry, "price_volume_1").head.archived
+    assert receipt.archived and _head(registry, "price_volume_1").head.archived
     with pytest.raises(FactorConflictError):
         _archive_request(
             registry,
             ArchiveFactorRequest(
-                command_id="archive", factor_id="price_volume_1", expected_head=_ref(registry)
+                command_id="archive",
+                factor_id="other_factor",
+                expected_head=_ref(registry, "other_factor"),
             ),
         )
 

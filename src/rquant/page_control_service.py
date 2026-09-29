@@ -346,6 +346,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--factor-archive-web-uid", type=int)
     parser.add_argument("--factor-archive-shared-gid", type=int)
     parser.add_argument("--factor-archive-editors")
+    parser.add_argument("--factor-save-enabled", action="store_true")
     return parser
 
 
@@ -365,6 +366,7 @@ def main(
     factor_archive_web_uid: int | None = None,
     factor_archive_shared_gid: int | None = None,
     factor_archive_editors: str | None = None,
+    factor_save_enabled: bool = False,
     formula_market_config_path: Path | None = None,
 ) -> None:
     """Entry point. `argv` is what the runtime wrapper derived; keywords are for tests."""
@@ -408,6 +410,7 @@ def main(
             else arguments.factor_archive_shared_gid
         )
         factor_archive_editors = factor_archive_editors or arguments.factor_archive_editors
+        factor_save_enabled = factor_save_enabled or arguments.factor_save_enabled
     return _serve(
         runtime_root=runtime_root,
         expected_commit=expected_commit,
@@ -422,6 +425,7 @@ def main(
         factor_archive_web_uid=factor_archive_web_uid,
         factor_archive_shared_gid=factor_archive_shared_gid,
         factor_archive_editors=factor_archive_editors,
+        factor_save_enabled=factor_save_enabled,
         formula_market_config_path=formula_market_config_path,
     )
 
@@ -441,6 +445,7 @@ def _serve(
     factor_archive_web_uid: int | None = None,
     factor_archive_shared_gid: int | None = None,
     factor_archive_editors: str | None = None,
+    factor_save_enabled: bool = False,
     formula_market_config_path: Path | None = None,
 ) -> None:
     from rquant.runtime_deployment_profile import (
@@ -548,6 +553,8 @@ def _serve(
         value is not None for value in factor_fields
     ):
         raise ValueError("factor archive listener requires socket, registry, IDs and editors")
+    if factor_save_enabled and not all(value is not None for value in factor_fields):
+        raise ValueError("factor save requires the private factor listener")
     factor_backend = None
     factor_editor_users: frozenset[str] = frozenset()
     if all(value is not None for value in factor_fields):
@@ -632,7 +639,9 @@ def _serve(
             )
 
             factor_archive_server = build_factor_definition_admission_server(
-                FactorDefinitionAdmission(service, editor_users=factor_editor_users),
+                FactorDefinitionAdmission(
+                    service, editor_users=factor_editor_users, save_enabled=factor_save_enabled
+                ),
                 socket_path=factor_archive_socket_path,
                 trusted_web_uid=factor_archive_web_uid,
                 shared_gid=factor_archive_shared_gid,
