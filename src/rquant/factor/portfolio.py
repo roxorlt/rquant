@@ -1,4 +1,4 @@
-"""Pure quantile research curves from complete, non-overlapping observations."""
+"""Pure quantile research curves from paired, non-overlapping observations."""
 
 from __future__ import annotations
 
@@ -89,8 +89,9 @@ def _target_weight_change(previous: tuple[str, ...], current: tuple[str, ...]) -
 
 
 def _common_window(samples: list[FactorSample], universe: set[str]) -> tuple[datetime, datetime]:
-    if len(samples) != len(universe) or {sample.stock_code for sample in samples} != universe:
-        raise ValueError("each decision date must cover the complete universe")
+    members = {sample.stock_code for sample in samples}
+    if not samples or len(members) != len(samples) or not members <= universe:
+        raise ValueError("each decision date needs a nonempty subset of the universe")
     decision_at = samples[0].decision_at
     return_end_at = samples[0].return_end_at
     if any(sample.decision_at != decision_at for sample in samples):

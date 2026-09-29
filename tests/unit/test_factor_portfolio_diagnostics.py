@@ -93,6 +93,53 @@ def test_three_stock_two_period_curves_are_compounded_in_time_order() -> None:
     )
 
 
+def test_fixed_universe_valid_subsets_compound_groups_and_target_weight_changes() -> None:
+    from rquant.factor.portfolio import evaluate_factor_portfolios
+
+    samples = (
+        _sample("A", 1, 0.1),
+        _sample("B", 2, 0.2),
+        _sample("C", 3, 0.3),
+        _sample("A", 1, 0.05, decision_at=SECOND),
+        _sample("C", 2, -0.1, decision_at=SECOND),
+        _sample("D", 3, 0.2, decision_at=SECOND),
+    )
+    first, second = evaluate_factor_portfolios(
+        _input(tuple(reversed(samples)), universe=("A", "B", "C", "D"))
+    ).days
+
+    assert [day.source_sample_count for day in (first, second)] == [3, 3]
+    assert [group.period_return for group in first.groupings[0].groups] == pytest.approx(
+        [0.1, 0.2, 0.3]
+    )
+    assert [group.period_return for group in second.groupings[0].groups] == pytest.approx(
+        [0.05, -0.1, 0.2]
+    )
+    assert [group.cumulative_return for group in second.groupings[0].groups] == pytest.approx(
+        [0.155, 0.08, 0.56]
+    )
+    assert [group.target_weight_turnover for group in second.groupings[0].groups] == [0, 1, 1]
+    assert all(group.status == "insufficient_samples" for group in second.groupings[1:])
+
+
+def test_partial_day_below_three_keeps_explicit_insufficient_grouping() -> None:
+    from rquant.factor.portfolio import evaluate_factor_portfolios
+
+    samples = tuple(
+        _sample(code, factor, 0, decision_at=decision_at)
+        for decision_at, stocks in (
+            (FIRST, (("A", 1), ("B", 2), ("C", 3))),
+            (SECOND, (("A", 1), ("B", 2))),
+        )
+        for code, factor in stocks
+    )
+    first, second = evaluate_factor_portfolios(_input(samples, universe=("A", "B", "C"))).days
+
+    assert first.groupings[0].status == "ok"
+    assert second.source_sample_count == 2
+    assert all(group.status == "insufficient_samples" for group in second.groupings)
+
+
 def test_direction_tie_order_and_group_sizes_match_existing_evaluator() -> None:
     from rquant.factor.evaluate import evaluate_factor
     from rquant.factor.portfolio import evaluate_factor_portfolios
@@ -165,7 +212,6 @@ def test_ten_group_partition_has_no_empty_group_with_eleven_stocks() -> None:
 @pytest.mark.parametrize(
     ("mutate", "message"),
     [
-        (lambda rows: rows[:-1], "complete universe"),
         (
             lambda rows: (
                 rows[:-1] + (_sample("C", 3, 0.3, decision_at=SECOND + timedelta(minutes=1)),)
