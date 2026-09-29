@@ -68,7 +68,7 @@ export default function StrategiesPage() {
   return (
     <>
       <PageHeader eyebrow="策略与验证" title="策略" note="已核验的策略定义与当前参数" />
-      {meta.data === undefined && meta.isError ? (
+      {meta.isError ? (
         <Panel>
           <div className="strategy-state" role="alert">
             <p>策略目录暂时无法核对，请稍后重试。</p>

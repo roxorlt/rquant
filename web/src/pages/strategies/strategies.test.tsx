@@ -139,4 +139,23 @@ describe("策略目录", () => {
     await user.click(screen.getByRole("button", { name: "重新加载" }));
     expect(await screen.findByRole("table", { name: "策略列表" })).toBeInTheDocument();
   });
+
+  it("网页状态轮询失败后隐藏旧详情，恢复时重新核对", async () => {
+    publish();
+    const user = userEvent.setup();
+    const view = renderApp("/strategies");
+    expect(await screen.findByRole("table", { name: "当前参数" })).toHaveTextContent("1.5%");
+
+    server.use(http.get("*/api/v1/meta", () => new HttpResponse(null, { status: 503 })));
+    await act(async () => {
+      await view.queryClient.invalidateQueries({ queryKey: ["meta"] });
+    });
+    expect(await screen.findByText("策略目录暂时无法核对，请稍后重试。")).toBeInTheDocument();
+    expect(screen.queryByRole("table", { name: "策略列表" })).toBeNull();
+    expect(screen.queryByRole("table", { name: "当前参数" })).toBeNull();
+
+    server.use(metaHandler(metaEnvelope()));
+    await user.click(screen.getByRole("button", { name: "重新加载" }));
+    expect(await screen.findByRole("table", { name: "当前参数" })).toHaveTextContent("1.5%");
+  });
 });
