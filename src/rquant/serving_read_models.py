@@ -972,6 +972,38 @@ PAGE_PROJECTION_CONTRACTS: Mapping[str, ServingProjectionContract] = MappingProx
             event_date_columns=("range_start", "range_end"),
             event_time_columns=("as_of_time", "completed_at"),
         ),
+        "factor_definition_state": _contract(
+            "lab_jobs",
+            (
+                ("status_key", "string"),
+                ("status", "string"),
+                ("definition_count", "int"),
+                ("registry_instance_id", "string"),
+                ("snapshot_sha256", "string"),
+            ),
+            ("status_key",),
+            max_rows=1,
+            max_bytes=2 * 1024,
+        ),
+        "factor_definition": _contract(
+            "lab_jobs",
+            (
+                ("factor_id", "string"),
+                ("version", "int"),
+                ("content_sha256", "string"),
+                ("name_zh", "string"),
+                ("category", "string"),
+                ("direction", "string"),
+                ("expression", "string"),
+                ("earliest_available_date", "date"),
+                ("dependency_columns_json", "string"),
+                ("max_history_window", "int"),
+                ("archived", "bool"),
+            ),
+            ("factor_id",),
+            max_rows=512,
+            max_bytes=2 * 1024 * 1024,
+        ),
         "data_audit_status": _contract(
             "lab_jobs",
             (
@@ -1824,6 +1856,16 @@ class ServingReadModelInput(RuntimeContractModel):
             )
 
             validate_price_alert_rule_projections(
+                {projection.table_name: projection for projection in self.projections}
+            )
+
+        if any(
+            projection.table_name in {"factor_definition_state", "factor_definition"}
+            for projection in self.projections
+        ):
+            from rquant.factor.serving_projection import validate_factor_definition_projections
+
+            validate_factor_definition_projections(
                 {projection.table_name: projection for projection in self.projections}
             )
 

@@ -53,7 +53,7 @@ def test_serving_physical_table_specs_have_a_canonical_fingerprint() -> None:
     second = serving_physical_table_specs_fingerprint()
 
     assert first == second
-    assert first == "02317a67322fa4021a25aa9f5450682be08b96924368a50c06b9b262c4bea665"
+    assert first == "ae30c5efd0a226c457262f37daaa4f8e68e4069e8bcdb70ea5df77735b93d805"
 
 
 def _signal() -> SignalEnvelope:
