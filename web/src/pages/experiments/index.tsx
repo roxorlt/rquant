@@ -99,7 +99,7 @@ const resultColumns: DataColumn<ExperimentItem>[] = [
 
 export default function ExperimentsPage() {
   const meta = useCurrentMeta();
-  const generationId = meta.data?.data.generation?.generation_id ?? null;
+  const generationId = meta.isError ? null : (meta.data?.data.generation?.generation_id ?? null);
   const [pageState, setPageState] = useState<{
     generationId: string | null;
     cursors: (string | null)[];
@@ -174,8 +174,12 @@ export default function ExperimentsPage() {
             </Button>
           </div>
         </Panel>
-      ) : query.isLoading ? (
+      ) : meta.data === undefined || (generationId !== null && query.isLoading) ? (
         <PageSkeleton label="正在加载实验记录" />
+      ) : generationId === null ? (
+        <Panel>
+          <EmptyState title="实验记录暂时不可用" hint="数据恢复后会显示，请稍后刷新。" />
+        </Panel>
       ) : query.error ? (
         <Panel>
           <div className="exp-message" role="alert">

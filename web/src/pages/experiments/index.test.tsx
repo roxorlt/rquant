@@ -33,6 +33,73 @@ const second: Schemas["ExperimentItem"] = {
 };
 
 describe("实验记录", () => {
+  it("元数据未返回前不请求或展示实验，核验后只请求当前数据代", async () => {
+    const generation = "f".repeat(64);
+    let releaseMeta = () => {};
+    const metaGate = new Promise<void>((resolve) => {
+      releaseMeta = resolve;
+    });
+    const requests: (string | null)[] = [];
+    server.use(
+      http.get("*/api/v1/meta", async () => {
+        await metaGate;
+        return HttpResponse.json(metaEnvelope({ generationId: generation }));
+      }),
+      http.get("*/api/v1/experiments", ({ request }) => {
+        requests.push(new URL(request.url).searchParams.get("generation_id"));
+        return HttpResponse.json({
+          data: {
+            available: true,
+            items: [first],
+            retained_count: 1,
+            truncated: false,
+            oldest_registered_at: first.registered_at,
+            next_cursor: null,
+          },
+          serving: metaEnvelope({ generationId: generation }).serving,
+        });
+      }),
+    );
+    renderApp("/experiments");
+    expect(await screen.findByRole("heading", { name: "实验记录", level: 1 })).toBeVisible();
+    expect(await screen.findByRole("status", { name: "正在加载实验记录" })).toBeVisible();
+    expect(screen.queryByRole("table", { name: "实验记录" })).not.toBeInTheDocument();
+    expect(requests).toEqual([]);
+
+    releaseMeta();
+    expect(await screen.findByRole("table", { name: "实验记录" })).toBeVisible();
+    expect(requests).toEqual([generation]);
+  });
+
+  it("元数据没有可用数据代时不请求或展示实验", async () => {
+    const noGeneration = metaEnvelope();
+    noGeneration.data.generation = null;
+    noGeneration.serving = { ...noGeneration.serving, generation_id: null, state: "unavailable" };
+    const requests: string[] = [];
+    server.use(
+      metaHandler(noGeneration),
+      http.get("*/api/v1/experiments", ({ request }) => {
+        requests.push(request.url);
+        return HttpResponse.json({
+          data: {
+            available: true,
+            items: [first],
+            retained_count: 1,
+            truncated: false,
+            oldest_registered_at: first.registered_at,
+            next_cursor: null,
+          },
+          serving,
+        });
+      }),
+    );
+    renderApp("/experiments");
+    expect(await screen.findByText("实验记录暂时不可用")).toBeVisible();
+    expect(screen.queryByRole("table", { name: "实验记录" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "实验对比" })).not.toBeInTheDocument();
+    expect(requests).toEqual([]);
+  });
+
   it("展示真实结果、未发布字段和稳定分页，不把内部编号放进正文", async () => {
     const requests: string[] = [];
     server.use(
@@ -196,37 +263,52 @@ describe("实验记录", () => {
     expect(screen.getByRole("button", { name: "对比所选" })).toBeDisabled();
   });
 
-  it("Serving 换代时隐藏旧选择与对比结果", async () => {
-    let generation = serving.generation_id;
+  it("已核验的数据代变化时直接隐藏旧记录与对比，再展示新代结果", async () => {
+    const firstGeneration = serving.generation_id;
+    const nextGeneration = "f".repeat(64);
+    let releaseNext = () => {};
+    const nextGate = new Promise<void>((resolve) => {
+      releaseNext = resolve;
+    });
+    const requests: (string | null)[] = [];
     server.use(
-      http.get("*/api/v1/experiments", () =>
-        HttpResponse.json({
+      http.get("*/api/v1/experiments", async ({ request }) => {
+        const generation = new URL(request.url).searchParams.get("generation_id");
+        requests.push(generation);
+        if (generation === nextGeneration) await nextGate;
+        return HttpResponse.json({
           data: {
             available: true,
-            items: [first, second],
-            retained_count: 2,
+            items: generation === nextGeneration ? [second] : [first, second],
+            retained_count: generation === nextGeneration ? 1 : 2,
             truncated: false,
             oldest_registered_at: second.registered_at,
             next_cursor: null,
           },
           serving: { ...serving, generation_id: generation },
-        }),
-      ),
+        });
+      }),
     );
     const user = userEvent.setup();
     const { queryClient } = renderApp("/experiments");
+    await waitFor(() => expect(requests).toContain(firstGeneration));
     const table = await screen.findByRole("table", { name: "实验记录" });
     await user.click(within(table).getByRole("checkbox", { name: "选择均线研究" }));
     await user.click(within(table).getByRole("checkbox", { name: "选择突破研究" }));
     await user.click(screen.getByRole("button", { name: "对比所选" }));
     expect(screen.getByRole("region", { name: "实验对比" })).toBeVisible();
 
-    generation = "f".repeat(64);
-    const changed = metaEnvelope({ generationId: generation });
+    const changed = metaEnvelope({ generationId: nextGeneration });
     server.use(metaHandler(changed));
     act(() => queryClient.setQueryData(META_QUERY_KEY, changed));
-    await waitFor(() => expect(screen.getByRole("button", { name: "对比所选" })).toBeDisabled());
+    expect(await screen.findByRole("status", { name: "正在加载实验记录" })).toBeVisible();
+    expect(screen.queryByRole("table", { name: "实验记录" })).not.toBeInTheDocument();
     expect(screen.queryByRole("region", { name: "实验对比" })).not.toBeInTheDocument();
+    releaseNext();
+    expect(await screen.findByRole("table", { name: "实验记录" })).toHaveTextContent("突破研究");
+    expect(screen.getByRole("table", { name: "实验记录" })).not.toHaveTextContent("均线研究");
+    expect(screen.getByRole("button", { name: "对比所选" })).toBeDisabled();
+    expect(requests).toEqual([firstGeneration, nextGeneration]);
   });
 
   it("元数据首次成功后轮询失败时隐藏旧实验对比，恢复后可重新加载", async () => {
