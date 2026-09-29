@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from rquant.research_lake import ResearchDataset
 
 SUSPENSION_SESSION_EVIDENCE_DATASET = "stock_suspend_session_evidence"
+FACTOR_EVAL_CONTRACT_VERSION = "factor-eval-v1"
 
 
 class _DependencyModel(BaseModel):
@@ -23,6 +24,27 @@ class StrategyTableDependency(_DependencyModel):
     date_column: str | None = None
     code_column: str | None = None
     available_at_column: str | None = None
+
+
+_FACTOR_TABLE_DEPENDENCIES = (
+    StrategyTableDependency(
+        dataset_id="daily_bar",
+        table_name="daily_bar",
+        date_column="trade_date",
+        code_column="ts_code",
+    ),
+    StrategyTableDependency(
+        dataset_id="adj_factor",
+        table_name="adj_factor",
+        date_column="trade_date",
+        code_column="ts_code",
+    ),
+    StrategyTableDependency(
+        dataset_id="trade_calendar",
+        table_name="trade_calendar",
+        date_column="cal_date",
+    ),
+)
 
 
 class BoundStrategyEligibility(_DependencyModel):
@@ -83,11 +105,17 @@ def query_bound_strategy_eligibility(
 class StrategyExecutionDependencies(_DependencyModel):
     strategy_id: str = Field(min_length=1)
     contract_version: str = Field(min_length=1)
-    lake_datasets: tuple[ResearchDataset, ...] = Field(min_length=1)
+    lake_datasets: tuple[ResearchDataset, ...]
     materialized_tables: tuple[StrategyTableDependency, ...] = Field(min_length=1)
 
     @model_validator(mode="after")
     def validate_unique_dependencies(self) -> StrategyExecutionDependencies:
+        if not self.lake_datasets and (
+            self.strategy_id != "factor_eval"
+            or self.contract_version != FACTOR_EVAL_CONTRACT_VERSION
+            or self.materialized_tables != _FACTOR_TABLE_DEPENDENCIES
+        ):
+            raise ValueError("lake_datasets may be empty only for the exact factor_eval contract")
         if len(self.lake_datasets) != len(set(self.lake_datasets)):
             raise ValueError("lake_datasets must be unique")
         table_names = [item.table_name for item in self.materialized_tables]
@@ -184,6 +212,17 @@ STRATEGY_EXECUTION_DEPENDENCIES: dict[str, StrategyExecutionDependencies] = {
         ),
     ),
 }
+
+FACTOR_EVAL_DEPENDENCIES = StrategyExecutionDependencies(
+    strategy_id="factor_eval",
+    contract_version=FACTOR_EVAL_CONTRACT_VERSION,
+    lake_datasets=(),
+    materialized_tables=_FACTOR_TABLE_DEPENDENCIES,
+)
+
+
+def factor_execution_dependencies() -> StrategyExecutionDependencies:
+    return FACTOR_EVAL_DEPENDENCIES
 
 
 def strategy_execution_dependencies(
