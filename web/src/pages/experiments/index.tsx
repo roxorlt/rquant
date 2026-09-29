@@ -38,7 +38,7 @@ function coverageStartText(at: string | null): string {
   return `最早登记于 ${formatShanghaiDateTime(date).slice(0, 16)}（北京时间）`;
 }
 
-const columns: DataColumn<ExperimentItem>[] = [
+const resultColumns: DataColumn<ExperimentItem>[] = [
   {
     id: "family",
     header: "研究假设",
@@ -104,10 +104,55 @@ export default function ExperimentsPage() {
     generationId: string | null;
     cursors: (string | null)[];
   }>({ generationId: null, cursors: [null] });
+  const [selectionState, setSelectionState] = useState<{
+    generationId: string | null;
+    items: ExperimentItem[];
+  }>({ generationId: null, items: [] });
+  const [comparison, setComparison] = useState<{
+    generationId: string | null;
+    ids: string[];
+  } | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
   const cursors = pageState.generationId === generationId ? pageState.cursors : [null];
+  const selected = selectionState.generationId === generationId ? selectionState.items : [];
+  const compareOpen =
+    selected.length === 2 &&
+    comparison?.generationId === generationId &&
+    comparison.ids.every((id, index) => id === selected[index]?.experiment_id);
   const page = cursors.length;
   const query = useExperiments(cursors[page - 1] ?? null, generationId, refreshKey);
+
+  const toggleSelected = (item: ExperimentItem) => {
+    const hasItem = selected.some((entry) => entry.experiment_id === item.experiment_id);
+    const items = hasItem
+      ? selected.filter((entry) => entry.experiment_id !== item.experiment_id)
+      : selected.length < 2
+        ? [...selected, item]
+        : selected;
+    setSelectionState({ generationId, items });
+    setComparison(null);
+  };
+
+  const columns: DataColumn<ExperimentItem>[] = [
+    {
+      id: "select",
+      header: "选择",
+      value: () => null,
+      cell: (item) => {
+        const checked = selected.some((entry) => entry.experiment_id === item.experiment_id);
+        return (
+          <input
+            type="checkbox"
+            aria-label={`选择${item.hypothesis_family}`}
+            checked={checked}
+            disabled={!checked && selected.length >= 2}
+            onChange={() => toggleSelected(item)}
+          />
+        );
+      },
+    },
+    ...resultColumns,
+  ];
 
   const previous = () => setPageState({ generationId, cursors: cursors.slice(0, -1) });
 
@@ -155,43 +200,108 @@ export default function ExperimentsPage() {
           ) : null}
         </Panel>
       ) : (
-        <Panel
-          title="实验记录"
-          sub="列表显示研究假设；策略显示名、参数、夏普、年化、备注暂无可信记录"
-          flush
-        >
-          {query.data.truncated ? (
-            <p className="exp-window" role="status">
-              仅显示最近 {formatCount(query.data.retained_count)} 条实验 ·{" "}
-              {coverageStartText(query.data.oldest_registered_at)}
-            </p>
+        <>
+          <Panel title="实验记录" sub="仅展示已发布的结果" flush>
+            {query.data.truncated ? (
+              <p className="exp-window" role="status">
+                仅显示最近 {formatCount(query.data.retained_count)} 条实验 ·{" "}
+                {coverageStartText(query.data.oldest_registered_at)}
+              </p>
+            ) : null}
+            <div className="exp-select-bar">
+              <div className="exp-selected" aria-live="polite">
+                {selected.length === 0 ? (
+                  <span>选择两条实验进行对比</span>
+                ) : (
+                  selected.map((item) => (
+                    <Button
+                      key={item.experiment_id}
+                      variant="ghost"
+                      size="sm"
+                      aria-label={`移除${item.hypothesis_family}`}
+                      onClick={() => toggleSelected(item)}
+                    >
+                      {item.hypothesis_family} <span aria-hidden="true">×</span>
+                    </Button>
+                  ))
+                )}
+              </div>
+              <Button
+                size="sm"
+                disabled={selected.length !== 2}
+                disabledReason={selected.length !== 2 ? "请选择两条实验" : undefined}
+                onClick={() =>
+                  setComparison({ generationId, ids: selected.map((item) => item.experiment_id) })
+                }
+              >
+                对比所选
+              </Button>
+            </div>
+            <DataTable
+              rows={query.data.items}
+              columns={columns}
+              rowKey={(item) => item.experiment_id}
+              label="实验记录"
+              emptyText="这一页没有更多实验"
+            />
+            <div className="exp-pages">
+              <span className="exp-count">
+                第 {formatCount(page)} 页 · 最近 {formatCount(query.data.retained_count)} 条
+              </span>
+              <Button size="sm" disabled={page === 1} onClick={previous}>
+                上一页
+              </Button>
+              <Button
+                size="sm"
+                disabled={query.data.next_cursor === null}
+                onClick={() => {
+                  const next = query.data?.next_cursor;
+                  if (next) setPageState({ generationId, cursors: [...cursors, next] });
+                }}
+              >
+                下一页
+              </Button>
+            </div>
+          </Panel>
+          {compareOpen ? (
+            <Panel title="实验对比" label="实验对比" sub="并排查看已发布结果">
+              <div className="exp-compare-grid">
+                {selected.map((item) => {
+                  const state = statusLabel[item.status];
+                  return (
+                    <article className="exp-compare-card" key={item.experiment_id}>
+                      <div className="exp-compare-heading">
+                        <h3>{item.hypothesis_family}</h3>
+                        <Pill kind={state.kind}>{state.label}</Pill>
+                      </div>
+                      <dl>
+                        <div>
+                          <dt>净收益</dt>
+                          <dd>
+                            <ChangeText value={item.net_return_pct} />
+                          </dd>
+                        </div>
+                        <div>
+                          <dt>最大回撤</dt>
+                          <dd>{formatPercent(item.max_drawdown_pct)}</dd>
+                        </div>
+                        <div>
+                          <dt>胜率</dt>
+                          <dd>{formatPercent(item.win_rate_pct)}</dd>
+                        </div>
+                        <div>
+                          <dt>交易数</dt>
+                          <dd>{formatCount(item.trade_count)}</dd>
+                        </div>
+                      </dl>
+                    </article>
+                  );
+                })}
+              </div>
+              <p className="exp-compare-note">样本与成本口径尚未发布，暂不计算差值。</p>
+            </Panel>
           ) : null}
-          <DataTable
-            rows={query.data.items}
-            columns={columns}
-            rowKey={(item) => item.experiment_id}
-            label="实验记录"
-            emptyText="这一页没有更多实验"
-          />
-          <div className="exp-pages">
-            <span className="exp-count">
-              第 {formatCount(page)} 页 · 最近 {formatCount(query.data.retained_count)} 条
-            </span>
-            <Button size="sm" disabled={page === 1} onClick={previous}>
-              上一页
-            </Button>
-            <Button
-              size="sm"
-              disabled={query.data.next_cursor === null}
-              onClick={() => {
-                const next = query.data?.next_cursor;
-                if (next) setPageState({ generationId, cursors: [...cursors, next] });
-              }}
-            >
-              下一页
-            </Button>
-          </div>
-        </Panel>
+        </>
       )}
     </>
   );

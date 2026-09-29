@@ -15,6 +15,83 @@
   font-size: 12px;
 }
 
+.exp-select-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 16px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--rule);
+}
+
+.exp-selected {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.exp-compare-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.exp-compare-card {
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+}
+
+.exp-compare-heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.exp-compare-heading h3 {
+  margin: 0;
+  font-size: 14px;
+  overflow-wrap: anywhere;
+}
+
+.exp-compare-card dl {
+  display: grid;
+  gap: 8px;
+  margin: 14px 0 0;
+}
+
+.exp-compare-card dl > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  border-top: 1px solid var(--rule);
+  padding-top: 8px;
+}
+
+.exp-compare-card dt {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.exp-compare-card dd {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.exp-compare-note {
+  margin: 12px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .exp-pages,
 .exp-actions,
 .exp-message {
@@ -44,6 +121,12 @@
 }
 
 @media (max-width: 760px) {
+  .exp-select-bar {
+    flex-wrap: wrap;
+  }
+  .exp-compare-grid {
+    grid-template-columns: 1fr;
+  }
   .exp-pages {
     flex-wrap: wrap;
   }
