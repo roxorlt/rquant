@@ -1330,7 +1330,11 @@ class ResearchExecutionSession:
                 self._session_dir
                 / f"{index:06d}-{artifact.file_hash}.parquet"
             )
-            os.link(path, session_path)
+            if published.strategy_name == "factor_eval":
+                # Factor reads need an independent inode throughout one lease.
+                shutil.copyfile(path, session_path)
+            else:
+                os.link(path, session_path)
             if (
                 (
                     artifact.file_size is not None

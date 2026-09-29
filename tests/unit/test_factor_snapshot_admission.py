@@ -6,6 +6,7 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import duckdb
+import pandas as pd
 import pytest
 from pydantic import ValidationError
 
@@ -223,6 +224,84 @@ def test_factor_admission_reads_frozen_three_table_rows_and_receipt(tmp_path: Pa
             assert not hasattr(lease, "_conn")
         with pytest.raises(RuntimeError, match="closed"):
             lease.query_daily_bars(query)
+
+
+def test_factor_lease_keeps_frozen_rows_after_source_parquet_in_place_rewrite(
+    tmp_path: Path,
+) -> None:
+    from rquant.factor_snapshot_admission import open_factor_snapshot_admission
+    from rquant.research_snapshot import FactorReadQuery
+
+    source_path = tmp_path / "source.duckdb"
+    lake_root = tmp_path / "lake"
+    with DuckDBStore(source_path) as store:
+        _seed_source(store)
+        with duckdb.connect(str(source_path)) as source:
+            snapshot, binding = _binding(store, source, lake_root)
+        artifact = next(
+            item for item in binding.manifest.artifacts if item.table_name == "daily_bar"
+        )
+        artifact_path = lake_root / artifact.relative_path
+        query = FactorReadQuery(
+            binding_hash=binding.binding_hash,
+            stock_codes=("000001.SZ",),
+            start_date=_FIRST,
+            end_date=_LAST,
+            row_limit=5,
+        )
+        with open_factor_snapshot_admission(
+            _request(snapshot, binding), metadata_store=store, lake_root=lake_root
+        ) as (lease, _decision):
+            inode_before = artifact_path.stat().st_ino
+            changed = pd.read_parquet(artifact_path)
+            changed.loc[
+                (changed["ts_code"] == "000001.SZ") & (changed["trade_date"] == _FIRST),
+                "close",
+            ] = 999.0
+            changed.to_parquet(artifact_path, index=False)
+            assert artifact_path.stat().st_ino == inode_before
+            assert lease.query_daily_bars(query).rows[0].close == 10.5
+        assert not list((lake_root / ".execution_sessions").iterdir())
+
+
+def test_factor_admission_rejects_source_mutation_during_session_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rquant import research_snapshot
+    from rquant.factor_snapshot_admission import (
+        FactorSnapshotAdmissionError,
+        open_factor_snapshot_admission,
+    )
+
+    source_path = tmp_path / "source.duckdb"
+    lake_root = tmp_path / "lake"
+    with DuckDBStore(source_path) as store:
+        _seed_source(store)
+        with duckdb.connect(str(source_path)) as source:
+            snapshot, binding = _binding(store, source, lake_root)
+        original_copy = research_snapshot.shutil.copyfile
+        copies = 0
+
+        def mutate_before_copy(source: Path, target: Path) -> Path:
+            nonlocal copies
+            copies += 1
+            if copies == 1:
+                source.write_bytes(b"changed during session copy")
+            return original_copy(source, target)
+
+        monkeypatch.setattr(research_snapshot.shutil, "copyfile", mutate_before_copy)
+        with (
+            pytest.raises(FactorSnapshotAdmissionError) as error,
+            open_factor_snapshot_admission(
+                _request(snapshot, binding), metadata_store=store, lake_root=lake_root
+            ),
+        ):
+            pytest.fail("mutated source exposed a factor lease")
+        assert copies >= 1
+        assert {item.code for item in error.value.decision.failures} == {
+            "session_verification_failed"
+        }
+        assert not list((lake_root / ".execution_sessions").iterdir())
 
 
 def test_factor_builder_rejects_preopened_source_transaction(tmp_path: Path) -> None:
