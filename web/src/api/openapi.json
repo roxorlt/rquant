@@ -4475,6 +4475,22 @@
         "title": "Envelope[StockSummaryData]",
         "type": "object"
       },
+      "Envelope_StrategyCatalogData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/StrategyCatalogData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[StrategyCatalogData]",
+        "type": "object"
+      },
       "Envelope_SurgeData_": {
         "properties": {
           "data": {
@@ -11563,6 +11579,87 @@
         "title": "StockSummaryData",
         "type": "object"
       },
+      "StrategyCatalogData": {
+        "properties": {
+          "available": {
+            "title": "Available",
+            "type": "boolean"
+          },
+          "strategies": {
+            "items": {
+              "$ref": "#/components/schemas/StrategyCatalogItem"
+            },
+            "title": "Strategies",
+            "type": "array"
+          }
+        },
+        "required": [
+          "available",
+          "strategies"
+        ],
+        "title": "StrategyCatalogData",
+        "type": "object"
+      },
+      "StrategyCatalogItem": {
+        "properties": {
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "parameters": {
+            "items": {
+              "$ref": "#/components/schemas/StrategyParameter"
+            },
+            "title": "Parameters",
+            "type": "array"
+          },
+          "registered_at": {
+            "format": "date-time",
+            "title": "Registered At",
+            "type": "string"
+          },
+          "strategy_id": {
+            "title": "Strategy Id",
+            "type": "string"
+          },
+          "version": {
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "strategy_id",
+          "name",
+          "version",
+          "registered_at",
+          "parameters"
+        ],
+        "title": "StrategyCatalogItem",
+        "type": "object"
+      },
+      "StrategyParameter": {
+        "properties": {
+          "display_value": {
+            "title": "Display Value",
+            "type": "string"
+          },
+          "key": {
+            "title": "Key",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "label",
+          "display_value"
+        ],
+        "title": "StrategyParameter",
+        "type": "object"
+      },
       "SurgeConfig": {
         "properties": {
           "boards": {
@@ -14359,6 +14456,56 @@
         "summary": "个股概览",
         "tags": [
           "stocks"
+        ]
+      }
+    },
+    "/api/v1/strategies": {
+      "get": {
+        "operationId": "list_strategies_api_v1_strategies_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "generation_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "pattern": "^[0-9a-f]{64}$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Generation Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_StrategyCatalogData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "已核验策略定义",
+        "tags": [
+          "strategies"
         ]
       }
     },

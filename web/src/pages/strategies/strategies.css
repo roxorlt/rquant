@@ -1,0 +1,26 @@
+.strategy-stack {
+  display: grid;
+  gap: 16px;
+  min-width: 0;
+}
+
+.strategy-state {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  min-height: 112px;
+  color: var(--crit-t);
+  font-size: 13px;
+}
+
+.strategy-state p {
+  margin: 0;
+}
+
+@media (max-width: 760px) {
+  .strategy-stack {
+    gap: 12px;
+  }
+}

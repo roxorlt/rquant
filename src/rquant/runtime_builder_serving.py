@@ -56,7 +56,7 @@ _REFERENCE_SLOW_CONTRACT_DATASET_ID = "reference_slow_contract"
 #: `signals` reader still refuses the round instead of publishing the same empty table.
 #: It lives here rather than in `runtime_serving_snapshot`, which imports this module.
 DEFAULT_OPTIONAL_SOURCE_DATASETS: frozenset[str] = frozenset(
-    {"lab_jobs", "promotions", "ops_status"}
+    {"lab_jobs", "promotions", "ops_status", "strategy_catalog"}
 )
 
 
@@ -118,18 +118,19 @@ class ServingRuntimeSettings(RuntimeContractModel):
             raise ValueError("serving source authorities contain duplicate datasets")
         expected = set(_SOURCE_PAYLOAD_KINDS)
         observed = set(dataset_ids)
-        legacy = expected.difference({"ops_status"})
-        if observed not in (expected, legacy):
+        seven = expected.difference({"strategy_catalog"})
+        legacy = seven.difference({"ops_status"})
+        if observed not in (expected, seven, legacy):
             missing = sorted(expected.difference(dataset_ids))
             unexpected = sorted(set(dataset_ids).difference(_SOURCE_PAYLOAD_KINDS))
             raise ValueError(
-                "serving source authorities require exactly seven owner datasets "
-                "or the legacy six without ops_status; "
+                "serving source authorities require exactly eight owner datasets, "
+                "seven without strategy_catalog, or the legacy six without ops_status; "
                 f"missing={missing}, unexpected={unexpected}"
             )
-        if observed == expected and "ops_status" not in self.optional_source_datasets:
+        if observed in (expected, seven) and "ops_status" not in self.optional_source_datasets:
             raise ValueError("ops_status must be optional in the seven-owner serving manifest")
-        if observed == expected and self.ops_manifest_digest is None:
+        if observed in (expected, seven) and self.ops_manifest_digest is None:
             raise ValueError("seven-owner serving manifest requires ops_manifest_digest")
         if observed == legacy and self.ops_manifest_digest is not None:
             raise ValueError("legacy six-owner manifest cannot assert ops_manifest_digest")
@@ -155,6 +156,7 @@ _SOURCE_PAYLOAD_KINDS = {
     "runtime_health": "runtime_health",
     "lab_jobs": "lab_jobs",
     "promotions": "promotions",
+    "strategy_catalog": "strategy_catalog",
     "ops_status": "ops_status",
     _REFERENCE_SLOW_AUTHORITY_DATASET_ID: "reference_slow",
 }
@@ -327,12 +329,14 @@ def serving_publisher_builder(
                 lab_jobs_reader=readers["lab_jobs"],
                 promotions_reader=readers["promotions"],
                 ops_status_reader=readers.get("ops_status"),
+                strategy_catalog_reader=readers.get("strategy_catalog"),
                 expected_ops_manifest_digest=settings.ops_manifest_digest,
                 reference_slow_reader=readers[_REFERENCE_SLOW_AUTHORITY_DATASET_ID],
                 #: The legacy six-owner shape has no ops authority yet. Other sources
                 #: follow the manifest; only classified ops integrity is also optional.
                 optional_datasets=frozenset(settings.optional_source_datasets).union(
-                    {"ops_status"} if "ops_status" not in readers else ()
+                    ({"ops_status"} if "ops_status" not in readers else set())
+                    | ({"strategy_catalog"} if "strategy_catalog" not in readers else set())
                 ),
             )
             resolved_snapshot_loader = assembler.assemble

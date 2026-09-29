@@ -95,8 +95,8 @@ export const PAGES: readonly PageDef[] = [
     path: "/strategies",
     title: "策略",
     group: "策略与验证",
-    ready: false,
-    summary: "管理策略的版本和参数，看它走到了哪一步。",
+    ready: true,
+    summary: "查看已核验的策略定义和当前参数。",
   },
   {
     id: "backtest",

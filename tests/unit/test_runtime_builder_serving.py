@@ -29,6 +29,7 @@ from rquant.runtime_serving_snapshot import (
     REFERENCE_SLOW_DATASET_ID,
     RUNTIME_HEALTH_DATASET_ID,
     SIGNALS_DATASET_ID,
+    STRATEGY_CATALOG_DATASET_ID,
     LabJobsPayload,
     OpsStatusPayload,
     PaperAccountsPayload,
@@ -430,6 +431,10 @@ def test_exact_seven_and_legacy_six_owner_shapes_are_the_only_accepted_sets(
         _manifest(tmp_path, settings=settings)
     )
     assert OPS_STATUS_DATASET_ID in seven().source_generations
+    assert any(
+        reason.startswith("serving:strategy_catalog:unavailable:")
+        for reason in seven().degraded_reasons
+    )
 
     missing_digest = dict(settings)
     missing_digest.pop("ops_manifest_digest")
@@ -470,6 +475,17 @@ def test_exact_seven_and_legacy_six_owner_shapes_are_the_only_accepted_sets(
     ]
     with pytest.raises(ValidationError, match="seven owner datasets|legacy six"):
         ServingRuntimeSettings.model_validate(wrong_six)
+
+
+def test_explicit_eight_owner_shape_accepts_strategy_catalog(tmp_path: Path) -> None:
+    settings, _roots = _authority_settings(tmp_path)
+    settings["source_authorities"].append(
+        {
+            "dataset_id": STRATEGY_CATALOG_DATASET_ID,
+            "root": str(tmp_path / "strategy-catalog-authority"),
+        }
+    )
+    assert len(ServingRuntimeSettings.model_validate(settings).source_authorities) == 8
 
 
 def test_corrupt_optional_ops_authority_does_not_block_other_serving_sources(
@@ -562,6 +578,8 @@ def test_serving_publishes_while_the_research_authorities_have_never_published(
         "current authority is unavailable",
         "serving:promotions:unavailable:ServingSourceAuthorityUnavailableError: "
         "current authority is unavailable",
+        "serving:strategy_catalog:unavailable:ServingSourceAuthorityUnavailableError: "
+        "strategy catalog source is not installed",
     ]
     #: and the four that did answer are still bound to their own evidence -- only the
     #: two named above were degraded
@@ -602,6 +620,8 @@ def test_unpublished_paper_authority_stays_unavailable_then_recovers_or_fails_cl
         "current authority is unavailable",
         "serving:paper_accounts:unavailable:ServingSourceAuthorityUnavailableError: "
         f"{unavailable_reason}",
+        "serving:strategy_catalog:unavailable:ServingSourceAuthorityUnavailableError: "
+        "strategy catalog source is not installed",
     )
     with ServingReader(tmp_path / "serving").acquire_generation() as lease:
         paper_watermark = next(
@@ -648,6 +668,8 @@ def test_unpublished_paper_authority_stays_unavailable_then_recovers_or_fails_cl
     assert recovered.degraded_reasons == (
         "serving:ops_status:unavailable:ServingSourceAuthorityUnavailableError: "
         "current authority is unavailable",
+        "serving:strategy_catalog:unavailable:ServingSourceAuthorityUnavailableError: "
+        "strategy catalog source is not installed",
     )
     with ServingReader(tmp_path / "serving").acquire_generation() as lease:
         assert lease.manifest.generation_id != first_generation

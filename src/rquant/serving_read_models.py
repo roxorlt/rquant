@@ -163,6 +163,31 @@ def _contract(
 
 PAGE_PROJECTION_CONTRACTS: Mapping[str, ServingProjectionContract] = MappingProxyType(
     {
+        "strategy_catalog": _contract(
+            "strategy_catalog",
+            (
+                ("strategy_id", "string"),
+                ("name", "string"),
+                ("version", "int"),
+                ("registered_at", "timestamp"),
+            ),
+            ("strategy_id",),
+            max_rows=3,
+            max_bytes=4 * 1024,
+            event_time_columns=("registered_at",),
+        ),
+        "strategy_catalog_parameter": _contract(
+            "strategy_catalog",
+            (
+                ("strategy_id", "string"),
+                ("parameter_key", "string"),
+                ("label", "string"),
+                ("display_value", "string"),
+            ),
+            ("strategy_id", "parameter_key"),
+            max_rows=32,
+            max_bytes=16 * 1024,
+        ),
         "paper_order_window": _contract(
             "paper_accounts",
             (
