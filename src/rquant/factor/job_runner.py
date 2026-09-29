@@ -7,8 +7,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Literal
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from rquant.factor.display_artifact import (
+    FactorDisplayArtifactReceipt,
+    load_factor_display_artifact,
+    project_factor_display_artifact,
+    publish_factor_display_artifact,
+)
 from rquant.factor.historical_adapter import (
     HistoricalFactorResearch,
     assemble_historical_factor_research,
@@ -38,6 +44,9 @@ class FactorEvaluationCompletion(BaseModel):
     artifact_sha256: Sha256
     artifact_filename: str
     artifact_byte_count: int = Field(gt=0, strict=True)
+    display_artifact_sha256: Sha256 | None = None
+    display_artifact_filename: str | None = None
+    display_artifact_byte_count: int | None = Field(default=None, gt=0, strict=True)
     result_sha256: Sha256
     source_sha256: Sha256
     snapshot_id: Sha256
@@ -55,6 +64,27 @@ class FactorEvaluationCompletion(BaseModel):
     @classmethod
     def _utc_time(cls, value: datetime) -> datetime:
         return value.astimezone(UTC)
+
+    @model_validator(mode="after")
+    def _complete_display_receipt(self) -> FactorEvaluationCompletion:
+        fields = (
+            self.display_artifact_sha256,
+            self.display_artifact_filename,
+            self.display_artifact_byte_count,
+        )
+        if any(value is None for value in fields) and not all(value is None for value in fields):
+            raise ValueError("factor display receipt requires digest, filename and size")
+        if self.display_artifact_sha256 is not None:
+            FactorDisplayArtifactReceipt(
+                sha256=self.display_artifact_sha256,
+                filename=self.display_artifact_filename,
+                byte_count=self.display_artifact_byte_count,
+            )
+        return self
+
+    @property
+    def display_status(self) -> Literal["available", "display_unavailable"]:
+        return "available" if self.display_artifact_sha256 is not None else "display_unavailable"
 
 
 def _clock_utc(now: Callable[[], datetime]) -> datetime:
@@ -150,12 +180,22 @@ def run_factor_evaluation_job(
         or reloaded.research != research
     ):
         raise ValueError("reloaded factor artifact differs from this evaluation")
+    _before_deadline(now, checked.deadline)
+    display_receipt = FactorDisplayArtifactReceipt.model_validate(
+        publish_factor_display_artifact(reloaded, artifact_root)
+    )
+    display = load_factor_display_artifact(artifact_root, display_receipt.sha256)
+    if display != project_factor_display_artifact(reloaded):
+        raise ValueError("reloaded factor display differs from this evaluation")
     source = reloaded.research.receipt
     return FactorEvaluationCompletion(
         spec_sha256=checked.spec_sha256,
         artifact_sha256=receipt.sha256,
         artifact_filename=receipt.filename,
         artifact_byte_count=receipt.byte_count,
+        display_artifact_sha256=display_receipt.sha256,
+        display_artifact_filename=display_receipt.filename,
+        display_artifact_byte_count=display_receipt.byte_count,
         result_sha256=reloaded.research.result.sha256,
         source_sha256=source.source_sha256,
         snapshot_id=source.snapshot_id,

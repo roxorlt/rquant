@@ -17,9 +17,17 @@ from uuid import uuid4
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from rquant.factor.display_artifact import (
+    FactorDisplayArtifactV1,
+    _load_factor_display_artifact_with_identity,
+    project_factor_display_artifact,
+)
 from rquant.factor.job_runner import FactorEvaluationCompletion
 from rquant.factor.job_spec import FactorEvaluationJobSpec
-from rquant.factor.result_artifact import FactorResearchArtifactV1, load_factor_research_artifact
+from rquant.factor.result_artifact import (
+    FactorResearchArtifactV1,
+    _load_factor_research_artifact_with_identity,
+)
 from rquant.strict_json import canonical_json_bytes, strict_canonical_json_loads
 
 _IMMUTABLE = ConfigDict(extra="forbid", frozen=True, strict=True, revalidate_instances="always")
@@ -219,7 +227,21 @@ def _model_from_json(model: type[BaseModel], value: object, max_bytes: int) -> B
         raise ValueError("factor ledger persisted JSON exceeds its budget")
     strict_canonical_json_loads(value)
     parsed = model.model_validate_json(value)
-    if _canonical_model(parsed) != value:
+    if model is FactorEvaluationCompletion and parsed.display_status == "display_unavailable":
+        legacy = canonical_json_bytes(
+            parsed.model_dump(
+                mode="json",
+                round_trip=True,
+                exclude={
+                    "display_artifact_sha256",
+                    "display_artifact_filename",
+                    "display_artifact_byte_count",
+                },
+            )
+        ).decode("utf-8")
+        if legacy != value:
+            raise ValueError("factor legacy completion JSON is not canonical")
+    elif _canonical_model(parsed) != value:
         raise ValueError("factor ledger persisted model JSON is not canonical")
     return parsed
 
@@ -317,6 +339,7 @@ def _checked_command(row: sqlite3.Row) -> tuple[str, str, str]:
 def _checked_completion(
     completion: FactorEvaluationCompletion,
     artifact: FactorResearchArtifactV1,
+    display: FactorDisplayArtifactV1,
     spec: FactorEvaluationJobSpec,
     now: datetime,
 ) -> None:
@@ -324,11 +347,16 @@ def _checked_completion(
     source = research.receipt
     adapter = spec.adapter_request
     byte_count = len(canonical_json_bytes(artifact.model_dump(mode="json", round_trip=True)))
+    display_byte_count = len(canonical_json_bytes(display.model_dump(mode="json", round_trip=True)))
     if (
         completion.spec_sha256 != spec.spec_sha256
         or completion.artifact_sha256 != artifact.content_sha256
         or completion.artifact_filename != f"factor-research-v1-{artifact.content_sha256}.json"
         or completion.artifact_byte_count != byte_count
+        or completion.display_artifact_sha256 != display.content_sha256
+        or completion.display_artifact_filename
+        != f"factor-display-v1-{display.content_sha256}.json"
+        or completion.display_artifact_byte_count != display_byte_count
         or completion.result_sha256 != research.result.sha256
         or completion.source_sha256 != source.source_sha256
         or completion.snapshot_id != source.snapshot_id
@@ -358,6 +386,8 @@ def _checked_completion(
         or research.request.as_of != adapter.as_of
     ):
         raise FactorLedgerCompletionError("factor artifact differs from the exact job spec")
+    if display != project_factor_display_artifact(artifact):
+        raise FactorLedgerCompletionError("factor display differs from the complete artifact")
 
 
 class FactorEvaluationJobLedger:
@@ -781,9 +811,22 @@ class FactorEvaluationJobLedger:
             checked_completion = FactorEvaluationCompletion.model_validate(
                 completion.model_dump(mode="python")
             )
-            artifact = load_factor_research_artifact(
-                artifact_root, checked_completion.artifact_sha256
+            if checked_completion.display_status != "available":
+                raise FactorLedgerCompletionError("new factor success requires a display artifact")
+            artifact, artifact_root_identity, artifact_identity = (
+                _load_factor_research_artifact_with_identity(
+                    artifact_root, checked_completion.artifact_sha256
+                )
             )
+            display, display_root_identity, display_identity = (
+                _load_factor_display_artifact_with_identity(
+                    artifact_root, checked_completion.display_artifact_sha256
+                )
+            )
+            if artifact_root_identity != display_root_identity:
+                raise FactorLedgerCompletionError(
+                    "factor artifact roots changed during verification"
+                )
         except (OSError, TypeError, ValueError, ValidationError) as exc:
             raise FactorLedgerCompletionError("factor result artifact cannot be verified") from exc
         with self._writer() as connection:
@@ -792,7 +835,31 @@ class FactorEvaluationJobLedger:
             if state is None:
                 raise FactorLedgerLeaseError("factor job does not exist")
             self._live_lease(state, lease_token, expected_version, current)
-            _checked_completion(checked_completion, artifact, state.spec, current)
+            _checked_completion(checked_completion, artifact, display, state.spec, current)
+            try:
+                latest_artifact, latest_root, latest_identity = (
+                    _load_factor_research_artifact_with_identity(
+                        artifact_root, checked_completion.artifact_sha256
+                    )
+                )
+                latest_display, latest_display_root, latest_display_identity = (
+                    _load_factor_display_artifact_with_identity(
+                        artifact_root, checked_completion.display_artifact_sha256
+                    )
+                )
+                if (
+                    latest_artifact != artifact
+                    or latest_display != display
+                    or latest_root != artifact_root_identity
+                    or latest_display_root != display_root_identity
+                    or latest_identity != artifact_identity
+                    or latest_display_identity != display_identity
+                ):
+                    raise FactorLedgerCompletionError("factor artifact changed before completion")
+            except (OSError, ValueError, ValidationError) as exc:
+                raise FactorLedgerCompletionError(
+                    "factor artifact changed before completion"
+                ) from exc
             current = self._now()
             self._live_lease(state, lease_token, expected_version, current)
             if checked_completion.completed_at > current:

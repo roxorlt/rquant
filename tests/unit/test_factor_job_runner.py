@@ -12,10 +12,15 @@ import pytest
 from pydantic import ValidationError
 
 from rquant.data_metadata import DatasetSnapshot, DatasetSnapshotBinding
+from rquant.factor.display_artifact import (
+    load_factor_display_artifact,
+    project_factor_display_artifact,
+)
 from rquant.factor.historical_adapter import (
     HistoricalFactorAdapterRequest,
     HistoricalFactorResearch,
 )
+from rquant.factor.job_ledger import FactorEvaluationJobLedger
 from rquant.factor.job_runner import FactorEvaluationCompletion, run_factor_evaluation_job
 from rquant.factor.job_spec import FactorEvaluationJobSpec
 from rquant.factor.result_artifact import load_factor_research_artifact
@@ -120,6 +125,7 @@ def test_runner_round_trip_retry_and_single_closed_admission(
         first = _run(spec, store, tmp_path, artifact_root=root, now=snapshot.as_of_time)
         again = _run(spec, store, tmp_path, artifact_root=root, now=snapshot.as_of_time)
         artifact = load_factor_research_artifact(root, first.artifact_sha256)
+        display = load_factor_display_artifact(root, first.display_artifact_sha256)
 
         assert first == again
         assert calls == [spec.admission_request, spec.admission_request]
@@ -128,6 +134,12 @@ def test_runner_round_trip_retry_and_single_closed_admission(
         assert first.artifact_sha256 == artifact.content_sha256
         assert first.artifact_filename == f"factor-research-v1-{artifact.content_sha256}.json"
         assert first.artifact_byte_count == (root / first.artifact_filename).stat().st_size
+        assert first.display_artifact_filename == f"factor-display-v1-{display.content_sha256}.json"
+        assert (
+            first.display_artifact_byte_count
+            == (root / first.display_artifact_filename).stat().st_size
+        )
+        assert display == project_factor_display_artifact(artifact)
         assert first.result_sha256 == artifact.research.result.sha256
         assert first.source_sha256 == artifact.research.receipt.source_sha256
         assert first.snapshot_id == snapshot.snapshot_id
@@ -138,7 +150,7 @@ def test_runner_round_trip_retry_and_single_closed_admission(
         assert first.completed_at == snapshot.as_of_time.astimezone(UTC)
         assert artifact.code_revision == spec.code_revision
         assert artifact.research.receipt.snapshot_id == first.snapshot_id
-        assert len(list(root.iterdir())) == 1
+        assert len(list(root.iterdir())) == 2
         with pytest.raises(RuntimeError, match="closed"):
             leases[0].query_sse_calendar(
                 FactorReadQuery(
@@ -474,3 +486,57 @@ def test_runner_publish_failure_keeps_prior_artifact(
             load_factor_research_artifact(root, first.artifact_sha256).content_sha256
             == first.artifact_sha256
         )
+
+
+def test_display_publish_failure_keeps_complete_file_for_idempotent_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rquant.factor import job_runner as module
+
+    with _admitted(tmp_path) as (store, _lease, _decision, snapshot, binding):
+        spec = _spec(snapshot, binding)
+        root = _artifact_root(tmp_path)
+        real_publish = module.publish_factor_display_artifact
+
+        def interrupted(*_args: object, **_kwargs: object) -> None:
+            raise OSError("injected display publication interruption")
+
+        monkeypatch.setattr(module, "publish_factor_display_artifact", interrupted)
+        with pytest.raises(OSError, match="display publication interruption"):
+            _run(spec, store, tmp_path, artifact_root=root, now=snapshot.as_of_time)
+        complete_files = list(root.glob("factor-research-v1-*.json"))
+        assert len(complete_files) == 1
+        assert list(root.glob("factor-display-v1-*.json")) == []
+
+        monkeypatch.setattr(module, "publish_factor_display_artifact", real_publish)
+        receipt = _run(spec, store, tmp_path, artifact_root=root, now=snapshot.as_of_time)
+        assert complete_files[0].name == receipt.artifact_filename
+        assert receipt.display_status == "available"
+        assert load_factor_display_artifact(root, receipt.display_artifact_sha256) == (
+            project_factor_display_artifact(
+                load_factor_research_artifact(root, receipt.artifact_sha256)
+            )
+        )
+
+
+def test_admitted_runner_two_artifacts_ledger_success_and_identity_reopen(tmp_path: Path) -> None:
+    with _admitted(tmp_path) as (store, _lease, _decision, snapshot, binding):
+        spec = _spec(snapshot, binding)
+        root = _artifact_root(tmp_path)
+        completion = _run(spec, store, tmp_path, artifact_root=root, now=snapshot.as_of_time)
+        ledger = FactorEvaluationJobLedger(
+            tmp_path / "factor-jobs.sqlite3", clock=lambda: snapshot.as_of_time
+        )
+        identity = ledger.initialize()
+        job = ledger.submit("synthetic-factor-evaluation", spec)
+        lease = ledger.claim(lease_seconds=60)
+        assert lease is not None
+        success = ledger.complete(job.job_id, lease.lease_token, lease.version, completion, root)
+        assert success.status == "succeeded"
+        assert success.completion.display_status == "available"
+        assert (root / completion.artifact_filename).is_file()
+        assert (root / completion.display_artifact_filename).is_file()
+        reopened = FactorEvaluationJobLedger.open_existing(
+            identity, clock=lambda: snapshot.as_of_time
+        )
+        assert reopened.get(job.job_id) == success
