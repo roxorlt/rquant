@@ -39,7 +39,7 @@ ReturnPriceBasis = Literal["raw", "forward_adjusted", "backward_adjusted"]
 HoldingSessions = Literal[1, 5, 10, 20]
 ResearchDayStatus = Literal["evaluated", "no_samples"]
 ResearchSummaryStatus = Literal["evaluated", "no_samples"]
-ResearchPortfolioStatus = Literal["available", "insufficient_data"]
+ResearchPortfolioStatus = Literal["available", "available_partial", "insufficient_data"]
 Sha256 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 
 
@@ -378,11 +378,18 @@ def assemble_factor_research_result(request: FactorResearchRequest) -> FactorRes
     summary = summarize_factor_ic(evaluation) if evaluation is not None else None
     decay = evaluate_factor_ic_decay(checked)
     complete = all(coverage.valid_count == coverage.expected_count for coverage in coverages)
+    enough_for_groups = all(coverage.valid_count >= 3 for coverage in coverages)
     portfolio = (
         evaluate_factor_portfolios(evaluation_input)
-        if complete and evaluation_input is not None
+        if enough_for_groups and evaluation_input is not None
         else None
     )
+    if portfolio is None:
+        portfolio_status: ResearchPortfolioStatus = "insufficient_data"
+    elif complete:
+        portfolio_status = "available"
+    else:
+        portfolio_status = "available_partial"
     fields: dict[str, object] = {
         "definition": checked.factor_input.definition,
         "factor_id": factor_values.factor_id,
@@ -399,7 +406,7 @@ def assemble_factor_research_result(request: FactorResearchRequest) -> FactorRes
         "summary_status": "evaluated" if evaluation is not None else "no_samples",
         "ic_summary": summary,
         "ic_decay": decay,
-        "portfolio_status": "available" if portfolio is not None else "insufficient_data",
+        "portfolio_status": portfolio_status,
         "portfolio_diagnostics": portfolio,
     }
     serializable = FactorResearchResult.model_construct(**fields, sha256="0" * 64)

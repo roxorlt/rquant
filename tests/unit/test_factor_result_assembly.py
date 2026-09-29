@@ -128,6 +128,54 @@ def _request(
     )
 
 
+def _partial_group_request(*, second_missing: tuple[str, ...] = ("B",)) -> FactorResearchRequest:
+    from rquant.factor.result import FactorForwardReturn, FactorResearchRequest
+
+    base = _request()
+    stocks = ("A", "B", "C", "D")
+    factors = ((1.0, 2.0, 3.0, None), (1.0, 2.5, 2.0, 3.0))
+    returns = ((0.1, 0.2, 0.3, 0.4), (0.05, 0.1, -0.1, 0.2))
+    observations = tuple(
+        FeatureObservation(
+            stock_code=stock,
+            trade_date=day,
+            column="close",
+            value=factors[day_index][stock_index],
+            first_visible_at=_DECISIONS[day_index] - timedelta(minutes=1),
+        )
+        for day_index, day in enumerate(_DAYS)
+        for stock_index, stock in enumerate(stocks)
+    )
+    forward_returns = tuple(
+        FactorForwardReturn(
+            stock_code=stock,
+            decision_date=day,
+            decision_at=_DECISIONS[day_index],
+            return_end_at=_ENDS[day_index],
+            value=None
+            if day_index == 1 and stock in second_missing
+            else returns[day_index][stock_index],
+            missing_reason="missing_price" if day_index == 1 and stock in second_missing else None,
+            first_available_at=None
+            if day_index == 1 and stock in second_missing
+            else _ENDS[day_index],
+        )
+        for day_index, day in enumerate(_DAYS)
+        for stock_index, stock in enumerate(stocks)
+    )
+    return FactorResearchRequest(
+        factor_input=FactorTimeSeriesInput.model_validate(
+            base.factor_input.model_copy(update={"universe": stocks, "observations": observations})
+        ),
+        forward_returns=forward_returns,
+        as_of=_AS_OF,
+        factor_source_id=base.factor_source_id,
+        return_source_id=base.return_source_id,
+        return_price_basis=base.return_price_basis,
+        holding_sessions=base.holding_sessions,
+    )
+
+
 def _missing_return(row: FactorForwardReturn, reason: str = "missing_price") -> FactorForwardReturn:
     return type(row).model_validate(
         {**row.model_dump(), "value": None, "missing_reason": reason, "first_available_at": None}
@@ -518,6 +566,77 @@ def test_partial_pairs_keep_missing_reasons_and_disable_portfolio_curve() -> Non
     assert first.evaluation.normal_ic.value is None
     assert first.evaluation.effective_sample_count == 1
     assert result.days[1].coverage.valid_count == 3
+    assert result.portfolio_status == "insufficient_data"
+    assert result.portfolio_diagnostics is None
+
+
+def test_three_valid_pairs_each_day_keep_partial_group_diagnostics() -> None:
+    from rquant.factor import assemble_factor_research_result
+    from rquant.factor.result import FactorResearchRequest
+
+    request = _partial_group_request()
+    result = assemble_factor_research_result(request)
+
+    assert result.summary_status == "evaluated"
+    assert result.ic_summary is not None
+    assert result.portfolio_status == "available_partial"
+    assert [(day.coverage.expected_count, day.coverage.valid_count) for day in result.days] == [
+        (4, 3),
+        (4, 3),
+    ]
+    assert [
+        (row.reason, row.count) for row in result.days[0].coverage.factor_missing_by_reason
+    ] == [("missing_value", 1)]
+    assert [
+        (row.reason, row.count) for row in result.days[1].coverage.return_missing_by_reason
+    ] == [("missing_price", 1)]
+    assert result.portfolio_diagnostics is not None
+    first, second = result.portfolio_diagnostics.days
+    assert [day.source_sample_count for day in (first, second)] == [3, 3]
+    assert [point.period_return for point in first.groupings[0].groups] == pytest.approx(
+        [0.1, 0.2, 0.3]
+    )
+    assert [point.period_return for point in second.groupings[0].groups] == pytest.approx(
+        [0.05, -0.1, 0.2]
+    )
+    assert [point.cumulative_return for point in second.groupings[0].groups] == pytest.approx(
+        [0.155, 0.08, 0.56]
+    )
+    assert [point.target_weight_turnover for point in second.groupings[0].groups] == [0, 1, 1]
+    assert all(group.status == "insufficient_samples" for group in first.groupings[1:])
+    assert all(group.status == "insufficient_samples" for group in second.groupings[1:])
+    content = json.dumps(
+        result.model_dump(mode="json", exclude={"sha256"}),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    assert result.sha256 == hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+    reordered = FactorResearchRequest.model_validate(
+        request.model_copy(
+            update={
+                "factor_input": request.factor_input.model_copy(
+                    update={"observations": tuple(reversed(request.factor_input.observations))}
+                ),
+                "forward_returns": tuple(reversed(request.forward_returns)),
+            }
+        )
+    )
+    repeated = assemble_factor_research_result(reordered)
+    assert repeated.input_sha256 == result.input_sha256
+    assert repeated.sha256 == result.sha256
+    assert repeated == result
+
+
+def test_one_day_with_only_two_valid_pairs_keeps_entire_curve_unavailable() -> None:
+    from rquant.factor import assemble_factor_research_result
+
+    result = assemble_factor_research_result(_partial_group_request(second_missing=("B", "D")))
+
+    assert [day.coverage.valid_count for day in result.days] == [3, 2]
+    assert result.days[1].evaluation is not None
+    assert result.days[1].evaluation.groupings[0].status == "insufficient_samples"
     assert result.portfolio_status == "insufficient_data"
     assert result.portfolio_diagnostics is None
 
