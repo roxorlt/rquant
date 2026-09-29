@@ -259,6 +259,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/factors/definitions/{factor_id}/archive": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 归档当前因子定义 */
+        post: operations["archive_factor_definition_api_v1_factors_definitions__factor_id__archive_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/factors/definitions/{factor_id}/archive/resume": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 续查原归档命令 */
+        post: operations["resume_factor_archive_api_v1_factors_definitions__factor_id__archive_resume_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/health": {
         parameters: {
             query?: never;
@@ -2399,6 +2433,11 @@ export interface components {
             data: components["schemas"]["ExperimentListData"];
             serving: components["schemas"]["ServingMeta"];
         };
+        /** Envelope[FactorArchiveCommandData] */
+        Envelope_FactorArchiveCommandData_: {
+            data: components["schemas"]["FactorArchiveCommandData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
         /** Envelope[FactorCatalogData] */
         Envelope_FactorCatalogData_: {
             data: components["schemas"]["FactorCatalogData"];
@@ -2594,6 +2633,42 @@ export interface components {
             /** Truncated */
             truncated: boolean;
         };
+        /** FactorArchiveCommandData */
+        FactorArchiveCommandData: {
+            /** Command Id */
+            command_id: string;
+            /** Content Sha256 */
+            content_sha256: string;
+            /**
+             * Current Head Updated
+             * @default false
+             */
+            current_head_updated: boolean;
+            /** Factor Id */
+            factor_id: string;
+            /** Message */
+            message: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "rejected" | "pending" | "succeeded_waiting_publication" | "published" | "unavailable";
+            /** Version */
+            version: number;
+        };
+        /** FactorArchiveCommandRequest */
+        FactorArchiveCommandRequest: {
+            /** Command Id */
+            command_id: string;
+            expected_head: components["schemas"]["FactorHeadRef"];
+            /** Generation Id */
+            generation_id: string;
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+        };
         /** FactorCatalogData */
         FactorCatalogData: {
             /**
@@ -2603,6 +2678,11 @@ export interface components {
             availability: "unavailable" | "empty" | "populated";
             /** Available At */
             available_at: string | null;
+            /**
+             * Can Archive
+             * @default false
+             */
+            can_archive: boolean;
             /** Definitions */
             definitions: components["schemas"]["FactorDefinitionItem"][];
         };
@@ -2636,6 +2716,13 @@ export interface components {
             max_history_window: number;
             /** Name Zh */
             name_zh: string;
+            /** Version */
+            version: number;
+        };
+        /** FactorHeadRef */
+        FactorHeadRef: {
+            /** Content Sha256 */
+            content_sha256: string;
             /** Version */
             version: number;
         };
@@ -5633,6 +5720,76 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_FactorCatalogData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    archive_factor_definition_api_v1_factors_definitions__factor_id__archive_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                factor_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["FactorArchiveCommandRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_FactorArchiveCommandData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    resume_factor_archive_api_v1_factors_definitions__factor_id__archive_resume_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                factor_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["FactorArchiveCommandRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_FactorArchiveCommandData_"];
                 };
             };
             /** @description Validation Error */

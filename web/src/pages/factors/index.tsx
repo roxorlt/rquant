@@ -1,9 +1,51 @@
-import { useState } from "react";
-import { type FactorDefinitionItem, useFactorCatalog } from "@/api/factors";
+import { useEffect, useRef, useState } from "react";
+import {
+  type FactorArchiveCommandData,
+  type FactorArchiveCommandRequest,
+  type FactorDefinitionItem,
+  postFactorArchive,
+  useFactorCatalog,
+} from "@/api/factors";
 import { useCurrentMeta } from "@/api/useMeta";
 import { type DataColumn, DataTable } from "@/table/DataTable";
-import { Button, EmptyState, PageHeader, PageSkeleton, Panel, RelativeTime, Tip } from "@/ui";
+import {
+  Button,
+  ConfirmDialog,
+  EmptyState,
+  PageHeader,
+  PageSkeleton,
+  Panel,
+  RelativeTime,
+  Tip,
+} from "@/ui";
 import "./factors.css";
+
+const ARCHIVE_STORAGE_KEY = "rquant.factor.archive-command.v1";
+
+type StoredArchive = { factorId: string; command: FactorArchiveCommandRequest };
+
+function storedArchive(): StoredArchive | null {
+  try {
+    const raw = window.localStorage.getItem(ARCHIVE_STORAGE_KEY);
+    if (raw === null) return null;
+    const parsed: unknown = JSON.parse(raw);
+    if (typeof parsed !== "object" || parsed === null) return null;
+    const record = parsed as Partial<StoredArchive>;
+    if (
+      typeof record.factorId !== "string" ||
+      typeof record.command?.command_id !== "string" ||
+      typeof record.command.requested_at !== "string" ||
+      typeof record.command.generation_id !== "string" ||
+      typeof record.command.expected_head?.version !== "number" ||
+      typeof record.command.expected_head.content_sha256 !== "string"
+    ) {
+      return null;
+    }
+    return record as StoredArchive;
+  } catch {
+    return null;
+  }
+}
 
 const columns: DataColumn<FactorDefinitionItem>[] = [
   {
@@ -36,6 +78,12 @@ export default function FactorsPage() {
   const [selection, setSelection] = useState<{ generationId: string; factorId: string } | null>(
     null,
   );
+  const [archiveCommand, setArchiveCommand] = useState<StoredArchive | null>(storedArchive);
+  const [archiveResult, setArchiveResult] = useState<FactorArchiveCommandData | null>(null);
+  const [archiveError, setArchiveError] = useState<string | null>(null);
+  const [archiveBusy, setArchiveBusy] = useState(false);
+  const [confirmArchive, setConfirmArchive] = useState(false);
+  const restoredCommand = useRef(false);
   const selectedId =
     selection !== null && selection.generationId === currentGeneration ? selection.factorId : null;
   const changed =
@@ -44,8 +92,79 @@ export default function FactorsPage() {
     currentGeneration !== catalog.serving.generation_id;
   const rows = changed ? [] : (catalog.data?.definitions ?? []);
   const selected = rows.find((row) => row.factor_id === selectedId) ?? rows[0] ?? null;
+  const canFinishArchive =
+    archiveCommand !== null &&
+    archiveResult?.status === "published" &&
+    typeof currentGeneration === "string" &&
+    currentGeneration !== archiveCommand.command.generation_id &&
+    catalog.serving?.generation_id === currentGeneration &&
+    catalog.data?.availability !== "unavailable" &&
+    !catalog.isFetching;
+  const runArchive = async (record: StoredArchive, resume: boolean) => {
+    setArchiveBusy(true);
+    setArchiveError(null);
+    try {
+      const result = await postFactorArchive(record.factorId, record.command, resume);
+      setArchiveResult(result);
+      if (result.status === "published") {
+        await meta.refetch();
+      }
+    } catch (error) {
+      setArchiveError(
+        error instanceof Error ? error.message : "归档状态暂不可用，请用原命令继续查看。",
+      );
+    } finally {
+      setArchiveBusy(false);
+    }
+  };
+
+  useEffect(() => {
+    if (restoredCommand.current) return;
+    restoredCommand.current = true;
+    const record = storedArchive();
+    if (record !== null) void runArchive(record, true);
+  });
+
+  const submitArchive = () => {
+    if (selected === null || selected.archived || typeof currentGeneration !== "string") return;
+    const record: StoredArchive = {
+      factorId: selected.factor_id,
+      command: {
+        generation_id: currentGeneration,
+        command_id: crypto.randomUUID(),
+        requested_at: new Date().toISOString(),
+        expected_head: {
+          version: selected.version,
+          content_sha256: selected.content_sha256,
+        },
+      },
+    };
+    window.localStorage.setItem(ARCHIVE_STORAGE_KEY, JSON.stringify(record));
+    setArchiveCommand(record);
+    setArchiveResult(null);
+    setConfirmArchive(false);
+    void runArchive(record, false);
+  };
+
+  const clearRejectedArchive = () => {
+    window.localStorage.removeItem(ARCHIVE_STORAGE_KEY);
+    setArchiveCommand(null);
+    setArchiveResult(null);
+    setArchiveError(null);
+    void refreshDefinitions();
+  };
+
+  const finishArchive = () => {
+    if (!canFinishArchive) return;
+    window.localStorage.removeItem(ARCHIVE_STORAGE_KEY);
+    setArchiveCommand(null);
+    setArchiveResult(null);
+    setArchiveError(null);
+  };
+
   const refreshDefinitions = async () => {
     const refreshed = await meta.refetch();
+    if (archiveCommand !== null && !archiveBusy) void runArchive(archiveCommand, true);
     if (refreshed.isError || refreshed.data === undefined) return;
     const nextGeneration = refreshed.data.data.generation?.generation_id ?? null;
     if (nextGeneration !== currentGeneration) {
@@ -73,6 +192,30 @@ export default function FactorsPage() {
           </Button>
         }
       />
+      {archiveCommand !== null ? (
+        <Panel>
+          <div className="factor-command-state" role={archiveError ? "alert" : "status"}>
+            <p>{archiveError ?? archiveResult?.message ?? "正在核对归档状态，请稍后查看。"}</p>
+            {archiveResult?.status === "rejected" ? (
+              <Button size="sm" onClick={clearRejectedArchive}>
+                刷新当前版本
+              </Button>
+            ) : archiveResult?.status === "published" ? (
+              <Button size="sm" disabled={!canFinishArchive} onClick={finishArchive}>
+                继续查看因子
+              </Button>
+            ) : (
+              <Button
+                size="sm"
+                disabled={archiveBusy}
+                onClick={() => void runArchive(archiveCommand, true)}
+              >
+                刷新状态
+              </Button>
+            )}
+          </div>
+        </Panel>
+      ) : null}
       {meta.isError ? (
         <Panel>
           <div className="factor-state" role="alert">
@@ -170,11 +313,32 @@ export default function FactorsPage() {
                   </div>
                   <code>{selected.expression}</code>
                 </div>
+                {catalog.data?.can_archive && !selected.archived && archiveCommand === null ? (
+                  <div className="factor-detail-actions">
+                    <Button
+                      size="sm"
+                      disabled={archiveBusy}
+                      onClick={() => setConfirmArchive(true)}
+                    >
+                      归档
+                    </Button>
+                  </div>
+                ) : null}
               </div>
             </Panel>
           ) : null}
         </div>
       )}
+      <ConfirmDialog
+        open={confirmArchive}
+        level="heavy"
+        title="归档因子"
+        description="归档当前定义，历史记录仍会保留。"
+        confirmLabel="确认归档"
+        busy={archiveBusy}
+        onConfirm={submitArchive}
+        onCancel={() => setConfirmArchive(false)}
+      />
     </>
   );
 }

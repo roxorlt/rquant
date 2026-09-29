@@ -11,6 +11,7 @@ const nextGeneration = "b".repeat(64);
 const definitions = [
   {
     factor_id: "price_volume_factor",
+    content_sha256: "a".repeat(64),
     name_zh: "价量动量",
     category_label: "技术",
     direction: "higher_is_better",
@@ -24,6 +25,7 @@ const definitions = [
   },
   {
     factor_id: "old_factor",
+    content_sha256: "b".repeat(64),
     name_zh: "成交变化",
     category_label: "技术",
     direction: "lower_is_better",
@@ -47,6 +49,7 @@ function catalog(
       availability,
       available_at: availability === "unavailable" ? null : "2026-09-24T07:31:00Z",
       definitions: rows,
+      can_archive: availability === "populated",
     },
     serving: metaEnvelope({ generationId }).serving,
   };
@@ -64,6 +67,83 @@ function publish(
 }
 
 describe("因子库", () => {
+  it("确认当前版本归档后保留原命令并续查发布", async () => {
+    publish();
+    const ids: string[] = [];
+    server.use(
+      http.post("*/api/v1/factors/definitions/price_volume_factor/archive", async ({ request }) => {
+        const body = (await request.json()) as { command_id: string };
+        ids.push(body.command_id);
+        return HttpResponse.json({
+          data: {
+            status: "succeeded_waiting_publication",
+            command_id: body.command_id,
+            factor_id: "price_volume_factor",
+            version: 2,
+            content_sha256: "a".repeat(64),
+            current_head_updated: false,
+            message: "已提交，等待更新。",
+          },
+          serving: metaEnvelope().serving,
+        });
+      }),
+      http.post(
+        "*/api/v1/factors/definitions/price_volume_factor/archive/resume",
+        async ({ request }) => {
+          const body = (await request.json()) as { command_id: string };
+          ids.push(body.command_id);
+          return HttpResponse.json({
+            data: {
+              status: "published",
+              command_id: body.command_id,
+              factor_id: "price_volume_factor",
+              version: 2,
+              content_sha256: "a".repeat(64),
+              current_head_updated: false,
+              message: "已归档，历史记录仍会保留。",
+            },
+            serving: metaEnvelope({ generationId: nextGeneration }).serving,
+          });
+        },
+      ),
+    );
+    renderApp("/factors");
+    await screen.findByRole("region", { name: "因子详情" });
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "归档" }));
+    expect(screen.getByText("归档当前定义，历史记录仍会保留。")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "确认归档" }));
+    expect(await screen.findByText("已提交，等待更新。")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "刷新状态" }));
+    expect(await screen.findByText("已归档，历史记录仍会保留。")).toBeInTheDocument();
+    expect(ids).toHaveLength(2);
+    expect(ids[0]).toBe(ids[1]);
+    expect(screen.getByRole("button", { name: "继续查看因子" })).toBeDisabled();
+    server.use(
+      metaHandler(metaEnvelope({ generationId: nextGeneration })),
+      http.get("*/api/v1/factors/definitions", () =>
+        HttpResponse.json(
+          catalog(
+            [
+              { ...definitions[0]!, archived: true },
+              {
+                ...definitions[1]!,
+                archived: false,
+                factor_id: "another_factor",
+                name_zh: "新因子",
+              },
+            ],
+            nextGeneration,
+          ),
+        ),
+      ),
+    );
+    await user.click(screen.getByRole("button", { name: "刷新" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "继续查看因子" })).toBeEnabled());
+    await user.click(screen.getByRole("button", { name: "继续查看因子" }));
+    await user.click(screen.getByRole("row", { name: /新因子/ }));
+    expect(screen.getByRole("button", { name: "归档" })).toBeInTheDocument();
+  });
   it("只读已发布定义，可用键盘选择归档因子，正文无内部标识或假结果", async () => {
     publish();
     const { container } = renderApp("/factors");

@@ -25,6 +25,10 @@ from rquant.canvas_publication_receipt import (
     Ed25519CanvasPublicationSigner,
     SecureCanvasPublicationSigningClient,
 )
+from rquant.factor.page_control_backend import (
+    FactorDefinitionPageControlBackend as RegistryFactorBackend,
+)
+from rquant.factor.registry import FactorDefinitionRegistry
 from rquant.formula_market_page_backend import FormulaMarketPageBackend
 from rquant.formula_market_private_config import load_private_formula_market_config
 from rquant.formula_pool_definition import FormulaPoolDefinitionStore, FormulaPoolSaveBackend
@@ -337,6 +341,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="shared private socket GID for price rule admission",
     )
+    parser.add_argument("--factor-archive-socket", type=Path)
+    parser.add_argument("--factor-archive-registry", type=Path)
+    parser.add_argument("--factor-archive-web-uid", type=int)
+    parser.add_argument("--factor-archive-shared-gid", type=int)
+    parser.add_argument("--factor-archive-editors")
     return parser
 
 
@@ -351,6 +360,11 @@ def main(
     price_rule_socket_path: Path | None = None,
     price_rule_web_uid: int | None = None,
     price_rule_shared_gid: int | None = None,
+    factor_archive_socket_path: Path | None = None,
+    factor_archive_registry_path: Path | None = None,
+    factor_archive_web_uid: int | None = None,
+    factor_archive_shared_gid: int | None = None,
+    factor_archive_editors: str | None = None,
     formula_market_config_path: Path | None = None,
 ) -> None:
     """Entry point. `argv` is what the runtime wrapper derived; keywords are for tests."""
@@ -379,6 +393,21 @@ def main(
             if price_rule_shared_gid is not None
             else arguments.price_rule_shared_gid
         )
+        factor_archive_socket_path = factor_archive_socket_path or arguments.factor_archive_socket
+        factor_archive_registry_path = (
+            factor_archive_registry_path or arguments.factor_archive_registry
+        )
+        factor_archive_web_uid = (
+            factor_archive_web_uid
+            if factor_archive_web_uid is not None
+            else arguments.factor_archive_web_uid
+        )
+        factor_archive_shared_gid = (
+            factor_archive_shared_gid
+            if factor_archive_shared_gid is not None
+            else arguments.factor_archive_shared_gid
+        )
+        factor_archive_editors = factor_archive_editors or arguments.factor_archive_editors
     return _serve(
         runtime_root=runtime_root,
         expected_commit=expected_commit,
@@ -388,6 +417,11 @@ def main(
         price_rule_socket_path=price_rule_socket_path,
         price_rule_web_uid=price_rule_web_uid,
         price_rule_shared_gid=price_rule_shared_gid,
+        factor_archive_socket_path=factor_archive_socket_path,
+        factor_archive_registry_path=factor_archive_registry_path,
+        factor_archive_web_uid=factor_archive_web_uid,
+        factor_archive_shared_gid=factor_archive_shared_gid,
+        factor_archive_editors=factor_archive_editors,
         formula_market_config_path=formula_market_config_path,
     )
 
@@ -402,6 +436,11 @@ def _serve(
     price_rule_socket_path: Path | None = None,
     price_rule_web_uid: int | None = None,
     price_rule_shared_gid: int | None = None,
+    factor_archive_socket_path: Path | None = None,
+    factor_archive_registry_path: Path | None = None,
+    factor_archive_web_uid: int | None = None,
+    factor_archive_shared_gid: int | None = None,
+    factor_archive_editors: str | None = None,
     formula_market_config_path: Path | None = None,
 ) -> None:
     from rquant.runtime_deployment_profile import (
@@ -498,6 +537,30 @@ def _serve(
                 rule_pool_root=page_profile.data_dir / "user_presets",
             ),
         )
+    factor_fields = (
+        factor_archive_socket_path,
+        factor_archive_registry_path,
+        factor_archive_web_uid,
+        factor_archive_shared_gid,
+        factor_archive_editors,
+    )
+    if any(value is not None for value in factor_fields) and not all(
+        value is not None for value in factor_fields
+    ):
+        raise ValueError("factor archive listener requires socket, registry, IDs and editors")
+    factor_backend = None
+    factor_editor_users: frozenset[str] = frozenset()
+    if all(value is not None for value in factor_fields):
+        assert factor_archive_registry_path is not None
+        assert factor_archive_editors is not None
+        names = tuple(name.strip() for name in factor_archive_editors.split(","))
+        if not names or any(not name for name in names) or len(set(names)) != len(names):
+            raise ValueError("factor archive editors must be distinct exact names")
+        factor_editor_users = frozenset(names)
+        factor_backend = RegistryFactorBackend(
+            FactorDefinitionRegistry(factor_archive_registry_path)
+        )
+        factor_backend.identity()
     service = build_page_control_service(
         outbox_path=page_profile.outbox_path,
         data_dir=page_profile.data_dir,
@@ -505,6 +568,7 @@ def _serve(
         allowed_lab_export_roots=(page_profile.data_dir / "exports",),
         formula_market_backend=formula_market_backend,
         formula_pool_backend=formula_pool_backend,
+        factor_definition_backend=factor_backend,
         load_default_lab_backend=False,
         consumer_service_id=canvas_profile.consumer_service_id,
         consumer_instance_id=canvas_profile.consumer_instance_id,
@@ -559,6 +623,22 @@ def _serve(
             )
         except Exception:
             logger.exception("Price rule admission listener disabled during startup")
+    factor_archive_server = None
+    if factor_backend is not None:
+        try:
+            from rquant.factor_definition_admission import (
+                FactorDefinitionAdmission,
+                build_factor_definition_admission_server,
+            )
+
+            factor_archive_server = build_factor_definition_admission_server(
+                FactorDefinitionAdmission(service, editor_users=factor_editor_users),
+                socket_path=factor_archive_socket_path,
+                trusted_web_uid=factor_archive_web_uid,
+                shared_gid=factor_archive_shared_gid,
+            )
+        except Exception:
+            logger.exception("Factor archive admission listener disabled during startup")
     server_class = _server_class_for_host(host)
     try:
         server = server_class((host, port), handler_for(service))
@@ -569,6 +649,8 @@ def _serve(
             watchlist_server.server_close()
         if price_rule_server is not None:
             price_rule_server.server_close()
+        if factor_archive_server is not None:
+            factor_archive_server.server_close()
         raise
     ack_thread = None
     ack_started = False
@@ -576,6 +658,8 @@ def _serve(
     watchlist_started = False
     price_rule_thread = None
     price_rule_started = False
+    factor_archive_thread = None
+    factor_archive_started = False
     try:
         if ack_server is not None:
             ack_thread = threading.Thread(target=ack_server.serve_forever, daemon=True)
@@ -591,6 +675,12 @@ def _serve(
             )
             price_rule_thread.start()
             price_rule_started = True
+        if factor_archive_server is not None:
+            factor_archive_thread = threading.Thread(
+                target=factor_archive_server.serve_forever, daemon=True
+            )
+            factor_archive_thread.start()
+            factor_archive_started = True
         server.serve_forever()
     finally:
         server.server_close()
@@ -609,6 +699,11 @@ def _serve(
                 price_rule_server.shutdown()
                 price_rule_thread.join()
             price_rule_server.server_close()
+        if factor_archive_server is not None:
+            if factor_archive_started and factor_archive_thread is not None:
+                factor_archive_server.shutdown()
+                factor_archive_thread.join()
+            factor_archive_server.server_close()
 
 
 if __name__ == "__main__":

@@ -17,6 +17,7 @@ from rquant.factor.registry import (
     FactorDefinitionRegistry,
     FactorHeadRef,
     FactorIntegrityError,
+    FactorRegistryIdentity,
     FactorRegistryIdentityError,
     SaveFactorDefinitionRequest,
 )
@@ -138,6 +139,198 @@ def _save_command(
         definition=_definition(version=version),
         expected_head=expected_head,
     )
+
+
+def test_archive_admission_binds_registry_and_only_drains_its_command(tmp_path: Path) -> None:
+    registry = FactorDefinitionRegistry(tmp_path / "factors.sqlite3")
+    identity = registry.initialize()
+    registry.save(
+        SaveFactorDefinitionRequest(
+            command_id="initial-save", definition=_definition(), expected_head=None
+        ),
+        expected_identity=identity,
+    )
+    service = _service(tmp_path, backend=FactorDefinitionPageControlBackend(registry))
+    head = registry.get_head("price_volume_1", expected_identity=identity)
+    assert head is not None
+    archive = ArchiveFactor(
+        command_id="archive-web-1",
+        requested_at=NOW,
+        factor_id="price_volume_1",
+        expected_head=FactorHeadRef(version=1, content_sha256=head.content_sha256),
+    )
+    unrelated = _save_command(command_id="unrelated-save")
+    service.outbox.enqueue_trusted_factor_definition(
+        _owned_factor_definition_command(unrelated, authenticated_actor_id="research-admin")
+    )
+
+    receipt = service._submit_trusted_factor_archive(
+        archive,
+        authenticated_actor_id="research-admin",
+        verified_registry_instance_id=identity.instance_id,
+    )
+
+    assert receipt.status is PageControlStatus.SUCCEEDED
+    assert service.outbox.receipt(unrelated.command_id).status is PageControlStatus.PENDING
+    with sqlite3.connect(service.outbox.path) as connection:
+        payload = connection.execute(
+            "SELECT payload_json FROM page_control_command WHERE command_id = ?",
+            (archive.command_id,),
+        ).fetchone()[0]
+    assert identity.instance_id in payload
+    assert str(identity.st_ino) in payload
+    assert (
+        service._lookup_trusted_factor_archive(archive, authenticated_actor_id="research-admin")
+        == receipt
+    )
+    with pytest.raises(PageControlCommandConflictError):
+        service._resume_trusted_factor_archive(archive, authenticated_actor_id="another-user")
+    assert registry.get_head("price_volume_1", expected_identity=identity).head.archived
+
+
+def test_archive_admission_rejects_serving_registry_mismatch_before_enqueue(
+    tmp_path: Path,
+) -> None:
+    source = FactorDefinitionRegistry(tmp_path / "serving-factor.sqlite3")
+    source_identity = source.initialize()
+    destination = FactorDefinitionRegistry(tmp_path / "factors.sqlite3")
+    destination_identity = destination.initialize()
+    for registry, identity in (
+        (source, source_identity),
+        (destination, destination_identity),
+    ):
+        registry.save(
+            SaveFactorDefinitionRequest(
+                command_id="same-definition", definition=_definition(), expected_head=None
+            ),
+            expected_identity=identity,
+        )
+    source_head = source.get_head("price_volume_1", expected_identity=source_identity)
+    destination_head = destination.get_head(
+        "price_volume_1", expected_identity=destination_identity
+    )
+    assert source_head is not None and destination_head is not None
+    assert source_head.content_sha256 == destination_head.content_sha256
+    assert source_identity.instance_id != destination_identity.instance_id
+    service = _service(tmp_path, backend=FactorDefinitionPageControlBackend(destination))
+    archive = ArchiveFactor(
+        command_id="archive-web-2",
+        requested_at=NOW,
+        factor_id="price_volume_1",
+        expected_head=FactorHeadRef(version=1, content_sha256=source_head.content_sha256),
+    )
+    with pytest.raises(ValueError, match="registry"):
+        service._submit_trusted_factor_archive(
+            archive,
+            authenticated_actor_id="research-admin",
+            verified_registry_instance_id=source_identity.instance_id,
+        )
+    assert service.outbox.receipt(archive.command_id) is None
+    assert not destination.get_head(
+        "price_volume_1", expected_identity=destination_identity
+    ).head.archived
+
+
+def test_archive_admission_does_not_write_replacement_registry_after_enqueue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "factors.sqlite3"
+    registry = FactorDefinitionRegistry(path)
+    identity = registry.initialize()
+    saved = registry.save(
+        SaveFactorDefinitionRequest(
+            command_id="initial-save", definition=_definition(), expected_head=None
+        ),
+        expected_identity=identity,
+    )
+    service = _service(tmp_path, backend=FactorDefinitionPageControlBackend(registry))
+    command = ArchiveFactor(
+        command_id="archive-before-replace",
+        requested_at=NOW,
+        factor_id="price_volume_1",
+        expected_head=FactorHeadRef(version=1, content_sha256=saved.content_sha256),
+    )
+    enqueue = service.outbox.enqueue_trusted_factor_definition
+
+    def replace_after_enqueue(owned: object) -> object:
+        receipt = enqueue(owned)
+        path.rename(tmp_path / "original.sqlite3")
+        replacement = FactorDefinitionRegistry(path)
+        replacement_identity = replacement.initialize()
+        replacement.save(
+            SaveFactorDefinitionRequest(
+                command_id="replacement-save", definition=_definition(), expected_head=None
+            ),
+            expected_identity=replacement_identity,
+        )
+        return receipt
+
+    monkeypatch.setattr(service.outbox, "enqueue_trusted_factor_definition", replace_after_enqueue)
+    receipt = service._submit_trusted_factor_archive(
+        command,
+        authenticated_actor_id="research-admin",
+        verified_registry_instance_id=identity.instance_id,
+    )
+    assert receipt.status is not PageControlStatus.SUCCEEDED
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("SELECT count(*) FROM factor_archive_events").fetchone()[0] == 0
+    with pytest.raises(PageControlCommandConflictError):
+        service._lookup_trusted_factor_archive(
+            command.model_copy(
+                update={"expected_head": FactorHeadRef(version=1, content_sha256="0" * 64)}
+            ),
+            authenticated_actor_id="research-admin",
+        )
+
+
+def test_archive_admission_rechecks_registry_before_enqueue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "factors.sqlite3"
+    registry = FactorDefinitionRegistry(path)
+    identity = registry.initialize()
+    saved = registry.save(
+        SaveFactorDefinitionRequest(
+            command_id="initial-save", definition=_definition(), expected_head=None
+        ),
+        expected_identity=identity,
+    )
+    backend = FactorDefinitionPageControlBackend(registry)
+    service = _service(tmp_path, backend=backend)
+    original_identity = backend.identity
+    calls = 0
+
+    def replace_before_recheck() -> FactorRegistryIdentity:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            path.rename(tmp_path / "original.sqlite3")
+            replacement = FactorDefinitionRegistry(path)
+            replacement_identity = replacement.initialize()
+            replacement.save(
+                SaveFactorDefinitionRequest(
+                    command_id="replacement-save", definition=_definition(), expected_head=None
+                ),
+                expected_identity=replacement_identity,
+            )
+        return original_identity()
+
+    monkeypatch.setattr(backend, "identity", replace_before_recheck)
+    command = ArchiveFactor(
+        command_id="archive-before-recheck",
+        requested_at=NOW,
+        factor_id="price_volume_1",
+        expected_head=FactorHeadRef(version=1, content_sha256=saved.content_sha256),
+    )
+    with pytest.raises(ValueError, match="registry"):
+        service._submit_trusted_factor_archive(
+            command,
+            authenticated_actor_id="research-admin",
+            verified_registry_instance_id=identity.instance_id,
+        )
+    assert service.outbox.receipt(command.command_id) is None
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("SELECT count(*) FROM factor_archive_events").fetchone()[0] == 0
 
 
 def test_generic_admission_rejects_factor_commands_and_trusted_actor_is_durable(

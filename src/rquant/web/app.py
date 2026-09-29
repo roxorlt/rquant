@@ -8,6 +8,7 @@ stripped, so this app only knows ``/api/v1/...``. No static files, no CORS, no d
 from __future__ import annotations
 
 import json
+import re
 import secrets
 import threading
 from collections.abc import AsyncIterator, Callable
@@ -85,6 +86,7 @@ from rquant.web.settings import WebSettings
 
 if TYPE_CHECKING:
     from rquant.alert_ack_admission import AckAdmissionClient
+    from rquant.factor_definition_admission import FactorDefinitionAdmissionClient
     from rquant.watchlist_admission import WatchlistAdmissionClient
 
 API_TITLE = "rQuant Web API"
@@ -103,6 +105,9 @@ _WRITE_BODY_LIMITS = {
     "/api/v1/pools/formula/commands": formula_pool_save_commands.MAX_REQUEST_BYTES,
     "/api/v1/tasks/jobs/commands": tasks_controls.MAX_REQUEST_BYTES,
 }
+_FACTOR_ARCHIVE_WRITE = re.compile(
+    r"^/api/v1/factors/definitions/[a-z][a-z0-9_]{0,63}/archive(?:/resume)?$"
+)
 
 
 def _utc_now() -> datetime:
@@ -125,6 +130,7 @@ class WebContext:
     ack_lookup: AckLookupGateway
     ack_admission: AckAdmissionClient | None
     watchlist_admission: WatchlistAdmissionClient | None
+    factor_admission: FactorDefinitionAdmissionClient | None
     unit_log_client: UnitLogClient | None
     unit_log_access_audit: ServiceLogAccessAudit | None
     unit_log_gate: threading.BoundedSemaphore
@@ -145,6 +151,7 @@ def create_app(
     ack_lookup_transport: AckLookupTransport | None = None,
     ack_admission_client: AckAdmissionClient | None = None,
     watchlist_admission_client: WatchlistAdmissionClient | None = None,
+    factor_admission_client: FactorDefinitionAdmissionClient | None = None,
     unit_log_client: UnitLogClient | None = None,
     unit_log_access_audit: ServiceLogAccessAudit | None = None,
     backfill_plan_command_transport: BackfillPlanCommandTransport | None = None,
@@ -215,6 +222,19 @@ def create_app(
             if watchlist_admission_client is not None
             else WatchlistAdmissionClient(settings.watchlist_admission_socket_path)
         )
+    configured_factor_admission = None
+    if settings.factor_admission_socket_path is not None:
+        from rquant.factor_definition_admission import FactorDefinitionAdmissionClient
+
+        configured_factor_admission = (
+            factor_admission_client
+            if factor_admission_client is not None
+            else FactorDefinitionAdmissionClient(
+                settings.factor_admission_socket_path,
+                expected_service_uid=settings.factor_admission_service_uid,
+                shared_gid=settings.factor_admission_shared_gid,
+            )
+        )
     configured_unit_log = None
     if settings.unit_log_socket_path is not None:
         assert settings.unit_log_service_uid is not None
@@ -265,6 +285,7 @@ def create_app(
         ),
         ack_admission=configured_ack_admission,
         watchlist_admission=configured_watchlist_admission,
+        factor_admission=configured_factor_admission,
         unit_log_client=configured_unit_log,
         unit_log_access_audit=unit_log_access_audit,
         unit_log_gate=threading.BoundedSemaphore(1),
@@ -289,7 +310,10 @@ def create_app(
 
     @app.middleware("http")
     async def security_headers(request: Request, call_next: Callable[..., Any]) -> Response:
-        if request.method == "POST" and request.url.path in _WRITE_BODY_LIMITS:
+        body_limit = _WRITE_BODY_LIMITS.get(request.url.path)
+        if body_limit is None and _FACTOR_ARCHIVE_WRITE.fullmatch(request.url.path):
+            body_limit = factors.MAX_ARCHIVE_REQUEST_BYTES
+        if request.method == "POST" and body_limit is not None:
             content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
             if content_type != "application/json":
                 return JSONResponse(
@@ -301,7 +325,7 @@ def create_app(
             total = 0
             async for part in request.stream():
                 total += len(part)
-                if total > _WRITE_BODY_LIMITS[request.url.path]:
+                if total > body_limit:
                     return JSONResponse(
                         status_code=413,
                         content={"detail": "请求内容过长，请删减后重试。"},
