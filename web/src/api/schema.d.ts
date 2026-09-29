@@ -837,6 +837,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/tasks/jobs/commands": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 控制研究任务 */
+        post: operations["submit_lab_control_api_v1_tasks_jobs_commands_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tasks/jobs/control-capabilities": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 研究任务操作权限 */
+        get: operations["control_capabilities_api_v1_tasks_jobs_control_capabilities_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/tasks/jobs/{job_id}/events": {
         parameters: {
             query?: never;
@@ -3014,6 +3048,51 @@ export interface components {
             service_label: string;
         };
         JsonValue: unknown;
+        /** LabControlCapabilities */
+        LabControlCapabilities: {
+            /** Can Control */
+            can_control: boolean;
+        };
+        /** LabControlReceipt */
+        LabControlReceipt: {
+            /**
+             * Command Id
+             * Format: uuid
+             */
+            command_id: string;
+            /** Message */
+            message: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "submitted" | "pending" | "processing" | "unknown" | "conflict" | "failed";
+        };
+        /** LabControlRequest */
+        LabControlRequest: {
+            /**
+             * Action
+             * @enum {string}
+             */
+            action: "pause" | "resume" | "cancel" | "retry";
+            /**
+             * Command Id
+             * Format: uuid
+             */
+            command_id: string;
+            /** Expected Version */
+            expected_version: number;
+            /**
+             * Job Id
+             * Format: uuid
+             */
+            job_id: string;
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+        };
         /** LocalExpr */
         LocalExpr: {
             /**
@@ -4036,6 +4115,8 @@ export interface components {
         };
         /** ResearchJobItem */
         ResearchJobItem: {
+            /** Available Actions */
+            available_actions?: ("pause" | "resume" | "cancel" | "retry")[] | null;
             /** Eta At */
             eta_at: string | null;
             /** Eta High */
@@ -4048,6 +4129,8 @@ export interface components {
             job_id: string;
             /** Job Type Label */
             job_type_label: string;
+            /** Job Version */
+            job_version?: number | null;
             /** Progress Fraction */
             progress_fraction: number;
             /** Resource Label */
@@ -4842,6 +4925,11 @@ export interface components {
         };
         /** TaskOverviewData */
         TaskOverviewData: {
+            /**
+             * Can Control Research Jobs
+             * @default false
+             */
+            can_control_research_jobs: boolean;
             /**
              * Can View Research Logs
              * @default false
@@ -6467,6 +6555,68 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    submit_lab_control_api_v1_tasks_jobs_commands_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["LabControlRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LabControlReceipt"];
+                };
+            };
+            /** @description Conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LabControlReceipt"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    control_capabilities_api_v1_tasks_jobs_control_capabilities_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LabControlCapabilities"];
                 };
             };
         };

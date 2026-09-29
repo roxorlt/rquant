@@ -221,6 +221,67 @@ for (const viewport of [
       ).toEqual([]);
     });
 
+    test("keyboard can open, dismiss and confirm a research cancellation", async ({ page }) => {
+      const first = OVERVIEW_ENVELOPE.data.research.items[0];
+      if (first === undefined) throw new Error("synthetic research job is missing");
+      const overview: typeof OVERVIEW_ENVELOPE = {
+        ...OVERVIEW_ENVELOPE,
+        data: {
+          ...OVERVIEW_ENVELOPE.data,
+          can_control_research_jobs: true,
+          research: {
+            ...OVERVIEW_ENVELOPE.data.research,
+            items: [{ ...first, job_version: 7, available_actions: ["cancel"] }],
+          },
+        },
+      };
+      const posts: components["schemas"]["LabControlRequest"][] = [];
+      await page.route("**/api/v1/meta", async (route) => {
+        const response = await route.fetch();
+        const payload = await response.json();
+        payload.data.generation.generation_id = overview.serving.generation_id;
+        await route.fulfill({ json: payload });
+      });
+      await page.route("**/api/v1/tasks/overview**", async (route) => {
+        await route.fulfill({ json: overview });
+      });
+      await page.route("**/api/v1/tasks/jobs/control-capabilities", async (route) => {
+        await route.fulfill({ json: { can_control: true } });
+      });
+      await page.route("**/api/v1/tasks/jobs/commands", async (route) => {
+        posts.push(route.request().postDataJSON());
+        await route.fulfill({
+          json: {
+            command_id: posts.at(-1)?.command_id,
+            status: "submitted",
+            message: "已提交，等待状态更新。",
+          },
+        });
+      });
+
+      await page.goto("./#/tasks");
+      const cancel = page.getByRole("button", { name: "取消动量参数搜索" });
+      await expect(cancel).toBeVisible();
+      await cancel.focus();
+      await page.keyboard.press("Enter");
+      await expect(page.getByRole("dialog")).toBeVisible();
+      await page.keyboard.press("Escape");
+      await expect(page.getByRole("dialog")).toHaveCount(0);
+      expect(posts).toHaveLength(0);
+
+      await cancel.focus();
+      await page.keyboard.press("Space");
+      const confirm = page.getByRole("dialog").getByRole("button", { name: "确认取消" });
+      await expect(confirm).toBeVisible();
+      await confirm.focus();
+      await page.keyboard.press("Enter");
+      await expect(page.getByText("已提交，等待状态更新。")).toBeVisible();
+      expect(posts).toHaveLength(1);
+      expect(posts[0]?.action).toBe("cancel");
+      expect(posts[0]?.expected_version).toBe(7);
+      await expectNoHorizontalOverflow(page, "keyboard research cancellation");
+    });
+
     test("real published empty queue explains why there are no rows", async ({ page }) => {
       const watcher = watch(page);
       await page.goto("./#/tasks");
