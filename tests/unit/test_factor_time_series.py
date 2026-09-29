@@ -27,7 +27,9 @@ if TYPE_CHECKING:
     )
 
 
-def _definition(expression: str, *, earliest_available_date: date = _DAYS[0]) -> FactorDefinition:
+def _definition(
+    expression: str, *, earliest_available_date: date | None = _DAYS[0]
+) -> FactorDefinition:
     return build_factor_definition(
         factor_id="synthetic_factor",
         name_zh="合成因子",
@@ -70,7 +72,7 @@ def _input(
     *,
     universe: tuple[str, ...] = (_A,),
     decision_times: tuple[DecisionTime, ...] | None = None,
-    earliest_available_date: date = _DAYS[0],
+    earliest_available_date: date | None = _DAYS[0],
 ) -> FactorTimeSeriesInput:
     from rquant.factor.time_series import DecisionTime, FactorTimeSeriesInput
 
@@ -352,6 +354,24 @@ def test_dates_before_definition_availability_stay_empty_but_can_supply_history(
     )
     assert _point(result, days[0], _A).missing_reason == "before_available_date"
     assert _point(result, days[1], _A).value == pytest.approx(1.5)
+
+
+def test_unknown_earliest_date_evaluates_present_rows_and_keeps_real_missing() -> None:
+    result = _run(
+        _input(
+            "ts_mean(close, 2)",
+            _DAYS[:3],
+            (
+                _observation(_DAYS[0], _A, "close", 1.0),
+                _observation(_DAYS[1], _A, "close", 2.0),
+            ),
+            earliest_available_date=None,
+        )
+    )
+    assert _point(result, _DAYS[0], _A).missing_reason == "insufficient_history"
+    assert _point(result, _DAYS[1], _A).value == pytest.approx(1.5)
+    assert _point(result, _DAYS[2], _A).missing_reason is not None
+    assert _point(result, _DAYS[2], _A).missing_reason != "before_available_date"
 
 
 def test_contracts_reject_naive_times_and_results_are_frozen() -> None:

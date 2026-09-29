@@ -2782,11 +2782,8 @@ export interface components {
             direction: "higher_is_better" | "lower_is_better";
             /** Direction Label */
             direction_label: string;
-            /**
-             * Earliest Available Date
-             * Format: date
-             */
-            earliest_available_date: string;
+            /** Earliest Available Date */
+            earliest_available_date: string | null;
             /** Expression */
             expression: string;
             /** Factor Id */

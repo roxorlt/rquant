@@ -48,7 +48,11 @@ def project_factor_definition_projections(
                 "category": row.category,
                 "direction": row.direction,
                 "expression": row.expression,
-                "earliest_available_date": row.earliest_available_date.isoformat(),
+                "earliest_available_date": (
+                    row.earliest_available_date.isoformat()
+                    if row.earliest_available_date is not None
+                    else None
+                ),
                 "dependency_columns_json": canonical_json_bytes(row.dependency_columns).decode(
                     "utf-8"
                 ),
@@ -101,11 +105,16 @@ def validate_factor_definition_projections(
         ):
             raise ValueError("factor definition dependencies must be a string list")
         earliest = row["earliest_available_date"]
-        if not isinstance(earliest, str) or date.fromisoformat(earliest).isoformat() != earliest:
-            raise ValueError("factor definition earliest date must be canonical")
+        parsed_earliest: date | None = None
+        if earliest is not None:
+            if not isinstance(earliest, str):
+                raise ValueError("factor definition earliest date must be canonical")
+            parsed_earliest = date.fromisoformat(earliest)
+            if parsed_earliest.isoformat() != earliest:
+                raise ValueError("factor definition earliest date must be canonical")
         row_data = dict(row)
         row_data.pop("dependency_columns_json")
-        row_data["earliest_available_date"] = date.fromisoformat(earliest)
+        row_data["earliest_available_date"] = parsed_earliest
         row_data["dependency_columns"] = tuple(dependencies)
         rows.append(FactorDefinitionServingRow.model_validate(row_data))
     return FactorDefinitionServingSnapshot(

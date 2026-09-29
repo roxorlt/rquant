@@ -31,7 +31,7 @@ class FactorDefinition(BaseModel):
     category: str
     direction: FactorDirection
     version: int = Field(ge=1, strict=True)
-    earliest_available_date: date
+    earliest_available_date: date | None
     expression: str
     dependency_columns: tuple[str, ...]
     max_history_window: int = Field(ge=1, strict=True)
@@ -90,7 +90,7 @@ def build_factor_definition(
     category: str,
     direction: FactorDirection,
     version: int,
-    earliest_available_date: date,
+    earliest_available_date: date | None,
     expression: str,
     feature_catalog: FeatureCatalog,
     dependency_columns: tuple[str, ...] | None = None,
