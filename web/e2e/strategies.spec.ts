@@ -44,9 +44,20 @@ test("策略目录的真实字段、键盘选择和手机布局", async ({ page 
   await expect(
     page.getByRole("table", { name: "当前参数" }).getByText("跳空幅度下限"),
   ).toBeVisible();
+  await expect(page.locator(".strategy-detail-meta")).toContainText("登记时间");
+  const auction = page.getByRole("table", { name: "策略列表" }).getByRole("row", {
+    name: /集合竞价跳空/,
+  });
   const growth = page.getByRole("table", { name: "策略列表" }).getByRole("row", {
     name: /科创及创业板放量/,
   });
+  await auction.focus();
+  await page.keyboard.press("ArrowDown");
+  await expect(growth).toBeFocused();
+  await page.keyboard.press("Space");
+  await expect(
+    page.getByRole("table", { name: "当前参数" }).getByText("创业板、科创板"),
+  ).toBeVisible();
   await growth.focus();
   await page.keyboard.press("Enter");
   await expect(
@@ -60,6 +71,7 @@ test("策略目录的真实字段、键盘选择和手机布局", async ({ page 
   await page.setViewportSize({ width: 390, height: 844 });
   await expect(page.getByRole("table", { name: "策略列表" })).toBeVisible();
   await expect(page.getByRole("table", { name: "当前参数" })).toBeVisible();
+  await expect(page.locator(".strategy-detail-meta")).toContainText("登记时间");
   await expectNoHorizontalOverflow(page, "strategy phone");
   expect(watcher.problems).toEqual([]);
 });

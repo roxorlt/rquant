@@ -25,5 +25,6 @@ export function useStrategyCatalog(
       }
       return data;
     },
+    { enabled: typeof generationId === "string" },
   );
 }

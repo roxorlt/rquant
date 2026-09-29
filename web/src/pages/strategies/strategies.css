@@ -19,6 +19,13 @@
   margin: 0;
 }
 
+.strategy-detail-meta {
+  display: inline-flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+}
+
 @media (max-width: 760px) {
   .strategy-stack {
     gap: 12px;
