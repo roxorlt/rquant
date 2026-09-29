@@ -443,8 +443,12 @@ class FactorDefinitionRegistry:
             (factor_id,),
         ).fetchall()
         if head_row is None:
-            if version_rows:
-                raise FactorIntegrityError("factor versions have no head")
+            archive_event = connection.execute(
+                "SELECT 1 FROM factor_archive_events WHERE factor_id = ? LIMIT 1",
+                (factor_id,),
+            ).fetchone()
+            if version_rows or archive_event is not None:
+                raise FactorIntegrityError("factor history has no head")
             return None, ()
         head_version = head_row["version"]
         head_digest = head_row["content_sha256"]
@@ -524,14 +528,53 @@ class FactorDefinitionRegistry:
         if records[-1].content_sha256 != head_digest:
             raise FactorIntegrityError("factor head digest differs from latest version")
         archive_events = connection.execute(
-            "SELECT content_sha256 FROM factor_archive_events WHERE factor_id = ? AND version = ?",
-            (factor_id, head_version),
+            "SELECT e.command_id, e.version, e.content_sha256, "
+            "c.action AS command_action, c.request_sha256 AS command_request_sha256, "
+            "c.receipt_json AS command_receipt_json, "
+            "c.receipt_sha256 AS command_receipt_sha256 "
+            "FROM factor_archive_events AS e LEFT JOIN factor_commands AS c "
+            "ON c.command_id = e.command_id "
+            "WHERE e.factor_id = ? ORDER BY e.version",
+            (factor_id,),
         ).fetchall()
-        if (
-            len(archive_events) > 1
-            or bool(archive_events) != bool(archived)
-            or (archive_events and archive_events[0]["content_sha256"] != head_digest)
-        ):
+        archived_versions: set[int] = set()
+        for event in archive_events:
+            version = event["version"]
+            command_id = event["command_id"]
+            if (
+                type(version) is not int
+                or not 1 <= version <= head_version
+                or version in archived_versions
+                or not isinstance(command_id, str)
+                or _COMMAND_ID_PATTERN.fullmatch(command_id) is None
+                or event["content_sha256"] != records[version - 1].content_sha256
+                or event["command_action"] != "archive"
+            ):
+                raise FactorIntegrityError("factor archive event is invalid")
+            expected_head = FactorHeadRef(
+                version=version, content_sha256=records[version - 1].content_sha256
+            )
+            expected_request = ArchiveFactorRequest(
+                command_id=command_id, factor_id=factor_id, expected_head=expected_head
+            )
+            expected_receipt = FactorDefinitionReceipt(
+                command_id=command_id,
+                action="archive",
+                factor_id=factor_id,
+                version=version,
+                content_sha256=expected_head.content_sha256,
+                archived=True,
+            )
+            receipt_json = event["command_receipt_json"]
+            if (
+                not isinstance(receipt_json, str)
+                or _sha256(receipt_json) != event["command_receipt_sha256"]
+                or _decode_receipt(receipt_json) != expected_receipt
+                or event["command_request_sha256"] != _request_sha256("archive", expected_request)
+            ):
+                raise FactorIntegrityError("factor archive command differs from event")
+            archived_versions.add(version)
+        if (head_version in archived_versions) != bool(archived):
             raise FactorIntegrityError("factor archive state differs from archive event")
         return head, tuple(records)
 
@@ -695,7 +738,8 @@ class FactorDefinitionRegistry:
         with self._reader(expected_identity) as connection:
             factor_ids = connection.execute(
                 "SELECT factor_id FROM factor_heads UNION "
-                "SELECT factor_id FROM factor_versions ORDER BY factor_id"
+                "SELECT factor_id FROM factor_versions UNION "
+                "SELECT factor_id FROM factor_archive_events ORDER BY factor_id"
             ).fetchall()
             current: list[FactorDefinitionRecord] = []
             for row in factor_ids:

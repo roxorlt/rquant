@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import sqlite3
 from datetime import date, datetime, timedelta, timezone
@@ -227,6 +228,103 @@ def test_corrupt_historical_version_or_command_receipt_rejects_snapshot(
                 "WHERE command_id = 'save-v1'",
                 (malformed, malformed_sha),
             )
+    with pytest.raises(FactorIntegrityError):
+        project_factor_definition_serving_snapshot(
+            registry, expected_identity=identity, available_at=_AT
+        )
+
+
+@pytest.mark.parametrize("reactivated", [False, True])
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "receipt_json",
+        "receipt_sha256",
+        "receipt_version",
+        "request_sha256",
+        "command_action",
+        "missing_command",
+        "event_content_sha256",
+        "event_factor_id",
+    ],
+)
+def test_projection_rejects_corrupt_current_or_historical_archive_command(
+    tmp_path: Path, damage: str, reactivated: bool
+) -> None:
+    from rquant.factor.definition_serving import project_factor_definition_serving_snapshot
+
+    path = tmp_path / "factors.sqlite3"
+    registry, identity = _registry(path)
+    first = _save(registry, identity, "save-v1", _definition("factor_a"))
+    archive_request = ArchiveFactorRequest(
+        command_id="archive-v1",
+        factor_id="factor_a",
+        expected_head=FactorHeadRef(version=1, content_sha256=first.content_sha256),
+    )
+    registry.archive(archive_request, expected_identity=identity)
+    if reactivated:
+        _save(
+            registry,
+            identity,
+            "save-v2",
+            _definition("factor_a", version=2),
+            archive_request.expected_head,
+        )
+    baseline = project_factor_definition_serving_snapshot(
+        registry, expected_identity=identity, available_at=_AT
+    )
+    assert baseline.state.status == "populated"
+    assert baseline.definitions[0].archived is not reactivated
+
+    with sqlite3.connect(path) as connection:
+        if damage == "receipt_json":
+            malformed = "{bad"
+            connection.execute(
+                "UPDATE factor_commands SET receipt_json = ?, receipt_sha256 = ? "
+                "WHERE command_id = 'archive-v1'",
+                (malformed, hashlib.sha256(malformed.encode()).hexdigest()),
+            )
+        elif damage == "receipt_sha256":
+            connection.execute(
+                "UPDATE factor_commands SET receipt_sha256 = ? WHERE command_id = 'archive-v1'",
+                ("f" * 64,),
+            )
+        elif damage == "receipt_version":
+            payload = json.loads(
+                connection.execute(
+                    "SELECT receipt_json FROM factor_commands WHERE command_id = 'archive-v1'"
+                ).fetchone()[0]
+            )
+            payload["version"] = 2
+            encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            connection.execute(
+                "UPDATE factor_commands SET receipt_json = ?, receipt_sha256 = ? "
+                "WHERE command_id = 'archive-v1'",
+                (encoded, hashlib.sha256(encoded.encode()).hexdigest()),
+            )
+        elif damage == "request_sha256":
+            connection.execute(
+                "UPDATE factor_commands SET request_sha256 = ? WHERE command_id = 'archive-v1'",
+                ("f" * 64,),
+            )
+        elif damage == "command_action":
+            connection.execute(
+                "UPDATE factor_commands SET action = 'save' WHERE command_id = 'archive-v1'"
+            )
+        elif damage == "missing_command":
+            connection.execute("DELETE FROM factor_commands WHERE command_id = 'archive-v1'")
+        elif damage == "event_content_sha256":
+            connection.execute(
+                "UPDATE factor_archive_events SET content_sha256 = ? "
+                "WHERE command_id = 'archive-v1'",
+                ("f" * 64,),
+            )
+        else:
+            connection.execute(
+                "UPDATE factor_archive_events SET factor_id = 'orphan_factor' "
+                "WHERE command_id = 'archive-v1'"
+            )
+
     with pytest.raises(FactorIntegrityError):
         project_factor_definition_serving_snapshot(
             registry, expected_identity=identity, available_at=_AT
