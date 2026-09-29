@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from math import ceil, isfinite, sqrt
+from math import ceil, e, isfinite, sqrt
 from statistics import NormalDist
 from typing import Annotated, Literal
 
@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 FiniteFloat = Annotated[float, Field(strict=True, allow_inf_nan=False)]
 _NORMAL = NormalDist()
 _MIN_OBSERVATIONS = 30
+_EULER_MASCHERONI = 0.5772156649015329
 
 
 class SinglePeriodSharpeInput(BaseModel):
@@ -70,6 +71,36 @@ class MinimumTrackRecordLengthResult(BaseModel):
         elif self.estimated_observations is None or self.minimum_observations is None:
             raise ValueError("reachable length requires estimated and minimum observations")
         return self
+
+
+class DeflatedSharpeInput(BaseModel):
+    """Single-period selected Sharpe and complete independent-trial family evidence.
+
+    Convert annualized Sharpe before calling. The caller must verify the trial
+    family's completeness and independence; a raw run count is not a substitute.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, revalidate_instances="always")
+
+    selected_strategy: SinglePeriodSharpeInput
+    independent_trial_count: int = Field(strict=True, ge=1)
+    family_sharpe_std_per_period: FiniteFloat = Field(ge=0.0)
+
+    @model_validator(mode="after")
+    def _zero_reference_baseline(self) -> DeflatedSharpeInput:
+        if self.selected_strategy.benchmark_sharpe_per_period != 0.0:
+            raise ValueError("selected_strategy benchmark must be zero for DSR")
+        return self
+
+
+class DeflatedSharpeResult(BaseModel):
+    """Probability above the expected maximum noise Sharpe for an independent family."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    inputs: DeflatedSharpeInput
+    expected_max_noise_sharpe_per_period: FiniteFloat = Field(ge=0.0)
+    probability: FiniteFloat = Field(ge=0.0, le=1.0)
 
 
 def _estimation_variance_factor(inputs: SinglePeriodSharpeInput) -> float:
@@ -133,4 +164,38 @@ def minimum_track_record_length_per_period(
         status="reachable",
         estimated_observations=estimated,
         minimum_observations=max(_MIN_OBSERVATIONS, ceil(estimated)),
+    )
+
+
+def deflated_sharpe_ratio_per_period(inputs: DeflatedSharpeInput) -> DeflatedSharpeResult:
+    """Deflate selected per-period Sharpe against the family's expected noise maximum."""
+
+    inputs = DeflatedSharpeInput.model_validate(inputs)
+    count = inputs.independent_trial_count
+    dispersion = inputs.family_sharpe_std_per_period
+    if count == 1 or dispersion == 0.0:
+        threshold = 0.0
+    else:
+        try:
+            first_probability = 1.0 - 1.0 / count
+            second_probability = 1.0 - 1.0 / (count * e)
+            if first_probability >= 1.0 or second_probability >= 1.0:
+                raise ValueError("independent trial count exceeds quantile precision")
+            expected_max_standard_normal = (1.0 - _EULER_MASCHERONI) * _NORMAL.inv_cdf(
+                first_probability
+            ) + _EULER_MASCHERONI * _NORMAL.inv_cdf(second_probability)
+            threshold = dispersion * expected_max_standard_normal
+        except OverflowError as exc:
+            raise ValueError("expected noise Sharpe exceeds finite numeric range") from exc
+        if not isfinite(threshold):
+            raise ValueError("expected noise Sharpe exceeds finite numeric range")
+
+    adjusted = inputs.selected_strategy.model_copy(
+        update={"benchmark_sharpe_per_period": threshold}
+    )
+    psr = probabilistic_sharpe_ratio_per_period(adjusted)
+    return DeflatedSharpeResult(
+        inputs=inputs,
+        expected_max_noise_sharpe_per_period=threshold,
+        probability=psr.probability,
     )
