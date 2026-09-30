@@ -50,8 +50,25 @@ def test_runner_returns_three_bound_completed_layers_and_cleans_session(tmp_path
 
 
 @pytest.mark.parametrize("tail", ["exception", "missing", "extra", "cancel"])
-def test_failure_after_last_evaluation_cannot_publish_success(tmp_path: Path, tail: str) -> None:
-    from rquant.factor.stream_runner import run_factor_stream_research
+@pytest.mark.parametrize("with_decay", [False, True])
+def test_failure_after_last_evaluation_cannot_publish_success(
+    tmp_path: Path, tail: str, with_decay: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rquant.factor.decay_stream import FactorICDecayStream
+    from rquant.factor.stream_runner import (
+        run_factor_stream_research,
+        run_factor_stream_research_with_decay,
+    )
+
+    run = run_factor_stream_research_with_decay if with_decay else run_factor_stream_research
+    cleared = []
+    original_close = FactorICDecayStream.close
+
+    def close(accumulator: FactorICDecayStream) -> None:
+        original_close(accumulator)
+        cleared.append(accumulator)
+
+    monkeypatch.setattr(FactorICDecayStream, "close", close)
 
     with _prepared(tmp_path) as (metadata, lake, request):
         closed = []
@@ -78,15 +95,129 @@ def test_failure_after_last_evaluation_cannot_publish_success(tmp_path: Path, ta
             else (RuntimeError if tail == "exception" else ValueError)
         )
         with pytest.raises(expected):
-            run_factor_stream_research(
-                request, metadata_store=metadata, lake_root=lake, universe_requests=source()
-            )
+            run(request, metadata_store=metadata, lake_root=lake, universe_requests=source())
         assert closed == [True]
+        if with_decay:
+            assert cleared
+            assert all(
+                item.cached_factor_count == item.cached_period_count == 0
+                and item.completion is None
+                for item in cleared
+            )
         assert not list((lake / ".execution_sessions").iterdir())
 
 
-def test_admission_failure_closes_owned_unstarted_source(tmp_path: Path) -> None:
-    from rquant.factor.stream_runner import run_factor_stream_research
+def test_decay_entry_uses_same_queries_and_processes_each_batch_after_statistics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rquant.factor import daily_stream, stream_snapshot
+    from rquant.factor.decay_stream import FactorICDecayStream
+    from rquant.factor.stream_runner import (
+        FactorStreamResearchResult,
+        run_factor_stream_research,
+        run_factor_stream_research_with_decay,
+    )
+    from rquant.research_snapshot import FactorStreamReadLease
+
+    queries = []
+    sessions = []
+    processed = []
+    original_session = stream_snapshot.ResearchExecutionSession
+    evaluate = daily_stream._evaluate_day
+    consume = FactorICDecayStream.consume
+
+    def session(**kwargs: object) -> object:
+        created = original_session(**kwargs)
+        sessions.append(created)
+        return created
+
+    def evaluation(*args: object) -> object:
+        result = evaluate(*args)
+        processed.append(result.trade_date)
+        return result
+
+    def consumed(accumulator: FactorICDecayStream, batch: object) -> None:
+        assert batch.universe.trade_date in processed
+        consume(accumulator, batch)
+
+    monkeypatch.setattr(stream_snapshot, "ResearchExecutionSession", session)
+    for name in ("query_daily_bars", "query_adj_factors", "query_sse_calendar"):
+        original = getattr(FactorStreamReadLease, name)
+
+        def query(
+            lease: FactorStreamReadLease,
+            request: object,
+            method: object = original,
+            label: str = name,
+        ) -> object:
+            queries.append((label, request))
+            return method(lease, request)
+
+        monkeypatch.setattr(FactorStreamReadLease, name, query)
+    with _prepared(tmp_path) as (metadata, lake, request):
+        legacy_source = _OwnedPools(_pools(request))
+        legacy = run_factor_stream_research(
+            request, metadata_store=metadata, lake_root=lake, universe_requests=legacy_source
+        )
+        first_queries = tuple(queries)
+        queries.clear()
+        monkeypatch.setattr(daily_stream, "_evaluate_day", evaluation)
+        monkeypatch.setattr(FactorICDecayStream, "consume", consumed)
+        source = _OwnedPools(_pools(request))
+        result = run_factor_stream_research_with_decay(
+            request, metadata_store=metadata, lake_root=lake, universe_requests=source
+        )
+        assert type(legacy) is FactorStreamResearchResult
+        assert result.research == legacy
+        assert tuple(queries) == first_queries
+        assert legacy_source.iterations == source.iterations == 1
+        assert legacy_source.closed and source.closed
+        assert len(sessions) == 2
+        assert result.decay.periods[0].ic_summary == result.research.statistics.ic_summary
+        assert [day.normal_ic for day in result.decay.periods[0].days] == [
+            day.evaluation.normal_ic for day in result.research.statistics.days
+        ]
+        assert not list((lake / ".execution_sessions").iterdir())
+
+
+def test_decay_wrapper_rejects_different_completed_scope_even_after_rehash(tmp_path: Path) -> None:
+    from rquant.factor.decay_stream import (
+        FactorICDecayStreamResult,
+        factor_ic_decay_stream_request_sha256,
+    )
+    from rquant.factor.stream_runner import (
+        FactorStreamResearchWithDecayResult,
+        run_factor_stream_research_with_decay,
+    )
+
+    with _prepared(tmp_path) as (metadata, lake, request):
+        result = run_factor_stream_research_with_decay(
+            request, metadata_store=metadata, lake_root=lake, universe_requests=_pools(request)
+        )
+        changed_request = result.decay.request.model_copy(
+            update={
+                "computation_stock_codes": result.decay.request.computation_stock_codes
+                + ("999999.SZ",)
+            }
+        )
+        fields = result.decay.model_dump(exclude={"sha256"})
+        fields["request"] = changed_request
+        fields["request_sha256"] = factor_ic_decay_stream_request_sha256(changed_request)
+        fields["input_sha256"] = canonical_sha256(
+            (fields["request_sha256"], fields["statistics_input_sha256"])
+        )
+        decay = FactorICDecayStreamResult(**fields, sha256=canonical_sha256(fields))
+        wrapped = {"research": result.research, "decay": decay}
+        with pytest.raises(ValidationError, match="completed inputs differ"):
+            FactorStreamResearchWithDecayResult(**wrapped, sha256=canonical_sha256(wrapped))
+
+
+@pytest.mark.parametrize("with_decay", [False, True])
+def test_admission_failure_closes_owned_unstarted_source(tmp_path: Path, with_decay: bool) -> None:
+    from rquant.factor.stream_runner import (
+        run_factor_stream_research,
+        run_factor_stream_research_with_decay,
+    )
     from rquant.factor.stream_snapshot import FactorStreamSnapshotAdmissionError
 
     with _prepared(tmp_path) as (metadata, lake, request):
@@ -106,9 +237,10 @@ def test_admission_failure_closes_owned_unstarted_source(tmp_path: Path) -> None
             }
         )
         with pytest.raises(FactorStreamSnapshotAdmissionError, match="source_identity"):
-            run_factor_stream_research(
-                invalid, metadata_store=metadata, lake_root=lake, universe_requests=source
+            run = (
+                run_factor_stream_research_with_decay if with_decay else run_factor_stream_research
             )
+            run(invalid, metadata_store=metadata, lake_root=lake, universe_requests=source)
         assert source.closed
         assert source.iterations == 0
         assert not list((lake / ".execution_sessions").glob("*"))
