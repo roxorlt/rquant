@@ -1,9 +1,14 @@
 import { useEffect, useRef, useState } from "react";
+import { ApiError } from "@/api/client";
 import {
   type FactorArchiveCommandData,
   type FactorArchiveCommandRequest,
   type FactorDefinitionItem,
+  type FactorSaveCommandData,
+  type FactorSaveDraft,
   postFactorArchive,
+  postFactorSave,
+  useFactorCapabilities,
   useFactorCatalog,
 } from "@/api/factors";
 import { useCurrentMeta } from "@/api/useMeta";
@@ -18,7 +23,19 @@ import {
   RelativeTime,
   Tip,
 } from "@/ui";
+import { FactorEditor, type FactorEditorDraft } from "./FactorEditor";
 import { FactorResults } from "./FactorResults";
+import {
+  clearSaveCommand,
+  persistEditorDraft,
+  persistSaveCommand,
+  persistSaveRejection,
+  readEditorDraft,
+  readSaveCommand,
+  readSaveRejection,
+  SAVE_DRAFT_KEY,
+  storageWritable,
+} from "./factorSaveState";
 import "./factors.css";
 
 const ARCHIVE_STORAGE_KEY = "rquant.factor.archive-command.v1";
@@ -32,6 +49,15 @@ function sameArchive(current: StoredArchive | null, candidate: StoredArchive): b
     current.command.command_id === candidate.command.command_id &&
     current.command.generation_id === candidate.command.generation_id &&
     current.command.requested_at === candidate.command.requested_at
+  );
+}
+
+function sameSave(current: FactorSaveDraft | null, candidate: FactorSaveDraft): boolean {
+  return (
+    current !== null &&
+    current.command_id === candidate.command_id &&
+    current.requested_at === candidate.requested_at &&
+    current.generation_id === candidate.generation_id
   );
 }
 
@@ -85,11 +111,34 @@ export default function FactorsPage() {
   const meta = useCurrentMeta();
   const currentGeneration =
     meta.data === undefined ? undefined : (meta.data.data.generation?.generation_id ?? null);
-  const catalog = useFactorCatalog(currentGeneration);
+  const viewer = meta.data?.data.viewer;
+  const [permissionRevision, setPermissionRevision] = useState(0);
+  const catalog = useFactorCatalog(currentGeneration, viewer, permissionRevision);
+  const capabilities = useFactorCapabilities(
+    currentGeneration,
+    catalog.data?.can_save === true && catalog.serving?.generation_id === currentGeneration,
+    viewer,
+    permissionRevision,
+  );
   const [selection, setSelection] = useState<{ generationId: string; factorId: string } | null>(
     null,
   );
   const [archiveCommand, setArchiveCommand] = useState<StoredArchive | null>(storedArchive);
+  const [editorDraft, setEditorDraft] = useState<FactorEditorDraft | null>(readEditorDraft);
+  const [editorOpen, setEditorOpen] = useState(false);
+  const [storageReady, setStorageReady] = useState(storageWritable);
+  const [saveCommand, setSaveCommand] = useState<FactorSaveDraft | null>(readSaveCommand);
+  const [saveResult, setSaveResult] = useState<FactorSaveCommandData | null>(
+    () => readSaveRejection(saveCommand)?.result ?? null,
+  );
+  const [deniedViewer, setDeniedViewer] = useState<string | null>(
+    () => readSaveRejection(saveCommand)?.deniedViewer ?? null,
+  );
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [saveBusy, setSaveBusy] = useState(false);
+  const saveCommandRef = useRef(saveCommand);
+  const saveBusyRef = useRef(false);
+  const restoredSave = useRef(false);
   const [archiveResult, setArchiveResult] = useState<FactorArchiveCommandData | null>(null);
   const [archiveError, setArchiveError] = useState<string | null>(null);
   const [archiveBusy, setArchiveBusy] = useState(false);
@@ -105,6 +154,59 @@ export default function FactorsPage() {
     currentGeneration !== catalog.serving.generation_id;
   const rows = changed ? [] : (catalog.data?.definitions ?? []);
   const selected = rows.find((row) => row.factor_id === selectedId) ?? rows[0] ?? null;
+  const catalogVerified =
+    typeof currentGeneration === "string" &&
+    catalog.serving?.generation_id === currentGeneration &&
+    catalog.serving.state === "ready" &&
+    catalog.data !== undefined &&
+    catalog.data.availability !== "unavailable" &&
+    !meta.isError &&
+    !catalog.error &&
+    !catalog.isFetching &&
+    !changed;
+  const saveAvailable =
+    typeof viewer === "string" &&
+    viewer !== deniedViewer &&
+    catalogVerified &&
+    catalog.data?.can_save === true &&
+    capabilities.data?.can_save === true &&
+    capabilities.serving?.generation_id === currentGeneration &&
+    capabilities.serving.state === "ready" &&
+    !capabilities.error &&
+    !capabilities.isFetching &&
+    meta.data?.serving.state === "ready";
+  const draftCurrentRow =
+    editorDraft?.factor_id === null
+      ? null
+      : (rows.find((row) => row.factor_id === editorDraft?.factor_id) ?? null);
+  const draftStale =
+    editorDraft !== null &&
+    (editorDraft.generation_id !== currentGeneration ||
+      (editorDraft.mode === "edit" &&
+        (draftCurrentRow === null ||
+          draftCurrentRow.archived ||
+          draftCurrentRow.version !== editorDraft.expected_head?.version ||
+          draftCurrentRow.content_sha256 !== editorDraft.expected_head.content_sha256)));
+  const canRebaseDraft =
+    saveAvailable &&
+    (editorDraft?.mode === "create" || (draftCurrentRow !== null && !draftCurrentRow.archived));
+  const canFinishSave =
+    saveCommand !== null &&
+    saveResult?.status === "published" &&
+    typeof currentGeneration === "string" &&
+    currentGeneration !== saveCommand.generation_id &&
+    catalogVerified &&
+    catalog.data?.definitions.some(
+      (row) =>
+        row.factor_id === saveResult.factor_id &&
+        ((!row.archived &&
+          row.version === saveResult.version &&
+          row.content_sha256 === saveResult.content_sha256) ||
+          (saveResult.current_head_updated &&
+            saveResult.version !== null &&
+            saveResult.version !== undefined &&
+            row.version > saveResult.version)),
+    ) === true;
   const canFinishArchive =
     archiveCommand !== null &&
     archiveResult?.status === "published" &&
@@ -139,6 +241,192 @@ export default function FactorsPage() {
     }
   };
 
+  const runSave = async (record: FactorSaveDraft, action: "save" | "resume" | "retry") => {
+    if (!sameSave(saveCommandRef.current, record) || saveBusyRef.current) return;
+    saveBusyRef.current = true;
+    setSaveBusy(true);
+    setSaveError(null);
+    try {
+      const result = await postFactorSave(record, action);
+      if (!sameSave(saveCommandRef.current, record)) return;
+      if (result.command_id !== record.command_id) {
+        setSaveError("保存结果尚未确认，请保留这次操作。");
+        return;
+      }
+      if (result.status === "rejected" && !persistSaveRejection(record, result))
+        setStorageReady(false);
+      setSaveResult(result);
+      if (result.status === "published") void meta.refetch();
+    } catch (error) {
+      if (!sameSave(saveCommandRef.current, record)) return;
+      const permissionDenied =
+        error instanceof ApiError && (error.status === 401 || error.status === 403);
+      if (permissionDenied) {
+        setDeniedViewer(viewer ?? null);
+        void meta.refetch();
+      }
+      if (
+        action === "save" &&
+        error instanceof ApiError &&
+        [401, 403, 409, 422].includes(error.status)
+      ) {
+        const rejection: FactorSaveCommandData = {
+          status: "rejected",
+          command_id: record.command_id,
+          message: error.message,
+          current_head_updated: false,
+        };
+        if (!persistSaveRejection(record, rejection, permissionDenied ? (viewer ?? null) : null))
+          setStorageReady(false);
+        setSaveResult(rejection);
+      } else {
+        setSaveError("保存结果尚未确认，请保留这次操作。");
+      }
+    } finally {
+      if (sameSave(saveCommandRef.current, record)) {
+        saveBusyRef.current = false;
+        setSaveBusy(false);
+      }
+    }
+  };
+
+  useEffect(() => {
+    if (restoredSave.current) return;
+    restoredSave.current = true;
+    const record = saveCommandRef.current;
+    if (record !== null && saveResult?.status !== "rejected") void runSave(record, "resume");
+  });
+
+  const updateEditorDraft = (draft: FactorEditorDraft) => {
+    setEditorDraft(draft);
+    if (!persistEditorDraft(draft)) setStorageReady(false);
+  };
+
+  const beginCreate = () => {
+    if (
+      !saveAvailable ||
+      saveCommandRef.current !== null ||
+      archiveCommandRef.current !== null ||
+      typeof currentGeneration !== "string"
+    )
+      return;
+    updateEditorDraft({
+      generation_id: currentGeneration,
+      mode: "create",
+      factor_id: null,
+      expected_head: null,
+      name_zh: "",
+      category: "技术",
+      category_label: "技术",
+      direction: "higher_is_better",
+      expression: "",
+    });
+    setEditorOpen(true);
+  };
+
+  const beginEdit = () => {
+    if (
+      !saveAvailable ||
+      saveCommandRef.current !== null ||
+      archiveCommandRef.current !== null ||
+      selected === null ||
+      selected.archived ||
+      typeof currentGeneration !== "string"
+    )
+      return;
+    if (editorDraft?.mode === "edit" && editorDraft.factor_id === selected.factor_id) {
+      setEditorOpen(true);
+      return;
+    }
+    updateEditorDraft({
+      generation_id: currentGeneration,
+      mode: "edit",
+      factor_id: selected.factor_id,
+      expected_head: { version: selected.version, content_sha256: selected.content_sha256 },
+      name_zh: selected.name_zh,
+      category: selected.category,
+      category_label: selected.category_label,
+      direction: selected.direction,
+      expression: selected.expression,
+    });
+    setEditorOpen(true);
+  };
+
+  const rebaseDraft = () => {
+    if (!canRebaseDraft || editorDraft === null || typeof currentGeneration !== "string") return;
+    if (editorDraft.mode === "edit" && draftCurrentRow === null) return;
+    updateEditorDraft({
+      ...editorDraft,
+      generation_id: currentGeneration,
+      expected_head:
+        editorDraft.mode === "create" || draftCurrentRow === null
+          ? null
+          : {
+              version: draftCurrentRow.version,
+              content_sha256: draftCurrentRow.content_sha256,
+            },
+    });
+  };
+
+  const submitSave = () => {
+    if (
+      editorDraft === null ||
+      !storageReady ||
+      !saveAvailable ||
+      draftStale ||
+      saveCommandRef.current !== null ||
+      archiveCommandRef.current !== null
+    )
+      return;
+    const record: FactorSaveDraft = {
+      generation_id: editorDraft.generation_id,
+      command_id: crypto.randomUUID(),
+      requested_at: new Date().toISOString(),
+      mode: editorDraft.mode,
+      factor_id: editorDraft.factor_id,
+      expected_head: editorDraft.expected_head,
+      name_zh: editorDraft.name_zh.trim(),
+      category: editorDraft.category,
+      direction: editorDraft.direction,
+      expression: editorDraft.expression,
+    };
+    if (!persistEditorDraft(editorDraft) || !persistSaveCommand(record)) {
+      setStorageReady(false);
+      return;
+    }
+    saveCommandRef.current = record;
+    setSaveCommand(record);
+    setSaveResult(null);
+    setSaveError(null);
+    setEditorOpen(false);
+    void runSave(record, "save");
+  };
+
+  const finishSave = () => {
+    if (saveResult?.status !== "rejected" && !canFinishSave) return;
+    if (!clearSaveCommand()) {
+      setStorageReady(false);
+      return;
+    }
+    saveCommandRef.current = null;
+    saveBusyRef.current = false;
+    setSaveCommand(null);
+    setSaveResult(null);
+    setSaveError(null);
+    setSaveBusy(false);
+    if (canFinishSave) {
+      try {
+        window.localStorage.removeItem(SAVE_DRAFT_KEY);
+      } catch {
+        setStorageReady(false);
+      }
+      setEditorDraft(null);
+      void refreshDefinitions(false);
+    } else {
+      setEditorOpen(true);
+    }
+  };
+
   useEffect(() => {
     if (restoredCommand.current) return;
     restoredCommand.current = true;
@@ -147,7 +435,14 @@ export default function FactorsPage() {
   });
 
   const submitArchive = () => {
-    if (selected === null || selected.archived || typeof currentGeneration !== "string") return;
+    if (
+      selected === null ||
+      selected.archived ||
+      typeof currentGeneration !== "string" ||
+      saveCommandRef.current !== null ||
+      archiveCommandRef.current !== null
+    )
+      return;
     const record: StoredArchive = {
       factorId: selected.factor_id,
       command: {
@@ -196,11 +491,11 @@ export default function FactorsPage() {
     if (resumeArchive && activeCommand !== null && !archiveBusyRef.current)
       void runArchive(activeCommand, true);
     if (refreshed.isError || refreshed.data === undefined) return;
+    setDeniedViewer(null);
+    setPermissionRevision((revision) => revision + 1);
     const nextGeneration = refreshed.data.data.generation?.generation_id ?? null;
     if (nextGeneration !== currentGeneration) {
       setSelection(null);
-    } else if (typeof nextGeneration === "string") {
-      catalog.refetch();
     }
   };
 
@@ -211,17 +506,80 @@ export default function FactorsPage() {
         title="因子研究"
         note="查看已发布因子与历史检验"
         actions={
-          <Button
-            size="sm"
-            onClick={() => void refreshDefinitions()}
-            disabled={
-              currentGeneration === null || currentGeneration === undefined || catalog.isFetching
-            }
-          >
-            刷新
-          </Button>
+          <>
+            {saveAvailable && saveCommand === null && archiveCommand === null ? (
+              <Button
+                size="sm"
+                variant="primary"
+                onClick={editorDraft === null ? beginCreate : () => setEditorOpen(true)}
+              >
+                {editorDraft === null ? "新建因子" : "继续编辑草稿"}
+              </Button>
+            ) : null}
+            <Button
+              size="sm"
+              onClick={() => void refreshDefinitions()}
+              disabled={
+                currentGeneration === null || currentGeneration === undefined || catalog.isFetching
+              }
+            >
+              刷新
+            </Button>
+          </>
         }
       />
+      {saveCommand !== null ? (
+        <Panel>
+          <div
+            className="factor-command-state"
+            role={saveError || saveResult?.status === "rejected" ? "alert" : "status"}
+          >
+            <p>
+              {saveResult?.status === "rejected"
+                ? saveResult.message
+                : canFinishSave
+                  ? saveResult?.current_head_updated
+                    ? "已保存，当前已有新版本。"
+                    : "已保存。"
+                  : (saveError ??
+                    (saveResult?.status === "pending"
+                      ? "正在保存，请稍后查看。"
+                      : saveResult?.status === "succeeded_waiting_publication" ||
+                          saveResult?.status === "published"
+                        ? "已提交，等待更新。"
+                        : "保存结果尚未确认，请保留这次操作。"))}
+            </p>
+            {saveResult?.status === "rejected" ? (
+              <Button size="sm" onClick={finishSave}>
+                修改草稿
+              </Button>
+            ) : canFinishSave ? (
+              <Button size="sm" onClick={finishSave}>
+                继续查看因子
+              </Button>
+            ) : (
+              <div className="factor-command-actions">
+                <Button
+                  size="sm"
+                  disabled={saveBusy}
+                  onClick={() => void runSave(saveCommand, "resume")}
+                >
+                  刷新状态
+                </Button>
+                {saveError !== null || saveResult?.status === "uncertain" ? (
+                  <Button
+                    size="sm"
+                    disabled={saveBusy}
+                    onClick={() => void runSave(saveCommand, "retry")}
+                  >
+                    用原请求重试
+                  </Button>
+                ) : null}
+              </div>
+            )}
+          </div>
+        </Panel>
+      ) : null}
       {archiveCommand !== null ? (
         <Panel>
           <div className="factor-command-state" role={archiveError ? "alert" : "status"}>
@@ -350,15 +708,35 @@ export default function FactorsPage() {
                     </div>
                     <code>{selected.expression}</code>
                   </div>
-                  {catalog.data?.can_archive && !selected.archived && archiveCommand === null ? (
+                  {(saveAvailable &&
+                    !selected.archived &&
+                    saveCommand === null &&
+                    archiveCommand === null) ||
+                  (catalog.data?.can_archive &&
+                    !selected.archived &&
+                    archiveCommand === null &&
+                    saveCommand === null) ? (
                     <div className="factor-detail-actions">
-                      <Button
-                        size="sm"
-                        disabled={archiveBusy}
-                        onClick={() => setConfirmArchive(true)}
-                      >
-                        归档
-                      </Button>
+                      {saveAvailable &&
+                      !selected.archived &&
+                      saveCommand === null &&
+                      archiveCommand === null ? (
+                        <Button size="sm" onClick={beginEdit}>
+                          编辑
+                        </Button>
+                      ) : null}
+                      {catalog.data?.can_archive &&
+                      !selected.archived &&
+                      archiveCommand === null &&
+                      saveCommand === null ? (
+                        <Button
+                          size="sm"
+                          disabled={archiveBusy}
+                          onClick={() => setConfirmArchive(true)}
+                        >
+                          归档
+                        </Button>
+                      ) : null}
                     </div>
                   ) : null}
                 </div>
@@ -383,6 +761,23 @@ export default function FactorsPage() {
         busy={archiveBusy}
         onConfirm={submitArchive}
         onCancel={() => setConfirmArchive(false)}
+      />
+      <FactorEditor
+        draft={editorDraft}
+        open={editorOpen}
+        capabilities={capabilities.data}
+        catalog={catalog.data}
+        currentDefinition={draftCurrentRow}
+        currentGeneration={currentGeneration}
+        canSave={saveAvailable}
+        storageReady={storageReady}
+        stale={draftStale}
+        canRebase={canRebaseDraft}
+        busy={saveBusy || saveCommand !== null}
+        onChange={updateEditorDraft}
+        onClose={() => setEditorOpen(false)}
+        onRebase={rebaseDraft}
+        onSubmit={submitSave}
       />
     </>
   );
