@@ -54,3 +54,16 @@
 ## 完成边界
 
 本片证明实际文件内容可封存、复读、精确绑定并驱动一次研究。真实提供方历史归档、市场覆盖、指数有效成员语义及实际采集 PIT 仍须采集/核验；内容散列不证明这些事实。本片不开放网页运行入口、不改生产或停用 Streamlit。后续依次接 v2 持久任务/结果封存、可信准入与原型运行交互，再实现每日因子跟踪；完整平台目标继续保持未完成。
+
+## 本地验收（2026-10-01）
+
+- 实现 branch `cdx/20261001-factor-member-archive`，base `54cfc71493ec913e8bef6bda78c80a1f954cbe44`；初候选 `98f3c0b733fcde81e1696ad744eea5c78e21088c`，唯一修复候选 `802e5049524a17681d69511ff7d29ccf42829b44`，direct parent 为初候选，均实际核对 clean。只新增既定四文件，旧 v1 / runner / ledger / shared FS 零修改。
+- 本地合入提交 `fce880ddcd542c5d5934e3a4b155d4b44267778f`；root 核对四文件与受审修复候选逐字节一致。
+- 日文件上限 4 MiB，manifest 上限 2 MiB；7,000 单日事实保留完整，7,001 拒绝，1,024/1,025 日程边界和解析前字节边界实际验证。来源摘要从规范日组件计算，保留原来源标签、声明 SHA 与真实观察时刻；声明 SHA 不当作真实性证据。
+- Python 3.12.13 下分别有实际 3 项、5 项产品红测，随后 3 passed + 5 passed + 21 passed / 8 deselected；后八项复用此前有效通过结果，不计新增。四池文件→reader→raw/formula/statistics/decay 与旧入口黄金一致；12 日动态/合法空池及 24 个受测弱引用释放成立。
+- missing/corrupt/cancel 尾部没有完成回执；FD 与执行副本实际清理。写入取消仅清自有临时文件、保留无关文件；读后同字节换 inode 被拒绝，真实观察时刻未被回写到历史 09:25。
+- 一次集中独立终审发现 `FMEM-FINAL-01`：跨日重用输入文件名会覆盖首次身份。原实现者只增加二读前拒绝重名两行及实际原子替换回归，1 failed→2 passed，无 skip/deselect，其中一项为旧正向；原审查者唯一一次定向复核关闭、accept。累计 30 个不同有效用例，不能写成一次 30 全绿。
+- Ruff / format / diff-check 通过，所有自有测试/审查进程已结束。Python 3.11 运行时、旧 7,000×16 规模、全仓、新 CI、真实提供方覆盖/PIT及本片真实负载未运行；已有效旧规模只在未变边界内复用。
+- 固定清单从 18,719 增至 18,749，只新增两测试文件的 30 节点，无删除或重复；55 批准跳过原件不变，清单 SHA256 `70cfbde6dde497148b3c14ad83528cc72c0517d14b1c973668ae509c334b2b07`。正常生成后两项必要清单门禁在 Python 3.13.12 实际 2 passed（8.98s），未执行全部清单。
+
+完整命令、红绿与资源回执在 `/private/tmp/rquant-factor-member-archive-evidence-20261001.md`，root 合入/清单证据在 `/private/tmp/rquant-factor-member-archive-root-evidence-20261001.md`，清单 baseline/generated/delta 在 `/private/tmp/rquant-factor-member-archive-manifest-n10iqoyx/`，门禁输出在 `/private/tmp/rquant-factor-member-archive-manifest-gates-20261001.log`。本片仍是本地合成与实际文件行为验收，不是生产历史来源或网页替代验收。
