@@ -1159,6 +1159,42 @@ _FACTOR_READ_MODEL = ConfigDict(
     extra="forbid", frozen=True, strict=True, revalidate_instances="always"
 )
 _FiniteFact = Annotated[float, Field(allow_inf_nan=False)]
+FACTOR_STREAM_SNAPSHOT_BUILDER_VERSION = "factor-stream-snapshot-v2"
+FACTOR_STREAM_SOURCE_CONTRACT_VERSION = "factor-stream-source-v2"
+
+
+class FactorComputationScope(BaseModel):
+    """Fixed calculation codes, without a market membership or PIT claim."""
+
+    model_config = _FACTOR_READ_MODEL
+
+    stock_codes: tuple[str, ...] = Field(min_length=1, max_length=7_000)
+    start_date: date
+    end_date: date
+    as_of_time: AwareDatetime
+    source_mode: Literal["historical_retrospective"] = "historical_retrospective"
+
+    @field_validator("stock_codes")
+    @classmethod
+    def _valid_codes(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(value) != len(set(value)):
+            raise ValueError("computation scope contains duplicate codes")
+        if any(_FACTOR_STOCK_PATTERN.fullmatch(code) is None for code in value):
+            raise ValueError("computation scope contains invalid codes")
+        return tuple(sorted(value))
+
+    @field_validator("as_of_time")
+    @classmethod
+    def _utc_cutoff(cls, value: datetime) -> datetime:
+        return normalize_utc_datetime(value)
+
+    @model_validator(mode="after")
+    def _valid_range(self) -> FactorComputationScope:
+        if self.start_date > self.end_date or (self.end_date - self.start_date).days >= 4_096:
+            raise ValueError("computation scope exceeds its natural day range")
+        if self.as_of_time.date() < self.end_date:
+            raise ValueError("computation scope cutoff precedes end_date")
+        return self
 
 
 class FactorReadQuery(BaseModel):
@@ -1432,7 +1468,7 @@ class ResearchExecutionSession:
         self.close()
 
 
-class FactorReadLease:
+class _FactorTableReadLease:
     """Only the fixed factor tables and columns of one verified execution session."""
 
     __slots__ = ("__session", "__start_date", "__end_date")
@@ -1444,12 +1480,6 @@ class FactorReadLease:
         start_date: date,
         end_date: date,
     ) -> None:
-        if (
-            session.binding.manifest.strategy_name != "factor_eval"
-            or session.binding.manifest.builder_version != FACTOR_SNAPSHOT_BUILDER_VERSION
-            or session.binding.manifest.dependency_contract_version != FACTOR_EVAL_CONTRACT_VERSION
-        ):
-            raise ValueError("factor lease requires verified dedicated binding")
         self.__session = session
         self.__start_date = start_date
         self.__end_date = end_date
@@ -1568,6 +1598,97 @@ class FactorReadLease:
                 for row in rows
             ),
         )
+
+
+class FactorReadLease(_FactorTableReadLease):
+    """The unchanged v1-only, fixed-table read boundary."""
+
+    __slots__ = ()
+
+    def __init__(
+        self, session: ResearchExecutionSession, *, start_date: date, end_date: date
+    ) -> None:
+        if (
+            session.binding.manifest.strategy_name != "factor_eval"
+            or session.binding.manifest.builder_version != FACTOR_SNAPSHOT_BUILDER_VERSION
+            or session.binding.manifest.dependency_contract_version != FACTOR_EVAL_CONTRACT_VERSION
+        ):
+            raise ValueError("factor lease requires verified dedicated binding")
+        super().__init__(session, start_date=start_date, end_date=end_date)
+
+
+class FactorStreamReadLease(_FactorTableReadLease):
+    """V2 public bridge; all reads use this session's verified private copies."""
+
+    __slots__ = ("__scope", "__codes")
+
+    def __init__(
+        self, session: ResearchExecutionSession, *, start_date: date, end_date: date
+    ) -> None:
+        manifest = session.binding.manifest
+        if (
+            manifest.strategy_name != "factor_eval"
+            or manifest.builder_version != FACTOR_STREAM_SNAPSHOT_BUILDER_VERSION
+            or manifest.dependency_contract_version != FACTOR_STREAM_SOURCE_CONTRACT_VERSION
+            or len(manifest.artifacts) != 4
+            or {a.table_name for a in manifest.artifacts}
+            != {"daily_bar", "adj_factor", "trade_calendar", "factor_computation_scope"}
+        ):
+            raise ValueError("stream lease requires verified v2 dedicated binding")
+        if session._closed:
+            raise RuntimeError("factor read lease session is closed")
+        rows = session._conn.execute(
+            """SELECT ts_code, start_date, end_date, as_of_time
+            FROM factor_computation_scope ORDER BY ts_code LIMIT 7001"""
+        ).fetchall()
+        if not rows or len(rows) > 7_000:
+            raise ValueError("bound computation scope is empty or too large")
+        if any(
+            row[1:] != (manifest.start_date, manifest.end_date, manifest.as_of_time) for row in rows
+        ):
+            raise ValueError("bound computation scope dates or cutoff differ from manifest")
+        self.__scope = FactorComputationScope(
+            stock_codes=tuple(row[0] for row in rows),
+            start_date=manifest.start_date,
+            end_date=manifest.end_date,
+            as_of_time=manifest.as_of_time,
+        )
+        self.__codes = frozenset(self.__scope.stock_codes)
+        if (
+            start_date < manifest.start_date
+            or end_date > manifest.end_date
+            or start_date > end_date
+        ):
+            raise ValueError("stream lease dates exceed bound computation scope")
+        for table, columns in _FACTOR_TABLE_COLUMNS.items():
+            selected = ", ".join(_quoted_identifier(column) for column in sorted(columns))
+            session._conn.execute(f"SELECT {selected} FROM {_quoted_identifier(table)} LIMIT 0")
+            if table == "trade_calendar":
+                invalid = session._conn.execute(
+                    """SELECT count(*) FROM trade_calendar
+                    WHERE exchange != 'SSE' OR cal_date NOT BETWEEN ? AND ?""",
+                    [manifest.start_date, manifest.end_date],
+                ).fetchone()
+            else:
+                invalid = session._conn.execute(
+                    f"""SELECT count(*) FROM {_quoted_identifier(table)} AS facts
+                    LEFT JOIN factor_computation_scope AS scope USING (ts_code)
+                    WHERE scope.ts_code IS NULL OR facts.trade_date NOT BETWEEN ? AND ?""",
+                    [manifest.start_date, manifest.end_date],
+                ).fetchone()
+            if invalid is not None and invalid[0]:
+                raise ValueError(f"bound {table} rows exceed computation scope")
+        super().__init__(session, start_date=start_date, end_date=end_date)
+
+    @property
+    def scope(self) -> FactorComputationScope:
+        return self.__scope
+
+    def _checked(self, query: FactorReadQuery) -> FactorReadQuery:
+        checked = super()._checked(query)
+        if not self.__codes.issuperset(checked.stock_codes):
+            raise ValueError("factor read codes exceed bound computation scope")
+        return checked
 
 
 def open_research_execution_session(
