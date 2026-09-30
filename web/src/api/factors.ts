@@ -5,11 +5,15 @@ export type FactorDefinitionItem = Schemas["FactorDefinitionItem"];
 export type FactorCatalogData = Schemas["FactorCatalogData"];
 export type FactorArchiveCommandRequest = Schemas["FactorArchiveCommandRequest"];
 export type FactorArchiveCommandData = Schemas["FactorArchiveCommandData"];
+export type FactorCapabilitiesData = Schemas["FactorCapabilitiesData"];
+export type FactorSaveDraft = Schemas["FactorSaveDraft"];
+export type FactorSaveCommandData = Schemas["FactorSaveCommandData"];
 export type FactorResultItem = Schemas["FactorResultItem"];
 export type FactorResultListData = Schemas["FactorResultListData"];
 export type FactorResultDetailData = Schemas["FactorResultDetailData"];
 export type FactorResearchDisplay = Schemas["FactorResearchDisplay"];
 type FactorCatalogEnvelope = Schemas["Envelope_FactorCatalogData_"];
+type FactorCapabilitiesEnvelope = Schemas["Envelope_FactorCapabilitiesData_"];
 type FactorResultListEnvelope = Schemas["Envelope_FactorResultListData_"];
 type FactorResultDetailEnvelope = Schemas["Envelope_FactorResultDetailData_"];
 
@@ -41,6 +45,50 @@ export async function postFactorArchive(
     );
   }
   return result.data.data;
+}
+
+export async function postFactorSave(
+  draft: FactorSaveDraft,
+  action: "save" | "resume" | "retry",
+): Promise<FactorSaveCommandData> {
+  const client = apiClient();
+  const options = { body: draft, headers: { "X-Rquant-Csrf": "1" } };
+  const result =
+    action === "save"
+      ? await client.POST("/api/v1/factors/definitions/save", options)
+      : action === "resume"
+        ? await client.POST("/api/v1/factors/definitions/save/resume", options)
+        : await client.POST("/api/v1/factors/definitions/save/retry", options);
+  if (result.data === undefined) {
+    throw new ApiError(
+      result.response.status,
+      result.response.status === 409
+        ? "因子已更新，请比对当前版本。"
+        : result.response.status === 422
+          ? "请检查名称、分类和表达式。"
+          : result.response.status === 401 || result.response.status === 403
+            ? "当前账号不能保存因子。"
+            : "保存结果尚未确认，请保留这次操作。",
+    );
+  }
+  return result.data.data;
+}
+
+export function useFactorCapabilities(
+  generationId: string | null | undefined,
+  enabled: boolean,
+): ServingQueryResult<FactorCapabilitiesData> {
+  return useServingQuery(
+    ["factors", "capabilities", generationId],
+    async (): Promise<FactorCapabilitiesEnvelope> => {
+      const { data, response } = await apiClient().GET("/api/v1/factors/capabilities");
+      if (data === undefined) {
+        throw new ApiError(response.status, "保存能力暂时无法核对，请稍后重试。");
+      }
+      return data;
+    },
+    { enabled: enabled && typeof generationId === "string" },
+  );
 }
 
 export function useFactorCatalog(
