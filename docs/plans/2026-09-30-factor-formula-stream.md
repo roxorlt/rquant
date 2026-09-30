@@ -6,6 +6,8 @@
 
 冻结实现基准为本地集成提交 `7f29d29d132baca61d92d182dd635cc3d611b474`。允许写 `src/rquant/factor/formula_stream.py`、`tests/unit/test_factor_formula_stream.py`；为复用现有数值口径，可在 `time_series.py` 及其直接测试中做最小纯助手提取，须先向 orchestrator 说明具体重复点和 diff 边界。旧 `FactorTimeSeriesInput`、历史适配器、结果与 Web 合同及其容量保持不变。
 
+实施增补：orchestrator 已批准 `time_series.py` 内仅将原有 `cs_rank` 并列排名块原样提取为静态纯 `_cross_rank` 并替换原调用；其余算子、模型和容量不变，旧测试不修改。实现差异的直接基准为含本计划的 `7b656cb689feb8026feeffbee0604a1bdd977fbd`，最终一次审查集中覆盖这三份生产/测试文件及原时序、横截面直接回归。
+
 ## 输入与职责
 
 - 请求固定不可变定义、目录、精确升序交易日日程及各日决策时刻、截止 `as_of`、股票池选择和明确来源身份。计算代码清单是预先钉住的有界证券集合（最多 7,000，覆盖本次所有逐日清单），不是外部全市场覆盖证明；全市场事实完整性仍由来源层证明。日程最多 1,024 日，含预热日。
