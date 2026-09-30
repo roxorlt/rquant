@@ -666,4 +666,131 @@ describe("因子新建与编辑", () => {
       server.events.removeListener("response:mocked", observeResponse);
     }
   });
+
+  it("FSR-02：认证拒绝后修改草稿仍须重新核对保存权限", async () => {
+    publish([]);
+    server.use(
+      http.post("*/api/v1/factors/definitions/save", () => new HttpResponse(null, { status: 401 })),
+    );
+    renderApp("/factors");
+    const user = await openCreate();
+    await fillCreate(user);
+    await user.click(screen.getByRole("button", { name: "保存因子" }));
+    await user.click(await screen.findByRole("button", { name: "修改草稿" }));
+    expect(screen.getByRole("textbox", { name: "表达式" })).toHaveValue("ts_mean(close, 5)");
+    expect(screen.getByRole("button", { name: "保存因子" })).toBeDisabled();
+    await user.click(screen.getByText("关闭", { selector: "button" }));
+    await user.click(screen.getByRole("button", { name: "刷新" }));
+    await user.click(await screen.findByRole("button", { name: "继续编辑草稿" }));
+    expect(screen.getByRole("textbox", { name: "表达式" })).toHaveValue("ts_mean(close, 5)");
+    expect(screen.getByRole("button", { name: "保存因子" })).toBeEnabled();
+  });
+
+  it("FSR-02：同代账号失效不能沿用缓存保存权限", async () => {
+    publish([]);
+    const view = renderApp("/factors");
+    const user = await openCreate();
+    await fillCreate(user);
+    act(() => view.queryClient.setQueryData(["meta"], metaEnvelope({ viewer: null })));
+    expect(screen.getByRole("textbox", { name: "表达式" })).toHaveValue("ts_mean(close, 5)");
+    await waitFor(() => expect(screen.getByRole("button", { name: "保存因子" })).toBeDisabled());
+  });
+
+  it("FSR-01：入队前明确拒绝在重载换代后仍能结束原操作并修改草稿", async () => {
+    publish();
+    const seen: { action: string; body: Schemas["FactorSaveDraft"] }[] = [];
+    server.use(
+      http.post("*/api/v1/factors/definitions/save", async ({ request }) => {
+        seen.push({ action: "save", body: (await request.json()) as Schemas["FactorSaveDraft"] });
+        return new HttpResponse(null, { status: 409 });
+      }),
+      http.post("*/api/v1/factors/definitions/save/resume", async ({ request }) => {
+        const body = (await request.json()) as Schemas["FactorSaveDraft"];
+        seen.push({ action: "resume", body });
+        return HttpResponse.json(receipt(body, "uncertain"));
+      }),
+      http.post("*/api/v1/factors/definitions/save/retry", async ({ request }) => {
+        const body = (await request.json()) as Schemas["FactorSaveDraft"];
+        seen.push({ action: "retry", body });
+        return HttpResponse.json(receipt(body, "uncertain"));
+      }),
+    );
+    const view = renderApp("/factors");
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "编辑" }));
+    await user.clear(screen.getByRole("textbox", { name: "表达式" }));
+    await user.type(screen.getByRole("textbox", { name: "表达式" }), "ref(close, 2)");
+    await user.click(screen.getByRole("button", { name: "保存新版本" }));
+    await screen.findByRole("button", { name: "修改草稿" });
+    const original = seen[0]?.body;
+    server.use(
+      http.get("*/api/v1/meta", () =>
+        HttpResponse.json(metaEnvelope({ generationId: laterGeneration })),
+      ),
+    );
+    publish(
+      [{ ...savedFactor, version: 3, content_sha256: "d".repeat(64) }],
+      true,
+      true,
+      laterGeneration,
+    );
+    view.unmount();
+    renderApp("/factors");
+    const modify = await screen.findByRole("button", { name: "修改草稿" });
+    expect(JSON.parse(localStorage.getItem("rquant.factor.save-command.v1") ?? "null")).toEqual(
+      original,
+    );
+    await user.click(modify);
+    expect(seen).toEqual([{ action: "save", body: original }]);
+    expect(screen.getByRole("textbox", { name: "表达式" })).toHaveValue("ref(close, 2)");
+    expect(screen.getByRole("button", { name: "保存新版本" })).toBeDisabled();
+    expect(JSON.parse(localStorage.getItem("rquant.factor.save-draft.v1") ?? "null")).toMatchObject(
+      {
+        generation_id: generation,
+        expected_head: { version: 2, content_sha256: savedFactor.content_sha256 },
+      },
+    );
+    expect(localStorage.getItem("rquant.factor.save-command.v1")).toBeNull();
+    await user.click(await screen.findByRole("button", { name: "比对当前版本" }));
+    expect(await screen.findByRole("region", { name: "当前版本比对" })).toHaveTextContent(
+      "第 3 版",
+    );
+  });
+
+  it("FSR-02：同代切换账号先重新核对该账号权限，不能借用原账号缓存", async () => {
+    publish([]);
+    const view = renderApp("/factors");
+    const user = await openCreate();
+    await fillCreate(user);
+    publish([], false, false);
+    act(() => view.queryClient.setQueryData(["meta"], metaEnvelope({ viewer: "reader" })));
+    await waitFor(() => expect(screen.getByRole("button", { name: "保存因子" })).toBeDisabled());
+    expect(screen.getByRole("textbox", { name: "表达式" })).toHaveValue("ts_mean(close, 5)");
+    await user.click(screen.getByText("关闭", { selector: "button" }));
+    expect(screen.queryByRole("button", { name: /新建因子|继续编辑草稿/ })).toBeNull();
+  });
+
+  it("FSR-03：相同因子的编辑入口恢复明确拒绝后保留的四项草稿", async () => {
+    publish();
+    server.use(
+      http.post("*/api/v1/factors/definitions/save", () => new HttpResponse(null, { status: 422 })),
+    );
+    renderApp("/factors");
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "编辑" }));
+    await user.clear(screen.getByRole("textbox", { name: "中文名" }));
+    await user.type(screen.getByRole("textbox", { name: "中文名" }), "修改后的均值");
+    await user.selectOptions(screen.getByRole("combobox", { name: "分类" }), "动量");
+    await user.selectOptions(screen.getByRole("combobox", { name: "方向" }), "lower_is_better");
+    await user.clear(screen.getByRole("textbox", { name: "表达式" }));
+    await user.type(screen.getByRole("textbox", { name: "表达式" }), "ref(close, 2)");
+    await user.click(screen.getByRole("button", { name: "保存新版本" }));
+    await user.click(await screen.findByRole("button", { name: "修改草稿" }));
+    await user.click(screen.getByText("关闭", { selector: "button" }));
+    await user.click(screen.getByRole("button", { name: "编辑" }));
+    expect(await screen.findByRole("textbox", { name: "表达式" })).toHaveValue("ref(close, 2)");
+    expect(screen.getByRole("textbox", { name: "中文名" })).toHaveValue("修改后的均值");
+    expect(screen.getByRole("combobox", { name: "分类" })).toHaveValue("动量");
+    expect(screen.getByRole("combobox", { name: "方向" })).toHaveValue("lower_is_better");
+  });
 });

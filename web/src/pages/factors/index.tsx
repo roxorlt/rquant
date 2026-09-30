@@ -29,8 +29,10 @@ import {
   clearSaveCommand,
   persistEditorDraft,
   persistSaveCommand,
+  persistSaveRejection,
   readEditorDraft,
   readSaveCommand,
+  readSaveRejection,
   SAVE_DRAFT_KEY,
   storageWritable,
 } from "./factorSaveState";
@@ -109,10 +111,14 @@ export default function FactorsPage() {
   const meta = useCurrentMeta();
   const currentGeneration =
     meta.data === undefined ? undefined : (meta.data.data.generation?.generation_id ?? null);
-  const catalog = useFactorCatalog(currentGeneration);
+  const viewer = meta.data?.data.viewer;
+  const [permissionRevision, setPermissionRevision] = useState(0);
+  const catalog = useFactorCatalog(currentGeneration, viewer, permissionRevision);
   const capabilities = useFactorCapabilities(
     currentGeneration,
     catalog.data?.can_save === true && catalog.serving?.generation_id === currentGeneration,
+    viewer,
+    permissionRevision,
   );
   const [selection, setSelection] = useState<{ generationId: string; factorId: string } | null>(
     null,
@@ -122,7 +128,12 @@ export default function FactorsPage() {
   const [editorOpen, setEditorOpen] = useState(false);
   const [storageReady, setStorageReady] = useState(storageWritable);
   const [saveCommand, setSaveCommand] = useState<FactorSaveDraft | null>(readSaveCommand);
-  const [saveResult, setSaveResult] = useState<FactorSaveCommandData | null>(null);
+  const [saveResult, setSaveResult] = useState<FactorSaveCommandData | null>(
+    () => readSaveRejection(saveCommand)?.result ?? null,
+  );
+  const [deniedViewer, setDeniedViewer] = useState<string | null>(
+    () => readSaveRejection(saveCommand)?.deniedViewer ?? null,
+  );
   const [saveError, setSaveError] = useState<string | null>(null);
   const [saveBusy, setSaveBusy] = useState(false);
   const saveCommandRef = useRef(saveCommand);
@@ -154,6 +165,8 @@ export default function FactorsPage() {
     !catalog.isFetching &&
     !changed;
   const saveAvailable =
+    typeof viewer === "string" &&
+    viewer !== deniedViewer &&
     catalogVerified &&
     catalog.data?.can_save === true &&
     capabilities.data?.can_save === true &&
@@ -240,21 +253,32 @@ export default function FactorsPage() {
         setSaveError("保存结果尚未确认，请保留这次操作。");
         return;
       }
+      if (result.status === "rejected" && !persistSaveRejection(record, result))
+        setStorageReady(false);
       setSaveResult(result);
       if (result.status === "published") void meta.refetch();
     } catch (error) {
       if (!sameSave(saveCommandRef.current, record)) return;
+      const permissionDenied =
+        error instanceof ApiError && (error.status === 401 || error.status === 403);
+      if (permissionDenied) {
+        setDeniedViewer(viewer ?? null);
+        void meta.refetch();
+      }
       if (
         action === "save" &&
         error instanceof ApiError &&
         [401, 403, 409, 422].includes(error.status)
       ) {
-        setSaveResult({
+        const rejection: FactorSaveCommandData = {
           status: "rejected",
           command_id: record.command_id,
           message: error.message,
           current_head_updated: false,
-        });
+        };
+        if (!persistSaveRejection(record, rejection, permissionDenied ? (viewer ?? null) : null))
+          setStorageReady(false);
+        setSaveResult(rejection);
       } else {
         setSaveError("保存结果尚未确认，请保留这次操作。");
       }
@@ -270,7 +294,7 @@ export default function FactorsPage() {
     if (restoredSave.current) return;
     restoredSave.current = true;
     const record = saveCommandRef.current;
-    if (record !== null) void runSave(record, "resume");
+    if (record !== null && saveResult?.status !== "rejected") void runSave(record, "resume");
   });
 
   const updateEditorDraft = (draft: FactorEditorDraft) => {
@@ -310,6 +334,10 @@ export default function FactorsPage() {
       typeof currentGeneration !== "string"
     )
       return;
+    if (editorDraft?.mode === "edit" && editorDraft.factor_id === selected.factor_id) {
+      setEditorOpen(true);
+      return;
+    }
     updateEditorDraft({
       generation_id: currentGeneration,
       mode: "edit",
@@ -463,12 +491,11 @@ export default function FactorsPage() {
     if (resumeArchive && activeCommand !== null && !archiveBusyRef.current)
       void runArchive(activeCommand, true);
     if (refreshed.isError || refreshed.data === undefined) return;
+    setDeniedViewer(null);
+    setPermissionRevision((revision) => revision + 1);
     const nextGeneration = refreshed.data.data.generation?.generation_id ?? null;
     if (nextGeneration !== currentGeneration) {
       setSelection(null);
-    } else if (typeof nextGeneration === "string") {
-      catalog.refetch();
-      capabilities.refetch();
     }
   };
 

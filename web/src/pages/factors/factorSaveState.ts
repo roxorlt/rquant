@@ -1,8 +1,17 @@
-import type { FactorSaveDraft } from "@/api/factors";
+import type { FactorSaveCommandData, FactorSaveDraft } from "@/api/factors";
 import type { FactorEditorDraft } from "./FactorEditor";
 
 export const SAVE_COMMAND_KEY = "rquant.factor.save-command.v1";
 export const SAVE_DRAFT_KEY = "rquant.factor.save-draft.v1";
+export const SAVE_REJECTION_KEY = "rquant.factor.save-rejection.v1";
+
+type StoredSaveRejection = {
+  command: FactorSaveDraft;
+  result: Pick<FactorSaveCommandData, "command_id" | "message" | "current_head_updated"> & {
+    status: "rejected";
+  };
+  deniedViewer: string | null;
+};
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -85,6 +94,36 @@ export function readSaveCommand(): FactorSaveDraft | null {
   }
 }
 
+export function readSaveRejection(command: FactorSaveDraft | null): StoredSaveRejection | null {
+  if (command === null) return null;
+  try {
+    const raw = window.localStorage.getItem(SAVE_REJECTION_KEY);
+    if (raw === null) return null;
+    const value: unknown = JSON.parse(raw);
+    if (
+      !isRecord(value) ||
+      !validSaveCommand(value.command) ||
+      !isRecord(value.result) ||
+      value.result.status !== "rejected" ||
+      value.result.command_id !== command.command_id ||
+      typeof value.result.message !== "string" ||
+      value.result.current_head_updated !== false ||
+      (value.deniedViewer !== null && typeof value.deniedViewer !== "string")
+    )
+      return null;
+    const stored = value.command;
+    const matches = commandKeys.every((key) =>
+      key === "expected_head"
+        ? stored.expected_head?.version === command.expected_head?.version &&
+          stored.expected_head?.content_sha256 === command.expected_head?.content_sha256
+        : stored[key] === command[key],
+    );
+    return matches ? (value as StoredSaveRejection) : null;
+  } catch {
+    return null;
+  }
+}
+
 export function storageWritable(): boolean {
   try {
     const probe = "rquant.factor.save-storage-probe";
@@ -116,10 +155,37 @@ export function persistSaveCommand(command: FactorSaveDraft): boolean {
   }
 }
 
+export function persistSaveRejection(
+  command: FactorSaveDraft,
+  result: FactorSaveCommandData,
+  deniedViewer: string | null = null,
+): boolean {
+  if (result.status !== "rejected" || result.command_id !== command.command_id) return false;
+  const rejection: StoredSaveRejection = {
+    command,
+    result: {
+      command_id: result.command_id,
+      status: "rejected",
+      message: result.message,
+      current_head_updated: false,
+    },
+    deniedViewer,
+  };
+  try {
+    const serialized = JSON.stringify(rejection);
+    window.localStorage.setItem(SAVE_REJECTION_KEY, serialized);
+    return window.localStorage.getItem(SAVE_REJECTION_KEY) === serialized;
+  } catch {
+    return false;
+  }
+}
+
 export function clearSaveCommand(): boolean {
   try {
     window.localStorage.removeItem(SAVE_COMMAND_KEY);
-    return window.localStorage.getItem(SAVE_COMMAND_KEY) === null;
+    if (window.localStorage.getItem(SAVE_COMMAND_KEY) !== null) return false;
+    window.localStorage.removeItem(SAVE_REJECTION_KEY);
+    return true;
   } catch {
     return false;
   }

@@ -77,9 +77,11 @@ export async function postFactorSave(
 export function useFactorCapabilities(
   generationId: string | null | undefined,
   enabled: boolean,
+  viewer: string | null | undefined,
+  permissionRevision: number,
 ): ServingQueryResult<FactorCapabilitiesData> {
   return useServingQuery(
-    ["factors", "capabilities", generationId],
+    ["factors", "capabilities", generationId, viewer, permissionRevision],
     async (): Promise<FactorCapabilitiesEnvelope> => {
       const { data, response } = await apiClient().GET("/api/v1/factors/capabilities");
       if (data === undefined) {
@@ -87,15 +89,17 @@ export function useFactorCapabilities(
       }
       return data;
     },
-    { enabled: enabled && typeof generationId === "string" },
+    { enabled: enabled && typeof generationId === "string" && typeof viewer === "string" },
   );
 }
 
 export function useFactorCatalog(
   generationId: string | null | undefined,
+  viewer: string | null | undefined,
+  permissionRevision: number,
 ): ServingQueryResult<FactorCatalogData> {
   return useServingQuery(
-    ["factors", "definitions", generationId],
+    ["factors", "definitions", generationId, viewer, permissionRevision],
     async (): Promise<FactorCatalogEnvelope> => {
       const { data, response } = await apiClient().GET("/api/v1/factors/definitions", {
         params: { query: { generation_id: generationId ?? undefined } },
