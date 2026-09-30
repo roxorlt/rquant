@@ -400,3 +400,51 @@ def test_actual_day_must_fit_computation_scope_and_real_observation_cutoff(
             request, input_root=inputs, daily_filenames=("day.json",), root=root
         )
     assert not list(root.iterdir())
+
+
+def test_replaced_same_input_name_cannot_erase_the_first_day_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rquant.factor import member_archive
+
+    inputs, root = _private(tmp_path / "input"), _private(tmp_path / "archive")
+    days = (_FIRST, _FIRST + timedelta(days=1))
+    _write(inputs, "day.json", _payload(days[0]))
+    first_inode = (inputs / "day.json").stat().st_ino
+    closed, input_reads, root_descriptors = [], [], set()
+    original_read = member_archive._read_file
+
+    def read(root_fd: int, name: str, *args: object) -> object:
+        root_descriptors.add(root_fd)
+        if name == "day.json":
+            input_reads.append(name)
+        return original_read(root_fd, name, *args)
+
+    monkeypatch.setattr(member_archive, "_read_file", read)
+
+    def names() -> Iterator[str]:
+        try:
+            yield "day.json"
+            _write(inputs, "next-day.json", _payload(days[1]))
+            os.replace(inputs / "next-day.json", inputs / "day.json")
+            assert (inputs / "day.json").stat().st_ino != first_inode
+            yield "day.json"
+        finally:
+            closed.append(True)
+
+    with pytest.raises(ValueError, match="duplicate member input filename"):
+        member_archive.publish_factor_member_archive(
+            _request(days), input_root=inputs, daily_filenames=names(), root=root
+        )
+    assert input_reads == ["day.json"]
+    assert closed == [True]
+    assert not list(root.glob("factor-member-archive-*"))
+    assert not list(root.glob("*.tmp"))
+    assert root_descriptors
+    for descriptor in root_descriptors:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+    print(
+        "FMEM_FINAL_01_RESOURCES: input_inode_changed=true second_input_read=false "
+        "manifest_file_exists=false source_closed=true directory_fds_closed=true temps_clean=true"
+    )

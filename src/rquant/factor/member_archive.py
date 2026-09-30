@@ -366,6 +366,8 @@ def publish_factor_member_archive(
                 name = _input_name(next(iterator))
             except StopIteration:
                 raise ValueError("missing member input day") from None
+            if name in input_identities:
+                raise ValueError("duplicate member input filename")
             data, identity = _read_file(input_fd, name, MAX_FACTOR_MEMBER_DAY_BYTES)
             payload = _parse_day(data, stored=False)
             if payload.trade_date != expected_day:
