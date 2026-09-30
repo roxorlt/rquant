@@ -577,16 +577,7 @@ class _SeriesEvaluator:
             latest = _latest([cell for _, cell in valid])
             results = inputs.copy()
             if name == "cs_rank":
-                ordered = sorted(valid, key=lambda item: item[1].value)
-                index = 0
-                while index < len(ordered):
-                    end = index + 1
-                    while end < len(ordered) and ordered[end][1].value == ordered[index][1].value:
-                        end += 1
-                    rank = (index + 1 + end) / (2 * len(ordered))
-                    for stock, _ in ordered[index:end]:
-                        results[stock] = _present(rank, latest)
-                    index = end
+                self._cross_rank(valid, latest, results)
             elif name == "cs_zscore":
                 self._cross_zscore(valid, latest, results)
             elif name == "cs_winsorize":
@@ -599,6 +590,21 @@ class _SeriesEvaluator:
                 raise FactorTimeSeriesError("invalid_definition")
             self.cross_cache[key] = results
         return self.cross_cache[key][self.stock_code]
+
+    @staticmethod
+    def _cross_rank(
+        valid: list[tuple[str, _Cell]], latest: datetime | None, results: dict[str, _Cell]
+    ) -> None:
+        ordered = sorted(valid, key=lambda item: item[1].value)
+        index = 0
+        while index < len(ordered):
+            end = index + 1
+            while end < len(ordered) and ordered[end][1].value == ordered[index][1].value:
+                end += 1
+            rank = (index + 1 + end) / (2 * len(ordered))
+            for stock, _ in ordered[index:end]:
+                results[stock] = _present(rank, latest)
+            index = end
 
     def _cross_industry(
         self, day_index: int, valid: list[tuple[str, _Cell]], results: dict[str, _Cell]
