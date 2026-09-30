@@ -17,16 +17,16 @@
 
 - 只接受规范路径和普通非 symlink 的副本及 `.generation.json`，拒绝 RO WAL；绝不回落或 SQL 连接主库。
 - 严格解析现有 `ReplicaGenerationMetadata`；主库名称匹配受信配置字符串，`source_before == source_after`，主库与副本记录的 inode 身份不同，sidecar 的 replica watermark 与实际 RO/FD 相同。
-- 同时绑定 sidecar 字节摘要及 RO/sidecar 文件身份；打开前后、读取完成和准备成功前复核，代变化拒绝。本片不 stat 当前主库，不借 `validate_replica_generation` 访问它。
+- 同时绑定 sidecar 字节摘要及 RO/sidecar 文件身份；打开前后、读取完成及 COMMIT 后、开始元数据发布前复核，冻结前代变化拒绝。这次末尾复核是来源冻结点；之后正常刷代不撤销已核验的历史 artifact，最终准入核对冻结内容。本片不 stat 当前主库，不借 `validate_replica_generation` 访问它。
 - `connect_pinned_readonly` 只负责 FD/in-place 的只读连接；代验证由准备层完成。09:25 沿既有历史回溯假设，真实首次接收时刻和成员事实另行核验。
 
 ## 同次观察、物化与就绪
 
 1. 在同一个自有源事务内核验三表 schema/业务键、请求范围内实际日期/代码分布、SSE 完整自然日覆盖及范围内前交易日链；首行范围外 anchor 不伪造，须明确其验证依据或未验证边界。
 2. 同事务物化并校验现有四项 artifact（范围、日线、复权、SSE 日历），观测计数/边界与导出证据相符。范围 watermarks 从实际已验证的日历/导出得出，不直接把请求范围当已覆盖承诺；结构缺行数不称作全市场缺失。
-3. COMMIT 并确认源代未变后，依据实际收据/内容摘要生成 snapshot 身份，begin/finalize 实际 raw snapshot ready；再构造、发布、登记/finalize binding，最后使用既有 admission 复核。
+3. COMMIT 并完成最后源代复核后，依据实际收据/内容摘要生成 snapshot 身份，begin/finalize 实际 raw snapshot ready；再构造、发布、登记/finalize binding，最后使用既有 admission 复核。元数据发布阶段不继续要求 live 副本保持同代；回执仍绑定实际冻结的原代，不声明是当前最新数据。
 4. `DuckDBStore.begin_dataset_snapshot_binding` 要求 snapshot 已 ready，必须保留此公共合同。后段失败允许 raw ready + missing/building binding，但整体不可准入、不得返回 Prepared 成功；不回退 ready，不增 failed 状态。
-5. 所有路径关闭自有连接、FD及未完成事务，清理自有临时文件；不删除共享内容寻址文件或他人文件。失败与取消不发布完整准备成功。
+5. 所有路径关闭自有连接、FD及未完成事务，清理自有临时文件；不删除共享内容寻址文件或他人文件。失败与取消不返回完整 Prepared 成功；源内容已冻结且 binding 实际 ready 后的取消或后段异常，可以留下有效的双 ready 历史产物。
 
 ## 允许写集
 
@@ -41,7 +41,7 @@
 
 - 实际只读 DuckDB fixture + 匹配代收据，水位、counts/bounds/NULL与导出一致；一次源事务内观察和物化，stock scope和来源输入摘要有真实绑定，未填写承诺来绕过准备。
 - 实际准备产物直接通过现有 v2 admission 并接入小型 runner/decay；旧 public builder 相关回归有效。合法原始缺数明确观测，不能静默补零或声明成员完整。
-- 不完整/不一致日历、错误 schema、代替换/WAL/sidecar不匹配、物化或 binding 发布失败有聚焦拒绝证据；失败不得形成可准入成功，按上述生命周期允许 raw ready但binding缺失。取消和完成均验证资源清理。
+- 不完整/不一致日历、错误 schema、冻结前代替换/WAL/sidecar不匹配、物化或 binding 发布失败有聚焦拒绝证据；未完成物化或 binding 不得形成完整准入，按上述生命周期允许 raw ready但binding缺失。冻结后刷代仍保留原代回执；发布后取消不返回 Prepared，但有效历史 binding 可保留。取消和完成均验证资源清理。
 - 只补实际桥接/完成/绑定风险用例，不逐字段生成拒绝矩阵。复用未改变边界的旧 7,000 股规模证据，不称作本片真实资源证明。
 - 真实红到绿或等价行为证据，记录 Python/命令/exit/passed/skip/deselect和自有进程；Ruff/format/diff后冻结候选。最终一次集中独立终审，普通任务最多一次原实现者定向修复/原审查者复核。
 - root 处理生成测试清单、两项必要清单门禁和进度文档；未运行全量、CI、Python 3.11或真实负载不能写通过。
