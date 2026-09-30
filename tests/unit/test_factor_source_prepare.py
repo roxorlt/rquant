@@ -287,6 +287,26 @@ def test_actual_preparation_runs_formula_statistics_and_decay(tmp_path: Path) ->
         assert not list((lake / ".execution_sessions").iterdir())
 
 
+def test_integer_calendar_flag_is_rejected_before_snapshot_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _replica(tmp_path)
+    with duckdb.connect(str(path)) as seed:
+        seed.execute(
+            "ALTER TABLE trade_calendar ALTER COLUMN is_open TYPE INTEGER "
+            "USING CAST(is_open AS INTEGER)"
+        )
+    _sidecar(path)
+    opened = _track_connection(monkeypatch)
+    lake = tmp_path / "lake"
+    with DuckDBStore(tmp_path / "metadata.duckdb") as metadata:
+        with pytest.raises(ValueError, match="is_open.*schema"):
+            prepare_factor_stream_source(_request(path), metadata_store=metadata, lake_root=lake)
+        assert metadata._conn.execute("SELECT count(*) FROM dataset_snapshot").fetchone() == (0,)
+    assert "ROLLBACK" in opened[0][0].commands
+    _assert_cleaned(opened, lake)
+
+
 @pytest.mark.parametrize("damage", ["missing_calendar", "broken_chain", "wrong_schema"])
 def test_actual_bad_calendar_or_schema_cannot_prepare(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, damage: str

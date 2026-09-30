@@ -354,6 +354,8 @@ def _observe_source(
         code_column = "exchange" if table == "trade_calendar" else "ts_code"
         if types[day_column] != "DATE" or types[code_column] != "VARCHAR":
             raise ValueError(f"source date or code schema mismatch: {table}")
+        if table == "trade_calendar" and types["is_open"] != "BOOLEAN":
+            raise ValueError("source calendar is_open schema must be BOOLEAN")
     calendar = connection.execute(
         "SELECT cal_date, is_open, pretrade_date FROM trade_calendar "
         "WHERE exchange='SSE' AND cal_date BETWEEN ? AND ? ORDER BY cal_date",
