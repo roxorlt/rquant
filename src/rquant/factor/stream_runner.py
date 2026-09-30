@@ -13,6 +13,11 @@ from rquant.factor.daily_stream import (
     evaluate_factor_daily_stream,
     factor_daily_stream_request_sha256,
 )
+from rquant.factor.decay_stream import (
+    FactorICDecayStream,
+    FactorICDecayStreamRequest,
+    FactorICDecayStreamResult,
+)
 from rquant.factor.formula_stream import (
     FactorFormulaStreamCompletion,
     evaluate_factor_formula_stream,
@@ -112,6 +117,83 @@ def run_factor_stream_research(
     universe_requests: Iterable[FactorUniverseRequest],
 ) -> FactorStreamResearchResult:
     """Return success only after all calculation dates, raw tail and statistics complete."""
+    return _run_factor_stream_research(
+        request,
+        metadata_store=metadata_store,
+        lake_root=lake_root,
+        universe_requests=universe_requests,
+        decay=None,
+    )
+
+
+class FactorStreamResearchWithDecayResult(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid", frozen=True, strict=True, revalidate_instances="always"
+    )
+
+    research: FactorStreamResearchResult
+    decay: FactorICDecayStreamResult
+    sha256: Sha256
+
+    @model_validator(mode="after")
+    def _completed_decay_binding(self) -> FactorStreamResearchWithDecayResult:
+        expected = FactorICDecayStreamRequest(
+            statistics_request=self.research.statistics.request,
+            computation_stock_codes=self.research.request.source.scope.stock_codes,
+        )
+        if (
+            self.decay.request != expected
+            or self.decay.statistics_input_sha256 != self.research.statistics.input_sha256
+            or self.decay.batch_sha256s != self.research.statistics.batch_sha256s
+        ):
+            raise ValueError("research and decay completed inputs differ")
+        if self.sha256 != canonical_sha256(self.model_dump(exclude={"sha256"})):
+            raise ValueError("research with decay result digest differs")
+        return self
+
+
+def run_factor_stream_research_with_decay(
+    request: FactorStreamAdapterRequest,
+    *,
+    metadata_store: SnapshotMetadataStore,
+    lake_root: Path,
+    universe_requests: Iterable[FactorUniverseRequest],
+) -> FactorStreamResearchWithDecayResult:
+    try:
+        request = FactorStreamAdapterRequest.model_validate(request)
+        decay = FactorICDecayStream(
+            FactorICDecayStreamRequest(
+                statistics_request=factor_stream_statistics_request(request),
+                computation_stock_codes=request.source.scope.stock_codes,
+            )
+        )
+    except BaseException:
+        close = getattr(universe_requests, "close", None)
+        if close is not None:
+            close()
+        raise
+    try:
+        research = _run_factor_stream_research(
+            request,
+            metadata_store=metadata_store,
+            lake_root=lake_root,
+            universe_requests=universe_requests,
+            decay=decay,
+        )
+        fields = {"research": research, "decay": decay.finish(research.statistics)}
+        return FactorStreamResearchWithDecayResult(**fields, sha256=canonical_sha256(fields))
+    finally:
+        decay.close()
+
+
+def _run_factor_stream_research(
+    request: FactorStreamAdapterRequest,
+    *,
+    metadata_store: SnapshotMetadataStore,
+    lake_root: Path,
+    universe_requests: Iterable[FactorUniverseRequest],
+    decay: FactorICDecayStream | None,
+) -> FactorStreamResearchResult:
     adapter = None
     formula = None
     statistics_batches = None
@@ -130,7 +212,11 @@ def run_factor_stream_research(
                 assert formula is not None
                 for day in formula:
                     if day.universe.trade_date in evaluated:
-                        yield adapter.statistics_batch(day)
+                        batch = adapter.statistics_batch(day)
+                        yield batch
+                        if decay is not None:
+                            decay.consume(batch)
+                        del batch
 
             statistics_batches = batches()
             statistics = evaluate_factor_daily_stream(
