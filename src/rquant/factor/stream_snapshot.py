@@ -18,6 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from rquant.data_metadata import (
     DatasetSnapshot,
+    DatasetSnapshotArtifact,
     DatasetSnapshotBinding,
     DatasetSnapshotBindingFinalization,
     DatasetSnapshotBindingManifest,
@@ -126,68 +127,95 @@ def build_factor_stream_snapshot_binding(
         snapshot, scope.start_date, scope.end_date
     ):
         raise ValueError("stream computation scope differs from snapshot cutoff or range")
-    temporary = f"__factor_stream_scope_{uuid.uuid4().hex}"
-    quoted_scope = _quoted_identifier(temporary)
-    artifacts = []
     try:
         source_connection.execute("BEGIN TRANSACTION")
     except duckdb.Error as exc:
         raise ValueError("stream builder could not start its own source transaction") from exc
     try:
-        # A temporary relation freezes request-owned scope without modifying source tables.
-        source_connection.execute(
-            f"""CREATE TEMP TABLE {quoted_scope} (
-            ts_code VARCHAR PRIMARY KEY, start_date DATE NOT NULL, end_date DATE NOT NULL,
-            as_of_time TIMESTAMPTZ NOT NULL)"""
+        artifacts = _materialize_factor_stream_artifacts(
+            source_connection=source_connection, lake_root=lake_root, scope=scope
         )
-        source_connection.execute(
-            f"INSERT INTO {quoted_scope} SELECT unnest(?), ?, ?, ?",
-            [list(scope.stock_codes), scope.start_date, scope.end_date, scope.as_of_time],
-        )
-        for dependency in _DEPENDENCIES:
-            source_table = (
-                temporary if dependency.table_name == _SCOPE_TABLE else dependency.table_name
-            )
-            columns, key = _source_table_schema(source_connection, source_table)
-            expected_key = (
-                ("ts_code",)
-                if dependency.table_name == _SCOPE_TABLE
-                else _FACTOR_TABLE_KEYS[dependency.table_name]
-            )
-            required = (
-                {"ts_code", "start_date", "end_date", "as_of_time"}
-                if dependency.table_name == _SCOPE_TABLE
-                else _FACTOR_TABLE_COLUMNS[dependency.table_name]
-            )
-            if key != expected_key or not required <= {name for name, _ in columns}:
-                raise ValueError(
-                    "stream source required columns or business key mismatch: "
-                    f"{dependency.table_name}"
-                )
-            artifact = materialize_table_dependency(
-                source_connection,
-                dependency=dependency,
-                artifact_root=lake_root,
-                start_date=scope.start_date,
-                end_date=scope.end_date,
-                as_of_time=scope.as_of_time,
-                ts_codes=("SSE",)
-                if dependency.table_name == "trade_calendar"
-                else scope.stock_codes,
-                source_table_name=source_table,
-            )
-            verify_materialized_table_artifact(
-                artifact, lake_root=lake_root, as_of_time=scope.as_of_time
-            )
-            artifacts.append(artifact)
-        source_connection.execute(f"DROP TABLE {quoted_scope}")
         source_connection.execute("COMMIT")
     except Exception:
         source_connection.execute("ROLLBACK")
         raise
 
+    return _publish_factor_stream_binding(
+        metadata_store=metadata_store,
+        lake_root=lake_root,
+        snapshot=snapshot,
+        scope=scope,
+        artifacts=artifacts,
+        now=now,
+    )
+
+
+def _materialize_factor_stream_artifacts(
+    *,
+    source_connection: duckdb.DuckDBPyConnection,
+    lake_root: Path,
+    scope: FactorComputationScope,
+) -> tuple[DatasetSnapshotArtifact, ...]:
+    """Materialize within the caller's source transaction without publishing metadata."""
+    temporary = f"__factor_stream_scope_{uuid.uuid4().hex}"
+    quoted_scope = _quoted_identifier(temporary)
+    artifacts = []
+    source_connection.execute(
+        f"""CREATE TEMP TABLE {quoted_scope} (
+        ts_code VARCHAR PRIMARY KEY, start_date DATE NOT NULL, end_date DATE NOT NULL,
+        as_of_time TIMESTAMPTZ NOT NULL)"""
+    )
+    source_connection.execute(
+        f"INSERT INTO {quoted_scope} SELECT unnest(?), ?, ?, ?",
+        [list(scope.stock_codes), scope.start_date, scope.end_date, scope.as_of_time],
+    )
+    for dependency in _DEPENDENCIES:
+        source_table = temporary if dependency.table_name == _SCOPE_TABLE else dependency.table_name
+        columns, key = _source_table_schema(source_connection, source_table)
+        expected_key = (
+            ("ts_code",)
+            if dependency.table_name == _SCOPE_TABLE
+            else _FACTOR_TABLE_KEYS[dependency.table_name]
+        )
+        required = (
+            {"ts_code", "start_date", "end_date", "as_of_time"}
+            if dependency.table_name == _SCOPE_TABLE
+            else _FACTOR_TABLE_COLUMNS[dependency.table_name]
+        )
+        if key != expected_key or not required <= {name for name, _ in columns}:
+            raise ValueError(
+                "stream source required columns or business key mismatch: " + dependency.table_name
+            )
+        artifact = materialize_table_dependency(
+            source_connection,
+            dependency=dependency,
+            artifact_root=lake_root,
+            start_date=scope.start_date,
+            end_date=scope.end_date,
+            as_of_time=scope.as_of_time,
+            ts_codes=("SSE",) if dependency.table_name == "trade_calendar" else scope.stock_codes,
+            source_table_name=source_table,
+        )
+        verify_materialized_table_artifact(
+            artifact, lake_root=lake_root, as_of_time=scope.as_of_time
+        )
+        artifacts.append(artifact)
+    source_connection.execute(f"DROP TABLE {quoted_scope}")
+    return tuple(artifacts)
+
+
+def _publish_factor_stream_binding(
+    *,
+    metadata_store: SnapshotMetadataStore,
+    lake_root: Path,
+    snapshot: DatasetSnapshot,
+    scope: FactorComputationScope,
+    artifacts: tuple[DatasetSnapshotArtifact, ...],
+    now: Callable[[], datetime],
+) -> DatasetSnapshotBinding:
+    """Publish artifacts only after their raw snapshot is ready."""
     manifest = DatasetSnapshotBindingManifest(
-        snapshot_id=snapshot_id,
+        snapshot_id=snapshot.snapshot_id,
         strategy_name="factor_eval",
         start_date=scope.start_date,
         end_date=scope.end_date,
@@ -207,7 +235,7 @@ def build_factor_stream_snapshot_binding(
     binding = DatasetSnapshotBinding.create(
         manifest=manifest,
         artifact_root="research_lake",
-        manifest_relative_path=f"snapshots/{snapshot_id}/{provisional.binding_hash}/manifest.json",
+        manifest_relative_path=f"snapshots/{snapshot.snapshot_id}/{provisional.binding_hash}/manifest.json",
         created_at=built_at,
     )
     _publish_binding_manifest(lake_root=lake_root, binding=binding)
@@ -217,7 +245,8 @@ def build_factor_stream_snapshot_binding(
     if stored.status == "ready":
         return stored
     return metadata_store.finalize_dataset_snapshot_binding(
-        snapshot_id, DatasetSnapshotBindingFinalization(completed_at=normalize_utc_datetime(now()))
+        snapshot.snapshot_id,
+        DatasetSnapshotBindingFinalization(completed_at=normalize_utc_datetime(now())),
     )
 
 

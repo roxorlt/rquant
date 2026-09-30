@@ -666,6 +666,45 @@ def test_builder_never_takes_over_existing_transaction(tmp_path: Path) -> None:
         assert not lake.exists()
 
 
+def test_public_builder_still_requires_ready_snapshot_before_materialization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rquant.factor import stream_snapshot
+
+    with _source(tmp_path) as (metadata, source, _snapshot, lake):
+        building = DatasetSnapshot.create(
+            strategy_name="factor_eval",
+            as_of_time=_AS_OF,
+            code_commit="a" * 40,
+            origin="synthetic-building-v2",
+            created_at=_AS_OF,
+        )
+        metadata.begin_dataset_snapshot(building)
+
+        def unexpected(**_kwargs: object) -> None:
+            pytest.fail("public builder materialized a non-ready snapshot")
+
+        monkeypatch.setattr(stream_snapshot, "_materialize_factor_stream_artifacts", unexpected)
+        scope = stream_snapshot.FactorComputationScope(
+            stock_codes=_codes(3),
+            start_date=_FIRST,
+            end_date=_FIRST + timedelta(days=1),
+            as_of_time=_AS_OF,
+        )
+        with pytest.raises(ValueError, match="ready"):
+            stream_snapshot.build_factor_stream_snapshot_binding(
+                metadata_store=metadata,
+                source_connection=source,
+                lake_root=lake,
+                snapshot_id=building.snapshot_id,
+                scope=scope,
+            )
+        source.execute("BEGIN TRANSACTION")
+        source.execute("ROLLBACK")
+        assert metadata.get_dataset_snapshot_binding(building.snapshot_id) is None
+        assert not lake.exists()
+
+
 def test_builder_missing_source_table_rolls_back(tmp_path: Path) -> None:
     with _source(tmp_path, read_only=False) as (metadata, source, snapshot, lake):
         source.execute("DROP TABLE adj_factor")
