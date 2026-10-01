@@ -801,10 +801,11 @@ def archive_index_collections(request: IndexArchiveRequest) -> FactorMemberArchi
                 root=request.root,
                 daily_filenames=_filenames(request, preview),
             )
-            identity = _file_identity(
-                os.stat(reference.filename, dir_fd=archive_descriptor, follow_symlinks=False)
-            )
+            identity: tuple[int, ...] | None = None
             try:
+                identity = _file_identity(
+                    os.stat(reference.filename, dir_fd=archive_descriptor, follow_symlinks=False)
+                )
                 data, _ = _read_file(
                     archive_descriptor,
                     reference.filename,
@@ -815,6 +816,17 @@ def archive_index_collections(request: IndexArchiveRequest) -> FactorMemberArchi
                 _require_same_root(request.root, archive_descriptor)
                 _check_all(preview)
             except BaseException:
+                if identity is None:
+                    # A failed path stat still needs a file identity before owned cleanup.
+                    completion_descriptor = os.open(
+                        reference.filename,
+                        os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                        dir_fd=archive_descriptor,
+                    )
+                    try:
+                        identity = _file_identity(os.fstat(completion_descriptor))
+                    finally:
+                        os.close(completion_descriptor)
                 _cleanup_owned_temporary(archive_descriptor, reference.filename, identity[:2])
                 os.fsync(archive_descriptor)
                 raise

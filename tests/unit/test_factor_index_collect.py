@@ -464,6 +464,64 @@ def test_source_change_during_final_publication_cannot_leave_consumable_completi
     _no_manifest(request.root)
 
 
+def test_initial_post_publication_identity_failure_removes_owned_completion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    m = _module()
+    import rquant.factor.member_archive as archive
+
+    request = _archive_request(tmp_path, "hs300")
+    ref = m.load_index_capture_collection(request.index_roots[0]).responses[0]
+    raw = request.index_roots[0] / ref.raw_filename
+    original_bytes_publish = archive._publish_bytes
+    original_archive_publish = m.publish_factor_member_archive
+    original_stat = m.os.stat
+    published = None
+    source_changed = False
+    stat_failed_once = False
+
+    def publish(root: Path, descriptor: int, name: str, data: bytes, limit: int) -> tuple[int, ...]:
+        nonlocal source_changed
+        if name.startswith("factor-member-archive-v1-"):
+            raw.write_bytes(b"{}")
+            source_changed = True
+        return original_bytes_publish(root, descriptor, name, data, limit)
+
+    def remember(*args: object, **kwargs: object) -> object:
+        nonlocal published
+        published = original_archive_publish(*args, **kwargs)
+        return published
+
+    def stat(path: object, *args: object, **kwargs: object) -> object:
+        nonlocal stat_failed_once
+        if (
+            published is not None
+            and not stat_failed_once
+            and path == published.filename
+            and kwargs.get("dir_fd") is not None
+        ):
+            stat_failed_once = True
+            raise OSError("initial post-publication manifest identity read failed")
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(archive, "_publish_bytes", publish)
+    monkeypatch.setattr(m, "publish_factor_member_archive", remember)
+    monkeypatch.setattr(m.os, "stat", stat)
+    with pytest.raises(OSError, match="initial post-publication"):
+        m.archive_index_collections(request)
+    assert source_changed and stat_failed_once and published is not None
+    with pytest.raises(ValueError, match="digest differs"):
+        m.load_index_capture_collection(request.index_roots[0])
+    _no_manifest(request.root)
+    with (
+        pytest.raises((ValueError, OSError)),
+        open_factor_member_stream(request.root, published) as stream,
+    ):
+        list(stream)
+        stream.require_completion()
+    assert not list(tmp_path.rglob("*.tmp"))
+
+
 def test_imported_public_receipt_cli_preserves_observation_and_replays_only_its_day(
     tmp_path: Path,
 ) -> None:

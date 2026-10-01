@@ -47,3 +47,14 @@ root接受后执行新live两次实际官方捕获，保存原件与HTTP回执�
 - CLI证据脚本修正了自身tests路径、reader返回request/汇总SHA及负向fixture资源归类，错误日志保留；已成功的六个CLI子命令未重跑。其五个返回0/一个预期返回2，逐命令耗时未持久化，分别保留两个执行批的聚合2.852409958s/2.185477834s；最终证据核验脚本返回0/1.072962833s，见 `official-cli-evidence.py/json/log`。这些脚本修正未修改产品源码或测试。
 - Ruff check与format --check均返回0，`git diff --check`返回0。源码SHA256 `b789ab8e50e1c519353b0aedf0f7f129dd5af70b5e0e98a835560d0a3b4e0065`，测试SHA256 `0938ad53c28964afc033d4c5c73cb01f834b2abe8c4222df8e0a6cd1190409bc`；详细环境/语法/身份见 `source-environment-resource-evidence.json`。
 - 证据根 `/private/tmp/rquant-index-implementation-b5xzah9b` 保留，成功资料目录700/文件600，无发布临时文件。十个中断标记仅是两次绿测的预期负向fixture，保留供复核；成功CLI资料无中断。所有自有命令/CLI子进程已退出，无后台服务或未完成工具会话。候选本地提交后停止，root安排唯一一次集中终审及真实live/真实证券归档验收。
+
+## FIC-FINAL-01唯一一次定向修复
+
+- 原候选 `e89479709c40e4c7e6bea2080c8d48c2c97ceabc` 集中终审唯一阻断为FIC-FINAL-01（P2）：publisher返回后首次manifest身份stat位于清理保护外，来源变化且该stat抛错时仍留完成manifest。开始修复前实际分支/HEAD符合候选，status干净；只改本模块、同域测试与本计划。
+- 只将首次stat纳入原清理保护。若异常前尚未取得身份，使用同私有目录FD、`O_NOFOLLOW|O_CLOEXEC`打开该完成文件并由fstat取得dev/inode，关闭新增文件FD后沿原 `_cleanup_owned_temporary` 身份匹配清理和目录fsync。原publisher/reader、所有权检查与其他模块保持原合同；旧history_assemble同形stat登记为root后续backlog，未修改或扩展本片验证。
+- 证据目录 `/private/tmp/rquant-index-implementation-b5xzah9b/fic-final-01`。reviewer原脚本只读复制到自有 `reviewer-red/repro.py`，SHA256保持 `8b2572f770af9d059303edcfb879623c77ba0683ae4c6f8ff04f40e427a89d14`；精确原反例实跑exit0/1.266589459s，确认1个manifest、原reader完整2日、来源loader拒绝，作为红证据保留，不修改审查者材料。
+- 新增唯一节点 `tests/unit/test_factor_index_collect.py::test_initial_post_publication_identity_failure_removes_owned_completion`。实际红命令 `-m pytest tests/unit/test_factor_index_collect.py::test_initial_post_publication_identity_failure_removes_owned_completion -q --basetemp=<修复证据目录>/red-tmp --junitxml=<修复证据目录>/red.xml`，1 failed/0.68s，失败位于残留完成manifest断言。
+- 绿命令只运行上述新节点、`test_source_change_during_final_publication_cannot_leave_consumable_completion`与`test_two_exact_days_archive_through_original_reader_and_pool_contract`（均在同测试文件），`-q --basetemp=<修复证据目录>/green-tmp --junitxml=<修复证据目录>/green.xml`，5 passed/2.29s，无skip/deselect。新失败路径完成manifest为0，原reader无法接受完成，来源仍明确拒绝；旧两日两池成功和既有尾部来源/read失败直接回归通过。完整5节点在 `tested-nodeids.txt`。
+- Ruff首次仅SIM117提示测试with写法，合并等价上下文后check/format均exit0；测试行为未改，复用刚完成的5节点。3.11语法与diff检查exit0。原35中4个直接归档节点已重验，其余、原旧2、CLI、锁等证据保持有效，不重跑套件。`new-nodeids.txt`已更新全部36不同新增节点，累计有效不同节点377不是本轮运行数量。
+- 修后源码SHA256 `dc2151902666f13171f0d0bc20e8bd80d607c38184685991b97e3cbaadb16ab2`，测试SHA256 `d64011c10a9855560d94ce7854d63839f4c5bfa685603c312730eab094d8fe90`，收据为 `repair-evidence.json`。环境仍原Python3.13.12与离线配置。来源变更仅限自有合成fixture；红反例成功manifest保留为证据，绿失败目录只保留日文件/输入且无完成manifest或发布tmp。所有自有进程/工具会话已结束，新增FD由finally关闭。
+- 本普通任务唯一修复轮次到此用完；本地冻结新候选后停写，由原reviewer只复核此ID及修复直接回归，仍有阻断则交root决策，不继续第二轮或扩大范围。
