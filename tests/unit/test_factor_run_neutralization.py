@@ -9,7 +9,6 @@ from rquant.factor import run_request as public
 from rquant.factor.member_archive import _bytes
 from rquant.runtime_contracts import canonical_sha256
 
-
 _PARAMETERS = {
     "factor_id": "test",
     "expected_head": {"version": 1, "content_sha256": "a" * 64},
@@ -66,3 +65,14 @@ def test_public_availability_has_finite_mode_options() -> None:
         public.FactorRunParameters.model_validate_json(
             json.dumps({**_PARAMETERS, "neutralization": "size"})
         )
+
+
+def test_result_dtos_expose_server_mode_label_and_context_notes() -> None:
+    from rquant.web.models.factor_results import FactorResearchDisplay, FactorStreamResearchDisplay
+
+    for model in (FactorResearchDisplay, FactorStreamResearchDisplay):
+        assert model.model_fields["neutralization"].default == "none"
+        assert model.model_fields["neutralization_label"].default == "无"
+        assert model.model_fields["context_basis_label"].default is None
+        assert model.model_fields["context_note"].default is None
+    assert public.neutralization_label("industry_size") == "行业 + 市值"

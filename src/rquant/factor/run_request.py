@@ -14,6 +14,11 @@ from rquant.runtime_contracts import canonical_sha256
 
 RUN_IMMUTABLE = ConfigDict(extra="forbid", frozen=True, strict=True, revalidate_instances="always")
 NeutralizationMode = Literal["none", "industry", "industry_size"]
+NeutralizationLabel = Literal["无", "行业", "行业 + 市值"]
+
+
+def neutralization_label(mode: NeutralizationMode) -> NeutralizationLabel:
+    return {"none": "无", "industry": "行业", "industry_size": "行业 + 市值"}[mode]
 
 
 class FactorRunParameters(BaseModel):
