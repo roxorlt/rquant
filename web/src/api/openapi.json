@@ -5119,6 +5119,197 @@
         "title": "FactorCatalogData",
         "type": "object"
       },
+      "FactorDailyStreamCoverage": {
+        "additionalProperties": false,
+        "description": "Factor and return absence counts may overlap on the same stock.",
+        "properties": {
+          "expected_count": {
+            "maximum": 7000.0,
+            "minimum": 0.0,
+            "title": "Expected Count",
+            "type": "integer"
+          },
+          "factor_missing_by_reason": {
+            "items": {
+              "$ref": "#/components/schemas/FactorMissingCount"
+            },
+            "title": "Factor Missing By Reason",
+            "type": "array"
+          },
+          "factor_missing_count": {
+            "maximum": 7000.0,
+            "minimum": 0.0,
+            "title": "Factor Missing Count",
+            "type": "integer"
+          },
+          "return_missing_by_reason": {
+            "items": {
+              "$ref": "#/components/schemas/ReturnMissingCount"
+            },
+            "title": "Return Missing By Reason",
+            "type": "array"
+          },
+          "return_missing_count": {
+            "maximum": 7000.0,
+            "minimum": 0.0,
+            "title": "Return Missing Count",
+            "type": "integer"
+          },
+          "valid_count": {
+            "maximum": 7000.0,
+            "minimum": 0.0,
+            "title": "Valid Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "expected_count",
+          "valid_count",
+          "factor_missing_count",
+          "return_missing_count",
+          "factor_missing_by_reason",
+          "return_missing_by_reason"
+        ],
+        "title": "FactorDailyStreamCoverage",
+        "type": "object"
+      },
+      "FactorDailyStreamGroupPoint": {
+        "additionalProperties": false,
+        "properties": {
+          "cumulative_return": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cumulative Return"
+          },
+          "group_number": {
+            "maximum": 10.0,
+            "minimum": 1.0,
+            "title": "Group Number",
+            "type": "integer"
+          },
+          "member_count": {
+            "maximum": 7000.0,
+            "minimum": 1.0,
+            "title": "Member Count",
+            "type": "integer"
+          },
+          "period_return": {
+            "title": "Period Return",
+            "type": "number"
+          },
+          "target_weight_turnover": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Target Weight Turnover"
+          }
+        },
+        "required": [
+          "group_number",
+          "member_count",
+          "period_return",
+          "cumulative_return",
+          "target_weight_turnover"
+        ],
+        "title": "FactorDailyStreamGroupPoint",
+        "type": "object"
+      },
+      "FactorDailyStreamGrouping": {
+        "additionalProperties": false,
+        "description": "Cumulative sleeve spread is a diagnostic, not a tradable net asset value.",
+        "properties": {
+          "cumulative_status": {
+            "enum": [
+              "available",
+              "gap"
+            ],
+            "title": "Cumulative Status",
+            "type": "string"
+          },
+          "effective_sample_count": {
+            "maximum": 7000.0,
+            "minimum": 0.0,
+            "title": "Effective Sample Count",
+            "type": "integer"
+          },
+          "group_count": {
+            "enum": [
+              3,
+              5,
+              10
+            ],
+            "title": "Group Count",
+            "type": "integer"
+          },
+          "groups": {
+            "items": {
+              "$ref": "#/components/schemas/FactorDailyStreamGroupPoint"
+            },
+            "maxItems": 10,
+            "title": "Groups",
+            "type": "array"
+          },
+          "long_short_cumulative_spread": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Long Short Cumulative Spread"
+          },
+          "long_short_return": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Long Short Return"
+          },
+          "source_sample_count": {
+            "maximum": 7000.0,
+            "minimum": 0.0,
+            "title": "Source Sample Count",
+            "type": "integer"
+          },
+          "status": {
+            "enum": [
+              "ok",
+              "insufficient_samples"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "group_count",
+          "status",
+          "cumulative_status",
+          "source_sample_count",
+          "effective_sample_count",
+          "groups",
+          "long_short_return",
+          "long_short_cumulative_spread"
+        ],
+        "title": "FactorDailyStreamGrouping",
+        "type": "object"
+      },
       "FactorDayCoverage": {
         "additionalProperties": false,
         "description": "Paired sample coverage; factor and return absences can overlap.",
@@ -5647,9 +5838,13 @@
                 "$ref": "#/components/schemas/FactorResearchDisplay"
               },
               {
+                "$ref": "#/components/schemas/FactorStreamResearchDisplay"
+              },
+              {
                 "type": "null"
               }
-            ]
+            ],
+            "title": "Research"
           },
           "result": {
             "anyOf": [
@@ -5971,6 +6166,167 @@
           "expression"
         ],
         "title": "FactorSaveDraft",
+        "type": "object"
+      },
+      "FactorStreamDisplayCoverageDay": {
+        "additionalProperties": false,
+        "properties": {
+          "coverage": {
+            "$ref": "#/components/schemas/FactorDailyStreamCoverage"
+          },
+          "decision_date": {
+            "format": "date",
+            "title": "Decision Date",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "complete",
+              "partial",
+              "no_samples"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "decision_date",
+          "status",
+          "coverage"
+        ],
+        "title": "FactorStreamDisplayCoverageDay",
+        "type": "object"
+      },
+      "FactorStreamDisplayPortfolioDay": {
+        "additionalProperties": false,
+        "properties": {
+          "decision_date": {
+            "format": "date",
+            "title": "Decision Date",
+            "type": "string"
+          },
+          "groupings": {
+            "items": {
+              "$ref": "#/components/schemas/FactorDailyStreamGrouping"
+            },
+            "maxItems": 3,
+            "minItems": 3,
+            "title": "Groupings",
+            "type": "array"
+          }
+        },
+        "required": [
+          "decision_date",
+          "groupings"
+        ],
+        "title": "FactorStreamDisplayPortfolioDay",
+        "type": "object"
+      },
+      "FactorStreamResearchDisplay": {
+        "additionalProperties": false,
+        "properties": {
+          "basis_label": {
+            "title": "Basis Label",
+            "type": "string"
+          },
+          "coverage_days": {
+            "items": {
+              "$ref": "#/components/schemas/FactorStreamDisplayCoverageDay"
+            },
+            "title": "Coverage Days",
+            "type": "array"
+          },
+          "decay_periods": {
+            "items": {
+              "$ref": "#/components/schemas/FactorDisplayDecayPeriod"
+            },
+            "title": "Decay Periods",
+            "type": "array"
+          },
+          "holding_sessions": {
+            "enum": [
+              1,
+              5,
+              10,
+              20
+            ],
+            "title": "Holding Sessions",
+            "type": "integer"
+          },
+          "ic_points": {
+            "items": {
+              "$ref": "#/components/schemas/FactorDisplayICPoint"
+            },
+            "title": "Ic Points",
+            "type": "array"
+          },
+          "ic_summary": {
+            "$ref": "#/components/schemas/FactorICSummary"
+          },
+          "pool_label": {
+            "enum": [
+              "全市场（沪深非 ST）",
+              "创业板与科创板",
+              "沪深300",
+              "中证1000"
+            ],
+            "title": "Pool Label",
+            "type": "string"
+          },
+          "portfolio_days": {
+            "items": {
+              "$ref": "#/components/schemas/FactorStreamDisplayPortfolioDay"
+            },
+            "title": "Portfolio Days",
+            "type": "array"
+          },
+          "portfolio_status": {
+            "enum": [
+              "available",
+              "available_partial",
+              "insufficient_data"
+            ],
+            "title": "Portfolio Status",
+            "type": "string"
+          },
+          "return_price_basis": {
+            "enum": [
+              "raw",
+              "forward_adjusted",
+              "backward_adjusted"
+            ],
+            "title": "Return Price Basis",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 2,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "summary_status": {
+            "enum": [
+              "evaluated",
+              "no_samples"
+            ],
+            "title": "Summary Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "schema_version",
+          "basis_label",
+          "pool_label",
+          "return_price_basis",
+          "holding_sessions",
+          "summary_status",
+          "ic_summary",
+          "ic_points",
+          "decay_periods",
+          "portfolio_status",
+          "portfolio_days",
+          "coverage_days"
+        ],
+        "title": "FactorStreamResearchDisplay",
         "type": "object"
       },
       "FieldExpr": {

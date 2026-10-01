@@ -10,8 +10,10 @@ import sqlite3
 import stat
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from threading import Lock
 from typing import Literal
 from uuid import uuid4
 
@@ -28,6 +30,9 @@ from rquant.factor.result_artifact import (
     FactorResearchArtifactV1,
     _load_factor_research_artifact_with_identity,
 )
+from rquant.factor.stream_job_artifact import StreamArtifactWitness, verify_factor_stream_artifacts
+from rquant.factor.stream_job_runner import FactorStreamCompletion, decode_factor_completion_json
+from rquant.factor.stream_job_spec import FactorStreamJobSpec, decode_factor_job_spec_json
 from rquant.strict_json import canonical_json_bytes, strict_canonical_json_loads
 
 _IMMUTABLE = ConfigDict(extra="forbid", frozen=True, strict=True, revalidate_instances="always")
@@ -98,7 +103,7 @@ class FactorJobRecord(BaseModel):
     model_config = _IMMUTABLE
 
     job_id: str = Field(pattern=r"^[0-9a-f]{32}$")
-    spec: FactorEvaluationJobSpec
+    spec: FactorEvaluationJobSpec | FactorStreamJobSpec
     spec_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     status: FactorJobStatus
     version: int = Field(ge=0, strict=True)
@@ -107,7 +112,7 @@ class FactorJobRecord(BaseModel):
     updated_at: AwareDatetime
     lease_expires_at: AwareDatetime | None
     failure_code: FactorJobFailureCode | None
-    completion: FactorEvaluationCompletion | None
+    completion: FactorEvaluationCompletion | FactorStreamCompletion | None
 
 
 class FactorJobLease(BaseModel):
@@ -160,6 +165,8 @@ class _JobState(FactorJobRecord):
                 and self.completion.spec_sha256 == self.spec_sha256
                 and self.completion.code_revision == self.spec.code_revision
                 and self.completion.completed_at <= self.updated_at
+                and isinstance(self.completion, FactorStreamCompletion)
+                == isinstance(self.spec, FactorStreamJobSpec)
             )
         else:
             valid = (
@@ -284,14 +291,23 @@ def _decoded_job(row: sqlite3.Row) -> _JobState:
     try:
         if not isinstance(payload["job_id"], str) or _HEX32.fullmatch(payload["job_id"]) is None:
             raise ValueError("factor job ID is invalid")
-        spec = _model_from_json(FactorEvaluationJobSpec, payload["spec_json"], _MAX_SPEC_BYTES)
+        spec = decode_factor_job_spec_json(payload["spec_json"])
+        if _canonical_model(spec) != payload["spec_json"]:
+            raise ValueError("factor job spec JSON is not canonical")
         completion = (
             None
             if payload["completion_json"] is None
-            else _model_from_json(
-                FactorEvaluationCompletion, payload["completion_json"], _MAX_COMPLETION_BYTES
-            )
+            else decode_factor_completion_json(payload["completion_json"])
         )
+        if completion is not None:
+            completion_model = (
+                FactorStreamCompletion
+                if isinstance(completion, FactorStreamCompletion)
+                else FactorEvaluationCompletion
+            )
+            completion = _model_from_json(
+                completion_model, payload["completion_json"], _MAX_COMPLETION_BYTES
+            )
         created_at = _parsed_time(payload["created_at"])
         updated_at = _parsed_time(payload["updated_at"])
         lease_expires_at = _parsed_time(payload["lease_expires_at"], optional=True)
@@ -390,6 +406,16 @@ def _checked_completion(
         raise FactorLedgerCompletionError("factor display differs from the complete artifact")
 
 
+@dataclass(frozen=True, slots=True)
+class _PreparedStream:
+    instance: FactorLedgerIdentity
+    job_id: str
+    spec_sha256: str
+    lease_token: str
+    completion: FactorStreamCompletion
+    witnesses: tuple[StreamArtifactWitness, ...]
+
+
 class FactorEvaluationJobLedger:
     """Explicitly initialized ledger pinned to an out-of-band physical identity."""
 
@@ -402,6 +428,8 @@ class FactorEvaluationJobLedger:
         self.path = Path(raw)
         self._clock = clock
         self._expected: FactorLedgerIdentity | None = None
+        self._prepared: dict[object, _PreparedStream] = {}
+        self._prepared_lock = Lock()
 
     def _now(self) -> datetime:
         return _utc(self._clock())
@@ -647,12 +675,12 @@ class FactorEvaluationJobLedger:
         if updated.rowcount != 1:
             raise FactorLedgerIntegrityError("factor job vanished during update")
 
-    def submit(self, command_id: str, spec: FactorEvaluationJobSpec) -> FactorJobRecord:
+    def submit(
+        self, command_id: str, spec: FactorEvaluationJobSpec | FactorStreamJobSpec
+    ) -> FactorJobRecord:
         if not isinstance(command_id, str) or _COMMAND_PATTERN.fullmatch(command_id) is None:
             raise ValueError("factor command ID is invalid")
-        checked = FactorEvaluationJobSpec.model_validate(
-            spec.model_dump(mode="python", round_trip=True)
-        )
+        checked = decode_factor_job_spec_json(_canonical_model(spec))
         with self._writer() as connection:
             current = self._now()
             command = connection.execute(
@@ -723,6 +751,7 @@ class FactorEvaluationJobLedger:
                 if current < state.created_at:
                     raise ValueError("factor claim clock precedes submission")
                 if current >= state.spec.deadline:
+                    self._discard_job_prepared(state.job_id)
                     expired = state.model_copy(
                         update={
                             "status": "failed",
@@ -750,6 +779,7 @@ class FactorEvaluationJobLedger:
                     }
                 )
                 checked = _JobState.model_validate(claimed.model_dump(mode="python"))
+                self._discard_job_prepared(state.job_id)
                 self._store_job(connection, checked)
                 return checked.lease()
 
@@ -876,7 +906,151 @@ class FactorEvaluationJobLedger:
             )
             checked = _JobState.model_validate(succeeded.model_dump(mode="python"))
             self._store_job(connection, checked)
-            return checked.public()
+        return checked.public()
+
+    def discard_prepared_stream(self, handle: object) -> None:
+        """Release this instance's private evidence after cancellation or loss."""
+        with self._prepared_lock:
+            if type(handle) is object:
+                self._prepared.pop(handle, None)
+
+    def _discard_job_prepared(self, job_id: str, *, lease_token: str | None = None) -> None:
+        with self._prepared_lock:
+            for handle, prepared in tuple(self._prepared.items()):
+                if prepared.job_id == job_id and (
+                    lease_token is None or prepared.lease_token == lease_token
+                ):
+                    del self._prepared[handle]
+
+    def _prepared_stream(self, handle: object) -> _PreparedStream:
+        with self._prepared_lock:
+            prepared = self._prepared.get(handle) if type(handle) is object else None
+            if prepared is None or prepared.instance != self._expected:
+                raise FactorLedgerCompletionError(
+                    "stream prepared handle is not owned by this ledger instance"
+                )
+            return prepared
+
+    def prepare_stream_completion(
+        self,
+        job_id: str,
+        lease_token: str,
+        completion: FactorStreamCompletion,
+        artifact_root: Path,
+        member_root: Path,
+    ) -> object:
+        """Long verification outside the writer, while the worker keeps renewing."""
+        with self._reader() as connection:
+            state = self._load_job(connection, job_id)
+            if state is None or not isinstance(state.spec, FactorStreamJobSpec):
+                raise FactorLedgerCompletionError("stream preparation requires a v2 job")
+            self._live_lease(state, lease_token, state.version, self._now())
+            spec = state.spec
+        self._discard_job_prepared(job_id, lease_token=lease_token)
+        self._prune_prepared_streams()
+        try:
+            checked = FactorStreamCompletion.model_validate(completion.model_dump(mode="python"))
+            verified = verify_factor_stream_artifacts(spec, checked, artifact_root, member_root)
+        except (OSError, TypeError, ValueError, ValidationError) as exc:
+            raise FactorLedgerCompletionError(
+                "stream journal completion cannot be verified"
+            ) from exc
+        with self._reader() as connection:
+            state = self._load_job(connection, job_id)
+            if state is None or state.spec != spec:
+                raise FactorLedgerLeaseError("stream job changed during preparation")
+            self._live_lease(state, lease_token, state.version, self._now())
+            if checked.completed_at > self._now():
+                raise FactorLedgerCompletionError(
+                    "stream completion time exceeds trusted ledger time"
+                )
+        assert self._expected is not None
+        handle = object()
+        with self._prepared_lock:
+            for previous, record in tuple(self._prepared.items()):
+                if record.job_id == job_id and record.lease_token == lease_token:
+                    del self._prepared[previous]
+            if len(self._prepared) >= _MAX_LIST:
+                raise FactorLedgerCompletionError("stream prepared record capacity exceeded")
+            self._prepared[handle] = _PreparedStream(
+                self._expected, job_id, spec.spec_sha256, lease_token, checked, verified.witnesses
+            )
+        return handle
+
+    def _prune_prepared_streams(self) -> None:
+        with self._prepared_lock:
+            records = tuple(self._prepared.items())
+        if not records:
+            return
+        stale = []
+        try:
+            with self._reader() as connection:
+                current = self._now()
+                for handle, prepared in records:
+                    state = self._load_job(connection, prepared.job_id)
+                    if state is None or state.spec_sha256 != prepared.spec_sha256:
+                        stale.append(handle)
+                        continue
+                    try:
+                        self._live_lease(state, prepared.lease_token, state.version, current)
+                    except FactorLedgerLeaseError:
+                        stale.append(handle)
+        except BaseException:
+            with self._prepared_lock:
+                self._prepared.clear()
+            raise
+        for handle in stale:
+            self.discard_prepared_stream(handle)
+
+    def complete_prepared_stream(
+        self, job_id: str, lease_token: str, expected_version: int, handle: object
+    ) -> FactorJobRecord:
+        """Only identities and original lease/CAS checks occur after heartbeat stops."""
+        try:
+            prepared = self._prepared_stream(handle)
+            if prepared.job_id != job_id or not secrets.compare_digest(
+                prepared.lease_token, lease_token
+            ):
+                raise FactorLedgerCompletionError("stream prepared handle claim differs")
+            with self._writer() as connection:
+                # BEGIN IMMEDIATE may have waited: all named identities must be checked HERE.
+                if self._prepared_stream(handle) is not prepared:
+                    raise FactorLedgerCompletionError("stream prepared evidence was discarded")
+                try:
+                    for witness in prepared.witnesses:
+                        witness.recheck()
+                except (OSError, ValueError) as exc:
+                    raise FactorLedgerCompletionError(
+                        "stream artifacts changed before CAS"
+                    ) from exc
+                state = self._load_job(connection, job_id)
+                if (
+                    state is None
+                    or not isinstance(state.spec, FactorStreamJobSpec)
+                    or state.spec_sha256 != prepared.spec_sha256
+                ):
+                    raise FactorLedgerCompletionError("stream prepared job binding differs")
+                current = self._now()
+                self._live_lease(state, lease_token, expected_version, current)
+                if prepared.completion.completed_at > current:
+                    raise FactorLedgerCompletionError(
+                        "stream completion time exceeds trusted ledger time"
+                    )
+                succeeded = state.model_copy(
+                    update={
+                        "status": "succeeded",
+                        "version": state.version + 1,
+                        "updated_at": current,
+                        "lease_token": None,
+                        "lease_expires_at": None,
+                        "completion": prepared.completion,
+                    }
+                )
+                checked = _JobState.model_validate(succeeded.model_dump(mode="python"))
+                self._store_job(connection, checked)
+                return checked.public()
+        finally:
+            self.discard_prepared_stream(handle)
 
     def fail(
         self,
@@ -909,12 +1083,14 @@ class FactorEvaluationJobLedger:
                 }
             )
             checked = _JobState.model_validate(failed.model_dump(mode="python"))
+            self._discard_job_prepared(job_id)
             self._store_job(connection, checked)
             return checked.public()
 
     def get(self, job_id: str) -> FactorJobRecord | None:
         if not isinstance(job_id, str) or _HEX32.fullmatch(job_id) is None:
             raise ValueError("factor job ID is invalid")
+        self._prune_prepared_streams()
         with self._reader() as connection:
             state = self._load_job(connection, job_id)
             return None if state is None else state.public()

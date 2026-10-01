@@ -1,4 +1,4 @@
-import type { FactorResearchDisplay } from "@/api/factors";
+import type { FactorResearchDisplay, FactorResearchDisplayV2 } from "@/api/factors";
 import type { ChartColors } from "@/charts/tokens";
 import {
   decayOption,
@@ -87,6 +87,48 @@ it("只传已核验的 IC 和累计值，缺失日保留 null 断点", () => {
   expect(series[0]?.data[1]).toBeNull();
   expect(series[1]?.data[1]).toBeNull();
   expect(series[1]?.connectNulls).toBe(false);
+});
+
+it("新版轻量分组保留累计缺口和首次换手空值，不补持仓或重算收益", () => {
+  const light = {
+    ...research,
+    schema_version: 2,
+    pool_label: "沪深300",
+    portfolio_days: [
+      {
+        decision_date: "2026-09-21",
+        groupings: [
+          {
+            status: "ok",
+            group_count: 3,
+            cumulative_status: "gap",
+            source_sample_count: 12,
+            effective_sample_count: 12,
+            long_short_return: 0.01,
+            long_short_cumulative_spread: null,
+            groups: [
+              {
+                group_number: 1,
+                member_count: 4,
+                period_return: 0.02,
+                cumulative_return: null,
+                target_weight_turnover: null,
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  } as FactorResearchDisplayV2;
+  expect(groupCounts(light)).toEqual([3]);
+  expect(groupSeries(light, 3)[0]?.groups[0]?.cumulative_return).toBeNull();
+  const chart = groupOption(light, 3, colors).series as Array<{ data: unknown[] }>;
+  const turnover = turnoverOption(light, 3, colors).series as Array<{ data: unknown[] }>;
+  expect(chart[0]?.data).toEqual([null, null]);
+  expect(turnover[0]?.data).toEqual([null, null]);
+  expect(icSeries(light, "normal_ic")).toEqual(icSeries(research, "normal_ic"));
+  expect(decaySeries(light, "rank_ic")).toEqual(decaySeries(research, "rank_ic"));
+  expect("members" in (groupSeries(light, 3)[0]?.groups[0] ?? {})).toBe(false);
 });
 
 it("衰减和分组只呈现原始可用值，不补值或计算平均", () => {

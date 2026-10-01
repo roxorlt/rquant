@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { HttpResponse, http } from "msw";
 import { vi } from "vitest";
 import type { Schemas } from "@/api/client";
+import type { FactorResearchDisplay } from "@/api/factors";
 import { metaEnvelope } from "@/test/fixtures";
 import { findJargon } from "@/test/jargon";
 import { renderApp } from "@/test/render";
@@ -180,7 +181,7 @@ function result(jobId: string, overrides: Partial<ResultItem> = {}): ResultItem 
 
 function publishResults(
   items: ResultItem[],
-  detailResearch: Research | null = research,
+  detailResearch: FactorResearchDisplay | null = research,
   generationId = firstGeneration,
 ) {
   server.use(
@@ -232,6 +233,38 @@ function publish(
 }
 
 describe("因子库", () => {
+  it("新版显示真实池名、轻量分组和部分日期，缺失值保持空", async () => {
+    publish();
+    const stream: Schemas["FactorStreamResearchDisplay"] = {
+      ...research,
+      schema_version: 2,
+      pool_label: "中证1000",
+      ic_summary: { normal_ic: icSummary, rank_ic: icSummary },
+      coverage_days: research.coverage_days.map((day) => ({
+        ...day,
+        status: day.status === "evaluated" ? "partial" : "no_samples",
+      })),
+      portfolio_days: research.portfolio_days.map((day) => ({
+        decision_date: day.decision_date,
+        groupings: day.groupings.map((grouping) => ({
+          ...grouping,
+          group_count: grouping.group_count as 3 | 5 | 10,
+          cumulative_status: "gap",
+          groups: grouping.groups.map((group) => ({ ...group, cumulative_return: null })),
+        })),
+      })),
+    };
+    publishResults([result("2".repeat(32))], stream);
+    const { container } = renderApp("/factors");
+    const area = await screen.findByRole("region", { name: "检验结果" });
+    await within(area).findByText("中证1000");
+    expect(area).not.toHaveTextContent("固定样本");
+    expect(area).toHaveTextContent("部分日期可计算");
+    expect(within(area).getByRole("img", { name: "分组累计收益" })).toBeInTheDocument();
+    await userEvent.setup().click(within(area).getByText("查看分组收益明细"));
+    expect(area).toHaveTextContent("—");
+    expect(findJargon(container.textContent ?? "")).toEqual([]);
+  });
   it("只展示当前定义的最近成功检验，切换 IC 和分组并展开真实缺值", async () => {
     publish();
     const older = result("1".repeat(32), { updated_at: "2026-09-25T07:00:00Z" });

@@ -232,12 +232,17 @@ def get_factor_result(
             None,
         )
     )
+    from rquant.web.models.factor_results import FactorStreamResearchDisplay
+
     research = (
         None
         if display is None
-        else FactorResearchDisplay(
+        else (
+            FactorStreamResearchDisplay if display.schema_version == 2 else FactorResearchDisplay
+        )(
+            **({"schema_version": 2} if display.schema_version == 2 else {}),
             basis_label=_BASIS_LABEL,
-            pool_label="固定样本",
+            pool_label=display.pool_label if display.schema_version == 2 else "固定样本",
             return_price_basis=display.return_price_basis,
             holding_sessions=display.holding_sessions,
             summary_status=display.summary_status,

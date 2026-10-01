@@ -20,6 +20,10 @@ from rquant.factor.result import (
     ResearchSummaryStatus,
     ReturnPriceBasis,
 )
+from rquant.factor.stream_job_artifact import (
+    FactorStreamDisplayCoverageDay,
+    FactorStreamDisplayPortfolioDay,
+)
 from rquant.factor.summary import FactorICSummary
 
 
@@ -64,10 +68,26 @@ class FactorResearchDisplay(BaseModel):
     coverage_days: list[FactorDisplayCoverageDay]
 
 
+class FactorStreamResearchDisplay(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    schema_version: Literal[2]
+    basis_label: str
+    pool_label: Literal["全市场（沪深非 ST）", "创业板与科创板", "沪深300", "中证1000"]
+    return_price_basis: ReturnPriceBasis
+    holding_sessions: HoldingSessions
+    summary_status: ResearchSummaryStatus
+    ic_summary: FactorICSummary
+    ic_points: list[FactorDisplayICPoint]
+    decay_periods: list[FactorDisplayDecayPeriod]
+    portfolio_status: ResearchPortfolioStatus
+    portfolio_days: list[FactorStreamDisplayPortfolioDay]
+    coverage_days: list[FactorStreamDisplayCoverageDay]
+
+
 class FactorResultDetailData(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     availability: Literal["unavailable", "empty", "not_found", "ready"]
     available_at: datetime | None
     result: FactorResultItem | None
-    research: FactorResearchDisplay | None
+    research: FactorResearchDisplay | FactorStreamResearchDisplay | None

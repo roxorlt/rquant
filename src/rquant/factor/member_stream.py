@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from rquant.factor.daily_stream import FactorDailyStreamBatch
 from rquant.factor.member_archive import (
     MAX_FACTOR_MEMBER_DAY_BYTES,
     FactorMemberArchiveManifest,
@@ -234,13 +235,18 @@ def run_factor_stream_research_from_members(
     member_archive: FactorMemberArchiveReference,
     metadata_store: SnapshotMetadataStore,
     lake_root: Path,
+    batch_observer: Callable[[FactorDailyStreamBatch], None] | None = None,
 ) -> FactorMemberResearchResult:
     """The existing single execution plus actual member-file exhaustion and receipt."""
     request = FactorStreamAdapterRequest.model_validate(request)
     with open_factor_member_stream(member_root, member_archive) as stream:
         _matching_request(stream.manifest, request)
         result = run_factor_stream_research_with_decay(
-            request, metadata_store=metadata_store, lake_root=lake_root, universe_requests=stream
+            request,
+            metadata_store=metadata_store,
+            lake_root=lake_root,
+            universe_requests=stream,
+            batch_observer=batch_observer,
         )
         fields = {
             "member_archive": stream.reference,

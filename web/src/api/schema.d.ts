@@ -2869,6 +2869,68 @@ export interface components {
             definitions: components["schemas"]["FactorDefinitionItem"][];
         };
         /**
+         * FactorDailyStreamCoverage
+         * @description Factor and return absence counts may overlap on the same stock.
+         */
+        FactorDailyStreamCoverage: {
+            /** Expected Count */
+            expected_count: number;
+            /** Factor Missing By Reason */
+            factor_missing_by_reason: components["schemas"]["FactorMissingCount"][];
+            /** Factor Missing Count */
+            factor_missing_count: number;
+            /** Return Missing By Reason */
+            return_missing_by_reason: components["schemas"]["ReturnMissingCount"][];
+            /** Return Missing Count */
+            return_missing_count: number;
+            /** Valid Count */
+            valid_count: number;
+        };
+        /** FactorDailyStreamGroupPoint */
+        FactorDailyStreamGroupPoint: {
+            /** Cumulative Return */
+            cumulative_return: number | null;
+            /** Group Number */
+            group_number: number;
+            /** Member Count */
+            member_count: number;
+            /** Period Return */
+            period_return: number;
+            /** Target Weight Turnover */
+            target_weight_turnover: number | null;
+        };
+        /**
+         * FactorDailyStreamGrouping
+         * @description Cumulative sleeve spread is a diagnostic, not a tradable net asset value.
+         */
+        FactorDailyStreamGrouping: {
+            /**
+             * Cumulative Status
+             * @enum {string}
+             */
+            cumulative_status: "available" | "gap";
+            /** Effective Sample Count */
+            effective_sample_count: number;
+            /**
+             * Group Count
+             * @enum {integer}
+             */
+            group_count: 3 | 5 | 10;
+            /** Groups */
+            groups: components["schemas"]["FactorDailyStreamGroupPoint"][];
+            /** Long Short Cumulative Spread */
+            long_short_cumulative_spread: number | null;
+            /** Long Short Return */
+            long_short_return: number | null;
+            /** Source Sample Count */
+            source_sample_count: number;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "ok" | "insufficient_samples";
+        };
+        /**
          * FactorDayCoverage
          * @description Paired sample coverage; factor and return absences can overlap.
          */
@@ -3061,7 +3123,8 @@ export interface components {
             availability: "unavailable" | "empty" | "not_found" | "ready";
             /** Available At */
             available_at: string | null;
-            research: components["schemas"]["FactorResearchDisplay"] | null;
+            /** Research */
+            research: components["schemas"]["FactorResearchDisplay"] | components["schemas"]["FactorStreamResearchDisplay"] | null;
             result: components["schemas"]["FactorResultItem"] | null;
         };
         /** FactorResultItem */
@@ -3174,6 +3237,74 @@ export interface components {
              * Format: date-time
              */
             requested_at: string;
+        };
+        /** FactorStreamDisplayCoverageDay */
+        FactorStreamDisplayCoverageDay: {
+            coverage: components["schemas"]["FactorDailyStreamCoverage"];
+            /**
+             * Decision Date
+             * Format: date
+             */
+            decision_date: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "complete" | "partial" | "no_samples";
+        };
+        /** FactorStreamDisplayPortfolioDay */
+        FactorStreamDisplayPortfolioDay: {
+            /**
+             * Decision Date
+             * Format: date
+             */
+            decision_date: string;
+            /** Groupings */
+            groupings: components["schemas"]["FactorDailyStreamGrouping"][];
+        };
+        /** FactorStreamResearchDisplay */
+        FactorStreamResearchDisplay: {
+            /** Basis Label */
+            basis_label: string;
+            /** Coverage Days */
+            coverage_days: components["schemas"]["FactorStreamDisplayCoverageDay"][];
+            /** Decay Periods */
+            decay_periods: components["schemas"]["FactorDisplayDecayPeriod"][];
+            /**
+             * Holding Sessions
+             * @enum {integer}
+             */
+            holding_sessions: 1 | 5 | 10 | 20;
+            /** Ic Points */
+            ic_points: components["schemas"]["FactorDisplayICPoint"][];
+            ic_summary: components["schemas"]["FactorICSummary"];
+            /**
+             * Pool Label
+             * @enum {string}
+             */
+            pool_label: "全市场（沪深非 ST）" | "创业板与科创板" | "沪深300" | "中证1000";
+            /** Portfolio Days */
+            portfolio_days: components["schemas"]["FactorStreamDisplayPortfolioDay"][];
+            /**
+             * Portfolio Status
+             * @enum {string}
+             */
+            portfolio_status: "available" | "available_partial" | "insufficient_data";
+            /**
+             * Return Price Basis
+             * @enum {string}
+             */
+            return_price_basis: "raw" | "forward_adjusted" | "backward_adjusted";
+            /**
+             * Schema Version
+             * @constant
+             */
+            schema_version: 2;
+            /**
+             * Summary Status
+             * @enum {string}
+             */
+            summary_status: "evaluated" | "no_samples";
         };
         /** FieldExpr */
         FieldExpr: {
