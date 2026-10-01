@@ -14,10 +14,51 @@ export type FactorResultDetailData = Schemas["FactorResultDetailData"];
 export type FactorResearchDisplayV1 = Schemas["FactorResearchDisplay"];
 export type FactorResearchDisplayV2 = Schemas["FactorStreamResearchDisplay"];
 export type FactorResearchDisplay = FactorResearchDisplayV1 | FactorResearchDisplayV2;
+export type FactorRunRequest = Schemas["FactorRunRequest"];
+export type FactorRunParameters = Schemas["FactorRunParameters"];
+export type FactorRunAvailability = Schemas["FactorRunAvailability"];
+export type FactorRunOperationResult = Schemas["FactorRunOperationResult"];
 type FactorCatalogEnvelope = Schemas["Envelope_FactorCatalogData_"];
 type FactorCapabilitiesEnvelope = Schemas["Envelope_FactorCapabilitiesData_"];
 type FactorResultListEnvelope = Schemas["Envelope_FactorResultListData_"];
 type FactorResultDetailEnvelope = Schemas["Envelope_FactorResultDetailData_"];
+type FactorRunAvailabilityEnvelope = Schemas["Envelope_FactorRunAvailability_"];
+
+export async function postFactorRun(
+  request: FactorRunRequest,
+  action: "run" | "resume" | "retry",
+): Promise<FactorRunOperationResult> {
+  const options = { body: request, headers: { "X-Rquant-Csrf": "1" } };
+  const client = apiClient();
+  const result =
+    action === "run"
+      ? await client.POST("/api/v1/factors/runs", options)
+      : action === "resume"
+        ? await client.POST("/api/v1/factors/runs/resume", options)
+        : await client.POST("/api/v1/factors/runs/retry", options);
+  if (result.data === undefined) {
+    throw new ApiError(result.response.status, "检验结果暂未确认，请保留本次操作。");
+  }
+  return result.data.data;
+}
+
+export function useFactorRunAvailability(
+  generationId: string | null | undefined,
+  viewer: string | null | undefined,
+  permissionRevision: number,
+): ServingQueryResult<FactorRunAvailability> {
+  return useServingQuery(
+    ["factors", "run-availability", generationId, viewer, permissionRevision],
+    async (): Promise<FactorRunAvailabilityEnvelope> => {
+      const { data, response } = await apiClient().GET("/api/v1/factors/run-availability");
+      if (data === undefined) {
+        throw new ApiError(response.status, "检验条件暂时无法核对，请稍后刷新。");
+      }
+      return data;
+    },
+    { enabled: typeof generationId === "string" && typeof viewer === "string" },
+  );
+}
 
 export async function postFactorArchive(
   factorId: string,

@@ -1,7 +1,324 @@
 import { expect, test } from "@playwright/test";
+import type { MetaEnvelope, Schemas } from "../src/api/client.ts";
+import rejectionContract from "../src/pages/factors/factorRunRejection.fixture.json" with {
+  type: "json",
+};
 import { findJargon } from "../src/test/jargon.ts";
 import { APP_URL } from "./env.ts";
 import { expectNoHorizontalOverflow, watch } from "./watch.ts";
+
+for (const viewport of [
+  { width: 1440, height: 900, label: "desktop" },
+  { width: 390, height: 844, label: "phone" },
+]) {
+  test(`因子运行参数、确认、重载原请求恢复在 ${viewport.label} 可完成`, async ({
+    page,
+  }, testInfo) => {
+    const watcher = watch(page);
+    const metadata = (await (
+      await page.request.get(new URL("api/v1/meta", APP_URL).toString())
+    ).json()) as MetaEnvelope;
+    metadata.data.viewer = "tester";
+    const availability: Schemas["FactorRunAvailability"] = {
+      enabled: true,
+      reason: null,
+      start_date: "2026-09-01",
+      end_date: "2026-09-23",
+      pools: [
+        { selection: "all", label: "全市场（沪深非 ST）", available: true, reason: null },
+        { selection: "gem", label: "创业板与科创板", available: true, reason: null },
+        { selection: "hs300", label: "沪深300", available: false, reason: "缺少历史成分记录" },
+        { selection: "zz1000", label: "中证1000", available: true, reason: null },
+      ],
+    };
+    const requests: Schemas["FactorRunRequest"][] = [];
+    await page.route("**/api/v1/meta", (route) => route.fulfill({ json: metadata }));
+    await page.route("**/api/v1/factors/definitions*", (route) =>
+      route.fulfill({
+        json: {
+          data: {
+            availability: "populated",
+            available_at: metadata.serving.built_at,
+            definitions: definitions.map((item) => ({ ...item, category: "technical" })),
+            can_save: false,
+            can_archive: true,
+          },
+          serving: metadata.serving,
+        },
+      }),
+    );
+    await page.route("**/api/v1/factors/run-availability", (route) =>
+      route.fulfill({ json: { data: availability, serving: metadata.serving } }),
+    );
+    await page.route(/\/api\/v1\/factors\/results(?:\?.*)?$/, (route) =>
+      route.fulfill({
+        json: {
+          data: { availability: "empty", available_at: metadata.serving.built_at, results: [] },
+          serving: metadata.serving,
+        },
+      }),
+    );
+    await page.route(/\/api\/v1\/factors\/runs(?:\/(?:resume|retry))?$/, async (route) => {
+      const request = route.request().postDataJSON() as Schemas["FactorRunRequest"];
+      expect(route.request().headers()["x-rquant-csrf"]).toBe("1");
+      expect(
+        await page.evaluate(
+          () =>
+            JSON.parse(localStorage.getItem("rquant.factor.run-operation.v1") ?? "null").request,
+        ),
+      ).toEqual(request);
+      requests.push(request);
+      const submitted = route.request().url().endsWith("/retry");
+      const result: Schemas["FactorRunOperationResult"] = {
+        original_request: request,
+        status: submitted ? "submitted" : "uncertain",
+        reason: null,
+        job_id: submitted ? "b".repeat(32) : null,
+        spec_sha256: submitted ? "c".repeat(64) : null,
+      };
+      await route.fulfill({ json: { data: result, serving: metadata.serving } });
+    });
+    await page.setViewportSize({ width: viewport.width, height: viewport.height });
+    await page.goto("./#/factors");
+    const params = page.getByRole("region", { name: "检验参数" });
+    await expect(params.getByRole("button", { name: "运行检验" })).toBeEnabled();
+    await expect(params.getByRole("combobox", { name: "股票池" })).toHaveValue("all");
+    await expect(params.getByRole("combobox", { name: "调仓周期" })).toHaveValue("5");
+    await expect(params.getByRole("combobox", { name: "分组数" })).toHaveValue("5");
+    await expect(params.getByRole("button", { name: "RankIC" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    const tip = params.getByText("中性化说明");
+    await tip.focus();
+    await expect(page.getByRole("tooltip")).toContainText("尚未开放");
+    await params.getByRole("combobox", { name: "分组数" }).selectOption("10");
+    const topRun = page.locator(".ph-actions").getByRole("button", { name: "运行检验" });
+    await topRun.click();
+    const dialog = page.getByRole("dialog", { name: "运行因子检验" });
+    await expect(dialog).toContainText("价量动量 · 第 2 版");
+    await expect(dialog).toContainText("2026-09-01 至 2026-09-23");
+    await expect(dialog).toContainText("10 组 · RankIC");
+    expect(requests).toHaveLength(0);
+    await expectNoHorizontalOverflow(page, `factor run confirm ${viewport.label}`);
+    await page.screenshot({
+      path: testInfo.outputPath(`factor-run-confirm-${viewport.label}.png`),
+      fullPage: true,
+    });
+    await dialog.getByRole("button", { name: "确认运行" }).click();
+    await expect(
+      page.getByText("检验结果暂未确认，请保留本次操作。", { exact: true }),
+    ).toBeVisible();
+    expect(requests).toHaveLength(1);
+    await page.reload();
+    await expect(page.getByRole("button", { name: "用原请求重试检验" })).toBeEnabled();
+    await expect.poll(() => requests.length).toBe(2);
+    await page.getByRole("button", { name: "用原请求重试检验" }).click();
+    await expect(page.getByText("已提交，等待更新。", { exact: true })).toBeVisible();
+    expect(requests).toEqual([requests[0], requests[0], requests[0]]);
+    expect(requests[0]?.parameters).toMatchObject({
+      selection: "all",
+      holding_sessions: 5,
+      group_count: 10,
+      ic_method: "rank",
+      neutralization: "none",
+    });
+    await expect(page.getByText("检验完成。", { exact: true })).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "归档", exact: true })).toHaveCount(0);
+    await expectNoHorizontalOverflow(page, `factor run recovered ${viewport.label}`);
+    expect(findJargon(await page.locator("main").innerText())).toEqual([]);
+    await page.screenshot({
+      path: testInfo.outputPath(`factor-run-recovered-${viewport.label}.png`),
+      fullPage: true,
+    });
+    expect(watcher.problems).toEqual([]);
+  });
+
+  test(`FR-FINAL-01 真实拒绝回执重载后可改参并再次确认在 ${viewport.label} 可完成`, async ({
+    page,
+  }, testInfo) => {
+    const watcher = watch(page);
+    const original = rejectionContract.request as Schemas["FactorRunRequest"];
+    const captured = rejectionContract.responses.submit;
+    expect(captured.status).toBe(200);
+    const rejected = captured.body as Schemas["Envelope_FactorRunOperationResult_"];
+    expect(rejected.data.original_request).toEqual(original);
+    expect(rejected.data.status).toBe("rejected");
+    expect(rejected.data.job_id).toBeNull();
+    expect(rejected.data.spec_sha256).toBeNull();
+    const metadata = (await (
+      await page.request.get(new URL("api/v1/meta", APP_URL).toString())
+    ).json()) as MetaEnvelope;
+    metadata.data.viewer = rejectionContract.actor;
+    metadata.serving.generation_id = original.serving_generation_id;
+    if (metadata.data.generation === null) throw new Error("合成数据代缺失");
+    metadata.data.generation.generation_id = original.serving_generation_id;
+    const factor: Schemas["FactorDefinitionItem"] = {
+      factor_id: original.parameters.factor_id,
+      name_zh: "源校验因子",
+      category: "technical",
+      category_label: "技术",
+      direction: "higher_is_better",
+      direction_label: "偏好高值",
+      version: original.parameters.expected_head.version,
+      content_sha256: original.parameters.expected_head.content_sha256,
+      earliest_available_date: null,
+      archived: false,
+      expression: "ref(close, 2)",
+      dependency_columns: ["close"],
+      max_history_window: 2,
+    };
+    await page.addInitScript(
+      ({ firstId, nextId, requestedAt }) => {
+        Object.defineProperty(crypto, "randomUUID", {
+          configurable: true,
+          value: () => {
+            const count = Number(sessionStorage.getItem("fr-final-01-uuid") ?? "0");
+            sessionStorage.setItem("fr-final-01-uuid", String(count + 1));
+            return count === 0 ? firstId : nextId;
+          },
+        });
+        Date.prototype.toISOString = () => requestedAt;
+      },
+      {
+        firstId: original.command_id,
+        nextId: "66666666-6666-4666-8666-666666666666",
+        requestedAt: original.requested_at,
+      },
+    );
+    await page.route("**/api/v1/meta", (route) => route.fulfill({ json: metadata }));
+    await page.route("**/api/v1/factors/definitions*", (route) =>
+      route.fulfill({
+        json: {
+          data: {
+            availability: "populated",
+            available_at: metadata.serving.built_at,
+            definitions: [factor],
+            can_save: false,
+            can_archive: true,
+          },
+          serving: metadata.serving,
+        },
+      }),
+    );
+    await page.route("**/api/v1/factors/run-availability", (route) =>
+      route.fulfill({ json: { data: rejectionContract.availability, serving: metadata.serving } }),
+    );
+    await page.route(/\/api\/v1\/factors\/results(?:\?.*)?$/, (route) =>
+      route.fulfill({
+        json: {
+          data: { availability: "empty", available_at: metadata.serving.built_at, results: [] },
+          serving: metadata.serving,
+        },
+      }),
+    );
+    const requests: Schemas["FactorRunRequest"][] = [];
+    let resumed = 0;
+    await page.route("**/api/v1/factors/runs/resume", (route) => {
+      resumed += 1;
+      return route.fulfill({ status: 500 });
+    });
+    await page.route(/\/api\/v1\/factors\/runs$/, async (route) => {
+      const request = route.request().postDataJSON() as Schemas["FactorRunRequest"];
+      expect(route.request().headers()["x-rquant-csrf"]).toBe("1");
+      expect(
+        await page.evaluate(
+          () =>
+            JSON.parse(localStorage.getItem("rquant.factor.run-operation.v1") ?? "null").request,
+        ),
+      ).toEqual(request);
+      requests.push(request);
+      if (requests.length === 1) {
+        expect(request).toEqual(original);
+        // Replay the trusted factory→UDS→Web rejection body unchanged.
+        await route.fulfill({ status: captured.status, json: captured.body });
+      } else {
+        const pending: Schemas["FactorRunOperationResult"] = {
+          original_request: request,
+          status: "pending",
+          reason: null,
+          job_id: null,
+          spec_sha256: null,
+        };
+        await route.fulfill({ json: { data: pending, serving: metadata.serving } });
+      }
+    });
+    await page.setViewportSize({ width: viewport.width, height: viewport.height });
+    await page.goto("./#/factors");
+    const params = page.getByRole("region", { name: "检验参数" });
+    await expect(params.getByRole("button", { name: "运行检验" })).toBeEnabled();
+    await params
+      .getByRole("combobox", { name: "股票池" })
+      .selectOption(original.parameters.selection);
+    await params
+      .getByRole("combobox", { name: "调仓周期" })
+      .selectOption(String(original.parameters.holding_sessions));
+    await params
+      .getByRole("combobox", { name: "分组数" })
+      .selectOption(String(original.parameters.group_count));
+    await params
+      .getByRole("button", {
+        name: original.parameters.ic_method === "rank" ? "RankIC" : "NormalIC",
+      })
+      .click();
+    await params.getByLabel("开始日期").fill(original.parameters.start_date);
+    await params.getByLabel("结束日期").fill(original.parameters.end_date);
+    await params.getByRole("button", { name: "运行检验" }).click();
+    await page
+      .getByRole("dialog", { name: "运行因子检验" })
+      .getByRole("button", { name: "确认运行" })
+      .click();
+    await expect(page.getByRole("button", { name: "修改检验参数" })).toBeEnabled();
+    await expect(page.getByRole("region", { name: "本次检验" })).toContainText(
+      rejected.data.reason ?? "",
+    );
+    await expect(page.getByRole("button", { name: "归档", exact: true })).toHaveCount(0);
+    await page.reload();
+    await expect(page.getByRole("button", { name: "修改检验参数" })).toBeEnabled();
+    await expect(page.getByLabel("开始日期")).toHaveValue(original.parameters.start_date);
+    expect(resumed).toBe(0);
+    expect(requests).toEqual([original]);
+    await expectNoHorizontalOverflow(page, `factor rejected ${viewport.label}`);
+    await page.screenshot({
+      path: testInfo.outputPath(`factor-run-rejected-${viewport.label}.png`),
+      fullPage: true,
+    });
+    await page.getByRole("button", { name: "修改检验参数" }).click();
+    await expect(page.getByRole("button", { name: "归档", exact: true })).toBeEnabled();
+    expect(
+      await page.evaluate(() => localStorage.getItem("rquant.factor.run-operation.v1")),
+    ).toBeNull();
+    await params.getByLabel("开始日期").fill(original.parameters.end_date);
+    await params.getByRole("button", { name: "运行检验" }).click();
+    const nextConfirmation = page.getByRole("dialog", { name: "运行因子检验" });
+    await expect(nextConfirmation).toContainText(
+      `第 ${original.parameters.expected_head.version} 版`,
+    );
+    await expect(nextConfirmation).toContainText(
+      `${original.parameters.end_date} 至 ${original.parameters.end_date}`,
+    );
+    await expectNoHorizontalOverflow(page, `factor rejection correction ${viewport.label}`);
+    await page.screenshot({
+      path: testInfo.outputPath(`factor-run-rejection-correction-${viewport.label}.png`),
+      fullPage: true,
+    });
+    expect(requests).toHaveLength(1);
+    await nextConfirmation.getByRole("button", { name: "确认运行" }).click();
+    await expect(page.getByText("等待检验。", { exact: true })).toBeVisible();
+    expect(requests).toEqual([
+      original,
+      {
+        ...original,
+        command_id: "66666666-6666-4666-8666-666666666666",
+        parameters: { ...original.parameters, start_date: original.parameters.end_date },
+      },
+    ]);
+    await expect(page.getByRole("button", { name: "归档", exact: true })).toHaveCount(0);
+    await expect(page.getByText("检验完成。", { exact: true })).toHaveCount(0);
+    expect(findJargon(await page.locator("main").innerText())).toEqual([]);
+    expect(watcher.problems).toEqual([]);
+  });
+}
 
 const definitions = [
   {
@@ -34,6 +351,26 @@ const definitions = [
   },
 ];
 
+test.beforeEach(async ({ page }) => {
+  const metadata = (await (
+    await page.request.get(new URL("api/v1/meta", APP_URL).toString())
+  ).json()) as MetaEnvelope;
+  await page.route("**/api/v1/factors/run-availability", (route) =>
+    route.fulfill({
+      json: {
+        data: {
+          enabled: false,
+          reason: "尚未准备历史行情",
+          pools: [],
+          start_date: null,
+          end_date: null,
+        },
+        serving: metadata.serving,
+      },
+    }),
+  );
+});
+
 test("因子库桌面和手机列表详情可读、键盘选择且无横向溢出", async ({ page }) => {
   const watcher = watch(page);
   const meta = await page.request.get(new URL("api/v1/meta", APP_URL).toString());
@@ -59,6 +396,7 @@ test("因子库桌面和手机列表详情可读、键盘选择且无横向溢�
   await expect(page.getByText("ts_mean(volume, 3)")).toBeVisible();
   expect(findJargon(await page.locator("main").innerText())).toEqual([]);
   await expect(page.getByRole("button", { name: /运行检验|加入跟踪/ })).toHaveCount(0);
+  await expect(page.getByRole("region", { name: "检验参数" })).toContainText("尚未准备历史行情");
   await expectNoHorizontalOverflow(page, "factor desktop");
 
   await page.setViewportSize({ width: 390, height: 844 });

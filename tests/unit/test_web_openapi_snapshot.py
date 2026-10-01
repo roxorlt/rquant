@@ -48,6 +48,9 @@ def test_every_api_path_is_versioned_and_only_defined_mutations_use_post() -> No
                 "/api/v1/factors/definitions/save",
                 "/api/v1/factors/definitions/save/resume",
                 "/api/v1/factors/definitions/save/retry",
+                "/api/v1/factors/runs",
+                "/api/v1/factors/runs/resume",
+                "/api/v1/factors/runs/retry",
             }
             else {"get"}
         )

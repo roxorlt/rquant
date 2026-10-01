@@ -31,6 +31,8 @@ class FactorResultItem(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     job_id: str
+    spec_sha256: str | None = None
+    definition_content_sha256: str | None = None
     factor_id: str
     factor_version: int
     factor_name_zh: str | None

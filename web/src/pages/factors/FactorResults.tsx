@@ -30,8 +30,14 @@ import {
   icSeries,
   turnoverOption,
 } from "./factorCharts";
+import { matchesRunResult, type StoredRun } from "./factorRunState";
 
-type SelectedRun = { generationId: string; factorId: string; factorVersion: number; jobId: string };
+type SelectedRun = {
+  factorId: string;
+  factorVersion: number;
+  jobId: string;
+  preferredCommandId: string | null;
+};
 
 function missing(value: number | null, reason: string, digits = 4) {
   return value === null ? (
@@ -108,6 +114,12 @@ function ResultState({
 
 const runColumns: DataColumn<FactorResultItem>[] = [
   {
+    id: "version",
+    header: "版本",
+    value: (item) => item.factor_version,
+    cell: (item) => `第 ${item.factor_version} 版`,
+  },
+  {
     id: "time",
     header: "检验时间",
     value: (item) => item.updated_at,
@@ -121,9 +133,17 @@ const runColumns: DataColumn<FactorResultItem>[] = [
   },
 ];
 
-function Research({ research }: { research: FactorResearchDisplay }) {
-  const [method, setMethod] = useState<IcMethod>("normal_ic");
-  const [requestedGroupCount, setRequestedGroupCount] = useState<number | null>(null);
+function Research({
+  research,
+  initialMethod = "normal_ic",
+  initialGroupCount = null,
+}: {
+  research: FactorResearchDisplay;
+  initialMethod?: IcMethod;
+  initialGroupCount?: number | null;
+}) {
+  const [method, setMethod] = useState<IcMethod>(initialMethod);
+  const [requestedGroupCount, setRequestedGroupCount] = useState<number | null>(initialGroupCount);
   const counts = groupCounts(research);
   const count =
     requestedGroupCount !== null && counts.includes(requestedGroupCount)
@@ -392,32 +412,37 @@ export function FactorResults({
   factor,
   generationId,
   onRefresh,
+  preferred,
 }: {
   factor: FactorDefinitionItem;
   generationId: string;
   onRefresh: () => void;
+  preferred?: StoredRun | null;
 }) {
   const results = useFactorResults(generationId);
   const [selection, setSelection] = useState<SelectedRun | null>(null);
   const sameGeneration = results.serving?.generation_id === generationId;
   const runs = sameGeneration
     ? (results.data?.results ?? [])
-        .filter(
-          (item) =>
-            item.factor_id === factor.factor_id &&
-            item.factor_version === factor.version &&
-            item.definition_status === "current",
-        )
+        .filter((item) => item.factor_id === factor.factor_id)
         .sort((a, b) => b.updated_at.localeCompare(a.updated_at))
     : [];
   const currentSelection =
-    selection?.generationId === generationId &&
-    selection.factorId === factor.factor_id &&
-    selection.factorVersion === factor.version
-      ? (runs.find((item) => item.job_id === selection.jobId) ?? null)
+    selection?.factorId === factor.factor_id &&
+    selection.preferredCommandId === (preferred?.request.command_id ?? null)
+      ? (runs.find(
+          (item) =>
+            item.job_id === selection.jobId && item.factor_version === selection.factorVersion,
+        ) ?? null)
       : null;
+  const original =
+    preferred == null ? null : (runs.find((item) => matchesRunResult(item, preferred)) ?? null);
   const picked =
-    currentSelection ?? runs.find((item) => item.status === "succeeded") ?? runs[0] ?? null;
+    currentSelection ??
+    original ??
+    runs.find((item) => item.status === "succeeded") ??
+    runs[0] ??
+    null;
   const detail = useFactorResultDetail(
     generationId,
     picked?.status === "succeeded" && picked.display_status === "available" ? picked.job_id : null,
@@ -428,8 +453,10 @@ export function FactorResults({
     detail.data?.availability === "ready" &&
     detail.data.result?.job_id === picked.job_id &&
     detail.data.result.factor_id === factor.factor_id &&
-    detail.data.result.factor_version === factor.version &&
-    detail.data.result.definition_status === "current" &&
+    detail.data.result.factor_version === picked.factor_version &&
+    detail.data.result.definition_status === picked.definition_status &&
+    detail.data.result.spec_sha256 === picked.spec_sha256 &&
+    detail.data.result.definition_content_sha256 === picked.definition_content_sha256 &&
     detail.data.result.status === "succeeded" &&
     detail.data.result.display_status === "available" &&
     detail.data.result.updated_at === picked.updated_at &&
@@ -458,13 +485,7 @@ export function FactorResults({
   } else if (results.data.availability === "unavailable") {
     body = <ResultState title="检验结果暂不可用" hint="请稍后刷新。" onRefresh={results.refetch} />;
   } else if (runs.length === 0) {
-    const historical = results.data.results.some((item) => item.factor_id === factor.factor_id);
-    body = (
-      <ResultState
-        title={historical ? "当前版本还没有检验记录" : "还没有检验记录"}
-        hint="检验任务完成后会显示在这里。"
-      />
-    );
+    body = <ResultState title="还没有检验记录" hint="检验任务完成后会显示在这里。" />;
   } else if (picked?.status === "queued" || picked?.status === "running") {
     body = (
       <ResultState title="检验进行中" hint="完成后刷新查看结果。" onRefresh={results.refetch} />
@@ -511,7 +532,16 @@ export function FactorResults({
   } else if (research === null || research === undefined) {
     body = <ResultState title="检验详情暂不可用" hint="请稍后刷新。" onRefresh={results.refetch} />;
   } else {
-    body = <Research key={`${generationId}:${picked.job_id}`} research={research} />;
+    const originalParams =
+      original?.job_id === picked.job_id ? preferred?.request.parameters : null;
+    body = (
+      <Research
+        key={`${picked.job_id}:${preferred?.request.command_id ?? ""}`}
+        research={research}
+        initialMethod={originalParams?.ic_method === "rank" ? "rank_ic" : "normal_ic"}
+        initialGroupCount={originalParams?.group_count ?? null}
+      />
+    );
   }
 
   return (
@@ -539,16 +569,22 @@ export function FactorResults({
             selectedKey={picked?.job_id}
             onSelect={(item) =>
               setSelection({
-                generationId,
                 factorId: factor.factor_id,
-                factorVersion: factor.version,
+                factorVersion: item.factor_version,
                 jobId: item.job_id,
+                preferredCommandId: preferred?.request.command_id ?? null,
               })
             }
             label="最近检验"
             height={200}
           />
         </div>
+      ) : null}
+      {picked ? (
+        <p className="hint">
+          {picked.factor_name_zh} · 第 {picked.factor_version} 版检验
+          {picked.factor_version !== factor.version ? " · 历史版本" : ""}
+        </p>
       ) : null}
       {body}
     </Panel>

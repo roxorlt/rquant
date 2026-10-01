@@ -5,7 +5,6 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Annotated
 
-import duckdb
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, Response
 
 from rquant.factor.result_serving import (
@@ -124,7 +123,7 @@ def _read_results(borrowed: BorrowedGeneration | None) -> FactorResultServingSna
         if verified is None:
             raise ValueError("factor result group is absent")
         return verified
-    except (ValueError, TypeError, KeyError, duckdb.Error) as exc:
+    except Exception as exc:
         raise HTTPException(status_code=503, detail=_UNREADABLE) from exc
 
 
@@ -139,6 +138,8 @@ def _item(
     )
     return FactorResultItem(
         job_id=row.job_id,
+        spec_sha256=row.spec_sha256,
+        definition_content_sha256=row.definition_content_sha256,
         factor_id=row.factor_id,
         factor_version=row.factor_version,
         factor_name_zh=definition.name_zh if current else None,
@@ -161,7 +162,18 @@ def _data(
         return None, []
     catalog = _read_catalog(borrowed)
     definitions = {definition.factor_id: definition for definition in catalog.definitions}
-    return snapshot, [_item(row, definitions) for row in snapshot.index]
+    items = [_item(row, definitions) for row in snapshot.index]
+    displays = iter(snapshot.displays)
+    for i, row in enumerate(snapshot.index):
+        if row.display_status == "available":
+            artifact = next(displays)
+            if (
+                artifact.definition.factor_id != row.factor_id
+                or artifact.definition.version != row.factor_version
+            ):
+                raise HTTPException(status_code=503, detail="原版本结果暂不可核验。")
+            items[i] = items[i].model_copy(update={"factor_name_zh": artifact.definition.name_zh})
+    return snapshot, items
 
 
 @router.get("", response_model=Envelope[FactorResultListData], summary="因子检验结果")

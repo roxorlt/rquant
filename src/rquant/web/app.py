@@ -57,6 +57,7 @@ from rquant.web.routes import (
     data_audit_report_commands,
     experiments,
     factor_results,
+    factor_runs,
     factor_saves,
     factors,
     formula_market_commands,
@@ -89,6 +90,7 @@ from rquant.web.settings import WebSettings
 if TYPE_CHECKING:
     from rquant.alert_ack_admission import AckAdmissionClient
     from rquant.factor_definition_admission import FactorDefinitionAdmissionClient
+    from rquant.factor_run_admission import FactorRunAdmissionClient
     from rquant.watchlist_admission import WatchlistAdmissionClient
 
 API_TITLE = "rQuant Web API"
@@ -111,6 +113,7 @@ _FACTOR_ARCHIVE_WRITE = re.compile(
     r"^/api/v1/factors/definitions/[a-z][a-z0-9_]{0,63}/archive(?:/resume)?$"
 )
 _FACTOR_SAVE_WRITE = re.compile(r"^/api/v1/factors/definitions/save(?:/(?:resume|retry))?$")
+_FACTOR_RUN_WRITE = re.compile(r"^/api/v1/factors/runs(?:/(?:resume|retry))?$")
 
 
 def _utc_now() -> datetime:
@@ -134,6 +137,7 @@ class WebContext:
     ack_admission: AckAdmissionClient | None
     watchlist_admission: WatchlistAdmissionClient | None
     factor_admission: FactorDefinitionAdmissionClient | None
+    factor_run_admission: FactorRunAdmissionClient | None
     unit_log_client: UnitLogClient | None
     unit_log_access_audit: ServiceLogAccessAudit | None
     unit_log_gate: threading.BoundedSemaphore
@@ -155,6 +159,7 @@ def create_app(
     ack_admission_client: AckAdmissionClient | None = None,
     watchlist_admission_client: WatchlistAdmissionClient | None = None,
     factor_admission_client: FactorDefinitionAdmissionClient | None = None,
+    factor_run_admission_client: FactorRunAdmissionClient | None = None,
     unit_log_client: UnitLogClient | None = None,
     unit_log_access_audit: ServiceLogAccessAudit | None = None,
     backfill_plan_command_transport: BackfillPlanCommandTransport | None = None,
@@ -238,6 +243,15 @@ def create_app(
                 shared_gid=settings.factor_admission_shared_gid,
             )
         )
+    configured_factor_run = None
+    if settings.factor_run_admission_socket_path is not None:
+        from rquant.factor_run_admission import FactorRunAdmissionClient
+
+        configured_factor_run = factor_run_admission_client or FactorRunAdmissionClient(
+            settings.factor_run_admission_socket_path,
+            expected_service_uid=settings.factor_run_admission_service_uid,
+            shared_gid=settings.factor_run_admission_shared_gid,
+        )
     configured_unit_log = None
     if settings.unit_log_socket_path is not None:
         assert settings.unit_log_service_uid is not None
@@ -289,6 +303,7 @@ def create_app(
         ack_admission=configured_ack_admission,
         watchlist_admission=configured_watchlist_admission,
         factor_admission=configured_factor_admission,
+        factor_run_admission=configured_factor_run,
         unit_log_client=configured_unit_log,
         unit_log_access_audit=unit_log_access_audit,
         unit_log_gate=threading.BoundedSemaphore(1),
@@ -318,6 +333,8 @@ def create_app(
             body_limit = factors.MAX_ARCHIVE_REQUEST_BYTES
         if body_limit is None and _FACTOR_SAVE_WRITE.fullmatch(request.url.path):
             body_limit = factor_saves.MAX_SAVE_REQUEST_BYTES
+        if body_limit is None and _FACTOR_RUN_WRITE.fullmatch(request.url.path):
+            body_limit = factor_runs.MAX_RUN_REQUEST_BYTES
         if request.method == "POST" and body_limit is not None:
             content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
             if content_type != "application/json":
@@ -413,6 +430,7 @@ def create_app(
         strategies.router, prefix="/api/v1", tags=["strategies"], dependencies=private
     )
     app.include_router(factors.router, prefix="/api/v1", tags=["factors"], dependencies=private)
+    app.include_router(factor_runs.router, prefix="/api/v1", tags=["factors"], dependencies=private)
     app.include_router(
         factor_saves.router, prefix="/api/v1", tags=["factors"], dependencies=private
     )

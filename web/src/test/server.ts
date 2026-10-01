@@ -73,6 +73,20 @@ export const factorResultsUnavailableHandler = () =>
     }),
   );
 
+export const factorRunUnavailableHandler = () =>
+  http.get("*/api/v1/factors/run-availability", () =>
+    HttpResponse.json({
+      data: {
+        enabled: false,
+        reason: "尚未准备历史行情",
+        start_date: null,
+        end_date: null,
+        pools: [],
+      },
+      serving: metaEnvelope().serving,
+    }),
+  );
+
 export const manualWatchlistUnavailableHandler = () =>
   http.get("*/api/v1/watchlist", () =>
     HttpResponse.json({
@@ -119,6 +133,7 @@ export const server = setupServer(
   formulaMarketJobsHandler(),
   formulaPoolsHandler(),
   factorResultsUnavailableHandler(),
+  factorRunUnavailableHandler(),
   manualWatchlistUnavailableHandler(),
   manualWatchlistExactUnavailableHandler(),
 );

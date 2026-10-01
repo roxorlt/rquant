@@ -24,6 +24,7 @@ export interface ConfirmDialogProps {
   expiresAt?: Date;
   confirmLabel?: string;
   busy?: boolean;
+  disabled?: boolean;
   onConfirm: () => void;
   onCancel: () => void;
   /** Injectable clock for tests. */
@@ -39,6 +40,7 @@ export function ConfirmDialog({
   expiresAt,
   confirmLabel = "确认执行",
   busy = false,
+  disabled = false,
   onConfirm,
   onCancel,
   now = () => new Date(),
@@ -75,7 +77,11 @@ export function ConfirmDialog({
       onOk={onConfirm}
       okText={confirmLabel}
       cancelText="取消"
-      okButtonProps={{ danger: level === "high", disabled: expired || !nameMatches, loading: busy }}
+      okButtonProps={{
+        danger: level === "high",
+        disabled: disabled || expired || !nameMatches || busy,
+        loading: busy,
+      }}
       destroyOnHidden
     >
       <div className="confirm-body">

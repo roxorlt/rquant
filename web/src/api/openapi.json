@@ -4275,6 +4275,38 @@
         "title": "Envelope[FactorResultListData]",
         "type": "object"
       },
+      "Envelope_FactorRunAvailability_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/FactorRunAvailability"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[FactorRunAvailability]",
+        "type": "object"
+      },
+      "Envelope_FactorRunOperationResult_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/FactorRunOperationResult"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[FactorRunOperationResult]",
+        "type": "object"
+      },
       "Envelope_FactorSaveCommandData_": {
         "properties": {
           "data": {
@@ -5874,6 +5906,17 @@
             "title": "As Of Time",
             "type": "string"
           },
+          "definition_content_sha256": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Definition Content Sha256"
+          },
           "definition_status": {
             "enum": [
               "current",
@@ -5929,6 +5972,17 @@
           "job_id": {
             "title": "Job Id",
             "type": "string"
+          },
+          "spec_sha256": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Spec Sha256"
           },
           "status": {
             "enum": [
@@ -6005,6 +6059,277 @@
           "results"
         ],
         "title": "FactorResultListData",
+        "type": "object"
+      },
+      "FactorRunAvailability": {
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "end_date": {
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "End Date"
+          },
+          "pools": {
+            "items": {
+              "$ref": "#/components/schemas/FactorRunPoolOption"
+            },
+            "title": "Pools",
+            "type": "array"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "maxLength": 80,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "start_date": {
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Start Date"
+          }
+        },
+        "required": [
+          "enabled",
+          "pools"
+        ],
+        "title": "FactorRunAvailability",
+        "type": "object"
+      },
+      "FactorRunOperationResult": {
+        "additionalProperties": false,
+        "properties": {
+          "job_id": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{32}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Job Id"
+          },
+          "original_request": {
+            "$ref": "#/components/schemas/FactorRunRequest"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "maxLength": 80,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "spec_sha256": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Spec Sha256"
+          },
+          "status": {
+            "enum": [
+              "pending",
+              "processing",
+              "submitted",
+              "uncertain",
+              "rejected"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "original_request",
+          "status"
+        ],
+        "title": "FactorRunOperationResult",
+        "type": "object"
+      },
+      "FactorRunParameters": {
+        "additionalProperties": false,
+        "properties": {
+          "end_date": {
+            "format": "date",
+            "title": "End Date",
+            "type": "string"
+          },
+          "expected_head": {
+            "$ref": "#/components/schemas/FactorHeadRef"
+          },
+          "factor_id": {
+            "pattern": "^[a-z][a-z0-9_]{0,63}$",
+            "title": "Factor Id",
+            "type": "string"
+          },
+          "group_count": {
+            "default": 5,
+            "enum": [
+              3,
+              5,
+              10
+            ],
+            "title": "Group Count",
+            "type": "integer"
+          },
+          "holding_sessions": {
+            "enum": [
+              1,
+              5,
+              10,
+              20
+            ],
+            "title": "Holding Sessions",
+            "type": "integer"
+          },
+          "ic_method": {
+            "default": "rank",
+            "enum": [
+              "rank",
+              "normal"
+            ],
+            "title": "Ic Method",
+            "type": "string"
+          },
+          "neutralization": {
+            "const": "none",
+            "default": "none",
+            "title": "Neutralization",
+            "type": "string"
+          },
+          "selection": {
+            "enum": [
+              "all",
+              "hs300",
+              "zz1000",
+              "gem"
+            ],
+            "title": "Selection",
+            "type": "string"
+          },
+          "start_date": {
+            "format": "date",
+            "title": "Start Date",
+            "type": "string"
+          }
+        },
+        "required": [
+          "factor_id",
+          "expected_head",
+          "selection",
+          "start_date",
+          "end_date",
+          "holding_sessions"
+        ],
+        "title": "FactorRunParameters",
+        "type": "object"
+      },
+      "FactorRunPoolOption": {
+        "additionalProperties": false,
+        "properties": {
+          "available": {
+            "title": "Available",
+            "type": "boolean"
+          },
+          "label": {
+            "maxLength": 40,
+            "minLength": 1,
+            "title": "Label",
+            "type": "string"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "maxLength": 80,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "selection": {
+            "enum": [
+              "all",
+              "hs300",
+              "zz1000",
+              "gem"
+            ],
+            "title": "Selection",
+            "type": "string"
+          }
+        },
+        "required": [
+          "selection",
+          "label",
+          "available"
+        ],
+        "title": "FactorRunPoolOption",
+        "type": "object"
+      },
+      "FactorRunRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "command_id": {
+            "title": "Command Id",
+            "type": "string"
+          },
+          "parameters": {
+            "$ref": "#/components/schemas/FactorRunParameters"
+          },
+          "requested_at": {
+            "format": "date-time",
+            "title": "Requested At",
+            "type": "string"
+          },
+          "serving_generation_id": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Serving Generation Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "command_id",
+          "requested_at",
+          "serving_generation_id",
+          "parameters"
+        ],
+        "title": "FactorRunRequest",
         "type": "object"
       },
       "FactorSaveCommandData": {
@@ -15812,6 +16137,150 @@
           }
         },
         "summary": "因子检验详情",
+        "tags": [
+          "factors"
+        ]
+      }
+    },
+    "/api/v1/factors/run-availability": {
+      "get": {
+        "operationId": "run_availability_api_v1_factors_run_availability_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_FactorRunAvailability_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "因子检验参数",
+        "tags": [
+          "factors"
+        ]
+      }
+    },
+    "/api/v1/factors/runs": {
+      "post": {
+        "operationId": "submit_factor_run_api_v1_factors_runs_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FactorRunRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_FactorRunOperationResult_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "运行因子检验",
+        "tags": [
+          "factors"
+        ]
+      }
+    },
+    "/api/v1/factors/runs/resume": {
+      "post": {
+        "operationId": "resume_factor_run_api_v1_factors_runs_resume_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FactorRunRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_FactorRunOperationResult_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "核对原因子检验",
+        "tags": [
+          "factors"
+        ]
+      }
+    },
+    "/api/v1/factors/runs/retry": {
+      "post": {
+        "operationId": "retry_factor_run_api_v1_factors_runs_retry_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FactorRunRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_FactorRunOperationResult_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "重试原因子检验",
         "tags": [
           "factors"
         ]
