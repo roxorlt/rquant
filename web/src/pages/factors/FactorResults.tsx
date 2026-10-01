@@ -138,7 +138,9 @@ function Research({ research }: { research: FactorResearchDisplay }) {
   const expected = coverage.reduce((sum, day) => sum + day.coverage.expected_count, 0);
   const partial =
     coverage.some(
-      (day) => day.status !== "evaluated" || day.coverage.valid_count < day.coverage.expected_count,
+      (day) =>
+        day.status !== ("schema_version" in research ? "complete" : "evaluated") ||
+        day.coverage.valid_count < day.coverage.expected_count,
     ) || research.portfolio_status === "available_partial";
   const dates = coverage.map((day) => day.decision_date).sort();
   const period = dates.length === 0 ? EMPTY : `${dates[0]} 至 ${dates[dates.length - 1]}`;

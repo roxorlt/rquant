@@ -18,6 +18,8 @@ from rquant.factor.job_ledger import (
     FactorJobRecord,
 )
 from rquant.factor.job_runner import FactorEvaluationCompletion, run_factor_evaluation_job
+from rquant.factor.stream_job_runner import FactorStreamCompletion, run_factor_stream_job
+from rquant.factor.stream_job_spec import FactorStreamJobSpec
 from rquant.factor_snapshot_admission import (
     FactorSnapshotAdmissionError,
     FactorSnapshotMetadataStore,
@@ -91,6 +93,7 @@ def run_one_factor_job(
     lake_root: Path,
     artifact_root: Path,
     runner_now: Callable[[], datetime],
+    member_root: Path | None = None,
     lease_seconds: int = 30,
     heartbeat_interval_seconds: float = 5.0,
     heartbeat_join_timeout_seconds: float = 5.0,
@@ -134,35 +137,65 @@ def run_one_factor_job(
         logger.opt(exception=exc).error("factor evaluation heartbeat could not start")
         return FactorJobWorkerResult(status="lease_lost", job_id=claimed.job.job_id)
 
-    completion: FactorEvaluationCompletion | None = None
+    completion: FactorEvaluationCompletion | FactorStreamCompletion | None = None
+    prepared: object | None = None
     runner_error: Exception | None = None
     try:
-        completion = run_factor_evaluation_job(
-            claimed.job.spec,
-            metadata_store=metadata_store,
-            lake_root=lake_root,
-            artifact_root=artifact_root,
-            now=runner_now,
-        )
+        if isinstance(claimed.job.spec, FactorStreamJobSpec):
+            if member_root is None:
+                raise ValueError("stream job worker requires its member archive root")
+            completion = run_factor_stream_job(
+                claimed.job.spec,
+                metadata_store=metadata_store,
+                lake_root=lake_root,
+                artifact_root=artifact_root,
+                member_root=member_root,
+                now=runner_now,
+            )
+            prepared = ledger.prepare_stream_completion(
+                claimed.job.job_id, claimed.lease_token, completion, artifact_root, member_root
+            )
+        else:
+            completion = run_factor_evaluation_job(
+                claimed.job.spec,
+                metadata_store=metadata_store,
+                lake_root=lake_root,
+                artifact_root=artifact_root,
+                now=runner_now,
+            )
     except Exception as exc:
         runner_error = exc
         logger.opt(exception=exc).error("factor evaluation execution failed")
+    except BaseException:
+        ledger._discard_job_prepared(claimed.job.job_id)
+        raise
     finally:
         stop.set()
-        thread.join(timeout=heartbeat_join_timeout_seconds)
+        try:
+            thread.join(timeout=heartbeat_join_timeout_seconds)
+        except BaseException:
+            ledger._discard_job_prepared(claimed.job.job_id)
+            raise
 
     if thread.is_alive() or lost.is_set():
+        if prepared is not None:
+            ledger.discard_prepared_stream(prepared)
         return FactorJobWorkerResult(status="lease_lost", job_id=claimed.job.job_id)
     with lock:
         if runner_error is None:
             try:
-                record = ledger.complete(
-                    claimed.job.job_id,
-                    latest.lease_token,
-                    latest.version,
-                    completion,
-                    artifact_root,
-                )
+                if prepared is not None:
+                    record = ledger.complete_prepared_stream(
+                        claimed.job.job_id, latest.lease_token, latest.version, prepared
+                    )
+                else:
+                    record = ledger.complete(
+                        claimed.job.job_id,
+                        latest.lease_token,
+                        latest.version,
+                        completion,
+                        artifact_root,
+                    )
             except Exception as exc:
                 logger.opt(exception=exc).error("factor evaluation completion was not committed")
                 return FactorJobWorkerResult(status="lease_lost", job_id=claimed.job.job_id)

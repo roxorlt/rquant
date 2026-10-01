@@ -23,6 +23,11 @@ from rquant.factor.job_ledger import (
     FactorJobStatus,
     FactorLedgerIdentity,
 )
+from rquant.factor.stream_job_artifact import (
+    FactorStreamDisplayArtifact,
+    _load_factor_stream_display_with_identity,
+)
+from rquant.factor.stream_job_spec import FactorStreamJobSpec
 from rquant.serving_read_models import (
     ServingProjectionInput,
     ServingProjectionPayload,
@@ -40,6 +45,17 @@ _CHUNK_BYTES = 32 * 1024
 _RAW_BUDGET = 4 * 1024 * 1024
 _OWNER_BUDGET = 7 * 1024 * 1024
 _MAX_DISPLAYS = 4
+_Display = FactorDisplayArtifactV1 | FactorStreamDisplayArtifact
+
+
+def _load_display(
+    root: Path, digest: str, version: int
+) -> tuple[_Display, tuple[int, ...], tuple[int, ...]]:
+    if version == 1:
+        return _load_factor_display_artifact_with_identity(root, digest)
+    if version == 2:
+        return _load_factor_stream_display_with_identity(root, digest)
+    raise ValueError("unknown factor display version")
 
 
 def _digest(value: object) -> str:
@@ -125,9 +141,16 @@ class FactorResultDisplayChunk(BaseModel):
     data_b64: str
 
 
-def _display_binding(row: FactorResultIndexRow, display: FactorDisplayArtifactV1) -> None:
+def _display_binding(row: FactorResultIndexRow, display: _Display) -> None:
+    display_sha = (
+        display.content_sha256
+        if display.schema_version == 1
+        else hashlib.sha256(
+            canonical_json_bytes(display.model_dump(mode="json", round_trip=True))
+        ).hexdigest()
+    )
     if (
-        row.display_artifact_sha256 != display.content_sha256
+        row.display_artifact_sha256 != display_sha
         or row.full_artifact_sha256 != display.full_artifact_sha256
         or row.result_sha256 != display.result_sha256
         or row.definition_content_sha256 != display.definition_content_sha256
@@ -149,13 +172,13 @@ class FactorResultServingSnapshot(BaseModel):
     chunks: tuple[FactorResultDisplayChunk, ...] = Field(max_length=512)
 
     @property
-    def displays(self) -> tuple[FactorDisplayArtifactV1, ...]:
+    def displays(self) -> tuple[_Display, ...]:
         grouped: dict[str, list[FactorResultDisplayChunk]] = {}
         for chunk in self.chunks:
             grouped.setdefault(chunk.job_id, []).append(chunk)
         if set(grouped) != {row.job_id for row in self.index if row.display_status == "available"}:
             raise ValueError("factor result display group disagrees with the index")
-        displays: list[FactorDisplayArtifactV1] = []
+        displays: list[_Display] = []
         total = 0
         for row in self.index:
             if row.display_status != "available":
@@ -189,8 +212,15 @@ class FactorResultServingSnapshot(BaseModel):
                 or hashlib.sha256(data).hexdigest() != parts[0].file_sha256
             ):
                 raise ValueError("factor result display file bytes differ")
-            strict_canonical_json_loads(data)
-            display = FactorDisplayArtifactV1.model_validate_json(data, strict=False)
+            payload = strict_canonical_json_loads(data)
+            if not isinstance(payload, dict) or type(payload.get("schema_version")) is not int:
+                raise ValueError("factor display requires an explicit version")
+            model = {1: FactorDisplayArtifactV1, 2: FactorStreamDisplayArtifact}.get(
+                payload["schema_version"]
+            )
+            if model is None:
+                raise ValueError("unknown factor display version")
+            display = model.model_validate_json(data, strict=False)
             if data != canonical_json_bytes(display.model_dump(mode="json", round_trip=True)):
                 raise ValueError("factor result display file is not canonical")
             _display_binding(row, display)
@@ -232,7 +262,7 @@ class FactorResultServingSnapshot(BaseModel):
         return self
 
 
-def _chunks(job_id: str, display: FactorDisplayArtifactV1) -> tuple[FactorResultDisplayChunk, ...]:
+def _chunks(job_id: str, display: _Display) -> tuple[FactorResultDisplayChunk, ...]:
     data = canonical_json_bytes(display.model_dump(mode="json", round_trip=True))
     chunks = tuple(
         data[offset : offset + _CHUNK_BYTES] for offset in range(0, len(data), _CHUNK_BYTES)
@@ -252,17 +282,22 @@ def _chunks(job_id: str, display: FactorDisplayArtifactV1) -> tuple[FactorResult
 
 def _index_row(record: FactorJobRecord) -> FactorResultIndexRow:
     spec = record.spec
+    adapter = (
+        spec.adapter_request.formula
+        if isinstance(spec, FactorStreamJobSpec)
+        else spec.adapter_request
+    )
     completion = record.completion
     return FactorResultIndexRow(
         job_id=record.job_id,
         spec_sha256=record.spec_sha256,
-        factor_id=spec.adapter_request.definition.factor_id,
-        factor_version=spec.adapter_request.definition.version,
+        factor_id=adapter.definition.factor_id,
+        factor_version=adapter.definition.version,
         definition_content_sha256=spec.definition_content_sha256,
         status=record.status,
         failure_code=record.failure_code,
         updated_at=record.updated_at,
-        as_of_time=spec.adapter_request.as_of,
+        as_of_time=adapter.as_of,
         code_revision=spec.code_revision,
         source_sha256=None if completion is None else completion.source_sha256,
         result_sha256=None if completion is None else completion.result_sha256,
@@ -361,24 +396,31 @@ def project_factor_result_projections(
     ledger = FactorEvaluationJobLedger.open_existing(checked_identity)
     records = ledger.list_recent_updated(limit=50)
     index = tuple(_index_row(record) for record in records)
-    loaded: dict[str, tuple[FactorDisplayArtifactV1, tuple[int, int], tuple[int, ...]]] = {}
+    loaded: dict[str, tuple[_Display, tuple[int, ...], tuple[int, ...]]] = {}
     for record, row in zip(records, index, strict=True):
         completion = record.completion
         if completion is None or completion.display_status == "display_unavailable":
             continue
-        display, root_identity, file_identity = _load_factor_display_artifact_with_identity(
-            artifact_root, completion.display_artifact_sha256
+        v2 = isinstance(record.spec, FactorStreamJobSpec)
+        source = record.spec.adapter_request.source if v2 else record.spec.admission_request
+        adapter = record.spec.adapter_request.formula if v2 else record.spec.adapter_request
+        display, root_identity, file_identity = _load_display(
+            artifact_root, completion.display_artifact_sha256, record.spec.schema_version
+        )
+        filename = (
+            f"factor-stream-display-v2-{completion.display_artifact_sha256}.json"
+            if v2
+            else f"factor-display-v1-{display.content_sha256}.json"
         )
         if (
-            completion.display_artifact_filename
-            != f"factor-display-v1-{display.content_sha256}.json"
+            completion.display_artifact_filename != filename
             or completion.display_artifact_byte_count
             != len(canonical_json_bytes(display.model_dump(mode="json", round_trip=True)))
             or completion.spec_sha256 != record.spec_sha256
             or completion.code_revision != record.spec.code_revision
-            or completion.snapshot_id != record.spec.admission_request.snapshot_id
-            or completion.binding_hash != record.spec.admission_request.binding_hash
-            or completion.source_mode != record.spec.admission_request.source_mode
+            or completion.snapshot_id != source.snapshot_id
+            or completion.binding_hash != source.binding_hash
+            or completion.source_mode != ("historical_retrospective" if v2 else source.source_mode)
             or completion.visibility_basis != display.visibility_basis
             or completion.snapshot_as_of_time != display.snapshot_as_of_time
             or display.snapshot_id != completion.snapshot_id
@@ -390,7 +432,7 @@ def project_factor_result_projections(
             raise ValueError("factor display differs from its sealed completion")
         _display_binding(row, display)
         if (
-            display.definition != record.spec.adapter_request.definition
+            display.definition != adapter.definition
             or display.holding_sessions != record.spec.adapter_request.holding_sessions
             or completion.completed_at > observed
             or record.updated_at > observed
@@ -404,8 +446,8 @@ def project_factor_result_projections(
         if record.job_id not in loaded:
             continue
         completion = record.completion
-        repeated = _load_factor_display_artifact_with_identity(
-            artifact_root, completion.display_artifact_sha256
+        repeated = _load_display(
+            artifact_root, completion.display_artifact_sha256, record.spec.schema_version
         )
         if repeated != loaded[record.job_id]:
             raise ValueError("factor display file changed during projection")

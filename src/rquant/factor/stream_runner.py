@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, model_validator
@@ -158,6 +158,7 @@ def run_factor_stream_research_with_decay(
     metadata_store: SnapshotMetadataStore,
     lake_root: Path,
     universe_requests: Iterable[FactorUniverseRequest],
+    batch_observer: Callable[[FactorDailyStreamBatch], None] | None = None,
 ) -> FactorStreamResearchWithDecayResult:
     try:
         request = FactorStreamAdapterRequest.model_validate(request)
@@ -179,6 +180,7 @@ def run_factor_stream_research_with_decay(
             lake_root=lake_root,
             universe_requests=universe_requests,
             decay=decay,
+            batch_observer=batch_observer,
         )
         fields = {"research": research, "decay": decay.finish(research.statistics)}
         return FactorStreamResearchWithDecayResult(**fields, sha256=canonical_sha256(fields))
@@ -193,6 +195,7 @@ def _run_factor_stream_research(
     lake_root: Path,
     universe_requests: Iterable[FactorUniverseRequest],
     decay: FactorICDecayStream | None,
+    batch_observer: Callable[[FactorDailyStreamBatch], None] | None = None,
 ) -> FactorStreamResearchResult:
     adapter = None
     formula = None
@@ -216,6 +219,8 @@ def _run_factor_stream_research(
                         yield batch
                         if decay is not None:
                             decay.consume(batch)
+                        if batch_observer is not None:
+                            batch_observer(batch)
                         del batch
 
             statistics_batches = batches()
