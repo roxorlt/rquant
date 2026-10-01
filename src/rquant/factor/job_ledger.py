@@ -940,14 +940,14 @@ class FactorEvaluationJobLedger:
         member_root: Path,
     ) -> object:
         """Long verification outside the writer, while the worker keeps renewing."""
-        self._discard_job_prepared(job_id, lease_token=lease_token)
-        self._prune_prepared_streams()
         with self._reader() as connection:
             state = self._load_job(connection, job_id)
             if state is None or not isinstance(state.spec, FactorStreamJobSpec):
                 raise FactorLedgerCompletionError("stream preparation requires a v2 job")
             self._live_lease(state, lease_token, state.version, self._now())
             spec = state.spec
+        self._discard_job_prepared(job_id, lease_token=lease_token)
+        self._prune_prepared_streams()
         try:
             checked = FactorStreamCompletion.model_validate(completion.model_dump(mode="python"))
             verified = verify_factor_stream_artifacts(spec, checked, artifact_root, member_root)

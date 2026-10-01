@@ -478,3 +478,36 @@ def test_cancellation_before_prepare_handle_assignment_cleans_own_token(
             t.name == "factor-job-heartbeat" and t.is_alive() for t in threading.enumerate()
         )
         assert not list((lake / ".execution_sessions").iterdir())
+
+
+def test_invalid_prepare_token_refuses_before_private_evidence_cleanup(tmp_path: Path) -> None:
+    with _sealed(tmp_path) as (ledger, _, claim, completion, root, members, _, lake):
+        handle = ledger.prepare_stream_completion(
+            claim.job.job_id, claim.lease_token, completion, root, members
+        )
+        assert len(ledger._prepared) == 1
+        try:
+            with pytest.raises(FactorLedgerLeaseError):
+                ledger.prepare_stream_completion(claim.job.job_id, None, completion, root, members)
+            after_invalid = len(ledger._prepared)
+            renewed = ledger.heartbeat(claim.job.job_id, claim.lease_token, claim.version, 30)
+            print(
+                f"SJ_FINAL_02_NULL: rejected=true prepared_after_invalid={after_invalid} "
+                f"valid_heartbeat_version={renewed.version}"
+            )
+            finished = ledger.complete_prepared_stream(
+                claim.job.job_id, claim.lease_token, renewed.version, handle
+            )
+            assert after_invalid == 1 and finished.status == "succeeded"
+            assert not ledger._prepared
+            threads = sum(
+                t.name == "factor-job-heartbeat" and t.is_alive() for t in threading.enumerate()
+            )
+            copies = len(list((lake / ".execution_sessions").iterdir()))
+            assert threads == copies == 0
+            print(
+                f"SJ_FINAL_02_NULL_COMPLETE: status={finished.status} prepared=0 "
+                f"heartbeat_threads={threads} execution_copies={copies}"
+            )
+        finally:
+            ledger._discard_job_prepared(claim.job.job_id)
