@@ -25,6 +25,7 @@ from rquant.factor.formula_stream import (
     FactorFormulaStreamBatch,
     FactorFormulaStreamDay,
     FactorFormulaStreamRequest,
+    factor_formula_stream_batch_sha256,
     factor_formula_stream_request_sha256,
 )
 from rquant.factor.historical_adapter import (
@@ -32,6 +33,11 @@ from rquant.factor.historical_adapter import (
     HistoricalReturnWindow,
     _forward_return,
     _market_time,
+)
+from rquant.factor.neutralization_context import (
+    FactorNeutralizationContext,
+    FactorNeutralizationReadLease,
+    FactorNeutralizationSources,
 )
 from rquant.factor.result import HoldingSessions
 from rquant.factor.stream_snapshot import (
@@ -70,6 +76,9 @@ class FactorStreamAdapterRequest(BaseModel):
     formula: FactorFormulaStreamRequest
     evaluation_days: tuple[date, ...] = Field(min_length=1, max_length=MAX_TRADE_DAYS)
     holding_sessions: HoldingSessions
+    context: FactorNeutralizationContext | None = Field(
+        default=None, exclude_if=lambda v: v is None
+    )
 
     @field_validator("evaluation_days")
     @classmethod
@@ -80,6 +89,16 @@ class FactorStreamAdapterRequest(BaseModel):
 
     @model_validator(mode="after")
     def _bound_request(self) -> FactorStreamAdapterRequest:
+        if (self.context is None) != (self.formula.sources.context is None):
+            raise ValueError("formula context lacks its sealed source package")
+        if self.context is not None and (
+            self.context.sources != self.formula.sources.context
+            or self.context.snapshot_id != self.source.snapshot_id
+            or self.context.binding_hash != self.source.binding_hash
+            or self.context.scope_content_hash != self.scope_content_hash
+            or self.context.scope != self.source.scope
+        ):
+            raise ValueError("context differs from admitted raw source")
         if self.formula.computation_stock_codes != self.source.scope.stock_codes:
             raise ValueError("formula calculation codes differ from complete bound scope")
         if (
@@ -113,6 +132,7 @@ class FactorStreamFeatureDayReceipt(BaseModel):
     raw_sha256: Sha256
     missing_observation_count: int = Field(ge=0, le=42_000)
     known_null_count: int = Field(ge=0, le=42_000)
+    context_input_sha256: Sha256 | None = Field(default=None, exclude_if=lambda v: v is None)
 
 
 class FactorStreamReturnDayReceipt(BaseModel):
@@ -143,6 +163,10 @@ class FactorStreamAdapterCompletion(BaseModel):
     read_query_count: int = Field(ge=1)
     daily_bar_row_count: int = Field(ge=0)
     adj_factor_row_count: int = Field(ge=0)
+    context: FactorNeutralizationSources | None = Field(
+        default=None, exclude_if=lambda v: v is None
+    )
+    context_read_query_count: int | None = Field(default=None, ge=1, exclude_if=lambda v: v is None)
     input_sha256: Sha256
     sha256: Sha256
 
@@ -150,6 +174,23 @@ class FactorStreamAdapterCompletion(BaseModel):
     def _receipt_digest(self) -> FactorStreamAdapterCompletion:
         if self.processed_days != len(self.feature_days):
             raise ValueError("adapter completion count differs from feature schedule")
+        if (self.context is None) != (self.context_read_query_count is None) or any(
+            (day.context_input_sha256 is None) != (self.context is None)
+            for day in self.feature_days
+        ):
+            raise ValueError("adapter context completion lacks a daily input")
+        if self.context is not None:
+            self.context.require_binding(
+                mode="none",
+                snapshot_id=self.admission.snapshot_id,
+                binding_hash=self.admission.binding_hash,
+                as_of=self.admission.scope.as_of_time,
+            )
+            chunks = (len(self.admission.scope.stock_codes) + 499) // 500
+            if self.context_read_query_count != self.processed_days * chunks * (
+                int(self.context.industry is not None) + int(self.context.market_cap is not None)
+            ):
+                raise ValueError("adapter context query count differs from complete schedule")
         if self.input_sha256 != canonical_sha256(
             self.model_dump(exclude={"input_sha256", "sha256"})
         ):
@@ -207,6 +248,7 @@ class FactorStreamAdapter(Iterator[FactorFormulaStreamBatch]):
         lease: FactorStreamReadLease,
         decision: FactorStreamSnapshotAdmissionDecision,
         universe_requests: Iterable[FactorUniverseRequest],
+        context_lease: FactorNeutralizationReadLease | None = None,
     ) -> None:
         self.request = FactorStreamAdapterRequest.model_validate(request)
         self.admission = FactorStreamSnapshotAdmissionDecision.model_validate(decision)
@@ -220,6 +262,12 @@ class FactorStreamAdapter(Iterator[FactorFormulaStreamBatch]):
         ):
             raise FactorStreamAdapterError("source_binding_mismatch")
         self._lease = lease
+        if (context_lease is None) != (self.request.context is None) or (
+            context_lease is not None
+            and (context_lease.closed or context_lease.context != self.request.context)
+        ):
+            raise FactorStreamAdapterError("context_binding_mismatch")
+        self._context_lease = context_lease
         self._pools: Iterable[FactorUniverseRequest] | None = universe_requests
         self._pool_iterator: Iterator[FactorUniverseRequest] | None = None
         self._completion: FactorStreamAdapterCompletion | None = None
@@ -470,15 +518,26 @@ class FactorStreamAdapter(Iterator[FactorFormulaStreamBatch]):
                     sources=sources,
                     universe=universe,
                     feature_points=tuple(points),
+                    context=None
+                    if self._context_lease is None
+                    else self._context_lease.query(
+                        trade_date=day,
+                        panel_date=panel,
+                        stock_codes=self.request.source.scope.stock_codes,
+                        assumed_visible_at=_market_time(day, 9, 25),
+                    ),
                 )
                 self._features.append(
                     FactorStreamFeatureDayReceipt(
                         trade_date=day,
                         panel_date=panel,
-                        input_sha256=canonical_sha256(batch),
+                        input_sha256=factor_formula_stream_batch_sha256(batch),
                         raw_sha256=raw_sha,
                         missing_observation_count=missing,
                         known_null_count=known_null,
+                        context_input_sha256=None
+                        if batch.context is None
+                        else batch.context.sha256,
                     )
                 )
                 del raw, universe, bars, points, bar
@@ -582,5 +641,8 @@ class FactorStreamAdapter(Iterator[FactorFormulaStreamBatch]):
             "daily_bar_row_count": self._bar_count,
             "adj_factor_row_count": self._adj_count,
         }
+        if self._context_lease is not None:
+            fields["context"] = self._context_lease.context.sources
+            fields["context_read_query_count"] = self._context_lease.read_query_count
         fields["input_sha256"] = canonical_sha256(fields)
         self._completion = FactorStreamAdapterCompletion(**fields, sha256=canonical_sha256(fields))

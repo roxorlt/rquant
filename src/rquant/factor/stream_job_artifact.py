@@ -33,8 +33,13 @@ from rquant.factor.member_stream import (
     _matching_request,
     open_factor_member_stream,
 )
+from rquant.factor.neutralization_context import (
+    FactorNeutralizationSources,
+    require_factor_neutralization_binding,
+)
 from rquant.factor.result import ResearchPortfolioStatus, ResearchSummaryStatus
 from rquant.factor.result_artifact import _file_identity, _open_private_root, _root_path
+from rquant.factor.run_request import NeutralizationMode
 from rquant.factor.stream_adapter import factor_stream_statistics_request
 from rquant.factor.stream_job_spec import FactorStreamJobSpec
 from rquant.factor.summary import FactorICSummary
@@ -172,6 +177,10 @@ class FactorStreamDisplayArtifact(BaseModel):
     holding_sessions: Literal[1, 5, 10, 20]
     as_of: AwareDatetime
     selection: UniverseSelection
+    neutralization: NeutralizationMode = Field(default="none", exclude_if=lambda v: v == "none")
+    context: FactorNeutralizationSources | None = Field(
+        default=None, exclude_if=lambda v: v is None
+    )
     pool_label: Literal["全市场（沪深非 ST）", "创业板与科创板", "沪深300", "中证1000"]
     summary_status: ResearchSummaryStatus
     ic_summary: FactorICSummary
@@ -187,6 +196,13 @@ class FactorStreamDisplayArtifact(BaseModel):
 
     @model_validator(mode="after")
     def _digest(self) -> FactorStreamDisplayArtifact:
+        require_factor_neutralization_binding(
+            self.context,
+            mode=self.neutralization,
+            snapshot_id=self.snapshot_id,
+            binding_hash=self.binding_hash,
+            as_of=self.snapshot_as_of_time,
+        )
         if self.content_sha256 != _sha(_bytes_payload(self)):
             raise ValueError("stream display digest differs")
         return self
@@ -343,6 +359,8 @@ def project_factor_stream_display(full: FactorStreamFullArtifact) -> FactorStrea
         holding_sessions=request.holding_sessions,
         as_of=request.formula.as_of,
         selection=request.formula.selection,
+        neutralization=request.formula.neutralization,
+        context=request.formula.sources.context,
         pool_label=labels[request.formula.selection],
         summary_status=status,
         ic_summary=stats.ic_summary,
@@ -566,4 +584,6 @@ def checked_from_full(
         snapshot_as_of_time=source.scope.as_of_time,
         code_revision=full.spec.code_revision,
         completed_at=completed_at,
+        neutralization=full.spec.adapter_request.formula.neutralization,
+        context=full.spec.adapter_request.formula.sources.context,
     )

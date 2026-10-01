@@ -61,3 +61,46 @@ P0/P1 阻断；P2 仅可复现违反上述不变量或本片验收时阻断。�
 CSI 完整历史成分、18:40 因子跟踪、C3.2 尚缺的其他统计、正式配置安装、完整最大资源/生产体验属于继续 goal 的后续范围。本片不改既有采集器、不请求实际供应方、不读凭据或真实数据给子代理、不改生产数据库或 `deploy/`、不 push/main/tag/部署/切流/停 Streamlit，不调用第三方模型。子代理只能在指定干净 cdx 树离线开发，不继续委派；写入前确认真实原生身份、角色、父任务、分支、基准和 dirty 来源。
 
 后台准备好可冻结合同后交 root，停止扩展新功能；最终完成聚焦验证和所需门禁后提交干净候选并停写，交唯一独立 reviewer。越界、新增高风险前提或阻断修复上限到达时冻结证据并报告，不自动架构复盘或另起审查轮次。整体 goal 始终以原型全部功能和差距表整体验收收敛，本片不宣称 M3 完成。
+
+## 后台实现证据（2026-10-02）
+
+实际产品为 Codex desktop；原生子任务地址 `/root/factor_security_collection_impl`，父任务 `/root`，承担已委派 implementer 职责，无继续委派或第三方执行。工作树为 `/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-neutralization`，分支 `cdx/20260929-factor-neutralization`，启动基准 `b5c657cf656dcd936c87a0350fa9067ef365be9c`；启动状态和本片修改来源已核对，未混入未知改动。身份、最终文件清单、源码/测试 SHA 和每个实际命令的结果集中保存在自有证据根 `/private/tmp/rquant-neutralization-implementation-gptxxerj`。
+
+### 实现和稳定接口
+
+- `time_series.neutralize_factor_cells` 为唯一纯计算核；原行业/规模 DSL 调用原语义，联合模式采用组内中心化的共同斜率。共同样本、组大小、秩/方差和缩放丢失精度显式拒绝；原缺失原因保留。
+- `bind_factor_neutralization_context(prepared, *, industry=None, market_cap=None)` 返回有类型完整配对包；`open_factor_neutralization_context(context, *, lake_root)` 返回私有 lease，`query(trade_date, panel_date, stock_codes, assumed_visible_at)` 按 500 码拆分并保留原 raw fact/status。输入日摘要通过原模型的显式非有限数值字符串编码保留合法坏值，坏值仅退出共同样本。行业来源仍明确独立 API 回顾边界，日可见时间仍是回顾适配假设。
+- 可信 `save_factor_neutralization_context(root, context)` 返回内容寻址 `FactorRunFileReference`；配置新增可选 `neutralization_context`。原 `compile_factor_run_plan` 和 `run_configured_factor_worker` 签名不变。冻结 spec 中 `adapter_request.context` 保留完整包，`formula.sources.context`、完成回执和 display 保留紧凑配对摘要；source 的代码 commit 和执行代码 revision 各自记录，不假设二者相同。
+- 显式离线 CLI 为 `python -m rquant.factor.run_entry seal-context --root … --prepared-source … --industry-source … --market-cap-source … --lake-root … [--reference <原配置引用JSON>]`；输出有类型 `context_reference/configuration_reference`，引用原配置时保留其开关、权限名单和权威标识，只装配该上下文。
+- public parameters 为默认 `none` 的 `none/industry/industry_size`；availability 新增可选 `neutralizations`，每项为 `neutralization/label/available/reason`。浏览器不能声明来源、路径、actor 或 capability。public 稳定合同先行提交为 `84cc63a269565b20fe5af5783ca1b75996a1afd5`、`c67754822b58abf6cd1110a642b8e289118e5645`。
+- 实际发现 `draft.py` 固定 daily gate 会阻断 DSL 保存；经 root 明确确认，该直接依赖沿可信 backend/private capability 接线。原保存和运行名单独立，原 owned command、head、actor、registry/ledger 身份与恢复权威不变。无来源返回有限拒绝，不建立任务；原 effect 丢失后换配置仍恢复原 spec/job/mode。
+- journal 沿原 `full.journal.days[].artifact.filename` 保存 `FactorDailyStreamBatch.factor_values`。Serving 和 Web 从冻结产物导出 `research.neutralization/neutralization_label/context_basis_label/context_note`，覆盖率沿原 counts；通用 `missing_context` 不伪称分开统计行业和市值。
+
+### 实际验证与去重
+
+环境为只读借用的 `/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-source-integration/.venv/bin/python`：Python 3.13.12、Pydantic 2.13.1、DuckDB 1.5.2、pytest 9.0.3。每个命令使用清洁隔离 env、`RQUANT_DISABLE_DOTENV=1`、本树 `PYTHONPATH=src:.`、禁写 pyc、dummy token 和自有离线目录；无网络/供应方 HTTP、真实来源、凭据、生产访问或安装。
+
+必要实际红测包含：初始数学/public 缺功能；新来源模块缺失（2 failed/1.37s）；修正夹具后的旧公式基线（5 failed/1.10s）；可信配置/任务入口（7 failed/1.62s）；DSL trusted draft（两个实际失败，另一个首次为合成目录 gid 问题）；合法非有限 cap 摘要（1 failed/1.27s）；request/completion 配对（2 failed/2.45s）；缩放丢失非零因子（1 failed/1.02s）。所有原 log/XML 保留，早期无效 catalog/hash/window/目录夹具失败未冒充产品拒绝证据；修正后的基线公式红测为实际离线重放，未伪称其早于最初候选代码。
+
+| 有效实际结果 | 实际范围与时长 |
+| --- | --- |
+| 数学初绿 | 5 新 + 8 原稠密节点，13 passed/1.18s；新增精度节点随后通过（`green-precision-worker.xml` 中 6 个数学节点通过，命令中 Web 夹具两节点失败如实保留） |
+| public / DTO | 5 passed/1.13s；默认 none/public 原字节与 hash 有固定断言 |
+| formula/context | 最终配对命令中 8 个公式、3 个来源和 1 个完成绑定节点通过；同命令仅 CLI 输入文件权限夹具失败，随后修正为私有文件并实际通过 |
+| 任务、恢复和生命周期 | 9 passed/6.59s（7 新任务 + 2 来源）；真实中途异常、末尾同字节替换无成功产物，配置改变/回执丢失保留原任务 |
+| private DSL 保存→运行 | 3 passed/3.46s；原保存/运行名单独立 |
+| worker→Serving→Web/独立 OLS | 2 passed/5.47s；两个模式读取实际合成 journal 日值，与独立 NumPy dummy-matrix OLS 比较，API 返回原模式及中文标签 |
+| 最终日对象释放/绑定 | 3 passed/5.74s；前一日对象在下一日 observations 前释放，结束后全部 weakref 为空 |
+| 最终格式后直接 CLI/private DSL | 2 passed/4.36s，子进程回收、Unix 两服务线程 join/socket 清理 |
+| 原流式直接回归 | 43 passed/2.21s：none 算子黄金、动态成员、尾部、默认 context 拒绝、SSE/收益成熟日和原摘要链 |
+| 原可信入口直接回归 | 15 passed/8.29s：配置/CLI/取消、原 v1 固定摘要、独立 journal 重放和权限/恢复 |
+
+`new-nodeids.txt` 为实际 collection 的 **34 个精确新节点**；`old-passed-nodeids.txt` 为 **66 个去重旧节点**（8 原稠密 + 43 流式 + 15 入口，含一处旧 node 的必要新 mode 拒绝断言调整）。100 个不同节点有实际 passing JUnit；不把分命令重复通过、failed 命令中的失败、skip/deselect 或 collection 算为新增通过。最终 formatter/import 排序和等价测试格式改动复用有效行为证据，不再次运行全套；`test-command-results.json` 明确记录每份失败和通过及每个新节点的有效 JUnit 来源。
+
+启动前保存的七份旧 none payload（spec/formula request/config/completion/display/full/public run request）在新模型逐字节重放、原 SHA 均一致；旧 full 重投影的 display/completion 也一致（`legacy-replay.json`）。原 v1 spec 固定 SHA `3cc03cd3b8940db3431e5e1e4d53725602642d812e63766d4b25bcebc3dc233e` 的旧回归通过。Ruff/check/format/diff 均通过，27 个修改 Python 文件以 `ast.parse(feature_version=(3,11))` 实际解析；未声称使用 Python 3.11 runtime 执行。
+
+### 资源、范围与交接
+
+全部自有 exec/pytest/CLI 命令已退出；私有 reader、执行副本、日对象、journal 和 Unix 服务线程由实际断言确认释放。早期两个 gid 夹具失败所留空 `fneu-*` 目录按创建时间与对应 JUnit、dev/inode/owner 明确归属后移除。清洁 env 的默认 /private/tmp 父目录被原 proxy-proof 私有父目录检查正确拒绝；成功 Web 证据使用本树自有临时私有 proof 目录，finally 删除，未改鉴权或共享权限。仅自有合成旧规范原件与 log/XML 在证据根留存；无借用 runtime 改动。
+
+本片改动严格为必要后台/直接可信与 Web 投影、Python 测试和此附录；未改已验收采集器、ledger/schema、前端、生成合同、测试清单、依赖、生产或部署。后台候选交 root 后停写：真实两池 32 日、Frontend 组装、统一生成合同/必要门禁和唯一集中独立审查仍由 root 完成；这里不宣称整个 M3、PIT、最大负载或生产上线。

@@ -6,7 +6,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
-from rquant.factor.capability import HISTORICAL_DAILY_V1
+from rquant.factor.capability import HISTORICAL_DAILY_V1, DailyFactorCapabilities
 from rquant.factor.draft import FactorSaveDraft, draft_factor_id
 from rquant.factor.registry import FactorDefinitionReceipt
 from rquant.factor_definition_admission import (
@@ -235,11 +235,32 @@ def factor_capabilities(
             except Exception:
                 pass
         data = FactorCapabilitiesData.model_validate(
-            {**HISTORICAL_DAILY_V1.model_dump(mode="python"), "can_save": can_save}
+            {
+                **_trusted_capabilities(web, viewer, can_save).model_dump(mode="python"),
+                "can_save": can_save,
+            }
         )
     if meta.generation_id is not None:
         response.headers["X-Rquant-Generation"] = meta.generation_id
     return Envelope[FactorCapabilitiesData](data=data, serving=meta)
+
+
+def _trusted_capabilities(
+    web: object, viewer: str | None, can_save: bool
+) -> DailyFactorCapabilities:
+    if can_save and viewer is not None:
+        getter = getattr(web.factor_admission, "capabilities", None)
+        if getter is not None:
+            try:
+                return DailyFactorCapabilities.model_validate(getter(authenticated_actor_id=viewer))
+            except (
+                FactorDefinitionAdmissionUnavailableError,
+                FactorDefinitionAdmissionRejectedError,
+                OSError,
+                ValueError,
+            ):
+                pass
+    return HISTORICAL_DAILY_V1
 
 
 @router.post(
