@@ -48,3 +48,19 @@ def test_plan_refuses_over_1024_calculation_days() -> None:
         compile_factor_run_schedule(
             days, start_date=days[1], end_date=days[-2], holding_sessions=1, history_window=1
         )
+
+
+def test_plan_empty_trading_interval_is_editable_parameter_rejection() -> None:
+    from rquant.factor.run_plan import FactorRunPlanRejectedError, compile_factor_run_schedule
+
+    first = date(2026, 9, 1)
+    days = tuple(first + timedelta(days=i) for i in (0, 2, 4))
+    with pytest.raises(FactorRunPlanRejectedError) as failure:
+        compile_factor_run_schedule(
+            days,
+            start_date=first + timedelta(days=1),
+            end_date=first + timedelta(days=1),
+            holding_sessions=1,
+            history_window=1,
+        )
+    assert failure.value.reason == "所选区间没有交易日，请调整日期。"

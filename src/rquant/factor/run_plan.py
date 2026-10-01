@@ -140,8 +140,6 @@ def compile_factor_run_plan(
         loaded.open_ledger(clock=clock)
         scope = source.admission_request.scope
         params = request.parameters
-        if not scope.start_date <= params.start_date <= params.end_date <= scope.end_date:
-            raise ValueError("所选区间超出冻结来源")
         with open_factor_stream_snapshot_admission(
             source.admission_request,
             metadata_store=loaded.metadata,
@@ -177,6 +175,10 @@ def compile_factor_run_plan(
             if tuple(opened) != source.receipt.calendar_open_days:
                 raise ValueError("来源包日历与实际冻结来源不同")
         try:
+            if not scope.start_date <= params.start_date <= params.end_date <= scope.end_date:
+                raise FactorRunPlanRejectedError(
+                    "所选区间超出冻结来源", reason="请在数据可用区间内选择日期。"
+                )
             schedule = compile_factor_run_schedule(
                 tuple(opened),
                 start_date=params.start_date,

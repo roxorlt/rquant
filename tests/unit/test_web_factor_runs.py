@@ -401,3 +401,73 @@ def test_real_unix_web_unknown_or_existing_work_never_becomes_plan_rejection(
             assert result.status == "uncertain" and result.original_request == body
         assert outbox.receipt(body.command_id) is None
         assert not list(config.lake_root.glob(".execution_sessions/*"))
+
+
+@pytest.mark.parametrize("boundary", ["start_before_source", "end_after_source"])
+def test_real_unix_web_source_date_bounds_are_editable_rejections(
+    tmp_path: Path, boundary: str
+) -> None:
+    from rquant.factor.run_configuration import open_factor_run_configuration
+
+    with _real_run_web_client(tmp_path) as (client, body, backend, outbox, _):
+        availability = client.get("/api/v1/factors/run-availability").json()["data"]
+        start = (
+            _FIRST - timedelta(days=1)
+            if boundary == "start_before_source"
+            else _FIRST + timedelta(days=5)
+        )
+        end = (
+            body.parameters.end_date
+            if boundary == "start_before_source"
+            else _FIRST + timedelta(days=30)
+        )
+        body = body.model_copy(
+            update={
+                "parameters": body.parameters.model_copy(
+                    update={
+                        "start_date": start,
+                        "end_date": end,
+                    }
+                )
+            }
+        )
+        responses = {}
+        for name, path in (("submit", "runs"), ("resume", "runs/resume"), ("retry", "runs/retry")):
+            response = client.post(
+                f"/api/v1/factors/{path}",
+                json=body.model_dump(mode="json"),
+                headers={"x-rquant-csrf": "1"},
+            )
+            responses[name] = {"status": response.status_code, "body": response.json()}
+        for name in ("submit", "retry"):
+            assert responses[name]["status"] == 200, responses[name]
+            result = FactorRunOperationResult.model_validate(responses[name]["body"]["data"])
+            assert result.original_request == body and result.status == "rejected"
+            assert result.reason == "请在数据可用区间内选择日期。"
+            assert result.job_id is None and result.spec_sha256 is None
+        assert responses["resume"]["status"] == 404
+        assert outbox.receipt(body.command_id) is None
+        with open_factor_run_configuration(backend.root, backend.reference) as loaded:
+            assert loaded.open_ledger(clock=lambda: _AS_OF).list_recent() == ()
+            assert not list(loaded.configuration.lake_root.glob(".execution_sessions/*"))
+        exported = {
+            "actor": "alice",
+            "request": body.model_dump(mode="json"),
+            "availability": availability,
+            "responses": responses,
+            "context": (
+                "Synthetic actual frozen source/calendar, factory, Unix transport and "
+                "authenticated Web. Existing UID fixture seam; not installed dual-UID proof."
+            ),
+        }
+    exported["resources"] = {
+        "listener_joined": True,
+        "socket_removed": True,
+        "execution_copies": 0,
+        "jobs": 0,
+        "outbox_receipt": None,
+    }
+    prefix = "date" if boundary == "start_before_source" else "end-date"
+    Path(
+        f"/private/tmp/rquant-factor-run-entry-fr-final-01-{prefix}-http-contract.json"
+    ).write_text(json.dumps(exported, ensure_ascii=False, indent=2))
