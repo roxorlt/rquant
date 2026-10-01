@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+import hashlib
 import importlib
 import importlib.util
 import json
@@ -386,6 +387,58 @@ def test_source_change_before_final_manifest_write_removes_owned_completion(
         m.assemble_history_archive(request)
     assert len(published) == 1
     assert raw.read_bytes() == b"{}"
+    _no_manifest(request.root)
+
+
+def test_post_publication_manifest_read_error_removes_owned_completion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    m = _module()
+    import rquant.factor.member_archive as archive
+
+    source = _collection(tmp_path / "source", _DAYS[:2])
+    raw = source / f"bak-basic-{_DAYS[0]:%Y%m%d}.json"
+    original_publish = archive._publish_bytes
+    original_read = m._read_file
+    published = []
+    read_attempted = False
+
+    def change_before_manifest(
+        root: Path, root_fd: int, name: str, data: bytes, limit: int
+    ) -> tuple[int, ...]:
+        if name.startswith("factor-member-archive-v1-"):
+            raw.write_bytes(b"{}")
+        identity = original_publish(root, root_fd, name, data, limit)
+        if name.startswith("factor-member-archive-v1-"):
+            published.append(
+                archive.FactorMemberArchiveReference(
+                    filename=name, sha256=hashlib.sha256(data).hexdigest(), byte_count=len(data)
+                )
+            )
+        return identity
+
+    def fail_manifest_read(
+        descriptor: int, name: str, limit: int, expected_sha: str | None = None
+    ) -> tuple[bytes, tuple[int, ...]]:
+        nonlocal read_attempted
+        if name.startswith("factor-member-archive-v1-"):
+            read_attempted = True
+            raise OSError("offline fault in newly added post-publication manifest read")
+        return original_read(descriptor, name, limit, expected_sha)
+
+    monkeypatch.setattr(archive, "_publish_bytes", change_before_manifest)
+    monkeypatch.setattr(m, "_read_file", fail_manifest_read)
+    request = _request(tmp_path, (source,), _DAYS[:2])
+    with pytest.raises(OSError, match="post-publication manifest read"):
+        m.assemble_history_archive(request)
+    assert read_attempted and len(published) == 1 and raw.read_bytes() == b"{}"
+    with (
+        pytest.raises((ValueError, OSError)),
+        open_factor_member_stream(request.root, published[0]) as stream,
+    ):
+        for _ in stream:
+            pass
+        stream.require_completion()
     _no_manifest(request.root)
 
 

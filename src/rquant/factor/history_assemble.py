@@ -315,14 +315,18 @@ def assemble_history_archive(request: HistoryAssemblyRequest) -> FactorMemberArc
                 root=request.root,
                 daily_filenames=_checked_filenames(request, preview),
             )
-            data, identity = _read_file(
-                archive_descriptor,
-                reference.filename,
-                MAX_FACTOR_MEMBER_MANIFEST_BYTES,
-                reference.sha256,
+            # A verification read may fail after the completion file already exists.
+            identity = _file_identity(
+                os.stat(reference.filename, dir_fd=archive_descriptor, follow_symlinks=False)
             )
-            del data
             try:
+                data, _ = _read_file(
+                    archive_descriptor,
+                    reference.filename,
+                    MAX_FACTOR_MEMBER_MANIFEST_BYTES,
+                    reference.sha256,
+                )
+                del data
                 _require_same_root(request.root, archive_descriptor)
                 _check_sources(preview)
             except BaseException:

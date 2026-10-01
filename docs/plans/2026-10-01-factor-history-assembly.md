@@ -67,3 +67,13 @@ python -m rquant.factor.history_assemble archive --capture-root <完成批次一
 - 原reviewer的`repro.py`字节不变复制到自有`fha-final-01-repro`目录，离线实跑返回`member file changed after read`、成功manifest数0。脚本内candidate固定标签仍指修复起点，执行的是当前修复源码；上下文和实际源码SHA记录于`fha-final-01-evidence.json`。原reviewer证据与root实际来源未写入。
 - 同一Python3.13.12及既有离线配置；Ruff check、format --check、两文件3.11语法解析与git diff --check通过，未宣称3.11 runtime验证。命令及结果在同一自有证据根的`fha-final-01-*`收据中。
 - 所有本轮命令及pytest/CLI子进程已退出，无后台进程或发布`*.tmp`；故障仅改变自有合成原件，拒绝后成功manifest已清理，诊断资料保留。三文件局部commit后干净冻结，交原reviewer仅复核本ID及直接修复回归，不继续第二轮或扩大范围。
+
+## 人类授权的额外一次局部补修 FHA-FINAL-01（2026-10-01）
+
+原reviewer确认单一来源变化已关闭，但新增manifest验证读取在清理保护外，注入OSError会拒绝装配却留下原reader可完成的归档。用户直接答复「允许一次局部补修（建议）」；授权原件为`/private/tmp/rquant-factor-history-assembly-root-3bbdsk3y/extra-repair-authorization.json`（observed_at `2026-10-01T09:59:07.673070+00:00`），仅例外允许本ID此额外一轮，其他规则与三文件写集保持。从干净`402b0da2241f433c740ea50073e3b2a3e1a77f98`开始，原生身份和父任务不变。
+
+- 最小改动：原publisher返回后先从自有目录句柄记录已发布manifest的dev/inode，再把验证读取放入原失败清理块。读取OSError与后续来源拒绝都沿原按身份删除/fsync路径，publisher/reader和其他模块零改动。
+- 唯一新增节点`tests/unit/test_factor_history_assemble.py::test_post_publication_manifest_read_error_removes_owned_completion`；`fha-final-01-extra-red.log/xml`实际1 failed/1.38s，失败证明原reader仍能完成；修复后initial green为1 passed/1.34s。必要直接回归`fha-final-01-extra-regression.log/xml`为4 passed/1.64s（新路径、原简单变化、32日all/gem黄金），无skip/deselect。Ruff初次只报新测试SIM117；合并with上下文后仅该新测试复跑1 passed/1.13s，final Ruff check/format均通过，3.11语法与diff检查通过，实际runtime仍仅3.13.12。
+- 精确reviewer脚本原字节SHA `ae2bbdde9296f3e59b43126bc797fde2078657063721df4cf22e19d2442dc274`不变复制并执行。脚本要求旧反例仍有1个manifest的断言在修复后失败，自有`fha-final-01-extra-repro/verify.py`仅接住该断言并另行核实原注入确实执行、完成manifest数0、原reader因FileNotFoundError拒绝；完整结果保存于`verified-result.json`，未修改reviewer原件。
+- `new-nodeids.txt`已更新全部21个新增节点；额外1项和实际回归4项分别精确记录。旧20新、61/259和此前7项等仍有效结果复用，去重口径61+259+21=341，并非本轮执行341项。分命令真实结果、源码SHA与授权上下文保存为自有证据根`fha-final-01-extra-*`收据，未扩矩阵、清单或全量验证。
+- 所有自有命令/pytest/reader退出，无后台进程及发布临时文件。只修改自有合成原件，固定反例目录无完成manifest，部分日文件及红测反例保留诊断；真实来源和原reviewer证据零写入。本地commit后干净冻结，交同一reviewer仅复核本ID及直接修复回归；本额外一轮后如仍阻断立即停写。
