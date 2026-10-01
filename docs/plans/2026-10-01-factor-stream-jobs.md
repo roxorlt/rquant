@@ -61,7 +61,7 @@
 - **SJ-03 完成完整性：** 取消、尾部缺失/损坏、观察桥错误或未完整消费均不得得到成功完成链。
 - **SJ-04 唯一权威：** 最终提交使用同一已钉住 ledger 实例、实际当前时钟、最新 lease token/version、deadline 和原 CAS；旧 lease、丢失/过期 lease 或 ledger 换代均不能成功。heartbeat 正常推进 version 不使同一活 lease 的准备证据无效。
 - **SJ-05 准备证据不可冒充：** 长验证在 heartbeat 仍运行时，由实际同一 ledger 对象产生并私有持有。最终接口接受对象身份受核对的 opaque handle；调用方构造、复制、跨 ledger 或旧 claim 的 handle/“verified SHA”不能代替真实验证。绑定 job、spec、token、实例及验证过的文件身份，不钉住会合法递增的初始 version。
-- **SJ-06 文件稳定性：** 准备完成到 CAS 期间，full/display/journal/member 依赖的 root/文件身份再次核验；变化无成功。写事务内不复放整次 raw/AST 或逐日数值计算。
+- **SJ-06 文件稳定性：** 准备完成到 CAS 期间，full/display/journal/member 依赖的 root/文件身份再次核验；必须在取得原 writer 事务后、写 succeeded 前复核全部身份和 handle 绑定，防止等待写锁期间换代。变化无成功；写事务内不复放整次 raw/AST 或逐日数值计算。
 - **SJ-07 有界资源：** 每日逐批处理，无全期间点矩阵。准备记录有界（同一实例最多 200 个、一 job/claim 只保留一个），完成/失败/取消/失去 claim 后清理；重启不复用内存 handle，沿原 reclaim 重做验证。线程、FD、临时资源和无关文件正确处置。
 
 ### 失败路径与提交顺序
@@ -69,7 +69,7 @@
 1. worker 使用原 claim 并启动 heartbeat，按 spec 版本执行 v1/v2；v2 运行和发布期 deadline 实查。
 2. v2 调用同一 ledger 的准备阶段：先查真实 live claim，再在**无 SQLite 写事务、heartbeat 仍运行**期间读取产物、成员及 journal、独立数值复算，保存私有验证绑定/身份。任何失败返回原失败分类，不写 succeeded。
 3. worker 停 heartbeat 并 join，取它实际维护的最新 version；线程未结束或报告 lost 时无终态权威。长验证期间 lease 可以合法续期；丢失后最终 CAS 必拒绝。
-4. 短完成阶段核对 handle 身份、最新 token/version、deadline、绑定及具名文件/root 身份；进入原 writer 再用 trusted ledger clock 核 live claim/CAS，记录 succeeded。该窗口不重新读取并解析全部 journal、不重算 raw/AST/统计。
+4. 短完成阶段可在事务外预检 handle 和绑定；**必须取得原 writer 的写事务后**重新核对 handle、全部已验证具名文件/root 身份及任务绑定。等待 `BEGIN IMMEDIATE` 期间的替换也须被拒绝。身份检查完成后使用最新 trusted ledger clock 再核 live lease/token/version/deadline，然后原 CAS 记录 succeeded。该窗口不重新读取并解析全部 journal、不重算 raw/AST/统计。
 5. 原 default lease 30s；已有 7,000×16 raw/公式执行实测约 103s。不得把长复算放到停心跳后的 complete，或通过放宽租约到任意时长隐藏此问题。journal 复算实际耗时尚未测量，本轮要留下至少小样本真实时间与窗口行为证据，不将小样本时间写成全市场 SLA。
 
 排除：生产数据库/文件修复或迁移、权限/会话系统改造、Provider 历史采集/PIT 真实性、行业/市值中性化、React 运行按钮、每日跟踪、生产部署/切流/停 Streamlit、M11 下单。这些仍在完整目标后续依赖中，不以本片结论宣称原型完成。
@@ -84,7 +84,7 @@
    - 改 journal universe 并重哈希，用实际成员 reader 验证拒绝；错日期/来源/scope/定义/code/manifest/混版同样拒绝。
    - 实际尾部文件缺失/损坏、取消或观察器异常没有完成回执；FD/session/执行副本自有临时资源清理。
    - 通过可控制 trusted ledger clock 与真实线程证明准备期间 heartbeat 至少推进一次；超过初始 lease 但保持续期可成功，使用最新 version；停心跳后只有有界身份/绑定检查，无统计复算。
-   - 真实 lease 过期或被另一 claim 获得、ledger inode 换代、伪造/复制/跨实例/旧 claim handle、验证后文件或目录换代均无成功；同字节 inode 替换至少一个真实行为用例。
+   - 真实 lease 过期或被另一 claim 获得、ledger inode 换代、伪造/复制/跨实例/旧 claim handle、验证后文件或目录换代均无成功；同字节 inode 替换至少一个真实行为用例。另用真实 SQLite 写锁，在事务外预检后、等待取得 writer 时替换同字节文件 inode，取得事务后必须拒绝，持久状态无 succeeded。
    - v1 原规范字节固定对照、legacy 无 display 回读、既有提交成功/失败/命令重放仍成立；Serving 一次读取不调用数值重算，原容量/代际拒绝不变。
 5. 多日小样本验证逐批弱引用释放、十期缓存/有界元数据和所有 owned 线程/FD/临时文件处置；测试字节界限在解析前生效。旧 7,000×16 runner 规模证据仅在未变边界内复用，journal/准备成本只按本轮实际测量陈述，不宣称最大区间或真实负载完成。
 6. 改动区 Ruff/format/diff-check；冻结 clean candidate、完整 diff 和原始命令/日志/负面证据，由既有 reviewer 一次终审覆盖当前 diff、直接依赖、全部验收及上述冻结失败模型。最多三轮定向修复，范围外进入 backlog，不扩张全仓。
@@ -95,3 +95,7 @@
 ## 完成定义
 
 只有上述实际完整后端链路、负面行为、兼容、必要门禁及独立终审成立才可接受本片。它是原型检验后端依赖，不是网页可运行或线上替代验收。受信真实成员/范围/中性化上下文、认证提交及 React 运行/恢复、跟踪和其他模块继续实施；完整 goal 保持 active。
+
+## SPEC 审查（2026-10-01）
+
+原 native reviewer 对计划提交 `9eaab78d2f123417a4125396125c350dc2e96aa6` 一次集中核对发现 `SJ-SPEC-01 P1`：事务外身份检查后，`BEGIN IMMEDIATE` 等待期间可能换代。最小修订已将最终全部身份/handle 复核明确置于取得 writer 后，随后最新时钟检查租约及原 CAS，并加入真实写锁等待窗口换 inode 的失败验收。此阶段是 SPEC/直接代码时序审查，尚无产品测试证据；不增加数据库 schema 或扩大写集。
