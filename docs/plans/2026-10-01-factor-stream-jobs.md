@@ -24,10 +24,13 @@
 | `src/rquant/factor/job_ledger.py`、`job_worker.py` | 明确版本分派；同一实例准备验证和最终租约/CAS；不迁移 SQLite schema |
 | `src/rquant/factor/result_serving.py` | 显式 v1/v2 display 解析与成功任务绑定，保持 Serving 容量与代际验证 |
 | `src/rquant/web/models/factor_results.py`、`web/routes/factor_results.py` | 真实四池标签和轻量流式分组诊断类型，保持 v1 DTO 原形 |
+| `web/src/api/openapi.json`、`schema.d.ts`、`factors.ts` | 按唯一类型链生成新 DTO；结果读取类型明确覆盖 v1/v2，不手写 API 合同 |
+| `web/src/pages/factors/factorCharts.ts`、`FactorResults.tsx` 及其现有测试 | 最小新版只读消费兼容；保留现有布局、组件、缺值/部分样本口径，准确读取轻量分组/收益/换手 |
+| `web/dist/` | 由上述实际契约及消费者改动正常编译生成，遵守仓库提交及核对规则 |
 | 新增 `tests/unit/test_factor_stream_job_spec.py`、`test_factor_stream_job_artifact.py`、`test_factor_stream_job_runner.py`、`test_factor_stream_job_authority.py` | 新合同、真实文件链路、独立复算和并发失败证据 |
 | 现有 job/worker/Serving/Web 直接相关测试 | 必要兼容与回归；不复制原实现作测试预期 |
 
-如测试组织需要调整，只在上述直接相关测试内记录实际节点。清单、CHANGELOG 和进度文档由 root 在受审代码合入后更新。此增量不修改 React、生产配置或数据；不增加行业/市值上下文能力。
+如测试组织需要调整，只在上述直接相关测试内记录实际节点。清单、CHANGELOG 和进度文档由 root 在受审代码合入后更新。React 只做直接契约的只读消费兼容，不增加运行/跟踪写入口，不重新设计界面；此增量不修改生产配置或数据，也不增加行业/市值上下文能力。
 
 ## 合同与数值口径
 
@@ -63,6 +66,7 @@
 - **SJ-05 准备证据不可冒充：** 长验证在 heartbeat 仍运行时，由实际同一 ledger 对象产生并私有持有。最终接口接受对象身份受核对的 opaque handle；调用方构造、复制、跨 ledger 或旧 claim 的 handle/“verified SHA”不能代替真实验证。绑定 job、spec、token、实例及验证过的文件身份，不钉住会合法递增的初始 version。
 - **SJ-06 文件稳定性：** 准备完成到 CAS 期间，full/display/journal/member 依赖的 root/文件身份再次核验；必须在取得原 writer 事务后、写 succeeded 前复核全部身份和 handle 绑定，防止等待写锁期间换代。变化无成功；写事务内不复放整次 raw/AST 或逐日数值计算。
 - **SJ-07 有界资源：** 每日逐批处理，无全期间点矩阵。准备记录有界（同一实例最多 200 个、一 job/claim 只保留一个），完成/失败/取消/失去 claim 后清理；重启不复用内存 handle，沿原 reclaim 重做验证。线程、FD、临时资源和无关文件正确处置。
+- **SJ-08 消费兼容：** Pydantic→OpenAPI→TypeScript 唯一类型链一致；v1 响应字节/字段原形与页面行为保留，v2 明确区分轻量分组，不伪造持仓。只读图表按真实字段显示四池、缺值和部分状态，正文不出现内部代号/摘要。
 
 ### 失败路径与提交顺序
 
@@ -72,7 +76,7 @@
 4. 短完成阶段可在事务外预检 handle 和绑定；**必须取得原 writer 的写事务后**重新核对 handle、全部已验证具名文件/root 身份及任务绑定。等待 `BEGIN IMMEDIATE` 期间的替换也须被拒绝。身份检查完成后使用最新 trusted ledger clock 再核 live lease/token/version/deadline，然后原 CAS 记录 succeeded。该窗口不重新读取并解析全部 journal、不重算 raw/AST/统计。
 5. 原 default lease 30s；已有 7,000×16 raw/公式执行实测约 103s。不得把长复算放到停心跳后的 complete，或通过放宽租约到任意时长隐藏此问题。journal 复算实际耗时尚未测量，本轮要留下至少小样本真实时间与窗口行为证据，不将小样本时间写成全市场 SLA。
 
-排除：生产数据库/文件修复或迁移、权限/会话系统改造、Provider 历史采集/PIT 真实性、行业/市值中性化、React 运行按钮、每日跟踪、生产部署/切流/停 Streamlit、M11 下单。这些仍在完整目标后续依赖中，不以本片结论宣称原型完成。
+排除：生产数据库/文件修复或迁移、权限/会话系统改造、Provider 历史采集/PIT 真实性、行业/市值中性化、React 运行按钮、每日跟踪、生产部署/切流/停 Streamlit、M11 下单。这些仍在完整目标后续依赖中，不以只读兼容结论宣称原型完成。
 
 ## 集中实施与可执行验收
 
@@ -86,8 +90,9 @@
    - 通过可控制 trusted ledger clock 与真实线程证明准备期间 heartbeat 至少推进一次；超过初始 lease 但保持续期可成功，使用最新 version；停心跳后只有有界身份/绑定检查，无统计复算。
    - 真实 lease 过期或被另一 claim 获得、ledger inode 换代、伪造/复制/跨实例/旧 claim handle、验证后文件或目录换代均无成功；同字节 inode 替换至少一个真实行为用例。另用真实 SQLite 写锁，在事务外预检后、等待取得 writer 时替换同字节文件 inode，取得事务后必须拒绝，持久状态无 succeeded。
    - v1 原规范字节固定对照、legacy 无 display 回读、既有提交成功/失败/命令重放仍成立；Serving 一次读取不调用数值重算，原容量/代际拒绝不变。
+   - 新旧结果 DTO 经过实际 API 和生成类型链验证；既有结果页对真实轻量分组输出显示正确池名、IC/衰减/累计收益/换手与空/部分状态，不伪造持仓或将缺值转零。复用现有布局，仅为变化的消费分支做组件/图表行为证据。
 5. 多日小样本验证逐批弱引用释放、十期缓存/有界元数据和所有 owned 线程/FD/临时文件处置；测试字节界限在解析前生效。旧 7,000×16 runner 规模证据仅在未变边界内复用，journal/准备成本只按本轮实际测量陈述，不宣称最大区间或真实负载完成。
-6. 改动区 Ruff/format/diff-check；冻结 clean candidate、完整 diff 和原始命令/日志/负面证据，由既有 reviewer 一次终审覆盖当前 diff、直接依赖、全部验收及上述冻结失败模型。最多三轮定向修复，范围外进入 backlog，不扩张全仓。
+6. 改动区 Ruff/format/diff-check；由于改动实际网页 API/消费者，执行 `web/AGENTS.md` 和 `web.yml` 要求的类型链、`web check`、build/verify:dist、网页 API 回归及浏览器门禁各一次。预检 loopback/browser/依赖，离线复用 Node 22.22.2/pnpm 10.33.0 和已装包；不得因缺环境将未运行/受阻门禁写成通过。只有失败诊断或改动失效才重跑。冻结 clean candidate、完整 diff 和原始命令/日志/负面证据，由既有 reviewer 一次终审覆盖当前 diff、直接依赖、全部验收及上述冻结失败模型。最多三轮定向修复，范围外进入 backlog，不扩张全仓。
 7. root 仅在无阻断 finding 后本地合入，核对受审文件逐字节；正常生成清单并核对只新增实际节点，无旧删除/重复、55 approved skips 不变，执行仓库两项必要清单门禁。同步 CHANGELOG 和平台进度，不因阶段名追加全量测试。
 
 实际产品验证解释器 `/Users/roxor/brain/30-projects/rQuant/.venv/bin/python`（3.12.13），显式 `PYTHONPATH=<新 worktree>/src`、`RQUANT_DISABLE_DOTENV=1`、假 Tushare token、空通知 key、`NOTIFY_ENABLED=false`、独立 tmp DuckDB/parquet。实现者记录准确命令、实际环境、exit、红绿和资源日志；deselect/skip/环境受阻不能算通过。清单门禁按集成现有 Python 3.13.12 环境执行，不充当 3.11 或生产运行证据。
@@ -99,3 +104,7 @@
 ## SPEC 审查（2026-10-01）
 
 原 native reviewer 对计划提交 `9eaab78d2f123417a4125396125c350dc2e96aa6` 一次集中核对发现 `SJ-SPEC-01 P1`：事务外身份检查后，`BEGIN IMMEDIATE` 等待期间可能换代。最小修订已将最终全部身份/handle 复核明确置于取得 writer 后，随后最新时钟检查租约及原 CAS，并加入真实写锁等待窗口换 inode 的失败验收。此阶段是 SPEC/直接代码时序审查，尚无产品测试证据；不增加数据库 schema 或扩大写集。
+
+### 直接消费者与实际门禁补充
+
+root 随后实际读取 `tests/unit/test_web_openapi_snapshot.py`、`web/AGENTS.md` 和 `.github/workflows/web.yml`，确认网页 API 变化必须更新生成 OpenAPI/TS 类型并通过真实门禁；现有 `factors.ts`、`FactorResults.tsx`、`factorCharts.ts` 只消费 dense v1。原「不改 React」遗漏这个直接依赖。现只将上述最小类型链/只读消费兼容及正常 dist 纳入同一候选，新增 SJ-08 和相应聚焦验收；不增加布局、参数、提交/跟踪能力或独立 UI 子任务审查。原租约、失败模型和写入边界保持，既有 reviewer 仅核此 SPEC 补充后仍做一次整体最终候选审查。
