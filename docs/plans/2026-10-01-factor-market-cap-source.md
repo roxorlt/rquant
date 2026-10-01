@@ -112,3 +112,26 @@ env -i PATH=/usr/bin:/bin RQUANT_DISABLE_DOTENV=1 TUSHARE_TOKEN_MAIN=00000000000
 所有执行命令已退出，无后台进程或运行会话。用例实际验证一次 RO BEGIN/COMMIT、失败或取消 ROLLBACK、连接和源 FD 关闭、主库路径未 resolve/stat/open；正常及异常 reader 退出均关闭连接并删除私有副本。证据根没有 `.market-cap-reader-*` / `.market-cap-prepare-*` 或 `*.tmp-*` 遗留。代变化后已完成的内容寻址 Parquet 和损坏用例原件仅保留在自有临时证据根作诊断，没有成功来源返回。
 
 本片没有读取实际 RO/生产资料，没有 32 日真实对照、下一交易日适配、中性化、历史 PIT、3.11/3.12 runtime 或最大负载结果；这些不以合成证据替代。root 在干净候选后安排一次最终独立审查，并负责计划第 5 项真实来源验收和集成。普通任务最多一次定向修复，不沿用此前其他任务的额外许可。
+
+## 根任务最终验收（2026-10-01）
+
+受审候选 `29ce9eee3110b9ed67962291cb247bc913a9888e` 在本地集成树 `/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-source-integration`、分支 `cdx/20260929-factor-source-integration` 合入，merge `e539d7696dbfda2012870dfae5455435f886c2f7`。唯一集中独立审查 accept、范围内无 findings，报告 `/private/tmp/rquant-market-cap-final-review-0tehmTCA/review.md`，SHA256 `90583cf3855bbd2ea75bb2fa0d162698d21b8ddc0d5c0e93ee795f1cc52cb605`。没有修复/额外审查轮次；有效21新增＋2旧结果复用，没有重复文件级验证。源码/新测试保持上述受审字节，root仅维护清单和验收记录。
+
+### 实际只读副本与完整日范围
+
+根任务证据 `/private/tmp/rquant-factor-market-cap-root-iqd42zb3`。`accepted-candidate.json` 保存冻结候选、受审哈希和报告摘要；`actual-scope.json` 保存已验收的两池原成员档案 SHA、08-14—09-29 共32计算日及5571代码范围。原档案 all/gem SHA 分别为 `f50016de6a135f9a5339ce4a399f5ade598ddf76ec6f9470df09452ab22c7c23` / `8a3b5b8439c799ed678de93f8ad87e4b756a57900e13fb8193e7d2e776fbff1f`；仅复用日程与计算范围，没有重新取提供方数据或重跑已成立的无中性化 worker。
+
+`run-cloud-proof.py` 仅打包精确候选的 tracked `src/` 和上述已核对档案摘要的范围，不包含 `.env`/凭据；SSH `lighthouse@82.156.0.68` 调用 `/home/lighthouse/rquant/.venv/bin/python`，代码、元数据及产物仅在自有 `/tmp/rquant-factor-market-cap-proof-20261001-<随机ID>`。标准超时和 finally 清理，没有服务/基础设施或生产数据写入。实际云端 Python 3.14.4，从 `/home/lighthouse/rquant/data/rquant_ro.duckdb` 准备原行情包及新市值包，同副本代/范围/SHA、单位和前后 generation 完全一致。
+
+- 原RO约10.0GiB，实际冻结时刻 `2026-10-01T14:00:30.706958+00:00`；范围08-12—09-30。原三表194187日线、194478复权、50日历行；总市值物化194187行，NULL/非正/非有限及闭市日行均0，全35开盘日结构缺行798。
+- 32计算日按实际绑定日历的前一开盘日核对，新reader分500码/一日，完整5571×32＝178272组合逐值/逐状态/逐计数对比原RO。177529有效值完全一致、743缺行如实保留；共385查询，包含一项09-30原API核验样本。首日08-14配08-13：5540有效/31缺；末日09-29配09-28：5557有效/14缺，没有当日收盘值用于09:25或前填。
+- 样本000001.SZ/09-30总市值原值 `22452647.3574` 万元，与原RO及先前实际API回执一致。这里核验原日期配对及原值，不产生历史首见时间或PIT声明，也不是中性化公式、最大负载或生产安装通过。
+- 行情准备9.967s、市值准备2.814s，总19.683s；峰值RSS324419584 bytes＝309.391MiB。关闭后的reader拒绝查询，私有副本和两类准备scratch空，源FD与自有lake FD均0，RO代未变。远端tmp finally 已移除，所有SSH/采集对照/门禁命令退出，本地诊断原件明确保留。
+
+行情来源SHA `be3f51bb694240324142a2e904a312f51ae616b72c73b1798fd4db1ee3fe8215`，市值来源SHA `a791d90eaecb32f8b832963d83d60fb1b926ad8d0db2af271adfd9e2862e41e3`，市值原件SHA `59d2e65558f7117a0af2cadc9f412640ffd352922ec54ad7e3c1b77c2f087280`。完整response和逐日结果为 `response.json` / `real-summary.json`，response SHA256 `69de353ba213b82107533839d56dc6e18e9f6beb4774c2b54198181829be8208`；命令、归档及远端路径在 `dispatch.json`、实际stdout/stderr中。
+
+### 清单、集成与剩余范围
+
+正常收集18956 cases / 55 skips，SHA256 `999bca1bf6f8a36beef499fad2056097a3f9cd0330b92d10c40f5780d6099ab8`。相对18935旧清单精确仅新增21，无旧删除/重复；批准跳过原字节及SHA `1367a714636bb473ff37edd8af1928d460d2b95f84f3c2658b6a4004cbb1b813` 不变。`comparison.json`保留精确差异；root临时比较脚本曾把nodeid逻辑摘要误按文件字节SHA核验，按仓库 `nodeid_digest` 规则修正后通过，产品候选未改。两必要门禁本地Python3.13.12实际2 passed / 8.60s（`gates.log/xml`），没有执行全部18956項或新CI。
+
+市值事实来源已接通；下一片接中性化流式计算与该来源、申万行业有效区间，再接实际可用参数及React交互。CSI完整历史、18:40跟踪、正式配置/数据代、完整资源与生产体验仍须完成；M3继续部分，整体goal active。本轮没有push、main merge、tag、部署或Streamlit切流，主工作树既有修改保持原件。
