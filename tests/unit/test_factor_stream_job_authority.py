@@ -381,3 +381,100 @@ def test_cancellation_after_heartbeat_join_before_terminal_branch_cleans_prepare
         finally:
             ledger._discard_job_prepared(claim.job.job_id)
             assert not ledger._prepared
+
+
+def test_old_worker_cleanup_and_stale_prepare_preserve_new_claim_handle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rquant.factor import job_worker
+
+    with _sealed(tmp_path) as (ledger, clock, claim, completion, root, members, metadata, lake):
+        clock.instant += timedelta(seconds=31)
+        original_complete = ledger.complete_prepared_stream
+        newer = newer_handle = worker_token = None
+
+        def reclaims_before_old_cas(
+            job_id: str, lease_token: str, version: int, handle: object
+        ) -> object:
+            nonlocal newer, newer_handle, worker_token
+            worker_token = lease_token
+            clock.instant += timedelta(seconds=31)
+            newer = ledger.claim(lease_seconds=30)
+            assert newer.job.job_id == job_id and newer.lease_token != lease_token
+            newer_handle = ledger.prepare_stream_completion(
+                job_id, newer.lease_token, completion, root, members
+            )
+            assert len(ledger._prepared) == 1
+            return original_complete(job_id, lease_token, version, handle)
+
+        monkeypatch.setattr(job_worker, "run_factor_stream_job", lambda *a, **k: completion)
+        monkeypatch.setattr(ledger, "complete_prepared_stream", reclaims_before_old_cas)
+        try:
+            old = job_worker.run_one_factor_job(
+                ledger,
+                metadata_store=metadata,
+                lake_root=lake,
+                artifact_root=root,
+                member_root=members,
+                runner_now=clock,
+            )
+            after_exit = len(ledger._prepared)
+            assert newer is not None and newer_handle is not None and worker_token is not None
+            renewed = ledger.heartbeat(newer.job.job_id, newer.lease_token, newer.version, 30)
+            with pytest.raises(FactorLedgerLeaseError):
+                ledger.prepare_stream_completion(
+                    newer.job.job_id, worker_token, completion, root, members
+                )
+            after_stale_prepare = len(ledger._prepared)
+            print(
+                f"SJ_FINAL_02: old_status={old.status} prepared_after_exit={after_exit} "
+                f"prepared_after_stale_prepare={after_stale_prepare} "
+                f"new_heartbeat_version={renewed.version}"
+            )
+            finished = original_complete(
+                newer.job.job_id, newer.lease_token, renewed.version, newer_handle
+            )
+            assert old.status == "lease_lost" and after_exit == after_stale_prepare == 1
+            assert finished.status == "succeeded" and not ledger._prepared
+            threads = sum(
+                t.name == "factor-job-heartbeat" and t.is_alive() for t in threading.enumerate()
+            )
+            copies = len(list((lake / ".execution_sessions").iterdir()))
+            assert threads == copies == 0
+            print(
+                f"SJ_FINAL_02_COMPLETE: new_status={finished.status} prepared=0 "
+                f"heartbeat_threads={threads} execution_copies={copies}"
+            )
+        finally:
+            ledger._discard_job_prepared(claim.job.job_id)
+
+
+def test_cancellation_before_prepare_handle_assignment_cleans_own_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rquant.factor.job_worker import run_one_factor_job
+
+    with _sealed(tmp_path) as (ledger, clock, claim, _, root, members, metadata, lake):
+        clock.instant += timedelta(seconds=31)
+        original = ledger.prepare_stream_completion
+
+        def prepared_then_cancel(*args: object, **kwargs: object) -> object:
+            handle = original(*args, **kwargs)
+            assert handle in ledger._prepared
+            raise KeyboardInterrupt("synthetic cancellation before handle assignment")
+
+        monkeypatch.setattr(ledger, "prepare_stream_completion", prepared_then_cancel)
+        with pytest.raises(KeyboardInterrupt, match="before handle assignment"):
+            run_one_factor_job(
+                ledger,
+                metadata_store=metadata,
+                lake_root=lake,
+                artifact_root=root,
+                member_root=members,
+                runner_now=clock,
+            )
+        assert not ledger._prepared and ledger.get(claim.job.job_id).status == "running"
+        assert not any(
+            t.name == "factor-job-heartbeat" and t.is_alive() for t in threading.enumerate()
+        )
+        assert not list((lake / ".execution_sessions").iterdir())

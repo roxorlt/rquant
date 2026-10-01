@@ -208,4 +208,4 @@ def run_one_factor_job(
                 return FactorJobWorkerResult(status="lease_lost", job_id=claimed.job.job_id)
             return FactorJobWorkerResult(status="failed", job_id=claimed.job.job_id, record=record)
     finally:
-        ledger._discard_job_prepared(claimed.job.job_id)
+        ledger._discard_job_prepared(claimed.job.job_id, lease_token=claimed.lease_token)

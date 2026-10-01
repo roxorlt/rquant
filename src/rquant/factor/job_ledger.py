@@ -914,10 +914,12 @@ class FactorEvaluationJobLedger:
             if type(handle) is object:
                 self._prepared.pop(handle, None)
 
-    def _discard_job_prepared(self, job_id: str) -> None:
+    def _discard_job_prepared(self, job_id: str, *, lease_token: str | None = None) -> None:
         with self._prepared_lock:
             for handle, prepared in tuple(self._prepared.items()):
-                if prepared.job_id == job_id:
+                if prepared.job_id == job_id and (
+                    lease_token is None or prepared.lease_token == lease_token
+                ):
                     del self._prepared[handle]
 
     def _prepared_stream(self, handle: object) -> _PreparedStream:
@@ -938,7 +940,7 @@ class FactorEvaluationJobLedger:
         member_root: Path,
     ) -> object:
         """Long verification outside the writer, while the worker keeps renewing."""
-        self._discard_job_prepared(job_id)
+        self._discard_job_prepared(job_id, lease_token=lease_token)
         self._prune_prepared_streams()
         with self._reader() as connection:
             state = self._load_job(connection, job_id)
@@ -966,7 +968,7 @@ class FactorEvaluationJobLedger:
         handle = object()
         with self._prepared_lock:
             for previous, record in tuple(self._prepared.items()):
-                if record.job_id == job_id:
+                if record.job_id == job_id and record.lease_token == lease_token:
                     del self._prepared[previous]
             if len(self._prepared) >= _MAX_LIST:
                 raise FactorLedgerCompletionError("stream prepared record capacity exceeded")
