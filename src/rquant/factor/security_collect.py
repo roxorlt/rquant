@@ -18,7 +18,7 @@ import time
 from collections.abc import Callable, Iterator, Sequence
 from datetime import UTC, date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Literal, Protocol, TypeVar
+from typing import TYPE_CHECKING, Literal, Protocol, TypeVar
 
 import pandas as pd
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -53,6 +53,9 @@ from rquant.security_status import normalize_name
 from rquant.source_quota_store import SourceQuotaAttempt, SourceQuotaExhaustedError
 from rquant.source_quota_transport import SourceTransportCallReceipt, SourceTransportObserver
 from rquant.strict_json import canonical_json_bytes, strict_canonical_json_loads, strict_json_loads
+
+if TYPE_CHECKING:
+    from rquant.factor.name_collect import CapturedNameResponse
 
 STOCK_REFERENCE_FIELDS = (
     "ts_code",
@@ -261,12 +264,18 @@ class SecurityCaptureAdapter(Protocol):
 
 
 class _CaptureBudget:
-    def __init__(self, max_calls: int) -> None:
+    def __init__(
+        self,
+        max_calls: int,
+        *,
+        api_names: frozenset[str] = frozenset({"stock_basic", "bak_basic"}),
+    ) -> None:
         self.max_calls = max_calls
+        self.api_names = api_names
         self.actual_call_count = 0
 
     def observe(self, api_name: str, call: Callable[[], _T]) -> _T:
-        if api_name not in {"stock_basic", "bak_basic"}:
+        if api_name not in self.api_names:
             raise SourceQuotaExhaustedError("capture API is outside the explicit scope")
         if self.actual_call_count >= self.max_calls:
             raise SourceQuotaExhaustedError("explicit security capture call budget exhausted")
@@ -365,7 +374,7 @@ def _write_new(root: Path, descriptor: int, filename: str, data: bytes) -> None:
     os.fsync(descriptor)
 
 
-def _publish_collection(root: Path, descriptor: int, manifest: SecurityCollectionManifest) -> None:
+def _publish_collection(root: Path, descriptor: int, manifest: BaseModel) -> None:
     data = _bytes(manifest)
     if len(data) > MAX_COLLECTION_BYTES:
         raise ValueError("collection manifest exceeds byte limit")
@@ -571,6 +580,7 @@ def normalize_security_day(
     references: Sequence[CapturedSecurityResponse],
     *,
     selection: UniverseSelection = "all",
+    name_sources: Sequence[CapturedNameResponse] = (),
 ) -> SecurityDayResult:
     """Cross-check the listing intervals and historical names; never guess missing members."""
     daily = CapturedSecurityResponse.model_validate(daily)
@@ -578,6 +588,22 @@ def normalize_security_day(
     if daily.request.api_name != "bak_basic":
         raise ValueError("daily normalization requires a bak_basic request")
     day = daily.request.trade_date
+    names: dict[str, CapturedNameResponse] = {}
+    used_names: list[CapturedNameResponse] = []
+    if name_sources:
+        from rquant.factor.name_collect import (
+            MAX_NAME_CODES,
+            CapturedNameResponse,
+            resolve_name_day,
+        )
+
+        if len(name_sources) > MAX_NAME_CODES:
+            raise ValueError("name supplement exceeds explicit code budget")
+        for source in name_sources:
+            source = CapturedNameResponse.model_validate(source)
+            if source.request.ts_code in names:
+                raise ValueError("duplicate name supplement code")
+            names[source.request.ts_code] = source
     diagnostics: list[SecuritySourceDiagnostic] = []
     _reference_coverage(references, diagnostics)
     if any(capture.observed_at.astimezone(_CHINA).date() < day for capture in (*references, daily)):
@@ -724,6 +750,25 @@ def normalize_security_day(
         row = expected[code][0]
         board = _MARKET_BOARD.get(row["market"])
         name, is_st = normalize_name(history.get(code, {}).get("name"))
+        if code in names:
+            evidence = resolve_name_day(names[code], day)
+            diagnostics.extend(evidence.diagnostics)
+            if evidence.name is not None:
+                if name is not None and name != evidence.name:
+                    diagnostics.append(
+                        _issue("name_daily_conflict", "daily and interval names differ", code)
+                    )
+                else:
+                    name, is_st = evidence.name, evidence.is_st
+                    used_names.append(names[code])
+                    diagnostics.append(
+                        _issue(
+                            "name_interval_used",
+                            "single effective namechange interval",
+                            code,
+                            info=True,
+                        )
+                    )
         if board is None:
             diagnostics.append(
                 _issue("unknown_market", "provider market has no explicit board", code, info=True)
@@ -760,13 +805,21 @@ def normalize_security_day(
                 daily,
             )
         )
+        source_id = "tushare:bak_basic+stock_basic:v1"
+        observations = [capture.observed_at for capture in (*references, daily)]
+        if used_names:
+            source_sha = canonical_sha256(
+                ("tushare-historical-security-names-v1", source_sha, tuple(used_names))
+            )
+            source_id = "tushare:bak_basic+stock_basic+namechange:v1"
+            observations.extend(capture.observed_at for capture in used_names)
         batch = DailySecurityBatch(
             trade_date=day,
-            source_id="tushare:bak_basic+stock_basic:v1",
+            source_id=source_id,
             source_sha256=source_sha,
             source_mode="historical_retrospective",
             security_scope="china_a_share",
-            observed_at=max(capture.observed_at for capture in (*references, daily)),
+            observed_at=max(observations),
             complete_stock_codes=tuple(expected),
             facts=tuple(facts),
         )
@@ -783,10 +836,15 @@ def normalize_security_day(
 
 
 def iter_security_collection_days(
-    root: Path, *, selection: UniverseSelection = "all"
+    root: Path, *, selection: UniverseSelection = "all", name_root: Path | None = None
 ) -> Iterator[SecurityDayResult]:
     """Keep one reusable reference and at most one daily response in memory."""
     manifest = load_security_capture_collection(root)
+    name_sources = ()
+    if name_root is not None:
+        from rquant.factor.name_collect import iter_name_captures
+
+        name_sources = tuple(iter_name_captures(name_root))
     descriptor = _open_private_root(root)
     try:
         references = tuple(
@@ -801,7 +859,9 @@ def iter_security_collection_days(
         }
         for day in manifest.trading_days:
             capture = _load_capture(descriptor, days[day])
-            result = normalize_security_day(capture, references, selection=selection)
+            result = normalize_security_day(
+                capture, references, selection=selection, name_sources=name_sources
+            )
             del capture
             _require_same_root(root, descriptor)
             yield result
@@ -925,6 +985,7 @@ def archive_security_collection(
     input_root: Path,
     root: Path,
     trading_days: tuple[date, ...] | None = None,
+    name_root: Path | None = None,
 ) -> FactorMemberArchiveReference:
     """Validate every requested day, then use the existing immutable archive publisher."""
     if selection in ("hs300", "zz1000"):
@@ -935,7 +996,9 @@ def archive_security_collection(
     if not days or not set(days) <= set(manifest.trading_days):
         raise ValueError("requested archive days are absent from source collection")
     codes: set[str] = set()
-    for result in iter_security_collection_days(capture_root, selection=selection):
+    for result in iter_security_collection_days(
+        capture_root, selection=selection, name_root=name_root
+    ):
         if result.trade_date not in days:
             continue
         if not result.accepted:
@@ -952,7 +1015,9 @@ def archive_security_collection(
     descriptor = _new_root(input_root)
     try:
         names: list[str] = []
-        for result in iter_security_collection_days(capture_root, selection=selection):
+        for result in iter_security_collection_days(
+            capture_root, selection=selection, name_root=name_root
+        ):
             if result.trade_date not in days:
                 continue
             if not result.accepted:
@@ -1013,9 +1078,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     probe.add_argument("--root", type=Path, required=True)
     replay = commands.add_parser("replay", help="离线核对日期并输出拒绝原因与来源诊断")
     replay.add_argument("--capture-root", type=Path, required=True)
+    replay.add_argument("--name-root", type=Path, help="可选的单代码完整历史名称来源")
     replay.add_argument("--selection", choices=("all", "gem", "hs300", "zz1000"), default="all")
     archive = commands.add_parser("archive", help="按现有成员归档合同发布完整日期")
     archive.add_argument("--capture-root", type=Path, required=True)
+    archive.add_argument("--name-root", type=Path, help="可选的单代码完整历史名称来源")
     archive.add_argument("--selection", choices=("all", "gem", "hs300", "zz1000"), required=True)
     archive.add_argument("--as-of", type=_cli_time, required=True)
     archive.add_argument("--input-root", type=Path, required=True)
@@ -1040,7 +1107,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             results = []
             failed = False
             for result in iter_security_collection_days(
-                args.capture_root, selection=args.selection
+                args.capture_root, selection=args.selection, name_root=args.name_root
             ):
                 failed = failed or not result.accepted
                 results.append(
@@ -1070,6 +1137,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 input_root=args.input_root,
                 root=args.archive_root,
                 trading_days=None if args.days is None else tuple(args.days),
+                name_root=args.name_root,
             )
             print(
                 canonical_json_bytes(
