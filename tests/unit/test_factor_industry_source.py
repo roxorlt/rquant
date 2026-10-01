@@ -505,3 +505,97 @@ def test_ordinary_module_import_does_not_initialize_settings_or_network(
     monkeypatch.setattr(Settings, "__init__", forbidden)
     monkeypatch.setattr(socket, "socket", forbidden)
     importlib.reload(_module())
+
+
+def test_provider_delisted_alias_is_retained_raw_but_excluded_from_computation(
+    tmp_path: Path,
+) -> None:
+    m = _module()
+    alias = "T12345.SH"
+
+    def fetch(request: object) -> object:
+        capture = _capture(m, request)
+        if request.l1_code != "801010.SI" or request.is_new != "Y":
+            return capture
+        frame = pd.DataFrame(capture.response.items, columns=capture.response.fields)
+        frame.loc[len(frame)] = dict(
+            _member(1, "20100101", name="合成退市行业"),
+            ts_code=alias,
+            name="合成退市证券",
+            l1_code=request.l1_code,
+            is_new=request.is_new,
+        )
+        return m.make_industry_capture(
+            request,
+            frame,
+            requested_at=capture.requested_at,
+            observed_at=capture.observed_at,
+            transport_receipt=capture.transport_receipt,
+        )
+
+    root = tmp_path / "capture"
+    manifest = m.collect_industry_sources(m.IndustryCaptureRequest(root=root), fetch=fetch)
+    reference = manifest.responses[1]
+    raw = m.CapturedIndustryResponse.model_validate_json((root / reference.filename).read_bytes())
+    assert raw.response_sha256 == hashlib.sha256(_bytes(raw.response)).hexdigest()
+    assert raw.requested_at == raw.observed_at == _CAPTURED
+    original = [dict(zip(raw.response.fields, row, strict=True)) for row in raw.response.items]
+    assert original[-1]["ts_code"] == alias
+    assert original[-1]["name"] == "合成退市证券"
+    assert original[-1]["l1_name"] == "合成退市行业"
+    assert m.load_industry_collection(root) == manifest
+    prepared = _prepared(tmp_path)
+    lake = tmp_path / "industry-lake"
+    source = m.prepare_factor_industry_source(
+        m.FactorIndustryPrepareRequest(prepared_source=prepared, collection_root=root),
+        lake_root=lake,
+        now=lambda: _AS_OF,
+    )
+    assert source.scope.stock_codes == _CODES and source.artifact.row_count == 11
+    assert sum(ref.row_count for ref in manifest.responses[1:]) == 12
+    with m.open_factor_industry_source(source, lake_root=lake) as lease:
+        batch = lease.query(_query(m, source, offset=1))
+        assert tuple(fact.stock_code for fact in batch.facts) == _CODES
+        assert [fact.status for fact in batch.facts] == [
+            "boundary_unverified",
+            "valid",
+            "valid",
+            "valid",
+            "ambiguous",
+            "missing",
+            "valid",
+            "boundary_unverified",
+        ]
+        assert sum(batch.counts.model_dump().values()) == 8
+        with pytest.raises(ValueError):
+            _query(m, source, codes=(alias,))
+    with pytest.raises(ValueError):
+        m.FactorComputationScope(
+            stock_codes=(alias,),
+            start_date=_FIRST,
+            end_date=_FIRST,
+            as_of_time=_AS_OF,
+        )
+
+
+def test_provider_alias_rule_still_refuses_malformed_symbol() -> None:
+    m = _module()
+    request = m.IndustrySourceRequest(
+        api_name="index_member_all",
+        l1_code="801010.SI",
+        is_new="Y",
+    )
+    frame = pd.DataFrame(
+        [
+            dict(_member(1, "20100101"), ts_code="T1234.SH", l1_code="801010.SI", is_new="Y"),
+        ],
+        columns=request.fields,
+    )
+    with pytest.raises(ValueError, match="invalid code/name"):
+        m.make_industry_capture(
+            request,
+            frame,
+            requested_at=_CAPTURED,
+            observed_at=_CAPTURED,
+            transport_receipt=_receipt(request),
+        )

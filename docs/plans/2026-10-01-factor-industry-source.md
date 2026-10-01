@@ -96,3 +96,24 @@ SHA-256：
 所有命令已退出，无后台进程/运行会话。正常与异常 reader 退出实际验证连接关闭、私有副本删除且 lease 再读拒绝；改变原 DB、collection 与 Parquet 后活动私有 reader 仍返回同一事实。证据根检查没有 `.industry-prepare-*`、`.industry-reader-*`、发布临时文件或 `*.tmp-*`；诊断原件/失败夹具仅留自有证据目录。采集和准备的 FD 在 finally 关闭，逐文件读/发布复用既有 FD 工具。
 
 未访问实际三份预检或做真实 63 响应/32 日对照，未执行中性化、下一交易日映射、历史 PIT、最大负载或 3.11/3.12 runtime 验收。root 在本地干净候选后安排唯一最终独立审查，再完成冻结计划第 7 项实际来源对照及本地集成；普通最多一次定向修复，不沿用其他任务例外。
+
+## FIS-FINAL-01：唯一一次定向修复（2026-10-01）
+
+初版干净候选 `8eb267fc56c48f76289e42694396f201172045ad` 已由唯一集中审查 ACCEPT。其后 root 实际 SDK 发现 `index_member_all` 交通行业 Y 含退市原始别名 `T00018.SH`，旧六位计算代码规则误拒绝合法原件。root 报告已保存完整 63 响应/7920 成员行，总实际调用 64（3 旧预检 + 61 新 SDK，含一次未保留 frame 的精确重取），预算耗尽，不再请求。子任务没有访问这些实际资料；该新证据启动本片普通任务第 1 次、也是唯一一次定向修复，未使用此前 FHA 例外。
+
+修复前再次实际确认同一原生 implementer/父 `/root`、指定分支、上述 HEAD 和 clean status。写集仍仅原三文件。仅在原件词法校验使用独立 `_PROVIDER_SYMBOL`：正常六位数字或恰好 `T` + 五位数字，后缀 `.SH/.SZ/.BJ`；不接受任意字符串。原值、名称、日期、时刻、摘要不变，原行业/状态/字段/配额校验不变。共享 StockCode、FactorComputationScope、按日 query 和区间筛选均未改，别名不能加入计算范围、映射成另一股票或前填。
+
+实际环境/清洁离线前缀沿用上节；证据根 `/private/tmp/rquant-industry-implementation-hyufgvsh/fis-final-01`。必要命令为：
+
+| 公共前缀后的实际参数 | 结果 | 证据 |
+| --- | --- | --- |
+| `-m pytest tests/unit/test_factor_industry_source.py::test_provider_delisted_alias_is_retained_raw_but_excluded_from_computation tests/unit/test_factor_industry_source.py::test_provider_alias_rule_still_refuses_malformed_symbol -q --tb=short --basetemp=/private/tmp/rquant-industry-implementation-hyufgvsh/fis-final-01/red-tmp --junitxml=/private/tmp/rquant-industry-implementation-hyufgvsh/fis-final-01/red.xml` | exit 1，1 failed / 1 passed / 1.23s；合成 T12345.SH 被旧原件规则误拒绝，坏 symbol 拒绝已成立 | `red.log/xml` |
+| `-m pytest tests/unit/test_factor_industry_source.py::test_provider_delisted_alias_is_retained_raw_but_excluded_from_computation tests/unit/test_factor_industry_source.py::test_provider_alias_rule_still_refuses_malformed_symbol tests/unit/test_factor_industry_source.py::test_complete_31_industries_reuses_three_imports_and_dispatches_only_60 tests/unit/test_factor_industry_source.py::test_two_days_preserve_old_intervals_changes_overlap_missing_and_unverified_endpoints tests/unit/test_factor_industry_source.py::test_bad_provider_schema_intervals_or_limit_cannot_complete -q --tb=short --basetemp=/private/tmp/rquant-industry-implementation-hyufgvsh/fis-final-01/green-tmp --junitxml=/private/tmp/rquant-industry-implementation-hyufgvsh/fis-final-01/green.xml` | exit 0，10 passed / 1.74s，新增 2 + 直接相关旧 8 | `green.log/xml` |
+
+合成原件保留 `T12345.SH`、中文证券/行业名、原时刻和响应摘要；成员原件为 12 行，合法八码准备范围的 Parquet 仍 11 行，reader 输出八码完整事实/状态计数，别名 Scope/query 均明确拒绝。明显错误 `T1234.SH` 仍拒绝。没有读取真实别名资料、再发 SDK 请求、泛化新矩阵或重跑整个测试文件。
+
+新增精确两节点见修复目录 `new-nodeids.txt`；上级 `new-nodeids.txt` 已更新为本片全部 29 新节点。复用原 27 新节点和 2 个直接旧成功节点的有效证据；本次实际只跑上述 10 节点，不声称重跑 29/31。修复摘要为 `evidence-summary.json`，完整修复 diff 为 `fix.diff`。
+
+`-m ruff check` 和 `-m ruff format --check` 对两文件均 exit 0，见修复目录 `ruff-check.log` / `ruff-format-check.log`；3.11 AST 语法检查通过，实际 runtime 仍 3.13.12。最新 SHA-256：source `ba1ec66c17bb5d2b28a50711863feced9e37df61f65f080d3ec0d069a5caaa87`，test `02f33f4e9b9238bad9fd3d386433987518830131fa045e3075969809e27197a0`。
+
+所有命令已结束，无运行会话/后台进程；自有证据根没有准备、reader 或发布临时文件遗留，合成失败原件仅保留诊断。干净本地修复 commit 后停写，交原 reviewer 只复核本 ID 与直接修复回归；本片普通修复次数已用完，如仍阻断须停写报告。

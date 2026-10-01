@@ -28,7 +28,6 @@ from rquant.factor.result_artifact import (
 )
 from rquant.factor.security_collect import (
     _MODEL,
-    _STOCK_CODE,
     RawSecurityTable,
     _bytes,
     _new_root,
@@ -77,6 +76,8 @@ MAX_INDUSTRY_CALLS = 64
 MAX_INDUSTRIES = 31
 MAX_INDUSTRY_BYTES = 2 * 1024 * 1024
 _INDEX = re.compile(r"[0-9]{6}\.SI\Z")
+# Provider delisting aliases remain raw symbols, never computation stock codes.
+_PROVIDER_SYMBOL = re.compile(r"(?:[0-9]{6}|T[0-9]{5})\.(?:SH|SZ|BJ)\Z")
 _DEPENDENCY = StrategyTableDependency(
     dataset_id="factor_industry",
     table_name="industry_interval",
@@ -218,7 +219,7 @@ class CapturedIndustryResponse(BaseModel):
                     row["l1_code"] != self.request.l1_code
                     or row["is_new"] != self.request.is_new
                     or not isinstance(row["ts_code"], str)
-                    or not _STOCK_CODE.fullmatch(row["ts_code"])
+                    or not _PROVIDER_SYMBOL.fullmatch(row["ts_code"])
                     or not isinstance(row["l1_name"], str)
                     or not row["l1_name"].strip()
                 ):
