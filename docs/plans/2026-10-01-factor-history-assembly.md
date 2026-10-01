@@ -57,3 +57,13 @@ python -m rquant.factor.history_assemble archive --capture-root <完成批次一
 - 可选名称的跨批CLI按既有完整区间来源补值通过；普通模块导入的子进程证实无Settings/客户端初始化。Ruff check、format --check及git diff --check通过，两源/测试文件3.11语法解析通过；实际runtime仅3.13.12，不宣称3.11/3.12运行验证。
 
 资源处置：全部工具命令会话及subprocess子进程退出，未启动后台服务；自有证据根无发布`*.tmp`。合成采集、CLI输入/归档、离线配置及日志保留终审，测试临时资料遵循pytest默认保留，未全局清理。真实来源目录未写入。冻结干净候选后由root安排一次集中终审、实际32日装配/原RO-worker、清单两项门禁及本地集成决策。
+
+## 唯一定向修复 FHA-FINAL-01（2026-10-01）
+
+从干净候选`020585308c542c70f7821ae453a010928a7da76c`开始，已读原reviewer的完整审查及精确复现。原自然尾部检查之后、最终manifest写入之前改变来源仍能成功，违反本计划验收；仅在新装配层保留自有归档目录句柄，原publisher返回后读取并验证刚发布manifest的实际SHA/文件身份，再复核来源。复核拒绝时按已确认dev/inode移除该成功manifest并fsync目录，所有句柄在finally关闭。部分自有日文件保留诊断，原v1 publisher/reader、来源及worker合同零改动。
+
+- 唯一新增节点：`tests/unit/test_factor_history_assemble.py::test_source_change_before_final_manifest_write_removes_owned_completion`。`fha-final-01-red.log/xml`为1 failed/1.42s（DID NOT RAISE）；局部修复后`fha-final-01-green.log/xml`为1 passed/1.40s。
+- `fha-final-01-regression.log/xml`实际7 passed/2.15s：新增边界、原32日all/gem黄金、可选名称CLI、原较早尾部拒绝及两个直接旧publisher/reader节点；无skip/deselect。未重跑19项全文件或61/259旧套件，仍有效结果复用。全部20新增节点已更新`new-nodeids.txt`，修复1项及实际回归7项另存精确清单；去重有效口径61+259+20=340，并非本次执行340项。
+- 原reviewer的`repro.py`字节不变复制到自有`fha-final-01-repro`目录，离线实跑返回`member file changed after read`、成功manifest数0。脚本内candidate固定标签仍指修复起点，执行的是当前修复源码；上下文和实际源码SHA记录于`fha-final-01-evidence.json`。原reviewer证据与root实际来源未写入。
+- 同一Python3.13.12及既有离线配置；Ruff check、format --check、两文件3.11语法解析与git diff --check通过，未宣称3.11 runtime验证。命令及结果在同一自有证据根的`fha-final-01-*`收据中。
+- 所有本轮命令及pytest/CLI子进程已退出，无后台进程或发布`*.tmp`；故障仅改变自有合成原件，拒绝后成功manifest已清理，诊断资料保留。三文件局部commit后干净冻结，交原reviewer仅复核本ID及直接修复回归，不继续第二轮或扩大范围。

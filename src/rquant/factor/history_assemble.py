@@ -19,6 +19,7 @@ from typing import Literal
 from pydantic import BaseModel, Field, model_validator
 
 from rquant.factor.member_archive import (
+    MAX_FACTOR_MEMBER_MANIFEST_BYTES,
     FactorMemberArchiveReference,
     FactorMemberArchiveRequest,
     FactorMemberDayInput,
@@ -28,6 +29,7 @@ from rquant.factor.member_archive import (
 )
 from rquant.factor.name_collect import NameCollectionManifest, load_name_capture_collection
 from rquant.factor.result_artifact import (
+    _cleanup_owned_temporary,
     _file_identity,
     _open_private_root,
     _require_same_root,
@@ -306,13 +308,30 @@ def assemble_history_archive(request: HistoryAssemblyRequest) -> FactorMemberArc
         _check_sources(preview)
         _require_same_root(request.input_root, descriptor)
         archive_descriptor = _new_root(request.root)
-        os.close(archive_descriptor)
-        return publish_factor_member_archive(
-            archive_request,
-            input_root=request.input_root,
-            root=request.root,
-            daily_filenames=_checked_filenames(request, preview),
-        )
+        try:
+            reference = publish_factor_member_archive(
+                archive_request,
+                input_root=request.input_root,
+                root=request.root,
+                daily_filenames=_checked_filenames(request, preview),
+            )
+            data, identity = _read_file(
+                archive_descriptor,
+                reference.filename,
+                MAX_FACTOR_MEMBER_MANIFEST_BYTES,
+                reference.sha256,
+            )
+            del data
+            try:
+                _require_same_root(request.root, archive_descriptor)
+                _check_sources(preview)
+            except BaseException:
+                _cleanup_owned_temporary(archive_descriptor, reference.filename, identity[:2])
+                os.fsync(archive_descriptor)
+                raise
+            return reference
+        finally:
+            os.close(archive_descriptor)
     finally:
         os.close(descriptor)
 

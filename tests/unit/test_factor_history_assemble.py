@@ -359,6 +359,36 @@ def test_source_change_during_publisher_tail_read_cannot_publish_success(
     _no_manifest(request.root)
 
 
+def test_source_change_before_final_manifest_write_removes_owned_completion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    m = _module()
+    import rquant.factor.member_archive as archive
+
+    source = _collection(tmp_path / "source", _DAYS[:2])
+    raw = source / f"bak-basic-{_DAYS[0]:%Y%m%d}.json"
+    original = archive._publish_bytes
+    published = []
+
+    def change_before_manifest(
+        root: Path, root_fd: int, name: str, data: bytes, limit: int
+    ) -> tuple[int, ...]:
+        if name.startswith("factor-member-archive-v1-"):
+            raw.write_bytes(b"{}")
+        identity = original(root, root_fd, name, data, limit)
+        if name.startswith("factor-member-archive-v1-"):
+            published.append((name, identity))
+        return identity
+
+    monkeypatch.setattr(archive, "_publish_bytes", change_before_manifest)
+    request = _request(tmp_path, (source,), _DAYS[:2])
+    with pytest.raises(ValueError):
+        m.assemble_history_archive(request)
+    assert len(published) == 1
+    assert raw.read_bytes() == b"{}"
+    _no_manifest(request.root)
+
+
 def test_prior_batch_models_are_released_before_opening_the_next_batch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
