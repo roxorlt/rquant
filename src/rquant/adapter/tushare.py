@@ -348,6 +348,19 @@ class TushareAdapter:
         logger.info(f"Tushare namechange 返回 {len(normalized)} 行")
         return normalized
 
+    def namechange_history_raw(self, *, ts_code: str) -> pd.DataFrame:
+        """Preserve one code's history; start/end would filter announcement dates."""
+        frame = self._call_with_backoff(
+            "namechange",
+            lambda: self._pro.namechange(
+                ts_code=ts_code,
+                fields="ts_code,name,start_date,end_date,ann_date,change_reason",
+            ),
+        )
+        if not isinstance(frame, pd.DataFrame):
+            raise ValueError("namechange response is not a table")
+        return frame
+
     def suspend_d_raw(self, trade_date: date) -> pd.DataFrame:
         """Fetch the full-market suspend/resume event snapshot for one date."""
         columns = ["ts_code", "trade_date", "suspend_timing", "suspend_type"]
