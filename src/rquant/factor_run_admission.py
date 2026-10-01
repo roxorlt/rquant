@@ -10,6 +10,7 @@ from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from threading import Lock
 
+from rquant.factor.run_plan import FactorRunPlanRejectedError
 from rquant.factor.run_request import (
     FactorRunAvailability,
     FactorRunOperationResult,
@@ -117,11 +118,37 @@ class FactorRunAdmission:
     ) -> FactorRunOperationResult:
         self._authorize(authenticated_actor_id)
         with self._lock:
-            receipt = self.service._submit_trusted_factor_run(
-                request,
-                authenticated_actor_id=authenticated_actor_id,
-                verified_registry_instance_id=verified_registry_instance_id,
-            )
+            try:
+                receipt = self.service._submit_trusted_factor_run(
+                    request,
+                    authenticated_actor_id=authenticated_actor_id,
+                    verified_registry_instance_id=verified_registry_instance_id,
+                )
+            except FactorRunPlanRejectedError as exc:
+                if (
+                    self.service.outbox.lookup_factor_run_command(
+                        request, authenticated_actor_id=authenticated_actor_id
+                    )
+                    is not None
+                ):
+                    raise PageControlCommandConflictError(
+                        "original run is not unsubmitted"
+                    ) from exc
+                self.service.consumer._factor_run_backend().confirm_unsubmitted(
+                    request, verified_registry_instance_id=verified_registry_instance_id
+                )
+                if (
+                    self.service.outbox.lookup_factor_run_command(
+                        request, authenticated_actor_id=authenticated_actor_id
+                    )
+                    is not None
+                ):
+                    raise PageControlCommandConflictError(
+                        "original run is not unsubmitted"
+                    ) from exc
+                return FactorRunOperationResult(
+                    original_request=request, status="rejected", reason=exc.reason
+                )
             return self._result(request, receipt)
 
 

@@ -12,7 +12,7 @@ from pydantic import JsonValue
 
 from rquant.factor.job_ledger import FactorEvaluationJobLedger, FactorJobRecord
 from rquant.factor.member_archive import _READ_FLAGS, _check_identities, _load_manifest
-from rquant.factor.registry import FactorDefinitionRegistry
+from rquant.factor.registry import FactorDefinitionRegistry, FactorHeadRef
 from rquant.factor.result_artifact import _file_identity, _open_private_root, _require_named_regular
 from rquant.factor.run_configuration import (
     FactorRunConfiguration,
@@ -114,6 +114,30 @@ class FactorRunPageControlBackend:
             verified_registry_instance_id=verified_registry_instance_id,
             clock=self.clock,
         )
+
+    def confirm_unsubmitted(
+        self, request: FactorRunRequest, *, verified_registry_instance_id: str
+    ) -> None:
+        with open_factor_run_configuration(self.root, self.reference) as loaded:
+            config = loaded.configuration
+            if config.registry_identity.instance_id != verified_registry_instance_id:
+                raise ValueError("定义来源已变化，请刷新")
+            registry = FactorDefinitionRegistry(Path(config.registry_identity.path))
+            record = registry.get_head(
+                request.parameters.factor_id, expected_identity=config.registry_identity
+            )
+            if (
+                record is None
+                or record.head.archived
+                or FactorHeadRef(
+                    version=record.head.version, content_sha256=record.head.content_sha256
+                )
+                != request.parameters.expected_head
+            ):
+                raise ValueError("定义版本已变化，请刷新")
+            if loaded.open_ledger(clock=self.clock).command_exists(request.command_id):
+                raise ValueError("原操作已有任务记录，请继续核对原请求")
+            loaded.recheck()
 
     def validate(self, command: _OwnedSubmitFactorRun) -> None:
         registry = FactorDefinitionRegistry(Path(command.registry_identity.path))

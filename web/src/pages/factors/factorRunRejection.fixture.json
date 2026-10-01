@@ -1,0 +1,146 @@
+{
+  "actor": "alice",
+  "request": {
+    "command_id": "d223659a-99d0-4358-ad6a-a75fb05bea23",
+    "requested_at": "2026-08-01T08:00:00Z",
+    "serving_generation_id": "4b57a4c8fe09ee06acec03a45be015c060930b4c5bcb3b5d479c4aec266d35d4",
+    "parameters": {
+      "factor_id": "entry_test",
+      "expected_head": {
+        "version": 1,
+        "content_sha256": "b42eabaa7e31895211717bf07f29e73ff862fbeffa0cb1f76fb2ab5909e6a7a9"
+      },
+      "selection": "all",
+      "start_date": "2026-07-01",
+      "end_date": "2026-07-11",
+      "holding_sessions": 5,
+      "group_count": 5,
+      "ic_method": "rank",
+      "neutralization": "none"
+    }
+  },
+  "availability": {
+    "enabled": true,
+    "reason": null,
+    "pools": [
+      {
+        "selection": "all",
+        "label": "全市场（剔除北交所、ST）",
+        "available": true,
+        "reason": null
+      },
+      {
+        "selection": "hs300",
+        "label": "沪深300",
+        "available": false,
+        "reason": "缺少该股票池的历史归档"
+      },
+      {
+        "selection": "zz1000",
+        "label": "中证1000",
+        "available": false,
+        "reason": "缺少该股票池的历史归档"
+      },
+      {
+        "selection": "gem",
+        "label": "创业板 + 科创板",
+        "available": false,
+        "reason": "缺少该股票池的历史归档"
+      }
+    ],
+    "start_date": "2026-07-01",
+    "end_date": "2026-07-30"
+  },
+  "responses": {
+    "submit": {
+      "status": 200,
+      "body": {
+        "data": {
+          "original_request": {
+            "command_id": "d223659a-99d0-4358-ad6a-a75fb05bea23",
+            "requested_at": "2026-08-01T08:00:00Z",
+            "serving_generation_id": "4b57a4c8fe09ee06acec03a45be015c060930b4c5bcb3b5d479c4aec266d35d4",
+            "parameters": {
+              "factor_id": "entry_test",
+              "expected_head": {
+                "version": 1,
+                "content_sha256": "b42eabaa7e31895211717bf07f29e73ff862fbeffa0cb1f76fb2ab5909e6a7a9"
+              },
+              "selection": "all",
+              "start_date": "2026-07-01",
+              "end_date": "2026-07-11",
+              "holding_sessions": 5,
+              "group_count": 5,
+              "ic_method": "rank",
+              "neutralization": "none"
+            }
+          },
+          "status": "rejected",
+          "reason": "开始日期前的历史数据不足，请调整开始日期。",
+          "job_id": null,
+          "spec_sha256": null
+        },
+        "serving": {
+          "generation_id": "4b57a4c8fe09ee06acec03a45be015c060930b4c5bcb3b5d479c4aec266d35d4",
+          "built_at": "2026-09-24T07:31:00Z",
+          "age_seconds": 60.0,
+          "state": "ready",
+          "message": null,
+          "detail": "serving generation verified"
+        }
+      }
+    },
+    "resume": {
+      "status": 404,
+      "body": {
+        "detail": "原请求尚未确认，请重试原请求。"
+      }
+    },
+    "retry": {
+      "status": 200,
+      "body": {
+        "data": {
+          "original_request": {
+            "command_id": "d223659a-99d0-4358-ad6a-a75fb05bea23",
+            "requested_at": "2026-08-01T08:00:00Z",
+            "serving_generation_id": "4b57a4c8fe09ee06acec03a45be015c060930b4c5bcb3b5d479c4aec266d35d4",
+            "parameters": {
+              "factor_id": "entry_test",
+              "expected_head": {
+                "version": 1,
+                "content_sha256": "b42eabaa7e31895211717bf07f29e73ff862fbeffa0cb1f76fb2ab5909e6a7a9"
+              },
+              "selection": "all",
+              "start_date": "2026-07-01",
+              "end_date": "2026-07-11",
+              "holding_sessions": 5,
+              "group_count": 5,
+              "ic_method": "rank",
+              "neutralization": "none"
+            }
+          },
+          "status": "rejected",
+          "reason": "开始日期前的历史数据不足，请调整开始日期。",
+          "job_id": null,
+          "spec_sha256": null
+        },
+        "serving": {
+          "generation_id": "4b57a4c8fe09ee06acec03a45be015c060930b4c5bcb3b5d479c4aec266d35d4",
+          "built_at": "2026-09-24T07:31:00Z",
+          "age_seconds": 60.0,
+          "state": "ready",
+          "message": null,
+          "detail": "serving generation verified"
+        }
+      }
+    }
+  },
+  "context": "Synthetic real factory, PageControl, Unix transport and authenticated Web. UID seam is the existing test fixture; not installed dual-UID proof.",
+  "resources": {
+    "listener_joined": true,
+    "socket_removed": true,
+    "execution_copies": 0,
+    "jobs": 0,
+    "outbox_receipt": null
+  }
+}

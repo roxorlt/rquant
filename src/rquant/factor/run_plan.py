@@ -13,6 +13,14 @@ from rquant.factor.registry import FactorHeadRef, FactorRegistryIdentity
 from rquant.factor.run_request import RUN_IMMUTABLE, FactorRunRequest
 
 
+class FactorRunPlanRejectedError(ValueError):
+    """A parameter window cannot run against the verified frozen calendar."""
+
+    def __init__(self, message: str, *, reason: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
 class FactorRunSchedule(BaseModel):
     model_config = RUN_IMMUTABLE
 
@@ -42,17 +50,27 @@ def compile_factor_run_schedule(
         raise ValueError("检验参数或冻结日历不正确")
     indexes = tuple(i for i, day in enumerate(open_days) if start_date <= day <= end_date)
     if not indexes:
-        raise ValueError("所选区间没有交易日")
+        raise FactorRunPlanRejectedError(
+            "所选区间没有交易日", reason="所选区间没有交易日，请调整日期。"
+        )
     evaluations = indexes[::holding_sessions]
     first = evaluations[0] - history_window + 1
     last = evaluations[-1] + holding_sessions - 1
     if first < 1:
-        raise ValueError("来源缺少预热或首日前一交易日")
+        raise FactorRunPlanRejectedError(
+            "来源缺少预热或首日前一交易日",
+            reason="开始日期前的历史数据不足，请调整开始日期。",
+        )
     if last + 1 >= len(open_days):
-        raise ValueError("来源缺少完整收益窗口或下一交易日")
+        raise FactorRunPlanRejectedError(
+            "来源缺少完整收益窗口或下一交易日",
+            reason="结束日期后的收益数据不足，请调整结束日期。",
+        )
     calculation = open_days[first : last + 1]
     if len(calculation) > 1024:
-        raise ValueError("计算区间超过 1024 个交易日")
+        raise FactorRunPlanRejectedError(
+            "计算区间超过 1024 个交易日", reason="检验区间过长，请缩短日期范围。"
+        )
     return FactorRunSchedule(
         evaluation_days=tuple(open_days[i] for i in evaluations),
         calculation_days=calculation,
@@ -158,13 +176,23 @@ def compile_factor_run_plan(
                 start = end + timedelta(days=1)
             if tuple(opened) != source.receipt.calendar_open_days:
                 raise ValueError("来源包日历与实际冻结来源不同")
-        schedule = compile_factor_run_schedule(
-            tuple(opened),
-            start_date=params.start_date,
-            end_date=params.end_date,
-            holding_sessions=params.holding_sessions,
-            history_window=record.definition.max_history_window,
-        )
+        try:
+            schedule = compile_factor_run_schedule(
+                tuple(opened),
+                start_date=params.start_date,
+                end_date=params.end_date,
+                holding_sessions=params.holding_sessions,
+                history_window=record.definition.max_history_window,
+            )
+        except FactorRunPlanRejectedError:
+            loaded.recheck()
+            loaded.open_ledger(clock=clock)
+            if (
+                registry.get_head(params.factor_id, expected_identity=config.registry_identity)
+                != record
+            ):
+                raise ValueError("定义版本已变化，请刷新") from None
+            raise
         binding = next(
             (item for item in config.members if item.selection == params.selection), None
         )

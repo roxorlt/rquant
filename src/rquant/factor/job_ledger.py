@@ -731,6 +731,18 @@ class FactorEvaluationJobLedger:
             )
             return state.public()
 
+    def command_exists(self, command_id: str) -> bool:
+        """Any original command anchor prevents declaring an operation unsubmitted."""
+        if not isinstance(command_id, str) or _COMMAND_PATTERN.fullmatch(command_id) is None:
+            raise ValueError("factor command ID is invalid")
+        with self._reader() as connection:
+            return (
+                connection.execute(
+                    "SELECT 1 FROM factor_commands WHERE command_id = ?", (command_id,)
+                ).fetchone()
+                is not None
+            )
+
     def lookup_command(self, command_id: str, spec_sha256: str) -> FactorJobRecord | None:
         """Read one original command anchor without creating or rebasing its ledger."""
         if not isinstance(command_id, str) or _COMMAND_PATTERN.fullmatch(command_id) is None:

@@ -116,6 +116,64 @@ afterEach(() => {
 });
 
 describe("因子运行入口", () => {
+  it.each([
+    { name: "命令冲突", statuses: [409, 409, 409] },
+    { name: "续查尚无记录", statuses: [503, 404, 409] },
+    { name: "网络失联", statuses: [0, 0, 0] },
+  ])("$name 不能当作可信未入队拒绝，重载仍保留完整原操作", async ({ statuses }) => {
+    publish();
+    const seen: Schemas["FactorRunRequest"][] = [];
+    for (const [index, suffix] of ["", "/resume", "/retry"].entries()) {
+      server.use(
+        http.post(`*/api/v1/factors/runs${suffix}`, async ({ request }) => {
+          seen.push((await request.json()) as Schemas["FactorRunRequest"]);
+          const status = statuses[index] ?? 503;
+          return status === 0
+            ? HttpResponse.error()
+            : HttpResponse.json(
+                {
+                  detail:
+                    status === 404
+                      ? "原请求尚未确认，请重试原请求。"
+                      : "原请求暂不可推进，请核对参数和来源。",
+                },
+                { status },
+              );
+        }),
+      );
+    }
+    const view = renderApp("/factors");
+    const user = await confirmRun();
+    await screen.findByText("检验结果暂未确认，请保留本次操作。");
+    await user.click(screen.getByRole("button", { name: "刷新检验状态" }));
+    await waitFor(() => expect(seen).toHaveLength(2));
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "用原请求重试检验" })).toBeEnabled(),
+    );
+    await user.click(screen.getByRole("button", { name: "用原请求重试检验" }));
+    await waitFor(() => expect(seen).toHaveLength(3));
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "用原请求重试检验" })).toBeEnabled(),
+    );
+    view.unmount();
+    renderApp("/factors");
+    await waitFor(() => expect(seen).toHaveLength(4));
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "用原请求重试检验" })).toBeEnabled(),
+    );
+    expect(seen).toEqual([seen[0], seen[0], seen[0], seen[0]]);
+    const stored: {
+      request: Schemas["FactorRunRequest"];
+      result: Schemas["FactorRunOperationResult"];
+    } = JSON.parse(localStorage.getItem(runKey) ?? "null");
+    expect(stored.request).toEqual(seen[0]);
+    expect(stored.result.status).toBe("uncertain");
+    expect(stored.result.job_id).toBeNull();
+    expect(screen.queryByRole("button", { name: "修改检验参数" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "归档" })).toBeNull();
+    for (const button of screen.getAllByRole("button", { name: "运行检验" }))
+      expect(button).toBeDisabled();
+  });
   it.each(["123", "000"])("时间精度 %s 与真实模型回执一致，原请求严格恢复", async (fraction) => {
     publish();
     vi.spyOn(Date.prototype, "toISOString").mockReturnValue(`2026-10-01T00:00:00.${fraction}Z`);
