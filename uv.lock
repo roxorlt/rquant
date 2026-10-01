@@ -1742,6 +1742,7 @@ dependencies = [
     { name = "tqdm" },
     { name = "tushare" },
     { name = "uvicorn" },
+    { name = "xlrd" },
 ]
 
 [package.dev-dependencies]
@@ -1772,6 +1773,7 @@ requires-dist = [
     { name = "tqdm", specifier = ">=4.67.3" },
     { name = "tushare", specifier = ">=1.4.29" },
     { name = "uvicorn", specifier = ">=0.46.0,<0.47" },
+    { name = "xlrd", specifier = ">=2.0.2" },
 ]
 
 [package.metadata.requires-dev]
