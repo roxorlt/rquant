@@ -117,3 +117,33 @@ SHA-256：
 `-m ruff check` 和 `-m ruff format --check` 对两文件均 exit 0，见修复目录 `ruff-check.log` / `ruff-format-check.log`；3.11 AST 语法检查通过，实际 runtime 仍 3.13.12。最新 SHA-256：source `ba1ec66c17bb5d2b28a50711863feced9e37df61f65f080d3ec0d069a5caaa87`，test `02f33f4e9b9238bad9fd3d386433987518830131fa045e3075969809e27197a0`。
 
 所有命令已结束，无运行会话/后台进程；自有证据根没有准备、reader 或发布临时文件遗留，合成失败原件仅保留诊断。干净本地修复 commit 后停写，交原 reviewer 只复核本 ID 与直接修复回归；本片普通修复次数已用完，如仍阻断须停写报告。
+
+## 根任务最终验收（2026-10-02）
+
+### 候选、审查和有效测试
+
+最终候选 `d22e705d8f24836e6e7847fdafc103097379b2b0` 已在干净集成树本地合入 `e69e8687be01de35ca952580780c0a6cfd4eb233`。源码及测试与受审候选字节一致；本节是 root 补充的验收记录。独立审查只有一次，唯一普通局部修复及原审查者定向复核关闭 FIS-FINAL-01 并 ACCEPT；没有追加其他来源修复或审查。初审报告 `/private/tmp/rquant-industry-final-review-bxrk1j2m/review.md`，SHA `b75d73bb40685a12086cc5b28ea3e6b4944871a6aae6c1c3cb8be79d97307f67`；复核报告 `recheck-fis-final-01/recheck.md`，SHA `9dfc6ea4321bb29dca1ed74f61e96cdc3bf82a41fe16cda7149e938c50e8c0b5`。
+
+root 逐项核对原 JUnit 成功记录：29 个不同新增节点及 2 个直接旧节点有效，共 31；修复命令实际 10 passed，包含新增 2 和复用 8，不累加为 41。详见证据根 `/private/tmp/rquant-factor-industry-root-527cxk6q/implementation-final-xml-proof.json`，没有重跑来源测试套件。离线实际 Python 3.13.12，仅另有 3.11 AST 语法证据；没有声称 Python 3.11/3.12 CI 或 runtime 通过。
+
+### 真实原件与请求预算
+
+root 使用既有配置和正常 Tushare SDK 取得 SW2021 一级目录 31 行以及各行业 Y/N 成员；63 份保留响应共 7,920 行，其中当前 5,914、历史 2,006。总实际请求 64 次（3 次预检 + 61 次后续 SDK 调用，含一次原 frame 未保留的精确重取），在本片 64 次预算内且预算已用尽；三份耐久传输账本逐项记录 3/21/40 次。未保留的第一次响应不得算为成功原件，实际调用仍计入总数，见 `provider-originals-audit.json` / `durable-dispatch-proof.json`。
+
+修复后显式导入全部保留原件，不产生新请求。63 份保留响应的收据归属为 63 imported / 0 new / 63 retained actual，区别于完整采集总实际 64 次；`completed-import-proof.json` 核对原件摘要及 1,051,538 字节。目录和捕获文件权限为 700/600；原供应方退市别名被原样保留且不进入计算代码范围。完成 collection 文件 SHA `c819c96f033ecb6ce4a6397209bd5efbd4e4c0deceb7f4b1ad8d633aa63be0dc`，模型 SHA `cb464194bfa7d278456126fbccfa269b047234452fbb4f72c76f6cca3cbebb56`。
+
+### 32 日真实区间对照与资源
+
+在自有远端 `/tmp` 诊断目录中，只读生产副本 `/home/lighthouse/rquant/data/rquant_ro.duckdb`（10,761,547,776 字节），以 `2026-10-01T15:56:08.346849+00:00` 配对新的行情准备和行业来源。计算日 2026-08-14—09-29 共 32 个实际开盘日；对应特征日为各自前一交易日，首尾 08-13/09-28，范围 5,571 码。独立原始 JSON 区间投影不调用产品归一化或 query helper，与 384 次、每批最多 500 码的 reader 返回值、名称和状态逐项对照。
+
+178,272 个组合全部一致：177,959 有效、288 缺失、25 个日期端点待确认、0 跨行业歧义。Parquet 保留 7,382 条范围内原始区间；首日 5,549 有效/22 缺失，末日 5,571 有效，均含全部 31 个行业。没有前填或猜测端点，来源边界仍为 `captured_api_responses` / 历史回顾，不能称为历史 PIT 或同 RO 事务内取得的行业数据。
+
+云端实际 Python 3.14.4；行情准备 9.455 秒、行业准备 6.530 秒、总 20.679 秒，峰值 RSS 341,438,464 字节（325.621 MiB）。源/湖 FD 为 0，reader 私有副本删除且关闭后再读拒绝，RO 文件代未变，自有远端根删除。第一次自有打包执行因 tar 安全解包把私有目录变成 755 而被正确拒绝；只修正诊断目录 chmod 700，保存失败记录并清理旧根，没有第二次产品修复或新 HTTP。
+
+实际成功响应见 `response.json`，SHA `279b0b3a49afcf537867068370cb64bbc8669f3037cbbefaa10ed9c3cbba6837`；行情来源 SHA `8a7ea87e54ff62c4b187735a3ccc20415360aa4097ed1fe6b0288f88a5ca24fd`、行业来源 SHA `4888b5fda29a390a42c307f0eae19bcc4d8526a54cb3592cdf5e9093066c1e23`、行业 artifact SHA `23f0083326fc34531ab30a1dacec058b40ef973e02630c1115ee8cdc95e1b810`。真实原件及完成导入留在证据根，所有命令已退出；失败夹具和日志仅保留诊断。
+
+### 本地清单门禁与后续
+
+最终正常收集为 18,985 cases / 55 skips，完整 nodeid SHA `86037f8686488cbcda70f6aca2b473201ece7325c5f538bdbea57605e09df529`。相对原 18,956 清单精确新增 29 项，无旧删除或重复；批准跳过原字节不变，SHA `1367a714636bb473ff37edd8af1928d460d2b95f84f3c2658b6a4004cbb1b813`。root 更新清单、README 和固定计数字面量后，在隔离无真实凭据的环境实际执行 `test_checked_in_manifest_matches_exact_collection_without_missing_or_duplicate_cases` 和 `test_validator_aggregates_real_testcases_and_skips`，2 passed / 8.44 秒（命令墙钟 8.598 秒），见 `gates-proof.json` / `gates.xml` / `gates.log`。没有执行全部 18,985 项测试。
+
+主工作树已有 `AGENTS.md`、`CLAUDE.md`、`scripts/sync-from-cloud.sh` 三项修改均保留；集成仅补充本片验收、进度和清单元数据。没有 push、tag、部署、生产写入、切流或停服。本片完成行业事实来源，联合中性化计算、可信任务/公开参数/React 接线、CSI 完整历史、18:40 跟踪和正式生产仍继续实施；C3.2/M3 保持部分，整体 goal active。后续公开持久任务合同的新增边界须在实现前冻结，不重复来源审查或仍有效的无中性化 worker。
