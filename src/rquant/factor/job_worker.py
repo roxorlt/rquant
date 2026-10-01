@@ -141,75 +141,71 @@ def run_one_factor_job(
     prepared: object | None = None
     runner_error: Exception | None = None
     try:
-        if isinstance(claimed.job.spec, FactorStreamJobSpec):
-            if member_root is None:
-                raise ValueError("stream job worker requires its member archive root")
-            completion = run_factor_stream_job(
-                claimed.job.spec,
-                metadata_store=metadata_store,
-                lake_root=lake_root,
-                artifact_root=artifact_root,
-                member_root=member_root,
-                now=runner_now,
-            )
-            prepared = ledger.prepare_stream_completion(
-                claimed.job.job_id, claimed.lease_token, completion, artifact_root, member_root
-            )
-        else:
-            completion = run_factor_evaluation_job(
-                claimed.job.spec,
-                metadata_store=metadata_store,
-                lake_root=lake_root,
-                artifact_root=artifact_root,
-                now=runner_now,
-            )
-    except Exception as exc:
-        runner_error = exc
-        logger.opt(exception=exc).error("factor evaluation execution failed")
-    except BaseException:
-        ledger._discard_job_prepared(claimed.job.job_id)
-        raise
-    finally:
-        stop.set()
         try:
-            thread.join(timeout=heartbeat_join_timeout_seconds)
-        except BaseException:
-            ledger._discard_job_prepared(claimed.job.job_id)
-            raise
-
-    if thread.is_alive() or lost.is_set():
-        if prepared is not None:
-            ledger.discard_prepared_stream(prepared)
-        return FactorJobWorkerResult(status="lease_lost", job_id=claimed.job.job_id)
-    with lock:
-        if runner_error is None:
-            try:
-                if prepared is not None:
-                    record = ledger.complete_prepared_stream(
-                        claimed.job.job_id, latest.lease_token, latest.version, prepared
-                    )
-                else:
-                    record = ledger.complete(
-                        claimed.job.job_id,
-                        latest.lease_token,
-                        latest.version,
-                        completion,
-                        artifact_root,
-                    )
-            except Exception as exc:
-                logger.opt(exception=exc).error("factor evaluation completion was not committed")
-                return FactorJobWorkerResult(status="lease_lost", job_id=claimed.job.job_id)
-            return FactorJobWorkerResult(
-                status="succeeded", job_id=claimed.job.job_id, record=record
-            )
-        try:
-            record = ledger.fail(
-                claimed.job.job_id,
-                latest.lease_token,
-                latest.version,
-                _failure_code(runner_error),
-            )
+            if isinstance(claimed.job.spec, FactorStreamJobSpec):
+                if member_root is None:
+                    raise ValueError("stream job worker requires its member archive root")
+                completion = run_factor_stream_job(
+                    claimed.job.spec,
+                    metadata_store=metadata_store,
+                    lake_root=lake_root,
+                    artifact_root=artifact_root,
+                    member_root=member_root,
+                    now=runner_now,
+                )
+                prepared = ledger.prepare_stream_completion(
+                    claimed.job.job_id, claimed.lease_token, completion, artifact_root, member_root
+                )
+            else:
+                completion = run_factor_evaluation_job(
+                    claimed.job.spec,
+                    metadata_store=metadata_store,
+                    lake_root=lake_root,
+                    artifact_root=artifact_root,
+                    now=runner_now,
+                )
         except Exception as exc:
-            logger.opt(exception=exc).error("factor evaluation failure was not committed")
+            runner_error = exc
+            logger.opt(exception=exc).error("factor evaluation execution failed")
+        finally:
+            stop.set()
+            thread.join(timeout=heartbeat_join_timeout_seconds)
+
+        if thread.is_alive() or lost.is_set():
             return FactorJobWorkerResult(status="lease_lost", job_id=claimed.job.job_id)
-        return FactorJobWorkerResult(status="failed", job_id=claimed.job.job_id, record=record)
+        with lock:
+            if runner_error is None:
+                try:
+                    if prepared is not None:
+                        record = ledger.complete_prepared_stream(
+                            claimed.job.job_id, latest.lease_token, latest.version, prepared
+                        )
+                    else:
+                        record = ledger.complete(
+                            claimed.job.job_id,
+                            latest.lease_token,
+                            latest.version,
+                            completion,
+                            artifact_root,
+                        )
+                except Exception as exc:
+                    logger.opt(exception=exc).error(
+                        "factor evaluation completion was not committed"
+                    )
+                    return FactorJobWorkerResult(status="lease_lost", job_id=claimed.job.job_id)
+                return FactorJobWorkerResult(
+                    status="succeeded", job_id=claimed.job.job_id, record=record
+                )
+            try:
+                record = ledger.fail(
+                    claimed.job.job_id,
+                    latest.lease_token,
+                    latest.version,
+                    _failure_code(runner_error),
+                )
+            except Exception as exc:
+                logger.opt(exception=exc).error("factor evaluation failure was not committed")
+                return FactorJobWorkerResult(status="lease_lost", job_id=claimed.job.job_id)
+            return FactorJobWorkerResult(status="failed", job_id=claimed.job.job_id, record=record)
+    finally:
+        ledger._discard_job_prepared(claimed.job.job_id)

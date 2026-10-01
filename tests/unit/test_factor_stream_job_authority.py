@@ -318,3 +318,66 @@ def test_cancellation_after_prepare_before_cas_discards_private_evidence(
         assert not any(
             t.name == "factor-job-heartbeat" and t.is_alive() for t in threading.enumerate()
         )
+
+
+def test_cancellation_after_heartbeat_join_before_terminal_branch_cleans_prepared(
+    tmp_path: Path,
+) -> None:
+    import inspect
+    import sys
+
+    from rquant.factor.job_worker import run_one_factor_job
+
+    with _sealed(tmp_path) as (ledger, clock, claim, _, root, members, metadata, lake):
+        clock.instant += timedelta(seconds=31)
+        lines, first_line = inspect.getsourcelines(run_one_factor_job)
+        terminal_line = first_line + next(
+            offset
+            for offset, line in enumerate(lines)
+            if "if thread.is_alive() or lost.is_set():" in line
+        )
+        reached = False
+        previous_trace = sys.gettrace()
+
+        def interrupt(frame: object, event: str, argument: object) -> object:
+            nonlocal reached
+            if (
+                frame.f_code is run_one_factor_job.__code__
+                and event == "line"
+                and frame.f_lineno == terminal_line
+            ):
+                assert ledger._prepared
+                assert not any(
+                    t.name == "factor-job-heartbeat" and t.is_alive() for t in threading.enumerate()
+                )
+                assert not list((lake / ".execution_sessions").iterdir())
+                reached = True
+                sys.settrace(previous_trace)
+                raise KeyboardInterrupt("synthetic cancellation after join before terminal branch")
+            return interrupt
+
+        try:
+            sys.settrace(interrupt)
+            with pytest.raises(KeyboardInterrupt, match="after join"):
+                run_one_factor_job(
+                    ledger,
+                    metadata_store=metadata,
+                    lake_root=lake,
+                    artifact_root=root,
+                    member_root=members,
+                    runner_now=clock,
+                )
+        finally:
+            sys.settrace(previous_trace)
+        try:
+            record = ledger.get(claim.job.job_id)
+            print(
+                f"SJ_FINAL_01: after_join={reached} status={record.status} "
+                f"prepared_after_get={len(ledger._prepared)} heartbeat_threads=0 "
+                "execution_copies=0"
+            )
+            assert reached and record.status == "running"
+            assert not ledger._prepared
+        finally:
+            ledger._discard_job_prepared(claim.job.job_id)
+            assert not ledger._prepared
