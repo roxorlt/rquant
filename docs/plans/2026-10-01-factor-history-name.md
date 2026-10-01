@@ -71,3 +71,15 @@ python -m rquant.factor.security_collect archive --capture-root <旧来源目录
 不传名称补充，09-30 all仍拒绝，09-29/28维持准入；gem三日成员均与旧资料一致。实际source SHA、归档reference及日成员结果完整记录在上述JSON中。调用/资料完整性只依据显式source合同及逐日必须事实，不从stock_st缺席或当前名称推出False，不宣称历史PIT。
 
 资源：全部命令会话与`subprocess.run`均已退出，未启动后台服务；自有证据根没有遗留`*.tmp`发布文件。证据、捕获、归档及离线配置目录保留供root终审；root已有来源目录仅只读，未覆盖。下一步由root对干净候选安排一次独立终审，并负责单代码真实live、清单/两项必要门禁及集成决策。
+
+## 根任务最终验收（2026-10-01）
+
+受审候选 `7bef6f071c02863c9585f877adccc570d5552b5f`，干净基准14d834；原独立reviewer对本片做一次集中终审，accept、无finding，报告 `/private/tmp/rquant-factor-name-final-review-ZT48vv0q/review.md`。本地合入 `64ea9af254a56f1ca6b2445114c65881543a366d`；源码/新测试与候选精确一致。实现61相关passed/4.92s及259旧依赖证据仍有效、去重320；没有重复全仓审查或测试。
+
+root通过已有应用Settings主token正规认证运行新live入口，显式301139.SZ/max-calls=1，实际dispatch=1，无备用token。实收 `2026-10-01T08:21:56.709748+00:00`，三段名称原件SHA仍为 `5fd55bd90c5a4bc6be9b6b9ba7f32d9cb236b096e8c3f81c09a9baa4e85a1326`；完成manifest SHA `5f7f7011fceb0bae08cf66c3aa4f462b95a2d80312cf175c49cd12f0d2b6f9cb`，字节/引用SHA独立复核。未打印或归档凭据。普通导入预检无Settings初始化。
+
+最新日倒序核验三日：09-30全集5572/all5026/gem2027、该股False并入all；09-29全集5571/all5024/gem2027、09-28全集5569/all5022/gem2026，该股均True并被all排除。全集和gem精确成员不变，其他事实逐字段不变；source SHA实变、observed取本次名称实收。无名称入口旧09-30 all依旧拒绝。两池三日归档由现有reader require_completion：all摘要 `a431fee92af5d8d52f0f45f99e10e6d33a6e6ebbea1082f686a028fcf66f4e4f`，gem `8f8e84eba6f478f29b82a5c96ca8e07c96531ad6b7b8ed9e73004e9c7613264c`，均68,674 bytes。只补必要日事实及来源绑定，原reader/worker契约未改，复用此前真实RO/configured-worker证据。
+
+固定清单正常生成18,878 cases/55 skips，SHA256 `cab14c58cb515f2b31d4e452c177e57ee640a2869ea108656cbe325cb2924962`；比较只新增本片28nodeids，无删除/重复，approved-skips字节不变。README/计数断言同步，两必要门禁Python3.13.12实际2 passed/8.81s，Ruff/diff通过。没有全量执行、新CI、3.11/3.12 runtime或PIT通过声明。
+
+root证据 `/private/tmp/rquant-factor-name-root-7dyir3f0` 保留live原件/完整实际回放与归档、root-summary、comparison及两门禁日志。所有本片命令进程退出、无发布tmp/中断记录遗留；没有写生产数据、推送、部署或停Streamlit。另已只读预检现有RO的08-11—09-30共36交易日，作为下一片长历史装配候选，不以行数证明市场完整性。CSI官方09-09调样附件只读保存在 `/private/tmp/rquant-csi-official-announcement-y0r9h645`，尚缺完整基线/范围覆盖及精确生效日。长历史、CSI、行业/市值、18:40跟踪与生产验收继续实施，M3仍部分，整体goal active。
