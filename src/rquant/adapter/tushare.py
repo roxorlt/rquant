@@ -893,6 +893,37 @@ class TushareAdapter:
             ),
         )
 
+    def stock_basic_history_raw(self, *, list_status: str, exchange: str) -> pd.DataFrame:
+        """Preserve one explicit listing partition, including malformed response columns."""
+        if list_status not in {"L", "D", "P", "G", "UN"}:
+            raise ValueError("unsupported historical stock_basic list_status")
+        if exchange not in {"", "SSE", "SZSE", "BSE"}:
+            raise ValueError("unsupported historical stock_basic exchange")
+        frame = self._call_with_backoff(
+            "stock_basic",
+            lambda: self._pro.stock_basic(
+                exchange=exchange,
+                list_status=list_status,
+                fields="ts_code,name,exchange,curr_type,market,list_status,list_date,delist_date",
+            ),
+        )
+        if not isinstance(frame, pd.DataFrame):
+            raise RuntimeError("Tushare stock_basic history did not return a table")
+        return frame
+
+    def bak_basic_raw(self, trade_date: date) -> pd.DataFrame:
+        """Preserve the provider's daily names and listing dates without filling gaps."""
+        frame = self._call_with_backoff(
+            "bak_basic",
+            lambda: self._pro.bak_basic(
+                trade_date=trade_date.strftime("%Y%m%d"),
+                fields="trade_date,ts_code,name,list_date",
+            ),
+        )
+        if not isinstance(frame, pd.DataFrame):
+            raise RuntimeError("Tushare bak_basic did not return a table")
+        return frame
+
     # ══ 统一数据集回补层薄方法（dataset_backfill 注册表用） ══════════════════
     # 各方法 docstring 里的字段清单为 2026-07-01 trade_date=20260701 实测返回。
     # 共同约束：fields 显式、trade_date 归一化为 date、空返回容错、
