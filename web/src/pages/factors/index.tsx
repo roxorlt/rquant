@@ -25,6 +25,8 @@ import {
 } from "@/ui";
 import { FactorEditor, type FactorEditorDraft } from "./FactorEditor";
 import { FactorResults } from "./FactorResults";
+import { FactorRunConfirmation, FactorRunParameters, FactorRunStatus } from "./FactorRun";
+import { hasDefinitionCommand, hasRun, withFactorCommandLock } from "./factorRunState";
 import {
   clearSaveCommand,
   persistEditorDraft,
@@ -36,6 +38,7 @@ import {
   SAVE_DRAFT_KEY,
   storageWritable,
 } from "./factorSaveState";
+import { useFactorRun } from "./useFactorRun";
 import "./factors.css";
 
 const ARCHIVE_STORAGE_KEY = "rquant.factor.archive-command.v1";
@@ -164,9 +167,28 @@ export default function FactorsPage() {
     !catalog.error &&
     !catalog.isFetching &&
     !changed;
+  const run = useFactorRun({
+    generationId: currentGeneration,
+    viewer,
+    permissionRevision,
+    selected,
+    catalogVerified,
+    definitionBusy:
+      saveCommand !== null ||
+      archiveCommand !== null ||
+      saveBusy ||
+      archiveBusy ||
+      (typeof viewer === "string" && viewer === deniedViewer),
+  });
+  const runBlocksWrite =
+    run.occupied ||
+    run.busy ||
+    run.permissionDenied ||
+    (typeof viewer === "string" && viewer === deniedViewer);
   const saveAvailable =
     typeof viewer === "string" &&
     viewer !== deniedViewer &&
+    !run.permissionDenied &&
     catalogVerified &&
     catalog.data?.can_save === true &&
     capabilities.data?.can_save === true &&
@@ -305,6 +327,9 @@ export default function FactorsPage() {
   const beginCreate = () => {
     if (
       !saveAvailable ||
+      runBlocksWrite ||
+      hasRun() ||
+      hasDefinitionCommand() ||
       saveCommandRef.current !== null ||
       archiveCommandRef.current !== null ||
       typeof currentGeneration !== "string"
@@ -327,6 +352,9 @@ export default function FactorsPage() {
   const beginEdit = () => {
     if (
       !saveAvailable ||
+      runBlocksWrite ||
+      hasRun() ||
+      hasDefinitionCommand() ||
       saveCommandRef.current !== null ||
       archiveCommandRef.current !== null ||
       selected === null ||
@@ -368,11 +396,13 @@ export default function FactorsPage() {
     });
   };
 
-  const submitSave = () => {
+  const submitSave = async () => {
     if (
       editorDraft === null ||
       !storageReady ||
       !saveAvailable ||
+      runBlocksWrite ||
+      hasRun() ||
       draftStale ||
       saveCommandRef.current !== null ||
       archiveCommandRef.current !== null
@@ -390,16 +420,27 @@ export default function FactorsPage() {
       direction: editorDraft.direction,
       expression: editorDraft.expression,
     };
-    if (!persistEditorDraft(editorDraft) || !persistSaveCommand(record)) {
-      setStorageReady(false);
-      return;
-    }
-    saveCommandRef.current = record;
-    setSaveCommand(record);
-    setSaveResult(null);
-    setSaveError(null);
-    setEditorOpen(false);
-    void runSave(record, "save");
+    await withFactorCommandLock(() => {
+      if (
+        hasRun() ||
+        hasDefinitionCommand() ||
+        saveCommandRef.current !== null ||
+        archiveCommandRef.current !== null
+      ) {
+        run.sync();
+        return;
+      }
+      if (!persistEditorDraft(editorDraft) || !persistSaveCommand(record)) {
+        setStorageReady(false);
+        return;
+      }
+      saveCommandRef.current = record;
+      setSaveCommand(record);
+      setSaveResult(null);
+      setSaveError(null);
+      setEditorOpen(false);
+      void runSave(record, "save");
+    });
   };
 
   const finishSave = () => {
@@ -434,10 +475,15 @@ export default function FactorsPage() {
     if (record !== null) void runArchive(record, true);
   });
 
-  const submitArchive = () => {
+  const submitArchive = async () => {
     if (
       selected === null ||
       selected.archived ||
+      runBlocksWrite ||
+      hasRun() ||
+      !storageReady ||
+      !catalogVerified ||
+      typeof viewer !== "string" ||
       typeof currentGeneration !== "string" ||
       saveCommandRef.current !== null ||
       archiveCommandRef.current !== null
@@ -455,12 +501,33 @@ export default function FactorsPage() {
         },
       },
     };
-    window.localStorage.setItem(ARCHIVE_STORAGE_KEY, JSON.stringify(record));
-    archiveCommandRef.current = record;
-    setArchiveCommand(record);
-    setArchiveResult(null);
-    setConfirmArchive(false);
-    void runArchive(record, false);
+    await withFactorCommandLock(() => {
+      if (
+        hasRun() ||
+        hasDefinitionCommand() ||
+        saveCommandRef.current !== null ||
+        archiveCommandRef.current !== null
+      ) {
+        run.sync();
+        return;
+      }
+      try {
+        const serialized = JSON.stringify(record);
+        window.localStorage.setItem(ARCHIVE_STORAGE_KEY, serialized);
+        if (window.localStorage.getItem(ARCHIVE_STORAGE_KEY) !== serialized) {
+          setStorageReady(false);
+          return;
+        }
+      } catch {
+        setStorageReady(false);
+        return;
+      }
+      archiveCommandRef.current = record;
+      setArchiveCommand(record);
+      setArchiveResult(null);
+      setConfirmArchive(false);
+      void runArchive(record, false);
+    });
   };
 
   const clearRejectedArchive = () => {
@@ -486,6 +553,7 @@ export default function FactorsPage() {
   };
 
   const refreshDefinitions = async (resumeArchive = true) => {
+    run.sync();
     const refreshed = await meta.refetch();
     const activeCommand = archiveCommandRef.current;
     if (resumeArchive && activeCommand !== null && !archiveBusyRef.current)
@@ -499,6 +567,15 @@ export default function FactorsPage() {
     }
   };
 
+  useEffect(() => {
+    if (run.completed && run.operation !== null && typeof currentGeneration === "string") {
+      setSelection({
+        generationId: currentGeneration,
+        factorId: run.operation.request.parameters.factor_id,
+      });
+    }
+  }, [run.completed, run.operation, currentGeneration]);
+
   return (
     <>
       <PageHeader
@@ -507,7 +584,19 @@ export default function FactorsPage() {
         note="查看已发布因子与历史检验"
         actions={
           <>
-            {saveAvailable && saveCommand === null && archiveCommand === null ? (
+            {run.availability.data?.enabled && run.storageReady ? (
+              <Button
+                size="sm"
+                variant="primary"
+                disabledReason={
+                  !run.canStart ? (run.blockedReason ?? "请先完成本次检验。") : undefined
+                }
+                onClick={run.open}
+              >
+                运行检验
+              </Button>
+            ) : null}
+            {saveAvailable && !runBlocksWrite && saveCommand === null && archiveCommand === null ? (
               <Button
                 size="sm"
                 variant="primary"
@@ -528,6 +617,7 @@ export default function FactorsPage() {
           </>
         }
       />
+      <FactorRunStatus run={run} />
       {saveCommand !== null ? (
         <Panel>
           <div
@@ -638,33 +728,36 @@ export default function FactorsPage() {
         </Panel>
       ) : (
         <div className="factor-layout">
-          <Panel
-            title="因子列表"
-            sub={
-              catalog.data?.available_at ? (
-                <span>
-                  {rows.length} 个因子 · <RelativeTime at={catalog.data.available_at} />
-                  更新
-                </span>
-              ) : undefined
-            }
-            flush
-          >
-            <DataTable
-              rows={rows}
-              columns={columns}
-              rowKey={(row) => row.factor_id}
-              label="因子列表"
-              selectedKey={selected?.factor_id}
-              onSelect={
-                typeof currentGeneration === "string"
-                  ? (row) =>
-                      setSelection({ generationId: currentGeneration, factorId: row.factor_id })
-                  : undefined
+          <div className="factor-sidebar">
+            <FactorRunParameters run={run} />
+            <Panel
+              title="因子列表"
+              sub={
+                catalog.data?.available_at ? (
+                  <span>
+                    {rows.length} 个因子 · <RelativeTime at={catalog.data.available_at} />
+                    更新
+                  </span>
+                ) : undefined
               }
-              emptyText="还没有因子"
-            />
-          </Panel>
+              flush
+            >
+              <DataTable
+                rows={rows}
+                columns={columns}
+                rowKey={(row) => row.factor_id}
+                label="因子列表"
+                selectedKey={selected?.factor_id}
+                onSelect={
+                  typeof currentGeneration === "string"
+                    ? (row) =>
+                        setSelection({ generationId: currentGeneration, factorId: row.factor_id })
+                    : undefined
+                }
+                emptyText="还没有因子"
+              />
+            </Panel>
+          </div>
           {selected ? (
             <div className="factor-main">
               <Panel
@@ -708,14 +801,15 @@ export default function FactorsPage() {
                     </div>
                     <code>{selected.expression}</code>
                   </div>
-                  {(saveAvailable &&
+                  {!runBlocksWrite &&
+                  ((saveAvailable &&
                     !selected.archived &&
                     saveCommand === null &&
                     archiveCommand === null) ||
-                  (catalog.data?.can_archive &&
-                    !selected.archived &&
-                    archiveCommand === null &&
-                    saveCommand === null) ? (
+                    (catalog.data?.can_archive &&
+                      !selected.archived &&
+                      archiveCommand === null &&
+                      saveCommand === null)) ? (
                     <div className="factor-detail-actions">
                       {saveAvailable &&
                       !selected.archived &&
@@ -745,6 +839,11 @@ export default function FactorsPage() {
                 <FactorResults
                   factor={selected}
                   generationId={currentGeneration}
+                  preferred={
+                    run.preferred?.request.parameters.factor_id === selected.factor_id
+                      ? run.preferred
+                      : null
+                  }
                   onRefresh={() => void refreshDefinitions()}
                 />
               ) : null}
@@ -759,9 +858,11 @@ export default function FactorsPage() {
         description="归档当前定义，历史记录仍会保留。"
         confirmLabel="确认归档"
         busy={archiveBusy}
-        onConfirm={submitArchive}
+        disabled={runBlocksWrite || !catalogVerified || typeof viewer !== "string"}
+        onConfirm={() => void submitArchive()}
         onCancel={() => setConfirmArchive(false)}
       />
+      <FactorRunConfirmation run={run} />
       <FactorEditor
         draft={editorDraft}
         open={editorOpen}
@@ -773,11 +874,11 @@ export default function FactorsPage() {
         storageReady={storageReady}
         stale={draftStale}
         canRebase={canRebaseDraft}
-        busy={saveBusy || saveCommand !== null}
+        busy={saveBusy || saveCommand !== null || runBlocksWrite}
         onChange={updateEditorDraft}
         onClose={() => setEditorOpen(false)}
         onRebase={rebaseDraft}
-        onSubmit={submitSave}
+        onSubmit={() => void submitSave()}
       />
     </>
   );

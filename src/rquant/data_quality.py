@@ -6,7 +6,7 @@ import hashlib
 import json
 from collections.abc import Callable, Sequence
 from datetime import date, datetime, time, timedelta
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import (
     BaseModel,
@@ -26,8 +26,10 @@ from rquant.data_metadata import (
     stable_sha256,
     utc_now,
 )
-from rquant.storage.duckdb import DuckDBStore
 from rquant.suspension_evidence import suspension_session_evidence_sql
+
+if TYPE_CHECKING:
+    from rquant.storage.duckdb import DuckDBStore
 
 _READ_ONLY_ACCESS_MODE = "read_only"
 _WRITABLE_ACCESS_MODES = frozenset({"automatic", "read_write"})
@@ -624,7 +626,10 @@ class AuditFinding(QualityModel):
         )
 
 
-AuditCheck = Callable[[DuckDBStore], Sequence[AuditFinding]]
+if TYPE_CHECKING:
+    AuditCheck = Callable[[DuckDBStore], Sequence[AuditFinding]]
+else:
+    AuditCheck = Callable[..., Sequence[AuditFinding]]
 
 
 class AuditRule(QualityModel):
@@ -823,9 +828,7 @@ def limit_up_pool_calendar_audit_rules(
                 dataset_id="limit_up_pool_daily",
                 severity="P0",
                 scope_key=f"{start.isoformat()}/{end.isoformat()}",
-                message=(
-                    "Limit-up pool contains rows from closed or unknown sessions"
-                ),
+                message=("Limit-up pool contains rows from closed or unknown sessions"),
                 evidence={
                     "count": rows[0][4],
                     "sample_unknown_calendar_count": unknown_count,
@@ -960,10 +963,11 @@ def daily_minute_consistency_audit_rules(
                 VALUES {coverage_values}
             ),
             suspension_evidence AS (
-                {suspension_session_evidence_sql(
-                    "suspension.source = 'tushare' "
-                    "AND suspension.trade_date BETWEEN ? AND ?"
-                )}
+                {
+                suspension_session_evidence_sql(
+                    "suspension.source = 'tushare' AND suspension.trade_date BETWEEN ? AND ?"
+                )
+            }
             ),
             eligible_daily AS (
                 SELECT d.ts_code, d.trade_date
@@ -1729,8 +1733,12 @@ def resolve_audit_issues(
     )
 
 
-RepairCount = Callable[[DuckDBStore], int]
-RepairMutation = Callable[[DuckDBStore], None]
+if TYPE_CHECKING:
+    RepairCount = Callable[[DuckDBStore], int]
+    RepairMutation = Callable[[DuckDBStore], None]
+else:
+    RepairCount = Callable[..., int]
+    RepairMutation = Callable[..., None]
 
 
 class RepairAction(QualityModel):

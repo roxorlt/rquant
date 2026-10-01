@@ -155,7 +155,9 @@ def test_exact_definition_digest_is_required_for_current_name(tmp_path: Path) ->
         assert row["factor_id"] == "price_factor"
         assert row["factor_version"] == 1
         assert row["definition_status"] == "historical_unavailable"
-        assert row["factor_name_zh"] is None
+        assert row["factor_name_zh"] == "价格因子"
+        assert row["spec_sha256"] == _research_and_spec()[1].spec_sha256
+        assert row["definition_content_sha256"] == _research_and_spec()[1].definition_content_sha256
 
 
 def test_web_rejects_bad_factor_result_state_before_returning_charts(tmp_path: Path) -> None:

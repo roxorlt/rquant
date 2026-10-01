@@ -1,6 +1,6 @@
 .factor-layout {
   display: grid;
-  grid-template-columns: minmax(300px, 0.9fr) minmax(0, 1.45fr);
+  grid-template-columns: minmax(280px, 0.65fr) minmax(0, 1.7fr);
   align-items: start;
   gap: 16px;
   min-width: 0;
@@ -10,10 +10,37 @@
   min-width: 0;
 }
 .factor-main,
+.factor-sidebar,
 .factor-research {
   display: grid;
   gap: 16px;
   min-width: 0;
+}
+.factor-run-form {
+  display: grid;
+  gap: 14px;
+  min-width: 0;
+}
+.factor-run-form .field {
+  min-width: 0;
+}
+.factor-run-form .inp {
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+}
+.factor-run-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+.factor-run-summary {
+  display: grid;
+  gap: 6px;
+  margin-bottom: 14px;
+  color: var(--muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
 }
 .factor-run-list {
   margin-bottom: 18px;

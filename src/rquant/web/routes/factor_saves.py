@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from typing import Annotated
 
-import duckdb
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
 from rquant.factor.capability import HISTORICAL_DAILY_V1
@@ -167,7 +166,7 @@ def _save_response(
                             _verified_registry_instance_id(borrowed) == result.registry_instance_id
                         )
                         current_pointer = _pointer_matches(web, borrowed)
-                    except (HTTPException, OSError, ValueError, duckdb.Error):
+                    except Exception:
                         catalog = None
                         same_registry = False
                         current_pointer = False
@@ -233,7 +232,7 @@ def factor_capabilities(
                 can_save = catalog.availability in {"empty", "populated"} and _pointer_matches(
                     web, borrowed
                 )
-            except (HTTPException, OSError, ValueError, duckdb.Error):
+            except Exception:
                 pass
         data = FactorCapabilitiesData.model_validate(
             {**HISTORICAL_DAILY_V1.model_dump(mode="python"), "can_save": can_save}

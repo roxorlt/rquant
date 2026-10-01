@@ -265,7 +265,7 @@ describe("因子库", () => {
     expect(area).toHaveTextContent("—");
     expect(findJargon(container.textContent ?? "")).toEqual([]);
   });
-  it("只展示当前定义的最近成功检验，切换 IC 和分组并展开真实缺值", async () => {
+  it("当前与历史版本均可查看，切换 IC 和分组并展开真实缺值", async () => {
     publish();
     const older = result("1".repeat(32), { updated_at: "2026-09-25T07:00:00Z" });
     const newest = result("2".repeat(32));
@@ -281,6 +281,7 @@ describe("因子库", () => {
     const { container } = renderApp("/factors");
     const area = await screen.findByRole("region", { name: "检验结果" });
     await waitFor(() => expect(area).toHaveTextContent("+0.0312"));
+    expect(within(area).getByRole("table", { name: "最近检验" })).toHaveTextContent("第 1 版");
     expect(area).toHaveTextContent("历史回溯研究");
     expect(area).toHaveTextContent("固定样本");
     expect(area).toHaveTextContent("2026-09-21");
@@ -662,7 +663,9 @@ describe("因子库", () => {
     expect(findJargon(container.querySelector("main")?.textContent ?? "")).toEqual([]);
     expect(container.querySelector("main")?.textContent).not.toContain("old_factor");
     expect(screen.queryByRole("button", { name: /运行检验|加入跟踪/ })).toBeNull();
-    expect(screen.queryByText(/IC|分组收益|换手/)).toBeNull();
+    const results = screen.getByRole("region", { name: "检验结果" });
+    expect(within(results).queryByRole("img")).toBeNull();
+    expect(results).not.toHaveTextContent(/IC|分组收益|换手/);
   });
 
   it("起日未知时显示待检验，提示保留在悬停层，已知日期标记为记录起日", async () => {

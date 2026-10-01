@@ -48,7 +48,10 @@ from rquant.canvas_publication_receipt import (
 from rquant.data_audit_contracts import MAX_AUDIT_DAYS
 from rquant.factor.definition import FactorDefinition
 from rquant.factor.draft import FactorSaveDraft, build_draft_definition, draft_sha256
+from rquant.factor.job_ledger import FactorLedgerIdentity
 from rquant.factor.registry import FactorHeadRef, FactorRegistryIdentity
+from rquant.factor.run_request import FactorRunRequest
+from rquant.factor.stream_job_spec import FactorStreamJobSpec
 from rquant.lab_job_protocol import LabCommand
 from rquant.llm.schemas import RuleCall
 from rquant.manual_watchlist import (
@@ -99,6 +102,7 @@ _PRICE_RULE_KINDS = frozenset(
     {"save_price_alert_rule", "set_price_alert_rule_enabled", "delete_price_alert_rule"}
 )
 _FACTOR_DEFINITION_KINDS = frozenset({"save_factor_definition", "archive_factor"})
+_FACTOR_RUN_KINDS = frozenset({"submit_factor_run"})
 _FACTOR_REGISTRY_EFFECT_IDENTITY = "factor-registry-identity/v1"
 _LOCAL_FILESYSTEM_FENCE_SCHEMA_VERSION = 1
 _CANVAS_HEAD_CONTRACT = "canvas-current-head/v1"
@@ -217,6 +221,56 @@ class _OwnedSaveFactorDefinition(SaveFactorDefinition):
 class _OwnedArchiveFactor(ArchiveFactor):
     actor_id: OwnerId
     registry_identity: FactorRegistryIdentity
+
+
+class SubmitFactorRun(PageControlCommand):
+    kind: Literal["submit_factor_run"] = "submit_factor_run"
+    request: FactorRunRequest
+
+    @model_validator(mode="after")
+    def _original(self) -> SubmitFactorRun:
+        if (
+            self.command_id != self.request.command_id
+            or self.requested_at != self.request.requested_at
+        ):
+            raise ValueError("factor run differs from its original command")
+        return self
+
+
+class _OwnedSubmitFactorRun(SubmitFactorRun):
+    actor_id: OwnerId
+    registry_identity: FactorRegistryIdentity
+    ledger_identity: FactorLedgerIdentity
+    spec: FactorStreamJobSpec
+    original_request_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def _frozen(self) -> _OwnedSubmitFactorRun:
+        params, adapter = self.request.parameters, self.spec.adapter_request
+        definition = adapter.formula.definition
+        if (
+            self.original_request_sha256 != self.request.request_sha256
+            or params.factor_id != definition.factor_id
+            or params.expected_head.version != definition.version
+            or params.expected_head.content_sha256 != self.spec.definition_content_sha256
+            or params.selection != adapter.formula.selection
+            or params.holding_sessions != adapter.holding_sessions
+            or not all(
+                params.start_date <= day <= params.end_date for day in adapter.evaluation_days
+            )
+        ):
+            raise ValueError("factor run frozen inputs differ from the original request")
+        return self
+
+
+class FactorRunPageControlBackend(Protocol):
+    def authorize(self, actor_id: str) -> None: ...
+    def compile(
+        self, request: FactorRunRequest, *, verified_registry_instance_id: str
+    ) -> object: ...
+    def validate(self, command: _OwnedSubmitFactorRun) -> None: ...
+    def submit(self, command: _OwnedSubmitFactorRun) -> JsonValue: ...
+    def recover(self, command: _OwnedSubmitFactorRun) -> JsonValue | None: ...
 
 
 FactorDefinitionRequestValue = SaveFactorDefinition | ArchiveFactor
@@ -559,6 +613,7 @@ PageControlCommandValue = Annotated[
     | _OwnedDeletePriceAlertRule
     | _OwnedSaveFactorDefinition
     | _OwnedArchiveFactor
+    | _OwnedSubmitFactorRun
     | SaveCanvas
     | CreateCanvas
     | DeleteCanvas
@@ -1022,7 +1077,7 @@ class PageControlOutbox:
             command, (SavePriceAlertRule, SetPriceAlertRuleEnabled, DeletePriceAlertRule)
         ):
             raise ValueError("price rule commands require trusted submission")
-        if isinstance(command, (SaveFactorDefinition, ArchiveFactor)):
+        if isinstance(command, (SaveFactorDefinition, ArchiveFactor, SubmitFactorRun)):
             raise ValueError("factor commands require trusted submission")
         return self._enqueue(command)
 
@@ -1054,6 +1109,11 @@ class PageControlOutbox:
             raise TypeError("trusted factor submission requires an owned command")
         return self._enqueue(command, require_factor_definition_trust=True)
 
+    def enqueue_trusted_factor_run(self, command: _OwnedSubmitFactorRun) -> PageControlReceipt:
+        if type(command) is not _OwnedSubmitFactorRun:
+            raise TypeError("factor run requires an owned command")
+        return self._enqueue(command, require_factor_run_trust=True)
+
     def _enqueue(
         self,
         command: PageControlCommandValue,
@@ -1061,6 +1121,7 @@ class PageControlOutbox:
         require_watchlist_activation: bool = False,
         require_price_rule_activation: bool = False,
         require_factor_definition_trust: bool = False,
+        require_factor_run_trust: bool = False,
     ) -> PageControlReceipt:
         if (
             isinstance(command, (AddWatchlistItem, RemoveWatchlistItem))
@@ -1084,6 +1145,10 @@ class PageControlOutbox:
             require_factor_definition_trust and not is_owned_factor
         ):
             raise ValueError("factor commands require trusted submission")
+        if isinstance(command, SubmitFactorRun) != require_factor_run_trust or (
+            require_factor_run_trust and type(command) is not _OwnedSubmitFactorRun
+        ):
+            raise ValueError("factor runs require trusted submission")
         payload = command.model_dump_json()
         command_hash = _command_hash(command)
         enqueued_at = command.requested_at.isoformat(timespec="microseconds")
@@ -1380,6 +1445,34 @@ class PageControlOutbox:
             raise PageControlCommandConflictError(
                 "command_id already exists with different payload or actor"
             )
+        return stored, self._receipt(row)
+
+    def lookup_factor_run_command(
+        self,
+        request: FactorRunRequest,
+        *,
+        authenticated_actor_id: str,
+    ) -> tuple[_OwnedSubmitFactorRun, PageControlReceipt] | None:
+        checked = FactorRunRequest.model_validate(request)
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM page_control_command WHERE command_id = ?", (checked.command_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            stored = _COMMAND_ADAPTER.validate_json(row["payload_json"])
+        except ValueError as exc:
+            raise PageControlCommandConflictError("stored factor run is invalid") from exc
+        if (
+            type(stored) is not _OwnedSubmitFactorRun
+            or stored.actor_id != authenticated_actor_id
+            or stored.request != checked
+            or stored.original_request_sha256 != checked.request_sha256
+            or row["command_kind"] != stored.kind
+            or row["command_hash"] != _command_hash(stored)
+        ):
+            raise PageControlCommandConflictError("command ID has different parameters or actor")
         return stored, self._receipt(row)
 
     def acknowledgment(self, alert_id: str) -> AlertAcknowledgment | None:
@@ -1875,7 +1968,10 @@ class PageControlOutbox:
                     try:
                         parsed_command = _COMMAND_ADAPTER.validate_json(row["payload_json"])
                     except ValueError:
-                        if row["command_kind"] in _PRICE_RULE_KINDS | _FACTOR_DEFINITION_KINDS:
+                        if (
+                            row["command_kind"]
+                            in _PRICE_RULE_KINDS | _FACTOR_DEFINITION_KINDS | _FACTOR_RUN_KINDS
+                        ):
                             continue
                         raise
                     if isinstance(
@@ -1899,7 +1995,8 @@ class PageControlOutbox:
                     elif row["command_kind"] in _PRICE_RULE_KINDS:
                         continue
                     elif isinstance(
-                        parsed_command, (_OwnedSaveFactorDefinition, _OwnedArchiveFactor)
+                        parsed_command,
+                        (_OwnedSaveFactorDefinition, _OwnedArchiveFactor, _OwnedSubmitFactorRun),
                     ):
                         if (
                             parsed_command.kind != row["command_kind"]
@@ -1907,7 +2004,7 @@ class PageControlOutbox:
                             or _command_hash(parsed_command) != row["command_hash"]
                         ):
                             continue
-                    elif row["command_kind"] in _FACTOR_DEFINITION_KINDS:
+                    elif row["command_kind"] in _FACTOR_DEFINITION_KINDS | _FACTOR_RUN_KINDS:
                         continue
                     eligible.append(row)
                     if len(eligible) == limit:
@@ -2326,6 +2423,7 @@ class PageControlConsumer:
         formula_market_backend: FormulaMarketPageControlBackend | None = None,
         formula_pool_backend: FormulaPoolPageControlBackend | None = None,
         factor_definition_backend: FactorDefinitionPageControlBackend | None = None,
+        factor_run_backend: FactorRunPageControlBackend | None = None,
         clock: Callable[[], datetime] | None = None,
         lease_seconds: int = _DEFAULT_LEASE_SECONDS,
         consumer_id: str | None = None,
@@ -2345,6 +2443,7 @@ class PageControlConsumer:
         self.formula_market_backend = formula_market_backend
         self.formula_pool_backend = formula_pool_backend
         self.factor_definition_backend = factor_definition_backend
+        self.factor_run_backend = factor_run_backend
         self.clock = clock or (lambda: datetime.now(UTC))
         self.lease_seconds = lease_seconds
         self.consumer_service_id = consumer_service_id
@@ -2387,7 +2486,7 @@ class PageControlConsumer:
         return self.drain_factor_definition_command(command)
 
     def drain_factor_definition_command(
-        self, command: _OwnedFactorDefinitionValue
+        self, command: _OwnedFactorDefinitionValue | _OwnedSubmitFactorRun
     ) -> tuple[PageControlReceipt, ...]:
         with _PageControlExecutionMutex(self._consumer_mutex_path()) as acquired:
             if not acquired:
@@ -2501,6 +2600,25 @@ class PageControlConsumer:
         terminal = self._outcome_from_effect(effect)
         if terminal is not None:
             return terminal
+        if isinstance(command, _OwnedSubmitFactorRun):
+            if effect.result is None:
+                self._factor_run_backend().validate(command)
+                effect = self.outbox.record_started_effect_result(
+                    command.command_id,
+                    result={
+                        "contract": "factor-run-identities/v1",
+                        "registry_identity": command.registry_identity.model_dump(mode="json"),
+                        "ledger_identity": command.ledger_identity.model_dump(mode="json"),
+                    },
+                    owner_id=claim.owner_id,
+                    claim_token=claim.claim_token,
+                )
+            if effect.result != {
+                "contract": "factor-run-identities/v1",
+                "registry_identity": command.registry_identity.model_dump(mode="json"),
+                "ledger_identity": command.ledger_identity.model_dump(mode="json"),
+            }:
+                raise _RetryableUncertainEffectError("factor run original identities differ")
         if isinstance(command, (_OwnedSaveFactorDefinition, _OwnedArchiveFactor)):
             if effect.result is None:
                 try:
@@ -2614,7 +2732,9 @@ class PageControlConsumer:
         created: bool,
     ) -> _ExecutionOutcome:
         command = claim.command
-        if not created or isinstance(command, (_OwnedSaveFactorDefinition, _OwnedArchiveFactor)):
+        if not created or isinstance(
+            command, (_OwnedSaveFactorDefinition, _OwnedArchiveFactor, _OwnedSubmitFactorRun)
+        ):
             try:
                 recovered = self._recover_started_effect(command)
             except Exception as exc:
@@ -2763,6 +2883,8 @@ class PageControlConsumer:
     def _must_recover_before_failure(
         self, command: PageControlCommandValue, *, created: bool
     ) -> bool:
+        if isinstance(command, _OwnedSubmitFactorRun):
+            return not created or self.factor_run_backend is not None
         if isinstance(command, (_OwnedSaveFactorDefinition, _OwnedArchiveFactor)):
             return not created or self.factor_definition_backend is not None
         if isinstance(command, SubmitDataAuditReport):
@@ -2827,6 +2949,8 @@ class PageControlConsumer:
         return _ExecutionOutcome(PageControlStatus.FAILED, effect.result, effect.error)
 
     def _execute(self, command: PageControlCommandValue) -> JsonValue:
+        if isinstance(command, _OwnedSubmitFactorRun):
+            return self._factor_run_backend().submit(command)
         if isinstance(command, (_OwnedSaveFactorDefinition, _OwnedArchiveFactor)):
             return self._factor_definition_backend().submit(
                 command, expected_identity=self._expected_factor_identity(command.command_id)
@@ -2932,6 +3056,11 @@ class PageControlConsumer:
         if self.formula_pool_backend is None:
             raise RuntimeError("formula pool backend is unavailable")
         return self.formula_pool_backend
+
+    def _factor_run_backend(self) -> FactorRunPageControlBackend:
+        if self.factor_run_backend is None:
+            raise ValueError("factor run backend is not configured")
+        return self.factor_run_backend
 
     def _factor_definition_backend(self) -> FactorDefinitionPageControlBackend:
         if self.factor_definition_backend is None:
@@ -3163,6 +3292,8 @@ class PageControlConsumer:
         return None
 
     def _recover_started_effect(self, command: PageControlCommandValue) -> JsonValue | None:
+        if isinstance(command, _OwnedSubmitFactorRun):
+            return self._factor_run_backend().recover(command)
         if isinstance(command, (_OwnedSaveFactorDefinition, _OwnedArchiveFactor)):
             return self._factor_definition_backend().recover(
                 command, expected_identity=self._expected_factor_identity(command.command_id)
@@ -4231,7 +4362,7 @@ class PageControlService:
             command, (SavePriceAlertRule, SetPriceAlertRuleEnabled, DeletePriceAlertRule)
         ):
             raise ValueError("price rule commands require trusted submission")
-        if isinstance(command, (SaveFactorDefinition, ArchiveFactor)):
+        if isinstance(command, (SaveFactorDefinition, ArchiveFactor, SubmitFactorRun)):
             raise ValueError("factor commands require trusted submission")
         if isinstance(command, AckAlert):
             receipt = self.lookup_ack_command(command)
@@ -4269,6 +4400,75 @@ class PageControlService:
         return self._settle(
             owned, self.outbox.enqueue_trusted_price_rule(owned), price_rule_command=owned
         )
+
+    def _submit_trusted_factor_run(
+        self,
+        request: FactorRunRequest,
+        *,
+        authenticated_actor_id: str,
+        verified_registry_instance_id: str,
+    ) -> PageControlReceipt:
+        backend = self.consumer._factor_run_backend()
+        backend.authorize(authenticated_actor_id)
+        matched = self.outbox.lookup_factor_run_command(
+            request,
+            authenticated_actor_id=authenticated_actor_id,
+        )
+        if matched is not None:
+            owned, receipt = matched
+            self._lookup_trusted_factor_run(request, authenticated_actor_id=authenticated_actor_id)
+            return self._settle(owned, receipt, factor_run_command=owned)
+        plan = backend.compile(request, verified_registry_instance_id=verified_registry_instance_id)
+        owned = _OwnedSubmitFactorRun(
+            command_id=request.command_id,
+            requested_at=request.requested_at,
+            request=request,
+            actor_id=authenticated_actor_id,
+            registry_identity=plan.registry_identity,
+            ledger_identity=plan.ledger_identity,
+            spec=plan.spec,
+            original_request_sha256=request.request_sha256,
+        )
+        return self._settle(
+            owned, self.outbox.enqueue_trusted_factor_run(owned), factor_run_command=owned
+        )
+
+    def _lookup_trusted_factor_run(
+        self,
+        request: FactorRunRequest,
+        *,
+        authenticated_actor_id: str,
+    ) -> PageControlReceipt | None:
+        self.consumer._factor_run_backend().authorize(authenticated_actor_id)
+        matched = self.outbox.lookup_factor_run_command(
+            request, authenticated_actor_id=authenticated_actor_id
+        )
+        if matched is None:
+            return None
+        owned, receipt = matched
+        if receipt.status is PageControlStatus.SUCCEEDED:
+            recovered = self.consumer._factor_run_backend().recover(owned)
+            if recovered is None or recovered != receipt.result:
+                raise PageControlCommandConflictError(
+                    "factor run receipt differs from original ledger"
+                )
+        return receipt
+
+    def _resume_trusted_factor_run(
+        self,
+        request: FactorRunRequest,
+        *,
+        authenticated_actor_id: str,
+    ) -> PageControlReceipt:
+        self.consumer._factor_run_backend().authorize(authenticated_actor_id)
+        matched = self.outbox.lookup_factor_run_command(
+            request, authenticated_actor_id=authenticated_actor_id
+        )
+        if matched is None:
+            raise KeyError("factor run command not found")
+        owned, receipt = matched
+        self._lookup_trusted_factor_run(request, authenticated_actor_id=authenticated_actor_id)
+        return self._settle(owned, receipt, factor_run_command=owned)
 
     def _submit_trusted_factor_definition(
         self, command: FactorDefinitionRequestValue, *, authenticated_actor_id: str
@@ -4403,11 +4603,14 @@ class PageControlService:
         *,
         price_rule_command: _OwnedPriceAlertRuleValue | None = None,
         factor_archive_command: _OwnedFactorDefinitionValue | None = None,
+        factor_run_command: _OwnedSubmitFactorRun | None = None,
     ) -> PageControlReceipt:
         for _ in range(100):
             if receipt.status in _PAGE_CONTROL_TERMINAL_STATUSES:
                 return receipt
-            if factor_archive_command is not None:
+            if factor_run_command is not None:
+                drained = self.consumer.drain_factor_definition_command(factor_run_command)
+            elif factor_archive_command is not None:
                 drained = self.consumer.drain_factor_definition_command(factor_archive_command)
             elif price_rule_command is not None:
                 drained = self.consumer.drain_price_rule_command(price_rule_command)
@@ -5083,13 +5286,13 @@ def _fsync_descriptor(descriptor: int) -> None:
 
 
 def parse_page_control_command(payload: object) -> PageControlCommandValue:
-    if isinstance(payload, (SaveFactorDefinition, ArchiveFactor)):
+    if isinstance(payload, (SaveFactorDefinition, ArchiveFactor, SubmitFactorRun)):
         raise ValueError("factor commands require trusted submission")
     if isinstance(payload, Mapping):
         kind = payload.get("kind")
         if isinstance(kind, str) and kind in _PRICE_RULE_KINDS:
             raise ValueError("price rule commands require trusted submission")
-        if isinstance(kind, str) and kind in _FACTOR_DEFINITION_KINDS:
+        if isinstance(kind, str) and kind in _FACTOR_DEFINITION_KINDS | _FACTOR_RUN_KINDS:
             raise ValueError("factor commands require trusted submission")
     return _COMMAND_ADAPTER.validate_python(payload)
 

@@ -395,6 +395,74 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/factors/run-availability": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 因子检验参数 */
+        get: operations["run_availability_api_v1_factors_run_availability_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/factors/runs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 运行因子检验 */
+        post: operations["submit_factor_run_api_v1_factors_runs_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/factors/runs/resume": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 核对原因子检验 */
+        post: operations["resume_factor_run_api_v1_factors_runs_resume_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/factors/runs/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 重试原因子检验 */
+        post: operations["retry_factor_run_api_v1_factors_runs_retry_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/health": {
         parameters: {
             query?: never;
@@ -2586,6 +2654,16 @@ export interface components {
             data: components["schemas"]["FactorResultListData"];
             serving: components["schemas"]["ServingMeta"];
         };
+        /** Envelope[FactorRunAvailability] */
+        Envelope_FactorRunAvailability_: {
+            data: components["schemas"]["FactorRunAvailability"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[FactorRunOperationResult] */
+        Envelope_FactorRunOperationResult_: {
+            data: components["schemas"]["FactorRunOperationResult"];
+            serving: components["schemas"]["ServingMeta"];
+        };
         /** Envelope[FactorSaveCommandData] */
         Envelope_FactorSaveCommandData_: {
             data: components["schemas"]["FactorSaveCommandData"];
@@ -3134,6 +3212,8 @@ export interface components {
              * Format: date-time
              */
             as_of_time: string;
+            /** Definition Content Sha256 */
+            definition_content_sha256?: string | null;
             /**
              * Definition Status
              * @enum {string}
@@ -3156,6 +3236,8 @@ export interface components {
             failure_message: string | null;
             /** Job Id */
             job_id: string;
+            /** Spec Sha256 */
+            spec_sha256?: string | null;
             /**
              * Status
              * @enum {string}
@@ -3180,6 +3262,105 @@ export interface components {
             available_at: string | null;
             /** Results */
             results: components["schemas"]["FactorResultItem"][];
+        };
+        /** FactorRunAvailability */
+        FactorRunAvailability: {
+            /** Enabled */
+            enabled: boolean;
+            /** End Date */
+            end_date?: string | null;
+            /** Pools */
+            pools: components["schemas"]["FactorRunPoolOption"][];
+            /** Reason */
+            reason?: string | null;
+            /** Start Date */
+            start_date?: string | null;
+        };
+        /** FactorRunOperationResult */
+        FactorRunOperationResult: {
+            /** Job Id */
+            job_id?: string | null;
+            original_request: components["schemas"]["FactorRunRequest"];
+            /** Reason */
+            reason?: string | null;
+            /** Spec Sha256 */
+            spec_sha256?: string | null;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "pending" | "processing" | "submitted" | "uncertain" | "rejected";
+        };
+        /** FactorRunParameters */
+        FactorRunParameters: {
+            /**
+             * End Date
+             * Format: date
+             */
+            end_date: string;
+            expected_head: components["schemas"]["FactorHeadRef"];
+            /** Factor Id */
+            factor_id: string;
+            /**
+             * Group Count
+             * @default 5
+             * @enum {integer}
+             */
+            group_count: 3 | 5 | 10;
+            /**
+             * Holding Sessions
+             * @enum {integer}
+             */
+            holding_sessions: 1 | 5 | 10 | 20;
+            /**
+             * Ic Method
+             * @default rank
+             * @enum {string}
+             */
+            ic_method: "rank" | "normal";
+            /**
+             * Neutralization
+             * @default none
+             * @constant
+             */
+            neutralization: "none";
+            /**
+             * Selection
+             * @enum {string}
+             */
+            selection: "all" | "hs300" | "zz1000" | "gem";
+            /**
+             * Start Date
+             * Format: date
+             */
+            start_date: string;
+        };
+        /** FactorRunPoolOption */
+        FactorRunPoolOption: {
+            /** Available */
+            available: boolean;
+            /** Label */
+            label: string;
+            /** Reason */
+            reason?: string | null;
+            /**
+             * Selection
+             * @enum {string}
+             */
+            selection: "all" | "hs300" | "zz1000" | "gem";
+        };
+        /** FactorRunRequest */
+        FactorRunRequest: {
+            /** Command Id */
+            command_id: string;
+            parameters: components["schemas"]["FactorRunParameters"];
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+            /** Serving Generation Id */
+            serving_generation_id: string;
         };
         /** FactorSaveCommandData */
         FactorSaveCommandData: {
@@ -6646,6 +6827,125 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_FactorResultDetailData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    run_availability_api_v1_factors_run_availability_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_FactorRunAvailability_"];
+                };
+            };
+        };
+    };
+    submit_factor_run_api_v1_factors_runs_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["FactorRunRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_FactorRunOperationResult_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    resume_factor_run_api_v1_factors_runs_resume_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["FactorRunRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_FactorRunOperationResult_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    retry_factor_run_api_v1_factors_runs_retry_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["FactorRunRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_FactorRunOperationResult_"];
                 };
             };
             /** @description Validation Error */

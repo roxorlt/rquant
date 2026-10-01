@@ -47,6 +47,11 @@ FACTOR_ADMISSION_SERVICE_UID_ENV_VAR = "RQUANT_WEB_FACTOR_ADMISSION_SERVICE_UID"
 FACTOR_ADMISSION_SHARED_GID_ENV_VAR = "RQUANT_WEB_FACTOR_ADMISSION_SHARED_GID"
 FACTOR_EDITOR_USERS_ENV_VAR = "RQUANT_WEB_FACTOR_EDITOR_USERS"
 FACTOR_SAVE_ENABLED_ENV_VAR = "RQUANT_WEB_FACTOR_SAVE_ENABLED"
+FACTOR_RUN_ENABLED_ENV_VAR = "RQUANT_WEB_FACTOR_RUN_ENABLED"
+FACTOR_RUN_USERS_ENV_VAR = "RQUANT_WEB_FACTOR_RUN_USERS"
+FACTOR_RUN_SOCKET_ENV_VAR = "RQUANT_WEB_FACTOR_RUN_ADMISSION_SOCKET"
+FACTOR_RUN_SERVICE_UID_ENV_VAR = "RQUANT_WEB_FACTOR_RUN_ADMISSION_SERVICE_UID"
+FACTOR_RUN_SHARED_GID_ENV_VAR = "RQUANT_WEB_FACTOR_RUN_ADMISSION_SHARED_GID"
 INGRESS_SOCKET_ENV_VAR = "RQUANT_WEB_INGRESS_SOCKET"
 PROXY_PROOF_FILE_ENV_VAR = "RQUANT_WEB_PROXY_PROOF_FILE"
 LOG_ADMIN_USERS_ENV_VAR = "RQUANT_WEB_LOG_ADMIN_USERS"
@@ -122,6 +127,11 @@ class WebSettings(BaseModel):
     factor_admission_shared_gid: StrictInt | None = None
     factor_editor_users: frozenset[str] = frozenset()
     factor_save_enabled: bool = False
+    factor_run_enabled: bool = False
+    factor_run_users: frozenset[str] = frozenset()
+    factor_run_admission_socket_path: Path | None = None
+    factor_run_admission_service_uid: StrictInt | None = None
+    factor_run_admission_shared_gid: StrictInt | None = None
     ingress_socket_path: Path | None = None
     proxy_proof_file: Path | None = None
     log_admin_users: frozenset[str] = frozenset()
@@ -189,6 +199,34 @@ class WebSettings(BaseModel):
             self.factor_admission_socket_path is None or not self.factor_editor_users
         ):
             raise ValueError("factor save requires a configured private factor admission")
+        run_fields = (
+            self.factor_run_admission_socket_path,
+            self.factor_run_admission_service_uid,
+            self.factor_run_admission_shared_gid,
+        )
+        if (
+            any(value is not None for value in run_fields)
+            or self.factor_run_users
+            or self.factor_run_enabled
+        ):
+            if (
+                not all(value is not None for value in run_fields)
+                or not self.factor_run_users
+                or self.ingress_socket_path is None
+            ):
+                raise ValueError("factor run requires private ingress, socket, IDs and run users")
+            if self.factor_run_admission_service_uid == os.geteuid():
+                raise ValueError("factor run service UID must differ from Web UID")
+            reserved = {self.ingress_socket_path.parent}
+            for path in (
+                self.ack_admission_socket_path,
+                self.watchlist_admission_socket_path,
+                self.factor_admission_socket_path,
+            ):
+                if path is not None:
+                    reserved.add(path.parent)
+            if self.factor_run_admission_socket_path.parent in reserved:
+                raise ValueError("factor run admission needs a separate private directory")
         log_fields = (
             self.unit_log_socket_path,
             self.unit_log_service_uid,
@@ -259,7 +297,9 @@ class WebSettings(BaseModel):
             raise ValueError("proxy proof file path must be absolute and canonical")
         return value
 
-    @field_validator("log_admin_users", "lab_control_users", "factor_editor_users")
+    @field_validator(
+        "log_admin_users", "lab_control_users", "factor_editor_users", "factor_run_users"
+    )
     @classmethod
     def validate_operator_users(cls, value: frozenset[str]) -> frozenset[str]:
         if len(value) > 16 or any(_ADMIN_USER_PATTERN.fullmatch(user) is None for user in value):
@@ -273,14 +313,19 @@ class WebSettings(BaseModel):
             raise ValueError("read-only result root must be absolute and canonical")
         return value
 
-    @field_validator("factor_admission_socket_path")
+    @field_validator("factor_admission_socket_path", "factor_run_admission_socket_path")
     @classmethod
     def validate_factor_admission_path(cls, value: Path | None) -> Path | None:
         if value is not None and (not value.is_absolute() or ".." in value.parts):
             raise ValueError("factor archive socket path must be absolute and canonical")
         return value
 
-    @field_validator("factor_admission_service_uid", "factor_admission_shared_gid")
+    @field_validator(
+        "factor_admission_service_uid",
+        "factor_admission_shared_gid",
+        "factor_run_admission_service_uid",
+        "factor_run_admission_shared_gid",
+    )
     @classmethod
     def validate_factor_admission_identity(cls, value: int | None) -> int | None:
         if value is not None and (type(value) is not int or value < 0):
@@ -402,6 +447,27 @@ class WebSettings(BaseModel):
                 raise ValueError("factor save enablement must be true or false")
             values["factor_save_enabled"] = save_enabled == "true"
         ingress_socket = source.get(INGRESS_SOCKET_ENV_VAR, "").strip()
+        run_socket = source.get(FACTOR_RUN_SOCKET_ENV_VAR, "").strip()
+        if run_socket:
+            values["factor_run_admission_socket_path"] = Path(run_socket)
+        for env_name, field in (
+            (FACTOR_RUN_SERVICE_UID_ENV_VAR, "factor_run_admission_service_uid"),
+            (FACTOR_RUN_SHARED_GID_ENV_VAR, "factor_run_admission_shared_gid"),
+        ):
+            raw = source.get(env_name, "").strip()
+            if raw:
+                values[field] = int(raw)
+        run_users = source.get(FACTOR_RUN_USERS_ENV_VAR, "").strip()
+        if run_users:
+            names = tuple(user.strip() for user in run_users.split(","))
+            if any(not name for name in names) or len(set(names)) != len(names):
+                raise ValueError("factor run users must be distinct nonempty names")
+            values["factor_run_users"] = frozenset(names)
+        run_enabled = source.get(FACTOR_RUN_ENABLED_ENV_VAR, "").strip().lower()
+        if run_enabled:
+            if run_enabled not in {"true", "false"}:
+                raise ValueError("factor run enablement must be true or false")
+            values["factor_run_enabled"] = run_enabled == "true"
         if ingress_socket:
             if bind is not None or source.get(BIND_ENV_VAR, "").strip():
                 raise ValueError("private Web ingress cannot also configure a TCP bind")

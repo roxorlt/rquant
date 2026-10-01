@@ -731,6 +731,26 @@ class FactorEvaluationJobLedger:
             )
             return state.public()
 
+    def lookup_command(self, command_id: str, spec_sha256: str) -> FactorJobRecord | None:
+        """Read one original command anchor without creating or rebasing its ledger."""
+        if not isinstance(command_id, str) or _COMMAND_PATTERN.fullmatch(command_id) is None:
+            raise ValueError("factor command ID is invalid")
+        if not isinstance(spec_sha256, str) or _HEX64.fullmatch(spec_sha256) is None:
+            raise ValueError("factor command spec digest is invalid")
+        with self._reader() as connection:
+            row = connection.execute(
+                "SELECT * FROM factor_commands WHERE command_id = ?", (command_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            _, digest, job_id = _checked_command(row)
+            state = self._load_job(connection, job_id)
+            if state is None or state.spec_sha256 != digest:
+                raise FactorLedgerIntegrityError("factor command points to another job")
+            if digest != spec_sha256:
+                raise FactorLedgerConflictError("factor command ID has different content")
+            return state.public()
+
     def claim(self, *, lease_seconds: int) -> FactorJobLease | None:
         if type(lease_seconds) is not int or not 1 <= lease_seconds <= _MAX_LEASE_SECONDS:
             raise ValueError("factor lease duration is invalid")

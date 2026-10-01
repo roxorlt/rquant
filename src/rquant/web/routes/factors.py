@@ -5,7 +5,6 @@ from __future__ import annotations
 from datetime import date
 from typing import Annotated
 
-import duckdb
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, Response
 
 from rquant.factor.registry import FactorDefinitionReceipt
@@ -138,7 +137,7 @@ def _read_catalog(borrowed: BorrowedGeneration | None) -> FactorCatalogData:
                 for row in verified.definitions
             ],
         )
-    except (ValueError, TypeError, KeyError, duckdb.Error) as exc:
+    except Exception as exc:
         raise HTTPException(status_code=503, detail=_UNREADABLE) from exc
 
 
@@ -310,7 +309,7 @@ def _archive_response(
                             and pointer.generation_id == borrowed.pointer.generation_id
                             and pointer.manifest_sha256 == borrowed.pointer.manifest_sha256
                         )
-                    except (HTTPException, OSError, ValueError, duckdb.Error):
+                    except Exception:
                         catalog = None
                         instance_id = None
                         pointer_matches = False

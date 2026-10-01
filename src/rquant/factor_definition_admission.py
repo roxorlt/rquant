@@ -327,6 +327,7 @@ class FactorDefinitionAdmissionServer(socketserver.ThreadingMixIn, socketserver.
         trusted_web_uid: int,
         shared_gid: int,
         peer_uid: Callable[[socket.socket], int],
+        handler_type: type[BaseHTTPRequestHandler] | None = None,
     ) -> None:
         self.socket_path = socket_path
         self.admission = admission
@@ -335,7 +336,9 @@ class FactorDefinitionAdmissionServer(socketserver.ThreadingMixIn, socketserver.
         self._bound_identity: tuple[int, int] | None = None
         parent_info = socket_path.parent.lstat()
         parent_identity = (parent_info.st_dev, parent_info.st_ino)
-        super().__init__(str(socket_path), _handler_for_admission(), bind_and_activate=False)
+        super().__init__(
+            str(socket_path), handler_type or _handler_for_admission(), bind_and_activate=False
+        )
         try:
             self.server_bind()
             self._bound_identity = _socket_identity(socket_path)
@@ -558,6 +561,7 @@ def build_factor_definition_admission_server(
     trusted_web_uid: int | None = None,
     shared_gid: int | None = None,
     peer_uid: Callable[[socket.socket], int] = _peer_uid,
+    _handler_type: type[BaseHTTPRequestHandler] | None = None,
 ) -> FactorDefinitionAdmissionServer | None:
     if not admission.editor_users:
         return None
@@ -605,6 +609,7 @@ def build_factor_definition_admission_server(
         trusted_web_uid=trusted_web_uid,
         shared_gid=shared_gid,
         peer_uid=peer_uid,
+        handler_type=_handler_type,
     )
 
 
