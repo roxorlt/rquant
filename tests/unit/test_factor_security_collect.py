@@ -394,8 +394,144 @@ def test_interrupted_capture_has_no_completion_and_retries_spend_budget(
     assert not (root / "collection.json").exists()
     receipt = json.loads((root / "interrupted.json").read_bytes())
     assert receipt["status"] == "interrupted" and receipt["actual_call_count"] == 16
-    with pytest.raises(FileNotFoundError):
+    with pytest.raises(ValueError, match="采集中断"):
         m.load_security_capture_collection(root)
+
+
+def _probe_inputs(path: Path) -> Path:
+    path.mkdir(mode=0o700)
+    captures = (
+        *_references(_reference("300001.SZ", "创业板")),
+        _daily(("300001.SZ", "历史名称", "20200102")),
+    )
+    records = []
+    for i, capture in enumerate(captures):
+        filename = f"response-{i}.json"
+        (path / filename).write_bytes(
+            canonical_json_bytes(capture.response.model_dump(mode="json"))
+        )
+        records.append(
+            {
+                "api_name": capture.request.api_name,
+                "params": {"exchange": "", "list_status": capture.request.list_status}
+                if capture.request.api_name == "stock_basic"
+                else {"trade_date": "20260929"},
+                "fields": capture.request.fields,
+                "requested_at": capture.requested_at.isoformat(),
+                "observed_at": capture.observed_at.isoformat(),
+                "status": "response_archived",
+                "filename": filename,
+                "payload_sha256": capture.response_sha256,
+                "row_count": len(capture.response.items),
+            }
+        )
+    (path / "metadata.json").write_bytes(canonical_json_bytes({"requests": records}))
+    return path
+
+
+@pytest.mark.parametrize("entry", ["live", "probe"])
+@pytest.mark.parametrize("boundary", ["before_fsync", "directory_fsync"])
+def test_completion_publication_interruption_is_refused_for_capture_and_probe_import(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entry: str,
+    boundary: str,
+) -> None:
+    m = _module()
+    root = tmp_path / "interrupted-completion"
+    interrupted = False
+    original_write = m._write_all
+    original_fsync = m.os.fsync
+
+    def interrupted_write(descriptor: int, data: bytes) -> None:
+        nonlocal interrupted
+        original_write(descriptor, data)
+        if not interrupted and b'"status":"captured"' in data:
+            interrupted = True
+            raise KeyboardInterrupt("offline completion bytes before fsync")
+
+    def interrupted_directory_sync(descriptor: int) -> None:
+        nonlocal interrupted
+        if (
+            not interrupted
+            and (root / "collection.json").exists()
+            and os.fstat(descriptor).st_ino == root.stat().st_ino
+        ):
+            interrupted = True
+            raise KeyboardInterrupt("offline completion directory fsync")
+        original_fsync(descriptor)
+
+    if boundary == "before_fsync":
+        monkeypatch.setattr(m, "_write_all", interrupted_write)
+    else:
+        monkeypatch.setattr(m.os, "fsync", interrupted_directory_sync)
+    with pytest.raises(KeyboardInterrupt):
+        if entry == "live":
+            m.collect_security_sources(
+                m.SecurityCaptureRequest(root=root, trading_days=(_DAY,), max_calls=16),
+                adapter_factory=_adapter,
+                request_interval_seconds=0,
+            )
+        else:
+            m.import_security_probes((_probe_inputs(tmp_path / "probe-input"),), root=root)
+    assert interrupted
+    assert not (root / "collection.json").exists()
+    receipt = json.loads((root / "interrupted.json").read_bytes())
+    assert receipt["status"] == "interrupted" and receipt["error_type"] == "KeyboardInterrupt"
+    assert receipt["completed_response_count"] == (16 if entry == "live" else 6)
+    assert not list(root.glob("*.tmp"))
+    with pytest.raises(ValueError, match="采集中断"):
+        m.load_security_capture_collection(root)
+    with pytest.raises(ValueError, match="采集中断"):
+        list(m.iter_security_collection_days(root))
+    with pytest.raises(ValueError, match="采集中断"):
+        m.archive_security_collection(
+            root,
+            selection="all",
+            as_of=datetime.now(UTC),
+            input_root=tmp_path / "refused-input",
+            root=tmp_path / "refused-archive",
+        )
+    assert not (tmp_path / "refused-input").exists()
+    assert not (tmp_path / "refused-archive").exists()
+
+
+def test_loader_refuses_recorded_interruption_even_with_valid_completion(tmp_path: Path) -> None:
+    m = _module()
+    root = tmp_path / "legacy-interrupted"
+    m.collect_security_sources(
+        m.SecurityCaptureRequest(root=root, trading_days=(_DAY,), max_calls=16),
+        adapter_factory=_adapter,
+        request_interval_seconds=0,
+    )
+    assert m.load_security_capture_collection(root).status == "captured"
+    (root / "interrupted.json").write_bytes(
+        canonical_json_bytes(
+            {
+                "schema_version": 1,
+                "status": "interrupted",
+                "error_type": "KeyboardInterrupt",
+                "completed_response_count": 16,
+                "actual_call_count": 16,
+            }
+        )
+    )
+    (root / "interrupted.json").chmod(0o600)
+    with pytest.raises(ValueError, match="采集中断"):
+        m.load_security_capture_collection(root)
+    with pytest.raises(ValueError, match="采集中断"):
+        list(m.iter_security_collection_days(root))
+    with pytest.raises(ValueError, match="采集中断"):
+        m.archive_security_collection(
+            root,
+            selection="gem",
+            as_of=datetime.now(UTC),
+            input_root=tmp_path / "refused-input",
+            root=tmp_path / "refused-archive",
+        )
+    assert (root / "collection.json").exists()
+    assert not (tmp_path / "refused-input").exists()
+    assert not (tmp_path / "refused-archive").exists()
 
 
 def test_explicit_budget_and_date_boundaries_are_checked_before_client_creation(

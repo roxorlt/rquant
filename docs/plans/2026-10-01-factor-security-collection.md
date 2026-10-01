@@ -118,3 +118,23 @@ implementer 报告准确命令、Python 环境、红测→绿测、直接依赖�
 - Ruff check、format check、`git diff --check` 通过；没有全仓测试、前端编译或清单生成。
 - 实现者所有 pytest/CLI 子进程均已退出，所有测试临时目录由 pytest 清理；上述自有证据目录明确保留。
   真实 live 调用、正式原数据/worker 验证和一次最终独立审查由根任务继续完成，本片不宣称整体目标已达成。
+
+### FSC-FINAL-01 定向修复（唯一修复轮次）
+
+原候选 `c6dfb08985e18e553b6713d85cd7476fcac8d010` 的最终审查发现：完成 JSON 字节写入后、持久化前中断，
+会同时留下 `collection.json` 与 `interrupted.json`，loader 仍接受并允许成员归档。这可复现地违反中断验收。
+修复仅改 collector 完成发布、loader 中断检查及同域测试，不改来源归一化、股票池合同、adapter、worker 或 Serving。
+
+- live 与 import-probes 共用完成回执发布：先在私有目录中写临时文件，完成文件 fsync 后原子 no-replace rename，
+  再持久化目录。失败时按自有 inode 清理临时/完成文件；loader 在读取前后检查中断记录并明确拒绝。
+- 新增五个 nodeids：两种入口在「完整字节写入后、file fsync 前」及「完成 rename 后、directory fsync」中断的四项，
+  加一项旧目录同时存在有效完成回执与中断回执的拒绝测试。原普通 provider 中断测试同步断言明确拒绝错误。
+- 真实红测：5 failed、28 deselected，日志 `fsc-final-01-red.log`；修复后 5 passed、28 deselected，
+  日志 `fsc-final-01-green.log`。最终 collector 33 项与直接 archive/reader 消费者 30 项验证为
+  63 passed、0 skipped/0 deselected，5.70s，日志与 JUnit：`fsc-final-01-regression.log/xml`。
+  其余有效旧回归复用，未扩大测试或审查范围。
+- 原 reviewer 的 `repro.py` 未改代码，复制到实现者自有 `fsc-final-01-repro/` 后运行，
+  得到 `collection_exists=false`、`interrupted_exists=true`、`load_refused=ValueError`。
+- `new-nodeids.txt` 更新为本片全部新增 33 项；本轮新增五项单独列在 `fsc-final-01-added-nodeids.txt`。
+  证据均在 `/private/tmp/rquant-security-implementation-didrm_qf/`，明确保留；验证进程全部结束，无遗留 `.tmp`。
+  Ruff/format/diff 检查通过；原 reviewer 接下来仅定向复核 FSC-FINAL-01 及修复回归。

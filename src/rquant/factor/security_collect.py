@@ -12,6 +12,7 @@ import hashlib
 import math
 import os
 import re
+import secrets
 import sys
 import time
 from collections.abc import Callable, Iterator, Sequence
@@ -30,6 +31,7 @@ from rquant.factor.member_archive import (
     publish_factor_member_archive,
 )
 from rquant.factor.result_artifact import (
+    _cleanup_owned_temporary,
     _open_private_root,
     _require_same_root,
     _root_path,
@@ -45,6 +47,7 @@ from rquant.factor.universe import (
     UniverseSelection,
     select_factor_universe,
 )
+from rquant.private_fs import rename_noreplace_at
 from rquant.runtime_contracts import canonical_sha256
 from rquant.security_status import normalize_name
 from rquant.source_quota_store import SourceQuotaAttempt, SourceQuotaExhaustedError
@@ -362,6 +365,47 @@ def _write_new(root: Path, descriptor: int, filename: str, data: bytes) -> None:
     os.fsync(descriptor)
 
 
+def _publish_collection(root: Path, descriptor: int, manifest: SecurityCollectionManifest) -> None:
+    data = _bytes(manifest)
+    if len(data) > MAX_COLLECTION_BYTES:
+        raise ValueError("collection manifest exceeds byte limit")
+    temporary = f".security-collection-{secrets.token_hex(16)}.tmp"
+    identity: tuple[int, int] | None = None
+    try:
+        _require_same_root(root, descriptor)
+        file_descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+            dir_fd=descriptor,
+        )
+        try:
+            observed = os.fstat(file_descriptor)
+            identity = observed.st_dev, observed.st_ino
+            _write_all(file_descriptor, data)
+            os.fsync(file_descriptor)
+        finally:
+            os.close(file_descriptor)
+        _require_same_root(root, descriptor)
+        rename_noreplace_at(descriptor, temporary, descriptor, "collection.json")
+        os.fsync(descriptor)
+    except BaseException:
+        if identity is not None:
+            _cleanup_owned_temporary(descriptor, "collection.json", identity)
+        raise
+    finally:
+        if identity is not None:
+            _cleanup_owned_temporary(descriptor, temporary, identity)
+
+
+def _reject_interrupted_collection(descriptor: int) -> None:
+    try:
+        os.stat("interrupted.json", dir_fd=descriptor, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    raise ValueError("来源目录记录了采集中断，不能作为完成资料")
+
+
 def _save_capture(
     root: Path, descriptor: int, capture: CapturedSecurityResponse
 ) -> SecurityCaptureReference:
@@ -422,7 +466,7 @@ def collect_security_sources(
             responses=tuple(references),
             actual_call_count=budget.actual_call_count,
         )
-        _write_new(request.root, descriptor, "collection.json", _bytes(manifest))
+        _publish_collection(request.root, descriptor, manifest)
         return manifest
     except BaseException as exc:
         _write_new(
@@ -448,9 +492,11 @@ def load_security_capture_collection(root: Path) -> SecurityCollectionManifest:
     root = _root_path(root)
     descriptor = _open_private_root(root)
     try:
+        _reject_interrupted_collection(descriptor)
         data, _ = _read_file(descriptor, "collection.json", MAX_COLLECTION_BYTES)
         strict_canonical_json_loads(data)
         manifest = SecurityCollectionManifest.model_validate_json(data)
+        _reject_interrupted_collection(descriptor)
         _require_same_root(root, descriptor)
         return manifest
     finally:
@@ -849,7 +895,7 @@ def import_security_probes(
         manifest = SecurityCollectionManifest(
             trading_days=tuple(sorted(dates)), responses=tuple(references)
         )
-        _write_new(root, descriptor, "collection.json", _bytes(manifest))
+        _publish_collection(root, descriptor, manifest)
         return manifest
     except BaseException as exc:
         _write_new(
