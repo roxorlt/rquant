@@ -77,3 +77,19 @@ python -m rquant.factor.history_assemble archive --capture-root <完成批次一
 - 精确reviewer脚本原字节SHA `ae2bbdde9296f3e59b43126bc797fde2078657063721df4cf22e19d2442dc274`不变复制并执行。脚本要求旧反例仍有1个manifest的断言在修复后失败，自有`fha-final-01-extra-repro/verify.py`仅接住该断言并另行核实原注入确实执行、完成manifest数0、原reader因FileNotFoundError拒绝；完整结果保存于`verified-result.json`，未修改reviewer原件。
 - `new-nodeids.txt`已更新全部21个新增节点；额外1项和实际回归4项分别精确记录。旧20新、61/259和此前7项等仍有效结果复用，去重口径61+259+21=341，并非本轮执行341项。分命令真实结果、源码SHA与授权上下文保存为自有证据根`fha-final-01-extra-*`收据，未扩矩阵、清单或全量验证。
 - 所有自有命令/pytest/reader退出，无后台进程及发布临时文件。只修改自有合成原件，固定反例目录无完成manifest，部分日文件及红测反例保留诊断；真实来源和原reviewer证据零写入。本地commit后干净冻结，交同一reviewer仅复核本ID及直接修复回归；本额外一轮后如仍阻断立即停写。
+
+## 根任务最终验收（2026-10-01）
+
+受审候选 `1f4e1203fceb6ad03b761db342b1a3fadb23adc2` 已在本地集成树 `/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-source-integration`、分支 `cdx/20260929-factor-source-integration` 合入，merge `9824100759c3ffc97ef645db000a9b8891f76e5a`。源码和新增测试保持受审原件；root仅维护清单与验收文档。没有push、合main、tag、部署或Streamlit切流。
+
+一次集中独立终审的唯一 FHA-FINAL-01 经过原作者一次普通定向修复/原审查者复核，再经用户直接授权的额外一次局部OSError补修/同一审查者精确复核，最终closed / accept。授权、原反例和各次冻结证据保留，不修改全局轮次规则。最终报告 `/private/tmp/rquant-history-assembly-final-review-AsnNipVc/extra-recheck-fha-final-01/review.md`，SHA256 `24ae01b259b96ebab1c7ad4df06ea7eb84af76b501d780e61310b776b59164fa`；独立复现确认注入实际执行、完成manifest为0、原reader拒绝且无发布tmp。普通回归21 passed/2.96s、首次修复7 passed/2.15s、额外修复4 passed/1.64s和等价测试格式调整后新节点1 passed/1.13s均为分命令证据。新增21节点有实际红到绿；61名称/collector及259旧依赖结果仍有效，共341个不同有效节点，并非本次执行341项。没有追加审查或重复套件。
+
+root证据根 `/private/tmp/rquant-factor-history-assembly-root-3bbdsk3y`。实际45次调用取得30个早期日原件，与此前18次采集和单码名称原件组合，显式选择2026-08-14—09-29的32个真实开盘日，09-30只作实际未来收益尾部；不按工作日猜交易日、不伪造缺日。单批31日期/64实际dispatch上限不变。全市场/创业科创各32日逐日输入原件、证券事实、选中成员、sourceSHA和实收时刻与旧逐日入口精确对照，原reader均完成消费；归档reader按既定合同把两项来源字段绑定至聚合manifest。初次root校验误把该重绑定当作不一致，已仅修正临时校验脚本并复用有效all归档，产品候选零改动。
+
+两池代码并集均5571；实际完成manifest各80987 bytes，all SHA256 `f50016de6a135f9a5339ce4a399f5ade598ddf76ec6f9470df09452ab22c7c23`，gem `8a3b5b8439c799ed678de93f8ad87e4b756a57900e13fb8193e7d2e776fbff1f`。`actual-assembly-proof.json`、`archive-bindings.json`及逐日对照留档；本地Python3.13.12。回溯来源仍为historical_retrospective，不宣称历史PIT或提供方全部覆盖。
+
+真实云端验收从精确候选源码及实际归档接原只读副本、来源准备、配置工厂、账本和worker，holding=1、5组、RankIC、无中性化、close因子。约10.0GiB副本的5571代码范围物化194187日线、194478复权及50日历行；两个任务各32计算日/32评价日均succeeded。准备9.025s，all worker215.346s、gem126.703s，总399.998s，峰值RSS359.707MiB；实际云端Python3.14.4。`worker-summary.json`与完整response保存结果/来源摘要；response SHA256 `83f30acd006ecfc80bf76d29faeacf8474bdfe4700d1d150bd8307597ef3689e`。这是32日真实完整横截面测量，不等于1024日/7000股最大负载或正式生产安装验收。
+
+全部计算写入位于自有远端tmp，finally已移除；源句柄0、心跳线程空、执行副本与准备scratch为空。所有本片采集、装配、worker、审查与门禁命令已退出，无后台服务或发布临时文件；本地原件/失败诊断/验收收据明确保留，生产主库未打开或写入。
+
+固定清单经正常收集为18899项/55跳过，nodeid SHA256 `729affb74864da6d4d28245d7cea0bcdd61e15a7642e58d14d2047cf584cb976`。仅增上述21节点，无旧删除/重复；approved-skips原件SHA256仍为 `1367a714636bb473ff37edd8af1928d460d2b95f84f3c2658b6a4004cbb1b813`。两项必要门禁实际2 passed/9.52s，Python3.13.12，记录于`comparison.json`、`gates.xml`；没有执行全部18899项或新CI。整体goal保持active，M3仍部分；下一依赖为CSI有效成分，随后行业/市值上下文、工作日18:40跟踪、正式配置/数据代、完整资源与生产体验验收。
