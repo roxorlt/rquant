@@ -108,3 +108,21 @@
 ### 直接消费者与实际门禁补充
 
 root 随后实际读取 `tests/unit/test_web_openapi_snapshot.py`、`web/AGENTS.md` 和 `.github/workflows/web.yml`，确认网页 API 变化必须更新生成 OpenAPI/TS 类型并通过真实门禁；现有 `factors.ts`、`FactorResults.tsx`、`factorCharts.ts` 只消费 dense v1。原「不改 React」遗漏这个直接依赖。现只将上述最小类型链/只读消费兼容及正常 dist 纳入同一候选，新增 SJ-08 和相应聚焦验收；不增加布局、参数、提交/跟踪能力或独立 UI 子任务审查。原租约、失败模型和写入边界保持，既有 reviewer 仅核此 SPEC 补充后仍做一次整体最终候选审查。
+
+
+## 本地验收（2026-10-01）
+
+状态：本地功能候选已接受并合入，网页 API 发布门禁仍有基线失败，不能标记全部门禁/原型/生产完成。整体goal保持active。
+
+- 冻结最终候选 `1ecee412858c370717cde13dcb34e74716153d3c`，直接parent `3489b1ecad5bcf15eb2bfcafd38efffdef9e7121`；原SPEC base `ab3fe7281844ec366f58b25ed538e04f10ef0f26`。本地合入 `e3f02cfecfdf0dfb194f60f5342333216e4be6b4`，parents a545/1ecee；38份实际变更文件逐字节一致，合入时完整Git tree相同，主checkout原dirty修改未触碰。
+- 一次集中终审覆盖SJ-01..08/冻结失败模型、当前diff与直接依赖。`SJ-FINAL-01 P2`：join后、提交前取消遗留prepared记录，1failed→14passed；`SJ-FINAL-02 P2`：旧worker/旧prepare清理新claim，1failed→6passed，后续None sentinel同边界1failed→4passed。原reviewer三次定向复核最终关闭两项、accept；原claim/heartbeat版本推进、三个取消位置、空token拒绝后的有效handle保留均有实际证据，不追加第四轮或架构审计。
+- 核心Python3.12.13；四池真实合成worker→独立复算→CAS→Serving/Web用3.13.12。初始6failed→6passed；累计41不同新节点（spec7/artifact9/runner8/authority17）+68直接旧回归有效，通过结果按分次复用去重，不写一次109全绿。journal重哈希伪造数值/成员选择拒绝，尾部/取消/错误无完整回执，真实writer等待期间同字节新inode替换拒绝，opaque handle/claim/身份绑定与资源界限成立。
+- OpenAPI→TypeScript实际生成；web check535passed、build、提交后verify:dist通过。浏览器107passed/4截图skip（1440/390×light/dark），自有两端口退出后connection refused。必要Web API975 collected/970passed/5failed/exit1：root在clean a545/code755e相同3.13环境精确复现同5失败。缺口未放松或当作通过。
+- 发布前待办是既有三路由DuckDB依赖隔离、app导入隔离及current_user路由分类清单；下一独立范围按实际门禁收敛。无Python3.11、Linux/新CI或生产通过证据。本片真实provider成员覆盖/PIT与最大区间负载未验收，统计一致只相对实际journal和成员文件，不独立重算RAW/AST或认证提供方。
+- 独立准备成本：12股×15评价期，tracemalloc下0.547178s，Python peak3,533,749bytes、retained54,004bytes；30/30批对象释放。单次2日真实复算0.018465s，初始2s lease经真实heartbeat推进到version12，可信clock跨3s仍能提交，停心跳后无数值复算。不是RSS/全市场SLA；原7000×16约103s证据仅在未变边界内复用。
+- 正常生成清单18,790/55，全集SHA256 `8ab31477ae41d10b3eca888f852699e5397f5806f2c7fbfba187eccfbd972da9`，+41/-0、无重复、55批准跳过原件SHA256 `1367a714636bb473ff37edd8af1928d460d2b95f84f3c2658b6a4004cbb1b813`不变。精确收集门禁通过；clean aggregate夹具最初置于项目.cache产生外层rootdir前缀失败，移至自有/private/tmp仅补失败节点1passed/0.59s，不改产品/门禁断言。两项有效证据分别保存，不重复全仓执行。
+- 所有自有命令结束；线程、FD、临时执行副本及prepared记录正确清理，不终止他人进程。原有库/真实凭据/生产/Streamlit与发布权限边界保持。
+
+详细原始命令、红绿、退出与限制保存于 `/private/tmp/rquant-factor-stream-jobs-evidence-20261001.md`；root独立基线复现、合入及清单记录为 `/private/tmp/rquant-factor-stream-jobs-root-evidence-20261001.md`；完整清单delta `/private/tmp/rquant-factor-stream-jobs-manifest-7ffcyej0/manifest-delta.json`。关键证据已在本节固化，临时原始日志不能替代上述明确验收边界。
+
+后续依赖：实际归一化历史成员和正式来源/元数据配置→受认证检验准入及原型运行/恢复交互→每日18:40因子跟踪；行业/市值事实具备后完成中性化。C3.2仍是部分且未发布，M11下单排除，其他原型与差距表功能继续按既定目标推进。
