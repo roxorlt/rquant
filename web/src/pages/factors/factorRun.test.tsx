@@ -538,6 +538,8 @@ describe("因子运行入口", () => {
     };
     const research: Schemas["FactorStreamResearchDisplay"] = {
       schema_version: 2,
+      neutralization: "none",
+      neutralization_label: "无",
       basis_label: "收盘价到下一次调仓收盘价",
       pool_label: "全市场（沪深非 ST）",
       return_price_basis: "raw",

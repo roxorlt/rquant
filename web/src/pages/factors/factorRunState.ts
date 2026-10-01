@@ -16,6 +16,7 @@ export type StoredRun = {
   request: FactorRunRequest;
   factorName: string;
   poolLabel: string;
+  neutralizationLabel?: string;
   result: FactorRunOperationResult | null;
   denied: boolean;
 };
@@ -34,6 +35,17 @@ const parameterKeys = [
 ] as const satisfies readonly (keyof FactorRunParameters)[];
 const digest = /^[a-f0-9]{64}$/;
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
+const neutralizationModes = [
+  "none",
+  "industry",
+  "industry_size",
+] as const satisfies readonly FactorRunParameters["neutralization"][];
+
+export function isNeutralizationMode(
+  value: unknown,
+): value is FactorRunParameters["neutralization"] {
+  return neutralizationModes.some((mode) => mode === value);
+}
 
 function object(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -52,7 +64,7 @@ function validDraft(value: unknown): value is RunDraft & Record<string, unknown>
     typeof value.group_count === "number" &&
     [3, 5, 10].includes(value.group_count) &&
     (value.ic_method === "rank" || value.ic_method === "normal") &&
-    value.neutralization === "none"
+    isNeutralizationMode(value.neutralization)
   );
 }
 
@@ -132,6 +144,10 @@ export function readRun(): StoredRun | null {
       !validRunRequest(value.request) ||
       typeof value.factorName !== "string" ||
       typeof value.poolLabel !== "string" ||
+      (value.neutralizationLabel !== undefined &&
+        (typeof value.neutralizationLabel !== "string" ||
+          value.neutralizationLabel.length === 0 ||
+          value.neutralizationLabel.length > 40)) ||
       typeof value.denied !== "boolean" ||
       (value.result !== null && !validRunResult(value.result, value.request))
     )

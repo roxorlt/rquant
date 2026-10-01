@@ -24,6 +24,7 @@ import {
   withFactorCommandLock,
 } from "./factorRunState";
 import { storageWritable } from "./factorSaveState";
+import { neutralizationCaption, neutralizationChoices } from "./runNeutralization";
 
 const defaults: RunDraft = {
   selection: "all",
@@ -57,6 +58,8 @@ export function useFactorRun({
     () => readRunDraft() ?? (operation === null ? defaults : draftFrom(operation)),
   );
   const [confirmation, setConfirmation] = useState<StoredRun | null>(null);
+  const confirmationRef = useRef(confirmation);
+  confirmationRef.current = confirmation;
   const [storageReady, setStorageReady] = useState(storageWritable);
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
@@ -95,6 +98,10 @@ export function useFactorRun({
     !(availability.error instanceof ApiError && [401, 403].includes(availability.error.status)) &&
     !availability.isFetching;
   const selectedPool = availability.data?.pools.find((pool) => pool.selection === params.selection);
+  const neutralizations = neutralizationChoices(availability.data);
+  const selectedNeutralization = neutralizations.find(
+    (option) => option.neutralization === params.neutralization,
+  );
   const validDates =
     params.start_date !== "" && params.end_date !== "" && params.start_date <= params.end_date;
   const canStart =
@@ -110,6 +117,7 @@ export function useFactorRun({
     storageReady &&
     navigator.locks !== undefined &&
     selectedPool?.available === true &&
+    selectedNeutralization?.available === true &&
     validDates;
   verifiedRef.current = canStart;
   const currentHeadRef = useRef(selected);
@@ -124,7 +132,13 @@ export function useFactorRun({
     confirmation.request.serving_generation_id === generationId &&
     confirmation.request.parameters.factor_id === selected?.factor_id &&
     confirmation.request.parameters.expected_head.version === selected.version &&
-    confirmation.request.parameters.expected_head.content_sha256 === selected.content_sha256;
+    confirmation.request.parameters.expected_head.content_sha256 === selected.content_sha256 &&
+    confirmation.request.parameters.neutralization === params.neutralization &&
+    neutralizations.find(
+      (option) => option.neutralization === confirmation.request.parameters.neutralization,
+    )?.available === true;
+  const confirmationCurrentRef = useRef(confirmationCurrent);
+  confirmationCurrentRef.current = confirmationCurrent;
 
   const results = useFactorResults(operation?.result?.job_id ? generationId : null);
   const published =
@@ -341,6 +355,7 @@ export function useFactorRun({
       typeof generationId !== "string" ||
       selected === null ||
       selectedPool === undefined ||
+      selectedNeutralization?.available !== true ||
       hasRun() ||
       hasDefinitionCommand()
     )
@@ -349,6 +364,7 @@ export function useFactorRun({
       viewer,
       factorName: selected.name_zh,
       poolLabel: selectedPool.label,
+      neutralizationLabel: selectedNeutralization.label,
       result: null,
       denied: false,
       request: {
@@ -376,6 +392,8 @@ export function useFactorRun({
         const head = currentHeadRef.current;
         if (
           !verifiedRef.current ||
+          !confirmationCurrentRef.current ||
+          confirmationRef.current?.request.command_id !== confirmation.request.command_id ||
           actorRef.current !== confirmation.viewer ||
           generationRef.current !== confirmation.request.serving_generation_id ||
           head?.factor_id !== confirmation.request.parameters.factor_id ||
@@ -463,9 +481,11 @@ export function useFactorRun({
                           ? "选择一个因子后运行检验。"
                           : selectedPool?.available === false
                             ? (selectedPool.reason ?? "这个股票池暂不可用。")
-                            : !validDates
-                              ? "请选择有效的起止日期。"
-                              : null));
+                            : selectedNeutralization?.available !== true
+                              ? (selectedNeutralization?.reason ?? "这个中性化方式暂不可用。")
+                              : !validDates
+                                ? "请选择有效的起止日期。"
+                                : null));
   const status = completed
     ? "检验完成。"
     : failed
@@ -482,6 +502,9 @@ export function useFactorRun({
                 : "检验结果暂未确认，请保留本次操作。"));
   return {
     availability,
+    availabilityVerified,
+    neutralizations,
+    describeNeutralization: (record: StoredRun) => neutralizationCaption(record, neutralizations),
     params,
     update,
     operation,

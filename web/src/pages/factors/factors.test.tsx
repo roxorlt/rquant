@@ -69,6 +69,8 @@ const icSummary: Schemas["ICSeriesSummary"] = {
 };
 
 const research: Research = {
+  neutralization: "none",
+  neutralization_label: "无",
   basis_label: "收盘价到下一次调仓收盘价",
   pool_label: "固定样本",
   return_price_basis: "raw",
@@ -233,11 +235,157 @@ function publish(
 }
 
 describe("因子库", () => {
+  it("中性化结果使用各次历史检验自身模式与真实样本，说明可用键盘查看", async () => {
+    publish();
+    const draft = {
+      selection: "all",
+      start_date: "2026-09-01",
+      end_date: "2026-09-23",
+      holding_sessions: 5,
+      group_count: 5,
+      ic_method: "rank",
+      neutralization: "industry_size",
+    };
+    localStorage.setItem("rquant.factor.run-draft.v1", JSON.stringify(draft));
+    const newest = result("2".repeat(32));
+    const older = result("1".repeat(32), {
+      factor_version: 1,
+      definition_status: "historical_unavailable",
+      updated_at: "2026-09-25T07:00:00Z",
+    });
+    publishResults([older, newest]);
+    const industry: Research = {
+      ...research,
+      neutralization: "industry",
+      neutralization_label: "行业",
+      context_basis_label: "行业按回顾口径评价，可能包含事后信息。",
+      context_note: "缺少行业或市值的数据已排除。",
+    };
+    const combined: Research = {
+      ...research,
+      neutralization: "industry_size",
+      neutralization_label: "行业 + 市值",
+      context_basis_label: null,
+      context_note: null,
+    };
+    server.use(
+      http.get("*/api/v1/factors/run-availability", () =>
+        HttpResponse.json({
+          data: {
+            enabled: true,
+            reason: null,
+            start_date: draft.start_date,
+            end_date: draft.end_date,
+            pools: [{ selection: "all", label: "全市场", available: true, reason: null }],
+            neutralizations: [
+              { neutralization: "none", label: "无", available: true, reason: null },
+              { neutralization: "industry", label: "行业", available: true, reason: null },
+              {
+                neutralization: "industry_size",
+                label: "行业 + 市值",
+                available: true,
+                reason: null,
+              },
+            ],
+          },
+          serving: metaEnvelope().serving,
+        }),
+      ),
+      http.get("*/api/v1/factors/results/:jobId", ({ params }) =>
+        HttpResponse.json({
+          data: {
+            availability: "ready",
+            available_at: "2026-09-29T07:00:00Z",
+            result: params.jobId === older.job_id ? older : newest,
+            research: params.jobId === older.job_id ? combined : industry,
+          },
+          serving: metaEnvelope().serving,
+        }),
+      ),
+    );
+    const view = renderApp("/factors");
+    const area = await screen.findByRole("region", { name: "检验结果" });
+    await within(area).findByText("行业中性化");
+    const mode = screen.getByRole("combobox", { name: "中性化" });
+    await waitFor(() => expect(mode).toBeEnabled());
+    expect(mode).toHaveValue("industry_size");
+    expect(area).not.toHaveTextContent("行业 + 市值中性化");
+    expect(area).toHaveTextContent("有效 3 / 8");
+    expect(area).not.toHaveTextContent(industry.context_note ?? "");
+    const basis = within(area).getByText("行业口径");
+    act(() => basis.focus());
+    expect(basis).toHaveFocus();
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(
+      industry.context_basis_label ?? "",
+    );
+    act(() => basis.blur());
+    expect(basis).not.toHaveFocus();
+    await waitFor(() => expect(screen.queryByRole("tooltip")).toBeNull(), { timeout: 2000 });
+    const note = within(area).getByText("样本说明");
+    act(() => note.focus());
+    expect(note).toHaveFocus();
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(industry.context_note ?? "");
+    act(() => note.blur());
+    await waitFor(() => expect(screen.queryByRole("tooltip")).toBeNull(), { timeout: 2000 });
+    const user = userEvent.setup();
+    await user.selectOptions(mode, "none");
+    expect(area).toHaveTextContent("行业中性化");
+    const historical = within(area).getByRole("row", { name: /第 1 版/ });
+    await user.click(historical);
+    await within(area).findByText("行业 + 市值中性化");
+    expect(area).toHaveTextContent("第 1 版检验 · 历史版本");
+    expect(area).not.toHaveTextContent("行业中性化");
+    expect(within(area).queryByText("行业口径")).toBeNull();
+    expect(within(area).queryByText("样本说明")).toBeNull();
+    expect(findJargon(view.container.querySelector("main")?.textContent ?? "")).toEqual([]);
+  });
+
+  it("中性化结果兼容旧响应缺新增字段，缺研究时不从表单猜模式", async () => {
+    publish();
+    const item = result("1".repeat(32));
+    publishResults([item]);
+    const {
+      neutralization: _mode,
+      neutralization_label: _label,
+      context_basis_label: _basis,
+      context_note: _note,
+      ...legacy
+    } = research;
+    server.use(
+      http.get("*/api/v1/factors/results/:jobId", () =>
+        HttpResponse.json({
+          data: {
+            availability: "ready",
+            available_at: "2026-09-29T07:00:00Z",
+            result: item,
+            research: legacy,
+          },
+          serving: metaEnvelope().serving,
+        }),
+      ),
+    );
+    const view = renderApp("/factors");
+    const area = await screen.findByRole("region", { name: "检验结果" });
+    await within(area).findByText("无中性化");
+    expect(within(area).queryByText("行业口径")).toBeNull();
+    expect(within(area).queryByText("样本说明")).toBeNull();
+    publishResults([item], null);
+    await act(async () => {
+      await view.queryClient.invalidateQueries({
+        queryKey: ["factors", "result", firstGeneration],
+      });
+    });
+    await waitFor(() => expect(within(area).queryByText("无中性化")).toBeNull());
+    expect(within(area).queryByRole("img", { name: "IC 时序与累计 IC" })).toBeNull();
+  });
+
   it("新版显示真实池名、轻量分组和部分日期，缺失值保持空", async () => {
     publish();
     const stream: Schemas["FactorStreamResearchDisplay"] = {
       ...research,
       schema_version: 2,
+      neutralization: "industry_size",
+      neutralization_label: "行业 + 市值",
       pool_label: "中证1000",
       ic_summary: { normal_ic: icSummary, rank_ic: icSummary },
       coverage_days: research.coverage_days.map((day) => ({
@@ -260,6 +408,7 @@ describe("因子库", () => {
     await within(area).findByText("中证1000");
     expect(area).not.toHaveTextContent("固定样本");
     expect(area).toHaveTextContent("部分日期可计算");
+    expect(area).toHaveTextContent("行业 + 市值中性化");
     expect(within(area).getByRole("img", { name: "分组累计收益" })).toBeInTheDocument();
     await userEvent.setup().click(within(area).getByText("查看分组收益明细"));
     expect(area).toHaveTextContent("—");

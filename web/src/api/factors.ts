@@ -17,6 +17,7 @@ export type FactorResearchDisplay = FactorResearchDisplayV1 | FactorResearchDisp
 export type FactorRunRequest = Schemas["FactorRunRequest"];
 export type FactorRunParameters = Schemas["FactorRunParameters"];
 export type FactorRunAvailability = Schemas["FactorRunAvailability"];
+export type FactorRunNeutralizationOption = Schemas["FactorRunNeutralizationOption"];
 export type FactorRunOperationResult = Schemas["FactorRunOperationResult"];
 type FactorCatalogEnvelope = Schemas["Envelope_FactorCatalogData_"];
 type FactorCapabilitiesEnvelope = Schemas["Envelope_FactorCapabilitiesData_"];

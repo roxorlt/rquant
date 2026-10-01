@@ -3157,6 +3157,10 @@ export interface components {
         FactorResearchDisplay: {
             /** Basis Label */
             basis_label: string;
+            /** Context Basis Label */
+            context_basis_label?: string | null;
+            /** Context Note */
+            context_note?: string | null;
             /** Coverage Days */
             coverage_days: components["schemas"]["FactorDisplayCoverageDay"][];
             /** Decay Periods */
@@ -3169,6 +3173,18 @@ export interface components {
             /** Ic Points */
             ic_points: components["schemas"]["FactorDisplayICPoint"][];
             ic_summary: components["schemas"]["FactorICSummary"] | null;
+            /**
+             * Neutralization
+             * @default none
+             * @enum {string}
+             */
+            neutralization: "none" | "industry" | "industry_size";
+            /**
+             * Neutralization Label
+             * @default 无
+             * @enum {string}
+             */
+            neutralization_label: "无" | "行业" | "行业 + 市值";
             /**
              * Pool Label
              * @constant
@@ -3269,12 +3285,28 @@ export interface components {
             enabled: boolean;
             /** End Date */
             end_date?: string | null;
+            /** Neutralizations */
+            neutralizations?: components["schemas"]["FactorRunNeutralizationOption"][] | null;
             /** Pools */
             pools: components["schemas"]["FactorRunPoolOption"][];
             /** Reason */
             reason?: string | null;
             /** Start Date */
             start_date?: string | null;
+        };
+        /** FactorRunNeutralizationOption */
+        FactorRunNeutralizationOption: {
+            /** Available */
+            available: boolean;
+            /** Label */
+            label: string;
+            /**
+             * Neutralization
+             * @enum {string}
+             */
+            neutralization: "none" | "industry" | "industry_size";
+            /** Reason */
+            reason?: string | null;
         };
         /** FactorRunOperationResult */
         FactorRunOperationResult: {
@@ -3321,9 +3353,9 @@ export interface components {
             /**
              * Neutralization
              * @default none
-             * @constant
+             * @enum {string}
              */
-            neutralization: "none";
+            neutralization: "none" | "industry" | "industry_size";
             /**
              * Selection
              * @enum {string}
@@ -3447,6 +3479,10 @@ export interface components {
         FactorStreamResearchDisplay: {
             /** Basis Label */
             basis_label: string;
+            /** Context Basis Label */
+            context_basis_label?: string | null;
+            /** Context Note */
+            context_note?: string | null;
             /** Coverage Days */
             coverage_days: components["schemas"]["FactorStreamDisplayCoverageDay"][];
             /** Decay Periods */
@@ -3459,6 +3495,18 @@ export interface components {
             /** Ic Points */
             ic_points: components["schemas"]["FactorDisplayICPoint"][];
             ic_summary: components["schemas"]["FactorICSummary"];
+            /**
+             * Neutralization
+             * @default none
+             * @enum {string}
+             */
+            neutralization: "none" | "industry" | "industry_size";
+            /**
+             * Neutralization Label
+             * @default 无
+             * @enum {string}
+             */
+            neutralization_label: "无" | "行业" | "行业 + 市值";
             /**
              * Pool Label
              * @enum {string}
