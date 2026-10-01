@@ -7,7 +7,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from rquant.factor.capability import HISTORICAL_DAILY_V1
+from rquant.factor.capability import HISTORICAL_DAILY_V1, DailyFactorCapabilities
 from rquant.factor.definition import FactorDefinition, build_factor_definition
 from rquant.factor.evaluate import FactorDirection
 from rquant.factor.registry import FactorHeadRef
@@ -58,7 +58,10 @@ def draft_factor_id(draft: FactorSaveDraft, *, authenticated_actor_id: str) -> s
 
 
 def build_draft_definition(
-    draft: FactorSaveDraft, *, authenticated_actor_id: str
+    draft: FactorSaveDraft,
+    *,
+    authenticated_actor_id: str,
+    capabilities: DailyFactorCapabilities = HISTORICAL_DAILY_V1,
 ) -> FactorDefinition:
     checked = FactorSaveDraft.model_validate(draft)
     factor_id = draft_factor_id(checked, authenticated_actor_id=authenticated_actor_id)
@@ -72,5 +75,5 @@ def build_draft_definition(
         expression=checked.expression,
         feature_catalog=HISTORICAL_DAILY_V1.feature_catalog(),
     )
-    HISTORICAL_DAILY_V1.require_runnable_definition(definition)
+    DailyFactorCapabilities.model_validate(capabilities).require_runnable_definition(definition)
     return definition

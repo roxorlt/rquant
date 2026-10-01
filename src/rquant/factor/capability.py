@@ -117,3 +117,39 @@ HISTORICAL_DAILY_V1 = DailyFactorCapabilities(
         ),
     ),
 )
+
+
+def historical_daily_capabilities(
+    *, industry_available: bool = False, market_cap_available: bool = False
+) -> DailyFactorCapabilities:
+    enabled = tuple(
+        name
+        for name, present in (
+            ("industry_neutralize", industry_available),
+            ("size_neutralize", market_cap_available),
+        )
+        if present
+    )
+    return DailyFactorCapabilities.model_validate(
+        {
+            **HISTORICAL_DAILY_V1.model_dump(),
+            "runnable_operators": HISTORICAL_DAILY_V1.runnable_operators + enabled,
+            "unavailable_operators": tuple(
+                operator
+                for operator in HISTORICAL_DAILY_V1.unavailable_operators
+                if operator.name not in enabled
+            ),
+        }
+    )
+
+
+def neutralization_requirements(definition: FactorDefinition, mode: str) -> tuple[bool, bool]:
+    functions = {
+        node.func.id
+        for node in ast.walk(ast.parse(definition.expression, mode="eval"))
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    return (
+        mode in ("industry", "industry_size") or "industry_neutralize" in functions,
+        mode == "industry_size" or "size_neutralize" in functions,
+    )

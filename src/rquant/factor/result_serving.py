@@ -439,6 +439,13 @@ def project_factor_result_projections(
             or display.snapshot_as_of_time > observed
         ):
             raise ValueError("factor display differs from its exact job or observed time")
+        if v2 and (
+            display.neutralization != adapter.neutralization
+            or completion.neutralization != adapter.neutralization
+            or display.context != adapter.sources.context
+            or completion.context != adapter.sources.context
+        ):
+            raise ValueError("factor display context differs from its original spec")
         loaded[record.job_id] = display, root_identity, file_identity
     if ledger.list_recent_updated(limit=50) != records:
         raise ValueError("factor ledger changed during projection")

@@ -50,6 +50,26 @@ _DISPLAY_MESSAGES = {
 _BASIS_LABEL = "历史回溯研究；分组曲线不含撮合与交易费用。"
 
 
+def _neutralization_fields(display: object) -> dict[str, object]:
+    from rquant.factor.run_request import neutralization_label
+
+    mode = getattr(display, "neutralization", "none")
+    context = getattr(display, "context", None)
+    missing = context is not None and any(
+        count.reason == "missing_context" and count.count > 0
+        for day in display.coverage_days
+        for count in day.coverage.factor_missing_by_reason
+    )
+    return {
+        "neutralization": mode,
+        "neutralization_label": neutralization_label(mode),
+        "context_basis_label": "行业归属来自独立 API 的历史回顾，不代表当时已采集。"
+        if context is not None and context.industry is not None
+        else None,
+        "context_note": "缺少行业或市值数据的股票未参与检验。" if missing else None,
+    }
+
+
 def _read_results(borrowed: BorrowedGeneration | None) -> FactorResultServingSnapshot | None:
     if borrowed is None:
         return None
@@ -264,6 +284,7 @@ def get_factor_result(
             portfolio_status=display.portfolio_status,
             portfolio_days=list(display.portfolio_days),
             coverage_days=list(display.coverage_days),
+            **_neutralization_fields(display),
         )
     )
     availability = (

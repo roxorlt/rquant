@@ -17,8 +17,14 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_core import PydanticCustomError
 
-from rquant.factor.capability import HISTORICAL_DAILY_V1
+from rquant.factor.capability import historical_daily_capabilities
 from rquant.factor.definition import FactorDefinition
+from rquant.factor.neutralization_context import (
+    FactorNeutralizationDayBatch,
+    FactorNeutralizationSources,
+    require_factor_neutralization_binding,
+)
+from rquant.factor.run_request import NeutralizationMode
 from rquant.factor.time_series import (
     MAX_TRADE_DAYS,
     DecisionTime,
@@ -32,6 +38,7 @@ from rquant.factor.time_series import (
     _missing,
     _present,
     _SeriesEvaluator,
+    neutralize_factor_cells,
 )
 from rquant.factor.universe import (
     MAX_UNIVERSE_SECURITIES,
@@ -48,7 +55,9 @@ from rquant.runtime_contracts import canonical_sha256
 
 MAX_FORMULA_CACHE_SLOTS = 2_000_000
 _IMMUTABLE = ConfigDict(extra="forbid", frozen=True, strict=True, revalidate_instances="always")
-_CS_FUNCTIONS = frozenset({"cs_rank", "cs_zscore", "cs_winsorize"})
+_CS_FUNCTIONS = frozenset(
+    {"cs_rank", "cs_zscore", "cs_winsorize", "industry_neutralize", "size_neutralize"}
+)
 DailyFeatureColumn = Literal["open", "high", "low", "close", "vol", "amount"]
 FormulaStreamErrorReason = Literal[
     "cache_budget_exceeded",
@@ -82,6 +91,9 @@ class FactorFormulaStreamSources(BaseModel):
     security_source_sha256: Sha256
     index_source_id: SourceId | None = None
     index_source_sha256: Sha256 | None = None
+    context: FactorNeutralizationSources | None = Field(
+        default=None, exclude_if=lambda v: v is None
+    )
 
     @model_validator(mode="after")
     def _index_binding(self) -> FactorFormulaStreamSources:
@@ -102,6 +114,7 @@ class FactorFormulaStreamRequest(BaseModel):
     as_of: ObservedTime
     selection: UniverseSelection
     sources: FactorFormulaStreamSources
+    neutralization: NeutralizationMode = Field(default="none", exclude_if=lambda v: v == "none")
 
     @field_validator("computation_stock_codes")
     @classmethod
@@ -130,7 +143,19 @@ class FactorFormulaStreamRequest(BaseModel):
                 "index binding differs from selection",
             )
         try:
-            HISTORICAL_DAILY_V1.require_runnable_definition(self.definition)
+            context = self.sources.context
+            industry = context is not None and context.industry is not None
+            cap = context is not None and context.market_cap is not None
+            require_factor_neutralization_binding(
+                context,
+                mode=self.neutralization,
+                snapshot_id=self.sources.feature_source_id,
+                binding_hash=self.sources.feature_source_sha256,
+                as_of=self.as_of,
+            )
+            historical_daily_capabilities(
+                industry_available=industry, market_cap_available=cap
+            ).require_runnable_definition(self.definition)
         except ValueError as error:
             raise PydanticCustomError(
                 "factor_formula_stream_unsupported_definition", "definition lacks a daily contract"
@@ -177,6 +202,9 @@ class FactorFormulaStreamBatch(BaseModel):
     universe: FactorUniverseRequest
     feature_points: tuple[FactorFormulaFeaturePoint, ...] = Field(
         max_length=MAX_UNIVERSE_SECURITIES * 6
+    )
+    context: FactorNeutralizationDayBatch | None = Field(
+        default=None, exclude_if=lambda v: v is None
     )
 
     @field_validator("feature_points")
@@ -280,8 +308,14 @@ def _compile(request: FactorFormulaStreamRequest) -> _Plan:
 
     visit(root)
     # Each node's actual parent window, current feature points, and one working/output vector.
+    context = request.sources.context
+    context_slots = (
+        0
+        if context is None
+        else 4 * (int(context.industry is not None) + int(context.market_cap is not None)) + 4
+    )
     slots = len(request.computation_stock_codes) * (
-        sum(retained.values()) + len(request.definition.dependency_columns) + 1
+        sum(retained.values()) + len(request.definition.dependency_columns) + 1 + context_slots
     )
     if slots > MAX_FORMULA_CACHE_SLOTS:
         raise FactorFormulaStreamError("cache_budget_exceeded")
@@ -290,6 +324,14 @@ def _compile(request: FactorFormulaStreamRequest) -> _Plan:
 
 def factor_formula_stream_request_sha256(request: FactorFormulaStreamRequest) -> str:
     return canonical_sha256(FactorFormulaStreamRequest.model_validate(request))
+
+
+def factor_formula_stream_batch_sha256(batch: FactorFormulaStreamBatch) -> str:
+    if batch.context is None:
+        return canonical_sha256(batch)
+    fields = batch.model_dump()
+    fields["context"] = {"sha256": batch.context.sha256}
+    return canonical_sha256(fields)
 
 
 class _CachedSeries(_SeriesEvaluator):
@@ -321,6 +363,7 @@ class _DailyFormula:
         self, batch: FactorFormulaStreamBatch, pool: FactorUniverseResult, day_index: int
     ) -> tuple[FactorTimeSeriesValue, ...]:
         codes = self.request.computation_stock_codes
+        industries, caps = ({}, {}) if batch.context is None else batch.context.observations()
         points = {(point.stock_code, point.column): point for point in batch.feature_points}
         adapters = tuple(_CachedSeries(index, self.history) for index in range(len(codes)))
         for node in self.plan.nodes:
@@ -349,9 +392,16 @@ class _DailyFormula:
                     _SeriesEvaluator._cross_rank(valid, latest, results)
                 elif node.func.id == "cs_zscore":
                     _SeriesEvaluator._cross_zscore(valid, latest, results)
-                else:
+                elif node.func.id == "cs_winsorize":
                     _SeriesEvaluator._cross_winsorize(
                         valid, latest, results, _literal_number(node.args[1])
+                    )
+                else:
+                    results = neutralize_factor_cells(
+                        "industry" if node.func.id == "industry_neutralize" else "size",
+                        inputs,
+                        industries=industries,
+                        market_caps=caps,
                     )
                 current = tuple(
                     results.get(code, _missing("missing_observation")) for code in codes
@@ -360,6 +410,18 @@ class _DailyFormula:
                 current = tuple(adapter._evaluate_uncached(node, day_index) for adapter in adapters)
             self.history[id(node)].append((day_index, current))
         root_cells = self.history[id(self.plan.nodes[-1])][-1][1]
+        if self.request.neutralization != "none":
+            selected = {
+                code: cell
+                for code, cell in zip(codes, root_cells, strict=True)
+                if code in self.selected
+            }
+            results = neutralize_factor_cells(
+                self.request.neutralization, selected, industries=industries, market_caps=caps
+            )
+            root_cells = tuple(
+                results.get(code, cell) for code, cell in zip(codes, root_cells, strict=True)
+            )
         earliest = self.request.definition.earliest_available_date
         before_available = earliest is not None and pool.trade_date < earliest
         values: list[FactorTimeSeriesValue] = []
@@ -394,6 +456,16 @@ def _checked_day(
     if batch.request_sha256 != request_sha:
         raise FactorFormulaStreamError("request_binding_mismatch")
     if batch.sources != request.sources:
+        raise FactorFormulaStreamError("source_binding_mismatch")
+    context = batch.context
+    if (context is None) != (request.sources.context is None):
+        raise FactorFormulaStreamError("source_binding_mismatch")
+    if context is not None and (
+        context.sources != request.sources.context
+        or context.trade_date != decision.trade_date
+        or context.stock_codes != request.computation_stock_codes
+        or context.assumed_visible_at != decision.decision_at
+    ):
         raise FactorFormulaStreamError("source_binding_mismatch")
     if batch.universe.selection != request.selection:
         raise FactorFormulaStreamError("selection_mismatch")
@@ -478,7 +550,7 @@ class FactorFormulaStream(Iterator[FactorFormulaStreamDay]):
                 pool = _checked_day(request, batch, request_sha, decision)
                 self._engine._selected = frozenset(pool.stock_codes)
                 values = self._engine.evaluate(batch, pool, day_index)
-                input_sha = canonical_sha256(batch)
+                input_sha = factor_formula_stream_batch_sha256(batch)
                 history_sha = canonical_sha256((history_sha, input_sha))
                 fields = {
                     "factor_id": request.definition.factor_id,

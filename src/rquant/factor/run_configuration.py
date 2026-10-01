@@ -20,6 +20,7 @@ from rquant.factor.member_archive import (
     _read_file,
     _sha,
 )
+from rquant.factor.neutralization_context import FactorNeutralizationContext
 from rquant.factor.registry import FactorRegistryIdentity
 from rquant.factor.result_artifact import _open_private_root, _root_path
 from rquant.factor.run_request import RUN_IMMUTABLE
@@ -34,7 +35,9 @@ _MAX_CONFIG_BYTES = 256 * 1024
 class FactorRunFileReference(BaseModel):
     model_config = RUN_IMMUTABLE
 
-    kind: str = Field(pattern=r"^factor-(prepared-source|run-configuration)-v1$")
+    kind: str = Field(
+        pattern=r"^factor-(prepared-source|run-configuration|neutralization-context)-v1$"
+    )
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     filename: str
     byte_count: int = Field(gt=0, le=_MAX_SOURCE_BYTES)
@@ -68,11 +71,19 @@ class FactorRunConfiguration(BaseModel):
     members: tuple[FactorRunMemberBinding, ...] = Field(default=(), max_length=4)
     code_revision: str = Field(pattern=r"^[0-9a-f]{40}$")
     deadline_seconds: int = Field(default=3600, ge=60, le=86400)
+    neutralization_context: FactorRunFileReference | None = Field(
+        default=None, exclude_if=lambda v: v is None
+    )
 
     @model_validator(mode="after")
     def _fixed_paths(self) -> FactorRunConfiguration:
         if self.prepared_source.kind != "factor-prepared-source-v1":
             raise ValueError("配置缺少来源包")
+        if (
+            self.neutralization_context is not None
+            and self.neutralization_context.kind != "factor-neutralization-context-v1"
+        ):
+            raise ValueError("配置缺少中性化上下文包")
         for path in (
             self.lake_root,
             self.member_root,
@@ -129,6 +140,17 @@ def save_factor_run_configuration(
     )
 
 
+def save_factor_neutralization_context(
+    root: Path, context: FactorNeutralizationContext
+) -> FactorRunFileReference:
+    return _save(
+        root,
+        FactorNeutralizationContext.model_validate(context),
+        "factor-neutralization-context-v1",
+        _MAX_SOURCE_BYTES,
+    )
+
+
 def _load(
     descriptor: int,
     reference: FactorRunFileReference,
@@ -164,10 +186,12 @@ class LoadedFactorRunConfiguration:
         identities: dict[str, tuple[int, ...]],
         configuration: FactorRunConfiguration,
         source: FactorPreparedStreamSource,
+        context: FactorNeutralizationContext | None = None,
     ) -> None:
         self.root, self.descriptor, self.identities = root, descriptor, identities
         self.configuration, self.source = configuration, source
         self.metadata = PreparedFactorMetadata(source)
+        self.context = context
 
     def recheck(self) -> None:
         _check_identities(self.root, self.descriptor, self.identities)
@@ -198,15 +222,28 @@ def open_factor_run_configuration(
             descriptor, config.prepared_source, FactorPreparedStreamSource, _MAX_SOURCE_BYTES
         )
         assert isinstance(source, FactorPreparedStreamSource)
+        identities = {
+            reference.filename: config_identity,
+            config.prepared_source.filename: source_identity,
+        }
+        context = None
+        if config.neutralization_context is not None:
+            context, identity = _load(
+                descriptor,
+                config.neutralization_context,
+                FactorNeutralizationContext,
+                _MAX_SOURCE_BYTES,
+            )
+            assert isinstance(context, FactorNeutralizationContext)
+            context.require_prepared(source)
+            identities[config.neutralization_context.filename] = identity
         loaded = LoadedFactorRunConfiguration(
             root,
             descriptor,
-            {
-                reference.filename: config_identity,
-                config.prepared_source.filename: source_identity,
-            },
+            identities,
             config,
             source,
+            context,
         )
         loaded.recheck()
         yield loaded
