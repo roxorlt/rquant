@@ -130,9 +130,12 @@ for (const viewport of [
         await expect(dialog).toContainText(`${option.label}中性化`);
         expect(requests).toHaveLength(0);
         await expectNoHorizontalOverflow(page, `factor run confirm ${viewport.label}`);
+        await expect(dialog).toBeVisible();
+        await expect(dialog).toHaveCSS("opacity", "1");
         await page.screenshot({
           path: testInfo.outputPath(`factor-run-confirm-${viewport.label}.png`),
           fullPage: true,
+          animations: "disabled",
         });
         await dialog.getByRole("button", { name: "确认运行" }).click();
         await expect(
