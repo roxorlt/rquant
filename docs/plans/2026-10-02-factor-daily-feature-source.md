@@ -108,3 +108,16 @@ root 在干净 `93f82954fbab7ea2a5267cd758917abc8d01e375` 交FE前授权单一�
 正常隔离收集 exit0（Python3.13.12，8.119s），清单从19,081增加22个精确新节点至19,103；旧节点零移除、零重复，55项既定skip原字节不变。新逻辑摘要 `40deb84aa5071e4d5079d94204b8fb72a95e015d9d7223b64e626838be943eca`。只更新清单及测试说明/精确计数；两项仓库清单门禁实际2passed、exit0、8.381s，没有执行19,103项全量套件。证据根 `/private/tmp/rquant-factor-tracking-root-yegakn31/daily-feature-manifest-proof`，正常collect/比较/install/两门禁的原日志、XML和SHA收据保留。
 
 最终候选包含前后端、必要生成物和本次清单，唯一原生reviewer `/root/factor_security_collection_final_review` 只审精确diff、直接依赖、上述验收与有效原件；普通任务最多一次原作者定向修复、原审查者复核。真实32日逐值及worker验收留给接受后的root。全量生产覆盖、指标初始化核验和持续跟踪仍列后续，不把本片单次检验等同于整体验收。
+
+
+## Root真实只读及本地验收（2026-10-03，追加）
+
+唯一原生reviewer `/root/factor_security_collection_final_review` 对 `52e1bca5bede7ca03c32dd51108fa20f328b733f` 相对 `6105e17280c244f50bde62aafc73229a85aeef58` 一次集中终审ACCEPT、无DFE阻断、零产品修复轮。报告 `/private/tmp/rquant-daily-feature-final-review-wbbndhrd/review.md`，SHA256 `ac0528cc7e370322b52961d19fa2e20c025294f79f8615c2a4c6e6e9f45ea974`；没有重跑有效套件或读取真实资料。首56行原SHA保持。
+
+root在接受后由精确Git src归档、34份已接受原成员文件及独立参考构造8,985,456字节私有包，实际SSH固定RO只读/自有远端tmp：Python3.14.4/DuckDB1.5.2，原RO代前后相同。32日5571码两表16字段2,852,352格、768次最多500码reader查询逐项核对原SQL原值及缺因；所有有限值位相同，负MACD13,656格、J出范围1,506格保持。真实非有限及负零未出现，合成矩阵补其异常证据。
+
+新库存表达式 `rsi14 / 100 + turnover_rate / 100 + total_mv / circ_mv + ts_mean(volume_ratio,2)` 在09-24/28/29三个最新成熟评价日走真实trusted配置/worker/journal独立sealed replay与Serving投影；515有效值/14,552缺失结果与独立stdlib原始参考一致，最大误差3.552713678800501e-15（事前冻结容差2e-12+1e-12*abs(expected)）。来源和逐日覆盖与发布投影相等、无私有路径。真实32日为reader域，不宣称本次worker计算了32日。
+
+本次价格准备9.107s、库存准备3.765s、原值reader对照38.061s、worker62.437s，含独立重放/投影总154.974s、峰值612.344MiB；SSH含打包/传输159.374s、exit0。读句柄/湖句柄/心跳/私有scratch归零，自有远端tmp删除，无provider HTTP/生产写入/生产发布。原件 `/private/tmp/rquant-factor-tracking-root-yegakn31/daily-feature-proof/worker-response.json` 及dispatch/command/stderr，独立原始参考SHA和实际清理收据保留。root汇总收据首次将空心跳列表误比数字0，失败原件保留，按实际类型定向修正；产品与真实worker未改/未重跑。过期API/browser合成目录已按创建归属/owner/无句柄核对，恢复普通只读目录的owner写权限后标准删除；首次browser创建归属断言选错receipt保留，改核真实e2e job后删除，未动flags/ACL/平台保护。
+
+本地集成树从 `c0edd7b7f79cd3d4272f70506ad7b56a6a8065b6` 快进合入受审候选并核对clean。仅本片进度/顺序/Changelog与验收附录收尾；当前实现树保留用于已明确下一片库存字段跟踪，不增建worktree。原用户主树及其他任务未接管。新增字段跟踪、指标全市场生产口径/初始化、既有选股特征/分钟/竞价/温度/VP、CSI完整历史、正式配置/数据代/18:40及生产验收继续完成；M3部分、整体goal active，没有push/tag/生产部署或停Streamlit。
