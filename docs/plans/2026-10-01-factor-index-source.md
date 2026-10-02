@@ -69,3 +69,9 @@ root接受后执行新live两次实际官方捕获，保存原件与HTTP回执�
 - 09-30后没有实际收益尾部，本片未执行指数worker，不将当日完整名单或合成收益计为历史指数检验。官方05-29调整附件仅替换/备选，09-09调整取退市生效条件，仍缺历史完整基线/全部调整及精确有效日，不能用最新/按月权重填过去每日。M3/整体goal继续active。
 - 固定清单正常生成18935/55，SHA `7e1540bd0cf59fb5508243314a826f1178d1e55f289222ecde7c2162fef5e760`；只新增36，无旧删除/重复，批准跳过字节不变。两必要门禁实际2 passed/8.78s，未执行全部18935节点。源码/新测试与受审候选sha完全一致。所有采集/导入/归档/test/审查进程已退出，无自有后台或发布tmp；失败中断批次、红反例及本地证明明确保留。
 - 主工作树原HEAD与三份已知tracked修改保留。未push/main/tag/部署/切流或停Streamlit；完整CSI历史、行业/市值上下文、18:40跟踪、正式配置/数据代及完整资源/生产验收继续实施。下一片优先复用同代RO的daily_basic市值，行业源还需核定分类与完整区间。
+
+## 历史来源有界复核（2026-10-02）
+
+两轮限定官方域名检索及官方接口页核对，没有找到已说明完整逐日历史成分的接口；这不是历史资料不存在的证明。[Tushare index_weight](https://tushare.pro/document/2?doc_id=96)是月度成分/权重；[AKShare指数文档](https://akshare.akfamily.xyz/data/index/index.html)的 `index_stock_cons` 是最新名单，`index_stock_cons_csindex` 无历史日期参数；[CSI 05-29调整附件](https://oss-ch.csindex.com.cn/notice/20260529155822-%E9%99%84%E4%BB%B6%EF%BC%9A%E9%83%A8%E5%88%86%E6%8C%87%E6%95%B0%E6%A0%B7%E6%9C%AC%E8%B0%83%E6%95%B4%E5%90%8D%E5%8D%95.pdf)是调整名单，不能单独证明完整基线/全部临时调整。
+
+保留09-30真实当日名单能力；历史扩展需要经核验的逐日完整文件，或完整基线、全部调整目录及有效日证据。没有把月度/最新成分回填过去，也没有新增指数数据采集请求。检索记录 `/private/tmp/rquant-factor-neutralization-root-2wcyf7nd/index-history-source-research.md`。市值、行业及两种中性化计算/页面已由[本片验收](2026-10-02-factor-neutralization.md#根任务最终验收2026-10-02)接通；CSI完整历史、18:40跟踪仍在目标范围，M3保持部分。

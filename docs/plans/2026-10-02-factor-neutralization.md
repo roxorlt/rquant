@@ -104,3 +104,24 @@ CSI 完整历史成分、18:40 因子跟踪、C3.2 尚缺的其他统计、正�
 全部自有 exec/pytest/CLI 命令已退出；私有 reader、执行副本、日对象、journal 和 Unix 服务线程由实际断言确认释放。早期两个 gid 夹具失败所留空 `fneu-*` 目录按创建时间与对应 JUnit、dev/inode/owner 明确归属后移除。清洁 env 的默认 /private/tmp 父目录被原 proxy-proof 私有父目录检查正确拒绝；成功 Web 证据使用本树自有临时私有 proof 目录，finally 删除，未改鉴权或共享权限。仅自有合成旧规范原件与 log/XML 在证据根留存；无借用 runtime 改动。
 
 本片改动严格为必要后台/直接可信与 Web 投影、Python 测试和此附录；未改已验收采集器、ledger/schema、前端、生成合同、测试清单、依赖、生产或部署。后台候选交 root 后停写：真实两池 32 日、Frontend 组装、统一生成合同/必要门禁和唯一集中独立审查仍由 root 完成；这里不宣称整个 M3、PIT、最大负载或生产上线。
+
+## 根任务最终验收（2026-10-02）
+
+本地合入 `f3065f668f83bdc5342acbc8aea6f263a34ec28c`，最终受审候选 `b1eee49bb2a247d8cb7015106599e92203fed461`，合入时树内容完全一致。原生独立审查一次集中覆盖本片冻结模型、diff、直接依赖、测试和验收，accept、无finding、零修复轮。报告 `/private/tmp/rquant-neutralization-final-review-no1g4vu7/review.md`，SHA256 `aed161a5752769e94e00b31776cce3aef7f2e2c26c3a144febde9804993ff9b9`。此前FHA额外补修授权没有用于本片。
+
+后台34新 + 66旧共100个不同节点有效；前端576、Web API987通过，浏览器119收集/115通过/4原配置跳过。最终6项桌面/390px确认截图重叠，不累加；root实际查看确认及恢复截图。TypeScript、Biome、构建和已提交dist校验通过，首屏323.1KB低于550KB门限。缺私有TMPDIR的API失败、磁盘不足中断、未稳定动画截图、root首次清单缺跳过文件的错误均保留，未计为通过。有效命令、日志、XML及截图见 `/private/tmp/rquant-factor-neutralization-final-20261002-ufRVRHOk`；后台与前端聚焦证据分别见 `/private/tmp/rquant-neutralization-implementation-gptxxerj` 与 `/private/tmp/rquant-factor-neutralization-react-20261002-SpNDUN5e`。本地实际Python3.13.12，3.11为语法证据；真实诊断用云端Python3.14.4，没有新增3.11/3.12 runtime或CI结果。
+
+root在实际任务前重新只读捕获原始收盘价/市值，5.487s，旧代原件保留于 `previous-reference-20261002T051137861079Z`。新JSONL SHA256 `96887a24d92d893ff532f4c2718a299d2fd6f4203143b399a85e7e2bee3f4c5e`；独立NumPy行业哑变量矩阵 + 对数市值OLS没有调用产品中性化核。两组均为08-14—09-29的32计算日/32评价日、代码并集5,571，按前一实际SSE交易日取上下文，journal日期、代码、空值原因和数值逐项比较：
+
+| 实际任务 | worker秒 | 比较因子值 | 有效值 | 缺失分类 | 最大绝对误差 |
+|---|---:|---:|---:|---|---:|
+| 全市场 / 行业 | 250.173 | 160,462 | 160,251 | 205缺观测、6缺上下文 | 4.547e-13 |
+| 创业科创 / 行业 + 市值 | 189.319 | 64,685 | 64,526 | 89缺观测、64样本不足、6缺上下文 | 4.775e-12 |
+
+两份配置、原任务、completion及32日展示覆盖均核验成功，共225,147比较、224,777有效、370明确缺失。总诊断521.080s、峰值RSS481.359MiB包含准备、导入和独立验证，不代表单个worker峰值或最大区间负载。原件/市值在准备配对时核对同代；运行后live RO确实自动刷新，成功依据是封存原件及worker完整绑定，不声称live RO全程未变。行业API区间原件沿自己的实际采集边界，语义保持historical_retrospective，未证明PIT或全部来源同一RO事务。本次供应方数据HTTP为0，没有写生产库或发布正式结果。
+
+固定清单19,019/55，SHA256 `855197adec2aa611fea6b358f83ac5d071905c4ff65b2cc18e36a258bededc0e`；精确增34、无旧删除/重复，批准跳过原字节和SHA `1367a714636bb473ff37edd8af1928d460d2b95f84f3c2658b6a4004cbb1b813`不变。正常collection成功，两个必要门禁2 passed/8.591s，没有执行全部19,019节点。原none七类规范payload/摘要及旧full重投影逐字节兼容。
+
+root完整证据在 `/private/tmp/rquant-factor-neutralization-root-2wcyf7nd`，含冻结67文件SHA、接受记录、原始引用、独立黄金、`worker-response.json`、`actual-worker-evidence.json`、清单和门禁。worker回复SHA256 `6f2ba085d3d1483cbbaa2d6f9e8a40278004f7411e3bdee7a53605dd0b2e8626`。自有命令均完成；源/湖句柄0、心跳线程/私有副本为空，自有远端 `/tmp/rquant-factor-neutralization-proof-20261002-b096036a6e46` 已删除。测试服务器退出；临时node_modules指针精确移除，原依赖目录保留；未知来源目录及工作树未清理。
+
+收尾文档属于小改动：仅登记已有事实和后续范围，不改变接口、数据或行为，由root自检，不叠加审查或重跑有效测试。主工作树原HEAD/三份已知tracked修改保持；未push/main/tag/部署/切流或停Streamlit。M3仍部分；18:40跟踪、CSI完整历史、其他尚缺C3.2统计、正式配置/数据代和完整资源/生产体验继续实施。
