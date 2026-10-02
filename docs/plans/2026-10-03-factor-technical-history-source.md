@@ -46,3 +46,13 @@ backend冻结后frontend同树顺序接实际可信目录/来源与覆盖、测�
 - 借用 Python3.13.12/Pydantic2.13.1/DuckDB1.5.2/ta0.11.0/pytest9.0.3，仅本树PYTHONPATH、禁dotenv/bytecode、dummy配置及自有TMPDIR；无网络/真实资料/生产。`ruff-accepted.json`/`format-accepted.json` 实际exit0，11文件Python3.11 AST与源码SHA在 `syntax-and-file-sha.json`；git diff --check实际exit0。
 - `public-api.json` 是真实合成配置/产物导出的capability/display形状；`synthetic-source.json` 是完整合成typed v2来源。`resources.json`/`handoff-capture.json` 实际FD前后相等、只有MainThread、无私有reader/prepare目录；所有自有命令session已结束，无daemon/UDS。合成basetemp、工件和日志仅保留在该0700私有证据根供最终复核。
 - Backend 候选冻结后停写。前端接线/规范API生成/组合门禁、唯一独立审查、真实RO及worker验收由root接续；本片不宣称真实全市场覆盖、PIT、上市全历史、最大负载或上线。
+
+
+## React 前端实施与合成验证（2026-10-03）
+
+- 前端起点 `c5619a64388d6bdf87c3ff6a4dc373a092689d42`；原后端作者的 schema 修正 `25a5ac1819e144e1ed3e15a0833200df6c13c923` 后规范生成 OpenAPI/TS。前端源码与 dist 快照 `6bc8e9704d917b9af4cc681fb18ca22c0d5b069c`；生产 UI 仅改 `FactorDailyFeatures.tsx`，逐字段来源、初始化事实及覆盖缺因来自该历史结果自身。
+- 新增 9 个 Web 行为节点，首轮 8 failed / 1 passed 到最终 9 passed；首两次 check 在 TS 阶段退出，原件保留。唯一有效完整 check：60 文件 / 661 passed，exit 0；API 正常 `tests/unit/test_web_*.py` 门禁：993 passed，exit 0。前端新增 Python 节点 0；后端节点收据由 root 单独接收。
+- 首次完整浏览器：122 passed / 3 failed / 4 原配置 skipped，exit 1。精确修正新两节点的中文 Tip 定位及关闭等待后 2 passed；旧数据审计 390px 原节点不改代码的一次复现 1 passed。唯一有效通过共 125，4 skipped 不计通过；原失败 XML/log/trace 与 409 请求/响应时间序保留。
+- 1440×900 / 390×844 的键盘、触摸说明、历史来源与当前能力独立及换代恢复均有合成浏览器证据。仅为截图等待 Tip opacity=1 后补两节点 2 passed，未重复累计；最终 4 张 PNG 已实际查看。
+- Node 22.22.2 / pnpm 10.33.0 / Python 3.13.12 / Pydantic 2.13.1 / DuckDB 1.5.2。build、size、正常快照提交后的 verify:dist 均 exit 0；首屏 gzip 323.2 KB / 上限 550 KB，按需合计 437.7 KB。
+- 完整 argv、UTC、wall、exit、XML、节点、生成合同与截图 SHA、资源收据：`/private/tmp/rquant-technical-source-react-2jfu0_dg`。本片仅合成验证，真实来源验收与唯一联合审查由 root 接续。自有端口 18825 / 14225 已随服务器退出；API basetemp 与 browser-serving 保留给最终审查，句柄检查无匹配，不修改保护或删除未知资料。
