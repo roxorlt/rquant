@@ -1,5 +1,6 @@
 import { Button, ConfirmDialog, Panel, Segmented, Tip } from "@/ui";
-import type { RunDraft } from "./factorRunState";
+import { isNeutralizationMode, type RunDraft } from "./factorRunState";
+import { neutralizationExplanation } from "./runNeutralization";
 import type { useFactorRun } from "./useFactorRun";
 
 type Run = ReturnType<typeof useFactorRun>;
@@ -99,17 +100,28 @@ export function FactorRunParameters({ run }: { run: Run }) {
         </div>
         <label className="field">
           <span className="lbl">中性化</span>
-          <select className="inp" value="none" onChange={() => {}}>
-            <option value="none">无</option>
-            <option value="industry" disabled>
-              行业（暂不可用）
-            </option>
-            <option value="industry_size" disabled>
-              行业 + 市值（暂不可用）
-            </option>
+          <select
+            className="inp"
+            value={params.neutralization}
+            disabled={!run.availabilityVerified || run.permissionDenied}
+            onChange={(event) => {
+              if (isNeutralizationMode(event.target.value))
+                change("neutralization", event.target.value);
+            }}
+          >
+            {run.neutralizations.map((option) => (
+              <option
+                key={option.neutralization}
+                value={option.neutralization}
+                disabled={!option.available}
+              >
+                {option.label}
+                {option.available ? "" : "（暂不可用）"}
+              </option>
+            ))}
           </select>
         </label>
-        <Tip content="行业及行业 + 市值中性化尚未开放，当前检验保留原始因子值。">中性化说明</Tip>
+        <Tip content={neutralizationExplanation(run.neutralizations)}>中性化说明</Tip>
         <div className="field">
           <span className="lbl">IC 算法</span>
           <Segmented
@@ -157,6 +169,8 @@ export function FactorRunStatus({ run }: { run: Run }) {
         <span>
           {p.holding_sessions} 日 · {p.group_count} 组 ·{" "}
           {p.ic_method === "rank" ? "RankIC" : "NormalIC"}
+          {" · "}
+          {run.describeNeutralization(record)}
         </span>
       </div>
       <div
@@ -220,7 +234,8 @@ export function FactorRunConfirmation({ run }: { run: Run }) {
             </p>
             <p>
               {p.holding_sessions} 日调仓 · {p.group_count} 组 ·{" "}
-              {p.ic_method === "rank" ? "RankIC" : "NormalIC"} · 无中性化
+              {p.ic_method === "rank" ? "RankIC" : "NormalIC"} ·{" "}
+              {run.describeNeutralization(record)}
             </p>
             <p className="hint">确认后提交检验，结果更新后可查看。</p>
             {!run.confirmationCurrent ? (

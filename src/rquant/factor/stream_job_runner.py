@@ -11,6 +11,11 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validato
 
 from rquant.factor.job_runner import FactorEvaluationCompletion, _before_deadline, _clock_utc
 from rquant.factor.member_stream import run_factor_stream_research_from_members
+from rquant.factor.neutralization_context import (
+    FactorNeutralizationSources,
+    require_factor_neutralization_binding,
+)
+from rquant.factor.run_request import NeutralizationMode
 from rquant.factor.stream_job_artifact import (
     FactorStreamArtifactReference,
     FactorStreamFullArtifact,
@@ -52,6 +57,10 @@ class FactorStreamCompletion(BaseModel):
     result_kind: Literal["research_diagnostic"] = "research_diagnostic"
     code_revision: str = Field(pattern=r"^[0-9a-f]{40}$")
     completed_at: AwareDatetime
+    neutralization: NeutralizationMode = Field(default="none", exclude_if=lambda v: v == "none")
+    context: FactorNeutralizationSources | None = Field(
+        default=None, exclude_if=lambda v: v is None
+    )
 
     @field_validator("snapshot_as_of_time", "completed_at")
     @classmethod
@@ -61,6 +70,13 @@ class FactorStreamCompletion(BaseModel):
     @model_validator(mode="after")
     def _references(self) -> FactorStreamCompletion:
         _ = self.full_reference, self.display_reference
+        require_factor_neutralization_binding(
+            self.context,
+            mode=self.neutralization,
+            snapshot_id=self.snapshot_id,
+            binding_hash=self.binding_hash,
+            as_of=self.snapshot_as_of_time,
+        )
         return self
 
     @property

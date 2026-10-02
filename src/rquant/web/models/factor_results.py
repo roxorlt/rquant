@@ -20,6 +20,7 @@ from rquant.factor.result import (
     ResearchSummaryStatus,
     ReturnPriceBasis,
 )
+from rquant.factor.run_request import NeutralizationLabel, NeutralizationMode
 from rquant.factor.stream_job_artifact import (
     FactorStreamDisplayCoverageDay,
     FactorStreamDisplayPortfolioDay,
@@ -68,6 +69,10 @@ class FactorResearchDisplay(BaseModel):
     portfolio_status: ResearchPortfolioStatus
     portfolio_days: list[FactorPortfolioDay]
     coverage_days: list[FactorDisplayCoverageDay]
+    neutralization: NeutralizationMode = "none"
+    neutralization_label: NeutralizationLabel = "无"
+    context_basis_label: str | None = None
+    context_note: str | None = None
 
 
 class FactorStreamResearchDisplay(BaseModel):
@@ -84,6 +89,10 @@ class FactorStreamResearchDisplay(BaseModel):
     portfolio_status: ResearchPortfolioStatus
     portfolio_days: list[FactorStreamDisplayPortfolioDay]
     coverage_days: list[FactorStreamDisplayCoverageDay]
+    neutralization: NeutralizationMode = "none"
+    neutralization_label: NeutralizationLabel = "无"
+    context_basis_label: str | None = None
+    context_note: str | None = None
 
 
 class FactorResultDetailData(BaseModel):

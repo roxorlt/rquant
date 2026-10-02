@@ -20,6 +20,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
+from rquant.factor.capability import DailyFactorCapabilities
 from rquant.factor.draft import FactorSaveDraft, build_draft_definition, draft_factor_id
 from rquant.factor.registry import FactorDefinitionReceipt
 from rquant.manual_watchlist import OwnerId
@@ -40,6 +41,7 @@ _RESUME_ROUTE = f"{_ROUTE}/resume"
 _SAVE_ROUTE = f"{_ROUTE}/save"
 _SAVE_LOOKUP_ROUTE = f"{_SAVE_ROUTE}/lookup"
 _SAVE_RESUME_ROUTE = f"{_SAVE_ROUTE}/resume"
+_CAPABILITIES_ROUTE = f"{_ROUTE}/capabilities"
 _ACTOR_ADAPTER = TypeAdapter(OwnerId)
 _INSTANCE_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 
@@ -148,7 +150,11 @@ class FactorDefinitionAdmission:
             raise FactorDefinitionAdmissionRejectedError("save_disabled")
         with self._lock:
             try:
-                build_draft_definition(draft, authenticated_actor_id=authenticated_actor_id)
+                build_draft_definition(
+                    draft,
+                    authenticated_actor_id=authenticated_actor_id,
+                    capabilities=self.service.factor_definition_capabilities(),
+                )
             except ValueError as exc:
                 raise FactorDefinitionAdmissionRejectedError("invalid_draft") from exc
             try:
@@ -160,6 +166,12 @@ class FactorDefinitionAdmission:
             except PageControlCommandConflictError as exc:
                 raise FactorDefinitionAdmissionRejectedError("command_conflict") from exc
             return self._bound_save_result(draft, authenticated_actor_id, receipt)
+
+    def capabilities(self, *, authenticated_actor_id: str) -> DailyFactorCapabilities:
+        self._authorize(authenticated_actor_id)
+        if not self.save_enabled:
+            raise FactorDefinitionAdmissionRejectedError("save_disabled")
+        return self.service.factor_definition_capabilities()
 
     def lookup_save(
         self, draft: FactorSaveDraft, *, authenticated_actor_id: str
@@ -425,6 +437,7 @@ def _handler_for_admission() -> type[BaseHTTPRequestHandler]:
 
         def do_POST(self) -> None:  # noqa: N802
             save_route = self.path in {_SAVE_ROUTE, _SAVE_LOOKUP_ROUTE, _SAVE_RESUME_ROUTE}
+            capability_route = self.path == _CAPABILITIES_ROUTE
             if self.path not in {
                 _ROUTE,
                 _LOOKUP_ROUTE,
@@ -432,6 +445,7 @@ def _handler_for_admission() -> type[BaseHTTPRequestHandler]:
                 _SAVE_ROUTE,
                 _SAVE_LOOKUP_ROUTE,
                 _SAVE_RESUME_ROUTE,
+                _CAPABILITIES_ROUTE,
             }:
                 self.send_error(404)
                 return
@@ -454,7 +468,14 @@ def _handler_for_admission() -> type[BaseHTTPRequestHandler]:
                 body = self.rfile.read(size)
                 if len(body) != size:
                     raise ValueError("truncated factor archive admission body")
-                if save_route:
+                if capability_route:
+                    envelope = strict_json_loads(body, parse_constant=_reject_json_constant)
+                    if not isinstance(envelope, dict) or set(envelope) != {
+                        "authenticated_actor_id"
+                    }:
+                        raise ValueError("invalid factor capability envelope")
+                    actor = _ACTOR_ADAPTER.validate_python(envelope["authenticated_actor_id"])
+                elif save_route:
                     command, actor, instance_id = _decode_save_request(
                         body, submit=self.path == _SAVE_ROUTE
                     )
@@ -464,6 +485,10 @@ def _handler_for_admission() -> type[BaseHTTPRequestHandler]:
                 self._json(400, {"error": "invalid_command"})
                 return
             try:
+                if capability_route:
+                    capabilities = self.server.admission.capabilities(authenticated_actor_id=actor)
+                    self._json(200, capabilities.model_dump(mode="json"))
+                    return
                 if save_route:
                     assert isinstance(command, FactorSaveDraft)
                     if self.path == _SAVE_LOOKUP_ROUTE:
@@ -694,6 +719,13 @@ class FactorDefinitionAdmissionClient:
         assert receipt is not None
         return receipt
 
+    def capabilities(self, *, authenticated_actor_id: str) -> DailyFactorCapabilities:
+        result = self._request(
+            _CAPABILITIES_ROUTE, None, authenticated_actor_id=authenticated_actor_id
+        )
+        assert isinstance(result, DailyFactorCapabilities)
+        return result
+
     def submit_save(
         self,
         draft: FactorSaveDraft,
@@ -743,23 +775,23 @@ class FactorDefinitionAdmissionClient:
     def _request(
         self,
         route: str,
-        command: ArchiveFactor | FactorSaveDraft,
+        command: ArchiveFactor | FactorSaveDraft | None,
         *,
         authenticated_actor_id: str,
         verified_registry_instance_id: str | None = None,
-    ) -> FactorArchiveAdmissionResult | None:
+    ) -> FactorArchiveAdmissionResult | DailyFactorCapabilities | None:
         save_route = route in {_SAVE_ROUTE, _SAVE_LOOKUP_ROUTE, _SAVE_RESUME_ROUTE}
+        capability_route = route == _CAPABILITIES_ROUTE
         if save_route and type(command) is not FactorSaveDraft:
             raise TypeError("factor save admission requires a typed original draft")
-        if not save_route and type(command) is not ArchiveFactor:
+        if not save_route and not capability_route and type(command) is not ArchiveFactor:
             raise TypeError("factor archive admission requires an ownerless archive command")
         if not isinstance(authenticated_actor_id, str):
             raise ValueError("authenticated actor must be a string")
         actor = _ACTOR_ADAPTER.validate_python(authenticated_actor_id)
-        envelope: dict[str, object] = {
-            "authenticated_actor_id": actor,
-            "draft" if save_route else "command": command.model_dump(mode="json"),
-        }
+        envelope: dict[str, object] = {"authenticated_actor_id": actor}
+        if not capability_route:
+            envelope["draft" if save_route else "command"] = command.model_dump(mode="json")
         if route in {_ROUTE, _SAVE_ROUTE}:
             if (
                 not isinstance(verified_registry_instance_id, str)
@@ -817,6 +849,8 @@ class FactorDefinitionAdmissionClient:
                 raise FactorDefinitionAdmissionUnavailableError(
                     f"factor archive admission returned HTTP {response.status}"
                 )
+            if capability_route:
+                return DailyFactorCapabilities.model_validate_json(received)
             if route in {_LOOKUP_ROUTE, _SAVE_LOOKUP_ROUTE}:
                 if decoded == {"found": False}:
                     return None

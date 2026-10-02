@@ -13,6 +13,12 @@ from rquant.factor.universe import UniverseSelection
 from rquant.runtime_contracts import canonical_sha256
 
 RUN_IMMUTABLE = ConfigDict(extra="forbid", frozen=True, strict=True, revalidate_instances="always")
+NeutralizationMode = Literal["none", "industry", "industry_size"]
+NeutralizationLabel = Literal["无", "行业", "行业 + 市值"]
+
+
+def neutralization_label(mode: NeutralizationMode) -> NeutralizationLabel:
+    return {"none": "无", "industry": "行业", "industry_size": "行业 + 市值"}[mode]
 
 
 class FactorRunParameters(BaseModel):
@@ -26,7 +32,7 @@ class FactorRunParameters(BaseModel):
     holding_sessions: Literal[1, 5, 10, 20]
     group_count: Literal[3, 5, 10] = 5
     ic_method: Literal["rank", "normal"] = "rank"
-    neutralization: Literal["none"] = "none"
+    neutralization: NeutralizationMode = "none"
 
     @field_validator("start_date", "end_date", mode="before")
     @classmethod
@@ -92,6 +98,15 @@ class FactorRunPoolOption(BaseModel):
     reason: str | None = Field(default=None, max_length=80)
 
 
+class FactorRunNeutralizationOption(BaseModel):
+    model_config = RUN_IMMUTABLE
+
+    neutralization: NeutralizationMode
+    label: str = Field(min_length=1, max_length=40)
+    available: bool
+    reason: str | None = Field(default=None, max_length=80)
+
+
 class FactorRunAvailability(BaseModel):
     model_config = RUN_IMMUTABLE
 
@@ -100,6 +115,9 @@ class FactorRunAvailability(BaseModel):
     pools: tuple[FactorRunPoolOption, ...]
     start_date: date | None = None
     end_date: date | None = None
+    neutralizations: tuple[FactorRunNeutralizationOption, ...] | None = Field(
+        default=None, max_length=3, exclude_if=lambda value: value is None
+    )
 
 
 class FactorRunOperationResult(BaseModel):

@@ -5743,6 +5743,28 @@
             "title": "Basis Label",
             "type": "string"
           },
+          "context_basis_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Context Basis Label"
+          },
+          "context_note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Context Note"
+          },
           "coverage_days": {
             "items": {
               "$ref": "#/components/schemas/FactorDisplayCoverageDay"
@@ -5783,6 +5805,26 @@
                 "type": "null"
               }
             ]
+          },
+          "neutralization": {
+            "default": "none",
+            "enum": [
+              "none",
+              "industry",
+              "industry_size"
+            ],
+            "title": "Neutralization",
+            "type": "string"
+          },
+          "neutralization_label": {
+            "default": "无",
+            "enum": [
+              "无",
+              "行业",
+              "行业 + 市值"
+            ],
+            "title": "Neutralization Label",
+            "type": "string"
           },
           "pool_label": {
             "const": "固定样本",
@@ -6080,6 +6122,21 @@
             ],
             "title": "End Date"
           },
+          "neutralizations": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/FactorRunNeutralizationOption"
+                },
+                "maxItems": 3,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Neutralizations"
+          },
           "pools": {
             "items": {
               "$ref": "#/components/schemas/FactorRunPoolOption"
@@ -6117,6 +6174,49 @@
           "pools"
         ],
         "title": "FactorRunAvailability",
+        "type": "object"
+      },
+      "FactorRunNeutralizationOption": {
+        "additionalProperties": false,
+        "properties": {
+          "available": {
+            "title": "Available",
+            "type": "boolean"
+          },
+          "label": {
+            "maxLength": 40,
+            "minLength": 1,
+            "title": "Label",
+            "type": "string"
+          },
+          "neutralization": {
+            "enum": [
+              "none",
+              "industry",
+              "industry_size"
+            ],
+            "title": "Neutralization",
+            "type": "string"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "maxLength": 80,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          }
+        },
+        "required": [
+          "neutralization",
+          "label",
+          "available"
+        ],
+        "title": "FactorRunNeutralizationOption",
         "type": "object"
       },
       "FactorRunOperationResult": {
@@ -6226,8 +6326,12 @@
             "type": "string"
           },
           "neutralization": {
-            "const": "none",
             "default": "none",
+            "enum": [
+              "none",
+              "industry",
+              "industry_size"
+            ],
             "title": "Neutralization",
             "type": "string"
           },
@@ -6554,6 +6658,28 @@
             "title": "Basis Label",
             "type": "string"
           },
+          "context_basis_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Context Basis Label"
+          },
+          "context_note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Context Note"
+          },
           "coverage_days": {
             "items": {
               "$ref": "#/components/schemas/FactorStreamDisplayCoverageDay"
@@ -6587,6 +6713,26 @@
           },
           "ic_summary": {
             "$ref": "#/components/schemas/FactorICSummary"
+          },
+          "neutralization": {
+            "default": "none",
+            "enum": [
+              "none",
+              "industry",
+              "industry_size"
+            ],
+            "title": "Neutralization",
+            "type": "string"
+          },
+          "neutralization_label": {
+            "default": "无",
+            "enum": [
+              "无",
+              "行业",
+              "行业 + 市值"
+            ],
+            "title": "Neutralization Label",
+            "type": "string"
           },
           "pool_label": {
             "enum": [

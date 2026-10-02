@@ -7,131 +7,174 @@ import { findJargon } from "../src/test/jargon.ts";
 import { APP_URL } from "./env.ts";
 import { expectNoHorizontalOverflow, watch } from "./watch.ts";
 
+const neutralizationCases: Schemas["FactorRunNeutralizationOption"][] = [
+  { neutralization: "none", label: "无", available: true, reason: null },
+  { neutralization: "industry", label: "行业", available: true, reason: null },
+  { neutralization: "industry_size", label: "行业 + 市值", available: true, reason: null },
+];
+
 for (const viewport of [
   { width: 1440, height: 900, label: "desktop" },
   { width: 390, height: 844, label: "phone" },
 ]) {
-  test(`因子运行参数、确认、重载原请求恢复在 ${viewport.label} 可完成`, async ({
-    page,
-  }, testInfo) => {
-    const watcher = watch(page);
-    const metadata = (await (
-      await page.request.get(new URL("api/v1/meta", APP_URL).toString())
-    ).json()) as MetaEnvelope;
-    metadata.data.viewer = "tester";
-    const availability: Schemas["FactorRunAvailability"] = {
-      enabled: true,
-      reason: null,
-      start_date: "2026-09-01",
-      end_date: "2026-09-23",
-      pools: [
-        { selection: "all", label: "全市场（沪深非 ST）", available: true, reason: null },
-        { selection: "gem", label: "创业板与科创板", available: true, reason: null },
-        { selection: "hs300", label: "沪深300", available: false, reason: "缺少历史成分记录" },
-        { selection: "zz1000", label: "中证1000", available: true, reason: null },
-      ],
-    };
-    const requests: Schemas["FactorRunRequest"][] = [];
-    await page.route("**/api/v1/meta", (route) => route.fulfill({ json: metadata }));
-    await page.route("**/api/v1/factors/definitions*", (route) =>
-      route.fulfill({
-        json: {
-          data: {
-            availability: "populated",
-            available_at: metadata.serving.built_at,
-            definitions: definitions.map((item) => ({ ...item, category: "technical" })),
-            can_save: false,
-            can_archive: true,
-          },
-          serving: metadata.serving,
-        },
-      }),
-    );
-    await page.route("**/api/v1/factors/run-availability", (route) =>
-      route.fulfill({ json: { data: availability, serving: metadata.serving } }),
-    );
-    await page.route(/\/api\/v1\/factors\/results(?:\?.*)?$/, (route) =>
-      route.fulfill({
-        json: {
-          data: { availability: "empty", available_at: metadata.serving.built_at, results: [] },
-          serving: metadata.serving,
-        },
-      }),
-    );
-    await page.route(/\/api\/v1\/factors\/runs(?:\/(?:resume|retry))?$/, async (route) => {
-      const request = route.request().postDataJSON() as Schemas["FactorRunRequest"];
-      expect(route.request().headers()["x-rquant-csrf"]).toBe("1");
-      expect(
-        await page.evaluate(
-          () =>
-            JSON.parse(localStorage.getItem("rquant.factor.run-operation.v1") ?? "null").request,
-        ),
-      ).toEqual(request);
-      requests.push(request);
-      const submitted = route.request().url().endsWith("/retry");
-      const result: Schemas["FactorRunOperationResult"] = {
-        original_request: request,
-        status: submitted ? "submitted" : "uncertain",
-        reason: null,
-        job_id: submitted ? "b".repeat(32) : null,
-        spec_sha256: submitted ? "c".repeat(64) : null,
-      };
-      await route.fulfill({ json: { data: result, serving: metadata.serving } });
-    });
-    await page.setViewportSize({ width: viewport.width, height: viewport.height });
-    await page.goto("./#/factors");
-    const params = page.getByRole("region", { name: "检验参数" });
-    await expect(params.getByRole("button", { name: "运行检验" })).toBeEnabled();
-    await expect(params.getByRole("combobox", { name: "股票池" })).toHaveValue("all");
-    await expect(params.getByRole("combobox", { name: "调仓周期" })).toHaveValue("5");
-    await expect(params.getByRole("combobox", { name: "分组数" })).toHaveValue("5");
-    await expect(params.getByRole("button", { name: "RankIC" })).toHaveAttribute(
-      "aria-pressed",
-      "true",
-    );
-    const tip = params.getByText("中性化说明");
-    await tip.focus();
-    await expect(page.getByRole("tooltip")).toContainText("尚未开放");
-    await params.getByRole("combobox", { name: "分组数" }).selectOption("10");
-    const topRun = page.locator(".ph-actions").getByRole("button", { name: "运行检验" });
-    await topRun.click();
-    const dialog = page.getByRole("dialog", { name: "运行因子检验" });
-    await expect(dialog).toContainText("价量动量 · 第 2 版");
-    await expect(dialog).toContainText("2026-09-01 至 2026-09-23");
-    await expect(dialog).toContainText("10 组 · RankIC");
-    expect(requests).toHaveLength(0);
-    await expectNoHorizontalOverflow(page, `factor run confirm ${viewport.label}`);
-    await page.screenshot({
-      path: testInfo.outputPath(`factor-run-confirm-${viewport.label}.png`),
-      fullPage: true,
-    });
-    await dialog.getByRole("button", { name: "确认运行" }).click();
-    await expect(
-      page.getByText("检验结果暂未确认，请保留本次操作。", { exact: true }),
-    ).toBeVisible();
-    expect(requests).toHaveLength(1);
-    await page.reload();
-    await expect(page.getByRole("button", { name: "用原请求重试检验" })).toBeEnabled();
-    await expect.poll(() => requests.length).toBe(2);
-    await page.getByRole("button", { name: "用原请求重试检验" }).click();
-    await expect(page.getByText("已提交，等待更新。", { exact: true })).toBeVisible();
-    expect(requests).toEqual([requests[0], requests[0], requests[0]]);
-    expect(requests[0]?.parameters).toMatchObject({
-      selection: "all",
-      holding_sessions: 5,
-      group_count: 10,
-      ic_method: "rank",
-      neutralization: "none",
-    });
-    await expect(page.getByText("检验完成。", { exact: true })).toHaveCount(0);
-    await expect(page.getByRole("button", { name: "归档", exact: true })).toHaveCount(0);
-    await expectNoHorizontalOverflow(page, `factor run recovered ${viewport.label}`);
-    expect(findJargon(await page.locator("main").innerText())).toEqual([]);
-    await page.screenshot({
-      path: testInfo.outputPath(`factor-run-recovered-${viewport.label}.png`),
-      fullPage: true,
-    });
-    expect(watcher.problems).toEqual([]);
+  test.describe(`因子中性化 ${viewport.label}`, () => {
+    test.use({ isMobile: viewport.label === "phone", hasTouch: viewport.label === "phone" });
+    for (const option of neutralizationCases) {
+      const title =
+        option.neutralization === "none"
+          ? `因子运行参数、确认、重载原请求恢复在 ${viewport.label} 可完成`
+          : `因子${option.label}中性化确认与原请求恢复在 ${viewport.label} 可完成`;
+      test(title, async ({ page }, testInfo) => {
+        const watcher = watch(page);
+        const metadata = (await (
+          await page.request.get(new URL("api/v1/meta", APP_URL).toString())
+        ).json()) as MetaEnvelope;
+        metadata.data.viewer = "tester";
+        const availability: Schemas["FactorRunAvailability"] = {
+          enabled: true,
+          reason: null,
+          start_date: "2026-09-01",
+          end_date: "2026-09-23",
+          pools: [
+            { selection: "all", label: "全市场（沪深非 ST）", available: true, reason: null },
+            { selection: "gem", label: "创业板与科创板", available: true, reason: null },
+            { selection: "hs300", label: "沪深300", available: false, reason: "缺少历史成分记录" },
+            { selection: "zz1000", label: "中证1000", available: true, reason: null },
+          ],
+          ...(option.neutralization === "none" ? {} : { neutralizations: neutralizationCases }),
+        };
+        const requests: Schemas["FactorRunRequest"][] = [];
+        await page.route("**/api/v1/meta", (route) => route.fulfill({ json: metadata }));
+        await page.route("**/api/v1/factors/definitions*", (route) =>
+          route.fulfill({
+            json: {
+              data: {
+                availability: "populated",
+                available_at: metadata.serving.built_at,
+                definitions: definitions.map((item) => ({ ...item, category: "technical" })),
+                can_save: false,
+                can_archive: true,
+              },
+              serving: metadata.serving,
+            },
+          }),
+        );
+        await page.route("**/api/v1/factors/run-availability", (route) =>
+          route.fulfill({ json: { data: availability, serving: metadata.serving } }),
+        );
+        await page.route(/\/api\/v1\/factors\/results(?:\?.*)?$/, (route) =>
+          route.fulfill({
+            json: {
+              data: { availability: "empty", available_at: metadata.serving.built_at, results: [] },
+              serving: metadata.serving,
+            },
+          }),
+        );
+        await page.route(/\/api\/v1\/factors\/runs(?:\/(?:resume|retry))?$/, async (route) => {
+          const request = route.request().postDataJSON() as Schemas["FactorRunRequest"];
+          expect(route.request().headers()["x-rquant-csrf"]).toBe("1");
+          expect(
+            await page.evaluate(
+              () =>
+                JSON.parse(localStorage.getItem("rquant.factor.run-operation.v1") ?? "null")
+                  .request,
+            ),
+          ).toEqual(request);
+          requests.push(request);
+          if (option.neutralization !== "none") {
+            availability.neutralizations = neutralizationCases.map((mode) => ({
+              ...mode,
+              available: mode.neutralization === "none",
+              reason: mode.neutralization === "none" ? null : "缺少相应历史数据",
+            }));
+          }
+          const submitted = route.request().url().endsWith("/retry");
+          const result: Schemas["FactorRunOperationResult"] = {
+            original_request: request,
+            status: submitted ? "submitted" : "uncertain",
+            reason: null,
+            job_id: submitted ? "b".repeat(32) : null,
+            spec_sha256: submitted ? "c".repeat(64) : null,
+          };
+          await route.fulfill({ json: { data: result, serving: metadata.serving } });
+        });
+        await page.setViewportSize({ width: viewport.width, height: viewport.height });
+        await page.goto("./#/factors");
+        const params = page.getByRole("region", { name: "检验参数" });
+        await expect(params.getByRole("button", { name: "运行检验" })).toBeEnabled();
+        await expect(params.getByRole("combobox", { name: "股票池" })).toHaveValue("all");
+        await expect(params.getByRole("combobox", { name: "调仓周期" })).toHaveValue("5");
+        await expect(params.getByRole("combobox", { name: "分组数" })).toHaveValue("5");
+        await expect(params.getByRole("button", { name: "RankIC" })).toHaveAttribute(
+          "aria-pressed",
+          "true",
+        );
+        const tip = params.getByText("中性化说明");
+        if (viewport.label === "phone") {
+          expect(await page.evaluate(() => window.matchMedia("(hover: none)").matches)).toBe(true);
+          await tip.tap();
+        } else {
+          await tip.focus();
+        }
+        await expect(page.getByRole("tooltip")).toContainText(
+          option.neutralization === "none" ? "尚未开放" : "行业去除行业差异",
+        );
+        await params.getByRole("combobox", { name: "中性化" }).selectOption(option.neutralization);
+        await params.getByRole("combobox", { name: "分组数" }).selectOption("10");
+        const topRun = page.locator(".ph-actions").getByRole("button", { name: "运行检验" });
+        await topRun.click();
+        const dialog = page.getByRole("dialog", { name: "运行因子检验" });
+        await expect(dialog).toContainText("价量动量 · 第 2 版");
+        await expect(dialog).toContainText("2026-09-01 至 2026-09-23");
+        await expect(dialog).toContainText("10 组 · RankIC");
+        await expect(dialog).toContainText(`${option.label}中性化`);
+        expect(requests).toHaveLength(0);
+        await expectNoHorizontalOverflow(page, `factor run confirm ${viewport.label}`);
+        await expect(dialog).toBeVisible();
+        await expect(dialog).toHaveCSS("opacity", "1");
+        await page.screenshot({
+          path: testInfo.outputPath(`factor-run-confirm-${viewport.label}.png`),
+          fullPage: true,
+          animations: "disabled",
+        });
+        await dialog.getByRole("button", { name: "确认运行" }).click();
+        await expect(
+          page.getByText("检验结果暂未确认，请保留本次操作。", { exact: true }),
+        ).toBeVisible();
+        expect(requests).toHaveLength(1);
+        await params.getByRole("combobox", { name: "中性化" }).selectOption("none");
+        await expect(page.getByRole("region", { name: "本次检验" })).toContainText(
+          `${option.label}中性化`,
+        );
+        await page.reload();
+        await expect(page.getByRole("button", { name: "用原请求重试检验" })).toBeEnabled();
+        await expect.poll(() => requests.length).toBe(2);
+        await page.getByRole("button", { name: "用原请求重试检验" }).click();
+        await expect(page.getByText("已提交，等待更新。", { exact: true })).toBeVisible();
+        expect(requests).toEqual([requests[0], requests[0], requests[0]]);
+        expect(requests[0]?.parameters).toMatchObject({
+          selection: "all",
+          holding_sessions: 5,
+          group_count: 10,
+          ic_method: "rank",
+          neutralization: option.neutralization,
+        });
+        await expect(page.getByText("检验完成。", { exact: true })).toHaveCount(0);
+        await expect(page.getByRole("region", { name: "本次检验" })).toContainText(
+          `${option.label}中性化`,
+        );
+        await expect(page.getByRole("button", { name: "归档", exact: true })).toHaveCount(0);
+        await expectNoHorizontalOverflow(page, `factor run recovered ${viewport.label}`);
+        expect(findJargon(await page.locator("main").innerText())).toEqual([]);
+        await page.screenshot({
+          path: testInfo.outputPath(
+            `factor-run-${option.neutralization}-recovered-${viewport.label}.png`,
+          ),
+          fullPage: true,
+        });
+        expect(watcher.problems).toEqual([]);
+      });
+    }
   });
 
   test(`FR-FINAL-01 真实拒绝回执重载后可改参并再次确认在 ${viewport.label} 可完成`, async ({
@@ -558,6 +601,10 @@ test("真实检验图表可切 IC、分组并用键盘打开明细；手机无�
     zero_variance_day_count: 0,
   };
   const research = {
+    neutralization: "industry_size",
+    neutralization_label: "行业 + 市值",
+    context_basis_label: "行业按回顾口径评价，可能包含事后信息。",
+    context_note: "缺少行业或市值的数据已排除。",
     basis_label: "收盘价至下次调仓收盘价",
     pool_label: "固定样本",
     return_price_basis: "raw",
@@ -698,6 +745,12 @@ test("真实检验图表可切 IC、分组并用键盘打开明细；手机无�
   const area = page.getByRole("region", { name: "检验结果" });
   await expect(area.getByRole("img", { name: "IC 时序与累计 IC" })).toBeVisible();
   await expect(area.getByText("部分日期可计算")).toBeVisible();
+  await expect(area.getByText("行业 + 市值中性化")).toBeVisible();
+  await expect(area.getByText("有效 3 / 8")).toBeVisible();
+  await area.getByText("行业口径").focus();
+  await expect(page.getByRole("tooltip")).toContainText(research.context_basis_label);
+  await area.getByText("样本说明").focus();
+  await expect(page.getByRole("tooltip").filter({ hasText: research.context_note })).toBeVisible();
   await area.getByRole("button", { name: "RankIC" }).focus();
   await page.keyboard.press("Enter");
   await expect(area.getByRole("region", { name: "IC 统计" }).getByText("−0.0142")).toBeVisible();

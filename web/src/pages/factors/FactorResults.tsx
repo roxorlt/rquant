@@ -279,10 +279,15 @@ function Research({
         <span className="num">{period}</span>
         <span>{research.pool_label}</span>
         <span>调仓 {research.holding_sessions} 个交易日</span>
+        <span>{research.neutralization_label ?? "无"}中性化</span>
+        {research.context_basis_label ? (
+          <Tip content={research.context_basis_label}>行业口径</Tip>
+        ) : null}
         <Tip content={`${research.basis_label}；未计成交和费用。`}>收益口径</Tip>
         <span className="num">
-          样本 {formatCount(covered)} / {formatCount(expected)}
+          有效 {formatCount(covered)} / {formatCount(expected)}
         </span>
+        {research.context_note ? <Tip content={research.context_note}>样本说明</Tip> : null}
         {partial ? <span className="factor-partial">部分日期可计算</span> : null}
       </div>
       <div className="factor-research-top">

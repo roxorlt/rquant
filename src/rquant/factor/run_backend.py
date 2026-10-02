@@ -10,8 +10,13 @@ from typing import TYPE_CHECKING
 
 from pydantic import JsonValue
 
+from rquant.factor.capability import DailyFactorCapabilities, historical_daily_capabilities
 from rquant.factor.job_ledger import FactorEvaluationJobLedger, FactorJobRecord
 from rquant.factor.member_archive import _READ_FLAGS, _check_identities, _load_manifest
+from rquant.factor.neutralization_context import (
+    open_factor_neutralization_context,
+    select_factor_neutralization_context,
+)
 from rquant.factor.registry import FactorDefinitionRegistry, FactorHeadRef
 from rquant.factor.result_artifact import _file_identity, _open_private_root, _require_named_regular
 from rquant.factor.run_configuration import (
@@ -20,7 +25,12 @@ from rquant.factor.run_configuration import (
     open_factor_run_configuration,
 )
 from rquant.factor.run_plan import FrozenFactorRunPlan, compile_factor_run_plan
-from rquant.factor.run_request import FactorRunAvailability, FactorRunPoolOption, FactorRunRequest
+from rquant.factor.run_request import (
+    FactorRunAvailability,
+    FactorRunNeutralizationOption,
+    FactorRunPoolOption,
+    FactorRunRequest,
+)
 
 if TYPE_CHECKING:
     from rquant.page_control import _OwnedSubmitFactorRun
@@ -52,6 +62,25 @@ class FactorRunPageControlBackend:
     def authorize(self, actor_id: str) -> None:
         if not self.enabled or actor_id not in self.run_users:
             raise PermissionError("当前账号不能运行检验")
+
+    def capabilities(self) -> DailyFactorCapabilities:
+        with open_factor_run_configuration(self.root, self.reference) as loaded:
+            present = []
+            for industry, cap in ((True, False), (False, True)):
+                try:
+                    context = select_factor_neutralization_context(
+                        loaded.context, industry=industry, market_cap=cap
+                    )
+                    with open_factor_neutralization_context(
+                        context, lake_root=loaded.configuration.lake_root
+                    ):
+                        loaded.recheck()
+                    present.append(True)
+                except (OSError, ValueError):
+                    present.append(False)
+            return historical_daily_capabilities(
+                industry_available=present[0], market_cap_available=present[1]
+            )
 
     def availability(self, actor_id: str) -> FactorRunAvailability:
         self.authorize(actor_id)
@@ -99,7 +128,28 @@ class FactorRunPageControlBackend:
                 ),
                 start_date=scope.start_date,
                 end_date=scope.end_date,
+                neutralizations=self._neutralizations(),
             )
+
+    def _neutralizations(self) -> tuple[FactorRunNeutralizationOption, ...]:
+        capability = self.capabilities()
+        industry, cap = (
+            "industry_neutralize" in capability.runnable_operators,
+            "size_neutralize" in capability.runnable_operators,
+        )
+        return tuple(
+            FactorRunNeutralizationOption(
+                neutralization=mode,
+                label=label,
+                available=available,
+                reason=None if available else "缺少可核验的行业或市值来源",
+            )
+            for mode, label, available in (
+                ("none", "无", True),
+                ("industry", "行业", industry),
+                ("industry_size", "行业 + 市值", industry and cap),
+            )
+        )
 
     def compile(
         self,

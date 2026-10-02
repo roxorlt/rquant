@@ -101,6 +101,7 @@ def compile_factor_run_plan(
     verified_registry_instance_id: str,
     clock: Callable[[], datetime] = lambda: datetime.now(UTC),
 ) -> FrozenFactorRunPlan:
+    from rquant.factor.capability import neutralization_requirements
     from rquant.factor.formula_stream import (
         FactorFormulaStreamRequest,
         FactorFormulaStreamSources,
@@ -113,6 +114,10 @@ def compile_factor_run_plan(
         publish_factor_member_archive,
     )
     from rquant.factor.member_stream import open_factor_member_stream
+    from rquant.factor.neutralization_context import (
+        open_factor_neutralization_context,
+        select_factor_neutralization_context,
+    )
     from rquant.factor.registry import FactorDefinitionRegistry
     from rquant.factor.run_configuration import open_factor_run_configuration
     from rquant.factor.stream_adapter import FactorStreamAdapterRequest
@@ -140,6 +145,21 @@ def compile_factor_run_plan(
         loaded.open_ledger(clock=clock)
         scope = source.admission_request.scope
         params = request.parameters
+        needs_industry, needs_cap = neutralization_requirements(
+            record.definition, params.neutralization
+        )
+        try:
+            context = select_factor_neutralization_context(
+                loaded.context, industry=needs_industry, market_cap=needs_cap
+            )
+        except ValueError as error:
+            raise FactorRunPlanRejectedError(
+                "缺少可核验的行业或市值来源",
+                reason="缺少可核验的行业或市值来源，当前检验暂不可用。",
+            ) from error
+        if context is not None:
+            with open_factor_neutralization_context(context, lake_root=config.lake_root):
+                loaded.recheck()
         with open_factor_stream_snapshot_admission(
             source.admission_request,
             metadata_store=loaded.metadata,
@@ -231,6 +251,7 @@ def compile_factor_run_plan(
             **manifest.sources.model_dump(),
             feature_source_id=source.admission_request.snapshot_id,
             feature_source_sha256=source.admission_request.binding_hash,
+            context=None if context is None else context.sources,
         )
         formula = FactorFormulaStreamRequest(
             definition=record.definition,
@@ -243,6 +264,7 @@ def compile_factor_run_plan(
             as_of=scope.as_of_time,
             selection=params.selection,
             sources=sources,
+            neutralization=params.neutralization,
         )
         _compile(formula)
         spec = FactorStreamJobSpec(
@@ -253,6 +275,7 @@ def compile_factor_run_plan(
                 formula=formula,
                 evaluation_days=schedule.evaluation_days,
                 holding_sessions=params.holding_sessions,
+                context=context,
             ),
             member_archive=subset,
             definition_content_sha256=record.content_sha256,

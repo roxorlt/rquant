@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Iterator
+from contextlib import ExitStack
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, model_validator
@@ -23,6 +24,7 @@ from rquant.factor.formula_stream import (
     evaluate_factor_formula_stream,
     factor_formula_stream_request_sha256,
 )
+from rquant.factor.neutralization_context import open_factor_neutralization_context
 from rquant.factor.stream_adapter import (
     FactorStreamAdapter,
     FactorStreamAdapterCompletion,
@@ -63,6 +65,7 @@ class FactorStreamResearchResult(BaseModel):
             or raw.admission.scope != self.request.source.scope
             or raw.admission.scope_content_hash != self.request.scope_content_hash
             or raw.formula_request_sha256 != formula_sha
+            or raw.context != self.request.formula.sources.context
             or formula.request_sha256 != formula_sha
             or formula.sources != self.request.formula.sources
             or formula.definition_sha256 != canonical_sha256(self.request.formula.definition)
@@ -202,11 +205,25 @@ def _run_factor_stream_research(
     statistics_batches = None
     try:
         request = FactorStreamAdapterRequest.model_validate(request)
-        with open_factor_stream_snapshot_admission(
-            request.source, metadata_store=metadata_store, lake_root=lake_root
-        ) as (lease, decision):
+        with ExitStack() as stack:
+            lease, decision = stack.enter_context(
+                open_factor_stream_snapshot_admission(
+                    request.source, metadata_store=metadata_store, lake_root=lake_root
+                )
+            )
+            context_lease = (
+                stack.enter_context(
+                    open_factor_neutralization_context(request.context, lake_root=lake_root)
+                )
+                if request.context is not None
+                else None
+            )
             adapter = FactorStreamAdapter(
-                request, lease=lease, decision=decision, universe_requests=universe_requests
+                request,
+                lease=lease,
+                decision=decision,
+                universe_requests=universe_requests,
+                context_lease=context_lease,
             )
             formula = evaluate_factor_formula_stream(request.formula, adapter)
             evaluated = frozenset(request.evaluation_days)

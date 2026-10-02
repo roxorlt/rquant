@@ -46,6 +46,7 @@ from rquant.canvas_publication_receipt import (
     build_canvas_publication_claims,
 )
 from rquant.data_audit_contracts import MAX_AUDIT_DAYS
+from rquant.factor.capability import HISTORICAL_DAILY_V1, DailyFactorCapabilities
 from rquant.factor.definition import FactorDefinition
 from rquant.factor.draft import FactorSaveDraft, build_draft_definition, draft_sha256
 from rquant.factor.job_ledger import FactorLedgerIdentity
@@ -255,6 +256,7 @@ class _OwnedSubmitFactorRun(SubmitFactorRun):
             or params.expected_head.content_sha256 != self.spec.definition_content_sha256
             or params.selection != adapter.formula.selection
             or params.holding_sessions != adapter.holding_sessions
+            or params.neutralization != adapter.formula.neutralization
             or not all(
                 params.start_date <= day <= params.end_date for day in adapter.evaluation_days
             )
@@ -264,6 +266,7 @@ class _OwnedSubmitFactorRun(SubmitFactorRun):
 
 
 class FactorRunPageControlBackend(Protocol):
+    def capabilities(self) -> DailyFactorCapabilities: ...
     def authorize(self, actor_id: str) -> None: ...
     def compile(
         self, request: FactorRunRequest, *, verified_registry_instance_id: str
@@ -4524,7 +4527,9 @@ class PageControlService:
             command_id=checked.command_id,
             requested_at=checked.requested_at,
             definition=build_draft_definition(
-                checked, authenticated_actor_id=authenticated_actor_id
+                checked,
+                authenticated_actor_id=authenticated_actor_id,
+                capabilities=self.factor_definition_capabilities(),
             ),
             expected_head=checked.expected_head,
         )
@@ -4545,6 +4550,15 @@ class PageControlService:
             self.outbox.enqueue_trusted_factor_definition(owned),
             factor_archive_command=owned,
         )
+
+    def factor_definition_capabilities(self) -> DailyFactorCapabilities:
+        configured = getattr(self.consumer.factor_run_backend, "capabilities", None)
+        if configured is None:
+            return HISTORICAL_DAILY_V1
+        try:
+            return DailyFactorCapabilities.model_validate(configured())
+        except (OSError, ValueError):
+            return HISTORICAL_DAILY_V1
 
     def _lookup_trusted_factor_save(
         self, draft: FactorSaveDraft, *, authenticated_actor_id: str

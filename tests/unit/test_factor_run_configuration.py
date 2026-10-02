@@ -191,8 +191,6 @@ def test_missing_actual_member_file_disables_pool_and_refuses_compile(tmp_path: 
 
 
 def test_factory_refuses_wrong_head_instance_scope_and_changed_source(tmp_path: Path) -> None:
-    from pydantic import ValidationError
-
     from rquant.factor.run_backend import FactorRunPageControlBackend
 
     root, reference, request = _configured(tmp_path)
@@ -228,10 +226,12 @@ def test_factory_refuses_wrong_head_instance_scope_and_changed_source(tmp_path: 
         )
         with pytest.raises(ValueError, match="预热|收益窗口"):
             backend.compile(changed, verified_registry_instance_id=instance)
-    unsupported = request.model_dump(mode="json")
+    unsupported = request.model_dump()
     unsupported["parameters"]["neutralization"] = "industry"
-    with pytest.raises(ValidationError):
-        FactorRunRequest.model_validate(unsupported)
+    with pytest.raises(ValueError, match="行业或市值来源"):
+        backend.compile(
+            FactorRunRequest.model_validate(unsupported), verified_registry_instance_id=instance
+        )
     (root / config.prepared_source.filename).write_bytes(b"{}")
     with pytest.raises(ValueError, match="digest"):
         backend.compile(request, verified_registry_instance_id=instance)

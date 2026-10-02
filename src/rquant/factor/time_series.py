@@ -369,6 +369,181 @@ def _pearson(left: list[float], right: list[float]) -> float | None:
     return max(-1.0, min(1.0, numerator / math.sqrt(left_square * right_square)))
 
 
+def neutralize_factor_cells(
+    mode: Literal["industry", "size", "industry_size"],
+    inputs: dict[str, _Cell],
+    *,
+    industries: dict[str, IndustryObservation | None] | None = None,
+    market_caps: dict[str, MarketCapObservation | None] | None = None,
+) -> dict[str, _Cell]:
+    results = inputs.copy()
+    valid = [(stock, cell) for stock, cell in inputs.items() if cell.value is not None]
+    if mode == "industry":
+        _neutralize_industry(valid, results, industries or {})
+    elif mode == "size":
+        _neutralize_size(valid, results, market_caps or {})
+    elif mode == "industry_size":
+        _neutralize_joint(valid, results, industries or {}, market_caps or {})
+    else:
+        raise ValueError("unsupported neutralization")
+    return results
+
+
+def _neutralize_joint(
+    valid: list[tuple[str, _Cell]],
+    results: dict[str, _Cell],
+    industries: dict[str, IndustryObservation | None],
+    market_caps: dict[str, MarketCapObservation | None],
+) -> None:
+    groups: dict[str, list[tuple[str, _Cell, IndustryObservation, MarketCapObservation]]] = {}
+    for stock, cell in valid:
+        industry, cap = industries.get(stock), market_caps.get(stock)
+        if industry is None or industry.industry is None or cap is None or cap.market_cap is None:
+            results[stock] = _missing("missing_context")
+        else:
+            groups.setdefault(industry.industry, []).append((stock, cell, industry, cap))
+    eligible = []
+    for group in groups.values():
+        if len(group) < 2:
+            results[group[0][0]] = _missing("insufficient_samples")
+        else:
+            eligible.append(group)
+    samples = [sample for group in eligible for sample in group]
+    if len(samples) <= len(eligible) + 1:
+        for stock, *_ in samples:
+            results[stock] = _missing("insufficient_samples")
+        return
+    if all(len({cap.market_cap for _, _, _, cap in group}) == 1 for group in eligible):
+        for stock, *_ in samples:
+            results[stock] = _missing("zero_variance")
+        return
+    scale = max(abs(cell.value) for _, cell, _, _ in samples) or 1.0
+    if any(cell.value != 0 and cell.value / scale == 0 for _, cell, _, _ in samples):
+        for stock, *_ in samples:
+            results[stock] = _missing("precision_limit")
+        return
+    centered = []
+    for group in eligible:
+        pivot = group[0][3].market_cap
+        offsets = [_log_cap_ratio(cap.market_cap, pivot) for _, _, _, cap in group]
+        y = [cell.value / scale for _, cell, _, _ in group]
+        x_mean, y_mean = math.fsum(offsets) / len(group), math.fsum(y) / len(group)
+        centered.extend(
+            (sample, x - x_mean, value - y_mean)
+            for sample, x, value in zip(group, offsets, y, strict=True)
+        )
+    denominator = math.fsum(x * x for _, x, _ in centered)
+    if denominator == 0:
+        for stock, *_ in samples:
+            results[stock] = _missing("precision_limit")
+        return
+    slope = math.fsum(x * y for _, x, y in centered) / denominator
+    latest = max(
+        instant
+        for _, cell, industry, cap in samples
+        for instant in (cell.latest_visible_at, industry.first_visible_at, cap.first_visible_at)
+        if instant is not None
+    )
+    for (stock, _, _, _), x, y in centered:
+        prediction = slope * x
+        results[stock] = (
+            _present(math.fsum((y, -prediction)) * scale, latest)
+            if math.isfinite(prediction)
+            else _missing("non_finite_result")
+        )
+
+
+def _neutralize_industry(
+    valid: list[tuple[str, _Cell]],
+    results: dict[str, _Cell],
+    industries: dict[str, IndustryObservation | None],
+) -> None:
+    groups: dict[str, list[tuple[str, _Cell, IndustryObservation]]] = {}
+    for stock, cell in valid:
+        context = industries.get(stock)
+        if context is None or context.industry is None:
+            results[stock] = _missing("missing_context")
+        else:
+            groups.setdefault(context.industry, []).append((stock, cell, context))
+    for members in groups.values():
+        if len(members) < 2:
+            results[members[0][0]] = _missing("insufficient_samples")
+            continue
+        values = [cell.value for _, cell, _ in members if cell.value is not None]
+        center = _scaled_mean(values)
+        latest = max(
+            instant
+            for _, cell, context in members
+            for instant in (cell.latest_visible_at, context.first_visible_at)
+            if instant is not None
+        )
+        for stock, cell, _ in members:
+            assert cell.value is not None
+            residual = cell.value - center
+            if (center != 0 and residual == cell.value) or (
+                cell.value != 0 and residual == -center
+            ):
+                results[stock] = _missing("precision_limit")
+            else:
+                results[stock] = _present(residual, latest)
+
+
+def _neutralize_size(
+    valid: list[tuple[str, _Cell]],
+    results: dict[str, _Cell],
+    market_caps: dict[str, MarketCapObservation | None],
+) -> None:
+    samples: list[tuple[str, _Cell, MarketCapObservation]] = []
+    for stock, cell in valid:
+        context = market_caps.get(stock)
+        if context is None or context.market_cap is None:
+            results[stock] = _missing("missing_context")
+        else:
+            samples.append((stock, cell, context))
+    if len(samples) < 3:
+        for stock, _, _ in samples:
+            results[stock] = _missing("insufficient_samples")
+        return
+    caps = [context.market_cap for _, _, context in samples]
+    if len(set(caps)) == 1:
+        for stock, _, _ in samples:
+            results[stock] = _missing("zero_variance")
+        return
+    pivot = caps[0]
+    assert pivot is not None
+    offsets = [_log_cap_ratio(cap, pivot) for cap in caps if cap is not None]
+    if len(set(offsets)) == 1:
+        for stock, _, _ in samples:
+            results[stock] = _missing("precision_limit")
+        return
+    x_mean = math.fsum(offsets) / len(offsets)
+    centered_x = [value - x_mean for value in offsets]
+    denominator = math.fsum(value * value for value in centered_x)
+    if denominator == 0:
+        for stock, _, _ in samples:
+            results[stock] = _missing("precision_limit")
+        return
+    values = [cell.value for _, cell, _ in samples]
+    scale = max(abs(value) for value in values if value is not None) or 1.0
+    scaled_y = [value / scale for value in values if value is not None]
+    y_mean = math.fsum(scaled_y) / len(scaled_y)
+    centered_y = [value - y_mean for value in scaled_y]
+    slope = math.fsum(x * y for x, y in zip(centered_x, centered_y, strict=True)) / denominator
+    latest = max(
+        instant
+        for _, cell, context in samples
+        for instant in (cell.latest_visible_at, context.first_visible_at)
+        if instant is not None
+    )
+    for (stock, _, _), x, y in zip(samples, centered_x, centered_y, strict=True):
+        prediction = slope * x
+        if not math.isfinite(prediction):
+            results[stock] = _missing("non_finite_result")
+            continue
+        residual = math.fsum((y, -prediction)) * scale
+        results[stock] = _present(residual, latest)
+
+
 class _SeriesEvaluator:
     def __init__(
         self,
@@ -609,89 +784,26 @@ class _SeriesEvaluator:
     def _cross_industry(
         self, day_index: int, valid: list[tuple[str, _Cell]], results: dict[str, _Cell]
     ) -> None:
-        trade_date = self.trading_days[day_index]
-        groups: dict[str, list[tuple[str, _Cell, IndustryObservation]]] = {}
-        for stock, cell in valid:
-            context = self.industries.get((stock, trade_date))
-            if context is None or context.industry is None:
-                results[stock] = _missing("missing_context")
-            else:
-                groups.setdefault(context.industry, []).append((stock, cell, context))
-        for members in groups.values():
-            if len(members) < 2:
-                results[members[0][0]] = _missing("insufficient_samples")
-                continue
-            values = [cell.value for _, cell, _ in members if cell.value is not None]
-            center = _scaled_mean(values)
-            latest = max(
-                instant
-                for _, cell, context in members
-                for instant in (cell.latest_visible_at, context.first_visible_at)
-                if instant is not None
+        day = self.trading_days[day_index]
+        results.update(
+            neutralize_factor_cells(
+                "industry",
+                dict(valid),
+                industries={stock: self.industries.get((stock, day)) for stock, _ in valid},
             )
-            for stock, cell, _ in members:
-                assert cell.value is not None
-                residual = cell.value - center
-                if (center != 0 and residual == cell.value) or (
-                    cell.value != 0 and residual == -center
-                ):
-                    results[stock] = _missing("precision_limit")
-                else:
-                    results[stock] = _present(residual, latest)
+        )
 
     def _cross_size(
         self, day_index: int, valid: list[tuple[str, _Cell]], results: dict[str, _Cell]
     ) -> None:
-        trade_date = self.trading_days[day_index]
-        samples: list[tuple[str, _Cell, MarketCapObservation]] = []
-        for stock, cell in valid:
-            context = self.market_caps.get((stock, trade_date))
-            if context is None or context.market_cap is None:
-                results[stock] = _missing("missing_context")
-            else:
-                samples.append((stock, cell, context))
-        if len(samples) < 3:
-            for stock, _, _ in samples:
-                results[stock] = _missing("insufficient_samples")
-            return
-        caps = [context.market_cap for _, _, context in samples]
-        if len(set(caps)) == 1:
-            for stock, _, _ in samples:
-                results[stock] = _missing("zero_variance")
-            return
-        pivot = caps[0]
-        assert pivot is not None
-        offsets = [_log_cap_ratio(cap, pivot) for cap in caps if cap is not None]
-        if len(set(offsets)) == 1:
-            for stock, _, _ in samples:
-                results[stock] = _missing("precision_limit")
-            return
-        x_mean = math.fsum(offsets) / len(offsets)
-        centered_x = [value - x_mean for value in offsets]
-        denominator = math.fsum(value * value for value in centered_x)
-        if denominator == 0:
-            for stock, _, _ in samples:
-                results[stock] = _missing("precision_limit")
-            return
-        values = [cell.value for _, cell, _ in samples]
-        scale = max(abs(value) for value in values if value is not None) or 1.0
-        scaled_y = [value / scale for value in values if value is not None]
-        y_mean = math.fsum(scaled_y) / len(scaled_y)
-        centered_y = [value - y_mean for value in scaled_y]
-        slope = math.fsum(x * y for x, y in zip(centered_x, centered_y, strict=True)) / denominator
-        latest = max(
-            instant
-            for _, cell, context in samples
-            for instant in (cell.latest_visible_at, context.first_visible_at)
-            if instant is not None
+        day = self.trading_days[day_index]
+        results.update(
+            neutralize_factor_cells(
+                "size",
+                dict(valid),
+                market_caps={stock: self.market_caps.get((stock, day)) for stock, _ in valid},
+            )
         )
-        for (stock, _, _), x, y in zip(samples, centered_x, centered_y, strict=True):
-            prediction = slope * x
-            if not math.isfinite(prediction):
-                results[stock] = _missing("non_finite_result")
-                continue
-            residual = math.fsum((y, -prediction)) * scale
-            results[stock] = _present(residual, latest)
 
     @staticmethod
     def _cross_zscore(
