@@ -12,6 +12,7 @@ import {
   clearRun,
   hasDefinitionCommand,
   hasRun,
+  hasTracking,
   matchesRunResult,
   persistRun,
   persistRunDraft,
@@ -190,7 +191,7 @@ export function useFactorRun({
     const next = readRun();
     operationRef.current = next;
     setOperation(next);
-    setOccupied(hasRun() || hasDefinitionCommand());
+    setOccupied(hasRun() || hasDefinitionCommand() || hasTracking());
   }, []);
 
   useEffect(() => {
@@ -207,7 +208,7 @@ export function useFactorRun({
   }, [sync]);
 
   useEffect(() => {
-    setOccupied(definitionBusy || hasRun() || hasDefinitionCommand());
+    setOccupied(definitionBusy || hasRun() || hasDefinitionCommand() || hasTracking());
   }, [definitionBusy]);
 
   useEffect(() => {
@@ -357,6 +358,7 @@ export function useFactorRun({
       selectedPool === undefined ||
       selectedNeutralization?.available !== true ||
       hasRun() ||
+      hasTracking() ||
       hasDefinitionCommand()
     )
       return;
@@ -400,6 +402,7 @@ export function useFactorRun({
           head.version !== confirmation.request.parameters.expected_head.version ||
           head.content_sha256 !== confirmation.request.parameters.expected_head.content_sha256 ||
           hasRun() ||
+          hasTracking() ||
           hasDefinitionCommand()
         ) {
           sync();
@@ -473,8 +476,10 @@ export function useFactorRun({
                   ? "正在核对检验条件…"
                   : availability.data?.enabled === false
                     ? (availability.data.reason ?? "暂时无法运行检验。")
-                    : definitionBusy || hasDefinitionCommand()
-                      ? "请先完成保存或归档操作。"
+                    : definitionBusy || hasDefinitionCommand() || hasTracking()
+                      ? hasTracking()
+                        ? "请先完成跟踪操作。"
+                        : "请先完成保存或归档操作。"
                       : selected?.archived
                         ? "归档因子仅可查看历史检验。"
                         : selected === null

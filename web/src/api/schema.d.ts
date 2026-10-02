@@ -463,6 +463,74 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/factors/tracking/commands": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 加入或取消因子跟踪 */
+        post: operations["set_factor_tracked_api_v1_factors_tracking_commands_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/factors/tracking/commands/resume": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 核对原因子跟踪操作 */
+        post: operations["resume_factor_tracking_api_v1_factors_tracking_commands_resume_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/factors/tracking/commands/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 重试原因子跟踪操作 */
+        post: operations["retry_factor_tracking_api_v1_factors_tracking_commands_retry_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/factors/{factor_id}/tracking": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 因子持续跟踪 */
+        get: operations["factor_tracking_panel_api_v1_factors__factor_id__tracking_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/health": {
         parameters: {
             query?: never;
@@ -2669,6 +2737,16 @@ export interface components {
             data: components["schemas"]["FactorSaveCommandData"];
             serving: components["schemas"]["ServingMeta"];
         };
+        /** Envelope[FactorTrackingOperationResult] */
+        Envelope_FactorTrackingOperationResult_: {
+            data: components["schemas"]["FactorTrackingOperationResult"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[FactorTrackingPanel] */
+        Envelope_FactorTrackingPanel_: {
+            data: components["schemas"]["FactorTrackingPanel"];
+            serving: components["schemas"]["ServingMeta"];
+        };
         /** Envelope[FormulaMarketJobDetailData] */
         Envelope_FormulaMarketJobDetailData_: {
             data: components["schemas"]["FormulaMarketJobDetailData"];
@@ -3534,6 +3612,126 @@ export interface components {
              * @enum {string}
              */
             summary_status: "evaluated" | "no_samples";
+        };
+        /** FactorTrackingOperationResult */
+        FactorTrackingOperationResult: {
+            original_request: components["schemas"]["FactorTrackingRequest"];
+            /** Reason */
+            reason?: string | null;
+            receipt?: components["schemas"]["FactorTrackingReceipt"] | null;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "applied" | "pending" | "uncertain" | "rejected";
+        };
+        /** FactorTrackingPanel */
+        FactorTrackingPanel: {
+            /** Actual Start Date */
+            actual_start_date?: string | null;
+            /**
+             * Availability
+             * @enum {string}
+             */
+            availability: "unavailable" | "not_tracked" | "tracked";
+            /**
+             * Basis Label
+             * @default 历史回顾研究诊断；累计从实际起日计算，并非实盘收益。
+             */
+            basis_label: string;
+            /**
+             * Can Set Tracked
+             * @default false
+             */
+            can_set_tracked: boolean;
+            definition_head?: components["schemas"]["FactorHeadRef"] | null;
+            /** Factor Id */
+            factor_id: string;
+            /**
+             * Policy Label
+             * @default 全市场（剔除北交所、ST） · 每日 · 5组 · RankIC · 无运行后中性化
+             */
+            policy_label: string;
+            /**
+             * Policy Version
+             * @default 1
+             * @constant
+             */
+            policy_version: 1;
+            /** Reason */
+            reason?: string | null;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "unavailable" | "not_tracked" | "waiting" | "active" | "paused";
+            summary?: components["schemas"]["FactorTrackingSummary"] | null;
+            /**
+             * Tracked
+             * @default false
+             */
+            tracked: boolean;
+            /** Tracking Generation */
+            tracking_generation?: string | null;
+            /** Updated At */
+            updated_at?: string | null;
+        };
+        /** FactorTrackingReceipt */
+        FactorTrackingReceipt: {
+            /** Command Id */
+            command_id: string;
+            definition_head: components["schemas"]["FactorHeadRef"];
+            /** Factor Id */
+            factor_id: string;
+            /** Segment Id */
+            segment_id?: string | null;
+            /** Tracked */
+            tracked: boolean;
+            /** Tracking Generation */
+            tracking_generation: string;
+        };
+        /** FactorTrackingRequest */
+        FactorTrackingRequest: {
+            /** Command Id */
+            command_id: string;
+            expected_head: components["schemas"]["FactorHeadRef"];
+            /** Expected Tracking Generation */
+            expected_tracking_generation?: string | null;
+            /** Factor Id */
+            factor_id: string;
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+            /** Serving Generation Id */
+            serving_generation_id: string;
+            /** Tracked */
+            tracked: boolean;
+        };
+        /** FactorTrackingSummary */
+        FactorTrackingSummary: {
+            /** Complete Day Count */
+            complete_day_count: number;
+            /** Cumulative Long Short */
+            cumulative_long_short: number | null;
+            ic_20: components["schemas"]["ICSeriesSummary"];
+            /** Invalidated */
+            invalidated: boolean;
+            /** Latest Trade Date */
+            latest_trade_date: string | null;
+            /** Reason */
+            reason?: string | null;
+            /** Week Complete Day Count */
+            week_complete_day_count: number;
+            /** Week Day Count */
+            week_day_count: number;
+            /** Week Long Short */
+            week_long_short: number | null;
+            /** Yesterday Ic */
+            yesterday_ic: number | null;
+            /** Yesterday Long Short */
+            yesterday_long_short: number | null;
         };
         /** FieldExpr */
         FieldExpr: {
@@ -6994,6 +7192,138 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_FactorRunOperationResult_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    set_factor_tracked_api_v1_factors_tracking_commands_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["FactorTrackingRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_FactorTrackingOperationResult_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    resume_factor_tracking_api_v1_factors_tracking_commands_resume_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["FactorTrackingRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_FactorTrackingOperationResult_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    retry_factor_tracking_api_v1_factors_tracking_commands_retry_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["FactorTrackingRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_FactorTrackingOperationResult_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    factor_tracking_panel_api_v1_factors__factor_id__tracking_get: {
+        parameters: {
+            query?: {
+                generation_id?: string | null;
+            };
+            header?: never;
+            path: {
+                factor_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_FactorTrackingPanel_"];
                 };
             };
             /** @description Validation Error */

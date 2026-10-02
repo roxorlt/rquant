@@ -811,7 +811,9 @@ describe("因子库", () => {
     expect(detail).toHaveTextContent("ts_mean(volume, 3)");
     expect(findJargon(container.querySelector("main")?.textContent ?? "")).toEqual([]);
     expect(container.querySelector("main")?.textContent).not.toContain("old_factor");
-    expect(screen.queryByRole("button", { name: /运行检验|加入跟踪/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: "运行检验" })).toBeNull();
+    expect(screen.getByRole("button", { name: "加入跟踪" })).toBeDisabled();
+    await screen.findByText("跟踪数据尚未发布。");
     const results = screen.getByRole("region", { name: "检验结果" });
     expect(within(results).queryByRole("img")).toBeNull();
     expect(results).not.toHaveTextContent(/IC|分组收益|换手/);

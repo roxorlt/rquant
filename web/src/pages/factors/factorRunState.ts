@@ -6,6 +6,7 @@ import type {
 } from "@/api/factors";
 
 export const RUN_OPERATION_KEY = "rquant.factor.run-operation.v1";
+export const TRACKING_OPERATION_KEY = "rquant.factor.tracking-operation.v1";
 const RUN_DRAFT_KEY = "rquant.factor.run-draft.v1";
 export const ARCHIVE_COMMAND_KEY = "rquant.factor.archive-command.v1";
 const SAVE_COMMAND_KEY = "rquant.factor.save-command.v1";
@@ -166,6 +167,14 @@ export function hasRun(): boolean {
   }
 }
 
+export function hasTracking(): boolean {
+  try {
+    return localStorage.getItem(TRACKING_OPERATION_KEY) !== null;
+  } catch {
+    return true;
+  }
+}
+
 export function hasDefinitionCommand(): boolean {
   try {
     return (
@@ -222,7 +231,7 @@ export function persistRunDraft(value: RunDraft): boolean {
   }
 }
 
-// All three commands claim the same durable slot while holding the browser lock.
+// Every factor command claims its durable slot while holding the same browser lock.
 export async function withFactorCommandLock(
   action: () => void | Promise<void>,
   requireLock = false,

@@ -3,6 +3,12 @@ import type { MetaEnvelope, Schemas } from "../src/api/client.ts";
 import rejectionContract from "../src/pages/factors/factorRunRejection.fixture.json" with {
   type: "json",
 };
+import {
+  trackedFactor,
+  trackingPanel,
+  trackingResult,
+  trackingSummary,
+} from "../src/pages/factors/factorTracking.fixture.ts";
 import { findJargon } from "../src/test/jargon.ts";
 import { APP_URL } from "./env.ts";
 import { expectNoHorizontalOverflow, watch } from "./watch.ts";
@@ -12,6 +18,159 @@ const neutralizationCases: Schemas["FactorRunNeutralizationOption"][] = [
   { neutralization: "industry", label: "行业", available: true, reason: null },
   { neutralization: "industry_size", label: "行业 + 市值", available: true, reason: null },
 ];
+
+for (const viewport of [
+  { width: 1440, height: 900, label: "desktop" },
+  { width: 390, height: 844, label: "phone" },
+]) {
+  test.describe(`因子跟踪 ${viewport.label}`, () => {
+    test.use({ isMobile: viewport.label === "phone", hasTouch: viewport.label === "phone" });
+    test(`因子跟踪原请求恢复、同代确认与取消在 ${viewport.label} 可完成`, async ({
+      page,
+    }, testInfo) => {
+      const watcher = watch(page);
+      const metadata = (await (
+        await page.request.get(new URL("api/v1/meta", APP_URL).toString())
+      ).json()) as MetaEnvelope;
+      metadata.data.viewer = "tester";
+      const requests: Schemas["FactorTrackingRequest"][] = [];
+      let panel = trackingPanel();
+      const publish = (generationId: string) => {
+        if (metadata.data.generation === null) throw new Error("合成夹具缺少数据记录");
+        metadata.data.generation.generation_id = generationId;
+        metadata.serving.generation_id = generationId;
+      };
+      await page.route("**/api/v1/meta", (route) => route.fulfill({ json: metadata }));
+      await page.route("**/api/v1/factors/definitions*", (route) =>
+        route.fulfill({
+          json: {
+            data: {
+              availability: "populated",
+              available_at: metadata.serving.built_at,
+              definitions: [trackedFactor],
+              can_save: false,
+              can_archive: true,
+            },
+            serving: metadata.serving,
+          },
+        }),
+      );
+      await page.route("**/api/v1/factors/*/tracking*", (route) =>
+        route.fulfill({ json: { data: panel, serving: metadata.serving } }),
+      );
+      await page.route(/\/api\/v1\/factors\/results(?:\?.*)?$/, (route) =>
+        route.fulfill({
+          json: {
+            data: { availability: "empty", available_at: metadata.serving.built_at, results: [] },
+            serving: metadata.serving,
+          },
+        }),
+      );
+      await page.route(
+        /\/api\/v1\/factors\/tracking\/commands(?:\/(?:resume|retry))?$/,
+        async (route) => {
+          const request = route.request().postDataJSON() as Schemas["FactorTrackingRequest"];
+          expect(route.request().headers()["x-rquant-csrf"]).toBe("1");
+          expect(
+            await page.evaluate(
+              () =>
+                JSON.parse(localStorage.getItem("rquant.factor.tracking-operation.v1") ?? "null")
+                  .request,
+            ),
+          ).toEqual(request);
+          requests.push(request);
+          const accepted = !request.tracked || route.request().url().endsWith("/retry");
+          const result = trackingResult(request, accepted ? "applied" : "uncertain");
+          if (!request.tracked && result.receipt !== null && result.receipt !== undefined)
+            result.receipt.tracking_generation = "c".repeat(32);
+          await route.fulfill({ json: { data: result, serving: metadata.serving } });
+        },
+      );
+      await page.setViewportSize({ width: viewport.width, height: viewport.height });
+      await page.goto(`./#/factors?factor_id=${trackedFactor.factor_id}&panel=tracking`);
+      const area = page.getByRole("region", { name: "因子跟踪", exact: true });
+      await expect(area).toBeFocused();
+      const strategy = area.getByText("跟踪策略", { exact: true });
+      if (viewport.label === "phone") {
+        expect(await page.evaluate(() => matchMedia("(hover: none)").matches)).toBe(true);
+        await strategy.tap();
+      } else await strategy.focus();
+      await expect(page.getByRole("tooltip")).toContainText("18:40");
+      await expect(page.getByRole("tooltip")).toContainText("5组 · RankIC · 无运行后中性化");
+      const join = page.getByRole("button", { name: "加入跟踪", exact: true });
+      if (viewport.label === "phone") await strategy.tap();
+      await join.focus();
+      await page.keyboard.press("Enter");
+      const dialog = page.getByRole("dialog", { name: "加入因子跟踪" });
+      await expect(dialog).toContainText("价量动量 · 第 2 版");
+      await expect(dialog).toContainText("全市场 · 每日 · 5组 · RankIC · 无运行后中性化");
+      expect(requests).toHaveLength(0);
+      await expectNoHorizontalOverflow(page, `tracking confirm ${viewport.label}`);
+      await expect(dialog).toBeVisible();
+      await expect(dialog).toHaveCSS("opacity", "1");
+      await page.screenshot({
+        path: testInfo.outputPath(`factor-tracking-confirm-${viewport.label}.png`),
+        fullPage: true,
+        animations: "disabled",
+      });
+      await dialog.getByRole("button", { name: "确认加入" }).click();
+      await expect(
+        page.getByText("跟踪状态暂未确认，请保留本次操作。", { exact: true }),
+      ).toBeVisible();
+      expect(requests).toHaveLength(1);
+      await page.reload();
+      const retry = page.getByRole("button", { name: "用原请求重试跟踪", exact: true });
+      await expect(retry).toBeEnabled();
+      await expect.poll(() => requests.length).toBe(2);
+      await retry.click();
+      await expect(page.getByText("已保存，等待同步。", { exact: true })).toBeVisible();
+      expect(requests).toEqual([requests[0], requests[0], requests[0]]);
+      await expect(area).toContainText("本次跟踪尚未同步，请刷新状态。");
+      await expect(page.getByRole("button", { name: "取消跟踪", exact: true })).toHaveCount(0);
+      panel = trackingPanel({
+        availability: "tracked",
+        status: "active",
+        tracked: true,
+        tracking_generation: "b".repeat(32),
+        summary: trackingSummary,
+        actual_start_date: "2026-08-27",
+        updated_at: "2026-09-24T07:31:00Z",
+      });
+      publish("e".repeat(64));
+      await page.locator(".ph-actions").getByRole("button", { name: "刷新", exact: true }).click();
+      await expect(page.getByText("已加入跟踪。", { exact: true })).toBeVisible();
+      await page.getByRole("button", { name: "继续查看跟踪", exact: true }).click();
+      await expect(area).toContainText("+1.23%");
+      await expect(area).toContainText("−2.56%");
+      await expect(area).toContainText("+7.89%");
+      await expect(area).toContainText("20 / 20");
+      await expect(area).toContainText("2026-08-27");
+      expect(findJargon(await page.locator("main").innerText())).toEqual([]);
+      await expectNoHorizontalOverflow(page, `tracking active ${viewport.label}`);
+      await page.screenshot({
+        path: testInfo.outputPath(`factor-tracking-active-${viewport.label}.png`),
+        fullPage: true,
+        animations: "disabled",
+      });
+      await page.getByRole("button", { name: "取消跟踪", exact: true }).click();
+      await expect(page.getByText("已保存，等待同步。", { exact: true })).toBeVisible();
+      expect(requests[3]).toMatchObject({
+        tracked: false,
+        expected_tracking_generation: "b".repeat(32),
+        expected_head: requests[0]?.expected_head,
+      });
+      expect(requests[3]?.command_id).not.toBe(requests[0]?.command_id);
+      await expect(page.getByText("已取消跟踪。", { exact: true })).toHaveCount(0);
+      panel = trackingPanel({ tracking_generation: "c".repeat(32) });
+      publish("d".repeat(64));
+      await page.locator(".ph-actions").getByRole("button", { name: "刷新", exact: true }).click();
+      await expect(page.getByText("已取消跟踪。", { exact: true })).toBeVisible();
+      await page.getByRole("button", { name: "继续查看跟踪", exact: true }).click();
+      await expect(join).toBeEnabled();
+      expect(watcher.problems).toEqual([]);
+    });
+  });
+}
 
 for (const viewport of [
   { width: 1440, height: 900, label: "desktop" },
@@ -438,7 +597,9 @@ test("因子库桌面和手机列表详情可读、键盘选择且无横向溢�
   await expect(page.getByRole("region", { name: "因子详情" })).toContainText("已归档");
   await expect(page.getByText("ts_mean(volume, 3)")).toBeVisible();
   expect(findJargon(await page.locator("main").innerText())).toEqual([]);
-  await expect(page.getByRole("button", { name: /运行检验|加入跟踪/ })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "运行检验", exact: true })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "加入跟踪", exact: true })).toBeDisabled();
+  await expect(page.getByRole("region", { name: "因子跟踪" })).toContainText("跟踪数据尚未发布。");
   await expect(page.getByRole("region", { name: "检验参数" })).toContainText("尚未准备历史行情");
   await expectNoHorizontalOverflow(page, "factor desktop");
 
@@ -761,7 +922,9 @@ test("真实检验图表可切 IC、分组并用键盘打开明细；手机无�
   await expect(area.getByRole("table", { name: "IC 明细" })).toBeVisible();
   await expect(area.getByRole("table", { name: "IC 明细" })).toContainText("—");
   expect(findJargon(await page.locator("main").innerText())).toEqual([]);
-  await expect(page.getByRole("button", { name: /运行检验|加入跟踪/ })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "运行检验", exact: true })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "加入跟踪", exact: true })).toBeDisabled();
+  await expect(page.getByRole("region", { name: "因子跟踪" })).toContainText("跟踪数据尚未发布。");
   await expectNoHorizontalOverflow(page, "factor research desktop");
   await page.screenshot({ path: "test-results/factors-research-desktop.png", fullPage: true });
   await page.setViewportSize({ width: 390, height: 844 });

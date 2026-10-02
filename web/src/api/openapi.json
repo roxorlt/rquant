@@ -4323,6 +4323,38 @@
         "title": "Envelope[FactorSaveCommandData]",
         "type": "object"
       },
+      "Envelope_FactorTrackingOperationResult_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/FactorTrackingOperationResult"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[FactorTrackingOperationResult]",
+        "type": "object"
+      },
+      "Envelope_FactorTrackingPanel_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/FactorTrackingPanel"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[FactorTrackingPanel]",
+        "type": "object"
+      },
       "Envelope_FormulaMarketJobDetailData_": {
         "properties": {
           "data": {
@@ -6798,6 +6830,393 @@
           "coverage_days"
         ],
         "title": "FactorStreamResearchDisplay",
+        "type": "object"
+      },
+      "FactorTrackingOperationResult": {
+        "additionalProperties": false,
+        "properties": {
+          "original_request": {
+            "$ref": "#/components/schemas/FactorTrackingRequest"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "maxLength": 120,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "receipt": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FactorTrackingReceipt"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "status": {
+            "enum": [
+              "applied",
+              "pending",
+              "uncertain",
+              "rejected"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "original_request",
+          "status"
+        ],
+        "title": "FactorTrackingOperationResult",
+        "type": "object"
+      },
+      "FactorTrackingPanel": {
+        "additionalProperties": false,
+        "properties": {
+          "actual_start_date": {
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actual Start Date"
+          },
+          "availability": {
+            "enum": [
+              "unavailable",
+              "not_tracked",
+              "tracked"
+            ],
+            "title": "Availability",
+            "type": "string"
+          },
+          "basis_label": {
+            "default": "历史回顾研究诊断；累计从实际起日计算，并非实盘收益。",
+            "title": "Basis Label",
+            "type": "string"
+          },
+          "can_set_tracked": {
+            "default": false,
+            "title": "Can Set Tracked",
+            "type": "boolean"
+          },
+          "definition_head": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FactorHeadRef"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "factor_id": {
+            "title": "Factor Id",
+            "type": "string"
+          },
+          "policy_label": {
+            "default": "全市场（剔除北交所、ST） · 每日 · 5组 · RankIC · 无运行后中性化",
+            "title": "Policy Label",
+            "type": "string"
+          },
+          "policy_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Policy Version",
+            "type": "integer"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "maxLength": 120,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "status": {
+            "enum": [
+              "unavailable",
+              "not_tracked",
+              "waiting",
+              "active",
+              "paused"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "summary": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FactorTrackingSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "tracked": {
+            "default": false,
+            "title": "Tracked",
+            "type": "boolean"
+          },
+          "tracking_generation": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tracking Generation"
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At"
+          }
+        },
+        "required": [
+          "factor_id",
+          "availability",
+          "status"
+        ],
+        "title": "FactorTrackingPanel",
+        "type": "object"
+      },
+      "FactorTrackingReceipt": {
+        "additionalProperties": false,
+        "properties": {
+          "command_id": {
+            "title": "Command Id",
+            "type": "string"
+          },
+          "definition_head": {
+            "$ref": "#/components/schemas/FactorHeadRef"
+          },
+          "factor_id": {
+            "title": "Factor Id",
+            "type": "string"
+          },
+          "segment_id": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{32}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Segment Id"
+          },
+          "tracked": {
+            "title": "Tracked",
+            "type": "boolean"
+          },
+          "tracking_generation": {
+            "pattern": "^[0-9a-f]{32}$",
+            "title": "Tracking Generation",
+            "type": "string"
+          }
+        },
+        "required": [
+          "command_id",
+          "factor_id",
+          "tracked",
+          "tracking_generation",
+          "definition_head"
+        ],
+        "title": "FactorTrackingReceipt",
+        "type": "object"
+      },
+      "FactorTrackingRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "command_id": {
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+            "title": "Command Id",
+            "type": "string"
+          },
+          "expected_head": {
+            "$ref": "#/components/schemas/FactorHeadRef"
+          },
+          "expected_tracking_generation": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{32}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Tracking Generation"
+          },
+          "factor_id": {
+            "pattern": "^[a-z][a-z0-9_]{0,63}$",
+            "title": "Factor Id",
+            "type": "string"
+          },
+          "requested_at": {
+            "format": "date-time",
+            "title": "Requested At",
+            "type": "string"
+          },
+          "serving_generation_id": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Serving Generation Id",
+            "type": "string"
+          },
+          "tracked": {
+            "title": "Tracked",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "command_id",
+          "requested_at",
+          "serving_generation_id",
+          "factor_id",
+          "tracked",
+          "expected_head"
+        ],
+        "title": "FactorTrackingRequest",
+        "type": "object"
+      },
+      "FactorTrackingSummary": {
+        "additionalProperties": false,
+        "properties": {
+          "complete_day_count": {
+            "maximum": 20.0,
+            "minimum": 0.0,
+            "title": "Complete Day Count",
+            "type": "integer"
+          },
+          "cumulative_long_short": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cumulative Long Short"
+          },
+          "ic_20": {
+            "$ref": "#/components/schemas/ICSeriesSummary"
+          },
+          "invalidated": {
+            "title": "Invalidated",
+            "type": "boolean"
+          },
+          "latest_trade_date": {
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Latest Trade Date"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "maxLength": 120,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "week_complete_day_count": {
+            "maximum": 5.0,
+            "minimum": 0.0,
+            "title": "Week Complete Day Count",
+            "type": "integer"
+          },
+          "week_day_count": {
+            "maximum": 5.0,
+            "minimum": 0.0,
+            "title": "Week Day Count",
+            "type": "integer"
+          },
+          "week_long_short": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Week Long Short"
+          },
+          "yesterday_ic": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Yesterday Ic"
+          },
+          "yesterday_long_short": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Yesterday Long Short"
+          }
+        },
+        "required": [
+          "latest_trade_date",
+          "yesterday_ic",
+          "ic_20",
+          "complete_day_count",
+          "yesterday_long_short",
+          "week_long_short",
+          "week_day_count",
+          "week_complete_day_count",
+          "cumulative_long_short",
+          "invalidated"
+        ],
+        "title": "FactorTrackingSummary",
         "type": "object"
       },
       "FieldExpr": {
@@ -16427,6 +16846,189 @@
           }
         },
         "summary": "重试原因子检验",
+        "tags": [
+          "factors"
+        ]
+      }
+    },
+    "/api/v1/factors/tracking/commands": {
+      "post": {
+        "operationId": "set_factor_tracked_api_v1_factors_tracking_commands_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FactorTrackingRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_FactorTrackingOperationResult_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "加入或取消因子跟踪",
+        "tags": [
+          "factors"
+        ]
+      }
+    },
+    "/api/v1/factors/tracking/commands/resume": {
+      "post": {
+        "operationId": "resume_factor_tracking_api_v1_factors_tracking_commands_resume_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FactorTrackingRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_FactorTrackingOperationResult_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "核对原因子跟踪操作",
+        "tags": [
+          "factors"
+        ]
+      }
+    },
+    "/api/v1/factors/tracking/commands/retry": {
+      "post": {
+        "operationId": "retry_factor_tracking_api_v1_factors_tracking_commands_retry_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FactorTrackingRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_FactorTrackingOperationResult_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "重试原因子跟踪操作",
+        "tags": [
+          "factors"
+        ]
+      }
+    },
+    "/api/v1/factors/{factor_id}/tracking": {
+      "get": {
+        "operationId": "factor_tracking_panel_api_v1_factors__factor_id__tracking_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "factor_id",
+            "required": true,
+            "schema": {
+              "pattern": "^[a-z][a-z0-9_]{0,63}$",
+              "title": "Factor Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "generation_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "pattern": "^[0-9a-f]{64}$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Generation Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_FactorTrackingPanel_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "因子持续跟踪",
         "tags": [
           "factors"
         ]

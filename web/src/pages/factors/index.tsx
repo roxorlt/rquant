@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { useSearchParams } from "react-router";
 import { ApiError } from "@/api/client";
 import {
   type FactorArchiveCommandData,
@@ -26,7 +27,13 @@ import {
 import { FactorEditor, type FactorEditorDraft } from "./FactorEditor";
 import { FactorResults } from "./FactorResults";
 import { FactorRunConfirmation, FactorRunParameters, FactorRunStatus } from "./FactorRun";
-import { hasDefinitionCommand, hasRun, withFactorCommandLock } from "./factorRunState";
+import {
+  FactorTrackingAction,
+  FactorTrackingConfirmation,
+  FactorTrackingPanel,
+  FactorTrackingStatus,
+} from "./FactorTracking";
+import { hasDefinitionCommand, hasRun, hasTracking, withFactorCommandLock } from "./factorRunState";
 import {
   clearSaveCommand,
   persistEditorDraft,
@@ -39,6 +46,7 @@ import {
   storageWritable,
 } from "./factorSaveState";
 import { useFactorRun } from "./useFactorRun";
+import { useFactorTracking } from "./useFactorTracking";
 import "./factors.css";
 
 const ARCHIVE_STORAGE_KEY = "rquant.factor.archive-command.v1";
@@ -111,6 +119,9 @@ const columns: DataColumn<FactorDefinitionItem>[] = [
 ];
 
 export default function FactorsPage() {
+  const [searchParams, setSearchParams] = useSearchParams();
+  const linkedFactorId = searchParams.get("factor_id");
+  const trackingLink = searchParams.get("panel") === "tracking";
   const meta = useCurrentMeta();
   const currentGeneration =
     meta.data === undefined ? undefined : (meta.data.data.generation?.generation_id ?? null);
@@ -150,13 +161,19 @@ export default function FactorsPage() {
   const archiveBusyRef = useRef(false);
   const restoredCommand = useRef(false);
   const selectedId =
-    selection !== null && selection.generationId === currentGeneration ? selection.factorId : null;
+    linkedFactorId ??
+    (selection !== null && selection.generationId === currentGeneration
+      ? selection.factorId
+      : null);
   const changed =
     currentGeneration !== undefined &&
     catalog.serving !== undefined &&
     currentGeneration !== catalog.serving.generation_id;
   const rows = changed ? [] : (catalog.data?.definitions ?? []);
-  const selected = rows.find((row) => row.factor_id === selectedId) ?? rows[0] ?? null;
+  const selected =
+    selectedId === null
+      ? (rows[0] ?? null)
+      : (rows.find((row) => row.factor_id === selectedId) ?? null);
   const catalogVerified =
     typeof currentGeneration === "string" &&
     catalog.serving?.generation_id === currentGeneration &&
@@ -178,17 +195,38 @@ export default function FactorsPage() {
       archiveCommand !== null ||
       saveBusy ||
       archiveBusy ||
+      hasTracking() ||
       (typeof viewer === "string" && viewer === deniedViewer),
+  });
+  const tracking = useFactorTracking({
+    generationId: currentGeneration,
+    viewer,
+    permissionRevision,
+    selected,
+    catalogVerified,
+    otherBusy:
+      saveCommand !== null ||
+      archiveCommand !== null ||
+      saveBusy ||
+      archiveBusy ||
+      run.busy ||
+      run.permissionDenied ||
+      (typeof viewer === "string" && viewer === deniedViewer),
+    onPermissionDenied: setDeniedViewer,
   });
   const runBlocksWrite =
     run.occupied ||
     run.busy ||
     run.permissionDenied ||
+    tracking.occupied ||
+    tracking.busy ||
+    tracking.permissionDenied ||
     (typeof viewer === "string" && viewer === deniedViewer);
   const saveAvailable =
     typeof viewer === "string" &&
     viewer !== deniedViewer &&
     !run.permissionDenied &&
+    !tracking.permissionDenied &&
     catalogVerified &&
     catalog.data?.can_save === true &&
     capabilities.data?.can_save === true &&
@@ -329,6 +367,7 @@ export default function FactorsPage() {
       !saveAvailable ||
       runBlocksWrite ||
       hasRun() ||
+      hasTracking() ||
       hasDefinitionCommand() ||
       saveCommandRef.current !== null ||
       archiveCommandRef.current !== null ||
@@ -354,6 +393,7 @@ export default function FactorsPage() {
       !saveAvailable ||
       runBlocksWrite ||
       hasRun() ||
+      hasTracking() ||
       hasDefinitionCommand() ||
       saveCommandRef.current !== null ||
       archiveCommandRef.current !== null ||
@@ -403,6 +443,7 @@ export default function FactorsPage() {
       !saveAvailable ||
       runBlocksWrite ||
       hasRun() ||
+      hasTracking() ||
       draftStale ||
       saveCommandRef.current !== null ||
       archiveCommandRef.current !== null
@@ -423,6 +464,7 @@ export default function FactorsPage() {
     await withFactorCommandLock(() => {
       if (
         hasRun() ||
+        hasTracking() ||
         hasDefinitionCommand() ||
         saveCommandRef.current !== null ||
         archiveCommandRef.current !== null
@@ -481,6 +523,7 @@ export default function FactorsPage() {
       selected.archived ||
       runBlocksWrite ||
       hasRun() ||
+      hasTracking() ||
       !storageReady ||
       !catalogVerified ||
       typeof viewer !== "string" ||
@@ -504,6 +547,7 @@ export default function FactorsPage() {
     await withFactorCommandLock(() => {
       if (
         hasRun() ||
+        hasTracking() ||
         hasDefinitionCommand() ||
         saveCommandRef.current !== null ||
         archiveCommandRef.current !== null
@@ -554,6 +598,7 @@ export default function FactorsPage() {
 
   const refreshDefinitions = async (resumeArchive = true) => {
     run.sync();
+    tracking.sync();
     const refreshed = await meta.refetch();
     const activeCommand = archiveCommandRef.current;
     if (resumeArchive && activeCommand !== null && !archiveBusyRef.current)
@@ -584,6 +629,7 @@ export default function FactorsPage() {
         note="查看已发布因子与历史检验"
         actions={
           <>
+            <FactorTrackingAction tracking={tracking} />
             {run.availability.data?.enabled && run.storageReady ? (
               <Button
                 size="sm"
@@ -618,6 +664,7 @@ export default function FactorsPage() {
         }
       />
       <FactorRunStatus run={run} />
+      <FactorTrackingStatus tracking={tracking} />
       {saveCommand !== null ? (
         <Panel>
           <div
@@ -724,7 +771,12 @@ export default function FactorsPage() {
         </Panel>
       ) : catalog.data?.availability === "empty" ? (
         <Panel>
-          <EmptyState title="还没有因子" hint="保存因子后会显示在这里。" />
+          <EmptyState
+            title={
+              linkedFactorId === null ? "还没有因子" : "目标因子暂时不可查看，请从因子列表选择。"
+            }
+            hint="保存因子后会显示在这里。"
+          />
         </Panel>
       ) : (
         <div className="factor-layout">
@@ -750,8 +802,15 @@ export default function FactorsPage() {
                 selectedKey={selected?.factor_id}
                 onSelect={
                   typeof currentGeneration === "string"
-                    ? (row) =>
-                        setSelection({ generationId: currentGeneration, factorId: row.factor_id })
+                    ? (row) => {
+                        if (linkedFactorId !== null) {
+                          const next = new URLSearchParams(searchParams);
+                          next.delete("factor_id");
+                          next.delete("panel");
+                          setSearchParams(next, { replace: true });
+                        }
+                        setSelection({ generationId: currentGeneration, factorId: row.factor_id });
+                      }
                     : undefined
                 }
                 emptyText="还没有因子"
@@ -835,6 +894,10 @@ export default function FactorsPage() {
                   ) : null}
                 </div>
               </Panel>
+              <FactorTrackingPanel
+                tracking={tracking}
+                focusRequested={trackingLink && selected.factor_id === linkedFactorId}
+              />
               {typeof currentGeneration === "string" ? (
                 <FactorResults
                   factor={selected}
@@ -848,7 +911,11 @@ export default function FactorsPage() {
                 />
               ) : null}
             </div>
-          ) : null}
+          ) : (
+            <Panel>
+              <EmptyState title="目标因子暂时不可查看，请从因子列表选择。" />
+            </Panel>
+          )}
         </div>
       )}
       <ConfirmDialog
@@ -863,6 +930,7 @@ export default function FactorsPage() {
         onCancel={() => setConfirmArchive(false)}
       />
       <FactorRunConfirmation run={run} />
+      <FactorTrackingConfirmation tracking={tracking} />
       <FactorEditor
         draft={editorDraft}
         open={editorOpen}

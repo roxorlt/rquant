@@ -1,5 +1,6 @@
 import { HttpResponse, http } from "msw";
 import { setupServer } from "msw/node";
+import type { Schemas } from "@/api/client";
 import {
   channelsEnvelope,
   healthEnvelope,
@@ -87,6 +88,27 @@ export const factorRunUnavailableHandler = () =>
     }),
   );
 
+export const factorTrackingUnavailableHandler = () =>
+  http.get("*/api/v1/factors/:factorId/tracking", ({ params }) => {
+    const data: Schemas["FactorTrackingPanel"] = {
+      factor_id: String(params.factorId),
+      availability: "unavailable",
+      status: "unavailable",
+      tracked: false,
+      tracking_generation: null,
+      definition_head: null,
+      actual_start_date: null,
+      updated_at: null,
+      summary: null,
+      reason: "跟踪数据尚未发布。",
+      can_set_tracked: false,
+      policy_version: 1,
+      policy_label: "全市场（剔除北交所、ST） · 每日 · 5组 · RankIC · 无运行后中性化",
+      basis_label: "历史回顾研究诊断；累计从实际起日计算，并非实盘收益。",
+    };
+    return HttpResponse.json({ data, serving: metaEnvelope().serving });
+  });
+
 export const manualWatchlistUnavailableHandler = () =>
   http.get("*/api/v1/watchlist", () =>
     HttpResponse.json({
@@ -134,6 +156,7 @@ export const server = setupServer(
   formulaPoolsHandler(),
   factorResultsUnavailableHandler(),
   factorRunUnavailableHandler(),
+  factorTrackingUnavailableHandler(),
   manualWatchlistUnavailableHandler(),
   manualWatchlistExactUnavailableHandler(),
 );

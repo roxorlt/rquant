@@ -19,11 +19,68 @@ export type FactorRunParameters = Schemas["FactorRunParameters"];
 export type FactorRunAvailability = Schemas["FactorRunAvailability"];
 export type FactorRunNeutralizationOption = Schemas["FactorRunNeutralizationOption"];
 export type FactorRunOperationResult = Schemas["FactorRunOperationResult"];
+export type FactorTrackingRequest = Schemas["FactorTrackingRequest"];
+export type FactorTrackingOperationResult = Schemas["FactorTrackingOperationResult"];
+export type FactorTrackingReceipt = Schemas["FactorTrackingReceipt"];
+export type FactorTrackingPanel = Schemas["FactorTrackingPanel"];
+export type FactorTrackingSummary = Schemas["FactorTrackingSummary"];
 type FactorCatalogEnvelope = Schemas["Envelope_FactorCatalogData_"];
 type FactorCapabilitiesEnvelope = Schemas["Envelope_FactorCapabilitiesData_"];
 type FactorResultListEnvelope = Schemas["Envelope_FactorResultListData_"];
 type FactorResultDetailEnvelope = Schemas["Envelope_FactorResultDetailData_"];
 type FactorRunAvailabilityEnvelope = Schemas["Envelope_FactorRunAvailability_"];
+type FactorTrackingEnvelope = Schemas["Envelope_FactorTrackingPanel_"];
+
+export async function postFactorTracking(
+  request: FactorTrackingRequest,
+  action: "set" | "resume" | "retry",
+): Promise<FactorTrackingOperationResult> {
+  const client = apiClient();
+  const options = { body: request, headers: { "X-Rquant-Csrf": "1" } };
+  const result =
+    action === "set"
+      ? await client.POST("/api/v1/factors/tracking/commands", options)
+      : action === "resume"
+        ? await client.POST("/api/v1/factors/tracking/commands/resume", options)
+        : await client.POST("/api/v1/factors/tracking/commands/retry", options);
+  if (result.data === undefined) {
+    throw new ApiError(result.response.status, "跟踪状态暂未确认，请保留本次操作。");
+  }
+  return result.data.data;
+}
+
+export function useFactorTrackingPanel(
+  generationId: string | null | undefined,
+  factorId: string | null,
+  viewer: string | null | undefined,
+  permissionRevision: number,
+): ServingQueryResult<FactorTrackingPanel> {
+  return useServingQuery(
+    ["factors", "tracking", generationId, factorId, viewer, permissionRevision],
+    async (): Promise<FactorTrackingEnvelope> => {
+      const { data, response } = await apiClient().GET("/api/v1/factors/{factor_id}/tracking", {
+        params: {
+          path: { factor_id: factorId ?? "" },
+          query: { generation_id: generationId ?? undefined },
+        },
+      });
+      if (data === undefined) {
+        throw new ApiError(
+          response.status,
+          response.status === 404
+            ? "这个因子的跟踪数据暂时无法查看。"
+            : response.status === 401 || response.status === 403
+              ? "当前账号不能查看跟踪，请刷新后核对权限。"
+              : "跟踪数据暂时无法核对，请刷新后查看。",
+        );
+      }
+      return data;
+    },
+    {
+      enabled: typeof generationId === "string" && factorId !== null && typeof viewer === "string",
+    },
+  );
+}
 
 export async function postFactorRun(
   request: FactorRunRequest,

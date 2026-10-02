@@ -9,6 +9,23 @@
 .factor-layout > * {
   min-width: 0;
 }
+.factor-tracking-anchor {
+  min-width: 0;
+  scroll-margin-top: 20px;
+}
+.factor-tracking-anchor:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+  border-radius: 6px;
+}
+.factor-tracking-body {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+.factor-tracking-body .hint {
+  margin: 0;
+}
 .factor-main,
 .factor-sidebar,
 .factor-research {
