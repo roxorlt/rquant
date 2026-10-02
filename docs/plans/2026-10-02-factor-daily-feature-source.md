@@ -100,3 +100,11 @@ root 在干净 `93f82954fbab7ea2a5267cd758917abc8d01e375` 交FE前授权单一�
 完整浏览器原命令119passed/2failed/4skipped：新增取消夹具立即换代碰到旧代在途查询；首次定向又因响应定位漏 `/app/` 前缀失败，均保留原件与 trace。仅改该合成夹具为 applied 等待同步、旧查询完成后显式发布并刷新，保持原请求和精确代断言；最终桌面1440/390触屏2passed，unique有效121、原配置4skipped不计通过。测试类型/格式直接验证 exit0，生产源码/dist 未再变更，复用仍有效644/API/build/size/dist，不再完整重跑。最终四张编辑/结果截图已实际目视，路径/SHA 见 `screenshots.json`。
 
 所有自有命令退出，18817/14217释放，临时 proxy proof已删除，借用 node_modules保留。普通删除自有 API basetemp `rqdy-api-dmbjppvc` 与 `browser-serving` 遭封存只读夹具 PermissionError；准确路径、创建归属与保留原因见 `resources.json`，未改保护或其他目录。日志/XML/截图/合成原件保留供唯一集中审查。此证据不代表真实材料、32日worker、全市场生产口径或生产上线；接受后真实只读验收仍由 root 完成。
+
+## Root 清单与联合审查冻结（2026-10-03，追加）
+
+前后端均已提交并停止写入，frontend候选 `4d882f4cd1716802899c514694a27d771fd255fd` clean。root逐文件核对54项frontend SHA、28份实际命令日志及11份JUnit原件；失败/定向修复记录保留，unique浏览器有效121与原4跳过不相加重复。四张截图已实际查看，首56行冻结SHA保持不变。后台20项Python源/测试未被frontend修改。
+
+正常隔离收集 exit0（Python3.13.12，8.119s），清单从19,081增加22个精确新节点至19,103；旧节点零移除、零重复，55项既定skip原字节不变。新逻辑摘要 `40deb84aa5071e4d5079d94204b8fb72a95e015d9d7223b64e626838be943eca`。只更新清单及测试说明/精确计数；两项仓库清单门禁实际2passed、exit0、8.381s，没有执行19,103项全量套件。证据根 `/private/tmp/rquant-factor-tracking-root-yegakn31/daily-feature-manifest-proof`，正常collect/比较/install/两门禁的原日志、XML和SHA收据保留。
+
+最终候选包含前后端、必要生成物和本次清单，唯一原生reviewer `/root/factor_security_collection_final_review` 只审精确diff、直接依赖、上述验收与有效原件；普通任务最多一次原作者定向修复、原审查者复核。真实32日逐值及worker验收留给接受后的root。全量生产覆盖、指标初始化核验和持续跟踪仍列后续，不把本片单次检验等同于整体验收。
