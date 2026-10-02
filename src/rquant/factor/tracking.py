@@ -500,7 +500,7 @@ class FactorTrackingStore:
 
         with self._connection(expected_identity) as connection:
             state = self._state(connection, factor_id)
-            return () if state is None else _days(self, connection, state.segment_id)
+            return () if state is None else _days(self, connection, state)
 
     def _lookup(
         self, connection: sqlite3.Connection, request: FactorTrackingRequest, actor_id: str

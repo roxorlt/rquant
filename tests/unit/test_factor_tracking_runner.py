@@ -545,3 +545,168 @@ def test_tracking_natural_configuration_tail_finishes_before_cursor_commit(
         and store.get("tracked", expected_identity=identity).cursor is None
     )
     assert not store.days("tracked", expected_identity=identity)
+
+
+@pytest.mark.parametrize("boundary", ("reserve", "commit"))
+def test_tracking_paused_revision_fences_inflight_old_runner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, boundary: str
+) -> None:
+    import duckdb
+
+    import rquant.factor.tracking_runner as module
+    from rquant.factor.tracking import FactorTrackingConflict
+    from tests.unit.test_factor_source_prepare import _FIRST, _sidecar
+
+    sources = _sources(tmp_path)
+    first = _generation(tmp_path, sources, days=23)
+    store, identity = _joined(tmp_path, sources[2])
+    baseline_runner = module.FactorTrackingRunner(sources[1], first, identity, clock=lambda: _AT)
+    assert (
+        baseline_runner.run_history("tracked", target_end=_FIRST + timedelta(days=20)).status
+        == "updated"
+    )
+    before = store.get("tracked", expected_identity=identity)
+    old_days = store.days("tracked", expected_identity=identity)
+    clean = _generation(tmp_path, sources, days=34)
+    with duckdb.connect(str(sources[0])) as connection:
+        connection.execute(
+            "UPDATE daily_bar SET close=99. WHERE ts_code='000001.SZ' AND trade_date=?", [_FIRST]
+        )
+    _sidecar(sources[0])
+    revised = _generation(tmp_path, sources, days=34)
+    old = module.FactorTrackingRunner(sources[1], clean, identity, clock=lambda: _AT)
+    new = module.FactorTrackingRunner(sources[1], revised, identity, clock=lambda: _AT)
+    prepare, commit = old._prepare, old._commit
+
+    def prepared(state: object, target: object) -> object:
+        proposed = prepare(state, target)
+        assert proposed is not None
+        if boundary == "reserve":
+            assert new.run_history("tracked", target_end=target).status == "paused"
+        else:
+            with pytest.raises(FactorTrackingConflict):
+                new._prepare(state, target)
+        return proposed
+
+    def committing(*args: object) -> None:
+        assert new._message(before, paused=True, reason="历史因果输入已修订。").status == "paused"
+        commit(*args)
+
+    monkeypatch.setattr(old, "_prepare", prepared)
+    if boundary == "commit":
+        monkeypatch.setattr(old, "_commit", committing)
+    outcome = old.run_history("tracked", target_end=_FIRST + timedelta(days=31))
+    current = store.get("tracked", expected_identity=identity)
+    assert outcome.status == current.status == "paused"
+    assert current.cursor == before.cursor and current.generation == before.generation
+    assert store.days("tracked", expected_identity=identity) == old_days
+    reason = current.reason
+    assert old._message(before, paused=False, reason="旧运行等待。").status == "paused"
+    assert store.get("tracked", expected_identity=identity).reason == reason
+    assert not list((tmp_path / "lake").glob(".execution_sessions/*"))
+
+
+def test_tracking_missing_middle_contribution_rejects_projection_and_atomic_append(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sqlite3
+
+    from rquant.factor.tracking import FactorTrackingIntegrityError
+    from rquant.factor.tracking_runner import FactorTrackingRunner
+    from rquant.factor.tracking_serving import project_factor_tracking_snapshot
+    from tests.unit.test_factor_source_prepare import _FIRST
+
+    sources = _sources(tmp_path)
+    reference = _generation(tmp_path, sources, days=34)
+    store, identity = _joined(tmp_path, sources[2])
+    runner = FactorTrackingRunner(sources[1], reference, identity, clock=lambda: _AT)
+    assert runner.run_history("tracked", target_end=_FIRST + timedelta(days=31)).status == "updated"
+    before = store.get("tracked", expected_identity=identity)
+    days = store.days("tracked", expected_identity=identity)
+    assert len(days) == 29 and days[-2].trade_date not in (before.start_date, before.cursor)
+    commit = runner._commit
+
+    def missing(*args: object) -> None:
+        with sqlite3.connect(store.path) as connection:
+            connection.execute(
+                "DELETE FROM tracking_days WHERE segment_id=? AND trade_date=?",
+                (before.segment_id, days[-2].trade_date.isoformat()),
+            )
+        commit(*args)
+
+    monkeypatch.setattr(runner, "_commit", missing)
+    assert runner.run_history("tracked", target_end=_FIRST + timedelta(days=32)).status == "waiting"
+    current = store.get("tracked", expected_identity=identity)
+    assert current.cursor == before.cursor and current.start_date == before.start_date
+    with pytest.raises(FactorTrackingIntegrityError):
+        store.days("tracked", expected_identity=identity)
+    with pytest.raises(FactorTrackingIntegrityError):
+        project_factor_tracking_snapshot(identity, registry_identity=sources[2], available_at=_AT)
+    assert runner.run_history("tracked", target_end=_FIRST + timedelta(days=32)).status == "waiting"
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute("SELECT count(*) FROM tracking_days").fetchone()[0] == 28
+    assert not list((tmp_path / "lake").glob(".execution_sessions/*"))
+
+
+def test_tracking_real_registry_inode_tail_rolls_back_and_retains_head_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import shutil
+    import sqlite3
+
+    from rquant.factor.tracking_runner import FactorTrackingRunner
+    from tests.unit.test_factor_source_prepare import _FIRST
+
+    sources = _sources(tmp_path)
+    reference = _generation(tmp_path, sources, days=23)
+    store, identity = _joined(tmp_path, sources[2])
+    runner = FactorTrackingRunner(sources[1], reference, identity, clock=lambda: _AT)
+    registry_path = Path(sources[2].path)
+    original_path = registry_path.with_name("registry-original.sqlite")
+    save, check = runner.store._save_state, runner.store._check
+    replaced, recovering, lock_checked = False, False, False
+
+    def replace(connection: object, state: object) -> None:
+        nonlocal replaced
+        save(connection, state)
+        if state.cursor is not None and not replaced:
+            registry_path.rename(original_path)
+            shutil.copy2(original_path, registry_path)
+            assert registry_path.read_bytes() == original_path.read_bytes()
+            assert registry_path.stat().st_ino != original_path.stat().st_ino
+            replaced = True
+
+    def checked(connection: object, expected: object) -> None:
+        nonlocal lock_checked
+        check(connection, expected)
+        current = runner.store._state(connection, "tracked")
+        if recovering and current.cursor is not None:
+            writer = sqlite3.connect(
+                f"{registry_path.as_uri()}?mode=rw", uri=True, timeout=0, isolation_level=None
+            )
+            try:
+                writer.execute("BEGIN IMMEDIATE")
+                writer.execute("UPDATE factor_heads SET archived=1 WHERE factor_id='tracked'")
+                with pytest.raises(sqlite3.OperationalError, match="locked"):
+                    writer.execute("COMMIT")
+                lock_checked = True
+            finally:
+                if writer.in_transaction:
+                    writer.execute("ROLLBACK")
+                writer.close()
+
+    monkeypatch.setattr(runner.store, "_save_state", replace)
+    monkeypatch.setattr(runner.store, "_check", checked)
+    try:
+        outcome = runner.run_history("tracked", target_end=_FIRST + timedelta(days=20))
+        assert replaced and outcome.status == "waiting"
+        assert store.get("tracked", expected_identity=identity).cursor is None
+        assert not store.days("tracked", expected_identity=identity)
+    finally:
+        if replaced:
+            registry_path.unlink()
+            original_path.rename(registry_path)
+    recovering = True
+    assert runner.run_history("tracked", target_end=_FIRST + timedelta(days=20)).status == "updated"
+    assert lock_checked and len(store.days("tracked", expected_identity=identity)) == 18
+    assert not list((tmp_path / "lake").glob(".execution_sessions/*"))

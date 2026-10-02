@@ -51,6 +51,7 @@ from rquant.factor.tracking import (
     FactorTrackingState,
     FactorTrackingStore,
 )
+from rquant.factor.tracking_serving import _days
 from rquant.factor.universe import select_factor_universe
 from rquant.runtime_contracts import AwareUtcDatetime, canonical_sha256
 
@@ -339,19 +340,18 @@ class FactorTrackingRunner:
     ) -> FactorTrackingRunOutcome:
         with self.store._connection(self.identity, write=True) as connection:
             current = self.store._state(connection, state.factor_id)
-            if (
-                current is not None
-                and current.generation == state.generation
-                and current.tracked
-                and current.cursor == state.cursor
-                and (current.status != "paused" or paused)
-            ):
-                self.store._save_state(
-                    connection,
-                    current.model_copy(
-                        update={"status": "paused" if paused else "waiting", "reason": reason}
-                    ),
-                )
+            if current is not None and current.generation == state.generation and current.tracked:
+                if current.status == "paused":
+                    return FactorTrackingRunOutcome(
+                        factor_id=state.factor_id, status="paused", reason=current.reason
+                    )
+                if current.cursor == state.cursor:
+                    self.store._save_state(
+                        connection,
+                        current.model_copy(
+                            update={"status": "paused" if paused else "waiting", "reason": reason}
+                        ),
+                    )
         return FactorTrackingRunOutcome(
             factor_id=state.factor_id, status="paused" if paused else "waiting", reason=reason
         )
@@ -476,8 +476,10 @@ class FactorTrackingRunner:
                 or current.generation != state.generation
                 or not current.tracked
                 or current.cursor != state.cursor
+                or current.status == "paused"
             ):
                 raise FactorTrackingConflict("tracking generation changed before reservation")
+            _days(self.store, connection, current)
             previous = _last_run(self.store, connection, state.segment_id)
             if previous is not None and previous.status == "planned":
                 return previous
@@ -500,45 +502,61 @@ class FactorTrackingRunner:
         if tuple(day.trade_date for day in days) != run.plan.spec.adapter_request.evaluation_days:
             raise ValueError("tracking verified result schedule differs")
         registry = FactorDefinitionRegistry(Path(state.registry_identity.path))
-        with (
-            registry._reader(state.registry_identity) as definitions,
-            self.store._connection(self.identity, write=True) as connection,
-        ):
-            head, _ = registry._load_factor(definitions, state.factor_id)
-            current = self.store._state(connection, state.factor_id)
-            if (
-                current is None
-                or not current.tracked
-                or current.generation != run.segment_id
-                or head is None
-                or head.archived
-                or FactorHeadRef(version=head.version, content_sha256=head.content_sha256)
-                != state.head
-            ):
-                raise FactorTrackingConflict(
-                    "tracking generation or definition changed before commit"
-                )
-            stored = _last_run(self.store, connection, state.segment_id)
-            if stored is not None and stored.run_id == run.run_id and stored.status == "committed":
-                return
-            if stored != run or current.cursor != run.original_cursor:
-                raise FactorTrackingConflict("tracking cursor changed before commit")
-            job = ledger.get(job_id)
-            if job is None or job.status != "succeeded" or job.spec != run.plan.spec:
-                raise ValueError("tracking ledger is not completely successful")
-            for item in verified.witnesses:
-                item.recheck()
-            witness.recheck()
-            for day in days:
-                payload = _canonical_model_json(day)
+        with ExitStack() as registry_readers:
+            definitions = registry_readers.enter_context(registry._reader(state.registry_identity))
+            with self.store._connection(self.identity, write=True) as connection:
+                # Finish the natural reader tail while rollback is possible, retaining its
+                # SQLite read lock in this transaction until the tracking effect commits.
                 connection.execute(
-                    "INSERT INTO tracking_days VALUES (?, ?, ?, ?)",
-                    (run.segment_id, day.trade_date.isoformat(), payload, _sha256(payload)),
+                    "ATTACH DATABASE ? AS tracking_registry_guard",
+                    (f"{registry.path.as_uri()}?mode=ro",),
                 )
-            at = self.clock()
-            self.store._save_state(
-                connection,
-                current.model_copy(
+                guard = connection.execute(
+                    "SELECT instance_id FROM tracking_registry_guard.factor_registry_identity "
+                    "WHERE singleton=1"
+                ).fetchone()
+                if guard is None or guard[0] != state.registry_identity.instance_id:
+                    raise FactorTrackingIntegrityError("tracking registry guard identity differs")
+                head, _ = registry._load_factor(definitions, state.factor_id)
+                current = self.store._state(connection, state.factor_id)
+                if (
+                    current is None
+                    or not current.tracked
+                    or current.generation != run.segment_id
+                    or current.status == "paused"
+                    or head is None
+                    or head.archived
+                    or FactorHeadRef(version=head.version, content_sha256=head.content_sha256)
+                    != state.head
+                ):
+                    raise FactorTrackingConflict(
+                        "tracking generation or definition changed before commit"
+                    )
+                _days(self.store, connection, current)
+                stored = _last_run(self.store, connection, state.segment_id)
+                if (
+                    stored is not None
+                    and stored.run_id == run.run_id
+                    and stored.status == "committed"
+                ):
+                    registry_readers.close()
+                    return
+                if stored != run or current.cursor != run.original_cursor:
+                    raise FactorTrackingConflict("tracking cursor changed before commit")
+                job = ledger.get(job_id)
+                if job is None or job.status != "succeeded" or job.spec != run.plan.spec:
+                    raise ValueError("tracking ledger is not completely successful")
+                for item in verified.witnesses:
+                    item.recheck()
+                witness.recheck()
+                for day in days:
+                    payload = _canonical_model_json(day)
+                    connection.execute(
+                        "INSERT INTO tracking_days VALUES (?, ?, ?, ?)",
+                        (run.segment_id, day.trade_date.isoformat(), payload, _sha256(payload)),
+                    )
+                at = self.clock()
+                updated = current.model_copy(
                     update={
                         "cursor": days[-1].trade_date,
                         "start_date": current.start_date or days[0].trade_date,
@@ -546,16 +564,21 @@ class FactorTrackingRunner:
                         "status": "active",
                         "reason": None,
                     }
-                ),
-            )
-            _save_run(
-                self.store,
-                connection,
-                run.model_copy(update={"status": "committed", "committed_at": at}),
-            )
-            witness.recheck()
-            for item in verified.witnesses:
-                item.recheck()
+                )
+                self.store._save_state(
+                    connection,
+                    updated,
+                )
+                _save_run(
+                    self.store,
+                    connection,
+                    run.model_copy(update={"status": "committed", "committed_at": at}),
+                )
+                _days(self.store, connection, updated)
+                witness.recheck()
+                for item in verified.witnesses:
+                    item.recheck()
+                registry_readers.close()
 
     def run_history(
         self, factor_id: str, *, target_end: date | None = None
@@ -572,6 +595,7 @@ class FactorTrackingRunner:
         try:
             self._head(state)
             with self.store._connection(self.identity) as connection:
+                _days(self.store, connection, state)
                 pending = _last_run(self.store, connection, state.segment_id)
             if pending is None or pending.status != "planned":
                 proposed = self._prepare(state, target_end)

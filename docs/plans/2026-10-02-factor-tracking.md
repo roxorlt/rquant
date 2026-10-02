@@ -73,3 +73,13 @@ root在唯一集中终审accept后，复用现有真实原件及只读副本做�
 - `resources.json` 明确保留约305MiB自有合成夹具/日志供唯一终审；所有自有 tool/子进程命令已结束，两条 UDS 的 shutdown/join/server_close/unlink、并发 executor 退出有有效断言，本树临时 Web 私有证明目录已删除，证据根未留 socket。尝试 `/bin/ps` 被 sandbox 拒绝，`final-evidence` exit1 保留，不作 OS 整体零进程声明；按 root 指示不追加枚举/权限尝试，`final-evidence-corrected` exit0 保存现有资源收据。未启动常驻调度器或生产服务。
 - 显式 `python -m rquant.factor.tracking_entry` 提供 initialize/run-history/due/schedule/snapshot/serve；可信新 sealed reference 显式更换，pending 原 run 仍使用原 reference。历史 run 不伪造当前时钟；18:40 due 需实际当日 SSE/成熟就绪，过旧 calendar 进入真实 waiting。当前段固定代码域，代码域变化或全因果前缀超过原1024计算日预算时暂停/重新加入，不混接或隐式扩容；7000代码、单日500查询预算保持。
 - 本候选只完成后台停止点；真实32日验收、前端组合 API/Web/build/dist/浏览器/清单门禁及唯一集中终审由 root 后续执行，尚未据合成证据宣称真实长期来源/正式18:40服务或整个 M3 完成。未改采集器、旧计算数学、依赖、生成合同/前端、测试清单或生产/部署。
+
+## 实施证据：FT-FINAL 第1轮定向修复候选
+
+- 原作者身份/角色/父任务不变；写前实际核对本树分支及 clean HEAD `a6562da5cb2ae1c16b0290e3b57aefc323c3c371`。证据根 `/private/tmp/rquant-tracking-repair-1-c7tEmVgk` 的 `identity.json` 保留原集中报告 SHA `aa3836b30a91f25a66e044a15a9618e1e410e02407d1864f472e35ac5e1b3a4a`、两原反例/JSON 的来源与摘要；没有改动原55行冻结范围。以下为同一第1/3轮修复，待原审查者仅复核01/02/03。
+- FT-FINAL-01：在原子 reserve/commit 核对当前 paused；旧 `_message` 返回并保留已有暂停/原因。确定性交错中 A 完成旧配置 prepare 后，B 实际读到已修订前缀并持久化暂停；预留和提交两个边界均拒绝 A 继续推进原段。
+- FT-FINAL-02：统一可信贡献读取按同段、同定义/registry 的 committed `tracking_runs.plan.spec.adapter_request.evaluation_days` 和原游标链核对准确日期网格；Store/Serving 读取及推进前后均核验，缺失非首尾日期拒绝，不用旧日期补20/5日，不更改IC/分组/收益数学。新增反例在完整worker核验后、贡献事务前实际删除中间行，调用不推进游标，后续读取/投影均拒绝。
+- FT-FINAL-03：原 registry reader 的自然退出位于 tracking 事务仍可回滚的区域；同一事务临时以 `mode=ro` ATTACH 读取原 registry，保留 SQLite 读锁直至 tracking COMMIT/ROLLBACK，未改两库 schema、registry 源码或公共DTO。真实私有 registry rename＋同字节新 inode 替换触发原自然身份检查，贡献/游标回滚；恢复原 inode 后续原 job 成功，提交前另一真实 SQLite 写者的 COMMIT 被读锁拒绝。
+- 四个新增 testcase 在 `focused-red.xml` 实际4 failed/10.30s；`focused-green-corrected.xml` 实际4 passed/9.82s、实耗10.3274874169s、exit0。首个 green/格式命令因本地嵌套缩进编辑错误失败，原日志/XML保留；只修正该编辑错误，未放宽反例/校验。十个精确直接旧节点（增量黄金、暂停、原任务恢复、取消重加、来源/完成/自然配置尾部、中断、并发预留、私有至Serving链）在 `direct-regression.xml` 实际10 passed/16.56s、实耗17.1142381660s、exit0；没有重跑BE/API/浏览器全套。
+- 指定只读 Python3.13.12、清洁禁dotenv dummy环境；最终源码 Ruff/format/diff 与3.11 grammar证据及五文件 SHA 另存本轮证据。实际 `python -m rquant.cli web-openapi` exit0，完整原公开 schema 摘要仍为 `bd5ec989b1da2131097928ccf69e09d9ab0c5b32b6cc85d7805fa1aa4ea331ff`。本轮新增nodeids和直接旧去重、各真实命令结果由证据原件列明，root负责组合清单。
+- 自有同步命令已结束；原私有UDS链shutdown/join/unlink以及各测试执行副本归零断言有效，真实SQLite竞争写者rollback/close，原registry reader/附属读锁随本事务退出释放。自有合成夹具与失败日志保留供定向复核，不枚举OS整体进程、不清理他人目录。未访问网络、.env、凭据、真实数据或生产，未委派/安装/合并/推送/部署；真实32日验收仍由root在阻断关闭后执行。

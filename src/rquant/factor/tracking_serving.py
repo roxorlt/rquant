@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
@@ -17,6 +18,7 @@ from rquant.factor.tracking import (
     FactorTrackingIdentity,
     FactorTrackingIntegrityError,
     FactorTrackingPanel,
+    FactorTrackingState,
     FactorTrackingStore,
     summarize_factor_tracking,
 )
@@ -48,13 +50,45 @@ class FactorTrackingServingSnapshot(BaseModel):
 
 
 def _days(
-    store: FactorTrackingStore, connection: object, segment_id: str | None
+    store: FactorTrackingStore, connection: sqlite3.Connection, state: FactorTrackingState
 ) -> tuple[FactorTrackingDay, ...]:
-    if segment_id is None:
+    if state.segment_id is None:
         return ()
+    from rquant.factor.tracking_runner import _run_row
+
+    expected = []
+    pending = False
+    for index, row in enumerate(
+        connection.execute(
+            "SELECT * FROM tracking_runs WHERE segment_id=? ORDER BY rowid LIMIT ?",
+            (state.segment_id, MAX_TRACKING_DAYS + 1),
+        )
+    ):
+        if index >= MAX_TRACKING_DAYS:
+            raise FactorTrackingIntegrityError("tracking run history exceeds its capacity")
+        run = _run_row(store, row)
+        if (
+            run.factor_id != state.factor_id
+            or run.plan.registry_identity != state.registry_identity
+            or run.plan.request.parameters.expected_head != state.head
+            or pending
+            or run.original_cursor != (expected[-1] if expected else None)
+        ):
+            raise FactorTrackingIntegrityError("tracking committed run chain differs")
+        if run.status == "planned":
+            pending = True
+            continue
+        dates = run.plan.spec.adapter_request.evaluation_days
+        if (
+            not dates
+            or (expected and dates[0] <= expected[-1])
+            or len(expected) + len(dates) > MAX_TRACKING_DAYS
+        ):
+            raise FactorTrackingIntegrityError("tracking committed date grid is invalid")
+        expected.extend(dates)
     rows = connection.execute(
         "SELECT * FROM tracking_days WHERE segment_id=? ORDER BY trade_date LIMIT ?",
-        (segment_id, MAX_TRACKING_DAYS + 1),
+        (state.segment_id, MAX_TRACKING_DAYS + 1),
     ).fetchall()
     if len(rows) > MAX_TRACKING_DAYS:
         raise FactorTrackingIntegrityError("tracking history exceeds its capacity")
@@ -64,6 +98,14 @@ def _days(
         if day.trade_date.isoformat() != row["trade_date"]:
             raise FactorTrackingIntegrityError("tracking contribution date differs")
         result.append(day)
+    if tuple(day.trade_date for day in result) != tuple(expected) or (
+        state.start_date,
+        state.cursor,
+    ) != (
+        expected[0] if expected else None,
+        expected[-1] if expected else None,
+    ):
+        raise FactorTrackingIntegrityError("tracking contributions differ from committed date grid")
     return tuple(result)
 
 
@@ -98,12 +140,7 @@ def project_factor_tracking_snapshot(
                 or FactorHeadRef(version=current.version, content_sha256=current.content_sha256)
                 != state.head
             )
-            days = _days(store, connection, state.segment_id)
-            if (state.cursor is None) != (not days) or (
-                days
-                and (days[0].trade_date != state.start_date or days[-1].trade_date != state.cursor)
-            ):
-                raise ValueError("tracking contributions differ from atomic cursor")
+            days = _days(store, connection, state)
             panels.append(
                 FactorTrackingPanel(
                     factor_id=state.factor_id,
