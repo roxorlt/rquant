@@ -25,7 +25,7 @@ class DailyFactorField(BaseModel):
     value_semantics: Literal["stored_not_recomputed"] | None = Field(
         default=None, exclude_if=lambda v: v is None
     )
-    tracking_supported: Literal[False] | None = Field(default=None, exclude_if=lambda v: v is None)
+    tracking_supported: bool | None = Field(default=None, exclude_if=lambda v: v is None)
     tracking_unavailable_reason_zh: str | None = Field(
         default=None, min_length=1, max_length=120, exclude_if=lambda v: v is None
     )
@@ -160,8 +160,7 @@ def historical_daily_capabilities(
                 description_zh=f.description_zh,
                 unit=f.unit,
                 value_semantics="stored_not_recomputed",
-                tracking_supported=False,
-                tracking_unavailable_reason_zh="库存日线字段暂不支持持续跟踪。",
+                tracking_supported=True,
             )
             for f in STORED_DAILY_FIELDS
         )

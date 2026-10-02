@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo
 from loguru import logger
 from pydantic import BaseModel, Field, model_validator
 
+from rquant.factor.daily_feature_source import open_factor_daily_feature_source
 from rquant.factor.job_worker import run_one_factor_job
 from rquant.factor.member_archive import load_factor_member_archive
 from rquant.factor.member_stream import open_factor_member_stream
@@ -139,6 +140,11 @@ def _input_files(
         ):
             if source is not None:
                 paths.append(config.lake_root / source.artifact.relative_path)
+    if spec.adapter_request.daily_feature_source is not None:
+        paths.extend(
+            config.lake_root / table.artifact.relative_path
+            for table in spec.adapter_request.daily_feature_source.tables
+        )
     return tuple(paths)
 
 
@@ -147,6 +153,13 @@ def read_factor_tracking_prefix(
 ) -> tuple[tuple[FactorTrackingPrefixDay, ...], _InputWitness]:
     """Read one day and <=500 codes per raw query, without evaluating historical formulas."""
     request, config = spec.adapter_request, loaded.configuration
+    if request.daily_feature_source is not None:
+        if (
+            request.daily_feature_source != loaded.daily_features
+            or spec.daily_feature_lake_root != config.lake_root
+        ):
+            raise ValueError("tracking stored source differs from original configuration")
+        request.daily_feature_source.require_prepared(loaded.source)
     witness = _InputWitness(
         tuple((path, _input_identity(path)) for path in _input_files(loaded, spec))
     )
@@ -167,12 +180,22 @@ def read_factor_tracking_prefix(
                 open_factor_neutralization_context(request.context, lake_root=config.lake_root)
             )
         )
+        stored = (
+            None
+            if request.daily_feature_source is None
+            else stack.enter_context(
+                open_factor_daily_feature_source(
+                    request.daily_feature_source, lake_root=config.lake_root
+                )
+            )
+        )
         adapter = FactorStreamAdapter(
             request,
             lease=lease,
             decision=decision,
             universe_requests=members,
             context_lease=context,
+            daily_feature_lease=stored,
         )
         stack.callback(adapter.close)
         for batch in adapter:
@@ -208,6 +231,24 @@ def read_factor_tracking_prefix(
                 bars,
                 adjustments,
             )
+            if batch.daily_features is not None:
+                original = batch.daily_features
+                semantic += (
+                    (
+                        "stored-daily-fields-v1",
+                        tuple(field.column for field in original.sources.fields),
+                        original.trade_date,
+                        original.panel_date,
+                        tuple(
+                            (
+                                row.stock_code,
+                                tuple((v.status, v.value, v.non_finite_value) for v in row.values),
+                            )
+                            for row in original.rows
+                        ),
+                    ),
+                )
+                del original
             result.append(
                 FactorTrackingPrefixDay(trade_date=day, sha256=canonical_sha256(semantic))
             )
@@ -632,15 +673,25 @@ class FactorTrackingRunner:
                     return self._message(
                         state, paused=False, reason="原跟踪任务尚未完整成功，保留已有历史。"
                     )
+                stored_fields = pending.prefix_spec.adapter_request.daily_feature_source is not None
+                if stored_fields:
+                    # The stored reader removes its private copy before the artifact root
+                    # witness freezes the directory identity for the original commit.
+                    final_prefix, witness = read_factor_tracking_prefix(loaded, pending.prefix_spec)
+                    if final_prefix != pending.prefix:
+                        raise FactorTrackingConflict("tracking causal prefix changed after worker")
                 verified = verify_factor_stream_artifacts(
                     pending.plan.spec,
                     job.completion,
                     loaded.configuration.artifact_root,
                     loaded.configuration.member_root,
                 )
-                final_prefix, witness = read_factor_tracking_prefix(loaded, pending.prefix_spec)
-                if final_prefix != pending.prefix:
-                    raise FactorTrackingConflict("tracking causal prefix changed after worker")
+                if stored_fields:
+                    witness.recheck()
+                else:
+                    final_prefix, witness = read_factor_tracking_prefix(loaded, pending.prefix_spec)
+                    if final_prefix != pending.prefix:
+                        raise FactorTrackingConflict("tracking causal prefix changed after worker")
                 loaded.recheck()
             # Finish all source contexts before the atomic effect; recheck witnesses in the writer.
             self._commit(state, pending, verified, witness, ledger, job.job_id)

@@ -34,3 +34,13 @@ backend：tracking_runner.py、tracking_backend.py、capability.py，新增直�
 ## 后续
 
 本片接受后继续库存指标全市场生产口径与递归历史初始化、已有选股日线特征、分钟/竞价/温度/VP、CSI完整历史、正式数据/配置/18:40与生产UI验收。M3仍部分，整体goal active；生产部署/切流/停Streamlit按已有单独授权规则。
+
+## backend 实施与证据（2026-10-03）
+
+- 实际原生 implementer `/root/factor_security_collection_impl`，父 `/root`；本树/分支起点 `9197abd1acec5ced495dac7c30b16e4befdea049` clean，产品 Codex desktop。身份、源码导入和环境回执在 `/private/tmp/rquant-stored-tracking-implementation-hy_tbd2h/identity.json`。首36行SHA仍为 `1bdb4a5b0b88bc49c52fabae0eeb432d43c4a604879d9c0aa9f9ce2e0317b058`。
+- 写集仅三项 factor 模块、`test_factor_stored_tracking.py`、直接受影响的 `test_factor_daily_feature_pipeline.py` 及本附录。实际依赖才打开配对库存 reader/双表 witness；prefix 附加有序列名、trade/panel、code、status/value/nonfinite。来源代、路径、文案和receipt SHA不进入逻辑事实。cap 的 `tracking_supported` 支持 bool，可信已载来源16字段为true；缺来源/缺原件在开始前拒绝，取消不打开新reader；旧六字段省略此元数据。
+- `initial-red.xml` 两项实际红测：旧开始守卫及 prefix 缺 reader。`initial-green.xml` 为1失败1通过；worker已成功但追加拒绝，原因是 final-prefix 新reader清理私有目录改变 lake mtime，晚于原件 witness 冻结。root批准仅新字段分支先读/关闭/比对 final-prefix，再 verify 原件并 recheck witness/loaded；旧分支顺序不变。`_reserve`/`_commit` AST与基准相同，不修改共享 witness、事务或恢复。
+- 最终有效节点按 testcase 去重为14新增（13新文件节点+1改名替代）及9旧直接回归；原 `test_tracking_stored_start_is_refused_before_enqueue_but_existing_state_can_cancel` 移除，替代为 `test_tracking_stored_missing_source_is_refused_before_enqueue_but_existing_state_can_cancel`，原因是已有可信来源现在应支持开始，不能保留旧误导验收名。精确nodeids、removed→replacement、逐命令UTC/argv/exit/wall/XML和SHA见私有 `evidence-summary.json` / `new-nodeids.txt` / `old-nodeids.txt`。
+- 有效绿来自 `stored-core-green.xml` 的6个成功case（整命令另1个fixture身份失败，保留原件）、`stored-paths-green.xml` 5 passed/9.52s、`stored-final-paths-green.xml` 3 passed/5.88s 和 `direct-regressions-green.xml` 10 passed/11.44s；重复节点不累加。实际原toggle→首段1日+追加2日→sealed journal手算/独立重放→同源整段daily values/贡献/prefix/Serving摘要一致，重复不追加。四种历史原值/状态修订暂停；同值新代prefix不变；16字段所有状态、SSE休市前日/预热/中间缺行、501码分500+1仅读依赖字段、源自然tail及关闭后verify期间原件变更拒绝且无追加均已验证。
+- `legacy-prefix-proof.json` 用基准实际函数读取同一合成来源，对照当前有/无未用库存配置，旧v1两日prefix精确一致；测试固化实际黄金。Ruff/format check和5文件Python3.11 AST语法通过；最终源码/测试SHA、public shape、自然reader/copy与执行会话清理见 `source-resource-proof.json` / `public-api.json`。格式化/导入排序不改变行为，有效旧来源/统计证据复用，未跑全仓/API/FE门禁。
+- 环境为只读借用 integration Python3.13.12/Pydantic2.13.1/DuckDB1.5.2/pytest9.0.3，显式本树PYTHONPATH，禁dotenv/bytecode、隔离dummy配置和自有TMPDIR。所有命令已退出，reader scratch/执行会话零残留；自有合成资料保留于0700证据根供最终复核。未接触真实资料/网络/生产；FE组合门禁、唯一联合审查和root真实跟踪对照仍待后续完成，未宣称生产上线或整体goal完成。

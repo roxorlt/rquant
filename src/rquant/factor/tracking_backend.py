@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 from pydantic import BaseModel, JsonValue
 
 from rquant.factor.capability import historical_daily_capabilities
+from rquant.factor.daily_feature_source import open_factor_daily_feature_source
 from rquant.factor.registry import FactorDefinitionRegistry, FactorRegistryIdentity
 from rquant.factor.run_configuration import FactorRunFileReference, open_factor_run_configuration
 from rquant.factor.run_request import RUN_IMMUTABLE
@@ -81,12 +82,22 @@ class FactorTrackingPageControlBackend:
             ):
                 raise ValueError("跟踪状态已变化，请刷新")
             if request.tracked:
-                for field in historical_daily_capabilities(daily_features_available=True).fields:
-                    if (
-                        field.tracking_supported is False
-                        and field.column in record.definition.dependency_columns
+                columns = tuple(
+                    field.column
+                    for field in historical_daily_capabilities(daily_features_available=True).fields
+                    if field.value_semantics == "stored_not_recomputed"
+                    and field.column in record.definition.dependency_columns
+                )
+                if columns:
+                    source = loaded.daily_features
+                    if source is None:
+                        raise ValueError("缺少可核验的库存日线事实，暂不能加入跟踪。")
+                    source.require_prepared(loaded.source)
+                    source.select(columns)
+                    with open_factor_daily_feature_source(
+                        source, lake_root=loaded.configuration.lake_root
                     ):
-                        raise ValueError(field.tracking_unavailable_reason_zh)
+                        loaded.recheck()
             loaded.recheck()
             return FrozenFactorTrackingToggle(
                 request=request,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import timedelta
 from pathlib import Path
 
@@ -91,11 +92,8 @@ def test_trusted_catalog_admits_stored_fields_but_keeps_old_draft_bytes() -> Non
     caps = historical_daily_capabilities(daily_features_available=True)
     assert caps.version == "daily_stored_v1" and len(caps.fields) == 22
     stored_fields = caps.fields[len(HISTORICAL_DAILY_V1.fields) :]
-    assert all(field.tracking_supported is False for field in stored_fields)
-    assert all(
-        field.tracking_unavailable_reason_zh == "库存日线字段暂不支持持续跟踪。"
-        for field in stored_fields
-    )
+    assert all(field.tracking_supported is True for field in stored_fields)
+    assert all(field.tracking_unavailable_reason_zh is None for field in stored_fields)
     assert caps.model_dump()["fields"][:6] == HISTORICAL_DAILY_V1.model_dump()["fields"]
     assert len(HISTORICAL_DAILY_V1.fields) == 6 and HISTORICAL_DAILY_V1.version == "daily_v1"
     new = build_draft_definition(draft, authenticated_actor_id="alice", capabilities=caps)
@@ -178,7 +176,11 @@ def test_new_definition_requires_exact_selected_source_and_same_raw_binding(tmp_
 
 
 def _configured(
-    tmp_path: Path, *, expression: str = "ref(ma5, 1) + turnover_rate + close"
+    tmp_path: Path,
+    *,
+    expression: str = "ref(ma5, 1) + turnover_rate + close",
+    count: int = 12,
+    mutate: Callable | None = None,
 ) -> tuple:
     from rquant.factor.job_ledger import FactorEvaluationJobLedger
     from rquant.factor.registry import (
@@ -197,7 +199,7 @@ def _configured(
     from tests.unit.test_factor_member_archive import _private
     from tests.unit.test_factor_member_stream import _archive
 
-    source, prepared, lake = _source(tmp_path, count=12, days=8)
+    source, prepared, lake = _source(tmp_path, count=count, days=8, mutate=mutate)
     request = _request(source, prepared, expression=expression)
     members, archive, request = _archive(tmp_path, request, _pools(request))
     registry = FactorDefinitionRegistry(tmp_path / "registry.sqlite")
@@ -772,16 +774,16 @@ def _tracking_control(tmp_path: Path, *, expression: str, source_present: bool) 
     )
 
 
-def test_tracking_stored_start_is_refused_before_enqueue_but_existing_state_can_cancel(
+def test_tracking_stored_missing_source_is_refused_before_enqueue_but_existing_state_can_cancel(
     tmp_path: Path,
 ) -> None:
-    for source_present in (True, False):
+    for source_present in (False,):
         directory = tmp_path / str(source_present)
         directory.mkdir(mode=0o700)
         service, backend, outbox, store, identity, body = _tracking_control(
             directory, expression="ma5", source_present=source_present
         )
-        with pytest.raises(ValueError, match="库存日线字段暂不支持持续跟踪"):
+        with pytest.raises(ValueError, match="缺少可核验的库存日线事实"):
             service._submit_trusted_factor_tracking(
                 body,
                 authenticated_actor_id="alice",
