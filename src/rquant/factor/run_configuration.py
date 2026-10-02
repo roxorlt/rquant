@@ -11,6 +11,7 @@ from pathlib import Path
 from pydantic import BaseModel, Field, model_validator
 
 from rquant.data_metadata import DatasetSnapshot, DatasetSnapshotBinding
+from rquant.factor.daily_feature_source import FactorDailyFeatureSource
 from rquant.factor.job_ledger import FactorEvaluationJobLedger, FactorLedgerIdentity
 from rquant.factor.member_archive import (
     FactorMemberArchiveReference,
@@ -36,7 +37,7 @@ class FactorRunFileReference(BaseModel):
     model_config = RUN_IMMUTABLE
 
     kind: str = Field(
-        pattern=r"^factor-(prepared-source|run-configuration|neutralization-context)-v1$"
+        pattern=r"^factor-(prepared-source|run-configuration|neutralization-context|daily-feature-source)-v1$"
     )
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     filename: str
@@ -74,6 +75,9 @@ class FactorRunConfiguration(BaseModel):
     neutralization_context: FactorRunFileReference | None = Field(
         default=None, exclude_if=lambda v: v is None
     )
+    daily_feature_source: FactorRunFileReference | None = Field(
+        default=None, exclude_if=lambda v: v is None
+    )
 
     @model_validator(mode="after")
     def _fixed_paths(self) -> FactorRunConfiguration:
@@ -84,6 +88,11 @@ class FactorRunConfiguration(BaseModel):
             and self.neutralization_context.kind != "factor-neutralization-context-v1"
         ):
             raise ValueError("配置缺少中性化上下文包")
+        if (
+            self.daily_feature_source is not None
+            and self.daily_feature_source.kind != "factor-daily-feature-source-v1"
+        ):
+            raise ValueError("配置缺少库存日线事实包")
         for path in (
             self.lake_root,
             self.member_root,
@@ -151,6 +160,17 @@ def save_factor_neutralization_context(
     )
 
 
+def save_factor_daily_feature_source(
+    root: Path, source: FactorDailyFeatureSource
+) -> FactorRunFileReference:
+    return _save(
+        root,
+        FactorDailyFeatureSource.model_validate(source),
+        "factor-daily-feature-source-v1",
+        _MAX_SOURCE_BYTES,
+    )
+
+
 def _load(
     descriptor: int,
     reference: FactorRunFileReference,
@@ -187,11 +207,13 @@ class LoadedFactorRunConfiguration:
         configuration: FactorRunConfiguration,
         source: FactorPreparedStreamSource,
         context: FactorNeutralizationContext | None = None,
+        daily_features: FactorDailyFeatureSource | None = None,
     ) -> None:
         self.root, self.descriptor, self.identities = root, descriptor, identities
         self.configuration, self.source = configuration, source
         self.metadata = PreparedFactorMetadata(source)
         self.context = context
+        self.daily_features = daily_features
 
     def recheck(self) -> None:
         _check_identities(self.root, self.descriptor, self.identities)
@@ -237,6 +259,14 @@ def open_factor_run_configuration(
             assert isinstance(context, FactorNeutralizationContext)
             context.require_prepared(source)
             identities[config.neutralization_context.filename] = identity
+        daily_features = None
+        if config.daily_feature_source is not None:
+            daily_features, identity = _load(
+                descriptor, config.daily_feature_source, FactorDailyFeatureSource, _MAX_SOURCE_BYTES
+            )
+            assert isinstance(daily_features, FactorDailyFeatureSource)
+            daily_features.require_prepared(source)
+            identities[config.daily_feature_source.filename] = identity
         loaded = LoadedFactorRunConfiguration(
             root,
             descriptor,
@@ -244,6 +274,7 @@ def open_factor_run_configuration(
             config,
             source,
             context,
+            daily_features,
         )
         loaded.recheck()
         yield loaded

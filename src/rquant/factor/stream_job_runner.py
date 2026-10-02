@@ -126,6 +126,8 @@ def run_factor_stream_job(
     now: Callable[[], datetime],
 ) -> FactorStreamCompletion:
     spec = FactorStreamJobSpec.model_validate(spec)
+    if spec.daily_feature_lake_root is not None and lake_root != spec.daily_feature_lake_root:
+        raise ValueError("stored daily execution lake differs from frozen original")
     _before_deadline(now, spec.deadline)
     journal = FactorStreamJournalWriter(artifact_root, spec)
     try:

@@ -145,6 +145,22 @@ def compile_factor_run_plan(
         loaded.open_ledger(clock=clock)
         scope = source.admission_request.scope
         params = request.parameters
+        from rquant.factor.capability import HISTORICAL_DAILY_V1
+        from rquant.factor.daily_feature_source import open_factor_daily_feature_source
+
+        stored_columns = tuple(
+            c
+            for c in record.definition.dependency_columns
+            if c not in HISTORICAL_DAILY_V1.feature_catalog().columns
+        )
+        stored_source = loaded.daily_features if stored_columns else None
+        if stored_columns and stored_source is None:
+            raise FactorRunPlanRejectedError(
+                "缺少库存日线事实来源", reason="缺少可核验的库存日线事实，当前检验暂不可用。"
+            )
+        if stored_source is not None:
+            with open_factor_daily_feature_source(stored_source, lake_root=config.lake_root):
+                loaded.recheck()
         needs_industry, needs_cap = neutralization_requirements(
             record.definition, params.neutralization
         )
@@ -257,6 +273,7 @@ def compile_factor_run_plan(
             feature_source_id=source.admission_request.snapshot_id,
             feature_source_sha256=source.admission_request.binding_hash,
             context=None if context is None else context.sources,
+            daily_features=None if stored_source is None else stored_source.select(stored_columns),
         )
         formula = FactorFormulaStreamRequest(
             definition=record.definition,
@@ -282,6 +299,7 @@ def compile_factor_run_plan(
                 evaluation_days=schedule.evaluation_days,
                 holding_sessions=params.holding_sessions,
                 context=context,
+                daily_feature_source=stored_source,
                 extended_statistics=params.extended_statistics,
                 ic_method=params.ic_method if params.extended_statistics else None,
             ),
@@ -289,6 +307,7 @@ def compile_factor_run_plan(
             definition_content_sha256=record.content_sha256,
             deadline=max(clock().astimezone(UTC), scope.as_of_time)
             + timedelta(seconds=config.deadline_seconds),
+            daily_feature_lake_root=config.lake_root if stored_source is not None else None,
         )
         loaded.recheck()
         if (

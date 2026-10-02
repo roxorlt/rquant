@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import re
 from collections.abc import Iterator
+from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import date
 from math import fsum
@@ -18,6 +19,12 @@ from typing import Literal
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
+from rquant.factor.daily_feature_source import (
+    FactorDailyFeatureCounts,
+    FactorDailyFeatureSources,
+    open_factor_daily_feature_source,
+    read_factor_daily_feature_input,
+)
 from rquant.factor.daily_stream import (
     FactorDailyStreamBatch,
     FactorDailyStreamCoverage,
@@ -152,6 +159,23 @@ class FactorStreamDisplayCoverageDay(BaseModel):
     coverage: FactorDailyStreamCoverage
 
 
+class FactorDailyFeatureCoverageDay(BaseModel):
+    model_config = _IMMUTABLE
+    trade_date: date
+    panel_date: date
+    computation_stock_count: int = Field(ge=1, le=7000)
+    counts: tuple[FactorDailyFeatureCounts, ...] = Field(min_length=1, max_length=16)
+
+    @model_validator(mode="after")
+    def _grid(self) -> FactorDailyFeatureCoverageDay:
+        if self.panel_date >= self.trade_date or any(
+            c.valid + c.missing + c.null + c.non_finite != self.computation_stock_count
+            for c in self.counts
+        ):
+            raise ValueError("display stored daily coverage differs from code grid")
+        return self
+
+
 class FactorStreamDisplayArtifact(BaseModel):
     """Scalar diagnostics only; groups contain no synthetic dense holdings."""
 
@@ -188,6 +212,12 @@ class FactorStreamDisplayArtifact(BaseModel):
     extended_statistics: FactorExtendedStatistics | None = Field(
         default=None, exclude_if=lambda v: v is None
     )
+    daily_features: FactorDailyFeatureSources | None = Field(
+        default=None, exclude_if=lambda v: v is None
+    )
+    daily_feature_coverage_days: tuple[FactorDailyFeatureCoverageDay, ...] | None = Field(
+        default=None, min_length=1, max_length=1024, exclude_if=lambda v: v is None
+    )
     pool_label: Literal["全市场（沪深非 ST）", "创业板与科创板", "沪深300", "中证1000"]
     summary_status: ResearchSummaryStatus
     ic_summary: FactorICSummary
@@ -203,6 +233,20 @@ class FactorStreamDisplayArtifact(BaseModel):
 
     @model_validator(mode="after")
     def _digest(self) -> FactorStreamDisplayArtifact:
+        if (self.daily_features is None) != (self.daily_feature_coverage_days is None):
+            raise ValueError("display stored daily source lacks its coverage")
+        if self.daily_features is not None and (
+            self.daily_features.prepared_snapshot_id != self.snapshot_id
+            or self.daily_features.prepared_binding_hash != self.binding_hash
+            or tuple(day.trade_date for day in self.daily_feature_coverage_days)
+            != tuple(day.decision_date for day in self.coverage_days)
+            or any(
+                tuple(c.column for c in day.counts)
+                != tuple(f.column for f in self.daily_features.fields)
+                for day in self.daily_feature_coverage_days
+            )
+        ):
+            raise ValueError("display stored daily source, fields or evaluation dates differ")
         require_factor_neutralization_binding(
             self.context,
             mode=self.neutralization,
@@ -377,6 +421,19 @@ def project_factor_stream_display(full: FactorStreamFullArtifact) -> FactorStrea
         context=request.formula.sources.context,
         mad_multiple=request.formula.mad_multiple,
         extended_statistics=stats.extended_statistics,
+        daily_features=request.formula.sources.daily_features,
+        daily_feature_coverage_days=None
+        if request.daily_feature_source is None
+        else tuple(
+            FactorDailyFeatureCoverageDay(
+                trade_date=day.trade_date,
+                panel_date=day.panel_date,
+                computation_stock_count=len(request.source.scope.stock_codes),
+                counts=day.daily_feature_counts,
+            )
+            for day in result.research.research.adapter_completion.feature_days
+            if day.trade_date in request.evaluation_days
+        ),
         pool_label=labels[request.formula.selection],
         summary_status=status,
         ic_summary=stats.ic_summary,
@@ -516,7 +573,61 @@ def verify_factor_stream_artifacts(
                 computation_stock_codes=spec.adapter_request.source.scope.stock_codes,
             )
         )
-        with open_factor_member_stream(member_root, spec.member_archive) as members:
+        source_identities = None
+        with ExitStack() as stack:
+            stored_lease = None
+            if spec.adapter_request.daily_feature_source is not None:
+                lake = spec.daily_feature_lake_root
+                lake_fd = _open_private_root(lake)
+                try:
+                    source_identities = tuple(
+                        (
+                            table.artifact.relative_path,
+                            _file_identity(
+                                os.stat(
+                                    table.artifact.relative_path,
+                                    dir_fd=lake_fd,
+                                    follow_symlinks=False,
+                                )
+                            ),
+                        )
+                        for table in spec.adapter_request.daily_feature_source.tables
+                    )
+                finally:
+                    os.close(lake_fd)
+                stored_lease = stack.enter_context(
+                    open_factor_daily_feature_source(
+                        spec.adapter_request.daily_feature_source, lake_root=lake
+                    )
+                )
+                for feature in features.values():
+                    open_days = stored_lease.source.calendar_open_days
+                    if (
+                        feature.trade_date not in open_days
+                        or open_days.index(feature.trade_date) == 0
+                        or feature.panel_date != open_days[open_days.index(feature.trade_date) - 1]
+                    ):
+                        raise ValueError(
+                            "completed stored daily panel differs from actual previous SSE day"
+                        )
+                    original = read_factor_daily_feature_input(
+                        stored_lease,
+                        spec.adapter_request.formula.sources.daily_features,
+                        trade_date=feature.trade_date,
+                        panel_date=feature.panel_date,
+                        stock_codes=spec.adapter_request.source.scope.stock_codes,
+                    )
+                    if (
+                        original.sha256 != feature.daily_feature_input_sha256
+                        or original.counts != feature.daily_feature_counts
+                    ):
+                        raise ValueError(
+                            "completed stored daily inputs differ from sealed original values"
+                        )
+                    del original
+            members = stack.enter_context(
+                open_factor_member_stream(member_root, spec.member_archive)
+            )
             _matching_request(members.manifest, spec.adapter_request)
             journal_days = iter(journal.days)
             evaluated = frozenset(request.evaluation_days)
@@ -548,6 +659,24 @@ def verify_factor_stream_artifacts(
                             raise ValueError(
                                 "journal context differs from its completed daily source"
                             )
+                        if (batch.daily_features is None) != (stored_lease is None):
+                            raise ValueError(
+                                "journal stored daily input usage differs from frozen spec"
+                            )
+                        if stored_lease is not None:
+                            original = read_factor_daily_feature_input(
+                                stored_lease,
+                                spec.adapter_request.formula.sources.daily_features,
+                                trade_date=day.trade_date,
+                                panel_date=features[day.trade_date].panel_date,
+                                stock_codes=spec.adapter_request.source.scope.stock_codes,
+                            )
+                            if batch.daily_features != original:
+                                raise ValueError(
+                                    "journal stored daily values or missing states "
+                                    "differ from sealed originals"
+                                )
+                            del original
                         yield batch
                         decay.consume(batch)
                         del batch
@@ -573,12 +702,26 @@ def verify_factor_stream_artifacts(
                 )
             finally:
                 os.close(member_fd)
+        source_witnesses = ()
+        if source_identities is not None:
+            lake_fd = _open_private_root(spec.daily_feature_lake_root)
+            try:
+                source_witnesses = (
+                    StreamArtifactWitness(
+                        spec.daily_feature_lake_root,
+                        _file_identity(os.fstat(lake_fd)),
+                        source_identities,
+                    ),
+                )
+            finally:
+                os.close(lake_fd)
         artifact_witness = StreamArtifactWitness(
             _root_path(artifact_root), root_identity, tuple(identities.items())
         )
-        for witness in (artifact_witness, member_witness):
+        witnesses = (artifact_witness, member_witness, *source_witnesses)
+        for witness in witnesses:
             witness.recheck()
-        return VerifiedFactorStreamArtifacts(full, display, (artifact_witness, member_witness))
+        return VerifiedFactorStreamArtifacts(full, display, witnesses)
     finally:
         if batches is not None:
             batches.close()

@@ -444,6 +444,7 @@ def project_factor_result_projections(
             or completion.neutralization != adapter.neutralization
             or display.context != adapter.sources.context
             or completion.context != adapter.sources.context
+            or display.daily_features != adapter.sources.daily_features
         ):
             raise ValueError("factor display context differs from its original spec")
         if v2 and (

@@ -18,6 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from pydantic_core import PydanticCustomError
 
 from rquant.factor.capability import historical_daily_capabilities
+from rquant.factor.daily_feature_source import FactorDailyFeatureInput, FactorDailyFeatureSources
 from rquant.factor.definition import FactorDefinition
 from rquant.factor.neutralization_context import (
     FactorNeutralizationDayBatch,
@@ -58,7 +59,30 @@ _IMMUTABLE = ConfigDict(extra="forbid", frozen=True, strict=True, revalidate_ins
 _CS_FUNCTIONS = frozenset(
     {"cs_rank", "cs_zscore", "cs_winsorize", "industry_neutralize", "size_neutralize"}
 )
-DailyFeatureColumn = Literal["open", "high", "low", "close", "vol", "amount"]
+DailyFeatureColumn = Literal[
+    "open",
+    "high",
+    "low",
+    "close",
+    "vol",
+    "amount",
+    "ma5",
+    "ma10",
+    "ma20",
+    "ma60",
+    "rsi6",
+    "rsi14",
+    "macd",
+    "macd_signal",
+    "macd_hist",
+    "kdj_k",
+    "kdj_d",
+    "kdj_j",
+    "turnover_rate",
+    "volume_ratio",
+    "total_mv",
+    "circ_mv",
+]
 FormulaStreamErrorReason = Literal[
     "cache_budget_exceeded",
     "missing_batch",
@@ -92,6 +116,9 @@ class FactorFormulaStreamSources(BaseModel):
     index_source_id: SourceId | None = None
     index_source_sha256: Sha256 | None = None
     context: FactorNeutralizationSources | None = Field(
+        default=None, exclude_if=lambda v: v is None
+    )
+    daily_features: FactorDailyFeatureSources | None = Field(
         default=None, exclude_if=lambda v: v is None
     )
 
@@ -157,8 +184,28 @@ class FactorFormulaStreamRequest(BaseModel):
                 as_of=self.as_of,
             )
             historical_daily_capabilities(
-                industry_available=industry, market_cap_available=cap
+                industry_available=industry,
+                market_cap_available=cap,
+                daily_features_available=self.sources.daily_features is not None,
             ).require_runnable_definition(self.definition)
+            from rquant.factor.capability import HISTORICAL_DAILY_V1
+
+            extra = tuple(
+                c
+                for c in self.definition.dependency_columns
+                if c not in HISTORICAL_DAILY_V1.feature_catalog().columns
+            )
+            stored = self.sources.daily_features
+            if (
+                (stored is None) != (not extra)
+                or stored is not None
+                and (
+                    tuple(f.column for f in stored.fields) != extra
+                    or stored.prepared_snapshot_id != self.sources.feature_source_id
+                    or stored.prepared_binding_hash != self.sources.feature_source_sha256
+                )
+            ):
+                raise ValueError("stored feature dependency subset or raw binding differs")
         except ValueError as error:
             raise PydanticCustomError(
                 "factor_formula_stream_unsupported_definition", "definition lacks a daily contract"
@@ -204,9 +251,12 @@ class FactorFormulaStreamBatch(BaseModel):
     sources: FactorFormulaStreamSources
     universe: FactorUniverseRequest
     feature_points: tuple[FactorFormulaFeaturePoint, ...] = Field(
-        max_length=MAX_UNIVERSE_SECURITIES * 6
+        max_length=MAX_UNIVERSE_SECURITIES * 22
     )
     context: FactorNeutralizationDayBatch | None = Field(
+        default=None, exclude_if=lambda v: v is None
+    )
+    daily_features: FactorDailyFeatureInput | None = Field(
         default=None, exclude_if=lambda v: v is None
     )
 
@@ -479,6 +529,17 @@ def _checked_day(
     if batch.sources != request.sources:
         raise FactorFormulaStreamError("source_binding_mismatch")
     context = batch.context
+    stored = batch.daily_features
+    if (
+        (stored is None) != (request.sources.daily_features is None)
+        or stored is not None
+        and (
+            stored.sources != request.sources.daily_features
+            or stored.trade_date != decision.trade_date
+            or tuple(row.stock_code for row in stored.rows) != request.computation_stock_codes
+        )
+    ):
+        raise FactorFormulaStreamError("source_binding_mismatch")
     if (context is None) != (request.sources.context is None):
         raise FactorFormulaStreamError("source_binding_mismatch")
     if context is not None and (
@@ -521,6 +582,26 @@ def _checked_day(
             raise FactorFormulaStreamError("feature_date_mismatch")
         if point.first_visible_at is not None and point.first_visible_at > decision.decision_at:
             raise FactorFormulaStreamError("future_feature")
+    if stored is not None:
+        stored_points = {
+            (row.stock_code, field.column): value
+            for row in stored.rows
+            for field, value in zip(stored.sources.fields, row.values, strict=True)
+        }
+        for point in batch.feature_points:
+            value = stored_points.get((point.stock_code, point.column))
+            if value is not None and (
+                point.value != value.value
+                or point.state
+                != (
+                    "value"
+                    if value.status == "valid"
+                    else "missing_observation"
+                    if value.status == "missing"
+                    else "known_null"
+                )
+            ):
+                raise FactorFormulaStreamError("feature_grid_mismatch")
     return pool
 
 

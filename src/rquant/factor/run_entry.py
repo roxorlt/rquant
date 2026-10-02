@@ -13,6 +13,10 @@ from pathlib import Path
 
 from pydantic import BaseModel
 
+from rquant.factor.daily_feature_source import (
+    FactorDailyFeaturePrepareRequest,
+    prepare_factor_daily_feature_source,
+)
 from rquant.factor.industry_source import FactorIndustrySource
 from rquant.factor.market_cap_source import FactorMarketCapSource
 from rquant.factor.member_archive import _read_file
@@ -26,6 +30,7 @@ from rquant.factor.run_configuration import (
     FactorRunFileReference,
     open_factor_run_configuration,
     run_configured_factor_worker,
+    save_factor_daily_feature_source,
     save_factor_neutralization_context,
     save_factor_prepared_source,
     save_factor_run_configuration,
@@ -38,6 +43,12 @@ from rquant.strict_json import canonical_json_bytes, strict_canonical_json_loads
 class FactorNeutralizationSealReceipt(BaseModel):
     model_config = RUN_IMMUTABLE
     context_reference: FactorRunFileReference
+    configuration_reference: FactorRunFileReference | None = None
+
+
+class FactorDailyFeatureSealReceipt(BaseModel):
+    model_config = RUN_IMMUTABLE
+    source_reference: FactorRunFileReference
     configuration_reference: FactorRunFileReference | None = None
 
 
@@ -55,7 +66,15 @@ def _input(path: Path, model: type[BaseModel], limit: int) -> BaseModel:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="使用显式冻结配置的离线因子入口")
     parser.add_argument(
-        "action", choices=("save-source", "save-configuration", "seal-context", "worker", "serve")
+        "action",
+        choices=(
+            "save-source",
+            "save-configuration",
+            "seal-context",
+            "seal-daily-features",
+            "worker",
+            "serve",
+        ),
     )
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--input", type=Path)
@@ -69,6 +88,37 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--market-cap-source", type=Path)
     parser.add_argument("--lake-root", type=Path)
     args = parser.parse_args(argv)
+    if args.action == "seal-daily-features":
+        if args.prepared_source is None or args.lake_root is None:
+            parser.error("必须提供实际行情准备包和私有数据根")
+        prepared = _input(args.prepared_source, FactorPreparedStreamSource, 16 * 1024 * 1024)
+        source = prepare_factor_daily_feature_source(
+            FactorDailyFeaturePrepareRequest(prepared_source=prepared), lake_root=args.lake_root
+        )
+        configuration = None
+        if args.reference is not None:
+            reference = FactorRunFileReference.model_validate_json(args.reference)
+            with open_factor_run_configuration(args.root, reference) as loaded:
+                source.require_prepared(loaded.source)
+                if loaded.configuration.lake_root != args.lake_root:
+                    raise ValueError("配置与日线事实私有数据根不同")
+                configuration = loaded.configuration
+        source_reference = save_factor_daily_feature_source(args.root, source)
+        configuration_reference = None
+        if configuration is not None:
+            configuration = FactorRunConfiguration.model_validate(
+                {**configuration.model_dump(), "daily_feature_source": source_reference}
+            )
+            configuration_reference = save_factor_run_configuration(args.root, configuration)
+        print(
+            canonical_json_bytes(
+                FactorDailyFeatureSealReceipt(
+                    source_reference=source_reference,
+                    configuration_reference=configuration_reference,
+                ).model_dump(mode="json")
+            ).decode()
+        )
+        return 0
     if args.action == "seal-context":
         if (
             args.prepared_source is None

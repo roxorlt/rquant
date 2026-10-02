@@ -289,6 +289,8 @@ def get_factor_result(
                 {
                     "mad_multiple": display.mad_multiple,
                     "extended_statistics": display.extended_statistics,
+                    "daily_features": display.daily_features,
+                    "daily_feature_coverage_days": display.daily_feature_coverage_days,
                 }
                 if display.schema_version == 2
                 else {}

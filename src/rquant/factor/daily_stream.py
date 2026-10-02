@@ -15,6 +15,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_core import PydanticCustomError
 
+from rquant.factor.daily_feature_source import FactorDailyFeatureInput
 from rquant.factor.definition import FactorDefinition
 from rquant.factor.evaluate import (
     _GROUP_COUNTS,
@@ -129,6 +130,9 @@ class FactorDailyStreamBatch(BaseModel):
     factor_values: tuple[FactorTimeSeriesValue, ...] = Field(max_length=MAX_UNIVERSE_SECURITIES)
     forward_returns: tuple[FactorForwardReturn, ...] = Field(max_length=MAX_UNIVERSE_SECURITIES)
     context: FactorNeutralizationDayBatch | None = Field(
+        default=None, exclude_if=lambda v: v is None
+    )
+    daily_features: FactorDailyFeatureInput | None = Field(
         default=None, exclude_if=lambda v: v is None
     )
 

@@ -54,3 +54,31 @@ root于2026-10-02经已授权只读SSH核对固定RO副本：12项 `daily_indica
 库存指标全市场生产口径/长历史初始化、已有日线选股特征、分钟/竞价/温度/VP、CSI完整历史、正式配置/数据代与18:40服务和生产验收继续属于整体目标，不因本片来源接入而完成。没有push/tag/生产部署、切流或停Streamlit。
 
 相关证据齐备后冻结干净候选并停写；范围外问题记后续。普通任务到唯一修复/复核上限仍有阻断时冻结证据、报告选项，不自动扩大审查或架构复盘。整体goal保持active。
+
+## Backend 实施证据（2026-10-03，追加）
+
+实际 Codex desktop 原生任务 `/root/factor_security_collection_impl`，backend implementer、父 `/root`；本树分支 `cdx/20261002-factor-daily-features`，实际 clean 基线 `6105e17280c244f50bde62aafc73229a85aeef58`，root 计划已提交，无未知 dirty。首56行原 SHA256 不变。只读借用 integration Python3.13.12/Pydantic2.13.1/DuckDB1.5.2/pytest9.0.3，显式本树 `src:root`、禁 dotenv/bytecode、`env -i` dummy 与自有离线目录；无网络/.env/真实资料/生产/第三方工具/继续委派/安装。
+
+证据根 `/private/tmp/rquant-daily-features-implementation-jrKsUJ5h`（0700）：`identity.json`、`public-api.json`、`file-sha256.json`、`command-summary.json`、`valid-node-evidence.json`、`new-nodeids.txt`、`direct-old-nodeids.txt`、`resources.json`。精确20个 Python 写入文件与本计划的路径/字节/SHA 在文件清单，完整实际 argv/UTC/wall/exit、log/JUnit 在命令收据；失败原件均保留。
+
+### 实际实现与必要直接依赖
+
+新 `daily_feature_source.py` 同 pinned RO 事务封存两表16字段及代/范围/原prepared身份；严格 typed 单日 reader，500码分块、只读实际依赖、缺行/NULL/NaN/±Infinity 原因分开，库存原值不补值/重算。可信 capability/draft/config/plan 与前一 SSE adapter、输入摘要及 journal 接通。纯新字段表达式不依赖旧行情缺行，因子值与未来收益缺失保持独立；7000码/4096自然日/1024交易日/原AST预算保留。
+
+root 明确确认的直接边界：`daily_stream.py` 默认省略 typed 单日输入；`stream_job_spec.py` 仅使用新字段时冻结配置原内容寻址 `daily_feature_lake_root`，`stream_job_runner.py` 核对真实执行根；`stream_job_artifact.py` 独立读封存原件核对原值/缺因、实际前日与来源 witness，自然尾部仍沿原完成权威。`result_serving.py`、实际 `web/models/factor_results.py` 与 `web/routes/factor_results.py` 只沿既有投影传 compact 来源/实际字段/覆盖，不泄露私有路径。`run_entry.py` 显式 `seal-daily-features` CLI 真实回执见 `cli-subprocess.json`/`cli-response.json`（exit0、0.573s），返回来源及可选配置引用。
+
+额外 root 授权 `tracking_backend.py::compile` 的最小开始守卫：原入口只核对head/generation，精确红测真实入队而未拒绝；现以本片能力元数据在 enqueue 前拒绝依赖新字段的开始请求，不调用会额外拒绝旧算子的全局检查。新字段有/无当前来源均不能开始；原旧状态仍可取消，旧六字段、industry/size算子的 toggle 准入、原恢复沿旧合同。没有改 tracking runner/prefix/账本/lease/recovery 或统计核。
+
+### 合同与有效验证
+
+公开 run request 不变。可信 config 新 `daily_feature_source` 引用默认省略；仅实际新字段依赖的 spec/日输入/结果发回执。公共 compact `daily_features`、`daily_feature_coverage_days`（≤1024日）与字段单位/库存边界来自同一类型源，私有 source/query/config schema 仅供可信入口。16字段能力新增 `tracking_supported=false` 与 `tracking_unavailable_reason_zh="库存日线字段暂不支持持续跟踪。"`，原六项省略且 catalog 不重绑定。准确 schema/签名/文件行号在 `public-api.json`。
+
+新增22 unique、直接旧16 unique，集合不重叠，局部重验不累加。`source-red` 9failed、`pipeline-red` 3failed；`focused-final-green.xml` 20passed/10.816s，`direct-old-regression.xml` 13passed/10.995s；最后原件日历/能力变动只补 `final-direct-green.xml` 3passed/4.786s。能力元数据及开始守卫各有1failed精确红测。`tracking-admission-green.xml` 实际4passed/1failed（上下文夹具错误，该命令仍failed），只复用成功的新增守卫1和旧PageControl3；上下文夹具 typed catalog 错误原件另保留，精确修正后 `tracking-old-contract-corrected-green.xml` 1passed/2.319s。其余早期夹具/格式失败保持failed；一次未引用方括号的shell glob在pytest前失败，不计覆盖。Ruff check/format check 全20文件passed、`syntax-311.json` 为3.11 grammar及当前runtime compile，不冒充实际3.11运行。没有全仓/API/Web套件或额外审查。
+
+`legacy-canonical-equality.json`：仅将本树基线 `git show` 的16个已改源码文件保存自有私有目录（214,639字节），同一合成封存源分别真实基线/当前 worker，request/spec/config/full/display五份规范字节和SHA、completion全相等，当前原件独立重放通过；旧v1固定SHA节点也passed。独立原SQL/手算核对16字段/单位/状态、J超100/hist差值/负零、前日/ref预热中间缺日；实际 trusted PageControl→worker→journal/full/display→replay→Serving/Web通过。自然尾部变动无成功completion/full/display，重算所有外层摘要的伪改新字段值仍被原件拒绝；单日对象下一日之前释放。
+
+### 资源与未完成边界
+
+自有 command sessions 已退出，无后台 daemon/listener。Web TestClient lifespan关闭，本树 `tests/.daily-features-web-*` proof目录删除，reader异常/成功均close并删除私有副本，当前私有副本/本树proof均0；CLI子进程退出及fixture删除见 `cli-resources.json`。其余自有0700 pytest/黄金封存合成资料明确保留供复核，非运行资源。
+
+不声明真实全市场/32日worker、PIT/复权初始化、最大负载、网页按钮或生产上线。新增字段持续跟踪尚未接通，后续立即补相应prefix/策略；本片诚实禁止开始。frontend待干净后台候选后顺序接线，root负责最终组合门禁/唯一独立审查/接受后真实只读验收；整体goal继续active。

@@ -64,6 +64,8 @@ class FactorRunPageControlBackend:
             raise PermissionError("当前账号不能运行检验")
 
     def capabilities(self) -> DailyFactorCapabilities:
+        from rquant.factor.daily_feature_source import open_factor_daily_feature_source
+
         with open_factor_run_configuration(self.root, self.reference) as loaded:
             present = []
             for industry, cap in ((True, False), (False, True)):
@@ -78,8 +80,16 @@ class FactorRunPageControlBackend:
                     present.append(True)
                 except (OSError, ValueError):
                     present.append(False)
+            stored = loaded.daily_features is not None
+            if stored:
+                with open_factor_daily_feature_source(
+                    loaded.daily_features, lake_root=loaded.configuration.lake_root
+                ):
+                    loaded.recheck()
             return historical_daily_capabilities(
-                industry_available=present[0], market_cap_available=present[1]
+                industry_available=present[0],
+                market_cap_available=present[1],
+                daily_features_available=stored,
             )
 
     def availability(self, actor_id: str) -> FactorRunAvailability:

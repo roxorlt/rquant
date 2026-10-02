@@ -8,6 +8,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, model_validator
 
+from rquant.factor.daily_feature_source import open_factor_daily_feature_source
 from rquant.factor.daily_stream import (
     FactorDailyStreamBatch,
     FactorDailyStreamResult,
@@ -66,6 +67,7 @@ class FactorStreamResearchResult(BaseModel):
             or raw.admission.scope_content_hash != self.request.scope_content_hash
             or raw.formula_request_sha256 != formula_sha
             or raw.context != self.request.formula.sources.context
+            or raw.daily_features != self.request.formula.sources.daily_features
             or formula.request_sha256 != formula_sha
             or formula.sources != self.request.formula.sources
             or formula.definition_sha256 != canonical_sha256(self.request.formula.definition)
@@ -224,6 +226,13 @@ def _run_factor_stream_research(
                 decision=decision,
                 universe_requests=universe_requests,
                 context_lease=context_lease,
+                daily_feature_lease=stack.enter_context(
+                    open_factor_daily_feature_source(
+                        request.daily_feature_source, lake_root=lake_root
+                    )
+                )
+                if request.daily_feature_source is not None
+                else None,
             )
             formula = evaluate_factor_formula_stream(request.formula, adapter)
             evaluated = frozenset(request.evaluation_days)

@@ -73,7 +73,16 @@ def build_draft_definition(
         version=1 if checked.expected_head is None else checked.expected_head.version + 1,
         earliest_available_date=None,
         expression=checked.expression,
-        feature_catalog=HISTORICAL_DAILY_V1.feature_catalog(),
+        feature_catalog=capabilities.feature_catalog(),
     )
+    if set(definition.dependency_columns) <= set(HISTORICAL_DAILY_V1.feature_catalog().columns):
+        definition = build_factor_definition(
+            **{
+                **definition.model_dump(
+                    exclude={"dependency_columns", "max_history_window", "content_sha256"}
+                ),
+                "feature_catalog": HISTORICAL_DAILY_V1.feature_catalog(),
+            }
+        )
     DailyFactorCapabilities.model_validate(capabilities).require_runnable_definition(definition)
     return definition

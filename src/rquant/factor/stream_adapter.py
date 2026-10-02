@@ -14,6 +14,14 @@ from typing import Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from rquant.factor.daily_feature_source import (
+    FactorDailyFeatureCounts,
+    FactorDailyFeatureInput,
+    FactorDailyFeatureReadLease,
+    FactorDailyFeatureSource,
+    FactorDailyFeatureSources,
+    read_factor_daily_feature_input,
+)
 from rquant.factor.daily_stream import (
     FactorDailyStreamBatch,
     FactorDailyStreamRequest,
@@ -81,6 +89,9 @@ class FactorStreamAdapterRequest(BaseModel):
     context: FactorNeutralizationContext | None = Field(
         default=None, exclude_if=lambda v: v is None
     )
+    daily_feature_source: FactorDailyFeatureSource | None = Field(
+        default=None, exclude_if=lambda v: v is None
+    )
     extended_statistics: bool = Field(default=False, exclude_if=lambda v: v is False)
     ic_method: Literal["rank", "normal"] | None = Field(
         default=None, exclude_if=lambda v: v is None
@@ -95,6 +106,21 @@ class FactorStreamAdapterRequest(BaseModel):
 
     @model_validator(mode="after")
     def _bound_request(self) -> FactorStreamAdapterRequest:
+        stored, selected = self.daily_feature_source, self.formula.sources.daily_features
+        if (
+            (stored is None) != (selected is None)
+            or stored is not None
+            and (
+                stored.select(tuple(f.column for f in selected.fields)) != selected
+                or stored.prepared_snapshot_id != self.source.snapshot_id
+                or stored.prepared_binding_hash != self.source.binding_hash
+                or stored.scope_content_hash != self.scope_content_hash
+                or stored.scope != self.source.scope
+            )
+        ):
+            raise ValueError(
+                "stored daily facts differ from admitted raw source or dependency subset"
+            )
         if self.extended_statistics != (self.ic_method is not None):
             raise ValueError("extended statistics require their frozen IC method")
         if (self.context is None) != (self.formula.sources.context is None):
@@ -138,9 +164,13 @@ class FactorStreamFeatureDayReceipt(BaseModel):
     panel_date: date
     input_sha256: Sha256
     raw_sha256: Sha256
-    missing_observation_count: int = Field(ge=0, le=42_000)
-    known_null_count: int = Field(ge=0, le=42_000)
+    missing_observation_count: int = Field(ge=0, le=154_000)
+    known_null_count: int = Field(ge=0, le=154_000)
     context_input_sha256: Sha256 | None = Field(default=None, exclude_if=lambda v: v is None)
+    daily_feature_input_sha256: Sha256 | None = Field(default=None, exclude_if=lambda v: v is None)
+    daily_feature_counts: tuple[FactorDailyFeatureCounts, ...] | None = Field(
+        default=None, max_length=16, exclude_if=lambda v: v is None
+    )
 
 
 class FactorStreamReturnDayReceipt(BaseModel):
@@ -175,6 +205,12 @@ class FactorStreamAdapterCompletion(BaseModel):
         default=None, exclude_if=lambda v: v is None
     )
     context_read_query_count: int | None = Field(default=None, ge=1, exclude_if=lambda v: v is None)
+    daily_features: FactorDailyFeatureSources | None = Field(
+        default=None, exclude_if=lambda v: v is None
+    )
+    daily_feature_read_query_count: int | None = Field(
+        default=None, ge=1, exclude_if=lambda v: v is None
+    )
     input_sha256: Sha256
     sha256: Sha256
 
@@ -182,6 +218,33 @@ class FactorStreamAdapterCompletion(BaseModel):
     def _receipt_digest(self) -> FactorStreamAdapterCompletion:
         if self.processed_days != len(self.feature_days):
             raise ValueError("adapter completion count differs from feature schedule")
+        if (
+            (self.daily_features is None) != (self.daily_feature_read_query_count is None)
+            or any(
+                (day.daily_feature_input_sha256 is None) != (self.daily_features is None)
+                or (day.daily_feature_counts is None) != (self.daily_features is None)
+                for day in self.feature_days
+            )
+            or self.daily_features is not None
+            and (
+                self.daily_features.prepared_snapshot_id != self.admission.snapshot_id
+                or self.daily_features.prepared_binding_hash != self.admission.binding_hash
+                or self.daily_features.scope_content_hash != self.admission.scope_content_hash
+                or self.daily_feature_read_query_count
+                != self.processed_days * ((len(self.admission.scope.stock_codes) + 499) // 500)
+            )
+        ):
+            raise ValueError("stored daily completion differs from complete daily grid")
+        if self.daily_features is not None and any(
+            tuple(c.column for c in day.daily_feature_counts)
+            != tuple(f.column for f in self.daily_features.fields)
+            or any(
+                c.valid + c.missing + c.null + c.non_finite != len(self.admission.scope.stock_codes)
+                for c in day.daily_feature_counts
+            )
+            for day in self.feature_days
+        ):
+            raise ValueError("stored daily coverage differs from bound field and code grid")
         if (self.context is None) != (self.context_read_query_count is None) or any(
             (day.context_input_sha256 is None) != (self.context is None)
             for day in self.feature_days
@@ -265,6 +328,7 @@ class FactorStreamAdapter(Iterator[FactorFormulaStreamBatch]):
         decision: FactorStreamSnapshotAdmissionDecision,
         universe_requests: Iterable[FactorUniverseRequest],
         context_lease: FactorNeutralizationReadLease | None = None,
+        daily_feature_lease: FactorDailyFeatureReadLease | None = None,
     ) -> None:
         self.request = FactorStreamAdapterRequest.model_validate(request)
         self.admission = FactorStreamSnapshotAdmissionDecision.model_validate(decision)
@@ -285,6 +349,16 @@ class FactorStreamAdapter(Iterator[FactorFormulaStreamBatch]):
             raise FactorStreamAdapterError("context_binding_mismatch")
         self._context_lease = context_lease
         self._current_context: FactorNeutralizationDayBatch | None = None
+        if (daily_feature_lease is None) != (self.request.daily_feature_source is None) or (
+            daily_feature_lease is not None
+            and (
+                daily_feature_lease.closed
+                or daily_feature_lease.source != self.request.daily_feature_source
+            )
+        ):
+            raise FactorStreamAdapterError("stored_daily_binding_mismatch")
+        self._daily_feature_lease = daily_feature_lease
+        self._current_daily_features: FactorDailyFeatureInput | None = None
         self._pools: Iterable[FactorUniverseRequest] | None = universe_requests
         self._pool_iterator: Iterator[FactorUniverseRequest] | None = None
         self._completion: FactorStreamAdapterCompletion | None = None
@@ -336,6 +410,7 @@ class FactorStreamAdapter(Iterator[FactorFormulaStreamBatch]):
 
     def close(self) -> None:
         self._current_context = None
+        self._current_daily_features = None
         if not self._closed:
             self._closed = True
             try:
@@ -505,20 +580,63 @@ class FactorStreamAdapter(Iterator[FactorFormulaStreamBatch]):
                 ):
                     raise FactorStreamAdapterError("archive_binding_mismatch")
                 panel = self._panels[day]
-                bars, raw_sha = self._read_stock(
-                    "daily_bar", (panel,), self.request.formula.computation_stock_codes
-                )
+                from rquant.factor.capability import HISTORICAL_DAILY_V1
+
+                if (
+                    set(self.request.formula.definition.dependency_columns)
+                    & set(HISTORICAL_DAILY_V1.feature_catalog().columns)
+                    or self._daily_feature_lease is None
+                ):
+                    bars, raw_sha = self._read_stock(
+                        "daily_bar", (panel,), self.request.formula.computation_stock_codes
+                    )
+                else:
+                    bars, raw_sha = {}, canonical_sha256(("stored_daily_only", panel))
                 points: list[FactorFormulaFeaturePoint] = []
+                stored_input = None
+                stored_values = {}
+                if self._daily_feature_lease is not None:
+                    stored_input = read_factor_daily_feature_input(
+                        self._daily_feature_lease,
+                        sources.daily_features,
+                        trade_date=day,
+                        panel_date=panel,
+                        stock_codes=self.request.formula.computation_stock_codes,
+                    )
+                    stored_values = {
+                        (row.stock_code, field.column): value
+                        for row in stored_input.rows
+                        for field, value in zip(
+                            stored_input.sources.fields, row.values, strict=True
+                        )
+                    }
+                    raw_sha = canonical_sha256((raw_sha, stored_input.sha256))
+                    self._current_daily_features = (
+                        stored_input if day in self.request.evaluation_days else None
+                    )
                 missing = known_null = 0
                 for code in self.request.formula.computation_stock_codes:
                     bar = bars.get((panel, code))
                     for column in self.request.formula.definition.dependency_columns:
-                        value = None if bar is None else getattr(bar, column)
-                        state = (
-                            "missing_observation"
-                            if bar is None
-                            else ("known_null" if value is None else "value")
-                        )
+                        if (code, column) in stored_values:
+                            fact = stored_values[code, column]
+                            value = fact.value
+                            state = (
+                                "value"
+                                if fact.status == "valid"
+                                else "missing_observation"
+                                if fact.status == "missing"
+                                else "known_null"
+                            )
+                        else:
+                            value = None if bar is None else getattr(bar, column)
+                            state = (
+                                "missing_observation"
+                                if bar is None
+                                else "known_null"
+                                if value is None
+                                else "value"
+                            )
                         missing += state == "missing_observation"
                         known_null += state == "known_null"
                         points.append(
@@ -528,7 +646,9 @@ class FactorStreamAdapter(Iterator[FactorFormulaStreamBatch]):
                                 column=column,
                                 state=state,
                                 value=value,
-                                first_visible_at=None if bar is None else _market_time(day, 9, 25),
+                                first_visible_at=None
+                                if state == "missing_observation"
+                                else _market_time(day, 9, 25),
                             )
                         )
                 batch = FactorFormulaStreamBatch(
@@ -536,6 +656,7 @@ class FactorStreamAdapter(Iterator[FactorFormulaStreamBatch]):
                     sources=sources,
                     universe=universe,
                     feature_points=tuple(points),
+                    daily_features=stored_input,
                     context=None
                     if self._context_lease is None
                     else self._context_lease.query(
@@ -560,12 +681,16 @@ class FactorStreamAdapter(Iterator[FactorFormulaStreamBatch]):
                         raw_sha256=raw_sha,
                         missing_observation_count=missing,
                         known_null_count=known_null,
+                        daily_feature_input_sha256=None
+                        if stored_input is None
+                        else stored_input.sha256,
+                        daily_feature_counts=None if stored_input is None else stored_input.counts,
                         context_input_sha256=None
                         if batch.context is None
                         else batch.context.sha256,
                     )
                 )
-                del raw, universe, bars, points, bar
+                del raw, universe, bars, points, bar, stored_input, stored_values
                 yield batch
                 del batch
             try:
@@ -626,8 +751,10 @@ class FactorStreamAdapter(Iterator[FactorFormulaStreamBatch]):
                 factor_values=day.values,
                 forward_returns=tuple(returns),
                 context=self._current_context,
+                daily_features=self._current_daily_features,
             )
             self._current_context = None
+            self._current_daily_features = None
             self._returns.append(
                 FactorStreamReturnDayReceipt(
                     window=window,
@@ -671,5 +798,8 @@ class FactorStreamAdapter(Iterator[FactorFormulaStreamBatch]):
         if self._context_lease is not None:
             fields["context"] = self._context_lease.context.sources
             fields["context_read_query_count"] = self._context_lease.read_query_count
+        if self._daily_feature_lease is not None:
+            fields["daily_features"] = self.request.formula.sources.daily_features
+            fields["daily_feature_read_query_count"] = self._daily_feature_lease.query_count
         fields["input_sha256"] = canonical_sha256(fields)
         self._completion = FactorStreamAdapterCompletion(**fields, sha256=canonical_sha256(fields))

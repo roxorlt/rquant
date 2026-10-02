@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, JsonValue
 
+from rquant.factor.capability import historical_daily_capabilities
 from rquant.factor.registry import FactorDefinitionRegistry, FactorRegistryIdentity
 from rquant.factor.run_configuration import FactorRunFileReference, open_factor_run_configuration
 from rquant.factor.run_request import RUN_IMMUTABLE
@@ -79,6 +80,13 @@ class FactorTrackingPageControlBackend:
                 None if current is None else current.generation
             ):
                 raise ValueError("跟踪状态已变化，请刷新")
+            if request.tracked:
+                for field in historical_daily_capabilities(daily_features_available=True).fields:
+                    if (
+                        field.tracking_supported is False
+                        and field.column in record.definition.dependency_columns
+                    ):
+                        raise ValueError(field.tracking_unavailable_reason_zh)
             loaded.recheck()
             return FrozenFactorTrackingToggle(
                 request=request,

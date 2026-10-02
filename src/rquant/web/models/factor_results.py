@@ -5,8 +5,9 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
+from rquant.factor.daily_feature_source import FactorDailyFeatureSources
 from rquant.factor.display_artifact import (
     FactorDisplayCoverageDay,
     FactorDisplayDecayPeriod,
@@ -23,6 +24,7 @@ from rquant.factor.result import (
 )
 from rquant.factor.run_request import NeutralizationLabel, NeutralizationMode
 from rquant.factor.stream_job_artifact import (
+    FactorDailyFeatureCoverageDay,
     FactorStreamDisplayCoverageDay,
     FactorStreamDisplayPortfolioDay,
 )
@@ -96,6 +98,12 @@ class FactorStreamResearchDisplay(BaseModel):
     context_note: str | None = None
     mad_multiple: float | None = None
     extended_statistics: FactorExtendedStatistics | None = None
+    daily_features: FactorDailyFeatureSources | None = Field(
+        default=None, exclude_if=lambda v: v is None
+    )
+    daily_feature_coverage_days: tuple[FactorDailyFeatureCoverageDay, ...] | None = Field(
+        default=None, max_length=1024, exclude_if=lambda v: v is None
+    )
 
 
 class FactorResultDetailData(BaseModel):

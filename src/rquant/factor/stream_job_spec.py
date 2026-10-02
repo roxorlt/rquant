@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Mapping
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Literal, Self
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -30,6 +31,7 @@ class FactorStreamJobSpec(BaseModel):
     member_archive: FactorMemberArchiveReference
     definition_content_sha256: Sha256
     deadline: AwareDatetime
+    daily_feature_lake_root: Path | None = Field(default=None, exclude_if=lambda v: v is None)
 
     @field_validator("deadline")
     @classmethod
@@ -38,6 +40,14 @@ class FactorStreamJobSpec(BaseModel):
 
     @model_validator(mode="after")
     def _bindings(self) -> FactorStreamJobSpec:
+        if (self.daily_feature_lake_root is None) != (
+            self.adapter_request.daily_feature_source is None
+        ):
+            raise ValueError("stored daily original lake differs from source usage")
+        if self.daily_feature_lake_root is not None:
+            from rquant.factor.result_artifact import _root_path
+
+            _root_path(self.daily_feature_lake_root)
         if self.definition_content_sha256 != _definition_sha256(
             self.adapter_request.formula.definition
         ):
