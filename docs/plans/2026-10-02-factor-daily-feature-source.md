@@ -88,3 +88,15 @@ root 明确确认的直接边界：`daily_stream.py` 默认省略 typed 单日�
 root 在干净 `93f82954fbab7ea2a5267cd758917abc8d01e375` 交FE前授权单一字段目录文案修正：MA/RSI/K/D只说明对应指标；J才说明不裁到0–100，MACD分别为DIF/信号线/柱差值，仅hist说明已存DIF−DEA、不另乘2。基础4项、字段/单位/DTO、原值、旧六字段及其他逻辑不变。说明文字属于固定来源绑定，旧合成新字段包在新目录下明确拒绝，原件原封保留于证据根 `metadata-wording/before-*`，当前CLI真实重新封存回执已更新。
 
 只补实际失效范围 `wording-direct-green.xml`：原source原值/状态、能力目录、完整worker→原件重放→Serving/Web3节点passed（4.792s wall），22新nodeids不增加；16旧及五份旧字节黄金继续有效复用，没有扩大套件/审查。`metadata-wording/binding-and-strings.json` 核对仅中文名/说明变化、基础4项与旧六项不变及旧新字段包拒绝；public-api、SHA/handoff随新候选更新。CLI/reader/proof资源按同一收据关闭删除，Ruff/格式/3.11语法与diff直接自检保留。
+
+## Frontend 实施证据（2026-10-03，追加）
+
+实际 Codex desktop 原生任务 `/root/factor_save_react_final_review`，当前 frontend implementer、父 `/root`；同树同分支 clean 基线 `ed7d35c7ac0d9ac350c44ab9eefa049db30e59a0`。首56行保持原字节。只写直接相关 web、规范生成的 OpenAPI/TS/dist 及本附录；无 backend/Python test、依赖、权限或生产修改。实际 Node22.22.2/pnpm10.33.0、只读借用 Python3.13.12/Pydantic2.13.1，显式本树源码、禁 dotenv/dummy/private 夹具。公开合同与字段说明沿 backend `public-api.json`，SHA256 `0864cf9056534de706458a31a35034bdfecbda97097b35fc50c7f9a3be422fdc`。
+
+字段默认按实际 API 顺序显示六项，“全部字段”与中文搜索覆盖完整目录；独立说明 Tip、真实选区插入/光标、搜索 Enter 不保存。可信同代能力与已保存依赖只限制新加入跟踪，取消和原请求恢复仍可用；保存/单次检验不受新增跟踪限制。历史结果的库存口径与按日原始覆盖只来自自身结果，不用当前能力/表单重写。
+
+证据根 `/private/tmp/rquant-daily-features-react-gjh9cpxp`（0700），实际 argv/UTC/wall/exit/log/XML、版本、节点与 SHA 见 `evidence.md`、`command-summary.json`、`handoff.json`。新增 Web 19 unique、浏览器2 unique、Python 0。聚焦首次19项15failed/4passed，定向最终19passed；直接回归原件91passed/1failed（旧断言持有已卸载按钮），保留原断言意义后精确1passed/26deselected，最终正常 `pnpm check` 58文件644passed。正常 Web/API 55文件993passed，build/size passed，首屏 gzip323.1KB/550KB；产物未提交导致首次 `verify:dist` 比较失败原件保留，精确提交后正常验证 exit0。Git 默认 sandbox 的 index.lock 失败原件明确记录，随后正常 require_escalated 精确提交。
+
+完整浏览器原命令119passed/2failed/4skipped：新增取消夹具立即换代碰到旧代在途查询；首次定向又因响应定位漏 `/app/` 前缀失败，均保留原件与 trace。仅改该合成夹具为 applied 等待同步、旧查询完成后显式发布并刷新，保持原请求和精确代断言；最终桌面1440/390触屏2passed，unique有效121、原配置4skipped不计通过。测试类型/格式直接验证 exit0，生产源码/dist 未再变更，复用仍有效644/API/build/size/dist，不再完整重跑。最终四张编辑/结果截图已实际目视，路径/SHA 见 `screenshots.json`。
+
+所有自有命令退出，18817/14217释放，临时 proxy proof已删除，借用 node_modules保留。普通删除自有 API basetemp `rqdy-api-dmbjppvc` 与 `browser-serving` 遭封存只读夹具 PermissionError；准确路径、创建归属与保留原因见 `resources.json`，未改保护或其他目录。日志/XML/截图/合成原件保留供唯一集中审查。此证据不代表真实材料、32日worker、全市场生产口径或生产上线；接受后真实只读验收仍由 root 完成。

@@ -219,9 +219,6 @@ for (const viewport of [
                 .request,
           ),
         ).toEqual(body);
-        tracked = false;
-        cancelled = true;
-        currentGeneration = "f".repeat(64);
         await route.fulfill({ json: { data: trackingResult(body), serving: serving() } });
       });
 
@@ -330,7 +327,26 @@ for (const viewport of [
       tracked = true;
       await page.getByRole("button", { name: "刷新", exact: true }).click();
       await expect(page.getByRole("button", { name: "取消跟踪", exact: true })).toBeEnabled();
+      const oldPanel = page.waitForResponse(
+        (response) =>
+          cancellation.length === 1 &&
+          new URL(response.url()).pathname ===
+            new URL(`api/v1/factors/${diagnosticFactor.factor_id}/tracking`, APP_URL).pathname &&
+          new URL(response.url()).searchParams.get("generation_id") === "e".repeat(64),
+      );
+      const oldMeta = page.waitForResponse(
+        (response) =>
+          cancellation.length === 1 &&
+          new URL(response.url()).pathname === new URL("api/v1/meta", APP_URL).pathname,
+      );
       await page.getByRole("button", { name: "取消跟踪", exact: true }).click();
+      await Promise.all([oldPanel, oldMeta]);
+      await expect(page.getByText("已保存，等待同步。", { exact: true })).toBeVisible();
+      await expect(page.getByText("已取消跟踪。", { exact: true })).toHaveCount(0);
+      tracked = false;
+      cancelled = true;
+      currentGeneration = "f".repeat(64);
+      await page.locator(".ph-actions").getByRole("button", { name: "刷新", exact: true }).click();
       await expect(page.getByText("已取消跟踪。", { exact: true })).toBeVisible();
       expect(cancellation).toHaveLength(1);
       expect(cancellation[0]?.expected_head).toEqual({
