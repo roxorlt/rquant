@@ -53,3 +53,11 @@ backend：tracking_runner.py、tracking_backend.py、capability.py，新增直�
 - 唯一最终门禁实际结果：`pnpm check` 59文件/652 passed（exit0/31.064s），API的55个 `tests/unit/test_web_*.py` 文件993 passed（exit0/251.049s），`pnpm build` exit0/5.155s、首屏gzip323.1KB/550KB，`verify:dist` exit0/1.028s。正常浏览器门禁123 passed、4项原配置skipped（exit0/222.559s）；跳过不计通过。原生产UI和dist字节未变，不重复有效门禁。
 - 四张1440×900与390×844确认/原请求恢复截图在私有 `browser-results/factor-stored-tracking-*`，均实际查看；策略Tip支持键盘/手机点按、确认固定5组与左栏10组独立，旧第2版原操作不套新第3版。原编译红、夹具helper严格tuple解析失败和一项格式失败均保留原日志，修正后实际绿，不删除失败原件。
 - 实际运行时Node22.22.2/pnpm10.33.0及只读借用Python3.13.12/Pydantic2.13.1/DuckDB1.5.2；显式本树PYTHONPATH、禁dotenv与隔离dummy配置，只连接自有loopback/Unix合成夹具。服务/命令退出与端口归零证明由 `resources.json` 记录；自有API basetemp及浏览器合成资料保留供唯一联合审查，不改保护权限或删除未知目录，root依赖目录保留。root清单门禁、唯一联合审查和ACCEPT后的真实只读跟踪对照尚待完成，本附录不声称真实worker或生产验收。
+
+## root 清单与最终候选冻结（2026-10-03，真实验收前）
+
+后台 ad52729ba、前端45ccdf4e已各自提交clean并停写；root核对后台6文件、前端7文件、20份前端原log及8份新旧原XML。23个后台不同有效节点（14新增含1replacement、9旧）、Web652记录、API993、浏览器123通过/4原skip及build/size/dist有效证据复用；4张1440/390确认与恢复图已实际查看。生产hook/UI及dist字节不变；类型仅tracking_supported扩为boolean/null。
+
+正常精确collection实际exit0/8.585s，19103→19116，精确增14/删1对应已记录replacement、0重复、55批准skip字节不变。全套逻辑SHA154f4889ecbcc2f512456aad9cf42d8544361b542e3a8bacdef81c781c6e868d；只执行两必要清单门禁，实际2 passed/8.484s，不执行19116全套。root将本候选冻结后交唯一原reviewer集中终审（当前0修复轮）；ACCEPT后再按独立原始事实执行首1日/续2日/整3日及重复的实际只读跟踪对照，不将前片32日reader核验声称为32日新字段tracking。
+
+root证据在/private/tmp/rquant-factor-tracking-root-yegakn31/stored-tracking-{backend-freeze,frontend-freeze,root-visual-check}.json及stored-tracking-manifest-proof/；原红测、部分失败及helper失败全部保留。前端自有端口18823/14223已释放，合成资料暂保留给终审。计划前36行冻结SHA保持，后台5个Python字节保持；M3仍部分/未发布，整体goal active。
