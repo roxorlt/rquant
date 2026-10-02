@@ -57,7 +57,7 @@ root在唯一集中终审accept后，复用现有真实原件及只读副本做�
 ## 实施证据：接口冻结（后台仍在实施）
 
 - 实际产品 Codex desktop，原生子任务 `/root/factor_security_collection_impl`，角色 implementer，父 `/root`；指定树 `cdx-factor-tracking`、分支 `cdx/20261002-factor-tracking`，写前实际 HEAD `e38aee99af619ef4b85774bcfa495bf047545b62` 且 clean。身份、环境及命令证据根 `/private/tmp/rquant-tracking-implementation-NKpV3Fag`，未访问外部网络、真实资料、凭据或 `.env`，未委派。
-- 冻结用户合同为 `FactorTrackingRequest/OperationResult/Receipt/Panel/Summary`：用户仅选择 factor_id/tracked，原命令、UTC时间、head、Serving代及可选跟踪代提供恢复与并发保护；来源/路径/actor/策略不可由客户端指定。GET `/api/v1/factors/{factor_id}/tracking`，POST `/api/v1/factors/tracking/commands`、`/resume`、`/retry`。开关独立默认关闭，精确原命令恢复先于新的 Serving/配置预检。
+- 冻结用户合同为 `FactorTrackingRequest/OperationResult/Receipt/Panel/Summary`：用户仅选择 factor_id/tracked，原命令、UTC时间、head、Serving代及可选跟踪代提供恢复与并发保护；来源/路径/actor/策略不可由客户端指定。GET `/api/v1/factors/{factor_id}/tracking`，POST `/api/v1/factors/tracking/commands`、`/api/v1/factors/tracking/commands/resume`、`/api/v1/factors/tracking/commands/retry`。开关独立默认关闭，精确原命令恢复先于新的 Serving/配置预检。
 - 新14个唯一聚焦节点有效绿证据：领域7、可信 PageControl3、Web3、真实合成 UDS1；缺实现红测为 `domain-missing-red`、`control-red`、`web-contract-feature-red`。各 log/JSON/JUnit 原件在上述证据根。Web私有证明夹具曾被 `/private/tmp` 可写父目录真实拒绝，改为本树内自有0700临时目录及0400合成证明，未改变平台/产品权限校验，测试后自动移除。UDS listener 已 shutdown/join/server_close，socket 与自有目录删除均有断言。
 - 本次接口提交只供前端并行接续；增量计划/前缀/贡献提交、完整 Serving 生产接线及 CLI 尚未完成，不据此宣称 C3.3 完成。最终候选仍由 root 统一门禁和一次集中审查。
 
@@ -83,3 +83,14 @@ root在唯一集中终审accept后，复用现有真实原件及只读副本做�
 - 四个新增 testcase 在 `focused-red.xml` 实际4 failed/10.30s；`focused-green-corrected.xml` 实际4 passed/9.82s、实耗10.3274874169s、exit0。首个 green/格式命令因本地嵌套缩进编辑错误失败，原日志/XML保留；只修正该编辑错误，未放宽反例/校验。十个精确直接旧节点（增量黄金、暂停、原任务恢复、取消重加、来源/完成/自然配置尾部、中断、并发预留、私有至Serving链）在 `direct-regression.xml` 实际10 passed/16.56s、实耗17.1142381660s、exit0；没有重跑BE/API/浏览器全套。
 - 指定只读 Python3.13.12、清洁禁dotenv dummy环境；最终源码 Ruff/format/diff 与3.11 grammar证据及五文件 SHA 另存本轮证据。实际 `python -m rquant.cli web-openapi` exit0，完整原公开 schema 摘要仍为 `bd5ec989b1da2131097928ccf69e09d9ab0c5b32b6cc85d7805fa1aa4ea331ff`。本轮新增nodeids和直接旧去重、各真实命令结果由证据原件列明，root负责组合清单。
 - 自有同步命令已结束；原私有UDS链shutdown/join/unlink以及各测试执行副本归零断言有效，真实SQLite竞争写者rollback/close，原registry reader/附属读锁随本事务退出释放。自有合成夹具与失败日志保留供定向复核，不枚举OS整体进程、不清理他人目录。未访问网络、.env、凭据、真实数据或生产，未委派/安装/合并/推送/部署；真实32日验收仍由root在阻断关闭后执行。
+
+## 本地验收（2026-10-02）
+
+- 受审代码候选 `6cdadc0ae9a8fb077825dc494708303e79c8fb3a` 已原字节快进合入 `cdx/20260929-factor-source-integration`。独立终审一次；原作者第1/3轮定向修复、原审查者复核 **ACCEPT**，FT-FINAL-01/02/03全部关闭，没有第二次全审。复核报告 `/private/tmp/rquant-tracking-recheck-1-m2jh5lae/recheck.md`，SHA `95283257cf496c4a9612488dfdbc546ff7256ceef01c1facfbd3b86a947d43da`。
+- 后台34个新增与4个直接旧节点有去重有效绿证据；本轮4个新增红→绿和10个直接回归复用，不重复计数。Web603通过；网页API993个唯一有效通过；浏览器117个唯一有效通过、4个原配置skip；OpenAPI→TS、build/size/dist和1440px/390px截图成立。原全套失败命令及定向复跑均保留，不能把分命令有效覆盖称为原全套一次全绿。原首轮组合证据 `/private/tmp/rquant-factor-tracking-final-ckto8i9z`，修复证据 `/private/tmp/rquant-tracking-repair-1-c7tEmVgk`；Web字节本轮未变，未重跑仍有效门禁。
+- 正常清单收集19,019→19,054，仅新增35个实际nodeid、无删除/重复；55个批准skip原字节不变。两必要合同门禁实际2 passed，本轮9.261s；仅收集全清单，未执行19,054个测试。root清单/冻结证据 `/private/tmp/rquant-factor-tracking-root-yegakn31/repair-round-1`。
+- root真实只读验收：5,571代码、2026-08-14至09-29共32个交易日、178,272原始股票日期组合。纯NumPy/stdlib参照不导入产品计算；初次21日、追加11日的两条原提交计划只含各自新评价日。同一RO代重新封存后的32日整段重算逐日贡献、20日/5日/累计汇总及全部32日因果输入前缀完全相等；同日重复waiting且贡献不变。独立参照的原始SHA `b220f472468139f46c50296f23d71a5c29a710d42f50799b13701de7f151ca78`，成员归档SHA `f50016de6a135f9a5339ce4a399f5ade598ddf76ec6f9470df09452ab22c7c23`。
+- 首次脚本多纳入一个前置开市日，触发成员日期校验；按原始日历的前日08-13修正root脚本，32个预期评价日及黄金数学未变。随后组合验收触及900s脚本时限、整算未完成；保留已经实际提交且独立对照通过的21+11日证据，只补整段32日。该补验仍受900s时限，且额外核对同一RO代、原始SHA、全因果前缀及逐日/汇总精确相等；没有改产品或占用新修复轮，未把退出124记通过。原两失败尝试保留在root的 `real-worker-attempt-1/2`。
+- 成功整算含准备总540.100s、峰值RSS395.078MiB（Python3.14.4，单线程）；源准备9.773s，真实原件捕获8.145s。增量从dispatch至末次提交内时刻716.866s，不能当作每阶段完整wall或RSS测量。实际样本每天都有partial，近20日完整覆盖为0：周/累计多空保持null、invalidated=false，没有补零或假判失效。这是一个32日单字段历史诊断，尚非最大负载、长期运行或正式18:40服务验收。
+- 完整真实证据 `/private/tmp/rquant-factor-tracking-root-yegakn31/real-acceptance-summary.json`；增量原件 `owned-completed-stage-105241.json`，整算原件 `real-whole-proof/worker-response.json`（SHA `7c84595c8af950b2c074ee8a9033f4c6892605418d1967bfec2d16f64674e7f5`）。自有远端目录均删除；源/自有FD、heartbeat、execution副本为0，所有同步命令结束。自有本地原件/日志保留供追溯；未枚举OS整体进程或清理他人目录。
+- 加入/取消、原命令恢复、独立跟踪面板、版本暂停、增量及总览失效链接已在本地接通。入口默认关闭；CSI完整历史、MAD/行业IC/自相关、分钟/竞价新来源、正式配置/数据代、完整资源与生产安装继续实施。未push/main/tag/部署/切流或停Streamlit，M3保持部分。以上最新记录覆盖前述“仍在实施/待复核/真实验收待做”的历史停止点。
