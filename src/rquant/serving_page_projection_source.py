@@ -17,7 +17,10 @@ from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from tempfile import mkdtemp
 from types import MappingProxyType
-from typing import Annotated, Self
+from typing import TYPE_CHECKING, Annotated, Self
+
+if TYPE_CHECKING:
+    from rquant.factor.tracking import FactorTrackingIdentity
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -3600,6 +3603,7 @@ class DuckDBLabPageProjectionSource:
         backfill_plan_job_state_path: Path | None = None,
         factor_registry: FactorDefinitionRegistry | None = None,
         factor_registry_identity: FactorRegistryIdentity | None = None,
+        factor_tracking_identity: FactorTrackingIdentity | None = None,
     ) -> None:
         self.database_path = Path(os.path.abspath(database_path))
         #: this role's own state directory; see `_StableReadonlyDuckDB` (#255)
@@ -3650,6 +3654,27 @@ class DuckDBLabPageProjectionSource:
             raise TypeError("factor registry identity must be FactorRegistryIdentity")
         self.factor_registry = factor_registry
         self.factor_registry_identity = factor_registry_identity
+        if factor_tracking_identity is not None and factor_registry_identity is None:
+            raise ValueError("tracking projection requires its fixed factor registry")
+        self.factor_tracking_identity = factor_tracking_identity
+
+    def _factor_tracking_projections(
+        self, observed: datetime
+    ) -> tuple[ServingProjectionPayload, ...]:
+        from rquant.factor.tracking_serving import (
+            project_factor_tracking_projections,
+            project_factor_tracking_snapshot,
+        )
+
+        if self.factor_tracking_identity is None:
+            return ()
+        return project_factor_tracking_projections(
+            project_factor_tracking_snapshot(
+                self.factor_tracking_identity,
+                registry_identity=self.factor_registry_identity,
+                available_at=observed,
+            )
+        )
 
     def _backfill_plan_projections(
         self, observed_at: datetime
@@ -3987,6 +4012,7 @@ class DuckDBLabPageProjectionSource:
             backfill_plan_projections=self._backfill_plan_projections(observed),
             formula_market_projections=self._formula_market_projections(observed),
             factor_definition_projections=self._factor_definition_projections(observed),
+            factor_tracking_projections=self._factor_tracking_projections(observed),
         )
 
     @staticmethod
@@ -5246,6 +5272,10 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
             FACTOR_RESULT_PROJECTION_TABLES,
             validate_factor_result_projections,
         )
+        from rquant.factor.tracking_serving import (
+            FACTOR_TRACKING_PROJECTION_TABLES,
+            validate_factor_tracking_projections,
+        )
 
         names = {item.table_name for item in self.projections}
         required = {"data_audit_issue", "data_audit_status", "research_gate_metadata"}
@@ -5256,6 +5286,7 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
             FORMULA_MARKET_PROJECTION_TABLES,
             FACTOR_DEFINITION_PROJECTION_TABLES,
             FACTOR_RESULT_PROJECTION_TABLES,
+            FACTOR_TRACKING_PROJECTION_TABLES,
         )
         if (
             not required.issubset(names)
@@ -5272,6 +5303,8 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
             validate_factor_definition_projections(projections)
         if names >= FACTOR_RESULT_PROJECTION_TABLES:
             validate_factor_result_projections(projections)
+        if names >= FACTOR_TRACKING_PROJECTION_TABLES:
+            validate_factor_tracking_projections(projections)
         status = projections["data_audit_status"].rows
         issues = projections["data_audit_issue"].rows
         if len(status) != 1 or len(issues) != status[0]["finding_count"]:
@@ -5444,6 +5477,7 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
         formula_market_projections: tuple[ServingProjectionPayload, ...] = (),
         factor_definition_projections: tuple[ServingProjectionPayload, ...] = (),
         factor_result_projections: tuple[ServingProjectionPayload, ...] = (),
+        factor_tracking_projections: tuple[ServingProjectionPayload, ...] = (),
     ) -> LabPageProjectionSnapshot:
         from rquant.factor.result_serving import FACTOR_RESULT_PROJECTION_TABLES
 
@@ -5512,6 +5546,7 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
                     *formula_market_projections,
                     *factor_definition_projections,
                     *factor_result_projections,
+                    *factor_tracking_projections,
                 ),
                 key=lambda item: item.table_name,
             )

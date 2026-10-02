@@ -187,6 +187,20 @@ def test_command_conflict_and_two_workers_claim_once(tmp_path: Path) -> None:
     assert ledger.get(first.job_id).attempts == 1
 
 
+def test_tracking_explicit_claim_never_falls_back_to_another_job(tmp_path: Path) -> None:
+    ledger = _ledger(tmp_path)
+    _, spec = _research_and_spec()
+    first = ledger.submit("original", spec)
+    other = ledger.submit("tracking", spec.model_copy(update={"code_revision": "d" * 40}))
+    assert ledger.claim(lease_seconds=60, job_id="0" * 32) is None
+    assert ledger.get(first.job_id).status == "queued"
+    claimed = ledger.claim(lease_seconds=60, job_id=other.job_id)
+    assert claimed is not None and claimed.job.job_id == other.job_id
+    assert ledger.claim(lease_seconds=60, job_id=other.job_id) is None
+    assert ledger.get(first.job_id).status == "queued"
+    assert ledger.claim(lease_seconds=60).job.job_id == first.job_id
+
+
 def test_expired_lease_rotates_token_and_old_worker_cannot_finish(tmp_path: Path) -> None:
     spec, root, completion = _sealed(tmp_path)
     clock = _Clock()

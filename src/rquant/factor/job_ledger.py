@@ -763,18 +763,27 @@ class FactorEvaluationJobLedger:
                 raise FactorLedgerConflictError("factor command ID has different content")
             return state.public()
 
-    def claim(self, *, lease_seconds: int) -> FactorJobLease | None:
+    def claim(self, *, lease_seconds: int, job_id: str | None = None) -> FactorJobLease | None:
         if type(lease_seconds) is not int or not 1 <= lease_seconds <= _MAX_LEASE_SECONDS:
             raise ValueError("factor lease duration is invalid")
+        if job_id is not None and (type(job_id) is not str or _HEX32.fullmatch(job_id) is None):
+            raise ValueError("factor claim job ID is invalid")
         with self._writer() as connection:
             current = self._now()
             while True:
-                candidate = connection.execute(
-                    "SELECT job_id FROM factor_jobs WHERE status = 'queued' OR "
-                    "(status = 'running' AND lease_expires_at <= ?) "
-                    "ORDER BY created_at, job_id LIMIT 1",
-                    (_time(current),),
-                ).fetchone()
+                if job_id is None:
+                    candidate = connection.execute(
+                        "SELECT job_id FROM factor_jobs WHERE status = 'queued' OR "
+                        "(status = 'running' AND lease_expires_at <= ?) "
+                        "ORDER BY created_at, job_id LIMIT 1",
+                        (_time(current),),
+                    ).fetchone()
+                else:
+                    candidate = connection.execute(
+                        "SELECT job_id FROM factor_jobs WHERE job_id=? AND "
+                        "(status = 'queued' OR (status = 'running' AND lease_expires_at <= ?))",
+                        (job_id, _time(current)),
+                    ).fetchone()
                 if candidate is None:
                     return None
                 state = self._load_job(connection, candidate["job_id"])

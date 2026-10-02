@@ -589,8 +589,33 @@ def build_overview(context: GenerationContext, meta: ServingMeta) -> OverviewDat
         paper=paper,
         services=state_counts([item.status.state for item in services]),
         freshness=_freshness_summary(freshness),
-        attention=_attention(meta, services, freshness, deliveries),
+        attention=(
+            *_tracking_attention(context),
+            *_attention(meta, services, freshness, deliveries),
+        )[:_MAX_ATTENTION],
     )
+
+
+def _tracking_attention(context: GenerationContext) -> list[AttentionItem]:
+    from rquant.web.routes.factor_tracking import _read_tracking
+
+    snapshot = _read_tracking(context.borrowed)
+    if snapshot is None:
+        return []
+    return [
+        AttentionItem(
+            level="warn",
+            title=f"因子 {panel.factor_id} 跟踪诊断失效",
+            reason=panel.summary.reason,
+            to=f"/factors?factor_id={panel.factor_id}&panel=tracking",
+            action="看跟踪",
+        )
+        for panel in snapshot.panels
+        if panel.tracked
+        and panel.status == "active"
+        and panel.summary is not None
+        and panel.summary.invalidated
+    ][:_MAX_ATTENTION]
 
 
 def empty_overview(now: datetime, meta: ServingMeta) -> OverviewData:

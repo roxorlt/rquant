@@ -1146,6 +1146,7 @@ def build_web_fixture(
     strategy_catalog_projections: tuple[ServingProjectionPayload, ...] = (),
     factor_definition_projections: tuple[ServingProjectionPayload, ...] = (),
     factor_result_projections: tuple[ServingProjectionPayload, ...] = (),
+    factor_tracking_projections: tuple[ServingProjectionPayload, ...] = (),
 ) -> ServingGenerationManifest:
     """Publish generation ``sequence`` of ``scenario`` into ``root`` and select it."""
 
@@ -1157,7 +1158,8 @@ def build_web_fixture(
     generations = _generation_ids(scenario, sequence)
     if strategy_catalog_projections:
         if {item.table_name for item in strategy_catalog_projections} != {
-            "strategy_catalog", "strategy_catalog_parameter"
+            "strategy_catalog",
+            "strategy_catalog_parameter",
         }:
             raise ValueError("strategy catalog fixture requires both projections")
         generations["strategy_catalog"] = _digest(
@@ -1302,6 +1304,7 @@ def build_web_fixture(
             *backfill_plan_projections,
             *factor_definition_projections,
             *factor_result_projections,
+            *factor_tracking_projections,
         )
     )
     projections += tuple(

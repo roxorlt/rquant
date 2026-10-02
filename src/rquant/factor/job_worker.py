@@ -97,12 +97,17 @@ def run_one_factor_job(
     lease_seconds: int = 30,
     heartbeat_interval_seconds: float = 5.0,
     heartbeat_join_timeout_seconds: float = 5.0,
+    job_id: str | None = None,
 ) -> FactorJobWorkerResult:
     """Take at most one factor job; never create or repair its ledger."""
     _bounded_timing(lease_seconds, heartbeat_interval_seconds, heartbeat_join_timeout_seconds)
     if not callable(runner_now):
         raise TypeError("factor worker requires a runner clock")
-    claimed = ledger.claim(lease_seconds=lease_seconds)
+    claimed = (
+        ledger.claim(lease_seconds=lease_seconds)
+        if job_id is None
+        else ledger.claim(lease_seconds=lease_seconds, job_id=job_id)
+    )
     if claimed is None:
         return FactorJobWorkerResult(status="idle")
 
