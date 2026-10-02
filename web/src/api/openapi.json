@@ -3529,6 +3529,61 @@
             "minLength": 1,
             "title": "Name Zh",
             "type": "string"
+          },
+          "tracking_supported": {
+            "anyOf": [
+              {
+                "const": false,
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tracking Supported"
+          },
+          "tracking_unavailable_reason_zh": {
+            "anyOf": [
+              {
+                "maxLength": 120,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tracking Unavailable Reason Zh"
+          },
+          "unit": {
+            "anyOf": [
+              {
+                "enum": [
+                  "stored_price",
+                  "indicator",
+                  "percent",
+                  "ratio",
+                  "CNY_10000"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unit"
+          },
+          "value_semantics": {
+            "anyOf": [
+              {
+                "const": "stored_not_recomputed",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Value Semantics"
           }
         },
         "required": [
@@ -5119,7 +5174,10 @@
             "type": "array"
           },
           "version": {
-            "const": "daily_v1",
+            "enum": [
+              "daily_v1",
+              "daily_stored_v1"
+            ],
             "title": "Version",
             "type": "string"
           }
@@ -5181,6 +5239,242 @@
           "definitions"
         ],
         "title": "FactorCatalogData",
+        "type": "object"
+      },
+      "FactorDailyFeatureCounts": {
+        "additionalProperties": false,
+        "properties": {
+          "column": {
+            "enum": [
+              "ma5",
+              "ma10",
+              "ma20",
+              "ma60",
+              "rsi6",
+              "rsi14",
+              "macd",
+              "macd_signal",
+              "macd_hist",
+              "kdj_k",
+              "kdj_d",
+              "kdj_j",
+              "turnover_rate",
+              "volume_ratio",
+              "total_mv",
+              "circ_mv"
+            ],
+            "title": "Column",
+            "type": "string"
+          },
+          "missing": {
+            "minimum": 0.0,
+            "title": "Missing",
+            "type": "integer"
+          },
+          "non_finite": {
+            "minimum": 0.0,
+            "title": "Non Finite",
+            "type": "integer"
+          },
+          "null": {
+            "minimum": 0.0,
+            "title": "Null",
+            "type": "integer"
+          },
+          "valid": {
+            "minimum": 0.0,
+            "title": "Valid",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "column",
+          "valid",
+          "missing",
+          "null",
+          "non_finite"
+        ],
+        "title": "FactorDailyFeatureCounts",
+        "type": "object"
+      },
+      "FactorDailyFeatureCoverageDay": {
+        "additionalProperties": false,
+        "properties": {
+          "computation_stock_count": {
+            "maximum": 7000.0,
+            "minimum": 1.0,
+            "title": "Computation Stock Count",
+            "type": "integer"
+          },
+          "counts": {
+            "items": {
+              "$ref": "#/components/schemas/FactorDailyFeatureCounts"
+            },
+            "maxItems": 16,
+            "minItems": 1,
+            "title": "Counts",
+            "type": "array"
+          },
+          "panel_date": {
+            "format": "date",
+            "title": "Panel Date",
+            "type": "string"
+          },
+          "trade_date": {
+            "format": "date",
+            "title": "Trade Date",
+            "type": "string"
+          }
+        },
+        "required": [
+          "trade_date",
+          "panel_date",
+          "computation_stock_count",
+          "counts"
+        ],
+        "title": "FactorDailyFeatureCoverageDay",
+        "type": "object"
+      },
+      "FactorDailyFeatureSources": {
+        "additionalProperties": false,
+        "description": "The actual dependency subset, omitted entirely for original six-field definitions.",
+        "properties": {
+          "code_commit": {
+            "pattern": "^[0-9a-f]{40}$",
+            "title": "Code Commit",
+            "type": "string"
+          },
+          "fields": {
+            "items": {
+              "$ref": "#/components/schemas/FactorDailyStoredField"
+            },
+            "maxItems": 16,
+            "minItems": 1,
+            "title": "Fields",
+            "type": "array"
+          },
+          "prepared_binding_hash": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Prepared Binding Hash",
+            "type": "string"
+          },
+          "prepared_snapshot_id": {
+            "title": "Prepared Snapshot Id",
+            "type": "string"
+          },
+          "prepared_source_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Prepared Source Sha256",
+            "type": "string"
+          },
+          "price_basis": {
+            "const": "unverified",
+            "default": "unverified",
+            "title": "Price Basis",
+            "type": "string"
+          },
+          "recursive_initialization": {
+            "const": "unverified",
+            "default": "unverified",
+            "title": "Recursive Initialization",
+            "type": "string"
+          },
+          "scope_content_hash": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Scope Content Hash",
+            "type": "string"
+          },
+          "source_mode": {
+            "const": "historical_retrospective",
+            "default": "historical_retrospective",
+            "title": "Source Mode",
+            "type": "string"
+          },
+          "source_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Source Sha256",
+            "type": "string"
+          },
+          "value_semantics": {
+            "const": "stored_not_recomputed",
+            "default": "stored_not_recomputed",
+            "title": "Value Semantics",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_sha256",
+          "prepared_source_sha256",
+          "prepared_snapshot_id",
+          "prepared_binding_hash",
+          "scope_content_hash",
+          "code_commit",
+          "fields"
+        ],
+        "title": "FactorDailyFeatureSources",
+        "type": "object"
+      },
+      "FactorDailyStoredField": {
+        "additionalProperties": false,
+        "properties": {
+          "column": {
+            "enum": [
+              "ma5",
+              "ma10",
+              "ma20",
+              "ma60",
+              "rsi6",
+              "rsi14",
+              "macd",
+              "macd_signal",
+              "macd_hist",
+              "kdj_k",
+              "kdj_d",
+              "kdj_j",
+              "turnover_rate",
+              "volume_ratio",
+              "total_mv",
+              "circ_mv"
+            ],
+            "title": "Column",
+            "type": "string"
+          },
+          "description_zh": {
+            "title": "Description Zh",
+            "type": "string"
+          },
+          "name_zh": {
+            "title": "Name Zh",
+            "type": "string"
+          },
+          "table": {
+            "enum": [
+              "daily_indicator",
+              "daily_basic"
+            ],
+            "title": "Table",
+            "type": "string"
+          },
+          "unit": {
+            "enum": [
+              "stored_price",
+              "indicator",
+              "percent",
+              "ratio",
+              "CNY_10000"
+            ],
+            "title": "Unit",
+            "type": "string"
+          }
+        },
+        "required": [
+          "column",
+          "table",
+          "name_zh",
+          "unit",
+          "description_zh"
+        ],
+        "title": "FactorDailyStoredField",
         "type": "object"
       },
       "FactorDailyStreamCoverage": {
@@ -6971,6 +7265,31 @@
             },
             "title": "Coverage Days",
             "type": "array"
+          },
+          "daily_feature_coverage_days": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/FactorDailyFeatureCoverageDay"
+                },
+                "maxItems": 1024,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Daily Feature Coverage Days"
+          },
+          "daily_features": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FactorDailyFeatureSources"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "decay_periods": {
             "items": {

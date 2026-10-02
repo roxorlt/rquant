@@ -67,6 +67,8 @@ export function FactorEditor({
 }) {
   const [errors, setErrors] = useState<FieldErrors>({});
   const [comparedVersion, setComparedVersion] = useState<string | null>(null);
+  const [fieldSearch, setFieldSearch] = useState("");
+  const [allFields, setAllFields] = useState(false);
   const nameRef = useRef<HTMLInputElement>(null);
   const expressionRef = useRef<HTMLTextAreaElement>(null);
   if (draft === null) return null;
@@ -85,6 +87,7 @@ export function FactorEditor({
     setErrors({});
   };
   const insertField = (column: string) => {
+    if (busy || !canSave || !capabilities?.fields.some((field) => field.column === column)) return;
     const input = expressionRef.current;
     const start = input?.selectionStart ?? draft.expression.length;
     const end = input?.selectionEnd ?? draft.expression.length;
@@ -105,6 +108,15 @@ export function FactorEditor({
   };
   const currentVersionKey = `${currentGeneration}:${currentDefinition?.factor_id}:${currentDefinition?.version}:${currentDefinition?.content_sha256}`;
   const comparisonOpen = comparedVersion === currentVersionKey && currentDefinition !== null;
+  const fields = capabilities?.fields ?? [];
+  const search = fieldSearch.trim().toLocaleLowerCase();
+  const visibleFields = search
+    ? fields.filter((field) =>
+        `${field.name_zh} ${field.column}`.toLocaleLowerCase().includes(search),
+      )
+    : allFields
+      ? fields
+      : fields.slice(0, 6);
   return (
     <SideDrawer
       open={open}
@@ -243,23 +255,65 @@ export function FactorEditor({
         </div>
         <div className="factor-editor-help">
           <span>日线字段</span>
-          <Tip content="字段和算子支持不代表历史数据已覆盖；实际数据范围在检验时核对。">
-            字段说明
-          </Tip>
+          <div className="factor-editor-field-tools">
+            <Tip content={capabilities?.coverage_note_zh ?? "字段能力暂时无法核对。"}>字段说明</Tip>
+            {fields.length > 6 ? (
+              <Button
+                size="sm"
+                variant="ghost"
+                aria-expanded={allFields}
+                onClick={() => setAllFields(!allFields)}
+              >
+                {allFields ? "收起字段" : "全部字段"}
+              </Button>
+            ) : null}
+          </div>
         </div>
+        <input
+          className="inp factor-editor-search"
+          type="search"
+          aria-label="搜索日线字段"
+          placeholder="按中文名搜索字段"
+          value={fieldSearch}
+          maxLength={64}
+          onChange={(event) => setFieldSearch(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") event.preventDefault();
+          }}
+        />
         <div className="factor-editor-fields">
-          {capabilities?.fields.map((field) => (
-            <Tip key={field.column} content={field.description_zh} interactive>
+          {visibleFields.map((field) => (
+            <div className="factor-editor-field-choice" key={field.column}>
               <Button
                 size="sm"
                 aria-label={`插入${field.name_zh}`}
+                disabled={busy || !canSave}
                 onClick={() => insertField(field.column)}
               >
                 {field.name_zh}
               </Button>
-            </Tip>
+              <Tip content={field.description_zh} interactive>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  aria-label={`${field.name_zh}说明`}
+                  className="factor-editor-field-info"
+                >
+                  <span aria-hidden="true">ⓘ</span>
+                </Button>
+              </Tip>
+            </div>
           ))}
         </div>
+        {fields.length === 0 ? (
+          <p className="factor-editor-note" role="status">
+            字段暂时无法核对，请刷新后再插入。
+          </p>
+        ) : visibleFields.length === 0 ? (
+          <p className="factor-editor-note" role="status">
+            没有匹配的字段
+          </p>
+        ) : null}
         <label className="factor-editor-field">
           <span>
             表达式{" "}

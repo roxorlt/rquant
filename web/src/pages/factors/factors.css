@@ -313,3 +313,20 @@
     padding: 10px;
   }
 }
+.factor-daily-coverage-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin: 12px 0;
+}
+
+.factor-daily-coverage-head label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.factor-daily-coverage-head .inp {
+  min-height: 44px;
+}

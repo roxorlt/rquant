@@ -3,6 +3,7 @@ import { ApiError } from "@/api/client";
 import {
   type FactorDefinitionItem,
   postFactorTracking,
+  useFactorCapabilities,
   useFactorTrackingPanel,
 } from "@/api/factors";
 import { useCurrentMeta } from "@/api/useMeta";
@@ -64,6 +65,12 @@ export function useFactorTracking({
   const originalQuery = useFactorTrackingPanel(
     generationId,
     operation?.request.factor_id ?? null,
+    viewer,
+    permissionRevision,
+  );
+  const capabilities = useFactorCapabilities(
+    generationId,
+    catalogVerified && panelQuery.data?.can_set_tracked === true,
     viewer,
     permissionRevision,
   );
@@ -137,7 +144,27 @@ export function useFactorTracking({
     !hasDefinitionCommand() &&
     storageReady &&
     navigator.locks !== undefined;
-  const canJoin = canStart && selected !== null && !selected.archived;
+  const capabilitiesVerified =
+    metaVerified &&
+    catalogVerified &&
+    capabilities.serving?.generation_id === generationId &&
+    capabilities.serving?.state === "ready" &&
+    capabilities.data !== undefined &&
+    !capabilities.error &&
+    !capabilities.isFetching;
+  const unsupported = selected?.dependency_columns.map((column) =>
+    capabilities.data?.fields.find((field) => field.column === column),
+  );
+  const joinBlockedReason = !capabilitiesVerified
+    ? "字段能力暂时无法核对，请刷新后再加入跟踪。"
+    : unsupported?.some((field) => field === undefined)
+      ? "当前数据缺少该因子需要的字段，请核对后再加入跟踪。"
+      : (unsupported?.find((field) => field?.tracking_supported === false)
+          ?.tracking_unavailable_reason_zh ??
+        (unsupported?.some((field) => field?.tracking_supported === false)
+          ? "该因子的字段暂不支持持续跟踪。"
+          : null));
+  const canJoin = canStart && selected !== null && !selected.archived && joinBlockedReason === null;
   const canCancel = canStart && panel?.tracked === true;
   const confirmationCurrent =
     confirmation !== null &&
@@ -514,6 +541,7 @@ export function useFactorTracking({
     canContinue,
     canJoin,
     canCancel,
+    joinBlockedReason,
     blockedReason,
     status,
     completed,

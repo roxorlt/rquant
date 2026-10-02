@@ -1,6 +1,7 @@
 import { HttpResponse, http } from "msw";
 import { setupServer } from "msw/node";
 import type { Schemas } from "@/api/client";
+import { dailyCapability } from "../pages/factors/factorDailyFields.fixture";
 import {
   channelsEnvelope,
   healthEnvelope,
@@ -109,6 +110,19 @@ export const factorTrackingUnavailableHandler = () =>
     return HttpResponse.json({ data, serving: metaEnvelope().serving });
   });
 
+export const factorCapabilitiesHandler = () =>
+  http.get("*/api/v1/factors/capabilities", () =>
+    HttpResponse.json({
+      data: {
+        ...dailyCapability,
+        can_save: false,
+        version: "daily_v1",
+        fields: dailyCapability.fields.slice(0, 6),
+      },
+      serving: metaEnvelope().serving,
+    }),
+  );
+
 export const manualWatchlistUnavailableHandler = () =>
   http.get("*/api/v1/watchlist", () =>
     HttpResponse.json({
@@ -157,6 +171,7 @@ export const server = setupServer(
   factorResultsUnavailableHandler(),
   factorRunUnavailableHandler(),
   factorTrackingUnavailableHandler(),
+  factorCapabilitiesHandler(),
   manualWatchlistUnavailableHandler(),
   manualWatchlistExactUnavailableHandler(),
 );

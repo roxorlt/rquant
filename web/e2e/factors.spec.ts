@@ -1,5 +1,6 @@
 import { expect, test } from "@playwright/test";
 import type { MetaEnvelope, Schemas } from "../src/api/client.ts";
+import { dailyCapability } from "../src/pages/factors/factorDailyFields.fixture.ts";
 import rejectionContract from "../src/pages/factors/factorDiagnosticsRejection.fixture.json" with {
   type: "json",
 };
@@ -41,6 +42,19 @@ for (const viewport of [
         metadata.serving.generation_id = generationId;
       };
       await page.route("**/api/v1/meta", (route) => route.fulfill({ json: metadata }));
+      await page.route("**/api/v1/factors/capabilities", (route) =>
+        route.fulfill({
+          json: {
+            data: {
+              ...dailyCapability,
+              can_save: false,
+              version: "daily_v1",
+              fields: dailyCapability.fields.slice(0, 6),
+            },
+            serving: metadata.serving,
+          } satisfies Schemas["Envelope_FactorCapabilitiesData_"],
+        }),
+      );
       await page.route("**/api/v1/factors/definitions*", (route) =>
         route.fulfill({
           json: {

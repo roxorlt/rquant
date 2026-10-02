@@ -20,6 +20,7 @@ import {
 } from "@/format/number";
 import { type DataColumn, DataTable } from "@/table/DataTable";
 import { Button, EmptyState, Panel, Pill, RelativeTime, Segmented, Tip } from "@/ui";
+import { FactorDailyFeatures } from "./FactorDailyFeatures";
 import {
   autocorrelationOption,
   decayOption,
@@ -483,6 +484,7 @@ function Research({
         {research.context_note ? <Tip content={research.context_note}>样本说明</Tip> : null}
         {partial ? <span className="factor-partial">部分日期可计算</span> : null}
       </div>
+      <FactorDailyFeatures research={"schema_version" in research ? research : null} />
       <div className="factor-research-top">
         <section className="factor-result-section" aria-label="IC 统计">
           <div className="factor-section-head">

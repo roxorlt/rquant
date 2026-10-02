@@ -2473,6 +2473,14 @@ export interface components {
             description_zh: string;
             /** Name Zh */
             name_zh: string;
+            /** Tracking Supported */
+            tracking_supported?: false | null;
+            /** Tracking Unavailable Reason Zh */
+            tracking_unavailable_reason_zh?: string | null;
+            /** Unit */
+            unit?: ("stored_price" | "indicator" | "percent" | "ratio" | "CNY_10000") | null;
+            /** Value Semantics */
+            value_semantics?: "stored_not_recomputed" | null;
         };
         /** DataAuditHealthData */
         DataAuditHealthData: {
@@ -2998,9 +3006,9 @@ export interface components {
             unavailable_operators: components["schemas"]["UnavailableFactorOperator"][];
             /**
              * Version
-             * @constant
+             * @enum {string}
              */
-            version: "daily_v1";
+            version: "daily_v1" | "daily_stored_v1";
         };
         /** FactorCatalogData */
         FactorCatalogData: {
@@ -3023,6 +3031,105 @@ export interface components {
             can_save: boolean;
             /** Definitions */
             definitions: components["schemas"]["FactorDefinitionItem"][];
+        };
+        /** FactorDailyFeatureCounts */
+        FactorDailyFeatureCounts: {
+            /**
+             * Column
+             * @enum {string}
+             */
+            column: "ma5" | "ma10" | "ma20" | "ma60" | "rsi6" | "rsi14" | "macd" | "macd_signal" | "macd_hist" | "kdj_k" | "kdj_d" | "kdj_j" | "turnover_rate" | "volume_ratio" | "total_mv" | "circ_mv";
+            /** Missing */
+            missing: number;
+            /** Non Finite */
+            non_finite: number;
+            /** Null */
+            null: number;
+            /** Valid */
+            valid: number;
+        };
+        /** FactorDailyFeatureCoverageDay */
+        FactorDailyFeatureCoverageDay: {
+            /** Computation Stock Count */
+            computation_stock_count: number;
+            /** Counts */
+            counts: components["schemas"]["FactorDailyFeatureCounts"][];
+            /**
+             * Panel Date
+             * Format: date
+             */
+            panel_date: string;
+            /**
+             * Trade Date
+             * Format: date
+             */
+            trade_date: string;
+        };
+        /**
+         * FactorDailyFeatureSources
+         * @description The actual dependency subset, omitted entirely for original six-field definitions.
+         */
+        FactorDailyFeatureSources: {
+            /** Code Commit */
+            code_commit: string;
+            /** Fields */
+            fields: components["schemas"]["FactorDailyStoredField"][];
+            /** Prepared Binding Hash */
+            prepared_binding_hash: string;
+            /** Prepared Snapshot Id */
+            prepared_snapshot_id: string;
+            /** Prepared Source Sha256 */
+            prepared_source_sha256: string;
+            /**
+             * Price Basis
+             * @default unverified
+             * @constant
+             */
+            price_basis: "unverified";
+            /**
+             * Recursive Initialization
+             * @default unverified
+             * @constant
+             */
+            recursive_initialization: "unverified";
+            /** Scope Content Hash */
+            scope_content_hash: string;
+            /**
+             * Source Mode
+             * @default historical_retrospective
+             * @constant
+             */
+            source_mode: "historical_retrospective";
+            /** Source Sha256 */
+            source_sha256: string;
+            /**
+             * Value Semantics
+             * @default stored_not_recomputed
+             * @constant
+             */
+            value_semantics: "stored_not_recomputed";
+        };
+        /** FactorDailyStoredField */
+        FactorDailyStoredField: {
+            /**
+             * Column
+             * @enum {string}
+             */
+            column: "ma5" | "ma10" | "ma20" | "ma60" | "rsi6" | "rsi14" | "macd" | "macd_signal" | "macd_hist" | "kdj_k" | "kdj_d" | "kdj_j" | "turnover_rate" | "volume_ratio" | "total_mv" | "circ_mv";
+            /** Description Zh */
+            description_zh: string;
+            /** Name Zh */
+            name_zh: string;
+            /**
+             * Table
+             * @enum {string}
+             */
+            table: "daily_indicator" | "daily_basic";
+            /**
+             * Unit
+             * @enum {string}
+             */
+            unit: "stored_price" | "indicator" | "percent" | "ratio" | "CNY_10000";
         };
         /**
          * FactorDailyStreamCoverage
@@ -3651,6 +3758,9 @@ export interface components {
             context_note?: string | null;
             /** Coverage Days */
             coverage_days: components["schemas"]["FactorStreamDisplayCoverageDay"][];
+            /** Daily Feature Coverage Days */
+            daily_feature_coverage_days?: components["schemas"]["FactorDailyFeatureCoverageDay"][] | null;
+            daily_features?: components["schemas"]["FactorDailyFeatureSources"] | null;
             /** Decay Periods */
             decay_periods: components["schemas"]["FactorDisplayDecayPeriod"][];
             extended_statistics?: components["schemas"]["FactorExtendedStatistics"] | null;

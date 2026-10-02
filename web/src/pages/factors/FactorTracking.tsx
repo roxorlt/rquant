@@ -41,7 +41,9 @@ export function FactorTrackingAction({ tracking }: { tracking: Tracking }) {
       <Button
         size="sm"
         disabledReason={
-          !tracking.canJoin ? (tracking.blockedReason ?? "暂时不能加入跟踪。") : undefined
+          !tracking.canJoin
+            ? (tracking.blockedReason ?? tracking.joinBlockedReason ?? "暂时不能加入跟踪。")
+            : undefined
         }
         onClick={tracking.open}
       >

@@ -934,7 +934,7 @@ export default function FactorsPage() {
       <FactorEditor
         draft={editorDraft}
         open={editorOpen}
-        capabilities={capabilities.data}
+        capabilities={saveAvailable ? capabilities.data : undefined}
         catalog={catalog.data}
         currentDefinition={draftCurrentRow}
         currentGeneration={currentGeneration}

@@ -8,6 +8,7 @@ import { metaEnvelope } from "@/test/fixtures";
 import { findJargon } from "@/test/jargon";
 import { renderApp } from "@/test/render";
 import { server } from "@/test/server";
+import { dailyCapability } from "./factorDailyFields.fixture";
 import {
   anotherFactor,
   trackedFactor,
@@ -26,6 +27,17 @@ vi.mock("@/charts/EChart", () => ({
 }));
 function publish(panel = trackingPanel(), rows = [trackedFactor], generation = trackingGeneration) {
   server.use(
+    http.get("*/api/v1/factors/capabilities", () =>
+      HttpResponse.json({
+        data: {
+          ...dailyCapability,
+          can_save: false,
+          version: "daily_v1",
+          fields: dailyCapability.fields.slice(0, 6),
+        },
+        serving: metaEnvelope({ generationId: generation }).serving,
+      }),
+    ),
     http.get("*/api/v1/meta", () => HttpResponse.json(metaEnvelope({ generationId: generation }))),
     http.get("*/api/v1/factors/definitions", () =>
       HttpResponse.json({
@@ -305,9 +317,9 @@ it("暂停旧版本保留历史统计，重新加入绑定新版head并请求新
     }),
   );
   renderApp("/factors");
-  const button = await screen.findByRole("button", { name: "重新加入" });
-  await waitFor(() => expect(button).toBeEnabled());
-  await userEvent.click(button);
+  await screen.findByRole("button", { name: "重新加入" });
+  await waitFor(() => expect(screen.getByRole("button", { name: "重新加入" })).toBeEnabled());
+  await userEvent.click(screen.getByRole("button", { name: "重新加入" }));
   const dialog = await screen.findByRole("dialog", { name: "加入因子跟踪" });
   expect(dialog).toHaveTextContent("第 3 版");
   await userEvent.click(within(dialog).getByRole("button", { name: "确认加入" }));
