@@ -668,11 +668,14 @@ test("归档确认、刷新续查及手机布局", async ({ page }) => {
   const nextGeneration = "e".repeat(64);
   let published = false;
   const commandIds: string[] = [];
+  const trackingGenerations: string[] = [];
   await page.route(/\/api\/v1\/factors\/price_volume_factor\/tracking(?:\?.*)?$/, (route) => {
-    const currentServing = published ? { ...serving, generation_id: nextGeneration } : serving;
-    expect(new URL(route.request().url()).searchParams.get("generation_id")).toBe(
-      currentServing.generation_id,
-    );
+    const generationId = new URL(route.request().url()).searchParams.get("generation_id");
+    expect(generationId).not.toBeNull();
+    expect([serving.generation_id, nextGeneration]).toContain(generationId);
+    trackingGenerations.push(generationId ?? "");
+    // A query may already have captured the previous generation when publication arrives.
+    const requestedServing = { ...serving, generation_id: generationId };
     return route.fulfill({
       json: {
         data: trackingPanel({
@@ -682,7 +685,7 @@ test("归档确认、刷新续查及手机布局", async ({ page }) => {
           reason: "跟踪数据尚未发布。",
           can_set_tracked: false,
         }),
-        serving: currentServing,
+        serving: requestedServing,
       } satisfies Schemas["Envelope_FactorTrackingPanel_"],
     });
   });
@@ -756,6 +759,7 @@ test("归档确认、刷新续查及手机布局", async ({ page }) => {
   await page.screenshot({ path: "test-results/factors-archive-desktop.png", fullPage: true });
   await page.reload();
   await expect(page.getByText("已归档，历史记录仍会保留。")).toBeVisible();
+  await expect.poll(() => trackingGenerations.includes(nextGeneration)).toBe(true);
   expect(commandIds).toHaveLength(2);
   expect(commandIds[0]).toBe(commandIds[1]);
   await page.setViewportSize({ width: 390, height: 844 });
