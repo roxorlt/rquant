@@ -2478,9 +2478,9 @@ export interface components {
             /** Tracking Unavailable Reason Zh */
             tracking_unavailable_reason_zh?: string | null;
             /** Unit */
-            unit?: ("stored_price" | "indicator" | "percent" | "ratio" | "CNY_10000") | null;
+            unit?: ("stored_price" | "session_price" | "indicator" | "percent" | "ratio" | "CNY_10000") | null;
             /** Value Semantics */
-            value_semantics?: "stored_not_recomputed" | null;
+            value_semantics?: ("stored_not_recomputed" | "history_derived") | null;
         };
         /** DataAuditHealthData */
         DataAuditHealthData: {
@@ -3008,7 +3008,7 @@ export interface components {
              * Version
              * @enum {string}
              */
-            version: "daily_v1" | "daily_stored_v1";
+            version: "daily_v1" | "daily_stored_v1" | "daily_derived_v1";
         };
         /** FactorCatalogData */
         FactorCatalogData: {
@@ -3045,6 +3045,8 @@ export interface components {
             non_finite: number;
             /** Null */
             null: number;
+            /** Reasons */
+            reasons?: components["schemas"]["FactorDailyFeatureReasonCount"][];
             /** Valid */
             valid: number;
         };
@@ -3065,6 +3067,16 @@ export interface components {
              */
             trade_date: string;
         };
+        /** FactorDailyFeatureReasonCount */
+        FactorDailyFeatureReasonCount: {
+            /** Count */
+            count: number;
+            /**
+             * Reason
+             * @enum {string}
+             */
+            reason: "insufficient_window" | "no_initialization" | "history_break" | "missing_observation" | "derived_non_finite";
+        };
         /**
          * FactorDailyFeatureSources
          * @description The actual dependency subset, omitted entirely for original six-field definitions.
@@ -3083,15 +3095,15 @@ export interface components {
             /**
              * Price Basis
              * @default unverified
-             * @constant
+             * @enum {string}
              */
-            price_basis: "unverified";
+            price_basis: "unverified" | "observation_factor_then_output_session_scale";
             /**
              * Recursive Initialization
              * @default unverified
-             * @constant
+             * @enum {string}
              */
-            recursive_initialization: "unverified";
+            recursive_initialization: "unverified" | "first_valid_observation_no_restart";
             /** Scope Content Hash */
             scope_content_hash: string;
             /**
@@ -3102,12 +3114,13 @@ export interface components {
             source_mode: "historical_retrospective";
             /** Source Sha256 */
             source_sha256: string;
+            technical_history?: components["schemas"]["FactorTechnicalHistorySummary"] | null;
             /**
              * Value Semantics
              * @default stored_not_recomputed
-             * @constant
+             * @enum {string}
              */
-            value_semantics: "stored_not_recomputed";
+            value_semantics: "stored_not_recomputed" | "history_derived";
         };
         /** FactorDailyStoredField */
         FactorDailyStoredField: {
@@ -3129,7 +3142,9 @@ export interface components {
              * Unit
              * @enum {string}
              */
-            unit: "stored_price" | "indicator" | "percent" | "ratio" | "CNY_10000";
+            unit: "stored_price" | "session_price" | "indicator" | "percent" | "ratio" | "CNY_10000";
+            /** Value Semantics */
+            value_semantics?: "history_derived" | null;
         };
         /**
          * FactorDailyStreamCoverage
@@ -3813,6 +3828,55 @@ export interface components {
              * @enum {string}
              */
             summary_status: "evaluated" | "no_samples";
+        };
+        /** FactorTechnicalHistoryPolicy */
+        FactorTechnicalHistoryPolicy: {
+            /**
+             * Absent Bar
+             * @default no_synthetic_observation
+             * @constant
+             */
+            absent_bar: "no_synthetic_observation";
+            /**
+             * Algorithm Version
+             * @default rquant-ta-0.11.0-v1
+             * @constant
+             */
+            algorithm_version: "rquant-ta-0.11.0-v1";
+            /**
+             * Bad Observation
+             * @default blocks_reliable_suffix
+             * @constant
+             */
+            bad_observation: "blocks_reliable_suffix";
+            /** Implementation Sha256 */
+            implementation_sha256: string;
+            /**
+             * Initialization
+             * @default first_valid_observation_no_restart
+             * @constant
+             */
+            initialization: "first_valid_observation_no_restart";
+            /**
+             * Price Basis
+             * @default observation_factor_then_output_session_scale
+             * @constant
+             */
+            price_basis: "observation_factor_then_output_session_scale";
+        };
+        /** FactorTechnicalHistorySummary */
+        FactorTechnicalHistorySummary: {
+            /** Broken Codes */
+            broken_codes: number;
+            /** Initialized Codes */
+            initialized_codes: number;
+            /** Leading Invalid Observations */
+            leading_invalid_observations: number;
+            policy: components["schemas"]["FactorTechnicalHistoryPolicy"];
+            /** Source History Start */
+            source_history_start: string | null;
+            /** Uninitialized Codes */
+            uninitialized_codes: number;
         };
         /** FactorTrackingOperationResult */
         FactorTrackingOperationResult: {

@@ -5,11 +5,23 @@ import { type DataColumn, DataTable } from "@/table/DataTable";
 import { EmptyState, Tip } from "@/ui";
 
 type CoverageDay = NonNullable<FactorResearchDisplayV2["daily_feature_coverage_days"]>[number];
+type CoverageReason = NonNullable<CoverageDay["counts"][number]["reasons"]>[number]["reason"];
+
+const reasonLabels: Record<CoverageReason, string> = {
+  insufficient_window: "窗口不足",
+  no_initialization: "缺少初始化历史",
+  history_break: "历史断裂",
+  missing_observation: "缺少观察记录",
+  derived_non_finite: "推导值无效",
+};
 
 export function FactorDailyFeatures({ research }: { research: FactorResearchDisplayV2 | null }) {
   const [requestedField, setRequestedField] = useState<string | null>(null);
   const source = research?.daily_features;
   if (!source) return null;
+  const hasDerived = source.fields.some((field) => field.value_semantics === "history_derived");
+  const hasTechnical = source.fields.some((field) => field.table === "daily_indicator");
+  const history = hasDerived ? source.technical_history : null;
   const selectedField =
     source.fields.find((field) => field.column === requestedField) ?? source.fields[0];
   const days = research?.daily_feature_coverage_days;
@@ -33,11 +45,24 @@ export function FactorDailyFeatures({ research }: { research: FactorResearchDisp
       header: "有效 / 范围",
       value: (day) => count(day)?.valid ?? null,
       numeric: true,
-      cell: (day) => (
-        <span className="num">
-          {formatCount(count(day)?.valid)} / {formatCount(day.computation_stock_count)}
-        </span>
-      ),
+      cell: (day) => {
+        const item = count(day);
+        const value = `${formatCount(item?.valid)} / ${formatCount(day.computation_stock_count)}`;
+        return item?.reasons?.length ? (
+          <Tip
+            className="num"
+            content={item.reasons.map((reason) => (
+              <div key={reason.reason}>
+                {reasonLabels[reason.reason]}：{formatCount(reason.count)}
+              </div>
+            ))}
+          >
+            {value}
+          </Tip>
+        ) : (
+          <span className="num">{value}</span>
+        );
+      },
     },
     {
       id: "missing",
@@ -68,9 +93,24 @@ export function FactorDailyFeatures({ research }: { research: FactorResearchDisp
         <Tip
           content={
             <>
-              已存日线原值，未重新计算；缺值不补填。
-              {source.price_basis === "unverified" ||
-              source.recursive_initialization === "unverified" ? (
+              {hasDerived
+                ? "按各字段实际来源展示；缺值不补填。"
+                : "已存日线原值，未重新计算；缺值不补填。"}
+              {hasDerived &&
+              source.recursive_initialization === "first_valid_observation_no_restart" ? (
+                <div>从首个有效历史观察初始化；历史断裂后不重新初始化，不补K线。</div>
+              ) : null}
+              {history ? (
+                <div>
+                  历史起点 {history.source_history_start ?? "—"}；已初始化{" "}
+                  {formatCount(history.initialized_codes)}，未初始化{" "}
+                  {formatCount(history.uninitialized_codes)}，历史断裂{" "}
+                  {formatCount(history.broken_codes)}。
+                </div>
+              ) : null}
+              {hasTechnical &&
+              (source.price_basis === "unverified" ||
+                source.recursive_initialization === "unverified") ? (
                 <>
                   <br />
                   指标价格基准与初始化未核验。
@@ -78,7 +118,9 @@ export function FactorDailyFeatures({ research }: { research: FactorResearchDisp
               ) : null}
               {source.fields.map((field) => (
                 <div key={field.column}>
-                  {field.name_zh}：{field.description_zh}
+                  {field.name_zh}（
+                  {field.value_semantics === "history_derived" ? "历史推导" : "库存原值"}
+                  ）：{field.description_zh}
                 </div>
               ))}
             </>
