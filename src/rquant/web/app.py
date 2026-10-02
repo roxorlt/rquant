@@ -59,6 +59,7 @@ from rquant.web.routes import (
     factor_results,
     factor_runs,
     factor_saves,
+    factor_tracking,
     factors,
     formula_market_commands,
     formula_market_read,
@@ -91,6 +92,7 @@ if TYPE_CHECKING:
     from rquant.alert_ack_admission import AckAdmissionClient
     from rquant.factor_definition_admission import FactorDefinitionAdmissionClient
     from rquant.factor_run_admission import FactorRunAdmissionClient
+    from rquant.factor_tracking_admission import FactorTrackingAdmissionClient
     from rquant.watchlist_admission import WatchlistAdmissionClient
 
 API_TITLE = "rQuant Web API"
@@ -138,6 +140,7 @@ class WebContext:
     watchlist_admission: WatchlistAdmissionClient | None
     factor_admission: FactorDefinitionAdmissionClient | None
     factor_run_admission: FactorRunAdmissionClient | None
+    factor_tracking_admission: FactorTrackingAdmissionClient | None
     unit_log_client: UnitLogClient | None
     unit_log_access_audit: ServiceLogAccessAudit | None
     unit_log_gate: threading.BoundedSemaphore
@@ -160,6 +163,7 @@ def create_app(
     watchlist_admission_client: WatchlistAdmissionClient | None = None,
     factor_admission_client: FactorDefinitionAdmissionClient | None = None,
     factor_run_admission_client: FactorRunAdmissionClient | None = None,
+    factor_tracking_admission_client: FactorTrackingAdmissionClient | None = None,
     unit_log_client: UnitLogClient | None = None,
     unit_log_access_audit: ServiceLogAccessAudit | None = None,
     backfill_plan_command_transport: BackfillPlanCommandTransport | None = None,
@@ -252,6 +256,18 @@ def create_app(
             expected_service_uid=settings.factor_run_admission_service_uid,
             shared_gid=settings.factor_run_admission_shared_gid,
         )
+    configured_factor_tracking = None
+    if settings.factor_tracking_admission_socket_path is not None:
+        from rquant.factor_tracking_admission import FactorTrackingAdmissionClient
+
+        configured_factor_tracking = (
+            factor_tracking_admission_client
+            or FactorTrackingAdmissionClient(
+                settings.factor_tracking_admission_socket_path,
+                expected_service_uid=settings.factor_tracking_admission_service_uid,
+                shared_gid=settings.factor_tracking_admission_shared_gid,
+            )
+        )
     configured_unit_log = None
     if settings.unit_log_socket_path is not None:
         assert settings.unit_log_service_uid is not None
@@ -304,6 +320,7 @@ def create_app(
         watchlist_admission=configured_watchlist_admission,
         factor_admission=configured_factor_admission,
         factor_run_admission=configured_factor_run,
+        factor_tracking_admission=configured_factor_tracking,
         unit_log_client=configured_unit_log,
         unit_log_access_audit=unit_log_access_audit,
         unit_log_gate=threading.BoundedSemaphore(1),
@@ -335,6 +352,12 @@ def create_app(
             body_limit = factor_saves.MAX_SAVE_REQUEST_BYTES
         if body_limit is None and _FACTOR_RUN_WRITE.fullmatch(request.url.path):
             body_limit = factor_runs.MAX_RUN_REQUEST_BYTES
+        if request.url.path in (
+            "/api/v1/factors/tracking/commands",
+            "/api/v1/factors/tracking/commands/resume",
+            "/api/v1/factors/tracking/commands/retry",
+        ):
+            body_limit = factor_tracking.MAX_TRACKING_REQUEST_BYTES
         if request.method == "POST" and body_limit is not None:
             content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
             if content_type != "application/json":
@@ -431,6 +454,9 @@ def create_app(
     )
     app.include_router(factors.router, prefix="/api/v1", tags=["factors"], dependencies=private)
     app.include_router(factor_runs.router, prefix="/api/v1", tags=["factors"], dependencies=private)
+    app.include_router(
+        factor_tracking.router, prefix="/api/v1", tags=["factors"], dependencies=private
+    )
     app.include_router(
         factor_saves.router, prefix="/api/v1", tags=["factors"], dependencies=private
     )

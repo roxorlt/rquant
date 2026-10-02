@@ -53,3 +53,10 @@ root在唯一集中终审accept后，复用现有真实原件及只读副本做�
 一次独立终审集中覆盖SPEC、冻结diff、直接依赖/测试及上述失败模型。稳定ID为 `FT-FINAL-*`；原实现者修复、原审查者定向复核，最多3轮，P2仅可复现违反本片不变量/验收才阻断。范围外问题进入backlog；不额外叠加每子任务/两阶段审查、重复全量或自动架构重设计。
 
 排除CSI完整历史、其他C3.2统计、分钟/竞价新来源、正式配置/数据代/最大负载、生产infra/定时器安装、推送、切流和停Streamlit；它们仍在整体goal后续范围，不重复讨论方向。子代理只在指定干净cdx树离线实现，不继续委派，不访问网络、.env、真实凭据/数据或生产，不调用第三方模型或绕过平台控制。未完成/有阻断/权限或写集越界时冻结证据并交root，不能宣称功能已迁移。
+
+## 实施证据：接口冻结（后台仍在实施）
+
+- 实际产品 Codex desktop，原生子任务 `/root/factor_security_collection_impl`，角色 implementer，父 `/root`；指定树 `cdx-factor-tracking`、分支 `cdx/20261002-factor-tracking`，写前实际 HEAD `e38aee99af619ef4b85774bcfa495bf047545b62` 且 clean。身份、环境及命令证据根 `/private/tmp/rquant-tracking-implementation-NKpV3Fag`，未访问外部网络、真实资料、凭据或 `.env`，未委派。
+- 冻结用户合同为 `FactorTrackingRequest/OperationResult/Receipt/Panel/Summary`：用户仅选择 factor_id/tracked，原命令、UTC时间、head、Serving代及可选跟踪代提供恢复与并发保护；来源/路径/actor/策略不可由客户端指定。GET `/api/v1/factors/{factor_id}/tracking`，POST `/api/v1/factors/tracking/commands`、`/resume`、`/retry`。开关独立默认关闭，精确原命令恢复先于新的 Serving/配置预检。
+- 新14个唯一聚焦节点有效绿证据：领域7、可信 PageControl3、Web3、真实合成 UDS1；缺实现红测为 `domain-missing-red`、`control-red`、`web-contract-feature-red`。各 log/JSON/JUnit 原件在上述证据根。Web私有证明夹具曾被 `/private/tmp` 可写父目录真实拒绝，改为本树内自有0700临时目录及0400合成证明，未改变平台/产品权限校验，测试后自动移除。UDS listener 已 shutdown/join/server_close，socket 与自有目录删除均有断言。
+- 本次接口提交只供前端并行接续；增量计划/前缀/贡献提交、完整 Serving 生产接线及 CLI 尚未完成，不据此宣称 C3.3 完成。最终候选仍由 root 统一门禁和一次集中审查。

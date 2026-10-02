@@ -127,6 +127,11 @@ class WebSettings(BaseModel):
     factor_admission_shared_gid: StrictInt | None = None
     factor_editor_users: frozenset[str] = frozenset()
     factor_save_enabled: bool = False
+    factor_tracking_enabled: bool = False
+    factor_tracking_users: frozenset[str] = frozenset()
+    factor_tracking_admission_socket_path: Path | None = None
+    factor_tracking_admission_service_uid: StrictInt | None = None
+    factor_tracking_admission_shared_gid: StrictInt | None = None
     factor_run_enabled: bool = False
     factor_run_users: frozenset[str] = frozenset()
     factor_run_admission_socket_path: Path | None = None
@@ -199,6 +204,35 @@ class WebSettings(BaseModel):
             self.factor_admission_socket_path is None or not self.factor_editor_users
         ):
             raise ValueError("factor save requires a configured private factor admission")
+        tracking_fields = (
+            self.factor_tracking_admission_socket_path,
+            self.factor_tracking_admission_service_uid,
+            self.factor_tracking_admission_shared_gid,
+        )
+        if (
+            any(v is not None for v in tracking_fields)
+            or self.factor_tracking_users
+            or self.factor_tracking_enabled
+        ):
+            if (
+                not all(v is not None for v in tracking_fields)
+                or not self.factor_tracking_users
+                or self.ingress_socket_path is None
+            ):
+                raise ValueError("factor tracking requires private ingress, socket, IDs and users")
+            if self.factor_tracking_admission_service_uid == os.geteuid():
+                raise ValueError("factor tracking service UID must differ from Web UID")
+            reserved = {self.ingress_socket_path.parent}
+            for path in (
+                self.ack_admission_socket_path,
+                self.watchlist_admission_socket_path,
+                self.factor_admission_socket_path,
+                self.factor_run_admission_socket_path,
+            ):
+                if path is not None:
+                    reserved.add(path.parent)
+            if self.factor_tracking_admission_socket_path.parent in reserved:
+                raise ValueError("factor tracking admission needs a separate private directory")
         run_fields = (
             self.factor_run_admission_socket_path,
             self.factor_run_admission_service_uid,
@@ -298,7 +332,11 @@ class WebSettings(BaseModel):
         return value
 
     @field_validator(
-        "log_admin_users", "lab_control_users", "factor_editor_users", "factor_run_users"
+        "log_admin_users",
+        "lab_control_users",
+        "factor_editor_users",
+        "factor_run_users",
+        "factor_tracking_users",
     )
     @classmethod
     def validate_operator_users(cls, value: frozenset[str]) -> frozenset[str]:
@@ -313,7 +351,11 @@ class WebSettings(BaseModel):
             raise ValueError("read-only result root must be absolute and canonical")
         return value
 
-    @field_validator("factor_admission_socket_path", "factor_run_admission_socket_path")
+    @field_validator(
+        "factor_admission_socket_path",
+        "factor_run_admission_socket_path",
+        "factor_tracking_admission_socket_path",
+    )
     @classmethod
     def validate_factor_admission_path(cls, value: Path | None) -> Path | None:
         if value is not None and (not value.is_absolute() or ".." in value.parts):
@@ -325,6 +367,8 @@ class WebSettings(BaseModel):
         "factor_admission_shared_gid",
         "factor_run_admission_service_uid",
         "factor_run_admission_shared_gid",
+        "factor_tracking_admission_service_uid",
+        "factor_tracking_admission_shared_gid",
     )
     @classmethod
     def validate_factor_admission_identity(cls, value: int | None) -> int | None:
@@ -447,6 +491,33 @@ class WebSettings(BaseModel):
                 raise ValueError("factor save enablement must be true or false")
             values["factor_save_enabled"] = save_enabled == "true"
         ingress_socket = source.get(INGRESS_SOCKET_ENV_VAR, "").strip()
+        tracking_socket = source.get("RQUANT_WEB_FACTOR_TRACKING_ADMISSION_SOCKET", "").strip()
+        if tracking_socket:
+            values["factor_tracking_admission_socket_path"] = Path(tracking_socket)
+        for env_name, field in (
+            (
+                "RQUANT_WEB_FACTOR_TRACKING_ADMISSION_SERVICE_UID",
+                "factor_tracking_admission_service_uid",
+            ),
+            (
+                "RQUANT_WEB_FACTOR_TRACKING_ADMISSION_SHARED_GID",
+                "factor_tracking_admission_shared_gid",
+            ),
+        ):
+            raw = source.get(env_name, "").strip()
+            if raw:
+                values[field] = int(raw)
+        raw_users = source.get("RQUANT_WEB_FACTOR_TRACKING_USERS", "").strip()
+        if raw_users:
+            names = tuple(user.strip() for user in raw_users.split(","))
+            if any(not name for name in names) or len(set(names)) != len(names):
+                raise ValueError("factor tracking users must be distinct nonempty names")
+            values["factor_tracking_users"] = frozenset(names)
+        enabled = source.get("RQUANT_WEB_FACTOR_TRACKING_ENABLED", "").strip().lower()
+        if enabled:
+            if enabled not in {"true", "false"}:
+                raise ValueError("factor tracking enablement must be true or false")
+            values["factor_tracking_enabled"] = enabled == "true"
         run_socket = source.get(FACTOR_RUN_SOCKET_ENV_VAR, "").strip()
         if run_socket:
             values["factor_run_admission_socket_path"] = Path(run_socket)

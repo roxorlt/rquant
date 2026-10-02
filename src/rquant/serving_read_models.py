@@ -972,6 +972,27 @@ PAGE_PROJECTION_CONTRACTS: Mapping[str, ServingProjectionContract] = MappingProx
             event_date_columns=("range_start", "range_end"),
             event_time_columns=("as_of_time", "completed_at"),
         ),
+        "factor_tracking_state": _contract(
+            "lab_jobs",
+            (
+                ("status_key", "string"),
+                ("status", "string"),
+                ("row_count", "int"),
+                ("tracking_instance_id", "string"),
+                ("registry_instance_id", "string"),
+                ("snapshot_sha256", "string"),
+            ),
+            ("status_key",),
+            max_rows=1,
+            max_bytes=2048,
+        ),
+        "factor_tracking": _contract(
+            "lab_jobs",
+            (("factor_id", "string"), ("panel_json", "string")),
+            ("factor_id",),
+            max_rows=512,
+            max_bytes=2 * 1024 * 1024,
+        ),
         "factor_definition_state": _contract(
             "lab_jobs",
             (
@@ -1931,6 +1952,13 @@ class ServingReadModelInput(RuntimeContractModel):
             validate_factor_result_projections(
                 {projection.table_name: projection for projection in self.projections}
             )
+
+        if any(
+            p.table_name in {"factor_tracking_state", "factor_tracking"} for p in self.projections
+        ):
+            from rquant.factor.tracking_serving import validate_factor_tracking_projections
+
+            validate_factor_tracking_projections({p.table_name: p for p in self.projections})
 
         signal_ids = {record.signal.signal_id for record in self.signals}
         if any(record.signal_id not in signal_ids for record in self.routes):
