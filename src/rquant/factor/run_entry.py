@@ -37,6 +37,10 @@ from rquant.factor.run_configuration import (
 )
 from rquant.factor.run_request import RUN_IMMUTABLE
 from rquant.factor.source_prepare import FactorPreparedStreamSource
+from rquant.factor.technical_history_source import (
+    FactorTechnicalHistoryPrepareRequest,
+    prepare_factor_technical_history_source,
+)
 from rquant.strict_json import canonical_json_bytes, strict_canonical_json_loads
 
 
@@ -72,6 +76,7 @@ def main(argv: list[str] | None = None) -> int:
             "save-configuration",
             "seal-context",
             "seal-daily-features",
+            "seal-technical-history",
             "worker",
             "serve",
         ),
@@ -87,14 +92,28 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--industry-source", type=Path)
     parser.add_argument("--market-cap-source", type=Path)
     parser.add_argument("--lake-root", type=Path)
+    parser.add_argument("--max-input-rows", type=int, default=16_000_000)
+    parser.add_argument("--max-code-observations", type=int, default=50_000)
+    parser.add_argument("--max-output-cells", type=int, default=32_000_000)
     args = parser.parse_args(argv)
-    if args.action == "seal-daily-features":
+    if args.action in ("seal-daily-features", "seal-technical-history"):
         if args.prepared_source is None or args.lake_root is None:
             parser.error("必须提供实际行情准备包和私有数据根")
         prepared = _input(args.prepared_source, FactorPreparedStreamSource, 16 * 1024 * 1024)
-        source = prepare_factor_daily_feature_source(
-            FactorDailyFeaturePrepareRequest(prepared_source=prepared), lake_root=args.lake_root
-        )
+        if args.action == "seal-technical-history":
+            source = prepare_factor_technical_history_source(
+                FactorTechnicalHistoryPrepareRequest(
+                    prepared_source=prepared,
+                    max_input_rows=args.max_input_rows,
+                    max_code_observations=args.max_code_observations,
+                    max_output_cells=args.max_output_cells,
+                ),
+                lake_root=args.lake_root,
+            )
+        else:
+            source = prepare_factor_daily_feature_source(
+                FactorDailyFeaturePrepareRequest(prepared_source=prepared), lake_root=args.lake_root
+            )
         configuration = None
         if args.reference is not None:
             reference = FactorRunFileReference.model_validate_json(args.reference)

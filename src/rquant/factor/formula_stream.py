@@ -187,6 +187,8 @@ class FactorFormulaStreamRequest(BaseModel):
                 industry_available=industry,
                 market_cap_available=cap,
                 daily_features_available=self.sources.daily_features is not None,
+                technical_history_available=self.sources.daily_features is not None
+                and self.sources.daily_features.value_semantics == "history_derived",
             ).require_runnable_definition(self.definition)
             from rquant.factor.capability import HISTORICAL_DAILY_V1
 

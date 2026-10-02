@@ -35,3 +35,14 @@ backend冻结后frontend同树顺序接实际可信目录/来源与覆盖、测�
 ## 后续
 
 完成本片后继续已有选股日线特征、分钟/竞价/温度/VP、CSI完整历史、正式配置/数据代/18:40及生产UI验收。M3仍部分，整体goal active；生产发布、切流、停Streamlit与基础设施/生产数据写入按已有单独授权规则。
+
+## Backend 实施证据（2026-10-03）
+
+- 实际执行者：Codex desktop 原生 `/root/factor_security_collection_impl`，implementer，父 `/root`；本树 `cdx/20261003-factor-technical-source` 从 clean `70996889b17fe6e22766360e2336f4c7d9df19e4` 开始，全部新增改动自有。原37行 SHA256 仍为 `e55ad01b6fe6a606de74034fcb1eba207d0388383648a67c8c83e6fd35a98a75`。
+- 新 `technical_history_source.py` 及原 daily-feature 接口的 v2 分支封存原始输入、12项派生输出和4项库存基本事实；保存引用为 `factor-daily-feature-source-v2`，显式 CLI 为 `seal-technical-history`。v1/stored/default/未消费新字段均保留原路径。直接接线实际修改 capability、formula_stream、run_backend、run_configuration、run_entry、stream_job_artifact、tracking_runner；原计算核、stream_adapter/transaction/ledger/lease/recovery/auth 无需修改。
+- 同一个固定 RO 事务内每<=500码批次复制必要输入到私有 TEMP 表，单码帧调用原核，NaN仅在全输出结束后按实际需要的列各修复至多一次；全部代码保留播种/断裂元数据。私有reader用封存输入核验初始化回执；journal重放/原件身份witness同时包含输入工件。实际派生prefix只含逻辑值/状态/缺因、政策与panel当时已可知的播种/断裂，未来首次有效及未来断点不改变旧日；原 `_reserve`/`_commit` 完全未动。
+- 证据根 `/private/tmp/rquant-technical-history-implementation-7vlnxwto`：`identity.json`、逐命令 `.json/.log/.xml` 保留 argv/UTC/wall/exit 和所有失败原件。`source-red.xml` 实际2 failed；`source-audit-cap-red.xml` 实际2 failed/3 passed；`pipeline-fixture-corrected-red.xml` 实际1 failed/1 passed；`seed-binding-red.xml` 实际1 failed。夹具权限/序列化与格式检查的失败亦保留，未称通过。
+- 有效去重23新节点=`final-focused-green.xml` 22 passed/25.61s（wall26.064690s）+`derived-nonfinite.xml` 1 passed/1.41s（wall1.718518s）；后者直接核验批次NaN修复相关极值分支。15旧节点=`direct-legacy-regression.xml` 15 passed/8.47s（wall8.923178s），包含原库存来源/默认spec及draft/CLI/旧六字段prefix固定黄金。`new-nodeids.txt`/`old-nodeids.txt` 无重叠，无删除或改名；skip=0。随后产品变动仅导入排序与等价字符串换行，不重复累计原节点。
+- 借用 Python3.13.12/Pydantic2.13.1/DuckDB1.5.2/ta0.11.0/pytest9.0.3，仅本树PYTHONPATH、禁dotenv/bytecode、dummy配置及自有TMPDIR；无网络/真实资料/生产。`ruff-accepted.json`/`format-accepted.json` 实际exit0，11文件Python3.11 AST与源码SHA在 `syntax-and-file-sha.json`；git diff --check实际exit0。
+- `public-api.json` 是真实合成配置/产物导出的capability/display形状；`synthetic-source.json` 是完整合成typed v2来源。`resources.json`/`handoff-capture.json` 实际FD前后相等、只有MainThread、无私有reader/prepare目录；所有自有命令session已结束，无daemon/UDS。合成basetemp、工件和日志仅保留在该0700私有证据根供最终复核。
+- Backend 候选冻结后停写。前端接线/规范API生成/组合门禁、唯一独立审查、真实RO及worker验收由root接续；本片不宣称真实全市场覆盖、PIT、上市全历史、最大负载或上线。

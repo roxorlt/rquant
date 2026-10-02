@@ -31,6 +31,12 @@ from rquant.factor.source_prepare import (
     _dates,
     _generation,
 )
+from rquant.factor.technical_history_source import (
+    TECHNICAL_COLUMNS,
+    FactorTechnicalHistoryReceipt,
+    FactorTechnicalHistorySummary,
+    TechnicalHistoryReason,
+)
 from rquant.factor.universe import StockCode
 from rquant.readside_replica_gate import connect_pinned_readonly
 from rquant.research_lake import _quoted_literal
@@ -71,8 +77,11 @@ class FactorDailyStoredField(BaseModel):
     column: DailyStoredColumn
     table: Literal["daily_indicator", "daily_basic"]
     name_zh: str
-    unit: Literal["stored_price", "indicator", "percent", "ratio", "CNY_10000"]
+    unit: Literal["stored_price", "session_price", "indicator", "percent", "ratio", "CNY_10000"]
     description_zh: str
+    value_semantics: Literal["history_derived"] | None = Field(
+        default=None, exclude_if=lambda v: v is None
+    )
 
 
 STORED_DAILY_FIELDS = tuple(
@@ -149,6 +158,26 @@ STORED_DAILY_FIELDS = tuple(
     )
 )
 _FIELDS = {field.column: field for field in STORED_DAILY_FIELDS}
+DERIVED_DAILY_FIELDS = tuple(
+    FactorDailyStoredField.model_validate(
+        {
+            **field.model_dump(),
+            "unit": "session_price" if field.unit == "stored_price" else field.unit,
+            "value_semantics": "history_derived",
+            "description_zh": (
+                "从首个有效历史观察推导，按观察日复权因子计算、当日因子还原价格。"
+                if field.unit == "stored_price"
+                else "从首个有效历史观察推导；历史断裂不重置，KDJ J保留原值。"
+                if field.column == "kdj_j"
+                else "从首个有效历史观察推导；历史断裂不重置。"
+            ),
+        }
+    )
+    if field.column in TECHNICAL_COLUMNS
+    else field
+    for field in STORED_DAILY_FIELDS
+)
+_DERIVED_FIELDS = {field.column: field for field in DERIVED_DAILY_FIELDS}
 _TABLES = ("daily_indicator", "daily_basic")
 
 
@@ -164,6 +193,15 @@ class FactorDailyFeatureCounts(BaseModel):
     missing: int = Field(ge=0)
     null: int = Field(ge=0)
     non_finite: int = Field(ge=0)
+    reasons: tuple[FactorDailyFeatureReasonCount, ...] = Field(
+        default=(), max_length=5, exclude_if=lambda v: not v
+    )
+
+
+class FactorDailyFeatureReasonCount(BaseModel):
+    model_config = _MODEL
+    reason: TechnicalHistoryReason
+    count: int = Field(gt=0)
 
 
 class FactorDailyFeatureTable(BaseModel):
@@ -190,15 +228,40 @@ class FactorDailyFeatureSources(BaseModel):
     code_commit: str = Field(pattern=r"^[0-9a-f]{40}$")
     fields: tuple[FactorDailyStoredField, ...] = Field(min_length=1, max_length=16)
     source_mode: Literal["historical_retrospective"] = "historical_retrospective"
-    value_semantics: Literal["stored_not_recomputed"] = "stored_not_recomputed"
-    price_basis: Literal["unverified"] = "unverified"
-    recursive_initialization: Literal["unverified"] = "unverified"
+    value_semantics: Literal["stored_not_recomputed", "history_derived"] = "stored_not_recomputed"
+    price_basis: Literal["unverified", "observation_factor_then_output_session_scale"] = (
+        "unverified"
+    )
+    recursive_initialization: Literal["unverified", "first_valid_observation_no_restart"] = (
+        "unverified"
+    )
+    technical_history: FactorTechnicalHistorySummary | None = Field(
+        default=None, exclude_if=lambda v: v is None
+    )
 
     @model_validator(mode="after")
     def _fields(self) -> FactorDailyFeatureSources:
         columns = tuple(field.column for field in self.fields)
-        if columns != tuple(sorted(set(columns))) or any(
-            _FIELDS[f.column] != f for f in self.fields
+        derived = self.value_semantics == "history_derived"
+        catalog = _DERIVED_FIELDS if derived else _FIELDS
+        if (
+            derived != (self.technical_history is not None)
+            or (
+                derived
+                and (
+                    self.price_basis != "observation_factor_then_output_session_scale"
+                    or self.recursive_initialization != "first_valid_observation_no_restart"
+                )
+            )
+            or (
+                not derived
+                and (
+                    self.price_basis != "unverified"
+                    or self.recursive_initialization != "unverified"
+                )
+            )
+            or columns != tuple(sorted(set(columns)))
+            or any(catalog[f.column] != f for f in self.fields)
         ):
             raise ValueError("stored daily field contract differs from inventory contract")
         return self
@@ -206,7 +269,7 @@ class FactorDailyFeatureSources(BaseModel):
 
 class FactorDailyFeatureSource(BaseModel):
     model_config = _MODEL
-    schema_version: Literal[1] = 1
+    schema_version: Literal[1, 2] = 1
     prepared_source_sha256: str = Field(pattern=_SHA)
     prepared_snapshot_id: str
     prepared_binding_hash: str = Field(pattern=_SHA)
@@ -217,9 +280,16 @@ class FactorDailyFeatureSource(BaseModel):
     calendar_open_days: tuple[date, ...] = Field(max_length=4096)
     fields: tuple[FactorDailyStoredField, ...] = STORED_DAILY_FIELDS
     source_mode: Literal["historical_retrospective"] = "historical_retrospective"
-    value_semantics: Literal["stored_not_recomputed"] = "stored_not_recomputed"
-    price_basis: Literal["unverified"] = "unverified"
-    recursive_initialization: Literal["unverified"] = "unverified"
+    value_semantics: Literal["stored_not_recomputed", "history_derived"] = "stored_not_recomputed"
+    price_basis: Literal["unverified", "observation_factor_then_output_session_scale"] = (
+        "unverified"
+    )
+    recursive_initialization: Literal["unverified", "first_valid_observation_no_restart"] = (
+        "unverified"
+    )
+    technical_history: FactorTechnicalHistoryReceipt | None = Field(
+        default=None, exclude_if=lambda v: v is None
+    )
     source_read_boundary: Literal["single_snapshot_transaction"] = "single_snapshot_transaction"
     read_mode: Literal["descriptor", "in_place"]
     observed_at: datetime
@@ -235,8 +305,25 @@ class FactorDailyFeatureSource(BaseModel):
     @model_validator(mode="after")
     def _binding(self) -> FactorDailyFeatureSource:
         dates = _dates(self.scope)
+        derived = self.schema_version == 2
         if (
-            self.fields != STORED_DAILY_FIELDS
+            derived != (self.technical_history is not None)
+            or self.value_semantics != ("history_derived" if derived else "stored_not_recomputed")
+            or self.price_basis
+            != ("observation_factor_then_output_session_scale" if derived else "unverified")
+            or self.recursive_initialization
+            != ("first_valid_observation_no_restart" if derived else "unverified")
+            or (
+                derived
+                and tuple(code.stock_code for code in self.technical_history.codes)
+                != self.scope.stock_codes
+            )
+            or (
+                derived
+                and len(self.scope.stock_codes) * len(dates) * 16
+                > self.technical_history.max_output_cells
+            )
+            or self.fields != (DERIVED_DAILY_FIELDS if derived else STORED_DAILY_FIELDS)
             or self.completed_read_at < self.observed_at
             or self.calendar_open_days != tuple(sorted(set(self.calendar_open_days)))
             or not set(self.calendar_open_days) <= set(dates)
@@ -300,6 +387,7 @@ class FactorDailyFeatureSource(BaseModel):
             raise ValueError("daily features differ from paired prepared prices")
 
     def select(self, columns: tuple[str, ...]) -> FactorDailyFeatureSources:
+        derived = self.schema_version == 2 and bool(set(columns) & set(TECHNICAL_COLUMNS))
         return FactorDailyFeatureSources(
             source_sha256=self.sha256,
             prepared_source_sha256=self.prepared_source_sha256,
@@ -307,7 +395,18 @@ class FactorDailyFeatureSource(BaseModel):
             prepared_binding_hash=self.prepared_binding_hash,
             scope_content_hash=self.scope_content_hash,
             code_commit=self.code_commit,
-            fields=tuple(_FIELDS[c] for c in sorted(set(columns))),
+            fields=tuple(
+                (_DERIVED_FIELDS if derived else _FIELDS)[c] for c in sorted(set(columns))
+            ),
+            value_semantics="history_derived" if derived else "stored_not_recomputed",
+            price_basis=self.price_basis if derived else "unverified",
+            recursive_initialization=self.recursive_initialization if derived else "unverified",
+            technical_history=self.technical_history.summary() if derived else None,
+        )
+
+    def input_artifacts(self) -> tuple[DatasetSnapshotArtifact, ...]:
+        return tuple(table.artifact for table in self.tables) + (
+            () if self.technical_history is None else self.technical_history.inputs
         )
 
 
@@ -333,6 +432,7 @@ class FactorDailyFeatureValue(BaseModel):
     non_finite_value: Literal["NaN", "Infinity", "-Infinity"] | None = Field(
         default=None, exclude_if=lambda v: v is None
     )
+    reason: TechnicalHistoryReason | None = Field(default=None, exclude_if=lambda v: v is None)
 
     @model_validator(mode="after")
     def _value(self) -> FactorDailyFeatureValue:
@@ -340,6 +440,11 @@ class FactorDailyFeatureValue(BaseModel):
             self.status == "non_finite"
         ) != (self.non_finite_value is not None):
             raise ValueError("daily feature value and missing state differ")
+        if self.reason is not None and (
+            self.status == "valid"
+            or (self.reason == "derived_non_finite") != (self.status == "non_finite")
+        ):
+            raise ValueError("technical reason differs from missing value status")
         return self
 
 
@@ -377,7 +482,13 @@ class FactorDailyFeatureInput(BaseModel):
         )
         expected = tuple(
             FactorDailyFeatureCounts(
-                column=c, **{s: counts[c, s] for s in ("valid", "missing", "null", "non_finite")}
+                column=c,
+                **{s: counts[c, s] for s in ("valid", "missing", "null", "non_finite")},
+                reasons=_reason_counts(
+                    tuple(
+                        v for row in self.rows for i, v in enumerate(row.values) if columns[i] == c
+                    )
+                ),
             )
             for c in columns
         )
@@ -418,7 +529,10 @@ def read_factor_daily_feature_input(
                     stock_code=code,
                     values=tuple(
                         FactorDailyFeatureValue(
-                            status=f.status, value=f.value, non_finite_value=f.non_finite_value
+                            status=f.status,
+                            value=f.value,
+                            non_finite_value=f.non_finite_value,
+                            reason=f.reason,
                         )
                         for f in batch.facts[i * len(columns) : (i + 1) * len(columns)]
                     ),
@@ -433,7 +547,11 @@ def read_factor_daily_feature_input(
         rows=tuple(rows),
         counts=tuple(
             FactorDailyFeatureCounts(
-                column=c, **{s: counts[c, s] for s in ("valid", "missing", "null", "non_finite")}
+                column=c,
+                **{s: counts[c, s] for s in ("valid", "missing", "null", "non_finite")},
+                reasons=_reason_counts(
+                    tuple(v for row in rows for i, v in enumerate(row.values) if columns[i] == c)
+                ),
             )
             for c in columns
         ),
@@ -447,9 +565,21 @@ def _counts(
     count = Counter((f.column, f.status) for f in facts)
     return tuple(
         FactorDailyFeatureCounts(
-            column=c, **{s: count[c, s] for s in ("valid", "missing", "null", "non_finite")}
+            column=c,
+            **{s: count[c, s] for s in ("valid", "missing", "null", "non_finite")},
+            reasons=_reason_counts(tuple(f for f in facts if f.column == c)),
         )
         for c in columns
+    )
+
+
+def _reason_counts(
+    values: tuple[FactorDailyFeatureValue, ...],
+) -> tuple[FactorDailyFeatureReasonCount, ...]:
+    counts = Counter(v.reason for v in values if v.reason is not None)
+    return tuple(
+        FactorDailyFeatureReasonCount(reason=reason, count=counts[reason])
+        for reason in sorted(counts)
     )
 
 
@@ -478,12 +608,15 @@ class FactorDailyFeatureDayBatch(BaseModel):
         return self
 
 
-def _check_schema(columns: tuple[tuple[str, str], ...], table: str) -> None:
+def _check_schema(
+    columns: tuple[tuple[str, str], ...], table: str, *, technical: bool = False
+) -> None:
     types = dict(columns)
     if (
         types.get("ts_code") != "VARCHAR"
         or types.get("trade_date") != "DATE"
         or any(types.get(f.column) != "DOUBLE" for f in STORED_DAILY_FIELDS if f.table == table)
+        or (technical and any(types.get(c + "__reason") != "VARCHAR" for c in TECHNICAL_COLUMNS))
     ):
         raise ValueError("stored daily source schema differs from declared fields")
 
@@ -494,6 +627,8 @@ def _observe(
     open_days: tuple[date, ...],
     table: str,
     artifact: DatasetSnapshotArtifact,
+    *,
+    technical: bool = False,
 ) -> FactorDailyFeatureTable:
     where = "trade_date BETWEEN ? AND ? AND ts_code IN (SELECT unnest(?))"
     params = [scope.start_date, scope.end_date, list(scope.stock_codes)]
@@ -541,6 +676,16 @@ def _observe(
                 null=int(counts[2 + i * 3]),
                 non_finite=int(counts[3 + i * 3]),
                 missing=0,
+                reasons=tuple(
+                    FactorDailyFeatureReasonCount(reason=reason, count=int(count))
+                    for reason, count in connection.execute(
+                        f"SELECT {c}__reason,count(*) FROM {table} WHERE {where} "
+                        f"AND {c}__reason IS NOT NULL GROUP BY {c}__reason ORDER BY {c}__reason",
+                        params,
+                    ).fetchall()
+                )
+                if technical
+                else (),
             )
             for i, c in enumerate(fields)
         ),
@@ -683,21 +828,28 @@ class FactorDailyFeatureReadLease:
             or not self.source.scope.start_date <= query.trade_date <= self.source.scope.end_date
         ):
             raise ValueError("daily feature query exceeds source or scope")
-        values = {}
+        values, reasons = {}, {}
         for table in _TABLES:
             fields = tuple(c for c in query.fields if _FIELDS[c].table == table)
             if not fields:
                 continue
+            derived = table == "daily_indicator" and self.source.schema_version == 2
+            selected = fields + tuple(c + "__reason" for c in fields) if derived else fields
             rows = self._connection.execute(
-                f"SELECT ts_code, {','.join(fields)} FROM {table} "
+                f"SELECT ts_code, {','.join(selected)} FROM {table} "
                 "WHERE trade_date=? AND ts_code IN (SELECT unnest(?)) ORDER BY ts_code",
                 [query.trade_date, list(query.stock_codes)],
             ).fetchmany(501)
             if len(rows) > len(query.stock_codes) or len({row[0] for row in rows}) != len(rows):
                 raise ValueError("daily feature private query exceeds unique bounded grid")
             for row in rows:
-                for column, value in zip(fields, row[1:], strict=True):
+                for column, value in zip(fields, row[1 : 1 + len(fields)], strict=True):
                     values[row[0], column] = value
+                if derived:
+                    reasons.update(
+                        ((row[0], c), reason)
+                        for c, reason in zip(fields, row[1 + len(fields) :], strict=True)
+                    )
         facts = []
         for code in query.stock_codes:
             for column in query.fields:
@@ -705,6 +857,19 @@ class FactorDailyFeatureReadLease:
                 tag = None
                 if (code, column) not in values:
                     status = "missing"
+                    if self.source.schema_version == 2 and column in TECHNICAL_COLUMNS:
+                        initialized = next(
+                            c for c in self.source.technical_history.codes if c.stock_code == code
+                        )
+                        reasons[code, column] = (
+                            "no_initialization"
+                            if initialized.first_valid_date is None
+                            or query.trade_date < initialized.first_valid_date
+                            else "history_break"
+                            if initialized.break_date is not None
+                            and query.trade_date >= initialized.break_date
+                            else "missing_observation"
+                        )
                 elif value is None:
                     status = "null"
                 elif not math.isfinite(value):
@@ -723,6 +888,7 @@ class FactorDailyFeatureReadLease:
                         status=status,
                         value=value,
                         non_finite_value=tag,
+                        reason=reasons.get((code, column)),
                     )
                 )
         self.query_count += 1
@@ -752,16 +918,16 @@ def open_factor_daily_feature_source(
     try:
         with TemporaryDirectory(prefix=".daily-feature-reader-", dir=root) as scratch:
             private_root = Path(scratch)
-            for table in source.tables:
+            for artifact in source.input_artifacts():
                 original = verify_materialized_table_artifact(
-                    table.artifact, lake_root=root, as_of_time=source.scope.as_of_time
+                    artifact, lake_root=root, as_of_time=source.scope.as_of_time
                 )
-                target = private_root / table.artifact.relative_path
+                target = private_root / artifact.relative_path
                 target.parent.mkdir(parents=True)
                 shutil.copyfile(original, target)
                 os.chmod(target, 0o600)
                 verify_materialized_table_artifact(
-                    table.artifact, lake_root=private_root, as_of_time=source.scope.as_of_time
+                    artifact, lake_root=private_root, as_of_time=source.scope.as_of_time
                 )
             _require_same_root(root, descriptor)
             connection = duckdb.connect(":memory:")
@@ -778,7 +944,8 @@ def open_factor_daily_feature_source(
                         (str(row[0]), str(row[1]))
                         for row in connection.execute(f"DESCRIBE {table.table_name}").fetchall()
                     )
-                    _check_schema(columns, table.table_name)
+                    derived = source.schema_version == 2 and table.table_name == "daily_indicator"
+                    _check_schema(columns, table.table_name, technical=derived)
                     invalid = connection.execute(
                         f"SELECT count(*) FROM {table.table_name} "
                         "WHERE ts_code IS NULL OR trade_date IS NULL "
@@ -802,15 +969,47 @@ def open_factor_daily_feature_source(
                             source.calendar_open_days,
                             table.table_name,
                             table.artifact,
+                            technical=derived,
                         )
                         != table
                     ):
                         raise ValueError("private daily feature rows differ from scope or counts")
+                if source.technical_history is not None:
+                    (artifact,) = source.technical_history.inputs
+                    original = private_root / artifact.relative_path
+                    connection.execute(
+                        "CREATE VIEW technical_history_input AS SELECT * FROM read_parquet("
+                        f"{_quoted_literal(str(original))},hive_partitioning=false)"
+                    )
+                    facts = connection.execute(
+                        "SELECT ts_code,count(*),min(trade_date) FROM technical_history_input "
+                        "GROUP BY ts_code ORDER BY ts_code"
+                    ).fetchall()
+                    expected = [
+                        (c.stock_code, c.input_observations, c.raw_start_date)
+                        for c in source.technical_history.codes
+                        if c.input_observations
+                    ]
+                    if facts != expected:
+                        raise ValueError("technical sealed input differs from initialization scope")
+                    invalid = connection.execute(
+                        "SELECT count(*) FROM technical_history_input WHERE trade_date IS NULL "
+                        "OR trade_date>? OR ts_code NOT IN (SELECT unnest(?))",
+                        [source.scope.end_date, list(source.scope.stock_codes)],
+                    ).fetchone()
+                    repeated = connection.execute(
+                        "SELECT count(*) FROM (SELECT ts_code,trade_date "
+                        "FROM technical_history_input "
+                        "GROUP BY ts_code,trade_date HAVING count(*)>1)"
+                    ).fetchone()
+                    if invalid[0] or repeated[0]:
+                        raise ValueError("technical sealed history has invalid keys or dates")
+                    source.technical_history.require_sealed_initialization(connection)
                 lease = FactorDailyFeatureReadLease(source, connection, private_root)
                 yield lease
-                for table in source.tables:
+                for artifact in source.input_artifacts():
                     verify_materialized_table_artifact(
-                        table.artifact, lake_root=root, as_of_time=source.scope.as_of_time
+                        artifact, lake_root=root, as_of_time=source.scope.as_of_time
                     )
                 _require_same_root(root, descriptor)
             finally:

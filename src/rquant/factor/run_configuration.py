@@ -37,7 +37,7 @@ class FactorRunFileReference(BaseModel):
     model_config = RUN_IMMUTABLE
 
     kind: str = Field(
-        pattern=r"^factor-(prepared-source|run-configuration|neutralization-context|daily-feature-source)-v1$"
+        pattern=r"^factor-((prepared-source|run-configuration|neutralization-context)-v1|daily-feature-source-v[12])$"
     )
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     filename: str
@@ -88,9 +88,9 @@ class FactorRunConfiguration(BaseModel):
             and self.neutralization_context.kind != "factor-neutralization-context-v1"
         ):
             raise ValueError("配置缺少中性化上下文包")
-        if (
-            self.daily_feature_source is not None
-            and self.daily_feature_source.kind != "factor-daily-feature-source-v1"
+        if self.daily_feature_source is not None and self.daily_feature_source.kind not in (
+            "factor-daily-feature-source-v1",
+            "factor-daily-feature-source-v2",
         ):
             raise ValueError("配置缺少库存日线事实包")
         for path in (
@@ -166,7 +166,7 @@ def save_factor_daily_feature_source(
     return _save(
         root,
         FactorDailyFeatureSource.model_validate(source),
-        "factor-daily-feature-source-v1",
+        f"factor-daily-feature-source-v{source.schema_version}",
         _MAX_SOURCE_BYTES,
     )
 
@@ -265,6 +265,11 @@ def open_factor_run_configuration(
                 descriptor, config.daily_feature_source, FactorDailyFeatureSource, _MAX_SOURCE_BYTES
             )
             assert isinstance(daily_features, FactorDailyFeatureSource)
+            if (
+                config.daily_feature_source.kind
+                != f"factor-daily-feature-source-v{daily_features.schema_version}"
+            ):
+                raise ValueError("daily source reference version differs from its mode")
             daily_features.require_prepared(source)
             identities[config.daily_feature_source.filename] = identity
         loaded = LoadedFactorRunConfiguration(

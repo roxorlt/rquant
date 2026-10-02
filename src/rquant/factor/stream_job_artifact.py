@@ -582,16 +582,16 @@ def verify_factor_stream_artifacts(
                 try:
                     source_identities = tuple(
                         (
-                            table.artifact.relative_path,
+                            artifact.relative_path,
                             _file_identity(
                                 os.stat(
-                                    table.artifact.relative_path,
+                                    artifact.relative_path,
                                     dir_fd=lake_fd,
                                     follow_symlinks=False,
                                 )
                             ),
                         )
-                        for table in spec.adapter_request.daily_feature_source.tables
+                        for artifact in spec.adapter_request.daily_feature_source.input_artifacts()
                     )
                 finally:
                     os.close(lake_fd)

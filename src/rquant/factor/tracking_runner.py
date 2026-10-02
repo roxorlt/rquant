@@ -142,8 +142,8 @@ def _input_files(
                 paths.append(config.lake_root / source.artifact.relative_path)
     if spec.adapter_request.daily_feature_source is not None:
         paths.extend(
-            config.lake_root / table.artifact.relative_path
-            for table in spec.adapter_request.daily_feature_source.tables
+            config.lake_root / artifact.relative_path
+            for artifact in spec.adapter_request.daily_feature_source.input_artifacts()
         )
     return tuple(paths)
 
@@ -233,21 +233,32 @@ def read_factor_tracking_prefix(
             )
             if batch.daily_features is not None:
                 original = batch.daily_features
-                semantic += (
-                    (
-                        "stored-daily-fields-v1",
-                        tuple(field.column for field in original.sources.fields),
-                        original.trade_date,
-                        original.panel_date,
-                        tuple(
-                            (
-                                row.stock_code,
-                                tuple((v.status, v.value, v.non_finite_value) for v in row.values),
-                            )
-                            for row in original.rows
-                        ),
+                derived = original.sources.value_semantics == "history_derived"
+                daily_semantic = (
+                    "derived-daily-fields-v1" if derived else "stored-daily-fields-v1",
+                    tuple(field.column for field in original.sources.fields),
+                    original.trade_date,
+                    original.panel_date,
+                    tuple(
+                        (
+                            row.stock_code,
+                            tuple(
+                                (v.status, v.value, v.non_finite_value, v.reason)
+                                if derived
+                                else (v.status, v.value, v.non_finite_value)
+                                for v in row.values
+                            ),
+                        )
+                        for row in original.rows
                     ),
                 )
+                if derived:
+                    daily_semantic += (
+                        request.daily_feature_source.technical_history.causal_policy(
+                            original.panel_date
+                        ),
+                    )
+                semantic += (daily_semantic,)
                 del original
             result.append(
                 FactorTrackingPrefixDay(trade_date=day, sha256=canonical_sha256(semantic))
