@@ -220,7 +220,7 @@ for (const viewport of [
       const adjacent = autocorrelation.getByText("相邻评价期", { exact: true });
       if (viewport.label === "phone") await adjacent.tap();
       else await adjacent.focus();
-      await expect(page.getByRole("tooltip")).toContainText("不跨期补值");
+      await expect(page.getByRole("tooltip", { name: /不跨期补值/ })).toContainText("不跨期补值");
       if (viewport.label === "phone") await adjacent.tap();
       await autocorrelation.getByText("查看自相关明细", { exact: true }).click();
       await expect(autocorrelation.getByRole("table", { name: "自相关明细" })).toContainText(

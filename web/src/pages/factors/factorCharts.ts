@@ -11,10 +11,11 @@ export function industryIcOption(
   colors: ChartColors,
 ): EChartOption {
   const summaries = statistics.industry_summaries;
+  const numericAxis = yAxis(colors);
   return {
     ...baseOption(colors),
     grid: { left: 88, right: summaries.length > 10 ? 36 : 16, top: 16, bottom: 32 },
-    xAxis: yAxis(colors),
+    xAxis: { ...numericAxis, axisLabel: { ...numericAxis.axisLabel, hideOverlap: true } },
     yAxis: {
       ...xAxis(
         summaries.map((item) => item.l1_name),
