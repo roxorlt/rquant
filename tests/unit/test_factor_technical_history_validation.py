@@ -7,21 +7,19 @@ import shutil
 from collections.abc import Iterator
 from datetime import timedelta
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
-import rquant.factor.technical_history_source as technical
-import rquant.research_snapshot as snapshot
-from rquant.factor.daily_feature_source import (
-    FactorDailyFeatureQuery,
-    FactorDailyFeatureSource,
-    open_factor_daily_feature_source,
-)
-from tests.unit.test_factor_technical_history_source import _AS_OF, _FIRST, _prepared, _raw
+from tests.unit.test_factor_technical_history_source import _AS_OF, _FIRST, _module, _prepared, _raw
+
+if TYPE_CHECKING:
+    from rquant.factor.daily_feature_source import FactorDailyFeatureSource
 
 
 @pytest.fixture(autouse=True)
 def _empty_validation_cache() -> Iterator[None]:
+    technical = _module()
     cache = getattr(technical, "_TECHNICAL_INPUT_VALIDATIONS", None)
     if cache is not None:
         cache.clear()
@@ -31,6 +29,7 @@ def _empty_validation_cache() -> Iterator[None]:
 
 
 def _source(tmp_path: Path) -> FactorDailyFeatureSource:
+    technical = _module()
     path = _raw(tmp_path, days=12, count=3)
     prepared = _prepared(tmp_path, path, end=10, count=3)
     return technical.prepare_factor_technical_history_source(
@@ -43,6 +42,12 @@ def _source(tmp_path: Path) -> FactorDailyFeatureSource:
 def test_repeated_technical_reader_reuses_one_complete_logical_verification(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    import rquant.research_snapshot as snapshot
+    from rquant.factor.daily_feature_source import (
+        FactorDailyFeatureQuery,
+        open_factor_daily_feature_source,
+    )
+
     source = _source(tmp_path)
     scans = []
     logical = snapshot._logical_content_hash
@@ -72,6 +77,7 @@ def test_repeated_technical_reader_reuses_one_complete_logical_verification(
 
 
 def test_cached_input_still_rejects_wrong_metadata_and_earlier_asof(tmp_path: Path) -> None:
+    technical = _module()
     source = _source(tmp_path)
     (artifact,) = source.technical_history.inputs
     verify = technical._verify_technical_history_input
@@ -95,6 +101,8 @@ def test_cached_input_still_rejects_wrong_metadata_and_earlier_asof(tmp_path: Pa
 def test_cached_input_mutation_at_natural_tail_refuses_and_closes(
     tmp_path: Path, location: str
 ) -> None:
+    from rquant.factor.daily_feature_source import open_factor_daily_feature_source
+
     source = _source(tmp_path)
     (artifact,) = source.technical_history.inputs
     lake = tmp_path / "lake"
@@ -122,6 +130,8 @@ def test_cached_input_mutation_at_natural_tail_refuses_and_closes(
 
 
 def test_cached_same_byte_input_replacement_refuses_active_reader(tmp_path: Path) -> None:
+    from rquant.factor.daily_feature_source import open_factor_daily_feature_source
+
     source = _source(tmp_path)
     (artifact,) = source.technical_history.inputs
     lake = tmp_path / "lake"
@@ -138,6 +148,7 @@ def test_cached_same_byte_input_replacement_refuses_active_reader(tmp_path: Path
 
 
 def test_input_validation_cache_is_bounded_and_retains_no_resources(tmp_path: Path) -> None:
+    technical = _module()
     source = _source(tmp_path)
     (artifact,) = source.technical_history.inputs
     before = len(os.listdir("/dev/fd"))
