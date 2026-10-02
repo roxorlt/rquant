@@ -84,16 +84,20 @@ STORED_DAILY_FIELDS = tuple(
                     table="daily_indicator",
                     name_zh=n,
                     unit="stored_price",
-                    description_zh="库存指标，价格基准及初始化未核验；hist保留库存差值，不另乘2。",
+                    description_zh=d,
                 )
-                for c, n in (
-                    ("ma5", "5日均线"),
-                    ("ma10", "10日均线"),
-                    ("ma20", "20日均线"),
-                    ("ma60", "60日均线"),
-                    ("macd", "MACD差值"),
-                    ("macd_signal", "MACD信号"),
-                    ("macd_hist", "MACD库存差值"),
+                for c, n, d in (
+                    ("ma5", "5日均线", "已存5日均线，价格基准未核验。"),
+                    ("ma10", "10日均线", "已存10日均线，价格基准未核验。"),
+                    ("ma20", "20日均线", "已存20日均线，价格基准未核验。"),
+                    ("ma60", "60日均线", "已存60日均线，价格基准未核验。"),
+                    ("macd", "MACD DIF", "已存MACD DIF，价格基准及初始化未核验。"),
+                    ("macd_signal", "MACD信号线", "已存MACD信号线，价格基准及初始化未核验。"),
+                    (
+                        "macd_hist",
+                        "MACD柱差值",
+                        "已存DIF−DEA，不另乘2；价格基准及初始化未核验。",
+                    ),
                 )
             ),
             *(
@@ -102,14 +106,14 @@ STORED_DAILY_FIELDS = tuple(
                     table="daily_indicator",
                     name_zh=n,
                     unit="indicator",
-                    description_zh="库存指标，初始化未核验；保留原值，J不裁剪。",
+                    description_zh=d,
                 )
-                for c, n in (
-                    ("rsi6", "6日RSI"),
-                    ("rsi14", "14日RSI"),
-                    ("kdj_k", "KDJ K"),
-                    ("kdj_d", "KDJ D"),
-                    ("kdj_j", "KDJ J"),
+                for c, n, d in (
+                    ("rsi6", "6日RSI", "已存6日RSI点值，初始化未核验。"),
+                    ("rsi14", "14日RSI", "已存14日RSI点值，初始化未核验。"),
+                    ("kdj_k", "KDJ K", "已存KDJ K点值，初始化未核验。"),
+                    ("kdj_d", "KDJ D", "已存KDJ D点值，初始化未核验。"),
+                    ("kdj_j", "KDJ J", "已存KDJ J点值，初始化未核验；保留原值，不裁到0–100。"),
                 )
             ),
             FactorDailyStoredField(

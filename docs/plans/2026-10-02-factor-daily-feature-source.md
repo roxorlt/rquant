@@ -82,3 +82,9 @@ root 明确确认的直接边界：`daily_stream.py` 默认省略 typed 单日�
 自有 command sessions 已退出，无后台 daemon/listener。Web TestClient lifespan关闭，本树 `tests/.daily-features-web-*` proof目录删除，reader异常/成功均close并删除私有副本，当前私有副本/本树proof均0；CLI子进程退出及fixture删除见 `cli-resources.json`。其余自有0700 pytest/黄金封存合成资料明确保留供复核，非运行资源。
 
 不声明真实全市场/32日worker、PIT/复权初始化、最大负载、网页按钮或生产上线。新增字段持续跟踪尚未接通，后续立即补相应prefix/策略；本片诚实禁止开始。frontend待干净后台候选后顺序接线，root负责最终组合门禁/唯一独立审查/接受后真实只读验收；整体goal继续active。
+
+### 字段说明局部收尾
+
+root 在干净 `93f82954fbab7ea2a5267cd758917abc8d01e375` 交FE前授权单一字段目录文案修正：MA/RSI/K/D只说明对应指标；J才说明不裁到0–100，MACD分别为DIF/信号线/柱差值，仅hist说明已存DIF−DEA、不另乘2。基础4项、字段/单位/DTO、原值、旧六字段及其他逻辑不变。说明文字属于固定来源绑定，旧合成新字段包在新目录下明确拒绝，原件原封保留于证据根 `metadata-wording/before-*`，当前CLI真实重新封存回执已更新。
+
+只补实际失效范围 `wording-direct-green.xml`：原source原值/状态、能力目录、完整worker→原件重放→Serving/Web3节点passed（4.792s wall），22新nodeids不增加；16旧及五份旧字节黄金继续有效复用，没有扩大套件/审查。`metadata-wording/binding-and-strings.json` 核对仅中文名/说明变化、基础4项与旧六项不变及旧新字段包拒绝；public-api、SHA/handoff随新候选更新。CLI/reader/proof资源按同一收据关闭删除，Ruff/格式/3.11语法与diff直接自检保留。
