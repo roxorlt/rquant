@@ -61,3 +61,19 @@ backend：tracking_runner.py、tracking_backend.py、capability.py，新增直�
 正常精确collection实际exit0/8.585s，19103→19116，精确增14/删1对应已记录replacement、0重复、55批准skip字节不变。全套逻辑SHA154f4889ecbcc2f512456aad9cf42d8544361b542e3a8bacdef81c781c6e868d；只执行两必要清单门禁，实际2 passed/8.484s，不执行19116全套。root将本候选冻结后交唯一原reviewer集中终审（当前0修复轮）；ACCEPT后再按独立原始事实执行首1日/续2日/整3日及重复的实际只读跟踪对照，不将前片32日reader核验声称为32日新字段tracking。
 
 root证据在/private/tmp/rquant-factor-tracking-root-yegakn31/stored-tracking-{backend-freeze,frontend-freeze,root-visual-check}.json及stored-tracking-manifest-proof/；原红测、部分失败及helper失败全部保留。前端自有端口18823/14223已释放，合成资料暂保留给终审。计划前36行冻结SHA保持，后台5个Python字节保持；M3仍部分/未发布，整体goal active。
+
+## 根任务最终验收（2026-10-03）
+
+最终代码候选 `9500818f65d29b09c4ffdbbc215a2d4bed3dcc3b` 已由唯一原生独立 reviewer 集中接受，报告 `/private/tmp/rquant-stored-tracking-final-review-c_gpmmky/review.md`，SHA256 `699ef892d79b1399e0183b03c77c2a8eab78d19e7ceaf2bfaaa8ac32f8c92465`。无阻断 finding，0产品修复轮；审查复用仍有效证据，没有重复套件。root在真实对照成功后将候选快进合入本地研究集成分支；未发布、切流或停用Streamlit。首36行冻结字节保持。
+
+root仅用固定只读副本及既有原始事实，实际一次远端分发、三个worker任务：首段1日、追加2日、同源整段3日。计算范围5,571码，评价日为2026-09-24、09-28、09-29；表达式 `rsi14 / 100 + turnover_rate / 100 + total_mv / circ_mv + ts_mean(volume_ratio,2)`。首日171有效/4,850缺失；续段344有效/9,702缺失；整段515有效/14,552缺失（14,533缺观察、19空值）。与独立原始参考的最大绝对误差3.552713678800501e-15，容差固定2e-12＋1e-12×abs(expected)。分段与整段逐日贡献、汇总和完整逻辑前缀完全一致；重复返回等待、无新任务或追加，原取消成功且保留两个持久历史运行。
+
+准备4.733s，首段91.830s，续段157.482s，整段156.933s；整次worker证据420.585s、SSH墙钟425.458s，峰值629.695MiB。源副本物理身份执行前后相同；源和自有句柄0、worker心跳线程0、私有scratch空，远端自有目录已删除。没有提供方HTTP、生产写入或发布。证明为历史回溯研究；不证明PIT、库存指标全市场生产口径/递归初始化、32日新增字段跟踪或最大真实负载。
+
+有效聚焦证据为后台23个不同节点（14新含1明确replacement、9旧）、Web652记录、API993、浏览器123通过及4原配置skip；跳过不计通过。类型检查、构建、首屏323.1KB/550KB与产物一致性通过，4张桌面/390px确认与恢复图已由root和reviewer实际查看。清单19,103→19,116，精确增14/删1对应replacement、无重复，55批准skip字节未变；仅两必要清单门禁2通过，不执行19,116全套。
+
+原件与验收收据：`/private/tmp/rquant-factor-tracking-root-yegakn31/stored-tracking-accepted-real-proof.json`、`stored-tracking-proof/worker-response.json`及同目录原command/stderr；后台/前端冻结和原XML、清单原件保持。首次root本地收据断言把报告中文句号当ASCII句号，实际exit1且未分发worker；`stored-tracking-proof/acceptance-receipt-first-attempt.json`保留，随后仅修正收据helper，未改产品或增加审查轮次。原红测、部分失败和helper错误均保留。
+
+终审和真实对照完成后，root核对来源、设备/inode和无打开句柄，删除两份过期自有合成目录，实际释放3,624,679,432B；日志、XML、trace和截图保留。清理证据为 `stored-tracking-fixture-cleanup-preflight.json` / `stored-tracking-fixture-cleanup.json`，未改变平台保护；当前任务依赖因下一片有实际用途而保留。
+
+下一片只读预检已确认：正式只读副本日线7,338,351行/5,789码，而库存日线指标仅24,421行/280码；日线始于2020-08-24，复权因子始于2024-09-02，不能宣称上市全历史初始化。后续实现有明确价格口径与初始化边界的全市场技术指标研究来源，继续已有选股特征、分钟/竞价/温度/VP、CSI完整历史、正式配置/数据代/18:40与生产UI验收。M3仍部分，整体goal active；不重复已验收的库存来源与跟踪实现。
