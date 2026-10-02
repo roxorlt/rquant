@@ -6,11 +6,14 @@ import hashlib
 import importlib.metadata
 import math
 import os
+import stat
+from collections import OrderedDict
 from collections.abc import Callable, Iterator
 from contextlib import suppress
 from datetime import date, datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from threading import Lock
 from typing import TYPE_CHECKING, Literal
 
 import duckdb
@@ -18,12 +21,21 @@ import pandas as pd
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from rquant.data_metadata import DatasetSnapshotArtifact, normalize_utc_datetime, utc_now
-from rquant.factor.result_artifact import _open_private_root, _require_same_root, _root_path
+from rquant.factor.result_artifact import (
+    _file_identity,
+    _open_private_root,
+    _require_same_root,
+    _root_path,
+)
 from rquant.factor.source_prepare import FactorPreparedStreamSource, _check_generation, _generation
 from rquant.factor.universe import StockCode
 from rquant.indicator import technical
 from rquant.readside_replica_gate import connect_pinned_readonly
-from rquant.research_snapshot import _source_table_schema, materialize_table_dependency
+from rquant.research_snapshot import (
+    _source_table_schema,
+    materialize_table_dependency,
+    verify_materialized_table_artifact,
+)
 from rquant.runtime_contracts import canonical_sha256
 from rquant.strategy_dependencies import StrategyTableDependency
 
@@ -50,6 +62,81 @@ TECHNICAL_COLUMNS = tuple(
         )
     )
 )
+_InputIdentity = tuple[int, int, int, int, int, int, int, int]
+_TECHNICAL_INPUT_VALIDATION_LIMIT = 32
+_TECHNICAL_INPUT_VALIDATIONS: OrderedDict[tuple[str, datetime], None] = OrderedDict()
+_TECHNICAL_INPUT_VALIDATION_LOCK = Lock()
+
+
+def _verify_technical_history_input(
+    artifact: DatasetSnapshotArtifact,
+    *,
+    lake_root: Path,
+    as_of_time: datetime,
+    expected_identity: _InputIdentity | None = None,
+) -> tuple[Path, _InputIdentity]:
+    """Reuse only full validation of the exact metadata and cryptographic bytes."""
+    artifact = DatasetSnapshotArtifact.model_validate(artifact)
+    as_of_time = normalize_utc_datetime(as_of_time)
+    relative = Path("tables/technical_history_input/versions") / f"{artifact.file_hash}.parquet"
+    if (
+        artifact.artifact_type != "materialized_table"
+        or artifact.dataset_id != "factor_technical_history_inputs"
+        or artifact.table_name != "technical_history_input"
+        or Path(artifact.relative_path) != relative
+    ):
+        raise ValueError("technical input artifact is not the declared content-addressed table")
+    root = _root_path(lake_root)
+    root_descriptor = _open_private_root(root)
+    file_descriptor = None
+    try:
+        path = root / relative
+        if path.resolve() != path:
+            raise ValueError("technical input path changed or traverses a symbolic link")
+        file_descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)
+        observed = os.fstat(file_descriptor)
+        identity = _file_identity(observed)
+        if (
+            not stat.S_ISREG(observed.st_mode)
+            or observed.st_uid != os.getuid()
+            or _file_identity(path.stat(follow_symlinks=False)) != identity
+            or (expected_identity is not None and identity != expected_identity)
+        ):
+            raise ValueError("technical input file changed during access")
+        if artifact.file_size is not None and observed.st_size != artifact.file_size:
+            raise ValueError("technical input file size mismatch")
+        digest = hashlib.sha256()
+        while chunk := os.read(file_descriptor, 1024 * 1024):
+            digest.update(chunk)
+        if digest.hexdigest() != artifact.file_hash:
+            raise ValueError("technical input file hash mismatch")
+        # The key covers every declared field and the time at which it was verified.
+        key = canonical_sha256(artifact), as_of_time
+        with _TECHNICAL_INPUT_VALIDATION_LOCK:
+            cached = key in _TECHNICAL_INPUT_VALIDATIONS
+            if cached:
+                _TECHNICAL_INPUT_VALIDATIONS.move_to_end(key)
+        if not cached:
+            verify_materialized_table_artifact(artifact, lake_root=root, as_of_time=as_of_time)
+        if (
+            _file_identity(os.fstat(file_descriptor)) != identity
+            or _file_identity(path.stat(follow_symlinks=False)) != identity
+        ):
+            raise ValueError("technical input file changed during validation")
+        _require_same_root(root, root_descriptor)
+        if not cached:
+            with _TECHNICAL_INPUT_VALIDATION_LOCK:
+                _TECHNICAL_INPUT_VALIDATIONS[key] = None
+                _TECHNICAL_INPUT_VALIDATIONS.move_to_end(key)
+                while len(_TECHNICAL_INPUT_VALIDATIONS) > _TECHNICAL_INPUT_VALIDATION_LIMIT:
+                    _TECHNICAL_INPUT_VALIDATIONS.popitem(last=False)
+        return path, identity
+    finally:
+        if file_descriptor is not None:
+            os.close(file_descriptor)
+        os.close(root_descriptor)
+
+
 TechnicalHistoryReason = Literal[
     "insufficient_window",
     "no_initialization",

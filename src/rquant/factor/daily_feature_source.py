@@ -36,6 +36,8 @@ from rquant.factor.technical_history_source import (
     FactorTechnicalHistoryReceipt,
     FactorTechnicalHistorySummary,
     TechnicalHistoryReason,
+    _InputIdentity,
+    _verify_technical_history_input,
 )
 from rquant.factor.universe import StockCode
 from rquant.readside_replica_gate import connect_pinned_readonly
@@ -918,21 +920,39 @@ def open_factor_daily_feature_source(
     source = FactorDailyFeatureSource.model_validate(source)
     root = _root_path(lake_root)
     descriptor = _open_private_root(root)
-    connection, lease = None, None
+    connection, lease, private_descriptor = None, None, None
+    technical_identities: dict[str, tuple[_InputIdentity, _InputIdentity]] = {}
     try:
         with TemporaryDirectory(prefix=".daily-feature-reader-", dir=root) as scratch:
             private_root = Path(scratch)
+            if source.technical_history is not None:
+                private_descriptor = _open_private_root(private_root)
             for artifact in source.input_artifacts():
-                original = verify_materialized_table_artifact(
-                    artifact, lake_root=root, as_of_time=source.scope.as_of_time
-                )
+                technical = artifact.table_name == "technical_history_input"
+                if technical:
+                    original, original_identity = _verify_technical_history_input(
+                        artifact, lake_root=root, as_of_time=source.scope.as_of_time
+                    )
+                else:
+                    original = verify_materialized_table_artifact(
+                        artifact, lake_root=root, as_of_time=source.scope.as_of_time
+                    )
                 target = private_root / artifact.relative_path
                 target.parent.mkdir(parents=True)
                 shutil.copyfile(original, target)
                 os.chmod(target, 0o600)
-                verify_materialized_table_artifact(
-                    artifact, lake_root=private_root, as_of_time=source.scope.as_of_time
-                )
+                if technical:
+                    _, copied_identity = _verify_technical_history_input(
+                        artifact, lake_root=private_root, as_of_time=source.scope.as_of_time
+                    )
+                    technical_identities[artifact.relative_path] = (
+                        original_identity,
+                        copied_identity,
+                    )
+                else:
+                    verify_materialized_table_artifact(
+                        artifact, lake_root=private_root, as_of_time=source.scope.as_of_time
+                    )
             _require_same_root(root, descriptor)
             connection = duckdb.connect(":memory:")
             try:
@@ -1009,12 +1029,31 @@ def open_factor_daily_feature_source(
                     if invalid[0] or repeated[0]:
                         raise ValueError("technical sealed history has invalid keys or dates")
                     source.technical_history.require_sealed_initialization(connection)
+                    _require_same_root(private_root, private_descriptor)
                 lease = FactorDailyFeatureReadLease(source, connection, private_root)
                 yield lease
                 for artifact in source.input_artifacts():
-                    verify_materialized_table_artifact(
-                        artifact, lake_root=root, as_of_time=source.scope.as_of_time
-                    )
+                    if artifact.relative_path in technical_identities:
+                        _require_same_root(private_root, private_descriptor)
+                        original_identity, copied_identity = technical_identities[
+                            artifact.relative_path
+                        ]
+                        _verify_technical_history_input(
+                            artifact,
+                            lake_root=private_root,
+                            as_of_time=source.scope.as_of_time,
+                            expected_identity=copied_identity,
+                        )
+                        _verify_technical_history_input(
+                            artifact,
+                            lake_root=root,
+                            as_of_time=source.scope.as_of_time,
+                            expected_identity=original_identity,
+                        )
+                    else:
+                        verify_materialized_table_artifact(
+                            artifact, lake_root=root, as_of_time=source.scope.as_of_time
+                        )
                 _require_same_root(root, descriptor)
             finally:
                 if lease is not None:
@@ -1022,4 +1061,6 @@ def open_factor_daily_feature_source(
                 else:
                     connection.close()
     finally:
+        if private_descriptor is not None:
+            os.close(private_descriptor)
         os.close(descriptor)

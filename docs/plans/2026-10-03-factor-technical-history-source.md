@@ -56,3 +56,20 @@ backend冻结后frontend同树顺序接实际可信目录/来源与覆盖、测�
 - 1440×900 / 390×844 的键盘、触摸说明、历史来源与当前能力独立及换代恢复均有合成浏览器证据。仅为截图等待 Tip opacity=1 后补两节点 2 passed，未重复累计；最终 4 张 PNG 已实际查看。
 - Node 22.22.2 / pnpm 10.33.0 / Python 3.13.12 / Pydantic 2.13.1 / DuckDB 1.5.2。build、size、正常快照提交后的 verify:dist 均 exit 0；首屏 gzip 323.2 KB / 上限 550 KB，按需合计 437.7 KB。
 - 完整 argv、UTC、wall、exit、XML、节点、生成合同与截图 SHA、资源收据：`/private/tmp/rquant-technical-source-react-2jfu0_dg`。本片仅合成验证，真实来源验收与唯一联合审查由 root 接续。自有端口 18825 / 14225 已随服务器退出；API basetemp 与 browser-serving 保留给最终审查，句柄检查无匹配，不修改保护或删除未知资料。
+
+## 真实运行发现的局部性能问题（2026-10-03）
+
+受审 clean 候选 `f62f762b683b43797e204ba4cc0906825b1ab4bc` 的首轮真实验收在 1801.112s 以 exit 124 超时，不能计为通过。独立原审查报告已接受代码；实际账本只读观察为一个 succeeded job、一个已提交跟踪日。中断栈位于根任务再次核验该首日结果时，daily-feature lease 退出所调用的 `verify_materialized_table_artifact -> _logical_content_hash`；同一技术历史输入在原件、私有副本和退出阶段重复逐值扫描。原日志/响应/归档/原审查及精确候选保留在 `/private/tmp/rquant-factor-tracking-root-yegakn31/technical-source-proof/attempt-1-timeout`。远端 bootstrap 回执确认自有临时目录已删除，生产只读边界不变。
+
+稳定 finding `FTH-PERF-01`：仅对新增技术历史输入的重复完整验证做一次原作者局部修复及原审查者定向复核，仍为普通任务；不修改通用 research_lake/research_snapshot 哈希、v1 库存行为、公共 schema、账本/提交/恢复/鉴权或生产路径。实现前用有界合成材料测量重复逻辑扫描，确认耗时来源。
+
+验收：首次完整验证仍覆盖原物化工件的全部元数据、逻辑摘要与初始化证据；任何验证结果复用必须绑定完整工件元数据，并在每次读取/复制/退出核对实际文件字节的加密摘要及适用的文件/root 身份，不能仅靠路径、mtime、大小或宽泛缓存。修改原件/副本或改变声明须拒绝；缓存有明确容量且不保留 reader、连接或文件句柄；旧 v1 路径保持原行为。聚焦红绿与直接旧回归后，原 reviewer 只复核本 finding 与修复回归；前端及其他未失效证据复用。真实首1日＋续2日/整3日、独立参考、重复/取消及资源验收仍必须完整走完，未完成前不合入。超出上述局部边界先停写并报告，不自动重设计。
+
+## FTH-PERF-01 局部修复证据（2026-10-03）
+
+- 原 implementer `/root/factor_security_collection_impl`，父 `/root`；本树 `cdx/20261003-factor-technical-source` 从 `f62f762b683b43797e204ba4cc0906825b1ab4bc` 开始，仅 root 上述附录 dirty。只改 technical_history_source、daily_feature_source、新直接测试及本附录；原37行 SHA256 保持 `e55ad01b6fe6a606de74034fcb1eba207d0388383648a67c8c83e6fd35a98a75`。
+- 私有合成证据 `/private/tmp/rquant-technical-history-perf-tlbhbd1m`。同一200,000行/500码/400观察、同一文件 SHA 的六次原件/复制件验证，修前完整逻辑扫描6次、1.906158s（逻辑1.845759s），修后首次完整扫描1次、0.324324s；冷调用0.323444s，热调用0.000140–0.000276s。仅是有界合成测量，不代表真实7M行或最大负载验收。
+- 新技术输入分支用完整 artifact 元数据摘要与规范 asof 绑定最多32项成功逻辑验证；不保存路径、reader、连接或文件句柄。每次仍实读 SHA，并核对命名文件/已打开文件、适用 root 和时刻；活动 reader 原件/复制件尾部另核对原 dev/inode/完整文件身份。首次沿原 generic 全验证，每个 reader 的初始化 SQL 校验保留。v1、通用 hash、公开模型及原事务/恢复不改。
+- `perf-fixture-corrected-red.xml` 实际1 failed/1.50s，准确复现6次完整扫描；前两份夹具错误失败原件亦保留。有效去重6新节点见 `perf-initial-green.xml` 6 passed/3.23s，修改分支补验 `warm-mutation-green.xml` 2 passed/1.56s 属于同两节点，不累计。直接旧6节点 `direct-regression.xml` 6 passed/4.90s，包含原初始化、库存损坏、完整 worker/replay、输入缺失/尾部及旧 spec/prefix 黄金；无skip或删除改名。新元数据/时刻错配、恢复mtime的原件/副本修改、同字节换inode、容量及FD关闭有实际断言。
+- Python3.13.12/Pydantic2.13.1/DuckDB1.5.2/pytest9.0.3；仅本树导入、dummy配置、禁dotenv/bytecode和自有TMPDIR。逐命令 JSON/log/XML 记录实际argv/UTC/wall/exit，所有失败静态结果保留；最终 Ruff/format 通过，3.11语法/源码SHA/资源与精确nodeids随私有 handoff 保存。测试后变化仅等价排版及合并 with 上下文，不重复累计节点。
+- 实现冻结后停写；原 reviewer 仅复核 FTH-PERF-01 和直接回归，root 继续原真实3 jobs/1800s上限及独立参考/资源验收。未访问真实材料或声称超时已在真实来源解决，未重跑前端/API/浏览器及全清单。
