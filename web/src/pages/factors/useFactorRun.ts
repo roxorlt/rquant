@@ -21,6 +21,7 @@ import {
   readRunDraft,
   type StoredRun,
   sameRunRequest,
+  validMadMultiple,
   validRunResult,
   withFactorCommandLock,
 } from "./factorRunState";
@@ -35,6 +36,7 @@ const defaults: RunDraft = {
   group_count: 5,
   ic_method: "rank",
   neutralization: "none",
+  extended_statistics: true,
 };
 
 export function useFactorRun({
@@ -105,6 +107,7 @@ export function useFactorRun({
   );
   const validDates =
     params.start_date !== "" && params.end_date !== "" && params.start_date <= params.end_date;
+  const validOutliers = validMadMultiple(params.mad_multiple);
   const canStart =
     availabilityVerified &&
     catalogVerified &&
@@ -119,12 +122,25 @@ export function useFactorRun({
     navigator.locks !== undefined &&
     selectedPool?.available === true &&
     selectedNeutralization?.available === true &&
-    validDates;
+    validDates &&
+    validOutliers;
   verifiedRef.current = canStart;
   const currentHeadRef = useRef(selected);
   currentHeadRef.current = selected;
   const generationRef = useRef(generationId);
   generationRef.current = generationId;
+  // New runs always request diagnostics; old operations keep their original wire payload.
+  const { mad_multiple, ...otherParams } = params;
+  const requestParameters =
+    selected === null
+      ? null
+      : {
+          ...otherParams,
+          ...(mad_multiple == null ? {} : { mad_multiple }),
+          extended_statistics: true,
+          factor_id: selected.factor_id,
+          expected_head: { version: selected.version, content_sha256: selected.content_sha256 },
+        };
   const confirmationCurrent =
     confirmation !== null &&
     selected !== null &&
@@ -134,7 +150,11 @@ export function useFactorRun({
     confirmation.request.parameters.factor_id === selected?.factor_id &&
     confirmation.request.parameters.expected_head.version === selected.version &&
     confirmation.request.parameters.expected_head.content_sha256 === selected.content_sha256 &&
-    confirmation.request.parameters.neutralization === params.neutralization &&
+    requestParameters !== null &&
+    sameRunRequest(confirmation.request, {
+      ...confirmation.request,
+      parameters: requestParameters,
+    }) &&
     neutralizations.find(
       (option) => option.neutralization === confirmation.request.parameters.neutralization,
     )?.available === true;
@@ -356,6 +376,7 @@ export function useFactorRun({
       typeof generationId !== "string" ||
       selected === null ||
       selectedPool === undefined ||
+      requestParameters === null ||
       selectedNeutralization?.available !== true ||
       hasRun() ||
       hasTracking() ||
@@ -377,11 +398,7 @@ export function useFactorRun({
           .replace(/\.000Z$/, "Z")
           .replace(/\.(\d{3})Z$/, (_match, digits: string) => `.${digits}000Z`),
         serving_generation_id: generationId,
-        parameters: {
-          ...params,
-          factor_id: selected.factor_id,
-          expected_head: { version: selected.version, content_sha256: selected.content_sha256 },
-        },
+        parameters: requestParameters,
       },
     });
   };
@@ -488,9 +505,11 @@ export function useFactorRun({
                             ? (selectedPool.reason ?? "这个股票池暂不可用。")
                             : selectedNeutralization?.available !== true
                               ? (selectedNeutralization?.reason ?? "这个中性化方式暂不可用。")
-                              : !validDates
-                                ? "请选择有效的起止日期。"
-                                : null));
+                              : !validOutliers
+                                ? "MAD 倍数须为大于 0 的有限数值。"
+                                : !validDates
+                                  ? "请选择有效的起止日期。"
+                                  : null));
   const status = completed
     ? "检验完成。"
     : failed
@@ -547,5 +566,7 @@ function draftFrom(operation: StoredRun): RunDraft {
     group_count: p.group_count,
     ic_method: p.ic_method,
     neutralization: p.neutralization,
+    ...(p.mad_multiple === undefined ? {} : { mad_multiple: p.mad_multiple }),
+    ...(p.extended_statistics === undefined ? {} : { extended_statistics: p.extended_statistics }),
   };
 }

@@ -3179,6 +3179,27 @@ export interface components {
             /** Rank Ic Cumulative Sum */
             rank_ic_cumulative_sum: number | null;
         };
+        /** FactorExtendedStatistics */
+        FactorExtendedStatistics: {
+            /** Autocorrelation Points */
+            autocorrelation_points: components["schemas"]["FactorRankAutocorrelationPoint"][];
+            /**
+             * Ic Method
+             * @enum {string}
+             */
+            ic_method: "rank" | "normal";
+            /** Industry Coverage Days */
+            industry_coverage_days: components["schemas"]["FactorIndustryCoverageDay"][];
+            /** Industry Reason */
+            industry_reason?: string | null;
+            /**
+             * Industry Status
+             * @enum {string}
+             */
+            industry_status: "available" | "unavailable";
+            /** Industry Summaries */
+            industry_summaries: components["schemas"]["FactorIndustryICSummary"][];
+        };
         /** FactorHeadRef */
         FactorHeadRef: {
             /** Content Sha256 */
@@ -3193,6 +3214,47 @@ export interface components {
         FactorICSummary: {
             normal_ic: components["schemas"]["ICSeriesSummary"];
             rank_ic: components["schemas"]["ICSeriesSummary"];
+        };
+        /** FactorIndustryCoverageDay */
+        FactorIndustryCoverageDay: {
+            /** Expected Count */
+            expected_count: number;
+            /** Missing By Reason */
+            missing_by_reason: components["schemas"]["FactorIndustryMissingCount"][];
+            /** Paired Count */
+            paired_count: number;
+            /**
+             * Panel Date
+             * Format: date
+             */
+            panel_date: string;
+            /**
+             * Trade Date
+             * Format: date
+             */
+            trade_date: string;
+            /** Valid Label Count */
+            valid_label_count: number;
+        };
+        /** FactorIndustryICSummary */
+        FactorIndustryICSummary: {
+            ic_summary: components["schemas"]["ICSeriesSummary"];
+            /** L1 Code */
+            l1_code: string;
+            /** L1 Name */
+            l1_name: string;
+            /** Sample Count */
+            sample_count: number;
+        };
+        /** FactorIndustryMissingCount */
+        FactorIndustryMissingCount: {
+            /** Count */
+            count: number;
+            /**
+             * Reason
+             * @enum {string}
+             */
+            reason: "missing" | "ambiguous" | "boundary_unverified";
         };
         /** FactorMissingCount */
         FactorMissingCount: {
@@ -3230,6 +3292,25 @@ export interface components {
             return_end_at: string;
             /** Source Sample Count */
             source_sample_count: number;
+        };
+        /** FactorRankAutocorrelationPoint */
+        FactorRankAutocorrelationPoint: {
+            /** Common Count */
+            common_count: number;
+            /** Previous Trade Date */
+            previous_trade_date: string | null;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "first_period" | "no_common_members" | "insufficient_samples" | "zero_variance" | "ok";
+            /**
+             * Trade Date
+             * Format: date
+             */
+            trade_date: string;
+            /** Value */
+            value: number | null;
         };
         /** FactorResearchDisplay */
         FactorResearchDisplay: {
@@ -3409,6 +3490,11 @@ export interface components {
              */
             end_date: string;
             expected_head: components["schemas"]["FactorHeadRef"];
+            /**
+             * Extended Statistics
+             * @default false
+             */
+            extended_statistics: boolean;
             /** Factor Id */
             factor_id: string;
             /**
@@ -3428,6 +3514,8 @@ export interface components {
              * @enum {string}
              */
             ic_method: "rank" | "normal";
+            /** Mad Multiple */
+            mad_multiple?: number | null;
             /**
              * Neutralization
              * @default none
@@ -3565,6 +3653,7 @@ export interface components {
             coverage_days: components["schemas"]["FactorStreamDisplayCoverageDay"][];
             /** Decay Periods */
             decay_periods: components["schemas"]["FactorDisplayDecayPeriod"][];
+            extended_statistics?: components["schemas"]["FactorExtendedStatistics"] | null;
             /**
              * Holding Sessions
              * @enum {integer}
@@ -3573,6 +3662,8 @@ export interface components {
             /** Ic Points */
             ic_points: components["schemas"]["FactorDisplayICPoint"][];
             ic_summary: components["schemas"]["FactorICSummary"];
+            /** Mad Multiple */
+            mad_multiple?: number | null;
             /**
              * Neutralization
              * @default none

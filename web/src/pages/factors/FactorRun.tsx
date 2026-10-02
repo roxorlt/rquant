@@ -1,6 +1,7 @@
 import { Button, ConfirmDialog, Panel, Segmented, Tip } from "@/ui";
 import { isNeutralizationMode, type RunDraft } from "./factorRunState";
 import { neutralizationExplanation } from "./runNeutralization";
+import { outlierCaption, outlierExplanation } from "./runOutliers";
 import type { useFactorRun } from "./useFactorRun";
 
 type Run = ReturnType<typeof useFactorRun>;
@@ -99,6 +100,33 @@ export function FactorRunParameters({ run }: { run: Run }) {
           </label>
         </div>
         <label className="field">
+          <span className="lbl">离群值处理</span>
+          <select
+            className="inp"
+            value={params.mad_multiple == null ? "none" : "mad"}
+            disabled={!run.availabilityVerified || run.permissionDenied}
+            onChange={(event) => change("mad_multiple", event.target.value === "mad" ? 3 : null)}
+          >
+            <option value="none">不处理</option>
+            <option value="mad">MAD</option>
+          </select>
+        </label>
+        {params.mad_multiple != null ? (
+          <label className="field">
+            <span className="lbl">MAD 倍数</span>
+            <input
+              className="inp num"
+              type="number"
+              min="0"
+              step="any"
+              value={params.mad_multiple}
+              disabled={!run.availabilityVerified || run.permissionDenied}
+              onChange={(event) => change("mad_multiple", Number(event.target.value))}
+            />
+          </label>
+        ) : null}
+        <Tip content={outlierExplanation}>离群值处理说明</Tip>
+        <label className="field">
           <span className="lbl">中性化</span>
           <select
             className="inp"
@@ -171,6 +199,8 @@ export function FactorRunStatus({ run }: { run: Run }) {
           {p.ic_method === "rank" ? "RankIC" : "NormalIC"}
           {" · "}
           {run.describeNeutralization(record)}
+          {" · "}
+          {outlierCaption(p.mad_multiple)}
         </span>
       </div>
       <div
@@ -236,6 +266,8 @@ export function FactorRunConfirmation({ run }: { run: Run }) {
               {p.holding_sessions} 日调仓 · {p.group_count} 组 ·{" "}
               {p.ic_method === "rank" ? "RankIC" : "NormalIC"} ·{" "}
               {run.describeNeutralization(record)}
+              {" · "}
+              {outlierCaption(p.mad_multiple)}
             </p>
             <p className="hint">确认后提交检验，结果更新后可查看。</p>
             {!run.confirmationCurrent ? (

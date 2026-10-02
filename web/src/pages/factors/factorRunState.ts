@@ -11,7 +11,11 @@ const RUN_DRAFT_KEY = "rquant.factor.run-draft.v1";
 export const ARCHIVE_COMMAND_KEY = "rquant.factor.archive-command.v1";
 const SAVE_COMMAND_KEY = "rquant.factor.save-command.v1";
 
-export type RunDraft = Omit<FactorRunParameters, "factor_id" | "expected_head">;
+export type RunDraft = Omit<
+  FactorRunParameters,
+  "factor_id" | "expected_head" | "extended_statistics"
+> &
+  Partial<Pick<FactorRunParameters, "extended_statistics">>;
 export type StoredRun = {
   viewer: string;
   request: FactorRunRequest;
@@ -34,6 +38,11 @@ const parameterKeys = [
   "ic_method",
   "neutralization",
 ] as const satisfies readonly (keyof FactorRunParameters)[];
+const optionalParameterKeys = [
+  "mad_multiple",
+  "extended_statistics",
+] as const satisfies readonly (keyof FactorRunParameters)[];
+const allParameterKeys = [...parameterKeys, ...optionalParameterKeys];
 const digest = /^[a-f0-9]{64}$/;
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 const neutralizationModes = [
@@ -46,6 +55,14 @@ export function isNeutralizationMode(
   value: unknown,
 ): value is FactorRunParameters["neutralization"] {
   return neutralizationModes.some((mode) => mode === value);
+}
+
+export function validMadMultiple(value: unknown): boolean {
+  return (
+    value === undefined ||
+    value === null ||
+    (typeof value === "number" && Number.isFinite(value) && value > 0)
+  );
 }
 
 function object(value: unknown): value is Record<string, unknown> {
@@ -65,7 +82,9 @@ function validDraft(value: unknown): value is RunDraft & Record<string, unknown>
     typeof value.group_count === "number" &&
     [3, 5, 10].includes(value.group_count) &&
     (value.ic_method === "rank" || value.ic_method === "normal") &&
-    isNeutralizationMode(value.neutralization)
+    isNeutralizationMode(value.neutralization) &&
+    validMadMultiple(value.mad_multiple) &&
+    (value.extended_statistics === undefined || typeof value.extended_statistics === "boolean")
   );
 }
 
@@ -87,7 +106,7 @@ export function validRunRequest(value: unknown): value is FactorRunRequest {
   const p = value.parameters;
   return (
     validDraft(p) &&
-    Object.keys(p).length === parameterKeys.length &&
+    Object.keys(p).every((key) => allParameterKeys.some((known) => known === key)) &&
     parameterKeys.every((key) => key in p) &&
     typeof p.factor_id === "string" &&
     /^[a-z][a-z0-9_]{0,63}$/.test(p.factor_id) &&
@@ -105,7 +124,7 @@ export function sameRunRequest(a: FactorRunRequest, b: FactorRunRequest): boolea
     a.command_id === b.command_id &&
     a.requested_at === b.requested_at &&
     a.serving_generation_id === b.serving_generation_id &&
-    parameterKeys.every((key) =>
+    allParameterKeys.every((key) =>
       key === "expected_head"
         ? a.parameters.expected_head.version === b.parameters.expected_head.version &&
           a.parameters.expected_head.content_sha256 === b.parameters.expected_head.content_sha256

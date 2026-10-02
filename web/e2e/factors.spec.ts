@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
 import type { MetaEnvelope, Schemas } from "../src/api/client.ts";
-import rejectionContract from "../src/pages/factors/factorRunRejection.fixture.json" with {
+import rejectionContract from "../src/pages/factors/factorDiagnosticsRejection.fixture.json" with {
   type: "json",
 };
 import {

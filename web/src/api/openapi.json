@@ -5651,6 +5651,73 @@
         "title": "FactorDisplayICPoint",
         "type": "object"
       },
+      "FactorExtendedStatistics": {
+        "additionalProperties": false,
+        "properties": {
+          "autocorrelation_points": {
+            "items": {
+              "$ref": "#/components/schemas/FactorRankAutocorrelationPoint"
+            },
+            "maxItems": 1024,
+            "minItems": 1,
+            "title": "Autocorrelation Points",
+            "type": "array"
+          },
+          "ic_method": {
+            "enum": [
+              "rank",
+              "normal"
+            ],
+            "title": "Ic Method",
+            "type": "string"
+          },
+          "industry_coverage_days": {
+            "items": {
+              "$ref": "#/components/schemas/FactorIndustryCoverageDay"
+            },
+            "maxItems": 1024,
+            "title": "Industry Coverage Days",
+            "type": "array"
+          },
+          "industry_reason": {
+            "anyOf": [
+              {
+                "maxLength": 80,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Industry Reason"
+          },
+          "industry_status": {
+            "enum": [
+              "available",
+              "unavailable"
+            ],
+            "title": "Industry Status",
+            "type": "string"
+          },
+          "industry_summaries": {
+            "items": {
+              "$ref": "#/components/schemas/FactorIndustryICSummary"
+            },
+            "maxItems": 31,
+            "title": "Industry Summaries",
+            "type": "array"
+          }
+        },
+        "required": [
+          "ic_method",
+          "industry_status",
+          "industry_summaries",
+          "industry_coverage_days",
+          "autocorrelation_points"
+        ],
+        "title": "FactorExtendedStatistics",
+        "type": "object"
+      },
       "FactorHeadRef": {
         "additionalProperties": false,
         "properties": {
@@ -5688,6 +5755,116 @@
           "rank_ic"
         ],
         "title": "FactorICSummary",
+        "type": "object"
+      },
+      "FactorIndustryCoverageDay": {
+        "additionalProperties": false,
+        "properties": {
+          "expected_count": {
+            "maximum": 7000.0,
+            "minimum": 0.0,
+            "title": "Expected Count",
+            "type": "integer"
+          },
+          "missing_by_reason": {
+            "items": {
+              "$ref": "#/components/schemas/FactorIndustryMissingCount"
+            },
+            "maxItems": 3,
+            "title": "Missing By Reason",
+            "type": "array"
+          },
+          "paired_count": {
+            "maximum": 7000.0,
+            "minimum": 0.0,
+            "title": "Paired Count",
+            "type": "integer"
+          },
+          "panel_date": {
+            "format": "date",
+            "title": "Panel Date",
+            "type": "string"
+          },
+          "trade_date": {
+            "format": "date",
+            "title": "Trade Date",
+            "type": "string"
+          },
+          "valid_label_count": {
+            "maximum": 7000.0,
+            "minimum": 0.0,
+            "title": "Valid Label Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "trade_date",
+          "panel_date",
+          "expected_count",
+          "valid_label_count",
+          "paired_count",
+          "missing_by_reason"
+        ],
+        "title": "FactorIndustryCoverageDay",
+        "type": "object"
+      },
+      "FactorIndustryICSummary": {
+        "additionalProperties": false,
+        "properties": {
+          "ic_summary": {
+            "$ref": "#/components/schemas/ICSeriesSummary"
+          },
+          "l1_code": {
+            "pattern": "^\\d{6}\\.SI$",
+            "title": "L1 Code",
+            "type": "string"
+          },
+          "l1_name": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "L1 Name",
+            "type": "string"
+          },
+          "sample_count": {
+            "maximum": 7168000.0,
+            "minimum": 0.0,
+            "title": "Sample Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "l1_code",
+          "l1_name",
+          "sample_count",
+          "ic_summary"
+        ],
+        "title": "FactorIndustryICSummary",
+        "type": "object"
+      },
+      "FactorIndustryMissingCount": {
+        "additionalProperties": false,
+        "properties": {
+          "count": {
+            "maximum": 7000.0,
+            "minimum": 1.0,
+            "title": "Count",
+            "type": "integer"
+          },
+          "reason": {
+            "enum": [
+              "missing",
+              "ambiguous",
+              "boundary_unverified"
+            ],
+            "title": "Reason",
+            "type": "string"
+          }
+        },
+        "required": [
+          "reason",
+          "count"
+        ],
+        "title": "FactorIndustryMissingCount",
         "type": "object"
       },
       "FactorMissingCount": {
@@ -5766,6 +5943,65 @@
           "groupings"
         ],
         "title": "FactorPortfolioDay",
+        "type": "object"
+      },
+      "FactorRankAutocorrelationPoint": {
+        "additionalProperties": false,
+        "properties": {
+          "common_count": {
+            "maximum": 7000.0,
+            "minimum": 0.0,
+            "title": "Common Count",
+            "type": "integer"
+          },
+          "previous_trade_date": {
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Previous Trade Date"
+          },
+          "status": {
+            "enum": [
+              "first_period",
+              "no_common_members",
+              "insufficient_samples",
+              "zero_variance",
+              "ok"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "trade_date": {
+            "format": "date",
+            "title": "Trade Date",
+            "type": "string"
+          },
+          "value": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Value"
+          }
+        },
+        "required": [
+          "trade_date",
+          "previous_trade_date",
+          "common_count",
+          "status",
+          "value"
+        ],
+        "title": "FactorRankAutocorrelationPoint",
         "type": "object"
       },
       "FactorResearchDisplay": {
@@ -6323,6 +6559,11 @@
           "expected_head": {
             "$ref": "#/components/schemas/FactorHeadRef"
           },
+          "extended_statistics": {
+            "default": false,
+            "title": "Extended Statistics",
+            "type": "boolean"
+          },
           "factor_id": {
             "pattern": "^[a-z][a-z0-9_]{0,63}$",
             "title": "Factor Id",
@@ -6356,6 +6597,18 @@
             ],
             "title": "Ic Method",
             "type": "string"
+          },
+          "mad_multiple": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mad Multiple"
           },
           "neutralization": {
             "default": "none",
@@ -6726,6 +6979,16 @@
             "title": "Decay Periods",
             "type": "array"
           },
+          "extended_statistics": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FactorExtendedStatistics"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "holding_sessions": {
             "enum": [
               1,
@@ -6745,6 +7008,17 @@
           },
           "ic_summary": {
             "$ref": "#/components/schemas/FactorICSummary"
+          },
+          "mad_multiple": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mad Multiple"
           },
           "neutralization": {
             "default": "none",

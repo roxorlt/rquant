@@ -1,10 +1,87 @@
-import type { FactorResearchDisplay } from "@/api/factors";
+import type { FactorExtendedStatistics, FactorResearchDisplay } from "@/api/factors";
 import type { EChartOption } from "@/charts/echarts";
 import { baseOption } from "@/charts/options";
 import type { ChartColors } from "@/charts/tokens";
 import { formatNumber, formatPercent } from "@/format/number";
 
 export type IcMethod = "normal_ic" | "rank_ic";
+
+export function industryIcOption(
+  statistics: FactorExtendedStatistics,
+  colors: ChartColors,
+): EChartOption {
+  const summaries = statistics.industry_summaries;
+  return {
+    ...baseOption(colors),
+    grid: { left: 88, right: summaries.length > 10 ? 36 : 16, top: 16, bottom: 32 },
+    xAxis: yAxis(colors),
+    yAxis: {
+      ...xAxis(
+        summaries.map((item) => item.l1_name),
+        colors,
+      ),
+      inverse: true,
+      axisLabel: { color: colors.muted, fontSize: 11, width: 78, overflow: "truncate" },
+    },
+    ...(summaries.length > 10
+      ? {
+          dataZoom: [
+            {
+              type: "slider" as const,
+              yAxisIndex: 0,
+              startValue: 0,
+              endValue: 9,
+              right: 4,
+              width: 14,
+              showDetail: false,
+            },
+          ],
+        }
+      : {}),
+    series: [
+      {
+        name: statistics.ic_method === "rank" ? "RankIC 均值" : "NormalIC 均值",
+        type: "bar",
+        barMaxWidth: 20,
+        data: summaries.map((item) =>
+          item.ic_summary.mean === null
+            ? null
+            : {
+                value: item.ic_summary.mean,
+                itemStyle: { color: item.ic_summary.mean >= 0 ? colors.up : colors.down },
+              },
+        ),
+      },
+    ],
+  };
+}
+
+export function autocorrelationOption(
+  statistics: FactorExtendedStatistics,
+  colors: ChartColors,
+): EChartOption {
+  return {
+    ...baseOption(colors),
+    grid: { left: 52, right: 16, top: 16, bottom: 32 },
+    xAxis: xAxis(
+      statistics.autocorrelation_points.map((point) => point.trade_date),
+      colors,
+    ),
+    yAxis: yAxis(colors),
+    series: [
+      {
+        name: "因子自相关",
+        type: "line",
+        connectNulls: false,
+        showSymbol: true,
+        symbolSize: 5,
+        data: statistics.autocorrelation_points.map((point) => point.value),
+        lineStyle: { color: colors.accent, width: 2 },
+        itemStyle: { color: colors.accent },
+      },
+    ],
+  };
+}
 
 export function icSeries(research: FactorResearchDisplay, method: IcMethod) {
   return research.ic_points.map((point) => ({

@@ -76,7 +76,7 @@ function publish(options = availability, id = generation, viewer = "tester"): vo
 function request(
   mode: Schemas["FactorRunParameters"]["neutralization"],
 ): Schemas["FactorRunRequest"] {
-  return {
+  const value = {
     command_id: "88888888-8888-4888-8888-888888888888",
     requested_at: "2026-10-02T00:00:00Z",
     serving_generation_id: generation,
@@ -92,6 +92,8 @@ function request(
       neutralization: mode,
     },
   };
+  if (!validRunRequest(value)) throw new Error("合成原请求无效");
+  return value;
 }
 
 function submitted(original: Schemas["FactorRunRequest"], id = generation) {

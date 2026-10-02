@@ -7,7 +7,7 @@ import { metaEnvelope } from "@/test/fixtures";
 import { findJargon } from "@/test/jargon";
 import { renderApp } from "@/test/render";
 import { server } from "@/test/server";
-import contract from "./factorRunRejection.fixture.json";
+import contract from "./factorDiagnosticsRejection.fixture.json";
 import { RUN_OPERATION_KEY, validRunRequest, validRunResult } from "./factorRunState";
 
 vi.mock("@/charts/EChart", () => ({

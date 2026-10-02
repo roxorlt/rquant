@@ -14,6 +14,7 @@ export type FactorResultDetailData = Schemas["FactorResultDetailData"];
 export type FactorResearchDisplayV1 = Schemas["FactorResearchDisplay"];
 export type FactorResearchDisplayV2 = Schemas["FactorStreamResearchDisplay"];
 export type FactorResearchDisplay = FactorResearchDisplayV1 | FactorResearchDisplayV2;
+export type FactorExtendedStatistics = Schemas["FactorExtendedStatistics"];
 export type FactorRunRequest = Schemas["FactorRunRequest"];
 export type FactorRunParameters = Schemas["FactorRunParameters"];
 export type FactorRunAvailability = Schemas["FactorRunAvailability"];

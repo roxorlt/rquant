@@ -2,6 +2,7 @@ import { useState } from "react";
 import { ApiError } from "@/api/client";
 import {
   type FactorDefinitionItem,
+  type FactorExtendedStatistics,
   type FactorResearchDisplay,
   type FactorResultItem,
   useFactorResultDetail,
@@ -20,6 +21,7 @@ import {
 import { type DataColumn, DataTable } from "@/table/DataTable";
 import { Button, EmptyState, Panel, Pill, RelativeTime, Segmented, Tip } from "@/ui";
 import {
+  autocorrelationOption,
   decayOption,
   decaySeries,
   groupCounts,
@@ -28,9 +30,11 @@ import {
   type IcMethod,
   icOption,
   icSeries,
+  industryIcOption,
   turnoverOption,
 } from "./factorCharts";
 import { matchesRunResult, type StoredRun } from "./factorRunState";
+import { outlierCaption, outlierExplanation } from "./runOutliers";
 
 type SelectedRun = {
   factorId: string;
@@ -132,6 +136,192 @@ const runColumns: DataColumn<FactorResultItem>[] = [
     cell: (item) => item.status_label,
   },
 ];
+
+function autocorrelationReason(
+  status: FactorExtendedStatistics["autocorrelation_points"][number]["status"],
+): string {
+  switch (status) {
+    case "first_period":
+      return "首期没有可比较的前一期";
+    case "no_common_members":
+      return "相邻两期没有共同样本";
+    case "insufficient_samples":
+      return "共同样本不足";
+    case "zero_variance":
+      return "共同样本数值没有变化";
+    case "ok":
+      return EMPTY;
+  }
+}
+
+function Diagnostics({ statistics }: { statistics: FactorExtendedStatistics | null | undefined }) {
+  if (statistics == null)
+    return (
+      <EmptyState title="这次检验未生成行业 IC 和自相关。" hint="可查看其他检验，或重新运行。" />
+    );
+  const industryColumns: DataColumn<FactorExtendedStatistics["industry_summaries"][number]>[] = [
+    { id: "industry", header: "行业", value: (item) => item.l1_name },
+    {
+      id: "mean",
+      header: "IC 均值",
+      numeric: true,
+      value: (item) => item.ic_summary.mean,
+      cell: (item) => missing(item.ic_summary.mean, unavailableReason(item.ic_summary.status)),
+    },
+    {
+      id: "ir",
+      header: "IR",
+      numeric: true,
+      value: (item) => item.ic_summary.ir,
+      cell: (item) => missing(item.ic_summary.ir, unavailableReason(item.ic_summary.status), 3),
+    },
+    {
+      id: "days",
+      header: "有效日期",
+      value: (item) => item.ic_summary.valid_day_count,
+      cell: (item) => (
+        <span className="num">
+          {formatCount(item.ic_summary.valid_day_count)} /{" "}
+          {formatCount(item.ic_summary.source_day_count)}
+        </span>
+      ),
+    },
+    {
+      id: "samples",
+      header: "配对样本",
+      numeric: true,
+      value: (item) => item.sample_count,
+      cell: (item) => <span className="num">{formatCount(item.sample_count)}</span>,
+    },
+  ];
+  const coverageColumns: DataColumn<FactorExtendedStatistics["industry_coverage_days"][number]>[] =
+    [
+      { id: "date", header: "评价日期", value: (day) => day.trade_date },
+      { id: "panel", header: "行业资料日期", value: (day) => day.panel_date, secondary: true },
+      {
+        id: "labels",
+        header: "有效标签",
+        value: (day) => day.valid_label_count,
+        cell: (day) => (
+          <span className="num">
+            {formatCount(day.valid_label_count)} / {formatCount(day.expected_count)}
+          </span>
+        ),
+      },
+      {
+        id: "paired",
+        header: "配对样本",
+        numeric: true,
+        value: (day) => day.paired_count,
+        cell: (day) => <span className="num">{formatCount(day.paired_count)}</span>,
+      },
+      {
+        id: "missing",
+        header: "未参与原因",
+        value: (day) =>
+          day.missing_by_reason
+            .map(
+              (item) =>
+                `${item.reason === "missing" ? "标签缺失" : item.reason === "ambiguous" ? "标签不唯一" : "边界待核对"} ${formatCount(item.count)}`,
+            )
+            .join("；") || EMPTY,
+      },
+    ];
+  const autocorrelationColumns: DataColumn<
+    FactorExtendedStatistics["autocorrelation_points"][number]
+  >[] = [
+    { id: "date", header: "评价日期", value: (point) => point.trade_date },
+    {
+      id: "previous",
+      header: "前一期",
+      value: (point) => point.previous_trade_date ?? EMPTY,
+      secondary: true,
+    },
+    {
+      id: "value",
+      header: "自相关",
+      numeric: true,
+      value: (point) => point.value,
+      cell: (point) => missing(point.value, autocorrelationReason(point.status)),
+    },
+    {
+      id: "common",
+      header: "共同样本",
+      numeric: true,
+      value: (point) => point.common_count,
+      cell: (point) => <span className="num">{formatCount(point.common_count)}</span>,
+    },
+    { id: "reason", header: "说明", value: (point) => autocorrelationReason(point.status) },
+  ];
+  return (
+    <div className="factor-research-bottom">
+      <section className="factor-result-section" aria-label="行业 IC">
+        <div className="factor-section-head">
+          <h3>行业 IC</h3>
+          <span className="hint">{statistics.ic_method === "rank" ? "RankIC" : "NormalIC"}</span>
+          <Tip content="沿本次检验选用的 IC 算法，分别评价各行业；行业标签取评价日前一交易日。配对样本须同时具备因子值、收益和明确行业标签。">
+            行业说明
+          </Tip>
+        </div>
+        {statistics.industry_status === "unavailable" ? (
+          <EmptyState title={statistics.industry_reason ?? "行业数据暂不可用。"} />
+        ) : (
+          <>
+            {statistics.industry_reason ? (
+              <Tip content={statistics.industry_reason}>样本说明</Tip>
+            ) : null}
+            {statistics.industry_summaries.length === 0 ? (
+              <EmptyState title="暂无可计算的行业 IC" hint="有效样本或评价期不足。" />
+            ) : (
+              <>
+                <EChart
+                  label="行业 IC 均值"
+                  build={(colors) => industryIcOption(statistics, colors)}
+                />
+                <Disclosure label="查看行业 IC 明细">
+                  <DataTable
+                    rows={statistics.industry_summaries}
+                    columns={industryColumns}
+                    rowKey={(item) => item.l1_code}
+                    label="行业 IC 明细"
+                  />
+                </Disclosure>
+              </>
+            )}
+            <Disclosure label="查看行业覆盖">
+              <DataTable
+                rows={[...statistics.industry_coverage_days].reverse()}
+                columns={coverageColumns}
+                rowKey={(day) => day.trade_date}
+                label="行业覆盖"
+              />
+            </Disclosure>
+          </>
+        )}
+      </section>
+      <section className="factor-result-section" aria-label="因子自相关">
+        <div className="factor-section-head">
+          <h3>因子自相关</h3>
+          <Tip content="比较相邻两次评价期的因子排序；使用本次离群值处理、中性化后的共同样本。没有可比较样本的日期留空，不跨期补值。">
+            相邻评价期
+          </Tip>
+        </div>
+        <EChart
+          label="相邻评价期因子自相关"
+          build={(colors) => autocorrelationOption(statistics, colors)}
+        />
+        <Disclosure label="查看自相关明细">
+          <DataTable
+            rows={[...statistics.autocorrelation_points].reverse()}
+            columns={autocorrelationColumns}
+            rowKey={(point) => point.trade_date}
+            label="自相关明细"
+          />
+        </Disclosure>
+      </section>
+    </div>
+  );
+}
 
 function Research({
   research,
@@ -280,6 +470,9 @@ function Research({
         <span>{research.pool_label}</span>
         <span>调仓 {research.holding_sessions} 个交易日</span>
         <span>{research.neutralization_label ?? "无"}中性化</span>
+        <Tip content={outlierExplanation}>
+          {outlierCaption("schema_version" in research ? research.mad_multiple : undefined)}
+        </Tip>
         {research.context_basis_label ? (
           <Tip content={research.context_basis_label}>行业口径</Tip>
         ) : null}
@@ -352,6 +545,9 @@ function Research({
           />
         </Disclosure>
       </section>
+      <Diagnostics
+        statistics={"schema_version" in research ? research.extended_statistics : null}
+      />
       <div className="factor-research-bottom">
         <section className="factor-result-section" aria-label="分组累计收益">
           <div className="factor-section-head">
