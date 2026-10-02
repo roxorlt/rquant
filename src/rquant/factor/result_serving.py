@@ -446,6 +446,16 @@ def project_factor_result_projections(
             or completion.context != adapter.sources.context
         ):
             raise ValueError("factor display context differs from its original spec")
+        if v2 and (
+            display.mad_multiple != adapter.mad_multiple
+            or (display.extended_statistics is not None)
+            != record.spec.adapter_request.extended_statistics
+            or (
+                display.extended_statistics is not None
+                and display.extended_statistics.ic_method != record.spec.adapter_request.ic_method
+            )
+        ):
+            raise ValueError("factor display processing differs from its original spec")
         loaded[record.job_id] = display, root_identity, file_identity
     if ledger.list_recent_updated(limit=50) != records:
         raise ValueError("factor ledger changed during projection")

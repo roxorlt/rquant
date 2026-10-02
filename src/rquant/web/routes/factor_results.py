@@ -285,6 +285,14 @@ def get_factor_result(
             portfolio_days=list(display.portfolio_days),
             coverage_days=list(display.coverage_days),
             **_neutralization_fields(display),
+            **(
+                {
+                    "mad_multiple": display.mad_multiple,
+                    "extended_statistics": display.extended_statistics,
+                }
+                if display.schema_version == 2
+                else {}
+            ),
         )
     )
     availability = (

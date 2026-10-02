@@ -12,6 +12,7 @@ from rquant.factor.display_artifact import (
     FactorDisplayDecayPeriod,
     FactorDisplayICPoint,
 )
+from rquant.factor.extended_statistics import FactorExtendedStatistics
 from rquant.factor.job_ledger import FactorJobStatus
 from rquant.factor.portfolio import FactorPortfolioDay
 from rquant.factor.result import (
@@ -93,6 +94,8 @@ class FactorStreamResearchDisplay(BaseModel):
     neutralization_label: NeutralizationLabel = "无"
     context_basis_label: str | None = None
     context_note: str | None = None
+    mad_multiple: float | None = None
+    extended_statistics: FactorExtendedStatistics | None = None
 
 
 class FactorResultDetailData(BaseModel):

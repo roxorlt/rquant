@@ -148,9 +148,14 @@ def compile_factor_run_plan(
         needs_industry, needs_cap = neutralization_requirements(
             record.definition, params.neutralization
         )
+        diagnostic_industry = (
+            params.extended_statistics
+            and loaded.context is not None
+            and loaded.context.industry is not None
+        )
         try:
             context = select_factor_neutralization_context(
-                loaded.context, industry=needs_industry, market_cap=needs_cap
+                loaded.context, industry=needs_industry or diagnostic_industry, market_cap=needs_cap
             )
         except ValueError as error:
             raise FactorRunPlanRejectedError(
@@ -265,6 +270,7 @@ def compile_factor_run_plan(
             selection=params.selection,
             sources=sources,
             neutralization=params.neutralization,
+            mad_multiple=params.mad_multiple,
         )
         _compile(formula)
         spec = FactorStreamJobSpec(
@@ -276,6 +282,8 @@ def compile_factor_run_plan(
                 evaluation_days=schedule.evaluation_days,
                 holding_sessions=params.holding_sessions,
                 context=context,
+                extended_statistics=params.extended_statistics,
+                ic_method=params.ic_method if params.extended_statistics else None,
             ),
             member_archive=subset,
             definition_content_sha256=record.content_sha256,

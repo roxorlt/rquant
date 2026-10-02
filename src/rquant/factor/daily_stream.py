@@ -29,6 +29,12 @@ from rquant.factor.evaluate import (
     _partition_groups,
     _sorted_samples,
 )
+from rquant.factor.extended_statistics import (
+    FactorExtendedStatistics,
+    FactorExtendedStatisticsAccumulator,
+    FactorExtendedStatisticsRequest,
+)
+from rquant.factor.neutralization_context import FactorNeutralizationDayBatch
 from rquant.factor.portfolio import _compound, _target_weight_change
 from rquant.factor.result import (
     FactorForwardReturn,
@@ -98,6 +104,9 @@ class FactorDailyStreamRequest(BaseModel):
     sources: FactorDailyStreamSources
     return_price_basis: ReturnPriceBasis
     holding_sessions: HoldingSessions
+    extended_statistics: FactorExtendedStatisticsRequest | None = Field(
+        default=None, exclude_if=lambda v: v is None
+    )
 
     @field_validator("evaluation_days")
     @classmethod
@@ -119,6 +128,9 @@ class FactorDailyStreamBatch(BaseModel):
     return_end_at: ObservedTime
     factor_values: tuple[FactorTimeSeriesValue, ...] = Field(max_length=MAX_UNIVERSE_SECURITIES)
     forward_returns: tuple[FactorForwardReturn, ...] = Field(max_length=MAX_UNIVERSE_SECURITIES)
+    context: FactorNeutralizationDayBatch | None = Field(
+        default=None, exclude_if=lambda v: v is None
+    )
 
     @field_validator("universe")
     @classmethod
@@ -286,6 +298,23 @@ class FactorDailyStreamResult(BaseModel):
     ic_summary: FactorICSummary
     input_sha256: Sha256
     sha256: Sha256
+    extended_statistics: FactorExtendedStatistics | None = Field(
+        default=None, exclude_if=lambda v: v is None
+    )
+
+    @model_validator(mode="after")
+    def _extended_binding(self) -> FactorDailyStreamResult:
+        requested, result = self.request.extended_statistics, self.extended_statistics
+        if (requested is None) != (result is None):
+            raise ValueError("extended statistics differ from their request")
+        if result is not None and (
+            result.ic_method != requested.ic_method
+            or tuple(p.trade_date for p in result.autocorrelation_points)
+            != self.request.evaluation_days
+            or (result.industry_status == "available") != (requested.sources is not None)
+        ):
+            raise ValueError("extended statistics method, source or dates differ")
+        return self
 
 
 def factor_daily_stream_request_sha256(request: FactorDailyStreamRequest) -> str:
@@ -304,6 +333,19 @@ def _check_bound_day(
     if batch.request_sha256 != request_sha:
         raise FactorDailyStreamError("request_binding_mismatch")
     if batch.sources != request.sources:
+        raise FactorDailyStreamError("source_binding_mismatch")
+    extended = request.extended_statistics
+    expected_context = None if extended is None else extended.sources
+    context = batch.context
+    if (expected_context is None) != (context is None):
+        raise FactorDailyStreamError("source_binding_mismatch")
+    if context is not None and (
+        context.sources != expected_context
+        or context.trade_date != expected_day
+        or context.assumed_visible_at != batch.decision_at
+        or not set(batch.universe.stock_codes) <= set(context.stock_codes)
+        or expected_context.industry.captured_at > request.as_of
+    ):
         raise FactorDailyStreamError("source_binding_mismatch")
     if batch.universe.selection != request.selection:
         raise FactorDailyStreamError("selection_mismatch")
@@ -381,8 +423,11 @@ def _evaluate_day(
     previous_members: dict[int, tuple[tuple[str, ...], ...]],
     group_gross: dict[int, tuple[float, ...]],
     gaps: set[int],
+    extended: FactorExtendedStatisticsAccumulator | None = None,
 ) -> FactorDailyStreamDay:
     samples, coverage = _pair_day(batch)
+    if extended is not None:
+        extended.consume(batch, samples)
     sign = 1 if request.definition.direction == "higher_is_better" else -1
     factors = [sign * sample.factor_value for sample in samples]
     returns = [sample.forward_return for sample in samples]
@@ -483,33 +528,49 @@ def evaluate_factor_daily_stream(
     hashes: list[str] = []
     iterator = iter(batches)
     previous_end: datetime | None = None
-    for expected_day in request.evaluation_days:
-        try:
-            raw_batch = next(iterator)
-        except StopIteration:
-            raise FactorDailyStreamError("missing_batch") from None
-        batch = FactorDailyStreamBatch.model_validate(raw_batch)
-        _check_bound_day(request, request_sha, batch, expected_day, previous_end)
-        hashes.append(canonical_sha256(batch))
-        days.append(_evaluate_day(request, batch, previous_members, group_gross, gaps))
-        previous_end = batch.return_end_at
-        # Release the last yielded objects before advancing a one-shot producer.
-        del batch, raw_batch
+    extended = (
+        None
+        if request.extended_statistics is None
+        else FactorExtendedStatisticsAccumulator(
+            request.extended_statistics, request.definition.direction
+        )
+    )
     try:
-        next(iterator)
-    except StopIteration:
-        pass
-    else:
-        raise FactorDailyStreamError("unexpected_batch")
-    ordered_hashes = tuple(hashes)
-    fields = {
-        "request": request,
-        "request_sha256": request_sha,
-        "batch_sha256s": ordered_hashes,
-        "days": tuple(days),
-        "ic_summary": summarize_factor_ic(
-            FactorEvaluation(days=tuple(day.evaluation for day in days))
-        ),
-        "input_sha256": canonical_sha256((request_sha, ordered_hashes)),
-    }
-    return FactorDailyStreamResult(**fields, sha256=canonical_sha256(fields))
+        for expected_day in request.evaluation_days:
+            try:
+                raw_batch = next(iterator)
+            except StopIteration:
+                raise FactorDailyStreamError("missing_batch") from None
+            batch = FactorDailyStreamBatch.model_validate(raw_batch)
+            _check_bound_day(request, request_sha, batch, expected_day, previous_end)
+            hashes.append(canonical_sha256(batch))
+            if extended is None:
+                day = _evaluate_day(request, batch, previous_members, group_gross, gaps)
+            else:
+                day = _evaluate_day(request, batch, previous_members, group_gross, gaps, extended)
+            days.append(day)
+            previous_end = batch.return_end_at
+            del batch, raw_batch
+        try:
+            next(iterator)
+        except StopIteration:
+            pass
+        else:
+            raise FactorDailyStreamError("unexpected_batch")
+        ordered_hashes = tuple(hashes)
+        fields = {
+            "request": request,
+            "request_sha256": request_sha,
+            "batch_sha256s": ordered_hashes,
+            "days": tuple(days),
+            "ic_summary": summarize_factor_ic(
+                FactorEvaluation(days=tuple(day.evaluation for day in days))
+            ),
+            "input_sha256": canonical_sha256((request_sha, ordered_hashes)),
+        }
+        if extended is not None:
+            fields["extended_statistics"] = extended.finish()
+        return FactorDailyStreamResult(**fields, sha256=canonical_sha256(fields))
+    finally:
+        if extended is not None:
+            extended.close()

@@ -27,6 +27,7 @@ from rquant.factor.daily_stream import (
 from rquant.factor.decay_stream import FactorICDecayStream, FactorICDecayStreamRequest
 from rquant.factor.definition import FactorDefinition
 from rquant.factor.display_artifact import FactorDisplayDecayPeriod, FactorDisplayICPoint
+from rquant.factor.extended_statistics import FactorExtendedStatistics
 from rquant.factor.member_archive import _bytes, _check_identities, _publish_bytes, _read_file, _sha
 from rquant.factor.member_stream import (
     FactorMemberResearchResult,
@@ -181,6 +182,12 @@ class FactorStreamDisplayArtifact(BaseModel):
     context: FactorNeutralizationSources | None = Field(
         default=None, exclude_if=lambda v: v is None
     )
+    mad_multiple: float | None = Field(
+        default=None, strict=True, gt=0, allow_inf_nan=False, exclude_if=lambda v: v is None
+    )
+    extended_statistics: FactorExtendedStatistics | None = Field(
+        default=None, exclude_if=lambda v: v is None
+    )
     pool_label: Literal["全市场（沪深非 ST）", "创业板与科创板", "沪深300", "中证1000"]
     summary_status: ResearchSummaryStatus
     ic_summary: FactorICSummary
@@ -203,6 +210,13 @@ class FactorStreamDisplayArtifact(BaseModel):
             binding_hash=self.binding_hash,
             as_of=self.snapshot_as_of_time,
         )
+        if self.extended_statistics is not None and (
+            tuple(p.trade_date for p in self.extended_statistics.autocorrelation_points)
+            != tuple(day.decision_date for day in self.coverage_days)
+            or (self.extended_statistics.industry_status == "available")
+            != (self.context is not None and self.context.industry is not None)
+        ):
+            raise ValueError("display diagnostics dates or industry binding differ")
         if self.content_sha256 != _sha(_bytes_payload(self)):
             raise ValueError("stream display digest differs")
         return self
@@ -361,6 +375,8 @@ def project_factor_stream_display(full: FactorStreamFullArtifact) -> FactorStrea
         selection=request.formula.selection,
         neutralization=request.formula.neutralization,
         context=request.formula.sources.context,
+        mad_multiple=request.formula.mad_multiple,
+        extended_statistics=stats.extended_statistics,
         pool_label=labels[request.formula.selection],
         summary_status=status,
         ic_summary=stats.ic_summary,
@@ -490,6 +506,10 @@ def verify_factor_stream_artifacts(
         if checked != checked_from_full(full, full_ref, display_ref, checked.completed_at):
             raise ValueError("stream completion differs from exact artifacts")
         request = factor_stream_statistics_request(spec.adapter_request)
+        features = {
+            day.trade_date: day
+            for day in full.result.research.research.adapter_completion.feature_days
+        }
         decay = FactorICDecayStream(
             FactorICDecayStreamRequest(
                 statistics_request=request,
@@ -519,6 +539,15 @@ def verify_factor_stream_artifacts(
                             or canonical_sha256(batch) != day.batch_sha256
                         ):
                             raise ValueError("journal selection differs from actual member archive")
+                        if batch.context is not None and (
+                            batch.context.panel_date != features[day.trade_date].panel_date
+                            or batch.context.sha256 != features[day.trade_date].context_input_sha256
+                            or batch.context.stock_codes
+                            != spec.adapter_request.source.scope.stock_codes
+                        ):
+                            raise ValueError(
+                                "journal context differs from its completed daily source"
+                            )
                         yield batch
                         decay.consume(batch)
                         del batch

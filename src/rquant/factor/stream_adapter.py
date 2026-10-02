@@ -20,6 +20,7 @@ from rquant.factor.daily_stream import (
     FactorDailyStreamSources,
     factor_daily_stream_request_sha256,
 )
+from rquant.factor.extended_statistics import FactorExtendedStatisticsRequest
 from rquant.factor.formula_stream import (
     FactorFormulaFeaturePoint,
     FactorFormulaStreamBatch,
@@ -36,6 +37,7 @@ from rquant.factor.historical_adapter import (
 )
 from rquant.factor.neutralization_context import (
     FactorNeutralizationContext,
+    FactorNeutralizationDayBatch,
     FactorNeutralizationReadLease,
     FactorNeutralizationSources,
 )
@@ -79,6 +81,10 @@ class FactorStreamAdapterRequest(BaseModel):
     context: FactorNeutralizationContext | None = Field(
         default=None, exclude_if=lambda v: v is None
     )
+    extended_statistics: bool = Field(default=False, exclude_if=lambda v: v is False)
+    ic_method: Literal["rank", "normal"] | None = Field(
+        default=None, exclude_if=lambda v: v is None
+    )
 
     @field_validator("evaluation_days")
     @classmethod
@@ -89,6 +95,8 @@ class FactorStreamAdapterRequest(BaseModel):
 
     @model_validator(mode="after")
     def _bound_request(self) -> FactorStreamAdapterRequest:
+        if self.extended_statistics != (self.ic_method is not None):
+            raise ValueError("extended statistics require their frozen IC method")
         if (self.context is None) != (self.formula.sources.context is None):
             raise ValueError("formula context lacks its sealed source package")
         if self.context is not None and (
@@ -235,6 +243,14 @@ def factor_stream_statistics_request(
         ),
         return_price_basis="forward_adjusted",
         holding_sessions=request.holding_sessions,
+        extended_statistics=None
+        if not request.extended_statistics
+        else FactorExtendedStatisticsRequest(
+            ic_method=request.ic_method,
+            sources=request.formula.sources.context
+            if request.context is not None and request.context.industry is not None
+            else None,
+        ),
     )
 
 
@@ -268,6 +284,7 @@ class FactorStreamAdapter(Iterator[FactorFormulaStreamBatch]):
         ):
             raise FactorStreamAdapterError("context_binding_mismatch")
         self._context_lease = context_lease
+        self._current_context: FactorNeutralizationDayBatch | None = None
         self._pools: Iterable[FactorUniverseRequest] | None = universe_requests
         self._pool_iterator: Iterator[FactorUniverseRequest] | None = None
         self._completion: FactorStreamAdapterCompletion | None = None
@@ -318,6 +335,7 @@ class FactorStreamAdapter(Iterator[FactorFormulaStreamBatch]):
             close()
 
     def close(self) -> None:
+        self._current_context = None
         if not self._closed:
             self._closed = True
             try:
@@ -527,6 +545,13 @@ class FactorStreamAdapter(Iterator[FactorFormulaStreamBatch]):
                         assumed_visible_at=_market_time(day, 9, 25),
                     ),
                 )
+                if (
+                    self.statistics_request.extended_statistics is not None
+                    and self.statistics_request.extended_statistics.sources is not None
+                ):
+                    self._current_context = (
+                        batch.context if day in self.request.evaluation_days else None
+                    )
                 self._features.append(
                     FactorStreamFeatureDayReceipt(
                         trade_date=day,
@@ -600,7 +625,9 @@ class FactorStreamAdapter(Iterator[FactorFormulaStreamBatch]):
                 return_end_at=window.return_end_at,
                 factor_values=day.values,
                 forward_returns=tuple(returns),
+                context=self._current_context,
             )
+            self._current_context = None
             self._returns.append(
                 FactorStreamReturnDayReceipt(
                     window=window,

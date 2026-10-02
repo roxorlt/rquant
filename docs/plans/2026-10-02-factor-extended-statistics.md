@@ -51,3 +51,14 @@
 CSI 完整历史、分钟/竞价新来源、正式配置/数据代、最大负载与生产安装仍在整体 goal 后续范围。本片不更改固定跟踪策略、生产数据库、调度/基础设施，不 push/tag/部署/切流或停 Streamlit。子代理仅在指定干净树离线工作、不继续委派、不读网络/.env/凭据/真实资料/生产，不使用第三方工具或绕过平台控制。
 
 完成相关证据后冻结干净候选并停止写入，交唯一独立 reviewer。范围外问题记后续；到修复上限冻结证据，不自动架构复盘。整体 M3 在正式来源与上线验收齐备前保持部分。
+
+## 实施证据：后台候选
+
+- 实际产品 Codex desktop，原生子任务 `/root/factor_security_collection_impl`、implementer、父 `/root`；写前核对 `cdx/20261002-factor-diagnostics`、clean HEAD `6ac9f6407df432c1426a7a894dfa3ff5aac80e76`，本树实际导入、冻结53行 SHA 和借用运行时在 `/private/tmp/rquant-diagnostics-implementation-1aMv2kPF/identity.json`。未写另一工作树、访问网络/.env/真实资料/凭据/生产或继续委派。
+- 公开 `FactorRunParameters` 新增 mad_multiple（None关闭/有限正数）和 extended_statistics（False旧行为），省略默认；原命令保存完整参数。处理严格为表达式→原 MAD 核→原中性化。原 AST 2,000,000 槽预算计入 MAD 工作向量；固定 tracking 不开启两新参数。配置/schema/ledger/lease/recovery、原计算数学、采集器及生产/前端生成物不改。
+- 扩展开启时从原可信配置选择已配对行业来源，即使运行后none；未配置时主统计成功、行业诊断明确未生成。行业事实仍按真实前一 SSE 日期/全计算代码读取，每查询最多500；journal包含评价日原行业批，绑定原context SHA/日期/代码域与来源完成回执。只在评价日缓存当前行业批，消费后释放；自相关只保留上一评价期有效因子向量，不因缺收益删除因子或跳空期。自然尾部、错配、损坏和重放失败不发布成功。
+- 领域 `FactorExtendedStatistics` 保存本次 IC 方法、行业状态/短中文原因、最多31个行业IC摘要（复用原相关/摘要核）、最多1024个原日期覆盖日和相邻评价期平均秩自相关点。v2 display/Serving/Web可信投影来自原产物及spec，公开形状和源码行号在 `public-api.json`；没有浏览器source/path/actor输入、新存储框架或新schema版本。
+- 聚焦实际 `domain-red.xml` 为10 failed/6 passed、1.29s；`worker-red.xml` 为4 failed/2 passed、8.08s，其中两个夹具失败（原周期仅一期、错误外层journal绑定）保留并修正，没有把失败命令称绿。`domain-green` 16 passed/1.33s、`domain-final` 20 passed/1.28s、`worker-green` 6 passed/8.79s；最终 `final-new.xml` 26 passed/8.78s、实耗9.4947793330s，`last-affected.xml` 3 passed/5.70s、实耗6.4290992080s，后者含1新恢复节点及2原新增节点强化缓存释放。去重为27新节点；`direct-regression.xml` 15旧节点 passed/11.19s、实耗11.8245120420s，含旧canonical、独立原统计、原模式、原命令恢复、journal拒绝及固定tracking。精确nodeids/XML/每条argv、UTC、exit/time与失败日志由本证据根保留，不重跑全BE/API/Web/browser或清单。
+- 实现前用原None合成worker捕获request/spec/config及v1/v2 full/display共7份黄金。候选全部重载规范字节/SHA完全不变，两个display原投影也相等；`legacy-golden-sha.json`、`legacy-verification.json`保留准确摘要。捕获脚本函数名与v1直接JSON解码误用的原failed日志保留，修正为既有v1 loader。源尾部用自有行业文件同字节换inode实际失败，重算摘要/自相关和坏panel字节的原件校验拒绝；没有从这些合成证据声称真实资料已验收。
+- 只读借用Python3.13.12（Pydantic2.13.1/pytest9.0.3），清洁隔离dummy环境、显式本树PYTHONPATH、禁dotenv。12个改动Python文件Ruff/format/diff及3.11语法检查的真实收据、13文件SHA在本证据根；仅格式/import排序后的测试证据复用，其他受影响用例实际复跑。不宣称3.11/3.12运行或最大负载证据。
+- 所有自有命令已结束，没有常驻服务/调度器或tool session。自有Web合成证明目录自动移除有断言；执行副本、行业reader临时目录归零，当前行业对象weakref释放、单次消费与成功/失败缓存close均有断言。自有合成夹具/产物/失败日志保留给唯一组合终审；不枚举或清理其他进程/目录。后台干净commit后停写，前端/root负责组合门禁、唯一独立审查和accept后的真实只读对照。

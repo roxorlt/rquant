@@ -115,6 +115,9 @@ class FactorFormulaStreamRequest(BaseModel):
     selection: UniverseSelection
     sources: FactorFormulaStreamSources
     neutralization: NeutralizationMode = Field(default="none", exclude_if=lambda v: v == "none")
+    mad_multiple: float | None = Field(
+        default=None, strict=True, gt=0, allow_inf_nan=False, exclude_if=lambda v: v is None
+    )
 
     @field_validator("computation_stock_codes")
     @classmethod
@@ -315,7 +318,11 @@ def _compile(request: FactorFormulaStreamRequest) -> _Plan:
         else 4 * (int(context.industry is not None) + int(context.market_cap is not None)) + 4
     )
     slots = len(request.computation_stock_codes) * (
-        sum(retained.values()) + len(request.definition.dependency_columns) + 1 + context_slots
+        sum(retained.values())
+        + len(request.definition.dependency_columns)
+        + 1
+        + context_slots
+        + (6 if request.mad_multiple is not None else 0)
     )
     if slots > MAX_FORMULA_CACHE_SLOTS:
         raise FactorFormulaStreamError("cache_budget_exceeded")
@@ -410,6 +417,20 @@ class _DailyFormula:
                 current = tuple(adapter._evaluate_uncached(node, day_index) for adapter in adapters)
             self.history[id(node)].append((day_index, current))
         root_cells = self.history[id(self.plan.nodes[-1])][-1][1]
+        if self.request.mad_multiple is not None:
+            selected = {
+                code: cell
+                for code, cell in zip(codes, root_cells, strict=True)
+                if code in self.selected
+            }
+            valid = [(code, cell) for code, cell in selected.items() if cell.value is not None]
+            results = selected.copy()
+            _SeriesEvaluator._cross_winsorize(
+                valid, _latest([cell for _, cell in valid]), results, self.request.mad_multiple
+            )
+            root_cells = tuple(
+                results.get(code, cell) for code, cell in zip(codes, root_cells, strict=True)
+            )
         if self.request.neutralization != "none":
             selected = {
                 code: cell

@@ -33,6 +33,10 @@ class FactorRunParameters(BaseModel):
     group_count: Literal[3, 5, 10] = 5
     ic_method: Literal["rank", "normal"] = "rank"
     neutralization: NeutralizationMode = "none"
+    mad_multiple: float | None = Field(
+        default=None, strict=True, gt=0, allow_inf_nan=False, exclude_if=lambda v: v is None
+    )
+    extended_statistics: bool = Field(default=False, exclude_if=lambda v: v is False)
 
     @field_validator("start_date", "end_date", mode="before")
     @classmethod
