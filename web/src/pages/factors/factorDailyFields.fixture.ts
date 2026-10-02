@@ -1,7 +1,8 @@
 import type { Schemas } from "@/api/client";
 import { diagnosticResearch } from "./factorDiagnostics.fixture";
 
-// Captured public capability and model metadata from the frozen backend; synthetic results below.
+// Independent unavailable-tracking fixture; current trusted support is captured in factorStoredTracking.fixture.
+// Stored-field metadata and synthetic research below retain their original source facts.
 export const dailyCapability = {
   version: "daily_stored_v1",
   source_mode: "historical_retrospective",

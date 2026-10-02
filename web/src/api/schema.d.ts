@@ -2474,7 +2474,7 @@ export interface components {
             /** Name Zh */
             name_zh: string;
             /** Tracking Supported */
-            tracking_supported?: false | null;
+            tracking_supported?: boolean | null;
             /** Tracking Unavailable Reason Zh */
             tracking_unavailable_reason_zh?: string | null;
             /** Unit */

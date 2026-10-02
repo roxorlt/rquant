@@ -3533,7 +3533,6 @@
           "tracking_supported": {
             "anyOf": [
               {
-                "const": false,
                 "type": "boolean"
               },
               {

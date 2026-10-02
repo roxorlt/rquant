@@ -44,3 +44,12 @@ backend：tracking_runner.py、tracking_backend.py、capability.py，新增直�
 - 有效绿来自 `stored-core-green.xml` 的6个成功case（整命令另1个fixture身份失败，保留原件）、`stored-paths-green.xml` 5 passed/9.52s、`stored-final-paths-green.xml` 3 passed/5.88s 和 `direct-regressions-green.xml` 10 passed/11.44s；重复节点不累加。实际原toggle→首段1日+追加2日→sealed journal手算/独立重放→同源整段daily values/贡献/prefix/Serving摘要一致，重复不追加。四种历史原值/状态修订暂停；同值新代prefix不变；16字段所有状态、SSE休市前日/预热/中间缺行、501码分500+1仅读依赖字段、源自然tail及关闭后verify期间原件变更拒绝且无追加均已验证。
 - `legacy-prefix-proof.json` 用基准实际函数读取同一合成来源，对照当前有/无未用库存配置，旧v1两日prefix精确一致；测试固化实际黄金。Ruff/format check和5文件Python3.11 AST语法通过；最终源码/测试SHA、public shape、自然reader/copy与执行会话清理见 `source-resource-proof.json` / `public-api.json`。格式化/导入排序不改变行为，有效旧来源/统计证据复用，未跑全仓/API/FE门禁。
 - 环境为只读借用 integration Python3.13.12/Pydantic2.13.1/DuckDB1.5.2/pytest9.0.3，显式本树PYTHONPATH，禁dotenv/bytecode、隔离dummy配置和自有TMPDIR。所有命令已退出，reader scratch/执行会话零残留；自有合成资料保留于0700证据根供最终复核。未接触真实资料/网络/生产；FE组合门禁、唯一联合审查和root真实跟踪对照仍待后续完成，未宣称生产上线或整体goal完成。
+
+## frontend 实施与合成门禁（2026-10-03）
+
+- Codex desktop 原生 frontend implementer `/root/factor_save_react_final_review`，父 `/root`，起点 `ad52729ba5280d38e4239e46b49df3babfde16ce` clean。证据根 `/private/tmp/rquant-stored-tracking-react-pv55stie` 为自有0700目录；身份、当前树导入、生成合同来源及完整实际argv/UTC/exit/XML见 `identity.json`、`fixture-source.json`、`command-summary.json` 和 `evidence.md`。首36行冻结字节保持不变。
+- 现有同代能力判断、加入/取消及原请求恢复已满足本片，不修改生产hook/UI。当前可信22字段夹具取自后台 `public-api.json`（SHA256 `7bd229d6049f72a26552dd08affc818e0ec7610772e904384bc049aded655541`），经实际Pydantic Web模型JSON验证生成，16项支持跟踪；原false夹具明确保留为独立不可用场景。CLI重新生成OpenAPI与TS，旧false类型的16项真实编译红测exit2，生成后类型绿；不是手写业务DTO。
+- 新增8项组件行为及2项桌面/390px浏览器节点：可信当前head加入、固定策略不绑定左栏未提交参数、锁内能力缩减、缺来源/错代/失败时取消独立、丢回执/刷新/换代保留完整原请求和原head、账号变化禁写、receipt与投影精确确认。新增Python节点为0；后台有效23节点不重复执行。
+- 唯一最终门禁实际结果：`pnpm check` 59文件/652 passed（exit0/31.064s），API的55个 `tests/unit/test_web_*.py` 文件993 passed（exit0/251.049s），`pnpm build` exit0/5.155s、首屏gzip323.1KB/550KB，`verify:dist` exit0/1.028s。正常浏览器门禁123 passed、4项原配置skipped（exit0/222.559s）；跳过不计通过。原生产UI和dist字节未变，不重复有效门禁。
+- 四张1440×900与390×844确认/原请求恢复截图在私有 `browser-results/factor-stored-tracking-*`，均实际查看；策略Tip支持键盘/手机点按、确认固定5组与左栏10组独立，旧第2版原操作不套新第3版。原编译红、夹具helper严格tuple解析失败和一项格式失败均保留原日志，修正后实际绿，不删除失败原件。
+- 实际运行时Node22.22.2/pnpm10.33.0及只读借用Python3.13.12/Pydantic2.13.1/DuckDB1.5.2；显式本树PYTHONPATH、禁dotenv与隔离dummy配置，只连接自有loopback/Unix合成夹具。服务/命令退出与端口归零证明由 `resources.json` 记录；自有API basetemp及浏览器合成资料保留供唯一联合审查，不改保护权限或删除未知目录，root依赖目录保留。root清单门禁、唯一联合审查和ACCEPT后的真实只读跟踪对照尚待完成，本附录不声称真实worker或生产验收。
