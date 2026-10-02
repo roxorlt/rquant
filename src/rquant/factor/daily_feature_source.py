@@ -194,7 +194,11 @@ class FactorDailyFeatureCounts(BaseModel):
     null: int = Field(ge=0)
     non_finite: int = Field(ge=0)
     reasons: tuple[FactorDailyFeatureReasonCount, ...] = Field(
-        default=(), max_length=5, exclude_if=lambda v: not v
+        default=(),
+        max_length=5,
+        exclude_if=lambda v: not v,
+        # A schema default makes generated clients require this omitted empty array.
+        json_schema_extra=lambda schema: schema.pop("default", None),
     )
 
 

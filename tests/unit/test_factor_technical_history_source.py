@@ -33,6 +33,53 @@ _TECHNICAL = (
 )
 
 
+def test_counts_serialization_schema_matches_optional_reason_wire_and_old_bytes(
+    tmp_path: Path,
+) -> None:
+    from rquant.factor.daily_feature_source import (
+        FactorDailyFeatureCounts,
+        FactorDailyFeatureReasonCount,
+    )
+    from rquant.runtime_contracts import canonical_sha256
+    from rquant.web.app import create_app
+    from rquant.web.settings import WebSettings
+
+    old_hashes = {
+        "ma5": "80d43c191bd70b921b943833148615d706fa013cb937347dfe6732cae3bdcfc7",
+        "turnover_rate": "3af069d1b86ed1b20ec5e3fdc507c67920a4bfb586dc4acdea326108e88523a3",
+    }
+    for column, old_hash in old_hashes.items():
+        old_wire = (
+            '{"column":"' + column + '","valid":1,"missing":0,"null":0,"non_finite":0}'
+        ).encode()
+        counts = FactorDailyFeatureCounts(column=column, valid=1, missing=0, null=0, non_finite=0)
+        assert counts.model_dump_json().encode() == old_wire
+        assert counts.model_copy(update={"reasons": ()}).model_dump_json().encode() == old_wire
+        assert canonical_sha256(counts) == old_hash
+
+    with_reason = FactorDailyFeatureCounts(
+        column="ma5",
+        valid=0,
+        missing=0,
+        null=1,
+        non_finite=0,
+        reasons=(FactorDailyFeatureReasonCount(reason="insufficient_window", count=1),),
+    )
+    assert with_reason.model_dump(mode="json")["reasons"] == [
+        {"reason": "insufficient_window", "count": 1}
+    ]
+
+    app = create_app(WebSettings(serving_root=tmp_path / "serving"), background=False)
+    schemas = (
+        FactorDailyFeatureCounts.model_json_schema(mode="serialization"),
+        app.openapi()["components"]["schemas"]["FactorDailyFeatureCounts"],
+    )
+    for schema in schemas:
+        assert set(schema["required"]) == {"column", "valid", "missing", "null", "non_finite"}
+        assert schema["properties"]["reasons"]["maxItems"] == 5
+        assert "default" not in schema["properties"]["reasons"]
+
+
 def _module() -> object:
     name = "rquant.factor.technical_history_source"
     assert importlib.util.find_spec(name) is not None, "technical history preparation is missing"
