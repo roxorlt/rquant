@@ -38,7 +38,9 @@ from rquant.strict_json import strict_model_validate_canonical_json
 MAX_TRACKED_FACTORS = 512
 MAX_TRACKING_DAYS = 4096
 TRACKING_POLICY_LABEL = "全市场（剔除北交所、ST） · 每日 · 5组 · RankIC · 无运行后中性化"
-TRACKING_BASIS_LABEL = "历史回顾研究诊断；累计从实际起日计算，并非实盘收益。"
+TRACKING_BASIS_LABEL = (
+    "历史回顾研究诊断；行业算子采用独立API回顾归属；累计从实际起日计算，并非实盘收益。"
+)
 
 
 class FactorTrackingConflict(ValueError):  # noqa: N818
@@ -161,6 +163,22 @@ class FactorTrackingSummary(BaseModel):
     invalidated: bool
     reason: str | None = Field(default=None, max_length=120)
 
+    @model_validator(mode="after")
+    def _coverage(self) -> FactorTrackingSummary:
+        count = self.ic_20.source_day_count
+        if not self.complete_day_count <= count <= 20 or self.ic_20.valid_day_count > count:
+            raise ValueError("tracking IC window coverage differs")
+        expected = (
+            count == self.complete_day_count == self.ic_20.valid_day_count == 20
+            and self.ic_20.mean is not None
+            and self.ic_20.mean <= 0.0
+        )
+        if self.invalidated != expected or self.week_complete_day_count > self.week_day_count:
+            raise ValueError("tracking invalidation or week coverage differs")
+        if self.week_long_short is not None and self.week_complete_day_count != 5:
+            raise ValueError("tracking week return requires all five actual dates")
+        return self
+
 
 def _sleeve_spread(days: tuple[FactorTrackingDay, ...]) -> float | None:
     low = high = 1.0
@@ -268,6 +286,34 @@ class FactorTrackingPanel(BaseModel):
     policy_version: Literal[1] = 1
     policy_label: str = TRACKING_POLICY_LABEL
     basis_label: str = TRACKING_BASIS_LABEL
+
+    @model_validator(mode="after")
+    def _state_binding(self) -> FactorTrackingPanel:
+        if self.tracked != (self.availability == "tracked"):
+            raise ValueError("tracking panel flag differs from availability")
+        if self.availability in ("unavailable", "not_tracked"):
+            if (
+                self.status != self.availability
+                or self.summary is not None
+                or self.actual_start_date is not None
+            ):
+                raise ValueError("untracked panel carries an active result")
+        elif (
+            self.status not in ("waiting", "active", "paused")
+            or self.tracking_generation is None
+            or self.definition_head is None
+        ):
+            raise ValueError("tracked panel lacks its frozen identity")
+        if self.summary is not None and (
+            self.actual_start_date is None
+            or self.updated_at is None
+            or self.summary.latest_trade_date is None
+            or self.summary.latest_trade_date < self.actual_start_date
+        ):
+            raise ValueError("tracking summary lacks its actual period")
+        if self.status == "active" and self.summary is None:
+            raise ValueError("active tracking panel lacks a completed result")
+        return self
 
 
 class FactorTrackingStore:
@@ -446,6 +492,15 @@ class FactorTrackingStore:
             if len(ids) > MAX_TRACKED_FACTORS:
                 raise FactorTrackingIntegrityError("tracking collection exceeds its capacity")
             return tuple(self._state(connection, row[0]) for row in ids)
+
+    def days(
+        self, factor_id: str, *, expected_identity: FactorTrackingIdentity
+    ) -> tuple[FactorTrackingDay, ...]:
+        from rquant.factor.tracking_serving import _days
+
+        with self._connection(expected_identity) as connection:
+            state = self._state(connection, factor_id)
+            return () if state is None else _days(self, connection, state.segment_id)
 
     def _lookup(
         self, connection: sqlite3.Connection, request: FactorTrackingRequest, actor_id: str

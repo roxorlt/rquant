@@ -160,3 +160,89 @@ def test_tracking_projection_validates_entire_pair_and_keeps_empty_distinct(tmp_
         validate_factor_tracking_projections(
             {pair[0].table_name: pair[0], broken.table_name: broken}
         )
+
+
+def test_tracking_serving_publication_read_and_attention_use_one_generation(tmp_path: Path) -> None:
+    from rquant.factor.definition_serving import project_factor_definition_serving_snapshot
+    from rquant.factor.registry import FactorDefinitionRegistry
+    from rquant.factor.serving_projection import project_factor_definition_projections
+    from rquant.factor.tracking import FactorTrackingPanel, summarize_factor_tracking
+    from rquant.factor.tracking_serving import (
+        FactorTrackingServingSnapshot,
+        project_factor_tracking_projections,
+    )
+    from rquant.runtime_contracts import canonical_sha256
+    from rquant.serving_page_projection_source import LabPageProjectionSnapshot
+    from tests.support.web_serving_fixture import FIXTURE_BUILT_AT, build_web_fixture
+    from tests.unit.test_factor_tracking import _day, _registry
+
+    _, registry_identity, head = _registry(tmp_path)
+    definitions = project_factor_definition_projections(
+        project_factor_definition_serving_snapshot(
+            FactorDefinitionRegistry(Path(registry_identity.path)),
+            expected_identity=registry_identity,
+            available_at=FIXTURE_BUILT_AT,
+        )
+    )
+    days = tuple(_day(i, value=-0.5) for i in range(20))
+    panel = FactorTrackingPanel(
+        factor_id="tracked_test",
+        availability="tracked",
+        status="active",
+        tracked=True,
+        tracking_generation="c" * 32,
+        definition_head=head,
+        actual_start_date=days[0].trade_date,
+        updated_at=FIXTURE_BUILT_AT,
+        summary=summarize_factor_tracking(days),
+    )
+    fields = dict(
+        tracking_instance_id="a" * 32,
+        registry_instance_id=registry_identity.instance_id,
+        available_at=FIXTURE_BUILT_AT,
+        panels=(panel,),
+    )
+    pair = project_factor_tracking_projections(
+        FactorTrackingServingSnapshot(**fields, sha256=canonical_sha256(fields))
+    )
+    sealed = LabPageProjectionSnapshot.create(
+        available_at=FIXTURE_BUILT_AT,
+        factor_definition_projections=definitions,
+        factor_tracking_projections=pair,
+    )
+    assert {p.table_name for p in pair} <= {p.table_name for p in sealed.projections}
+    build_web_fixture(
+        tmp_path / "serving",
+        "baseline",
+        factor_definition_projections=definitions,
+        factor_tracking_projections=pair,
+    )
+    with _app(_settings(tmp_path), background=False) as app, ResearcherTestClient(app) as client:
+        actual = client.get("/api/v1/factors/tracked_test/tracking")
+        assert actual.status_code == 200, actual.text
+        assert actual.json()["data"]["summary"]["invalidated"]
+        overview = client.get("/api/v1/overview")
+        assert overview.status_code == 200
+        alert = next(
+            item
+            for item in overview.json()["data"]["attention"]
+            if item["to"] == "/factors?factor_id=tracked_test&panel=tracking"
+        )
+        assert "20" in alert["reason"] and "失效" in alert["title"]
+
+
+def test_tracking_typed_projection_refuses_inconsistent_state_and_invalidation() -> None:
+    from rquant.factor.tracking import (
+        FactorTrackingPanel,
+        FactorTrackingSummary,
+        summarize_factor_tracking,
+    )
+    from tests.unit.test_factor_tracking import _day
+
+    with pytest.raises(ValueError):
+        FactorTrackingPanel(
+            factor_id="example", availability="tracked", status="not_tracked", tracked=False
+        )
+    summary = summarize_factor_tracking(tuple(_day(i, value=0.5) for i in range(20)))
+    with pytest.raises(ValueError):
+        FactorTrackingSummary.model_validate({**summary.model_dump(), "invalidated": True})

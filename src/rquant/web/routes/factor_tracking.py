@@ -60,6 +60,9 @@ def _read_tracking(borrowed: BorrowedGeneration | None) -> FactorTrackingServing
                 for row in marks
             ):
                 raise ValueError("unpublished tracking projection has rows")
+            for name in _TABLES:
+                if borrowed.cursor.execute(f"SELECT 1 FROM {name} LIMIT 1").fetchone() is not None:
+                    raise ValueError("unpublished tracking table contains data")
             return None
         watermark = next(
             (w for w in borrowed.manifest.watermarks if w.dataset_id == "lab_jobs"), None
