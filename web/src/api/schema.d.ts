@@ -3636,7 +3636,7 @@ export interface components {
             availability: "unavailable" | "not_tracked" | "tracked";
             /**
              * Basis Label
-             * @default 历史回顾研究诊断；累计从实际起日计算，并非实盘收益。
+             * @default 历史回顾研究诊断；行业算子采用独立API回顾归属；累计从实际起日计算，并非实盘收益。
              */
             basis_label: string;
             /**
