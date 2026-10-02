@@ -1,5 +1,6 @@
 import { expect, test } from "@playwright/test";
 import type { MetaEnvelope, Schemas } from "../src/api/client.ts";
+import { trackingPanel } from "../src/pages/factors/factorTracking.fixture.ts";
 import { findJargon } from "../src/test/jargon.ts";
 import { APP_URL } from "./env.ts";
 import { expectNoHorizontalOverflow, watch } from "./watch.ts";
@@ -84,6 +85,22 @@ for (const viewport of [
           } satisfies Schemas["Envelope_FactorResultListData_"],
         }),
       );
+      await page.route(/\/api\/v1\/factors\/created_factor\/tracking(?:\?.*)?$/, (route) => {
+        expect(new URL(route.request().url()).searchParams.get("generation_id")).toBe(currentId);
+        return route.fulfill({
+          json: {
+            data: trackingPanel({
+              factor_id: "created_factor",
+              availability: "unavailable",
+              status: "unavailable",
+              definition_head: null,
+              reason: "跟踪数据尚未发布。",
+              can_set_tracked: false,
+            }),
+            serving: serving(),
+          } satisfies Schemas["Envelope_FactorTrackingPanel_"],
+        });
+      });
       await page.route(
         /\/api\/v1\/factors\/definitions\/save(?:\/(?:resume|retry))?$/,
         async (route) => {
@@ -247,7 +264,11 @@ for (const viewport of [
         await page.evaluate(() => localStorage.getItem("rquant.factor.save-command.v1")),
       ).toBeNull();
       expect(findJargon(await page.locator("main").innerText())).toEqual([]);
-      await expect(page.getByRole("button", { name: /运行检验|加入跟踪/ })).toHaveCount(0);
+      await expect(page.getByRole("button", { name: "运行检验" })).toHaveCount(0);
+      await expect(page.getByRole("button", { name: "加入跟踪" })).toBeDisabled();
+      await expect(page.getByRole("region", { name: "因子跟踪", exact: true })).toContainText(
+        "跟踪数据尚未发布。",
+      );
       expect(watcher.problems).toEqual([]);
     });
   });

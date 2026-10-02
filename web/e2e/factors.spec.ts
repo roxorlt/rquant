@@ -403,6 +403,27 @@ for (const viewport of [
         },
       }),
     );
+    await page.route(
+      new RegExp(`/api/v1/factors/${factor.factor_id}/tracking(?:\\?.*)?$`),
+      (route) => {
+        expect(new URL(route.request().url()).searchParams.get("generation_id")).toBe(
+          metadata.serving.generation_id,
+        );
+        return route.fulfill({
+          json: {
+            data: trackingPanel({
+              factor_id: factor.factor_id,
+              availability: "unavailable",
+              status: "unavailable",
+              definition_head: null,
+              reason: "跟踪数据尚未发布。",
+              can_set_tracked: false,
+            }),
+            serving: metadata.serving,
+          } satisfies Schemas["Envelope_FactorTrackingPanel_"],
+        });
+      },
+    );
     await page.route("**/api/v1/factors/run-availability", (route) =>
       route.fulfill({ json: { data: rejectionContract.availability, serving: metadata.serving } }),
     );
@@ -647,6 +668,24 @@ test("归档确认、刷新续查及手机布局", async ({ page }) => {
   const nextGeneration = "e".repeat(64);
   let published = false;
   const commandIds: string[] = [];
+  await page.route(/\/api\/v1\/factors\/price_volume_factor\/tracking(?:\?.*)?$/, (route) => {
+    const currentServing = published ? { ...serving, generation_id: nextGeneration } : serving;
+    expect(new URL(route.request().url()).searchParams.get("generation_id")).toBe(
+      currentServing.generation_id,
+    );
+    return route.fulfill({
+      json: {
+        data: trackingPanel({
+          availability: "unavailable",
+          status: "unavailable",
+          definition_head: null,
+          reason: "跟踪数据尚未发布。",
+          can_set_tracked: false,
+        }),
+        serving: currentServing,
+      } satisfies Schemas["Envelope_FactorTrackingPanel_"],
+    });
+  });
   await page.route("**/api/v1/meta", (route) =>
     route.fulfill({
       json: published
