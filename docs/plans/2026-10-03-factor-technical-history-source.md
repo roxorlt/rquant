@@ -73,3 +73,18 @@ backend冻结后frontend同树顺序接实际可信目录/来源与覆盖、测�
 - `perf-fixture-corrected-red.xml` 实际1 failed/1.50s，准确复现6次完整扫描；前两份夹具错误失败原件亦保留。有效去重6新节点见 `perf-initial-green.xml` 6 passed/3.23s，修改分支补验 `warm-mutation-green.xml` 2 passed/1.56s 属于同两节点，不累计。直接旧6节点 `direct-regression.xml` 6 passed/4.90s，包含原初始化、库存损坏、完整 worker/replay、输入缺失/尾部及旧 spec/prefix 黄金；无skip或删除改名。新元数据/时刻错配、恢复mtime的原件/副本修改、同字节换inode、容量及FD关闭有实际断言。
 - Python3.13.12/Pydantic2.13.1/DuckDB1.5.2/pytest9.0.3；仅本树导入、dummy配置、禁dotenv/bytecode和自有TMPDIR。逐命令 JSON/log/XML 记录实际argv/UTC/wall/exit，所有失败静态结果保留；最终 Ruff/format 通过，3.11语法/源码SHA/资源与精确nodeids随私有 handoff 保存。测试后变化仅等价排版及合并 with 上下文，不重复累计节点。
 - 实现冻结后停写；原 reviewer 仅复核 FTH-PERF-01 和直接回归，root 继续原真实3 jobs/1800s上限及独立参考/资源验收。未访问真实材料或声称超时已在真实来源解决，未重跑前端/API/浏览器及全清单。
+
+
+## 根任务最终验收（2026-10-03）
+
+受审候选 `9c11ef8c291dc40c4c7c681dac86aa4e499f3458` 实际clean，已快进合入本任务本地集成树；未合main或发布。一次集中独立终审及唯一一轮FTH-PERF-01局部修复/原审查者定向复核ACCEPT；首轮1801.112s/exit124超时原件保留，不计通过。
+
+5,571码6日12字段共401,112格逐值、缺因和初始化元数据与独立原始参考一致；首1日＋续2日/整3日贡献、汇总和完整逻辑前缀精确相等，重复不追加、原取消有效；14,970有效/97缺失，最大误差1.78e-15。实际1246.478s/峰值1860.672MiB，读句柄/心跳/私有scratch归零，远端自有目录已删除。
+
+真实来源只读腾讯云固定副本；新来源读取范围的7,182,124条实际历史输入不等于上市全历史或PIT。独立标准库参考的原件/索引固定，字段误差门槛始终为2e-12 + 1e-12×|expected|，未调用产品核生成预期。正式最大区间/最高负载和生产性能仍待验收。
+
+原39后台节点与修复新增6合计45不同有效；直接旧6、补验同2不重复累计。Web661/API993/浏览器125通过＋4原skip、生成合同/build/size/dist及四张实际查看截图证据复用。清单19,116→19,146精确增30，无删除/重复，原55skip字节不变；根任务最终两必要门禁2通过/8.685s，未执行全清单。Python实际离线3.13.12，真实worker 3.14.4；3.11仅AST，不宣称3.11/3.12 CI。
+
+有效原件：`/private/tmp/rquant-factor-tracking-root-yegakn31/technical-source-proof/accepted-real-proof.json`、`/private/tmp/rquant-technical-perf-recheck-l_t4cctg/directed-recheck.md`；首次超时与失败collect均单独保留。前端自有过期合成目录清理3,576,373,392B，日志/截图/参考保留；自有实现树为后续goal复用，集成树保留，未新增worktree。
+
+已有选股日线特征、分钟/竞价/温度/VP、CSI完整历史、正式配置/数据代/18:40及完整资源/生产验收继续实施；M3保持部分。整体goal active，没有生产写入、切流或停Streamlit。
