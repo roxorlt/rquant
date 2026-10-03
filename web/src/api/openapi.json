@@ -3563,7 +3563,9 @@
                   "indicator",
                   "percent",
                   "ratio",
-                  "CNY_10000"
+                  "CNY_10000",
+                  "observations",
+                  "binary"
                 ],
                 "type": "string"
               },
@@ -3578,7 +3580,8 @@
               {
                 "enum": [
                   "stored_not_recomputed",
-                  "history_derived"
+                  "history_derived",
+                  "stock_features_derived"
                 ],
                 "type": "string"
               },
@@ -5180,7 +5183,8 @@
             "enum": [
               "daily_v1",
               "daily_stored_v1",
-              "daily_derived_v1"
+              "daily_derived_v1",
+              "daily_stock_v1"
             ],
             "title": "Version",
             "type": "string"
@@ -5249,26 +5253,58 @@
         "additionalProperties": false,
         "properties": {
           "column": {
-            "enum": [
-              "ma5",
-              "ma10",
-              "ma20",
-              "ma60",
-              "rsi6",
-              "rsi14",
-              "macd",
-              "macd_signal",
-              "macd_hist",
-              "kdj_k",
-              "kdj_d",
-              "kdj_j",
-              "turnover_rate",
-              "volume_ratio",
-              "total_mv",
-              "circ_mv"
+            "anyOf": [
+              {
+                "enum": [
+                  "ma5",
+                  "ma10",
+                  "ma20",
+                  "ma60",
+                  "rsi6",
+                  "rsi14",
+                  "macd",
+                  "macd_signal",
+                  "macd_hist",
+                  "kdj_k",
+                  "kdj_d",
+                  "kdj_j",
+                  "turnover_rate",
+                  "volume_ratio",
+                  "total_mv",
+                  "circ_mv"
+                ],
+                "type": "string"
+              },
+              {
+                "enum": [
+                  "price_window_days_90d",
+                  "price_position_90d_pct",
+                  "price_rank_90d_pct",
+                  "distance_to_high_90d_pct",
+                  "distance_to_low_90d_pct",
+                  "price_window_days_120d",
+                  "price_position_120d_pct",
+                  "price_rank_120d_pct",
+                  "distance_to_high_120d_pct",
+                  "distance_to_low_120d_pct",
+                  "price_window_days_250d",
+                  "price_position_250d_pct",
+                  "price_rank_250d_pct",
+                  "distance_to_high_250d_pct",
+                  "distance_to_low_250d_pct",
+                  "accum_window_days_20d",
+                  "accum_obv_change_20d_pct",
+                  "accum_ad_flow_20d_pct",
+                  "accum_up_down_amount_ratio_20d",
+                  "accum_heavy_no_drop_days_20d",
+                  "accum_close_position_avg_20d_pct",
+                  "ma_alignment",
+                  "price_percentile_250d"
+                ],
+                "type": "string"
+              }
             ],
-            "title": "Column",
-            "type": "string"
+            "title": "Column"
           },
           "missing": {
             "minimum": 0.0,
@@ -5291,6 +5327,14 @@
             },
             "maxItems": 5,
             "title": "Reasons",
+            "type": "array"
+          },
+          "stock_reasons": {
+            "items": {
+              "$ref": "#/components/schemas/FactorDailyFeatureReasonCount"
+            },
+            "maxItems": 9,
+            "title": "Stock Reasons",
             "type": "array"
           },
           "valid": {
@@ -5322,7 +5366,7 @@
             "items": {
               "$ref": "#/components/schemas/FactorDailyFeatureCounts"
             },
-            "maxItems": 16,
+            "maxItems": 39,
             "minItems": 1,
             "title": "Counts",
             "type": "array"
@@ -5356,15 +5400,38 @@
             "type": "integer"
           },
           "reason": {
-            "enum": [
-              "insufficient_window",
-              "no_initialization",
-              "history_break",
-              "missing_observation",
-              "derived_non_finite"
+            "anyOf": [
+              {
+                "enum": [
+                  "insufficient_window",
+                  "no_initialization",
+                  "history_break",
+                  "missing_observation",
+                  "derived_non_finite"
+                ],
+                "type": "string"
+              },
+              {
+                "enum": [
+                  "missing_reference_factor",
+                  "non_finite_reference_factor",
+                  "non_positive_reference_factor",
+                  "missing_required_factor",
+                  "non_finite_required_factor",
+                  "non_positive_required_factor"
+                ],
+                "type": "string"
+              },
+              {
+                "enum": [
+                  "missing_daily_data",
+                  "insufficient_history",
+                  "undefined_statistic"
+                ],
+                "type": "string"
+              }
             ],
-            "title": "Reason",
-            "type": "string"
+            "title": "Reason"
           }
         },
         "required": [
@@ -5387,7 +5454,7 @@
             "items": {
               "$ref": "#/components/schemas/FactorDailyStoredField"
             },
-            "maxItems": 16,
+            "maxItems": 39,
             "minItems": 1,
             "title": "Fields",
             "type": "array"
@@ -5410,7 +5477,8 @@
             "default": "unverified",
             "enum": [
               "unverified",
-              "observation_factor_then_output_session_scale"
+              "observation_factor_then_output_session_scale",
+              "field_specific"
             ],
             "title": "Price Basis",
             "type": "string"
@@ -5419,7 +5487,8 @@
             "default": "unverified",
             "enum": [
               "unverified",
-              "first_valid_observation_no_restart"
+              "first_valid_observation_no_restart",
+              "field_specific"
             ],
             "title": "Recursive Initialization",
             "type": "string"
@@ -5440,6 +5509,16 @@
             "title": "Source Sha256",
             "type": "string"
           },
+          "stock_features": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FactorStockFeatureSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "technical_history": {
             "anyOf": [
               {
@@ -5454,7 +5533,8 @@
             "default": "stored_not_recomputed",
             "enum": [
               "stored_not_recomputed",
-              "history_derived"
+              "history_derived",
+              "stock_features_derived"
             ],
             "title": "Value Semantics",
             "type": "string"
@@ -5476,26 +5556,58 @@
         "additionalProperties": false,
         "properties": {
           "column": {
-            "enum": [
-              "ma5",
-              "ma10",
-              "ma20",
-              "ma60",
-              "rsi6",
-              "rsi14",
-              "macd",
-              "macd_signal",
-              "macd_hist",
-              "kdj_k",
-              "kdj_d",
-              "kdj_j",
-              "turnover_rate",
-              "volume_ratio",
-              "total_mv",
-              "circ_mv"
+            "anyOf": [
+              {
+                "enum": [
+                  "ma5",
+                  "ma10",
+                  "ma20",
+                  "ma60",
+                  "rsi6",
+                  "rsi14",
+                  "macd",
+                  "macd_signal",
+                  "macd_hist",
+                  "kdj_k",
+                  "kdj_d",
+                  "kdj_j",
+                  "turnover_rate",
+                  "volume_ratio",
+                  "total_mv",
+                  "circ_mv"
+                ],
+                "type": "string"
+              },
+              {
+                "enum": [
+                  "price_window_days_90d",
+                  "price_position_90d_pct",
+                  "price_rank_90d_pct",
+                  "distance_to_high_90d_pct",
+                  "distance_to_low_90d_pct",
+                  "price_window_days_120d",
+                  "price_position_120d_pct",
+                  "price_rank_120d_pct",
+                  "distance_to_high_120d_pct",
+                  "distance_to_low_120d_pct",
+                  "price_window_days_250d",
+                  "price_position_250d_pct",
+                  "price_rank_250d_pct",
+                  "distance_to_high_250d_pct",
+                  "distance_to_low_250d_pct",
+                  "accum_window_days_20d",
+                  "accum_obv_change_20d_pct",
+                  "accum_ad_flow_20d_pct",
+                  "accum_up_down_amount_ratio_20d",
+                  "accum_heavy_no_drop_days_20d",
+                  "accum_close_position_avg_20d_pct",
+                  "ma_alignment",
+                  "price_percentile_250d"
+                ],
+                "type": "string"
+              }
             ],
-            "title": "Column",
-            "type": "string"
+            "title": "Column"
           },
           "description_zh": {
             "title": "Description Zh",
@@ -5508,7 +5620,8 @@
           "table": {
             "enum": [
               "daily_indicator",
-              "daily_basic"
+              "daily_basic",
+              "daily_stock_feature"
             ],
             "title": "Table",
             "type": "string"
@@ -5520,7 +5633,9 @@
               "indicator",
               "percent",
               "ratio",
-              "CNY_10000"
+              "CNY_10000",
+              "observations",
+              "binary"
             ],
             "title": "Unit",
             "type": "string"
@@ -5528,7 +5643,10 @@
           "value_semantics": {
             "anyOf": [
               {
-                "const": "history_derived",
+                "enum": [
+                  "history_derived",
+                  "stock_features_derived"
+                ],
                 "type": "string"
               },
               {
@@ -7245,6 +7363,144 @@
           "expression"
         ],
         "title": "FactorSaveDraft",
+        "type": "object"
+      },
+      "FactorStockFeaturePolicy": {
+        "additionalProperties": false,
+        "properties": {
+          "accumulation_reference": {
+            "const": "excluded",
+            "default": "excluded",
+            "title": "Accumulation Reference",
+            "type": "string"
+          },
+          "accumulation_window": {
+            "const": 20,
+            "default": 20,
+            "title": "Accumulation Window",
+            "type": "integer"
+          },
+          "adjustment": {
+            "const": "complete_window_and_reference_factor",
+            "default": "complete_window_and_reference_factor",
+            "title": "Adjustment",
+            "type": "string"
+          },
+          "algorithm_version": {
+            "const": "rquant-stock-features-v1",
+            "default": "rquant-stock-features-v1",
+            "title": "Algorithm Version",
+            "type": "string"
+          },
+          "implementation_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Implementation Sha256",
+            "type": "string"
+          },
+          "ma_alignment_observations": {
+            "const": 60,
+            "default": 60,
+            "title": "Ma Alignment Observations",
+            "type": "integer"
+          },
+          "max_observations": {
+            "const": 250,
+            "default": 250,
+            "title": "Max Observations",
+            "type": "integer"
+          },
+          "percentile_observations": {
+            "const": 250,
+            "default": 250,
+            "title": "Percentile Observations",
+            "type": "integer"
+          },
+          "price_adjustment_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Price Adjustment Sha256",
+            "type": "string"
+          },
+          "price_reference": {
+            "const": "included_actual_observations",
+            "default": "included_actual_observations",
+            "title": "Price Reference",
+            "type": "string"
+          },
+          "price_windows": {
+            "default": [
+              90,
+              120,
+              250
+            ],
+            "items": {
+              "enum": [
+                90,
+                120,
+                250
+              ],
+              "type": "integer"
+            },
+            "title": "Price Windows",
+            "type": "array"
+          },
+          "rounding_digits": {
+            "const": 4,
+            "default": 4,
+            "title": "Rounding Digits",
+            "type": "integer"
+          },
+          "short_price_window": {
+            "const": "use_actual_count",
+            "default": "use_actual_count",
+            "title": "Short Price Window",
+            "type": "string"
+          }
+        },
+        "required": [
+          "implementation_sha256",
+          "price_adjustment_sha256"
+        ],
+        "title": "FactorStockFeaturePolicy",
+        "type": "object"
+      },
+      "FactorStockFeatureSummary": {
+        "additionalProperties": false,
+        "properties": {
+          "codes_with_history": {
+            "maximum": 7000.0,
+            "minimum": 0.0,
+            "title": "Codes With History",
+            "type": "integer"
+          },
+          "codes_without_history": {
+            "maximum": 7000.0,
+            "minimum": 0.0,
+            "title": "Codes Without History",
+            "type": "integer"
+          },
+          "policy": {
+            "$ref": "#/components/schemas/FactorStockFeaturePolicy"
+          },
+          "source_history_start": {
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source History Start"
+          }
+        },
+        "required": [
+          "policy",
+          "source_history_start",
+          "codes_with_history",
+          "codes_without_history"
+        ],
+        "title": "FactorStockFeatureSummary",
         "type": "object"
       },
       "FactorStreamDisplayCoverageDay": {

@@ -2478,9 +2478,9 @@ export interface components {
             /** Tracking Unavailable Reason Zh */
             tracking_unavailable_reason_zh?: string | null;
             /** Unit */
-            unit?: ("stored_price" | "session_price" | "indicator" | "percent" | "ratio" | "CNY_10000") | null;
+            unit?: ("stored_price" | "session_price" | "indicator" | "percent" | "ratio" | "CNY_10000" | "observations" | "binary") | null;
             /** Value Semantics */
-            value_semantics?: ("stored_not_recomputed" | "history_derived") | null;
+            value_semantics?: ("stored_not_recomputed" | "history_derived" | "stock_features_derived") | null;
         };
         /** DataAuditHealthData */
         DataAuditHealthData: {
@@ -3008,7 +3008,7 @@ export interface components {
              * Version
              * @enum {string}
              */
-            version: "daily_v1" | "daily_stored_v1" | "daily_derived_v1";
+            version: "daily_v1" | "daily_stored_v1" | "daily_derived_v1" | "daily_stock_v1";
         };
         /** FactorCatalogData */
         FactorCatalogData: {
@@ -3034,11 +3034,8 @@ export interface components {
         };
         /** FactorDailyFeatureCounts */
         FactorDailyFeatureCounts: {
-            /**
-             * Column
-             * @enum {string}
-             */
-            column: "ma5" | "ma10" | "ma20" | "ma60" | "rsi6" | "rsi14" | "macd" | "macd_signal" | "macd_hist" | "kdj_k" | "kdj_d" | "kdj_j" | "turnover_rate" | "volume_ratio" | "total_mv" | "circ_mv";
+            /** Column */
+            column: ("ma5" | "ma10" | "ma20" | "ma60" | "rsi6" | "rsi14" | "macd" | "macd_signal" | "macd_hist" | "kdj_k" | "kdj_d" | "kdj_j" | "turnover_rate" | "volume_ratio" | "total_mv" | "circ_mv") | ("price_window_days_90d" | "price_position_90d_pct" | "price_rank_90d_pct" | "distance_to_high_90d_pct" | "distance_to_low_90d_pct" | "price_window_days_120d" | "price_position_120d_pct" | "price_rank_120d_pct" | "distance_to_high_120d_pct" | "distance_to_low_120d_pct" | "price_window_days_250d" | "price_position_250d_pct" | "price_rank_250d_pct" | "distance_to_high_250d_pct" | "distance_to_low_250d_pct" | "accum_window_days_20d" | "accum_obv_change_20d_pct" | "accum_ad_flow_20d_pct" | "accum_up_down_amount_ratio_20d" | "accum_heavy_no_drop_days_20d" | "accum_close_position_avg_20d_pct" | "ma_alignment" | "price_percentile_250d");
             /** Missing */
             missing: number;
             /** Non Finite */
@@ -3047,6 +3044,8 @@ export interface components {
             null: number;
             /** Reasons */
             reasons?: components["schemas"]["FactorDailyFeatureReasonCount"][];
+            /** Stock Reasons */
+            stock_reasons?: components["schemas"]["FactorDailyFeatureReasonCount"][];
             /** Valid */
             valid: number;
         };
@@ -3071,11 +3070,8 @@ export interface components {
         FactorDailyFeatureReasonCount: {
             /** Count */
             count: number;
-            /**
-             * Reason
-             * @enum {string}
-             */
-            reason: "insufficient_window" | "no_initialization" | "history_break" | "missing_observation" | "derived_non_finite";
+            /** Reason */
+            reason: ("insufficient_window" | "no_initialization" | "history_break" | "missing_observation" | "derived_non_finite") | ("missing_reference_factor" | "non_finite_reference_factor" | "non_positive_reference_factor" | "missing_required_factor" | "non_finite_required_factor" | "non_positive_required_factor") | ("missing_daily_data" | "insufficient_history" | "undefined_statistic");
         };
         /**
          * FactorDailyFeatureSources
@@ -3097,13 +3093,13 @@ export interface components {
              * @default unverified
              * @enum {string}
              */
-            price_basis: "unverified" | "observation_factor_then_output_session_scale";
+            price_basis: "unverified" | "observation_factor_then_output_session_scale" | "field_specific";
             /**
              * Recursive Initialization
              * @default unverified
              * @enum {string}
              */
-            recursive_initialization: "unverified" | "first_valid_observation_no_restart";
+            recursive_initialization: "unverified" | "first_valid_observation_no_restart" | "field_specific";
             /** Scope Content Hash */
             scope_content_hash: string;
             /**
@@ -3114,21 +3110,19 @@ export interface components {
             source_mode: "historical_retrospective";
             /** Source Sha256 */
             source_sha256: string;
+            stock_features?: components["schemas"]["FactorStockFeatureSummary"] | null;
             technical_history?: components["schemas"]["FactorTechnicalHistorySummary"] | null;
             /**
              * Value Semantics
              * @default stored_not_recomputed
              * @enum {string}
              */
-            value_semantics: "stored_not_recomputed" | "history_derived";
+            value_semantics: "stored_not_recomputed" | "history_derived" | "stock_features_derived";
         };
         /** FactorDailyStoredField */
         FactorDailyStoredField: {
-            /**
-             * Column
-             * @enum {string}
-             */
-            column: "ma5" | "ma10" | "ma20" | "ma60" | "rsi6" | "rsi14" | "macd" | "macd_signal" | "macd_hist" | "kdj_k" | "kdj_d" | "kdj_j" | "turnover_rate" | "volume_ratio" | "total_mv" | "circ_mv";
+            /** Column */
+            column: ("ma5" | "ma10" | "ma20" | "ma60" | "rsi6" | "rsi14" | "macd" | "macd_signal" | "macd_hist" | "kdj_k" | "kdj_d" | "kdj_j" | "turnover_rate" | "volume_ratio" | "total_mv" | "circ_mv") | ("price_window_days_90d" | "price_position_90d_pct" | "price_rank_90d_pct" | "distance_to_high_90d_pct" | "distance_to_low_90d_pct" | "price_window_days_120d" | "price_position_120d_pct" | "price_rank_120d_pct" | "distance_to_high_120d_pct" | "distance_to_low_120d_pct" | "price_window_days_250d" | "price_position_250d_pct" | "price_rank_250d_pct" | "distance_to_high_250d_pct" | "distance_to_low_250d_pct" | "accum_window_days_20d" | "accum_obv_change_20d_pct" | "accum_ad_flow_20d_pct" | "accum_up_down_amount_ratio_20d" | "accum_heavy_no_drop_days_20d" | "accum_close_position_avg_20d_pct" | "ma_alignment" | "price_percentile_250d");
             /** Description Zh */
             description_zh: string;
             /** Name Zh */
@@ -3137,14 +3131,14 @@ export interface components {
              * Table
              * @enum {string}
              */
-            table: "daily_indicator" | "daily_basic";
+            table: "daily_indicator" | "daily_basic" | "daily_stock_feature";
             /**
              * Unit
              * @enum {string}
              */
-            unit: "stored_price" | "session_price" | "indicator" | "percent" | "ratio" | "CNY_10000";
+            unit: "stored_price" | "session_price" | "indicator" | "percent" | "ratio" | "CNY_10000" | "observations" | "binary";
             /** Value Semantics */
-            value_semantics?: "history_derived" | null;
+            value_semantics?: ("history_derived" | "stock_features_derived") | null;
         };
         /**
          * FactorDailyStreamCoverage
@@ -3738,6 +3732,92 @@ export interface components {
              * Format: date-time
              */
             requested_at: string;
+        };
+        /** FactorStockFeaturePolicy */
+        FactorStockFeaturePolicy: {
+            /**
+             * Accumulation Reference
+             * @default excluded
+             * @constant
+             */
+            accumulation_reference: "excluded";
+            /**
+             * Accumulation Window
+             * @default 20
+             * @constant
+             */
+            accumulation_window: 20;
+            /**
+             * Adjustment
+             * @default complete_window_and_reference_factor
+             * @constant
+             */
+            adjustment: "complete_window_and_reference_factor";
+            /**
+             * Algorithm Version
+             * @default rquant-stock-features-v1
+             * @constant
+             */
+            algorithm_version: "rquant-stock-features-v1";
+            /** Implementation Sha256 */
+            implementation_sha256: string;
+            /**
+             * Ma Alignment Observations
+             * @default 60
+             * @constant
+             */
+            ma_alignment_observations: 60;
+            /**
+             * Max Observations
+             * @default 250
+             * @constant
+             */
+            max_observations: 250;
+            /**
+             * Percentile Observations
+             * @default 250
+             * @constant
+             */
+            percentile_observations: 250;
+            /** Price Adjustment Sha256 */
+            price_adjustment_sha256: string;
+            /**
+             * Price Reference
+             * @default included_actual_observations
+             * @constant
+             */
+            price_reference: "included_actual_observations";
+            /**
+             * Price Windows
+             * @default [
+             *       90,
+             *       120,
+             *       250
+             *     ]
+             */
+            price_windows: (90 | 120 | 250)[];
+            /**
+             * Rounding Digits
+             * @default 4
+             * @constant
+             */
+            rounding_digits: 4;
+            /**
+             * Short Price Window
+             * @default use_actual_count
+             * @constant
+             */
+            short_price_window: "use_actual_count";
+        };
+        /** FactorStockFeatureSummary */
+        FactorStockFeatureSummary: {
+            /** Codes With History */
+            codes_with_history: number;
+            /** Codes Without History */
+            codes_without_history: number;
+            policy: components["schemas"]["FactorStockFeaturePolicy"];
+            /** Source History Start */
+            source_history_start: string | null;
         };
         /** FactorStreamDisplayCoverageDay */
         FactorStreamDisplayCoverageDay: {

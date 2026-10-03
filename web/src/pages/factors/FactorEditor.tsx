@@ -6,6 +6,7 @@ import type {
   FactorSaveDraft,
 } from "@/api/factors";
 import { Button, SideDrawer, Tip } from "@/ui";
+import { FactorFieldInfo } from "./FactorFieldInfo";
 import "./FactorEditor.css";
 
 export type FactorEditorDraft = Pick<
@@ -292,7 +293,7 @@ export function FactorEditor({
               >
                 {field.name_zh}
               </Button>
-              <Tip content={field.description_zh} interactive>
+              <Tip content={<FactorFieldInfo field={field} />} interactive>
                 <Button
                   size="sm"
                   variant="ghost"
