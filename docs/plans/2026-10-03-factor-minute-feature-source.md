@@ -65,4 +65,6 @@
 
 本片没有本地合入集成树：它仍为`0a2dea400236cbf75e5f945b020c5d61f6986c26`且clean；没有main/PR/tag/部署/切流/停Streamlit。M3保持部分，全goal未完成。两个自有工作树分别保留独特WIP与后续集成，符合未完成合版的保留条件。
 
+后续授权记录：用户在 FMS-003 有限提案后回复「继续」，已另行开始[跟踪重放耗时有限收敛](2026-10-04-factor-tracking-replay-performance.md)。该新范围先诊断，再最多一次局部修复和原审查者复核；上述失败事实与已经消耗的 FMS-002 补修轮次保持记录。
+
 冻结原件：`/private/tmp/rquant-factor-tracking-root-yegakn31/minute-feature-oom-repair-proof/failed-real-proof.json`；SHA256 `5e29ad30d744d58ec70741ecab18b742d66e85266e723218914955cc6cd3cd69`。原reviewer复核：`/private/tmp/rquant-minute-memory-recheck-X61h0a/RECHECK.md`；SHA256 `3c799c9e8c28f742ddc9c9a4bd7cb35bba4bb3f9dc49f933286333d8d44f0eb1`。
