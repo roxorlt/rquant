@@ -5,6 +5,7 @@ import os
 import time
 import tracemalloc
 import weakref
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -276,3 +277,108 @@ def test_journal_consumption_releases_batches_and_records_only_bounded_metadata(
             f"SJ_JOURNAL_COST: stocks=12 days=15 seconds={elapsed:.6f} "
             f"python_peak_bytes={peak} python_retained_bytes={retained} rss_measured=false"
         )
+
+
+def _stored_stream(tmp_path: Path) -> tuple:
+    from rquant.factor.stream_job_runner import run_factor_stream_job
+    from rquant.storage.duckdb import DuckDBStore
+    from tests.unit.test_factor_minute_feature_pipeline import _configuration, _plan
+    from tests.unit.test_factor_stock_feature_source import _AS_OF
+
+    root, reference, browser, _, config, _ = _configuration(tmp_path)
+    spec = _plan(root, reference, browser, config).spec
+    with DuckDBStore(tmp_path / "metadata-255-260.duckdb") as metadata:
+        completion = run_factor_stream_job(
+            spec,
+            metadata_store=metadata,
+            lake_root=config.lake_root,
+            member_root=config.member_root,
+            artifact_root=config.artifact_root,
+            now=lambda: _AS_OF,
+        )
+    return spec, completion, config
+
+
+def test_stored_replay_reads_each_feature_day_once_without_retaining_inputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rquant.factor import stream_job_artifact as artifacts
+
+    spec, completion, config = _stored_stream(tmp_path)
+    paths = tuple(config.artifact_root.iterdir()) + tuple(
+        config.lake_root / artifact.relative_path
+        for artifact in spec.adapter_request.daily_feature_source.input_artifacts()
+    )
+    before = {path: path.read_bytes() for path in paths}
+    read = artifacts.read_factor_daily_feature_input
+    calls, refs = [], []
+
+    def observed(*args: object, **kwargs: object) -> object:
+        assert all(ref() is None for ref in refs)
+        original = read(*args, **kwargs)
+        calls.append(original.trade_date)
+        refs.append(weakref.ref(original))
+        return original
+
+    monkeypatch.setattr(artifacts, "read_factor_daily_feature_input", observed)
+    verified = artifacts.verify_factor_stream_artifacts(
+        spec, completion, config.artifact_root, config.member_root
+    )
+    feature_days = verified.full.result.research.research.adapter_completion.feature_days
+    assert len(feature_days) == 4 and len(spec.adapter_request.evaluation_days) == 3
+    assert calls == [day.trade_date for day in feature_days]
+    assert all(ref() is None for ref in refs)
+    assert {path: path.read_bytes() for path in paths} == before
+    assert (
+        artifacts._bytes(verified.full)
+        == before[config.artifact_root / completion.artifact_filename]
+    )
+    assert (
+        artifacts._bytes(verified.display)
+        == before[config.artifact_root / completion.display_artifact_filename]
+    )
+    assert not list((config.lake_root / ".execution_sessions").iterdir())
+
+
+@pytest.mark.parametrize("target", ["warmup", "evaluated"])
+@pytest.mark.parametrize("damage", ["sha256", "counts", "panel"])
+def test_rehashed_wrong_stored_feature_completion_is_rejected(
+    tmp_path: Path, target: str, damage: str
+) -> None:
+    from rquant.factor.stream_job_artifact import verify_factor_stream_artifacts
+
+    spec, completion, config = _stored_stream(tmp_path)
+    full = verify_factor_stream_artifacts(
+        spec, completion, config.artifact_root, config.member_root
+    ).full
+    research = full.result.research.research
+    adapter = research.adapter_completion
+    features = list(adapter.feature_days)
+    index = 0 if target == "warmup" else 1
+    feature = features[index]
+    assert (feature.trade_date in spec.adapter_request.evaluation_days) == (target == "evaluated")
+    if damage == "sha256":
+        feature = feature.model_copy(update={"daily_feature_input_sha256": "0" * 64})
+    elif damage == "counts":
+        counts = feature.daily_feature_counts
+        assert counts[0].valid > 0
+        changed = counts[0].model_copy(
+            update={"valid": counts[0].valid - 1, "null": counts[0].null + 1}
+        )
+        feature = feature.model_copy(update={"daily_feature_counts": (changed, *counts[1:])})
+    else:
+        feature = feature.model_copy(update={"panel_date": feature.panel_date - timedelta(days=1)})
+    features[index] = feature
+    fields = adapter.model_dump(exclude={"input_sha256", "sha256"})
+    fields["feature_days"] = tuple(features)
+    adapter = _hashed(adapter, feature_days=tuple(features), input_sha256=canonical_sha256(fields))
+    result = _hashed(
+        full.result,
+        research=_hashed(
+            full.result.research, research=_hashed(research, adapter_completion=adapter)
+        ),
+    )
+    forged = _replace_full(full, config.artifact_root, completion, result=result)
+    message = "previous SSE day" if damage == "panel" else "sealed original values"
+    with pytest.raises(ValueError, match=message):
+        verify_factor_stream_artifacts(spec, forged, config.artifact_root, config.member_root)

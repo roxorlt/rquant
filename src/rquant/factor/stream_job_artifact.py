@@ -567,6 +567,7 @@ def verify_factor_stream_artifacts(
             day.trade_date: day
             for day in full.result.research.research.adapter_completion.feature_days
         }
+        evaluated = frozenset(request.evaluation_days)
         decay = FactorICDecayStream(
             FactorICDecayStreamRequest(
                 statistics_request=request,
@@ -610,6 +611,9 @@ def verify_factor_stream_artifacts(
                         raise ValueError(
                             "completed stored daily panel differs from actual previous SSE day"
                         )
+                    # Evaluated days share the original read with journal replay below.
+                    if feature.trade_date in evaluated:
+                        continue
                     original = read_factor_daily_feature_input(
                         stored_lease,
                         spec.adapter_request.formula.sources.daily_features,
@@ -630,7 +634,6 @@ def verify_factor_stream_artifacts(
             )
             _matching_request(members.manifest, spec.adapter_request)
             journal_days = iter(journal.days)
-            evaluated = frozenset(request.evaluation_days)
 
             def replay() -> Iterator[FactorDailyStreamBatch]:
                 for universe in members:
@@ -671,6 +674,15 @@ def verify_factor_stream_artifacts(
                                 panel_date=features[day.trade_date].panel_date,
                                 stock_codes=spec.adapter_request.source.scope.stock_codes,
                             )
+                            feature = features[day.trade_date]
+                            if (
+                                original.sha256 != feature.daily_feature_input_sha256
+                                or original.counts != feature.daily_feature_counts
+                            ):
+                                raise ValueError(
+                                    "completed stored daily inputs "
+                                    "differ from sealed original values"
+                                )
                             if batch.daily_features != original:
                                 raise ValueError(
                                     "journal stored daily values or missing states "
