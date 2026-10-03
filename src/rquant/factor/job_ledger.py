@@ -17,7 +17,17 @@ from threading import Lock
 from typing import Literal
 from uuid import uuid4
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    ValidationInfo,
+    ValidatorFunctionWrapHandler,
+    field_validator,
+    model_validator,
+)
 
 from rquant.factor.display_artifact import (
     FactorDisplayArtifactV1,
@@ -126,8 +136,23 @@ class FactorJobLease(BaseModel):
     expires_at: AwareDatetime
 
 
+@dataclass(frozen=True, slots=True)
+class _VerifiedSpec:
+    spec: FactorEvaluationJobSpec | FactorStreamJobSpec
+
+
 class _JobState(FactorJobRecord):
     lease_token: str | None
+
+    @field_validator("spec", mode="wrap")
+    @classmethod
+    def _same_verified_spec(
+        cls, value: object, handler: ValidatorFunctionWrapHandler, info: ValidationInfo
+    ) -> object:
+        # Only the exact immutable instance from a complete persisted decode can be reused.
+        if isinstance(info.context, _VerifiedSpec) and value is info.context.spec:
+            return value
+        return handler(value)
 
     @model_validator(mode="after")
     def _valid_state(self) -> _JobState:
@@ -286,12 +311,18 @@ _COLUMNS = (
 )
 
 
-def _decoded_job(row: sqlite3.Row) -> _JobState:
+def _decoded_job(
+    row: sqlite3.Row, *, verified_spec: FactorEvaluationJobSpec | FactorStreamJobSpec | None = None
+) -> _JobState:
     payload = {column: row[column] for column in _COLUMNS}
     try:
         if not isinstance(payload["job_id"], str) or _HEX32.fullmatch(payload["job_id"]) is None:
             raise ValueError("factor job ID is invalid")
-        spec = decode_factor_job_spec_json(payload["spec_json"])
+        spec = (
+            decode_factor_job_spec_json(payload["spec_json"])
+            if verified_spec is None
+            else verified_spec
+        )
         if _canonical_model(spec) != payload["spec_json"]:
             raise ValueError("factor job spec JSON is not canonical")
         completion = (
@@ -311,25 +342,34 @@ def _decoded_job(row: sqlite3.Row) -> _JobState:
         created_at = _parsed_time(payload["created_at"])
         updated_at = _parsed_time(payload["updated_at"])
         lease_expires_at = _parsed_time(payload["lease_expires_at"], optional=True)
-        state = _JobState(
-            job_id=payload["job_id"],
-            spec=spec,
-            spec_sha256=payload["spec_sha256"],
-            status=payload["status"],
-            version=payload["version"],
-            attempts=payload["attempts"],
-            created_at=created_at,
-            updated_at=updated_at,
-            lease_token=payload["lease_token"],
-            lease_expires_at=lease_expires_at,
-            failure_code=payload["failure_code"],
-            completion=completion,
+        state = _JobState.model_validate(
+            dict(
+                job_id=payload["job_id"],
+                spec=spec,
+                spec_sha256=payload["spec_sha256"],
+                status=payload["status"],
+                version=payload["version"],
+                attempts=payload["attempts"],
+                created_at=created_at,
+                updated_at=updated_at,
+                lease_token=payload["lease_token"],
+                lease_expires_at=lease_expires_at,
+                failure_code=payload["failure_code"],
+                completion=completion,
+            ),
+            context=None if verified_spec is None else _VerifiedSpec(verified_spec),
         )
         if not isinstance(row["row_sha256"], str) or _digest(payload) != row["row_sha256"]:
             raise FactorLedgerIntegrityError("factor job row digest differs")
         return state
     except (TypeError, ValueError, ValidationError) as exc:
         raise FactorLedgerIntegrityError("factor job persistent state is invalid") from exc
+
+
+@dataclass(frozen=True, slots=True)
+class _CapturedJob:
+    row: sqlite3.Row
+    command: sqlite3.Row
 
 
 def _command_payload(command_id: str, spec_sha256: str, job_id: str) -> dict[str, str]:
@@ -633,21 +673,57 @@ class FactorEvaluationJobLedger:
             raise FactorLedgerIntegrityError("factor ledger write failed") from exc
 
     @staticmethod
-    def _load_job(connection: sqlite3.Connection, job_id: str) -> _JobState | None:
+    def _capture_job(connection: sqlite3.Connection, job_id: str) -> _CapturedJob | None:
         row = connection.execute("SELECT * FROM factor_jobs WHERE job_id = ?", (job_id,)).fetchone()
         if row is None:
             return None
-        state = _decoded_job(row)
         anchor = connection.execute(
             "SELECT * FROM factor_commands WHERE job_id = ? ORDER BY command_id LIMIT 1",
             (job_id,),
         ).fetchone()
         if anchor is None:
             raise FactorLedgerIntegrityError("factor job has no command anchor")
-        _, spec_sha256, linked_job_id = _checked_command(anchor)
+        return _CapturedJob(row, anchor)
+
+    @staticmethod
+    def _decode_captured(
+        captured: _CapturedJob,
+        *,
+        verified_spec: FactorEvaluationJobSpec | FactorStreamJobSpec | None = None,
+    ) -> _JobState:
+        state = (
+            _decoded_job(captured.row)
+            if verified_spec is None
+            else _decoded_job(captured.row, verified_spec=verified_spec)
+        )
+        _, spec_sha256, linked_job_id = _checked_command(captured.command)
         if spec_sha256 != state.spec_sha256 or linked_job_id != state.job_id:
             raise FactorLedgerIntegrityError("factor command differs from job")
         return state
+
+    @staticmethod
+    def _load_job(connection: sqlite3.Connection, job_id: str) -> _JobState | None:
+        captured = FactorEvaluationJobLedger._capture_job(connection, job_id)
+        return None if captured is None else FactorEvaluationJobLedger._decode_captured(captured)
+
+    def _read_verified_job(self, job_id: str) -> _JobState | None:
+        # A rollback-journal reader must release its snapshot before expensive decoding.
+        with self._reader() as connection:
+            captured = self._capture_job(connection, job_id)
+        state = None if captured is None else self._decode_captured(captured)
+        self._require_path(self._expected_identity())
+        return state
+
+    def _load_same_spec(
+        self,
+        connection: sqlite3.Connection,
+        job_id: str,
+        spec: FactorEvaluationJobSpec | FactorStreamJobSpec,
+    ) -> _JobState | None:
+        captured = self._capture_job(connection, job_id)
+        # Canonical spec bytes, typed state and row hash remain checked, together with
+        # the command captured in this same transaction; only immutable redecoding is reused.
+        return None if captured is None else self._decode_captured(captured, verified_spec=spec)
 
     @staticmethod
     def _insert_job(connection: sqlite3.Connection, state: _JobState) -> None:
@@ -851,11 +927,14 @@ class FactorEvaluationJobLedger:
     ) -> FactorJobLease:
         if type(lease_seconds) is not int or not 1 <= lease_seconds <= _MAX_LEASE_SECONDS:
             raise ValueError("factor lease duration is invalid")
+        prior = self._read_verified_job(job_id)
+        if prior is None:
+            raise FactorLedgerLeaseError("factor job does not exist")
         with self._writer() as connection:
-            current = self._now()
-            state = self._load_job(connection, job_id)
+            state = self._load_same_spec(connection, job_id, prior.spec)
             if state is None:
                 raise FactorLedgerLeaseError("factor job does not exist")
+            current = self._now()
             self._live_lease(state, lease_token, expected_version, current)
             extended = state.model_copy(
                 update={
@@ -866,9 +945,18 @@ class FactorEvaluationJobLedger:
                     ),
                 }
             )
-            checked = _JobState.model_validate(extended.model_dump(mode="python"))
+            fields = extended.model_dump(mode="python")
+            fields["spec"] = state.spec
+            checked = _JobState.model_validate(fields, context=_VerifiedSpec(state.spec))
             self._store_job(connection, checked)
-            return checked.lease()
+            self._live_lease(state, lease_token, expected_version, self._now())
+        # COMMIT and fully typed public construction can both consume the lease.
+        # A loss after commit leaves the original recoverable row; never force an undo.
+        self._live_lease(state, lease_token, expected_version, self._now())
+        result = checked.lease()
+        self._require_path(self._expected_identity())
+        self._live_lease(checked, lease_token, checked.version, self._now())
+        return result
 
     def complete(
         self,
@@ -981,10 +1069,13 @@ class FactorEvaluationJobLedger:
         member_root: Path,
     ) -> object:
         """Long verification outside the writer, while the worker keeps renewing."""
+        prior = self._read_verified_job(job_id)
+        if prior is None or not isinstance(prior.spec, FactorStreamJobSpec):
+            raise FactorLedgerCompletionError("stream preparation requires a v2 job")
         with self._reader() as connection:
-            state = self._load_job(connection, job_id)
-            if state is None or not isinstance(state.spec, FactorStreamJobSpec):
-                raise FactorLedgerCompletionError("stream preparation requires a v2 job")
+            state = self._load_same_spec(connection, job_id, prior.spec)
+            if state is None:
+                raise FactorLedgerLeaseError("stream job disappeared during preparation")
             self._live_lease(state, lease_token, state.version, self._now())
             spec = state.spec
         self._discard_job_prepared(job_id, lease_token=lease_token)
@@ -997,7 +1088,7 @@ class FactorEvaluationJobLedger:
                 "stream journal completion cannot be verified"
             ) from exc
         with self._reader() as connection:
-            state = self._load_job(connection, job_id)
+            state = self._load_same_spec(connection, job_id, spec)
             if state is None or state.spec != spec:
                 raise FactorLedgerLeaseError("stream job changed during preparation")
             self._live_lease(state, lease_token, state.version, self._now())
