@@ -261,7 +261,7 @@ class FactorFormulaStreamBatch(BaseModel):
     sources: FactorFormulaStreamSources
     universe: FactorUniverseRequest
     feature_points: tuple[FactorFormulaFeaturePoint, ...] = Field(
-        max_length=MAX_UNIVERSE_SECURITIES * 45
+        max_length=MAX_UNIVERSE_SECURITIES * 56
     )
     context: FactorNeutralizationDayBatch | None = Field(
         default=None, exclude_if=lambda v: v is None

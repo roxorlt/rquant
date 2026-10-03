@@ -934,3 +934,107 @@ def test_large_daily_rolling_cross_section_once_records_bounded_allocations_and_
     assert consumed == len(released) == stream.completion.processed_days == 16
     assert stream._engine.history == {}
     assert peak < 256 * 1024 * 1024
+
+
+def _maximum_formula_batch(
+    columns: tuple[str, ...], *, codes: tuple[str, ...] | None = None
+) -> FactorFormulaStreamBatch:
+    from rquant.factor.formula_stream import FactorFormulaStreamBatch, FactorFormulaStreamSources
+
+    day = date(2026, 10, 2)
+    at = datetime.combine(day, time(9, 25), _TZ)
+    codes = codes if codes is not None else tuple(f"{index:06d}.SZ" for index in range(1, 7001))
+    securities = DailySecurityBatch(
+        trade_date=day,
+        source_id="synthetic-width-securities",
+        source_sha256="b" * 64,
+        source_mode="historical_retrospective",
+        security_scope="china_a_share",
+        observed_at=at,
+        complete_stock_codes=codes,
+        facts=tuple(
+            DailySecurityFact(
+                stock_code=code, exchange="SZ", board="main", is_listed=True, is_st=False
+            )
+            for code in codes
+        ),
+    )
+    return FactorFormulaStreamBatch(
+        request_sha256="c" * 64,
+        sources=FactorFormulaStreamSources(
+            source_mode="historical_retrospective",
+            feature_source_id="synthetic-width-prices",
+            feature_source_sha256="a" * 64,
+            security_source_id=securities.source_id,
+            security_source_sha256=securities.source_sha256,
+        ),
+        universe=FactorUniverseRequest(
+            selection="all", trade_date=day, as_of=at, securities=securities
+        ),
+        feature_points=tuple(
+            {
+                "stock_code": code,
+                "trade_date": day,
+                "column": column,
+                "state": "value",
+                "value": 1.0,
+                "first_visible_at": at,
+            }
+            for code in codes
+            for column in columns
+        ),
+    )
+
+
+def _minute_batch_columns(*, minute: bool, native: bool) -> tuple[str, ...]:
+    from rquant.factor.daily_feature_source import (
+        DERIVED_DAILY_FIELDS,
+        MINUTE_FEATURE_FIELDS,
+        STOCK_FEATURE_FIELDS,
+    )
+
+    fields = DERIVED_DAILY_FIELDS + STOCK_FEATURE_FIELDS + (MINUTE_FEATURE_FIELDS if minute else ())
+    return tuple(field.column for field in fields) + (
+        ("open", "high", "low", "close", "vol", "amount") if native else ()
+    )
+
+
+@pytest.mark.parametrize(
+    "minute,native,width",
+    ((False, True, 45), (True, False, 50), (True, True, 56)),
+    ids=("legacy45", "minute50", "minute56"),
+)
+def test_minute_maximum_formula_batch_grid(minute: bool, native: bool, width: int) -> None:
+    columns = _minute_batch_columns(minute=minute, native=native)
+    assert len(columns) == len(set(columns)) == width
+    batch = _maximum_formula_batch(columns)
+    assert len(batch.universe.securities.complete_stock_codes) == 7000
+    assert len(batch.feature_points) == 7000 * width
+    assert all(point.state == "value" and point.value == 1.0 for point in batch.feature_points)
+
+
+def test_minute_formula_batch_rejects_one_point_over_finite_limit() -> None:
+    from rquant.factor.formula_stream import FactorFormulaStreamBatch
+
+    batch = _maximum_formula_batch(_minute_batch_columns(minute=True, native=True))
+    payload = {name: getattr(batch, name) for name in FactorFormulaStreamBatch.model_fields}
+    payload["feature_points"] = batch.feature_points + (batch.feature_points[0],)
+    with pytest.raises(ValidationError) as caught:
+        FactorFormulaStreamBatch.model_validate(payload)
+    (error,) = caught.value.errors(include_input=False, include_url=False)
+    assert error["loc"] == ("feature_points",) and error["type"] == "too_long"
+    assert error["ctx"]["max_length"] == 7000 * 56
+    assert error["ctx"]["actual_length"] == 7000 * 56 + 1
+
+
+def test_original_six_formula_batch_canonical_bytes_unchanged() -> None:
+    import hashlib
+
+    from rquant.strict_json import canonical_json_bytes
+
+    batch = _maximum_formula_batch(("open", "high", "low", "close", "vol", "amount"), codes=_CODES)
+    data = canonical_json_bytes(batch.model_dump(mode="json"))
+    assert (
+        hashlib.sha256(data).hexdigest()
+        == "e72e94bf8c3c21f5d11fb8cc44c0a17201569486d21df719275307e0e9119fbe"
+    )
