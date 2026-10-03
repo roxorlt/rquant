@@ -30,6 +30,8 @@ from rquant.runtime_contracts import canonical_sha256
 from rquant.strategy_dependencies import StrategyTableDependency
 
 if TYPE_CHECKING:
+    from duckdb import DuckDBPyConnection
+
     from rquant.factor.daily_feature_source import (
         FactorDailyFeatureSource,
         FactorMinuteFeaturePrepareRequest,
@@ -471,6 +473,48 @@ def _derive_code(code: str, rows: list[tuple], days: tuple[date, ...]) -> pd.Dat
     return pd.DataFrame(result_rows)
 
 
+def _stage_minute_input_batch(
+    connection: DuckDBPyConnection,
+    scratch: Path,
+    query: str,
+    parameters: list[object],
+) -> None:
+    batch = scratch / "minute-input-batch.parquet"
+    database = scratch / "minute-input.duckdb"
+    # The source query stays in the pinned read transaction. Only owned scratch
+    # writes use a separate cursor, sharing the same 512MB buffer manager.
+    connection.execute(
+        "COPY (" + query + ") TO '" + str(batch).replace("'", "''") + "' (FORMAT PARQUET)",
+        parameters,
+    )
+    writer = connection.cursor()
+    try:
+        writer.execute(
+            "ATTACH '"
+            + str(database).replace("'", "''")
+            + "' AS factor_minute_input_staging (READ_WRITE)"
+        )
+        writer.execute(
+            "CREATE TABLE IF NOT EXISTS factor_minute_input_staging.minute_feature_input("
+            "ts_code VARCHAR,trade_time TIMESTAMP,freq VARCHAR,"
+            + ",".join(c + " DOUBLE" for c in _RAW_COLUMNS[3:-1])
+            + ",source VARCHAR,trade_date DATE,PRIMARY KEY(ts_code,trade_time,freq,source))"
+        )
+        writer.execute(
+            "INSERT INTO factor_minute_input_staging.minute_feature_input "
+            "SELECT * FROM read_parquet(?)",
+            [str(batch)],
+        )
+        writer.execute("CHECKPOINT factor_minute_input_staging")
+    finally:
+        # ART buffers cannot spill. Detaching each committed scratch batch frees
+        # its resident index before the next source query, retaining the key on disk.
+        with suppress(Exception):
+            writer.execute("DETACH factor_minute_input_staging")
+        writer.close()
+        batch.unlink(missing_ok=True)
+
+
 def prepare_factor_minute_feature_source(
     request: FactorMinuteFeaturePrepareRequest,
     *,
@@ -540,12 +584,6 @@ def prepare_factor_minute_feature_source(
                     or any(types.get(c) != "DOUBLE" for c in _RAW_COLUMNS[3:-1])
                 ):
                     raise ValueError("minute source schema/business key differs")
-                connection.execute(
-                    "CREATE TEMP TABLE minute_feature_input(ts_code "
-                    "VARCHAR,trade_time TIMESTAMP,freq VARCHAR,"
-                    + ",".join(c + " DOUBLE" for c in _RAW_COLUMNS[3:-1])
-                    + ",source VARCHAR,trade_date DATE,PRIMARY KEY(ts_code,trade_time,freq,source))"
-                )
                 first_panel = min(prepared.receipt.calendar_open_days, default=scope.start_date)
                 bounded = (
                     "WITH dates AS (SELECT DISTINCT ts_code,CAST(trade_time AS "
@@ -586,7 +624,13 @@ def prepare_factor_minute_feature_source(
                         n > request.max_code_rows for _, n in counts
                     ):
                         raise ValueError("minute complete historical input budget exceeded")
-                    connection.execute("INSERT INTO minute_feature_input " + bounded, params)
+                    _stage_minute_input_batch(connection, Path(scratch), bounded, params)
+                connection.execute(
+                    "ATTACH '"
+                    + str(Path(scratch) / "minute-input.duckdb").replace("'", "''")
+                    + "' AS factor_minute_input_staging (READ_ONLY)"
+                )
+                connection.execute("USE factor_minute_input_staging")
                 connection.execute(
                     "CREATE TEMP TABLE daily_minute_feature(ts_code VARCHAR,trade_date DATE,"
                     + ",".join(
