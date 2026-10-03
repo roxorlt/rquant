@@ -32,10 +32,6 @@ from rquant.research_snapshot import (
     verify_materialized_table_artifact,
 )
 from rquant.runtime_contracts import canonical_sha256
-from rquant.stock_features import (
-    DailyStockFeatureResult,
-    build_daily_stock_feature_result_from_history,
-)
 from rquant.strategy_dependencies import StrategyTableDependency
 
 if TYPE_CHECKING:
@@ -43,6 +39,7 @@ if TYPE_CHECKING:
         FactorDailyFeatureSource,
         FactorStockFeaturePrepareRequest,
     )
+    from rquant.stock_features import DailyStockFeatureResult
 
 _MODEL = ConfigDict(frozen=True, extra="forbid", strict=True, revalidate_instances="always")
 _SHA = r"^[0-9a-f]{64}$"
@@ -427,6 +424,8 @@ def _diagnostic(
 
 
 def _derive_code(code: str, rows: list[tuple], days: tuple[date, ...]) -> pd.DataFrame:
+    from rquant.stock_features import build_daily_stock_feature_result_from_history
+
     frame = pd.DataFrame(
         rows, columns=(*_RAW_COLUMNS, "bar_present", "adj_factor", "factor_present")
     )
