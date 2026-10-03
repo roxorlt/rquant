@@ -2478,9 +2478,9 @@ export interface components {
             /** Tracking Unavailable Reason Zh */
             tracking_unavailable_reason_zh?: string | null;
             /** Unit */
-            unit?: ("stored_price" | "session_price" | "indicator" | "percent" | "ratio" | "CNY_10000" | "observations" | "binary") | null;
+            unit?: ("stored_price" | "session_price" | "indicator" | "percent" | "ratio" | "CNY_10000" | "CNY" | "observations" | "binary") | null;
             /** Value Semantics */
-            value_semantics?: ("stored_not_recomputed" | "history_derived" | "stock_features_derived") | null;
+            value_semantics?: ("stored_not_recomputed" | "history_derived" | "stock_features_derived" | "minute_features_derived") | null;
         };
         /** DataAuditHealthData */
         DataAuditHealthData: {
@@ -3008,7 +3008,7 @@ export interface components {
              * Version
              * @enum {string}
              */
-            version: "daily_v1" | "daily_stored_v1" | "daily_derived_v1" | "daily_stock_v1";
+            version: "daily_v1" | "daily_stored_v1" | "daily_derived_v1" | "daily_stock_v1" | "daily_minute_v1";
         };
         /** FactorCatalogData */
         FactorCatalogData: {
@@ -3035,7 +3035,9 @@ export interface components {
         /** FactorDailyFeatureCounts */
         FactorDailyFeatureCounts: {
             /** Column */
-            column: ("ma5" | "ma10" | "ma20" | "ma60" | "rsi6" | "rsi14" | "macd" | "macd_signal" | "macd_hist" | "kdj_k" | "kdj_d" | "kdj_j" | "turnover_rate" | "volume_ratio" | "total_mv" | "circ_mv") | ("price_window_days_90d" | "price_position_90d_pct" | "price_rank_90d_pct" | "distance_to_high_90d_pct" | "distance_to_low_90d_pct" | "price_window_days_120d" | "price_position_120d_pct" | "price_rank_120d_pct" | "distance_to_high_120d_pct" | "distance_to_low_120d_pct" | "price_window_days_250d" | "price_position_250d_pct" | "price_rank_250d_pct" | "distance_to_high_250d_pct" | "distance_to_low_250d_pct" | "accum_window_days_20d" | "accum_obv_change_20d_pct" | "accum_ad_flow_20d_pct" | "accum_up_down_amount_ratio_20d" | "accum_heavy_no_drop_days_20d" | "accum_close_position_avg_20d_pct" | "ma_alignment" | "price_percentile_250d");
+            column: ("ma5" | "ma10" | "ma20" | "ma60" | "rsi6" | "rsi14" | "macd" | "macd_signal" | "macd_hist" | "kdj_k" | "kdj_d" | "kdj_j" | "turnover_rate" | "volume_ratio" | "total_mv" | "circ_mv") | ("price_window_days_90d" | "price_position_90d_pct" | "price_rank_90d_pct" | "distance_to_high_90d_pct" | "distance_to_low_90d_pct" | "price_window_days_120d" | "price_position_120d_pct" | "price_rank_120d_pct" | "distance_to_high_120d_pct" | "distance_to_low_120d_pct" | "price_window_days_250d" | "price_position_250d_pct" | "price_rank_250d_pct" | "distance_to_high_250d_pct" | "distance_to_low_250d_pct" | "accum_window_days_20d" | "accum_obv_change_20d_pct" | "accum_ad_flow_20d_pct" | "accum_up_down_amount_ratio_20d" | "accum_heavy_no_drop_days_20d" | "accum_close_position_avg_20d_pct" | "ma_alignment" | "price_percentile_250d") | ("signal_minute_amount" | "signal_cum_amount_asof" | "hist_same_minute_amount_median_20d" | "hist_cum_amount_asof_median_20d" | "signal_rel_amount_same_minute_20d" | "signal_rel_cum_amount_asof_20d" | "hist_intraday_days_20d" | "signal_opening_segment" | "signal_opening_segment_amount" | "signal_amount_accel_5m" | "signal_amount_accel_10m");
+            /** Minute Reasons */
+            minute_reasons?: components["schemas"]["FactorDailyFeatureReasonCount"][];
             /** Missing */
             missing: number;
             /** Non Finite */
@@ -3071,7 +3073,7 @@ export interface components {
             /** Count */
             count: number;
             /** Reason */
-            reason: ("insufficient_window" | "no_initialization" | "history_break" | "missing_observation" | "derived_non_finite") | ("missing_reference_factor" | "non_finite_reference_factor" | "non_positive_reference_factor" | "missing_required_factor" | "non_finite_required_factor" | "non_positive_required_factor") | ("missing_daily_data" | "insufficient_history" | "undefined_statistic");
+            reason: ("insufficient_window" | "no_initialization" | "history_break" | "missing_observation" | "derived_non_finite") | ("missing_reference_factor" | "non_finite_reference_factor" | "non_positive_reference_factor" | "missing_required_factor" | "non_finite_required_factor" | "non_positive_required_factor") | ("missing_daily_data" | "insufficient_history" | "undefined_statistic") | ("missing_target_minute" | "missing_history" | "missing_same_minute_history" | "zero_same_minute_baseline" | "zero_cumulative_baseline" | "not_applicable" | "no_acceleration_history" | "undefined_statistic");
         };
         /**
          * FactorDailyFeatureSources
@@ -3082,6 +3084,7 @@ export interface components {
             code_commit: string;
             /** Fields */
             fields: components["schemas"]["FactorDailyStoredField"][];
+            minute_features?: components["schemas"]["FactorMinuteFeatureSummary"] | null;
             /** Prepared Binding Hash */
             prepared_binding_hash: string;
             /** Prepared Snapshot Id */
@@ -3117,12 +3120,12 @@ export interface components {
              * @default stored_not_recomputed
              * @enum {string}
              */
-            value_semantics: "stored_not_recomputed" | "history_derived" | "stock_features_derived";
+            value_semantics: "stored_not_recomputed" | "history_derived" | "stock_features_derived" | "minute_features_derived";
         };
         /** FactorDailyStoredField */
         FactorDailyStoredField: {
             /** Column */
-            column: ("ma5" | "ma10" | "ma20" | "ma60" | "rsi6" | "rsi14" | "macd" | "macd_signal" | "macd_hist" | "kdj_k" | "kdj_d" | "kdj_j" | "turnover_rate" | "volume_ratio" | "total_mv" | "circ_mv") | ("price_window_days_90d" | "price_position_90d_pct" | "price_rank_90d_pct" | "distance_to_high_90d_pct" | "distance_to_low_90d_pct" | "price_window_days_120d" | "price_position_120d_pct" | "price_rank_120d_pct" | "distance_to_high_120d_pct" | "distance_to_low_120d_pct" | "price_window_days_250d" | "price_position_250d_pct" | "price_rank_250d_pct" | "distance_to_high_250d_pct" | "distance_to_low_250d_pct" | "accum_window_days_20d" | "accum_obv_change_20d_pct" | "accum_ad_flow_20d_pct" | "accum_up_down_amount_ratio_20d" | "accum_heavy_no_drop_days_20d" | "accum_close_position_avg_20d_pct" | "ma_alignment" | "price_percentile_250d");
+            column: ("ma5" | "ma10" | "ma20" | "ma60" | "rsi6" | "rsi14" | "macd" | "macd_signal" | "macd_hist" | "kdj_k" | "kdj_d" | "kdj_j" | "turnover_rate" | "volume_ratio" | "total_mv" | "circ_mv") | ("price_window_days_90d" | "price_position_90d_pct" | "price_rank_90d_pct" | "distance_to_high_90d_pct" | "distance_to_low_90d_pct" | "price_window_days_120d" | "price_position_120d_pct" | "price_rank_120d_pct" | "distance_to_high_120d_pct" | "distance_to_low_120d_pct" | "price_window_days_250d" | "price_position_250d_pct" | "price_rank_250d_pct" | "distance_to_high_250d_pct" | "distance_to_low_250d_pct" | "accum_window_days_20d" | "accum_obv_change_20d_pct" | "accum_ad_flow_20d_pct" | "accum_up_down_amount_ratio_20d" | "accum_heavy_no_drop_days_20d" | "accum_close_position_avg_20d_pct" | "ma_alignment" | "price_percentile_250d") | ("signal_minute_amount" | "signal_cum_amount_asof" | "hist_same_minute_amount_median_20d" | "hist_cum_amount_asof_median_20d" | "signal_rel_amount_same_minute_20d" | "signal_rel_cum_amount_asof_20d" | "hist_intraday_days_20d" | "signal_opening_segment" | "signal_opening_segment_amount" | "signal_amount_accel_5m" | "signal_amount_accel_10m");
             /** Description Zh */
             description_zh: string;
             /** Name Zh */
@@ -3131,14 +3134,14 @@ export interface components {
              * Table
              * @enum {string}
              */
-            table: "daily_indicator" | "daily_basic" | "daily_stock_feature";
+            table: "daily_indicator" | "daily_basic" | "daily_stock_feature" | "daily_minute_feature";
             /**
              * Unit
              * @enum {string}
              */
-            unit: "stored_price" | "session_price" | "indicator" | "percent" | "ratio" | "CNY_10000" | "observations" | "binary";
+            unit: "stored_price" | "session_price" | "indicator" | "percent" | "ratio" | "CNY_10000" | "CNY" | "observations" | "binary";
             /** Value Semantics */
-            value_semantics?: ("history_derived" | "stock_features_derived") | null;
+            value_semantics?: ("history_derived" | "stock_features_derived" | "minute_features_derived") | null;
         };
         /**
          * FactorDailyStreamCoverage
@@ -3371,6 +3374,120 @@ export interface components {
              * @enum {string}
              */
             reason: "missing" | "ambiguous" | "boundary_unverified";
+        };
+        /** FactorMinuteFeaturePolicy */
+        FactorMinuteFeaturePolicy: {
+            /**
+             * Algorithm Version
+             * @default rquant-intraday-relative-volume-v1
+             * @constant
+             */
+            algorithm_version: "rquant-intraday-relative-volume-v1";
+            /**
+             * Amount Unit
+             * @default CNY
+             * @constant
+             */
+            amount_unit: "CNY";
+            /**
+             * Current Cumulative
+             * @default all_observed_minutes_through_target
+             * @constant
+             */
+            current_cumulative: "all_observed_minutes_through_target";
+            /**
+             * Current Cumulative Sum
+             * @default pandas_float64_series_sum
+             * @constant
+             */
+            current_cumulative_sum: "pandas_float64_series_sum";
+            /**
+             * Evaluation Clock
+             * @default next_sse_day_09:25
+             * @constant
+             */
+            evaluation_clock: "next_sse_day_09:25";
+            /**
+             * Frequency
+             * @default 1min
+             * @constant
+             */
+            frequency: "1min";
+            /**
+             * Historical Cumulative Sum
+             * @default pandas_groupby_sum_then_series_median
+             * @constant
+             */
+            historical_cumulative_sum: "pandas_groupby_sum_then_series_median";
+            /**
+             * Historical Start
+             * @default earliest_selected_date_09:30_original_store_range
+             * @constant
+             */
+            historical_start: "earliest_selected_date_09:30_original_store_range";
+            /**
+             * History Selection
+             * @default previous_actual_dates_before_panel
+             * @constant
+             */
+            history_selection: "previous_actual_dates_before_panel";
+            /** Implementation Sha256 */
+            implementation_sha256: string;
+            /**
+             * Lookback Days
+             * @default 20
+             * @constant
+             */
+            lookback_days: 20;
+            /**
+             * Missing Target
+             * @default missing_target_minute_no_fallback
+             * @constant
+             */
+            missing_target: "missing_target_minute_no_fallback";
+            /**
+             * Panel Clock
+             * @default 15:00:00
+             * @constant
+             */
+            panel_clock: "15:00:00";
+            /**
+             * Rounding Digits
+             * @default 4
+             * @constant
+             */
+            rounding_digits: 4;
+            /**
+             * Source Priority
+             * @default [
+             *       "tushare",
+             *       "tushare_rt",
+             *       "other"
+             *     ]
+             */
+            source_priority: ("tushare" | "tushare_rt" | "other")[];
+            /**
+             * Timezone
+             * @default Asia/Shanghai
+             * @constant
+             */
+            timezone: "Asia/Shanghai";
+            /**
+             * Volume Unit
+             * @default shares
+             * @constant
+             */
+            volume_unit: "shares";
+        };
+        /** FactorMinuteFeatureSummary */
+        FactorMinuteFeatureSummary: {
+            /** Codes With History */
+            codes_with_history: number;
+            /** Codes Without History */
+            codes_without_history: number;
+            policy: components["schemas"]["FactorMinuteFeaturePolicy"];
+            /** Source History Start */
+            source_history_start: string | null;
         };
         /** FactorMissingCount */
         FactorMissingCount: {

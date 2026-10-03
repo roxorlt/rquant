@@ -16,12 +16,14 @@ from pydantic import BaseModel
 from rquant.factor.daily_feature_source import (
     FactorDailyFeaturePrepareRequest,
     FactorDailyFeatureSource,
+    FactorMinuteFeaturePrepareRequest,
     FactorStockFeaturePrepareRequest,
     prepare_factor_daily_feature_source,
 )
 from rquant.factor.industry_source import FactorIndustrySource
 from rquant.factor.market_cap_source import FactorMarketCapSource
 from rquant.factor.member_archive import _read_file
+from rquant.factor.minute_feature_source import prepare_factor_minute_feature_source
 from rquant.factor.neutralization_context import (
     bind_factor_neutralization_context,
     open_factor_neutralization_context,
@@ -81,6 +83,7 @@ def main(argv: list[str] | None = None) -> int:
             "seal-daily-features",
             "seal-technical-history",
             "seal-stock-features",
+            "seal-minute-features",
             "worker",
             "serve",
         ),
@@ -97,15 +100,39 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--industry-source", type=Path)
     parser.add_argument("--market-cap-source", type=Path)
     parser.add_argument("--lake-root", type=Path)
-    parser.add_argument("--max-input-rows", type=int, default=16_000_000)
+    parser.add_argument("--max-input-rows", type=int)
     parser.add_argument("--max-code-observations", type=int, default=50_000)
     parser.add_argument("--max-output-cells", type=int, default=32_000_000)
+    parser.add_argument("--max-code-rows", type=int, default=300_000)
     args = parser.parse_args(argv)
-    if args.action in ("seal-daily-features", "seal-technical-history", "seal-stock-features"):
+    if args.max_input_rows is None:
+        args.max_input_rows = 64_000_000 if args.action == "seal-minute-features" else 16_000_000
+    if args.action in (
+        "seal-daily-features",
+        "seal-technical-history",
+        "seal-stock-features",
+        "seal-minute-features",
+    ):
         if args.prepared_source is None or args.lake_root is None:
             parser.error("必须提供实际行情准备包和私有数据根")
         prepared = _input(args.prepared_source, FactorPreparedStreamSource, 16 * 1024 * 1024)
-        if args.action == "seal-stock-features":
+        if args.action == "seal-minute-features":
+            base = (
+                None
+                if args.base_daily_source is None
+                else _input(args.base_daily_source, FactorDailyFeatureSource, 16 * 1024 * 1024)
+            )
+            source = prepare_factor_minute_feature_source(
+                FactorMinuteFeaturePrepareRequest(
+                    prepared_source=prepared,
+                    base_daily_source=base,
+                    max_input_rows=args.max_input_rows,
+                    max_code_rows=args.max_code_rows,
+                    max_output_cells=args.max_output_cells,
+                ),
+                lake_root=args.lake_root,
+            )
+        elif args.action == "seal-stock-features":
             base = (
                 None
                 if args.base_daily_source is None

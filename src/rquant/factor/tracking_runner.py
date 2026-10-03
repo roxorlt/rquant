@@ -233,10 +233,13 @@ def read_factor_tracking_prefix(
             )
             if batch.daily_features is not None:
                 original = batch.daily_features
+                minute = original.sources.minute_features is not None
                 stock = original.sources.stock_features is not None
-                derived = original.sources.technical_history is not None or stock
+                derived = original.sources.technical_history is not None or stock or minute
                 daily_semantic = (
-                    "stock-daily-fields-v1"
+                    "minute-daily-fields-v1"
+                    if minute
+                    else "stock-daily-fields-v1"
                     if stock
                     else "derived-daily-fields-v1"
                     if derived
@@ -248,7 +251,16 @@ def read_factor_tracking_prefix(
                         (
                             row.stock_code,
                             tuple(
-                                (v.status, v.value, v.non_finite_value, v.reason, v.diagnostic)
+                                (
+                                    v.status,
+                                    v.value,
+                                    v.non_finite_value,
+                                    v.reason,
+                                    v.diagnostic,
+                                    v.minute_diagnostic,
+                                )
+                                if minute
+                                else (v.status, v.value, v.non_finite_value, v.reason, v.diagnostic)
                                 if stock
                                 else (v.status, v.value, v.non_finite_value, v.reason)
                                 if derived
@@ -267,6 +279,10 @@ def read_factor_tracking_prefix(
                     )
                 if stock:
                     daily_semantic += (request.daily_feature_source.stock_features.causal_policy(),)
+                if minute:
+                    daily_semantic += (
+                        request.daily_feature_source.minute_features.causal_policy(),
+                    )
                 semantic += (daily_semantic,)
                 del original
             result.append(

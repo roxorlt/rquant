@@ -3564,6 +3564,7 @@
                   "percent",
                   "ratio",
                   "CNY_10000",
+                  "CNY",
                   "observations",
                   "binary"
                 ],
@@ -3581,7 +3582,8 @@
                 "enum": [
                   "stored_not_recomputed",
                   "history_derived",
-                  "stock_features_derived"
+                  "stock_features_derived",
+                  "minute_features_derived"
                 ],
                 "type": "string"
               },
@@ -5184,7 +5186,8 @@
               "daily_v1",
               "daily_stored_v1",
               "daily_derived_v1",
-              "daily_stock_v1"
+              "daily_stock_v1",
+              "daily_minute_v1"
             ],
             "title": "Version",
             "type": "string"
@@ -5302,9 +5305,33 @@
                   "price_percentile_250d"
                 ],
                 "type": "string"
+              },
+              {
+                "enum": [
+                  "signal_minute_amount",
+                  "signal_cum_amount_asof",
+                  "hist_same_minute_amount_median_20d",
+                  "hist_cum_amount_asof_median_20d",
+                  "signal_rel_amount_same_minute_20d",
+                  "signal_rel_cum_amount_asof_20d",
+                  "hist_intraday_days_20d",
+                  "signal_opening_segment",
+                  "signal_opening_segment_amount",
+                  "signal_amount_accel_5m",
+                  "signal_amount_accel_10m"
+                ],
+                "type": "string"
               }
             ],
             "title": "Column"
+          },
+          "minute_reasons": {
+            "items": {
+              "$ref": "#/components/schemas/FactorDailyFeatureReasonCount"
+            },
+            "maxItems": 8,
+            "title": "Minute Reasons",
+            "type": "array"
           },
           "missing": {
             "minimum": 0.0,
@@ -5366,7 +5393,7 @@
             "items": {
               "$ref": "#/components/schemas/FactorDailyFeatureCounts"
             },
-            "maxItems": 39,
+            "maxItems": 50,
             "minItems": 1,
             "title": "Counts",
             "type": "array"
@@ -5429,6 +5456,19 @@
                   "undefined_statistic"
                 ],
                 "type": "string"
+              },
+              {
+                "enum": [
+                  "missing_target_minute",
+                  "missing_history",
+                  "missing_same_minute_history",
+                  "zero_same_minute_baseline",
+                  "zero_cumulative_baseline",
+                  "not_applicable",
+                  "no_acceleration_history",
+                  "undefined_statistic"
+                ],
+                "type": "string"
               }
             ],
             "title": "Reason"
@@ -5454,10 +5494,20 @@
             "items": {
               "$ref": "#/components/schemas/FactorDailyStoredField"
             },
-            "maxItems": 39,
+            "maxItems": 50,
             "minItems": 1,
             "title": "Fields",
             "type": "array"
+          },
+          "minute_features": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FactorMinuteFeatureSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "prepared_binding_hash": {
             "pattern": "^[0-9a-f]{64}$",
@@ -5534,7 +5584,8 @@
             "enum": [
               "stored_not_recomputed",
               "history_derived",
-              "stock_features_derived"
+              "stock_features_derived",
+              "minute_features_derived"
             ],
             "title": "Value Semantics",
             "type": "string"
@@ -5605,6 +5656,22 @@
                   "price_percentile_250d"
                 ],
                 "type": "string"
+              },
+              {
+                "enum": [
+                  "signal_minute_amount",
+                  "signal_cum_amount_asof",
+                  "hist_same_minute_amount_median_20d",
+                  "hist_cum_amount_asof_median_20d",
+                  "signal_rel_amount_same_minute_20d",
+                  "signal_rel_cum_amount_asof_20d",
+                  "hist_intraday_days_20d",
+                  "signal_opening_segment",
+                  "signal_opening_segment_amount",
+                  "signal_amount_accel_5m",
+                  "signal_amount_accel_10m"
+                ],
+                "type": "string"
               }
             ],
             "title": "Column"
@@ -5621,7 +5688,8 @@
             "enum": [
               "daily_indicator",
               "daily_basic",
-              "daily_stock_feature"
+              "daily_stock_feature",
+              "daily_minute_feature"
             ],
             "title": "Table",
             "type": "string"
@@ -5634,6 +5702,7 @@
               "percent",
               "ratio",
               "CNY_10000",
+              "CNY",
               "observations",
               "binary"
             ],
@@ -5645,7 +5714,8 @@
               {
                 "enum": [
                   "history_derived",
-                  "stock_features_derived"
+                  "stock_features_derived",
+                  "minute_features_derived"
                 ],
                 "type": "string"
               },
@@ -6348,6 +6418,168 @@
           "count"
         ],
         "title": "FactorIndustryMissingCount",
+        "type": "object"
+      },
+      "FactorMinuteFeaturePolicy": {
+        "additionalProperties": false,
+        "properties": {
+          "algorithm_version": {
+            "const": "rquant-intraday-relative-volume-v1",
+            "default": "rquant-intraday-relative-volume-v1",
+            "title": "Algorithm Version",
+            "type": "string"
+          },
+          "amount_unit": {
+            "const": "CNY",
+            "default": "CNY",
+            "title": "Amount Unit",
+            "type": "string"
+          },
+          "current_cumulative": {
+            "const": "all_observed_minutes_through_target",
+            "default": "all_observed_minutes_through_target",
+            "title": "Current Cumulative",
+            "type": "string"
+          },
+          "current_cumulative_sum": {
+            "const": "pandas_float64_series_sum",
+            "default": "pandas_float64_series_sum",
+            "title": "Current Cumulative Sum",
+            "type": "string"
+          },
+          "evaluation_clock": {
+            "const": "next_sse_day_09:25",
+            "default": "next_sse_day_09:25",
+            "title": "Evaluation Clock",
+            "type": "string"
+          },
+          "frequency": {
+            "const": "1min",
+            "default": "1min",
+            "title": "Frequency",
+            "type": "string"
+          },
+          "historical_cumulative_sum": {
+            "const": "pandas_groupby_sum_then_series_median",
+            "default": "pandas_groupby_sum_then_series_median",
+            "title": "Historical Cumulative Sum",
+            "type": "string"
+          },
+          "historical_start": {
+            "const": "earliest_selected_date_09:30_original_store_range",
+            "default": "earliest_selected_date_09:30_original_store_range",
+            "title": "Historical Start",
+            "type": "string"
+          },
+          "history_selection": {
+            "const": "previous_actual_dates_before_panel",
+            "default": "previous_actual_dates_before_panel",
+            "title": "History Selection",
+            "type": "string"
+          },
+          "implementation_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Implementation Sha256",
+            "type": "string"
+          },
+          "lookback_days": {
+            "const": 20,
+            "default": 20,
+            "title": "Lookback Days",
+            "type": "integer"
+          },
+          "missing_target": {
+            "const": "missing_target_minute_no_fallback",
+            "default": "missing_target_minute_no_fallback",
+            "title": "Missing Target",
+            "type": "string"
+          },
+          "panel_clock": {
+            "const": "15:00:00",
+            "default": "15:00:00",
+            "title": "Panel Clock",
+            "type": "string"
+          },
+          "rounding_digits": {
+            "const": 4,
+            "default": 4,
+            "title": "Rounding Digits",
+            "type": "integer"
+          },
+          "source_priority": {
+            "default": [
+              "tushare",
+              "tushare_rt",
+              "other"
+            ],
+            "items": {
+              "enum": [
+                "tushare",
+                "tushare_rt",
+                "other"
+              ],
+              "type": "string"
+            },
+            "title": "Source Priority",
+            "type": "array"
+          },
+          "timezone": {
+            "const": "Asia/Shanghai",
+            "default": "Asia/Shanghai",
+            "title": "Timezone",
+            "type": "string"
+          },
+          "volume_unit": {
+            "const": "shares",
+            "default": "shares",
+            "title": "Volume Unit",
+            "type": "string"
+          }
+        },
+        "required": [
+          "implementation_sha256"
+        ],
+        "title": "FactorMinuteFeaturePolicy",
+        "type": "object"
+      },
+      "FactorMinuteFeatureSummary": {
+        "additionalProperties": false,
+        "properties": {
+          "codes_with_history": {
+            "maximum": 7000.0,
+            "minimum": 0.0,
+            "title": "Codes With History",
+            "type": "integer"
+          },
+          "codes_without_history": {
+            "maximum": 7000.0,
+            "minimum": 0.0,
+            "title": "Codes Without History",
+            "type": "integer"
+          },
+          "policy": {
+            "$ref": "#/components/schemas/FactorMinuteFeaturePolicy"
+          },
+          "source_history_start": {
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source History Start"
+          }
+        },
+        "required": [
+          "policy",
+          "source_history_start",
+          "codes_with_history",
+          "codes_without_history"
+        ],
+        "title": "FactorMinuteFeatureSummary",
         "type": "object"
       },
       "FactorMissingCount": {

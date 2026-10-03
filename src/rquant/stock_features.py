@@ -563,6 +563,52 @@ def build_intraday_relative_volume_features(
     """
     signal_date = signal_time.date()
     signal_clock = signal_time.time()
+    previous_dates_df = store._conn.execute(
+        """
+        SELECT DISTINCT CAST(trade_time AS DATE) AS trade_date
+        FROM minute_bar
+        WHERE ts_code = ?
+          AND freq = ?
+          AND CAST(trade_time AS DATE) < ?
+        ORDER BY trade_date DESC
+        LIMIT ?
+        """,
+        [ts_code, freq, signal_date, lookback_days],
+    ).fetchdf()
+    previous_dates = tuple(_as_date(value) for value in previous_dates_df["trade_date"].tolist())
+    minutes = (
+        store.query_minute_bars(
+            ts_code,
+            datetime.combine(min(previous_dates), time(9, 30)),
+            datetime.combine(max(previous_dates), signal_clock),
+            freq=freq,
+        )
+        if previous_dates
+        else pd.DataFrame()
+    )
+    return build_intraday_relative_volume_features_from_history(
+        minutes,
+        previous_dates,
+        signal_time,
+        current_minute_amount=current_minute_amount,
+        current_cum_amount=current_cum_amount,
+        current_day_amounts=current_day_amounts,
+        lookback_days=lookback_days,
+    )
+
+
+def build_intraday_relative_volume_features_from_history(
+    minutes: pd.DataFrame,
+    previous_dates: Iterable[date],
+    signal_time: datetime,
+    *,
+    current_minute_amount: float,
+    current_cum_amount: float,
+    current_day_amounts: Iterable[tuple[time, float]] | None = None,
+    lookback_days: int = 20,
+) -> dict[str, float | int | None]:
+    """The store kernel over its already deduplicated history and actual selected dates."""
+    signal_clock = signal_time.time()
     opening_segment_end = time(9, 32)
     is_opening_segment = signal_clock <= opening_segment_end
     day_amounts = list(current_day_amounts or [])
@@ -589,20 +635,9 @@ def build_intraday_relative_volume_features(
         "signal_amount_accel_5m": _round_optional(_accel(5)),
         "signal_amount_accel_10m": _round_optional(_accel(10)),
     }
-    previous_dates_df = store._conn.execute(
-        """
-        SELECT DISTINCT CAST(trade_time AS DATE) AS trade_date
-        FROM minute_bar
-        WHERE ts_code = ?
-          AND freq = ?
-          AND CAST(trade_time AS DATE) < ?
-        ORDER BY trade_date DESC
-        LIMIT ?
-        """,
-        [ts_code, freq, signal_date, lookback_days],
-    ).fetchdf()
     prefix = f"{lookback_days}d"
-    if previous_dates_df.empty:
+    previous_dates = tuple(previous_dates)
+    if not previous_dates:
         return {
             "signal_minute_amount": _round_optional(current_minute_amount),
             "signal_cum_amount_asof": _round_optional(current_cum_amount),
@@ -614,10 +649,11 @@ def build_intraday_relative_volume_features(
             **intraday_features,
         }
 
-    previous_dates = [_as_date(value) for value in previous_dates_df["trade_date"].tolist()]
     start = datetime.combine(min(previous_dates), time(9, 30))
     end = datetime.combine(max(previous_dates), signal_clock)
-    minutes = store.query_minute_bars(ts_code, start, end, freq=freq)
+    if not minutes.empty:
+        observed = pd.to_datetime(minutes["trade_time"])
+        minutes = minutes[(observed >= start) & (observed <= end)]
     if minutes.empty:
         hist_days = 0
         same_median = None

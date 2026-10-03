@@ -30,6 +30,18 @@ from pydantic import (
 )
 
 from rquant.data_metadata import DatasetSnapshotArtifact, normalize_utc_datetime, utc_now
+from rquant.factor.minute_feature_source import (
+    MINUTE_FEATURE_COLUMNS,
+    MINUTE_FEATURE_DESCRIPTIONS,
+    FactorMinuteFeatureCode,
+    FactorMinuteFeatureDiagnostic,
+    FactorMinuteFeaturePolicy,
+    FactorMinuteFeatureReceipt,
+    FactorMinuteFeatureSummary,
+    MinuteFeatureColumn,
+    MinuteFeatureReason,
+    _verify_minute_feature_input,
+)
 from rquant.factor.result_artifact import _open_private_root, _require_same_root, _root_path
 from rquant.factor.source_prepare import (
     FactorPreparedStreamSource,
@@ -94,14 +106,14 @@ DailyInventoryColumn = Literal[
     "total_mv",
     "circ_mv",
 ]
-DailyStoredColumn = DailyInventoryColumn | StockFeatureColumn
+DailyStoredColumn = DailyInventoryColumn | StockFeatureColumn | MinuteFeatureColumn
 DailyFeatureStatus = Literal["valid", "missing", "null", "non_finite"]
 
 
 class FactorDailyStoredField(BaseModel):
     model_config = _MODEL
     column: DailyStoredColumn
-    table: Literal["daily_indicator", "daily_basic", "daily_stock_feature"]
+    table: Literal["daily_indicator", "daily_basic", "daily_stock_feature", "daily_minute_feature"]
     name_zh: str
     unit: Literal[
         "stored_price",
@@ -110,13 +122,14 @@ class FactorDailyStoredField(BaseModel):
         "percent",
         "ratio",
         "CNY_10000",
+        "CNY",
         "observations",
         "binary",
     ]
     description_zh: str
-    value_semantics: Literal["history_derived", "stock_features_derived"] | None = Field(
-        default=None, exclude_if=lambda v: v is None
-    )
+    value_semantics: (
+        Literal["history_derived", "stock_features_derived", "minute_features_derived"] | None
+    ) = Field(default=None, exclude_if=lambda v: v is None)
 
 
 STORED_DAILY_FIELDS = tuple(
@@ -225,6 +238,18 @@ STOCK_FEATURE_FIELDS = tuple(
     for c, n, u, d in STOCK_FEATURE_DESCRIPTIONS
 )
 _STOCK_FIELDS = {f.column: f for f in STOCK_FEATURE_FIELDS}
+MINUTE_FEATURE_FIELDS = tuple(
+    FactorDailyStoredField(
+        column=c,
+        table="daily_minute_feature",
+        name_zh=n,
+        unit=u,
+        description_zh=d,
+        value_semantics="minute_features_derived",
+    )
+    for c, n, u, d in MINUTE_FEATURE_DESCRIPTIONS
+)
+_MINUTE_FIELDS = {f.column: f for f in MINUTE_FEATURE_FIELDS}
 _TABLES = ("daily_indicator", "daily_basic")
 
 
@@ -254,10 +279,26 @@ class FactorDailyFeatureCounts(BaseModel):
         json_schema_extra=lambda schema: schema.pop("default", None),
     )
 
+    minute_reasons: tuple[FactorDailyFeatureReasonCount, ...] = Field(
+        default=(),
+        max_length=8,
+        exclude_if=lambda v: not v,
+        json_schema_extra=lambda schema: schema.pop("default", None),
+    )
+
     @model_validator(mode="after")
     def _reason_family(self) -> FactorDailyFeatureCounts:
-        if (self.column in STOCK_FEATURE_COLUMNS and self.reasons) or (
-            self.column not in STOCK_FEATURE_COLUMNS and self.stock_reasons
+        family = (
+            "minute"
+            if self.column in MINUTE_FEATURE_COLUMNS
+            else "stock"
+            if self.column in STOCK_FEATURE_COLUMNS
+            else "technical"
+        )
+        if (
+            (family != "technical" and self.reasons)
+            or (family != "stock" and self.stock_reasons)
+            or (family != "minute" and self.minute_reasons)
         ):
             raise ValueError("daily coverage reasons differ from the field family")
         return self
@@ -265,13 +306,15 @@ class FactorDailyFeatureCounts(BaseModel):
 
 class FactorDailyFeatureReasonCount(BaseModel):
     model_config = _MODEL
-    reason: TechnicalHistoryReason | StockFeatureReason
+    reason: TechnicalHistoryReason | StockFeatureReason | MinuteFeatureReason
     count: int = Field(gt=0)
 
 
 class FactorDailyFeatureTable(BaseModel):
     model_config = _MODEL
-    table_name: Literal["daily_indicator", "daily_basic", "daily_stock_feature"]
+    table_name: Literal[
+        "daily_indicator", "daily_basic", "daily_stock_feature", "daily_minute_feature"
+    ]
     artifact: DatasetSnapshotArtifact
     row_count: int = Field(ge=0)
     code_counts: tuple[FactorSourceCodeCount, ...] = Field(min_length=1, max_length=7000)
@@ -324,7 +367,9 @@ class _V3StockReceipt(BaseModel):
 class _V3Table(BaseModel):
     model_config = _MODEL
     code_counts_format: Literal["scope_ordered_rows_v1"] = "scope_ordered_rows_v1"
-    table_name: Literal["daily_indicator", "daily_basic", "daily_stock_feature"]
+    table_name: Literal[
+        "daily_indicator", "daily_basic", "daily_stock_feature", "daily_minute_feature"
+    ]
     artifact: DatasetSnapshotArtifact
     row_count: int = Field(ge=0)
     code_counts: tuple[_CodeCountRow, ...] = Field(min_length=1, max_length=7000)
@@ -342,6 +387,104 @@ class _V3BaseReference(BaseModel):
     read_mode: Literal["descriptor", "in_place"]
     observed_at: datetime
     completed_read_at: datetime
+
+
+_DateIndex = Annotated[int, Field(ge=0, le=27999)]
+_V4TechnicalRow = tuple[
+    _ObservationCount,
+    _DateIndex | None,
+    _DateIndex | None,
+    _DateIndex | None,
+    _ObservationCount,
+    _DateIndex | None,
+    Literal["invalid_ohlc", "invalid_factor", "non_finite_adjusted_price"] | None,
+]
+_V4StockRow = tuple[_ObservationCount, _ObservationCount, _DateIndex | None, _DateIndex | None]
+_MinuteRowCount = Annotated[int, Field(ge=0, le=300_000)]
+_V4MinuteRow = tuple[_MinuteRowCount, _MinuteRowCount, _DateIndex | None, _DateIndex | None]
+
+
+class _V4TechnicalReceipt(_V3TechnicalReceipt):
+    code_format: Literal["scope_ordered_date_indices_v1"] = "scope_ordered_date_indices_v1"
+    dates: tuple[date, ...] = Field(max_length=28000)
+    codes: tuple[_V4TechnicalRow, ...] = Field(min_length=1, max_length=7000)
+
+
+class _V4StockReceipt(_V3StockReceipt):
+    code_format: Literal["scope_ordered_date_indices_v1"] = "scope_ordered_date_indices_v1"
+    dates: tuple[date, ...] = Field(max_length=14000)
+    codes: tuple[_V4StockRow, ...] = Field(min_length=1, max_length=7000)
+
+
+class _V4MinuteReceipt(BaseModel):
+    model_config = _MODEL
+    code_format: Literal["scope_ordered_date_indices_v1"] = "scope_ordered_date_indices_v1"
+    policy: FactorMinuteFeaturePolicy
+    inputs: tuple[DatasetSnapshotArtifact, ...] = Field(min_length=1, max_length=1)
+    dates: tuple[date, ...] = Field(max_length=14000)
+    codes: tuple[_V4MinuteRow, ...] = Field(min_length=1, max_length=7000)
+    input_rows: int = Field(ge=0, le=128_000_000)
+    max_input_rows: int = Field(gt=0, le=128_000_000)
+    max_code_rows: int = Field(gt=0, le=300_000)
+    max_output_cells: int = Field(gt=0, le=128_000_000)
+
+
+class _V4BaseReference(_V3BaseReference):
+    schema_version: Literal[1, 2, 3]
+    base_daily_source: _V3BaseReference | None = Field(default=None, exclude_if=lambda v: v is None)
+
+
+def _v4_receipt_wire(
+    value: BaseModel, wire_type: type[BaseModel], date_positions: tuple[int, ...]
+) -> BaseModel:
+    keys = tuple(type(value.codes[0]).model_fields)[1:]
+    rows = tuple(tuple(getattr(code, key) for key in keys) for code in value.codes)
+    dates = tuple(sorted({row[i] for row in rows for i in date_positions if row[i] is not None}))
+    index = {d: i for i, d in enumerate(dates)}
+    fields = value.model_dump(exclude={"codes"})
+    fields.update(
+        dates=dates,
+        codes=tuple(
+            tuple(
+                index[v] if i in date_positions and v is not None else v for i, v in enumerate(row)
+            )
+            for row in rows
+        ),
+    )
+    return wire_type.model_validate(fields)
+
+
+def _v4_receipt_expand(
+    wire: BaseModel,
+    code_type: type[BaseModel],
+    receipt_type: type[BaseModel],
+    date_positions: tuple[int, ...],
+    info: ValidationInfo,
+) -> BaseModel:
+    if wire.dates != tuple(sorted(set(wire.dates))):
+        raise ValueError("compact date dictionary repeats or changes order")
+    used = {row[i] for row in wire.codes for i in date_positions if row[i] is not None}
+    if used != set(range(len(wire.dates))):
+        raise ValueError("compact date dictionary has missing, extra or out-of-range entries")
+    fields = wire.model_dump(exclude={"code_format", "dates", "codes"})
+    keys = tuple(code_type.model_fields)[1:]
+    fields["codes"] = tuple(
+        code_type(
+            stock_code=code,
+            **dict(
+                zip(
+                    keys,
+                    tuple(
+                        wire.dates[v] if i in date_positions and v is not None else v
+                        for i, v in enumerate(row)
+                    ),
+                    strict=True,
+                )
+            ),
+        )
+        for code, row in zip(_scope_row_codes(wire.codes, info), wire.codes, strict=True)
+    )
+    return receipt_type.model_validate(fields)
 
 
 def _validate_v3_wire(model: type[BaseModel], value: object, info: ValidationInfo) -> BaseModel:
@@ -367,10 +510,13 @@ class FactorDailyFeatureSources(BaseModel):
     prepared_binding_hash: str = Field(pattern=_SHA)
     scope_content_hash: str = Field(pattern=_SHA)
     code_commit: str = Field(pattern=r"^[0-9a-f]{40}$")
-    fields: tuple[FactorDailyStoredField, ...] = Field(min_length=1, max_length=39)
+    fields: tuple[FactorDailyStoredField, ...] = Field(min_length=1, max_length=50)
     source_mode: Literal["historical_retrospective"] = "historical_retrospective"
     value_semantics: Literal[
-        "stored_not_recomputed", "history_derived", "stock_features_derived"
+        "stored_not_recomputed",
+        "history_derived",
+        "stock_features_derived",
+        "minute_features_derived",
     ] = "stored_not_recomputed"
     price_basis: Literal[
         "unverified", "observation_factor_then_output_session_scale", "field_specific"
@@ -385,35 +531,48 @@ class FactorDailyFeatureSources(BaseModel):
     stock_features: FactorStockFeatureSummary | None = Field(
         default=None, exclude_if=lambda v: v is None
     )
+    minute_features: FactorMinuteFeatureSummary | None = Field(
+        default=None, exclude_if=lambda v: v is None
+    )
 
     @model_validator(mode="after")
     def _fields(self) -> FactorDailyFeatureSources:
         columns = tuple(field.column for field in self.fields)
-        stock = self.value_semantics == "stock_features_derived"
+        minute = self.minute_features is not None
+        stock = self.stock_features is not None
         technical = self.technical_history is not None
-        derived = self.value_semantics == "history_derived"
+        semantic = (
+            "minute_features_derived"
+            if minute
+            else "stock_features_derived"
+            if stock
+            else "history_derived"
+            if technical
+            else "stored_not_recomputed"
+        )
         catalog = {
             **(_DERIVED_FIELDS if technical else _FIELDS),
             **(_STOCK_FIELDS if stock else {}),
+            **(_MINUTE_FIELDS if minute else {}),
         }
         if (
-            stock != (self.stock_features is not None)
-            or (not stock and derived != technical)
+            self.value_semantics != semantic
+            or (minute and not set(columns) & set(MINUTE_FEATURE_COLUMNS))
             or (stock and not set(columns) & set(STOCK_FEATURE_COLUMNS))
             or self.price_basis
             != (
                 "field_specific"
-                if stock
+                if minute or stock
                 else "observation_factor_then_output_session_scale"
-                if derived
+                if technical
                 else "unverified"
             )
             or self.recursive_initialization
             != (
                 "field_specific"
-                if stock
+                if minute or stock
                 else "first_valid_observation_no_restart"
-                if derived
+                if technical
                 else "unverified"
             )
             or columns != tuple(sorted(set(columns)))
@@ -425,7 +584,7 @@ class FactorDailyFeatureSources(BaseModel):
 
 class FactorDailyFeatureSource(BaseModel):
     model_config = _MODEL
-    schema_version: Literal[1, 2, 3] = 1
+    schema_version: Literal[1, 2, 3, 4] = 1
     prepared_source_sha256: str = Field(pattern=_SHA)
     prepared_snapshot_id: str
     prepared_binding_hash: str = Field(pattern=_SHA)
@@ -437,7 +596,10 @@ class FactorDailyFeatureSource(BaseModel):
     fields: tuple[FactorDailyStoredField, ...] = STORED_DAILY_FIELDS
     source_mode: Literal["historical_retrospective"] = "historical_retrospective"
     value_semantics: Literal[
-        "stored_not_recomputed", "history_derived", "stock_features_derived"
+        "stored_not_recomputed",
+        "history_derived",
+        "stock_features_derived",
+        "minute_features_derived",
     ] = "stored_not_recomputed"
     price_basis: Literal[
         "unverified", "observation_factor_then_output_session_scale", "field_specific"
@@ -451,11 +613,14 @@ class FactorDailyFeatureSource(BaseModel):
     stock_features: FactorStockFeatureReceipt | None = Field(
         default=None, exclude_if=lambda v: v is None
     )
+    minute_features: FactorMinuteFeatureReceipt | None = Field(
+        default=None, exclude_if=lambda v: v is None
+    )
     source_read_boundary: Literal["single_snapshot_transaction"] = "single_snapshot_transaction"
     read_mode: Literal["descriptor", "in_place"]
     observed_at: datetime
     completed_read_at: datetime
-    tables: tuple[FactorDailyFeatureTable, ...] = Field(min_length=1, max_length=3)
+    tables: tuple[FactorDailyFeatureTable, ...] = Field(min_length=1, max_length=4)
     sha256: str = Field(pattern=_SHA)
 
     # Its wire reference uses the already validated shared fields and tables.
@@ -466,11 +631,23 @@ class FactorDailyFeatureSource(BaseModel):
     @field_validator(
         "technical_history",
         mode="before",
-        json_schema_input_type=FactorTechnicalHistoryReceipt | _V3TechnicalReceipt | None,
+        json_schema_input_type=FactorTechnicalHistoryReceipt
+        | _V3TechnicalReceipt
+        | _V4TechnicalReceipt
+        | None,
     )
     @classmethod
     def _expand_technical_wire(cls, value: object, info: ValidationInfo) -> object:
         if isinstance(value, dict) and "code_format" in value:
+            if info.data.get("schema_version") == 4:
+                wire = _validate_v3_wire(_V4TechnicalReceipt, value, info)
+                return _v4_receipt_expand(
+                    wire,
+                    FactorTechnicalHistoryCode,
+                    FactorTechnicalHistoryReceipt,
+                    (1, 2, 3, 5),
+                    info,
+                )
             if info.data.get("schema_version") != 3:
                 raise ValueError("compact technical receipt requires a v3 source")
             wire = _validate_v3_wire(_V3TechnicalReceipt, value, info)
@@ -492,11 +669,16 @@ class FactorDailyFeatureSource(BaseModel):
     @field_validator(
         "stock_features",
         mode="before",
-        json_schema_input_type=FactorStockFeatureReceipt | _V3StockReceipt | None,
+        json_schema_input_type=FactorStockFeatureReceipt | _V3StockReceipt | _V4StockReceipt | None,
     )
     @classmethod
     def _expand_stock_wire(cls, value: object, info: ValidationInfo) -> object:
         if isinstance(value, dict) and "code_format" in value:
+            if info.data.get("schema_version") == 4:
+                wire = _validate_v3_wire(_V4StockReceipt, value, info)
+                return _v4_receipt_expand(
+                    wire, FactorStockFeatureCode, FactorStockFeatureReceipt, (2, 3), info
+                )
             if info.data.get("schema_version") != 3:
                 raise ValueError("compact stock receipt requires a v3 source")
             wire = _validate_v3_wire(_V3StockReceipt, value, info)
@@ -514,6 +696,24 @@ class FactorDailyFeatureSource(BaseModel):
         return value
 
     @field_validator(
+        "minute_features",
+        mode="before",
+        json_schema_input_type=FactorMinuteFeatureReceipt | _V4MinuteReceipt | None,
+    )
+    @classmethod
+    def _expand_minute_wire(cls, value: object, info: ValidationInfo) -> object:
+        if isinstance(value, dict) and "code_format" in value:
+            if info.data.get("schema_version") != 4:
+                raise ValueError("compact minute receipt requires a v4 source")
+            wire = _validate_v3_wire(_V4MinuteReceipt, value, info)
+            return _v4_receipt_expand(
+                wire, FactorMinuteFeatureCode, FactorMinuteFeatureReceipt, (2, 3), info
+            )
+        if value is not None and info.mode == "json":
+            return _validate_v3_wire(FactorMinuteFeatureReceipt, value, info)
+        return value
+
+    @field_validator(
         "tables",
         mode="before",
         json_schema_input_type=tuple[FactorDailyFeatureTable | _V3Table, ...],
@@ -525,8 +725,8 @@ class FactorDailyFeatureSource(BaseModel):
         tables = []
         for table in value:
             if isinstance(table, dict) and "code_counts_format" in table:
-                if info.data.get("schema_version") != 3:
-                    raise ValueError("compact table counts require a v3 source")
+                if info.data.get("schema_version") not in (3, 4):
+                    raise ValueError("compact table counts require a v3/v4 source")
                 wire = _validate_v3_wire(_V3Table, table, info)
                 expanded = wire.model_dump(exclude={"code_counts_format", "code_counts"})
                 expanded["code_counts"] = tuple(
@@ -544,14 +744,18 @@ class FactorDailyFeatureSource(BaseModel):
     @field_validator(
         "base_daily_source",
         mode="before",
-        json_schema_input_type="FactorDailyFeatureSource | _V3BaseReference | None",
+        json_schema_input_type="FactorDailyFeatureSource | _V3BaseReference | "
+        "_V4BaseReference | None",
     )
     @classmethod
     def _expand_base_wire(cls, value: object, info: ValidationInfo) -> object:
         if isinstance(value, dict) and "representation" in value:
-            if info.data.get("schema_version") != 3:
-                raise ValueError("shared base reference requires a v3 source")
-            reference = _validate_v3_wire(_V3BaseReference, value, info)
+            version = info.data.get("schema_version")
+            if version not in (3, 4):
+                raise ValueError("shared base reference requires a v3/v4 source")
+            reference = _validate_v3_wire(
+                _V4BaseReference if version == 4 else _V3BaseReference, value, info
+            )
             derived = reference.schema_version == 2
             required = (
                 "prepared_source_sha256",
@@ -568,7 +772,7 @@ class FactorDailyFeatureSource(BaseModel):
                 raise ValueError("shared base reference has an invalid parent")
             shared = {key: info.data[key] for key in required[:-1]}
             shared.update(
-                reference.model_dump(exclude={"representation"}),
+                reference.model_dump(exclude={"representation", "base_daily_source"}),
                 fields=DERIVED_DAILY_FIELDS if derived else STORED_DAILY_FIELDS,
                 value_semantics="history_derived" if derived else "stored_not_recomputed",
                 price_basis="observation_factor_then_output_session_scale"
@@ -579,8 +783,48 @@ class FactorDailyFeatureSource(BaseModel):
                 else "unverified",
                 tables=info.data["tables"][:-1],
             )
-            if derived:
+            if reference.schema_version == 3:
+                nested = reference.base_daily_source
+                if nested is not None:
+                    inner = {key: info.data[key] for key in required[:-1]}
+                    inner.update(
+                        nested.model_dump(exclude={"representation"}),
+                        fields=DERIVED_DAILY_FIELDS
+                        if nested.schema_version == 2
+                        else STORED_DAILY_FIELDS,
+                        value_semantics="history_derived"
+                        if nested.schema_version == 2
+                        else "stored_not_recomputed",
+                        price_basis="observation_factor_then_output_session_scale"
+                        if nested.schema_version == 2
+                        else "unverified",
+                        recursive_initialization="first_valid_observation_no_restart"
+                        if nested.schema_version == 2
+                        else "unverified",
+                        tables=info.data["tables"][:-2],
+                    )
+                    if nested.schema_version == 2:
+                        inner["technical_history"] = info.data.get("technical_history")
+                    shared["base_daily_source"] = cls.model_validate(inner)
+                shared.update(
+                    fields=tuple(
+                        sorted(
+                            (() if nested is None else shared["base_daily_source"].fields)
+                            + STOCK_FEATURE_FIELDS,
+                            key=lambda f: f.column,
+                        )
+                    ),
+                    value_semantics="stock_features_derived",
+                    price_basis="field_specific",
+                    recursive_initialization="field_specific",
+                    stock_features=info.data.get("stock_features"),
+                )
+                if info.data.get("technical_history") is not None:
+                    shared["technical_history"] = info.data["technical_history"]
+            elif derived:
                 shared["technical_history"] = info.data.get("technical_history")
+            elif version == 4 and reference.base_daily_source is not None:
+                raise ValueError("inventory base reference cannot contain another base")
             # Validate the original v1/v2 digest before accepting the shared representation.
             return cls.model_validate(shared)
         if value is not None and info.mode == "json":
@@ -590,8 +834,12 @@ class FactorDailyFeatureSource(BaseModel):
     @field_serializer("technical_history", when_used="json")
     def _technical_wire(
         self, value: FactorTechnicalHistoryReceipt | None
-    ) -> FactorTechnicalHistoryReceipt | _V3TechnicalReceipt | None:
-        if value is None or self.schema_version != 3:
+    ) -> FactorTechnicalHistoryReceipt | _V3TechnicalReceipt | _V4TechnicalReceipt | None:
+        if value is None:
+            return value
+        if self.schema_version == 4:
+            return _v4_receipt_wire(value, _V4TechnicalReceipt, (1, 2, 3, 5))
+        if self.schema_version != 3:
             return value
         fields = value.model_dump(exclude={"codes"})
         fields["codes"] = tuple(
@@ -601,9 +849,13 @@ class FactorDailyFeatureSource(BaseModel):
         return _V3TechnicalReceipt.model_validate(fields)
 
     @field_serializer("stock_features", when_used="json")
-    def _stock_wire(self, value: FactorStockFeatureReceipt | None) -> _V3StockReceipt | None:
+    def _stock_wire(
+        self, value: FactorStockFeatureReceipt | None
+    ) -> _V3StockReceipt | _V4StockReceipt | None:
         if value is None:
             return None
+        if self.schema_version == 4:
+            return _v4_receipt_wire(value, _V4StockReceipt, (2, 3))
         fields = value.model_dump(exclude={"codes"})
         fields["codes"] = tuple(
             tuple(getattr(code, key) for key in tuple(FactorStockFeatureCode.model_fields)[1:])
@@ -611,11 +863,15 @@ class FactorDailyFeatureSource(BaseModel):
         )
         return _V3StockReceipt.model_validate(fields)
 
+    @field_serializer("minute_features", when_used="json")
+    def _minute_wire(self, value: FactorMinuteFeatureReceipt | None) -> _V4MinuteReceipt | None:
+        return None if value is None else _v4_receipt_wire(value, _V4MinuteReceipt, (2, 3))
+
     @field_serializer("tables", when_used="json")
     def _tables_wire(
         self, value: tuple[FactorDailyFeatureTable, ...]
     ) -> tuple[FactorDailyFeatureTable | _V3Table, ...]:
-        if self.schema_version != 3:
+        if self.schema_version not in (3, 4):
             return value
         return tuple(
             _V3Table(
@@ -626,16 +882,30 @@ class FactorDailyFeatureSource(BaseModel):
         )
 
     @field_serializer("base_daily_source", when_used="json")
-    def _base_wire(self, value: FactorDailyFeatureSource | None) -> _V3BaseReference | None:
+    def _base_wire(
+        self, value: FactorDailyFeatureSource | None
+    ) -> _V3BaseReference | _V4BaseReference | None:
         if value is None:
             return None
-        return _V3BaseReference(
+        fields = dict(
             schema_version=value.schema_version,
             sha256=value.sha256,
             read_mode=value.read_mode,
             observed_at=value.observed_at,
             completed_read_at=value.completed_read_at,
         )
+        if self.schema_version == 4:
+            if value.base_daily_source is not None:
+                inner = value.base_daily_source
+                fields["base_daily_source"] = _V3BaseReference(
+                    schema_version=inner.schema_version,
+                    sha256=inner.sha256,
+                    read_mode=inner.read_mode,
+                    observed_at=inner.observed_at,
+                    completed_read_at=inner.completed_read_at,
+                )
+            return _V4BaseReference(**fields)
+        return _V3BaseReference(**fields)
 
     @field_validator("observed_at", "completed_read_at")
     @classmethod
@@ -645,42 +915,54 @@ class FactorDailyFeatureSource(BaseModel):
     @model_validator(mode="after")
     def _binding(self) -> FactorDailyFeatureSource:
         dates = _dates(self.scope)
+        minute = self.schema_version == 4
         stock = self.schema_version == 3
         derived = self.schema_version == 2
+        extension = minute or stock
         base = self.base_daily_source
+        extra = MINUTE_FEATURE_FIELDS if minute else STOCK_FEATURE_FIELDS
         expected_fields = (
-            tuple(
-                sorted(
-                    (() if base is None else base.fields) + STOCK_FEATURE_FIELDS,
-                    key=lambda f: f.column,
-                )
-            )
-            if stock
+            tuple(sorted((() if base is None else base.fields) + extra, key=lambda f: f.column))
+            if extension
             else DERIVED_DAILY_FIELDS
             if derived
             else STORED_DAILY_FIELDS
         )
         expected_tables = (
             (() if base is None else tuple(t.table_name for t in base.tables))
-            + ("daily_stock_feature",)
-            if stock
+            + (("daily_minute_feature",) if minute else ("daily_stock_feature",))
+            if extension
             else _TABLES
         )
+        receipt = (
+            self.minute_features
+            if minute
+            else self.stock_features
+            if stock
+            else self.technical_history
+            if derived
+            else None
+        )
         if (
-            stock != (self.stock_features is not None)
-            or (not stock and base is not None)
+            minute != (self.minute_features is not None)
+            or (self.stock_features is not None)
+            != (stock or (minute and base is not None and base.stock_features is not None))
+            or (not extension and base is not None)
             or (
                 base is not None
                 and (
-                    base.schema_version not in (1, 2)
+                    base.schema_version not in ((1, 2, 3) if minute else (1, 2))
                     or self.technical_history != base.technical_history
+                    or (minute and self.stock_features != base.stock_features)
                 )
             )
-            or (stock and base is None and self.technical_history is not None)
-            or (not stock and derived != (self.technical_history is not None))
+            or (extension and base is None and self.technical_history is not None)
+            or (not extension and derived != (self.technical_history is not None))
             or self.value_semantics
             != (
-                "stock_features_derived"
+                "minute_features_derived"
+                if minute
+                else "stock_features_derived"
                 if stock
                 else "history_derived"
                 if derived
@@ -689,7 +971,7 @@ class FactorDailyFeatureSource(BaseModel):
             or self.price_basis
             != (
                 "field_specific"
-                if stock
+                if extension
                 else "observation_factor_then_output_session_scale"
                 if derived
                 else "unverified"
@@ -697,27 +979,17 @@ class FactorDailyFeatureSource(BaseModel):
             or self.recursive_initialization
             != (
                 "field_specific"
-                if stock
+                if extension
                 else "first_valid_observation_no_restart"
                 if derived
                 else "unverified"
             )
             or (
-                derived
-                and tuple(c.stock_code for c in self.technical_history.codes)
-                != self.scope.stock_codes
-            )
-            or (
-                derived
-                and len(self.scope.stock_codes) * len(dates) * 16
-                > self.technical_history.max_output_cells
-            )
-            or (
-                stock
+                receipt is not None
                 and (
-                    tuple(c.stock_code for c in self.stock_features.codes) != self.scope.stock_codes
+                    tuple(c.stock_code for c in receipt.codes) != self.scope.stock_codes
                     or len(self.scope.stock_codes) * len(dates) * len(expected_fields)
-                    > self.stock_features.max_output_cells
+                    > receipt.max_output_cells
                 )
             )
             or self.fields != expected_fields
@@ -739,9 +1011,9 @@ class FactorDailyFeatureSource(BaseModel):
                 "calendar_open_days",
             ):
                 if getattr(base, key) != getattr(self, key):
-                    raise ValueError("stock base differs from paired prepared source")
+                    raise ValueError("feature base differs from paired prepared source")
             if self.tables[:-1] != base.tables or self.observed_at < base.completed_read_at:
-                raise ValueError("stock base table or read boundary differs")
+                raise ValueError("feature base table or read boundary differs")
         for table in self.tables:
             columns = tuple(f.column for f in self.fields if f.table == table.table_name)
             closed = sum(
@@ -803,6 +1075,7 @@ class FactorDailyFeatureSource(BaseModel):
         selected = tuple(sorted(set(columns)))
         if not selected or any(c not in available for c in selected):
             raise ValueError("daily feature column is absent from the actual sealed source")
+        minute = bool(set(selected) & set(MINUTE_FEATURE_COLUMNS))
         stock = bool(set(selected) & set(STOCK_FEATURE_COLUMNS))
         technical = self.technical_history is not None and bool(
             set(selected) & set(TECHNICAL_COLUMNS)
@@ -815,23 +1088,26 @@ class FactorDailyFeatureSource(BaseModel):
             scope_content_hash=self.scope_content_hash,
             code_commit=self.code_commit,
             fields=tuple(available[c] for c in selected),
-            value_semantics="stock_features_derived"
+            value_semantics="minute_features_derived"
+            if minute
+            else "stock_features_derived"
             if stock
             else "history_derived"
             if technical
             else "stored_not_recomputed",
             price_basis="field_specific"
-            if stock
+            if stock or minute
             else "observation_factor_then_output_session_scale"
             if technical
             else "unverified",
             recursive_initialization="field_specific"
-            if stock
+            if stock or minute
             else "first_valid_observation_no_restart"
             if technical
             else "unverified",
             technical_history=self.technical_history.summary() if technical else None,
             stock_features=self.stock_features.summary() if stock else None,
+            minute_features=self.minute_features.summary() if minute else None,
         )
 
     def input_artifacts(self) -> tuple[DatasetSnapshotArtifact, ...]:
@@ -839,6 +1115,7 @@ class FactorDailyFeatureSource(BaseModel):
             tuple(t.artifact for t in self.tables)
             + (() if self.technical_history is None else self.technical_history.inputs)
             + (() if self.stock_features is None else self.stock_features.inputs)
+            + (() if self.minute_features is None else self.minute_features.inputs)
         )
 
 
@@ -851,12 +1128,21 @@ class FactorStockFeaturePrepareRequest(BaseModel):
     max_output_cells: int = Field(default=32_000_000, gt=0, le=64_000_000)
 
 
+class FactorMinuteFeaturePrepareRequest(BaseModel):
+    model_config = _MODEL
+    prepared_source: FactorPreparedStreamSource
+    base_daily_source: FactorDailyFeatureSource | None = None
+    max_input_rows: int = Field(default=64_000_000, gt=0, le=128_000_000)
+    max_code_rows: int = Field(default=300_000, gt=0, le=300_000)
+    max_output_cells: int = Field(default=32_000_000, gt=0, le=128_000_000)
+
+
 class FactorDailyFeatureQuery(BaseModel):
     model_config = _MODEL
     source_sha256: str = Field(pattern=_SHA)
     trade_date: date
     stock_codes: tuple[StockCode, ...] = Field(min_length=1, max_length=500)
-    fields: tuple[DailyStoredColumn, ...] = Field(min_length=1, max_length=39)
+    fields: tuple[DailyStoredColumn, ...] = Field(min_length=1, max_length=50)
 
     @field_validator("stock_codes", "fields")
     @classmethod
@@ -873,11 +1159,15 @@ class FactorDailyFeatureValue(BaseModel):
     non_finite_value: Literal["NaN", "Infinity", "-Infinity"] | None = Field(
         default=None, exclude_if=lambda v: v is None
     )
-    reason: TechnicalHistoryReason | StockFeatureReason | None = Field(
+    reason: TechnicalHistoryReason | StockFeatureReason | MinuteFeatureReason | None = Field(
         default=None, exclude_if=lambda v: v is None
     )
 
     diagnostic: FactorStockFeatureDiagnostic | None = Field(
+        default=None, exclude_if=lambda v: v is None
+    )
+
+    minute_diagnostic: FactorMinuteFeatureDiagnostic | None = Field(
         default=None, exclude_if=lambda v: v is None
     )
 
@@ -904,7 +1194,7 @@ class FactorDailyFeatureFact(FactorDailyFeatureValue):
 class FactorDailyFeatureInputRow(BaseModel):
     model_config = _MODEL
     stock_code: StockCode
-    values: tuple[FactorDailyFeatureValue, ...] = Field(min_length=1, max_length=39)
+    values: tuple[FactorDailyFeatureValue, ...] = Field(min_length=1, max_length=50)
 
 
 class FactorDailyFeatureInput(BaseModel):
@@ -915,7 +1205,7 @@ class FactorDailyFeatureInput(BaseModel):
     trade_date: date
     panel_date: date
     rows: tuple[FactorDailyFeatureInputRow, ...] = Field(min_length=1, max_length=7000)
-    counts: tuple[FactorDailyFeatureCounts, ...] = Field(min_length=1, max_length=39)
+    counts: tuple[FactorDailyFeatureCounts, ...] = Field(min_length=1, max_length=50)
     sha256: str = Field(pattern=_SHA)
 
     @model_validator(mode="after")
@@ -982,6 +1272,7 @@ def read_factor_daily_feature_input(
                             non_finite_value=f.non_finite_value,
                             reason=f.reason,
                             diagnostic=f.diagnostic,
+                            minute_diagnostic=f.minute_diagnostic,
                         )
                         for f in batch.facts[i * len(columns) : (i + 1) * len(columns)]
                     ),
@@ -1026,7 +1317,11 @@ def _count_reasons(
     column: str, values: tuple[FactorDailyFeatureValue, ...]
 ) -> dict[str, tuple[FactorDailyFeatureReasonCount, ...]]:
     return {
-        "stock_reasons" if column in STOCK_FEATURE_COLUMNS else "reasons": _reason_counts(values)
+        "minute_reasons"
+        if column in MINUTE_FEATURE_COLUMNS
+        else "stock_reasons"
+        if column in STOCK_FEATURE_COLUMNS
+        else "reasons": _reason_counts(values)
     }
 
 
@@ -1046,8 +1341,8 @@ class FactorDailyFeatureDayBatch(BaseModel):
     prepared_source_sha256: str = Field(pattern=_SHA)
     query: FactorDailyFeatureQuery
     trade_date: date
-    facts: tuple[FactorDailyFeatureFact, ...] = Field(min_length=1, max_length=19500)
-    counts: tuple[FactorDailyFeatureCounts, ...] = Field(min_length=1, max_length=39)
+    facts: tuple[FactorDailyFeatureFact, ...] = Field(min_length=1, max_length=25000)
+    counts: tuple[FactorDailyFeatureCounts, ...] = Field(min_length=1, max_length=50)
 
     @model_validator(mode="after")
     def _grid(self) -> FactorDailyFeatureDayBatch:
@@ -1071,13 +1366,23 @@ def _check_schema(
     *,
     technical: bool = False,
     stock: bool = False,
+    minute: bool = False,
 ) -> None:
     types = dict(columns)
-    catalog = STOCK_FEATURE_FIELDS if stock else STORED_DAILY_FIELDS
+    catalog = (
+        MINUTE_FEATURE_FIELDS if minute else STOCK_FEATURE_FIELDS if stock else STORED_DAILY_FIELDS
+    )
     if (
         types.get("ts_code") != "VARCHAR"
         or types.get("trade_date") != "DATE"
         or any(types.get(f.column) != "DOUBLE" for f in catalog if f.table == table)
+        or (
+            minute
+            and (
+                types.get("minute_diagnostic") != "VARCHAR"
+                or any(types.get(c + "__reason") != "VARCHAR" for c in MINUTE_FEATURE_COLUMNS)
+            )
+        )
         or (technical and any(types.get(c + "__reason") != "VARCHAR" for c in TECHNICAL_COLUMNS))
         or (
             stock
@@ -1100,12 +1405,19 @@ def _observe(
     *,
     technical: bool = False,
     stock: bool = False,
+    minute: bool = False,
 ) -> FactorDailyFeatureTable:
     where = "trade_date BETWEEN ? AND ? AND ts_code IN (SELECT unnest(?))"
     params = [scope.start_date, scope.end_date, list(scope.stock_codes)]
     fields = tuple(
         f.column
-        for f in (STOCK_FEATURE_FIELDS if stock else STORED_DAILY_FIELDS)
+        for f in (
+            MINUTE_FEATURE_FIELDS
+            if minute
+            else STOCK_FEATURE_FIELDS
+            if stock
+            else STORED_DAILY_FIELDS
+        )
         if f.table == table
     )
     counts = connection.execute(
@@ -1152,7 +1464,7 @@ def _observe(
                 non_finite=int(counts[3 + i * 3]),
                 missing=0,
                 **{
-                    "stock_reasons" if stock else "reasons": tuple(
+                    "minute_reasons" if minute else "stock_reasons" if stock else "reasons": tuple(
                         FactorDailyFeatureReasonCount(reason=reason, count=int(count))
                         for reason, count in connection.execute(
                             f"SELECT {c}__reason,count(*) FROM {table} WHERE {where} "
@@ -1161,7 +1473,7 @@ def _observe(
                             params,
                         ).fetchall()
                     )
-                    if technical or stock
+                    if technical or stock or minute
                     else ()
                 },
             )
@@ -1308,18 +1620,24 @@ class FactorDailyFeatureReadLease:
             or not self.source.scope.start_date <= query.trade_date <= self.source.scope.end_date
         ):
             raise ValueError("daily feature query exceeds source or scope")
-        values, reasons, diagnostics = {}, {}, {}
+        values, reasons, diagnostics, minute_diagnostics = {}, {}, {}, {}
         for table in (t.table_name for t in self.source.tables):
             fields = tuple(c for c in query.fields if self._fields[c].table == table)
             if not fields:
                 continue
+            minute = table == "daily_minute_feature"
             stock = table == "daily_stock_feature"
             derived = (
-                stock or table == "daily_indicator" and self.source.technical_history is not None
+                stock
+                or minute
+                or table == "daily_indicator"
+                and self.source.technical_history is not None
             )
             selected = fields + tuple(c + "__reason" for c in fields) if derived else fields
             if stock:
                 selected += tuple(c + "__diagnostic" for c in fields)
+            if minute:
+                selected += ("minute_diagnostic",)
             rows = self._connection.execute(
                 f"SELECT ts_code, {','.join(selected)} FROM {table} "
                 "WHERE trade_date=? AND ts_code IN (SELECT unnest(?)) ORDER BY ts_code",
@@ -1342,6 +1660,9 @@ class FactorDailyFeatureReadLease:
                         ((row[0], c), FactorStockFeatureDiagnostic.model_validate_json(value))
                         for c, value in zip(fields, row[1 + len(fields) * 2 :], strict=True)
                     )
+                if minute:
+                    diag = FactorMinuteFeatureDiagnostic.model_validate_json(row[-1])
+                    minute_diagnostics.update(((row[0], c), diag) for c in fields)
         facts = []
         for code in query.stock_codes:
             for column in query.fields:
@@ -1349,6 +1670,8 @@ class FactorDailyFeatureReadLease:
                 tag = None
                 if (code, column) not in values:
                     status = "missing"
+                    if column in MINUTE_FEATURE_COLUMNS:
+                        reasons[code, column] = "missing_target_minute"
                     if self.source.technical_history is not None and column in TECHNICAL_COLUMNS:
                         initialized = next(
                             c for c in self.source.technical_history.codes if c.stock_code == code
@@ -1382,6 +1705,7 @@ class FactorDailyFeatureReadLease:
                         non_finite_value=tag,
                         reason=reasons.get((code, column)),
                         diagnostic=diagnostics.get((code, column)),
+                        minute_diagnostic=minute_diagnostics.get((code, column)),
                     )
                 )
         self.query_count += 1
@@ -1412,13 +1736,24 @@ def open_factor_daily_feature_source(
     try:
         with TemporaryDirectory(prefix=".daily-feature-reader-", dir=root) as scratch:
             private_root = Path(scratch)
-            if source.technical_history is not None or source.stock_features is not None:
+            if (
+                source.technical_history is not None
+                or source.stock_features is not None
+                or source.minute_features is not None
+            ):
                 private_descriptor = _open_private_root(private_root)
             for artifact in source.input_artifacts():
                 technical = artifact.table_name == "technical_history_input"
                 stock = artifact.table_name == "stock_feature_input"
-                verifier = _verify_stock_feature_input if stock else _verify_technical_history_input
-                if technical or stock:
+                minute = artifact.table_name == "minute_feature_input"
+                verifier = (
+                    _verify_minute_feature_input
+                    if minute
+                    else _verify_stock_feature_input
+                    if stock
+                    else _verify_technical_history_input
+                )
+                if technical or stock or minute:
                     original, original_identity = verifier(
                         artifact, lake_root=root, as_of_time=source.scope.as_of_time
                     )
@@ -1430,7 +1765,7 @@ def open_factor_daily_feature_source(
                 target.parent.mkdir(parents=True)
                 shutil.copyfile(original, target)
                 os.chmod(target, 0o600)
-                if technical or stock:
+                if technical or stock or minute:
                     _, copied_identity = verifier(
                         artifact, lake_root=private_root, as_of_time=source.scope.as_of_time
                     )
@@ -1462,7 +1797,10 @@ def open_factor_daily_feature_source(
                         and table.table_name == "daily_indicator"
                     )
                     stock = table.table_name == "daily_stock_feature"
-                    _check_schema(columns, table.table_name, technical=derived, stock=stock)
+                    minute = table.table_name == "daily_minute_feature"
+                    _check_schema(
+                        columns, table.table_name, technical=derived, stock=stock, minute=minute
+                    )
                     invalid = connection.execute(
                         f"SELECT count(*) FROM {table.table_name} "
                         "WHERE ts_code IS NULL OR trade_date IS NULL "
@@ -1488,6 +1826,7 @@ def open_factor_daily_feature_source(
                             table.artifact,
                             technical=derived,
                             stock=stock,
+                            minute=minute,
                         )
                         != table
                     ):
@@ -1557,6 +1896,51 @@ def open_factor_daily_feature_source(
                     if observed != expected or invalid:
                         raise ValueError("stock sealed input differs from bounded scope")
                     _require_same_root(private_root, private_descriptor)
+                if source.minute_features is not None:
+                    from zoneinfo import ZoneInfo
+
+                    (artifact,) = source.minute_features.inputs
+                    path = private_root / artifact.relative_path
+                    connection.execute(
+                        "CREATE VIEW minute_feature_input AS SELECT * FROM read_parquet("
+                        + _quoted_literal(str(path))
+                        + ",hive_partitioning=false)"
+                    )
+                    observed = connection.execute(
+                        "SELECT ts_code,count(*),count(DISTINCT "
+                        "trade_time),min(trade_date),max(trade_date) FROM "
+                        "minute_feature_input GROUP BY ts_code ORDER BY ts_code"
+                    ).fetchall()
+                    expected = [
+                        (
+                            c.stock_code,
+                            c.input_rows,
+                            c.input_observations,
+                            c.raw_start_date,
+                            c.raw_end_date,
+                        )
+                        for c in source.minute_features.codes
+                        if c.input_rows
+                    ]
+                    invalid = connection.execute(
+                        "SELECT count(*) FROM minute_feature_input WHERE "
+                        "trade_time IS NULL OR trade_date IS NULL OR "
+                        "trade_date!=CAST(trade_time AS DATE) OR trade_date>? OR "
+                        "trade_time>? OR freq!='1min' OR ts_code NOT IN (SELECT "
+                        "unnest(?))",
+                        [
+                            source.scope.end_date,
+                            source.scope.as_of_time.astimezone(ZoneInfo("Asia/Shanghai")).replace(
+                                tzinfo=None
+                            ),
+                            list(source.scope.stock_codes),
+                        ],
+                    ).fetchone()[0]
+                    if observed != expected or invalid:
+                        raise ValueError(
+                            "minute sealed input differs from bounded clock/code scope"
+                        )
+                    _require_same_root(private_root, private_descriptor)
                 lease = FactorDailyFeatureReadLease(source, connection, private_root)
                 yield lease
                 for artifact in source.input_artifacts():
@@ -1566,7 +1950,9 @@ def open_factor_daily_feature_source(
                             artifact.relative_path
                         ]
                         verifier = (
-                            _verify_stock_feature_input
+                            _verify_minute_feature_input
+                            if artifact.table_name == "minute_feature_input"
+                            else _verify_stock_feature_input
                             if artifact.table_name == "stock_feature_input"
                             else _verify_technical_history_input
                         )

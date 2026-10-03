@@ -169,7 +169,7 @@ class FactorStreamFeatureDayReceipt(BaseModel):
     context_input_sha256: Sha256 | None = Field(default=None, exclude_if=lambda v: v is None)
     daily_feature_input_sha256: Sha256 | None = Field(default=None, exclude_if=lambda v: v is None)
     daily_feature_counts: tuple[FactorDailyFeatureCounts, ...] | None = Field(
-        default=None, max_length=39, exclude_if=lambda v: v is None
+        default=None, max_length=50, exclude_if=lambda v: v is None
     )
 
 

@@ -90,13 +90,24 @@ class FactorRunPageControlBackend:
                 industry_available=present[0],
                 market_cap_available=present[1],
                 daily_features_available=stored,
+                minute_features_available=stored
+                and loaded.daily_features.minute_features is not None,
+                minute_base_daily_available=stored
+                and loaded.daily_features.minute_features is not None
+                and any(
+                    f.table in ("daily_indicator", "daily_basic")
+                    for f in loaded.daily_features.fields
+                ),
                 technical_history_available=stored
                 and loaded.daily_features.technical_history is not None,
                 stock_features_available=stored
                 and loaded.daily_features.stock_features is not None,
                 stock_base_daily_available=stored
                 and loaded.daily_features.stock_features is not None
-                and loaded.daily_features.base_daily_source is not None,
+                and any(
+                    f.table in ("daily_indicator", "daily_basic")
+                    for f in loaded.daily_features.fields
+                ),
             )
 
     def availability(self, actor_id: str) -> FactorRunAvailability:

@@ -168,6 +168,14 @@ class FactorFormulaStreamRequest(BaseModel):
                 industry_available=industry,
                 market_cap_available=cap,
                 daily_features_available=self.sources.daily_features is not None,
+                minute_features_available=self.sources.daily_features is not None
+                and self.sources.daily_features.minute_features is not None,
+                minute_base_daily_available=self.sources.daily_features is not None
+                and self.sources.daily_features.minute_features is not None
+                and any(
+                    f.table in ("daily_indicator", "daily_basic")
+                    for f in self.sources.daily_features.fields
+                ),
                 technical_history_available=self.sources.daily_features is not None
                 and self.sources.daily_features.technical_history is not None,
                 stock_features_available=self.sources.daily_features is not None
@@ -175,9 +183,21 @@ class FactorFormulaStreamRequest(BaseModel):
                 stock_base_daily_available=self.sources.daily_features is not None
                 and self.sources.daily_features.stock_features is not None
                 and any(
-                    f.table != "daily_stock_feature" for f in self.sources.daily_features.fields
+                    f.table in ("daily_indicator", "daily_basic")
+                    for f in self.sources.daily_features.fields
                 ),
-            ).require_runnable_definition(self.definition)
+            ).require_runnable_definition(
+                self.definition.model_copy(
+                    update={
+                        "feature_catalog": type(self.definition.feature_catalog)(
+                            columns=self.definition.dependency_columns
+                        )
+                    }
+                )
+                if self.sources.daily_features is not None
+                and self.sources.daily_features.minute_features is not None
+                else self.definition
+            )
             from rquant.factor.capability import HISTORICAL_DAILY_V1
 
             extra = tuple(
