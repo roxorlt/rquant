@@ -51,3 +51,8 @@
 - 对应最小补修限于这三条直接边界。保持全部任务/命令/spec/身份与最终提交校验；耗时验证不应长期阻塞合法心跳；真正到期不复活，也不能报告已过期租约为有效。COMMIT 后的真实到期应按现有失租/恢复行为报告；不为强行回滚已提交行引入新恢复协议。
 - ledger 实际状态只有 queued/running/succeeded/failed，无 cancel API；不新增 cancelled 状态。取消验收沿已有 tracking 取消与现有终态/token fencing。原 5 秒 join timeout 语义保持；受控阻塞释放后核验线程/准备句柄清理。
 - 原始红测、时序、源码 SHA：`/private/tmp/rquant-stock-lease-causal-q6t_yepg/`；root 准入与冻结绑定：`/private/tmp/rquant-factor-tracking-root-yegakn31/stock-lease-diagnosis/product-entry-gate.json`。编码是用户已授权的一次补修，未增加轮次；真实验收仍必须完成。
+## 清单门禁的直接依赖（最终复核前）
+
+根任务正常收集得到 19,227 个节点，准确新增本片 27 个、无删除/重复，55 个批准跳过项字节不变。紧凑清单总计 5,243,496 B，超过现有 5 MiB 总上限 616 B，现有清单门禁实际失败；这是本次新增测试直接触发的集成依赖。
+
+本次同一候选只追加 `scripts/full_suite_shards.py` 的总清单上限由 5 MiB 调整到 6 MiB；单分片、单行、index、跳过表限制及解析、摘要、分片、实际测试集合不变。输入边界为受限大小的清单和 collection 输出，不得取消上限、放宽结构校验或改变批准跳过表。以原失败门禁转绿及直接容量拒绝用例为验证；原失败保留，原审查者在本次唯一最终定向复核中一并检查，不增加产品修复轮。
