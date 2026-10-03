@@ -6,7 +6,7 @@ import type {
   FactorSaveDraft,
 } from "@/api/factors";
 import { Button, SideDrawer, Tip } from "@/ui";
-import { FactorFieldInfo } from "./FactorFieldInfo";
+import { FactorFieldInfo, factorFieldName } from "./FactorFieldInfo";
 import "./FactorEditor.css";
 
 export type FactorEditorDraft = Pick<
@@ -110,10 +110,13 @@ export function FactorEditor({
   const currentVersionKey = `${currentGeneration}:${currentDefinition?.factor_id}:${currentDefinition?.version}:${currentDefinition?.content_sha256}`;
   const comparisonOpen = comparedVersion === currentVersionKey && currentDefinition !== null;
   const fields = capabilities?.fields ?? [];
+  const hasMinute = fields.some((field) => field.value_semantics === "minute_features_derived");
   const search = fieldSearch.trim().toLocaleLowerCase();
   const visibleFields = search
     ? fields.filter((field) =>
-        `${field.name_zh} ${field.column}`.toLocaleLowerCase().includes(search),
+        `${factorFieldName(field)} ${field.name_zh} ${field.column}`
+          .toLocaleLowerCase()
+          .includes(search),
       )
     : allFields
       ? fields
@@ -255,9 +258,17 @@ export function FactorEditor({
           </label>
         </div>
         <div className="factor-editor-help">
-          <span>日线字段</span>
+          <span>{hasMinute ? "字段" : "日线字段"}</span>
           <div className="factor-editor-field-tools">
-            <Tip content={capabilities?.coverage_note_zh ?? "字段能力暂时无法核对。"}>字段说明</Tip>
+            <Tip
+              content={
+                hasMinute
+                  ? "字段来自当前可用目录，点击插入；分钟仅用于历史回顾，固定时点和缺因见字段与结果说明。"
+                  : (capabilities?.coverage_note_zh ?? "字段能力暂时无法核对。")
+              }
+            >
+              字段说明
+            </Tip>
             {fields.length > 6 ? (
               <Button
                 size="sm"
@@ -273,7 +284,7 @@ export function FactorEditor({
         <input
           className="inp factor-editor-search"
           type="search"
-          aria-label="搜索日线字段"
+          aria-label={hasMinute ? "搜索字段" : "搜索日线字段"}
           placeholder="按中文名搜索字段"
           value={fieldSearch}
           maxLength={64}
@@ -287,17 +298,17 @@ export function FactorEditor({
             <div className="factor-editor-field-choice" key={field.column}>
               <Button
                 size="sm"
-                aria-label={`插入${field.name_zh}`}
+                aria-label={`插入${factorFieldName(field)}`}
                 disabled={busy || !canSave}
                 onClick={() => insertField(field.column)}
               >
-                {field.name_zh}
+                {factorFieldName(field)}
               </Button>
               <Tip content={<FactorFieldInfo field={field} />} interactive>
                 <Button
                   size="sm"
                   variant="ghost"
-                  aria-label={`${field.name_zh}说明`}
+                  aria-label={`${factorFieldName(field)}说明`}
                   className="factor-editor-field-info"
                 >
                   <span aria-hidden="true">ⓘ</span>
