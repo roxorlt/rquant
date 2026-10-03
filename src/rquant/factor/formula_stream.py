@@ -18,7 +18,11 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from pydantic_core import PydanticCustomError
 
 from rquant.factor.capability import historical_daily_capabilities
-from rquant.factor.daily_feature_source import FactorDailyFeatureInput, FactorDailyFeatureSources
+from rquant.factor.daily_feature_source import (
+    DailyStoredColumn,
+    FactorDailyFeatureInput,
+    FactorDailyFeatureSources,
+)
 from rquant.factor.definition import FactorDefinition
 from rquant.factor.neutralization_context import (
     FactorNeutralizationDayBatch,
@@ -59,30 +63,7 @@ _IMMUTABLE = ConfigDict(extra="forbid", frozen=True, strict=True, revalidate_ins
 _CS_FUNCTIONS = frozenset(
     {"cs_rank", "cs_zscore", "cs_winsorize", "industry_neutralize", "size_neutralize"}
 )
-DailyFeatureColumn = Literal[
-    "open",
-    "high",
-    "low",
-    "close",
-    "vol",
-    "amount",
-    "ma5",
-    "ma10",
-    "ma20",
-    "ma60",
-    "rsi6",
-    "rsi14",
-    "macd",
-    "macd_signal",
-    "macd_hist",
-    "kdj_k",
-    "kdj_d",
-    "kdj_j",
-    "turnover_rate",
-    "volume_ratio",
-    "total_mv",
-    "circ_mv",
-]
+DailyFeatureColumn = Literal["open", "high", "low", "close", "vol", "amount"] | DailyStoredColumn
 FormulaStreamErrorReason = Literal[
     "cache_budget_exceeded",
     "missing_batch",
@@ -188,7 +169,14 @@ class FactorFormulaStreamRequest(BaseModel):
                 market_cap_available=cap,
                 daily_features_available=self.sources.daily_features is not None,
                 technical_history_available=self.sources.daily_features is not None
-                and self.sources.daily_features.value_semantics == "history_derived",
+                and self.sources.daily_features.technical_history is not None,
+                stock_features_available=self.sources.daily_features is not None
+                and self.sources.daily_features.stock_features is not None,
+                stock_base_daily_available=self.sources.daily_features is not None
+                and self.sources.daily_features.stock_features is not None
+                and any(
+                    f.table != "daily_stock_feature" for f in self.sources.daily_features.fields
+                ),
             ).require_runnable_definition(self.definition)
             from rquant.factor.capability import HISTORICAL_DAILY_V1
 
@@ -253,7 +241,7 @@ class FactorFormulaStreamBatch(BaseModel):
     sources: FactorFormulaStreamSources
     universe: FactorUniverseRequest
     feature_points: tuple[FactorFormulaFeaturePoint, ...] = Field(
-        max_length=MAX_UNIVERSE_SECURITIES * 22
+        max_length=MAX_UNIVERSE_SECURITIES * 45
     )
     context: FactorNeutralizationDayBatch | None = Field(
         default=None, exclude_if=lambda v: v is None

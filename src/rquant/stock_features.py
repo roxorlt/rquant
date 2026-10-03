@@ -281,22 +281,20 @@ def _accumulation_features(
     obv_change: float | None = None
     if obv_close is not None:
         adjusted_close = pd.to_numeric(obv_close, errors="coerce")
-        direction = adjusted_close.diff().fillna(0.0).map(
-            lambda value: 1 if value > 0 else -1 if value < 0 else 0
+        direction = (
+            adjusted_close.diff()
+            .fillna(0.0)
+            .map(lambda value: 1 if value > 0 else -1 if value < 0 else 0)
         )
         obv = (direction * vol).cumsum()
         if total_vol > 0 and len(obv) > 1:
-            obv_change = (
-                float(obv.iloc[-1]) - float(obv.iloc[0])
-            ) / total_vol * 100
+            obv_change = (float(obv.iloc[-1]) - float(obv.iloc[0])) / total_vol * 100
 
     price_range = (high - low).replace(0, pd.NA)
     close_position = ((close - low) / price_range).clip(lower=0, upper=1)
     money_flow_multiplier = ((2 * close - high - low) / price_range).fillna(0.0)
     ad_flow = (
-        float((money_flow_multiplier * vol).sum()) / total_vol * 100
-        if total_vol > 0
-        else None
+        float((money_flow_multiplier * vol).sum()) / total_vol * 100 if total_vol > 0 else None
     )
 
     up_amount = float(amount[pct_chg > 0].sum())
@@ -348,13 +346,43 @@ def build_daily_stock_feature_result(
     """生成 T 日特征，并保留每个实际价格窗口的复权诊断。"""
     trend_rows = max(max(_MA_ALIGNMENT_WINDOWS), _PRICE_PERCENTILE_LOOKBACK)
     max_rows = max(max(price_lookbacks), accumulation_lookback + 1, trend_rows)
-    daily = _query_daily_window(
-        store,
+    daily = _query_daily_window(store, ts_code, reference_date, max_rows, include_reference=True)
+    factor_map = (
+        {}
+        if daily.empty
+        else _query_factor_map(
+            store, ts_code, _as_date(daily.iloc[0]["trade_date"]), reference_date
+        )
+    )
+    return build_daily_stock_feature_result_from_history(
+        daily,
+        factor_map,
         ts_code,
         reference_date,
-        max_rows,
-        include_reference=True,
+        price_lookbacks=price_lookbacks,
+        accumulation_lookback=accumulation_lookback,
     )
+
+
+def build_daily_stock_feature_result_from_history(
+    daily: pd.DataFrame,
+    factor_map: dict[date, float | None],
+    ts_code: str,
+    reference_date: date,
+    *,
+    price_lookbacks: tuple[int, ...] = (90, 120, 250),
+    accumulation_lookback: int = 20,
+) -> DailyStockFeatureResult:
+    """以已封存日线和因子复用选股核；仅消费参考日以前的实际观察。"""
+    if not daily.empty:
+        trend_rows = max(max(_MA_ALIGNMENT_WINDOWS), _PRICE_PERCENTILE_LOOKBACK)
+        max_rows = max(max(price_lookbacks), accumulation_lookback + 1, trend_rows)
+        daily = (
+            daily[daily["trade_date"].apply(_as_date) <= reference_date]
+            .sort_values("trade_date")
+            .tail(max_rows)
+            .reset_index(drop=True)
+        )
     if daily.empty:
         return DailyStockFeatureResult(
             ts_code=ts_code,
@@ -365,12 +393,6 @@ def build_daily_stock_feature_result(
             diagnostics={},
         )
 
-    factor_map = _query_factor_map(
-        store,
-        ts_code,
-        _as_date(daily.iloc[0]["trade_date"]),
-        reference_date,
-    )
     features: dict[str, float | int | None] = {}
     diagnostics: dict[str, PriceBasisDiagnostic] = {}
 
@@ -387,9 +409,7 @@ def build_daily_stock_feature_result(
                 )
             )
         else:
-            features.update(
-                _unavailable_price_position_features(lookback, len(window))
-            )
+            features.update(_unavailable_price_position_features(lookback, len(window)))
 
     ma_window_days = max(_MA_ALIGNMENT_WINDOWS)
     ma_key = f"ma_alignment_{ma_window_days}d"
@@ -408,9 +428,9 @@ def build_daily_stock_feature_result(
             ma_basis,
         )
         if ma_basis.available:
-            features["ma_alignment"] = _trend_features(
-                _apply_price_basis(ma_window, ma_basis)
-            )["ma_alignment"]
+            features["ma_alignment"] = _trend_features(_apply_price_basis(ma_window, ma_basis))[
+                "ma_alignment"
+            ]
 
     percentile_key = f"price_percentile_{_PRICE_PERCENTILE_LOOKBACK}d"
     features["price_percentile_250d"] = None
@@ -436,9 +456,11 @@ def build_daily_stock_feature_result(
                 _apply_price_basis(percentile_window, percentile_basis)
             )["price_percentile_250d"]
 
-    before_reference = daily[
-        daily["trade_date"].apply(_as_date) < reference_date
-    ].tail(accumulation_lookback).copy()
+    before_reference = (
+        daily[daily["trade_date"].apply(_as_date) < reference_date]
+        .tail(accumulation_lookback)
+        .copy()
+    )
     accumulation_key = f"accumulation_obv_{accumulation_lookback}d"
     scale_invariant_key = f"accumulation_scale_invariant_{accumulation_lookback}d"
     adjusted_obv_close: pd.Series | None = None
@@ -617,15 +639,9 @@ def build_intraday_relative_volume_features(
         hist_days = int(len(cum_by_day))
 
     rel_same = (
-        current_minute_amount / same_median
-        if same_median is not None and same_median > 0
-        else None
+        current_minute_amount / same_median if same_median is not None and same_median > 0 else None
     )
-    rel_cum = (
-        current_cum_amount / cum_median
-        if cum_median is not None and cum_median > 0
-        else None
-    )
+    rel_cum = current_cum_amount / cum_median if cum_median is not None and cum_median > 0 else None
     return {
         "signal_minute_amount": _round_optional(current_minute_amount),
         "signal_cum_amount_asof": _round_optional(current_cum_amount),

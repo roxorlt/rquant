@@ -14,6 +14,7 @@
 - 所属当前 root goal；唯一实现树 `/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-tracking-react`，分支 `cdx/20261003-factor-stock-source`，干净基准为上述 commit。集成树保留供验收后快进；无新 worktree。
 - 只修改日线特征单一核、独立来源 producer、直接来源/合同/能力/消费接线、必要 API 生成合同及因子页。不得修改 ledger、lease、tracking commit/recovery、generic artifact 校验、权限、生产部署或旧 Streamlit。
 - 现有原六字段默认 JSON/摘要及 v1/v2 来源/任务黄金保持；新增能力只由真实配对的选股来源开启。来源缺失、错配或损坏拒绝新字段，不回退库存或重新连生产主库。能力目录不承诺实际覆盖或 PIT。
+- root 明确追加：`stream_adapter.py` 字段宽度和 `tracking_backend.py` 准入目录是直接依赖，允许修改。v3 独立选股来源可通过 `FactorStockFeaturePrepareRequest.base_daily_source` 组合已经验证的 v1/v2 日线来源；严格绑定同一 prepared/scope/generation，复用封存原值，以实际 fields 开启目录。支持技术/基本16项与选股23项的同一次混合表达式；窗口诊断与递归初始化分别保留，不重算或虚构旧16项。
 
 ## 1. 冻结现有 23 字段语义，先红后绿
 

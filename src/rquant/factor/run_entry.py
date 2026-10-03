@@ -15,6 +15,8 @@ from pydantic import BaseModel
 
 from rquant.factor.daily_feature_source import (
     FactorDailyFeaturePrepareRequest,
+    FactorDailyFeatureSource,
+    FactorStockFeaturePrepareRequest,
     prepare_factor_daily_feature_source,
 )
 from rquant.factor.industry_source import FactorIndustrySource
@@ -37,6 +39,7 @@ from rquant.factor.run_configuration import (
 )
 from rquant.factor.run_request import RUN_IMMUTABLE
 from rquant.factor.source_prepare import FactorPreparedStreamSource
+from rquant.factor.stock_feature_source import prepare_factor_stock_feature_source
 from rquant.factor.technical_history_source import (
     FactorTechnicalHistoryPrepareRequest,
     prepare_factor_technical_history_source,
@@ -77,6 +80,7 @@ def main(argv: list[str] | None = None) -> int:
             "seal-context",
             "seal-daily-features",
             "seal-technical-history",
+            "seal-stock-features",
             "worker",
             "serve",
         ),
@@ -89,6 +93,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--web-uid", type=int)
     parser.add_argument("--shared-gid", type=int)
     parser.add_argument("--prepared-source", type=Path)
+    parser.add_argument("--base-daily-source", type=Path)
     parser.add_argument("--industry-source", type=Path)
     parser.add_argument("--market-cap-source", type=Path)
     parser.add_argument("--lake-root", type=Path)
@@ -96,11 +101,27 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-code-observations", type=int, default=50_000)
     parser.add_argument("--max-output-cells", type=int, default=32_000_000)
     args = parser.parse_args(argv)
-    if args.action in ("seal-daily-features", "seal-technical-history"):
+    if args.action in ("seal-daily-features", "seal-technical-history", "seal-stock-features"):
         if args.prepared_source is None or args.lake_root is None:
             parser.error("必须提供实际行情准备包和私有数据根")
         prepared = _input(args.prepared_source, FactorPreparedStreamSource, 16 * 1024 * 1024)
-        if args.action == "seal-technical-history":
+        if args.action == "seal-stock-features":
+            base = (
+                None
+                if args.base_daily_source is None
+                else _input(args.base_daily_source, FactorDailyFeatureSource, 16 * 1024 * 1024)
+            )
+            source = prepare_factor_stock_feature_source(
+                FactorStockFeaturePrepareRequest(
+                    prepared_source=prepared,
+                    base_daily_source=base,
+                    max_input_rows=args.max_input_rows,
+                    max_code_observations=args.max_code_observations,
+                    max_output_cells=args.max_output_cells,
+                ),
+                lake_root=args.lake_root,
+            )
+        elif args.action == "seal-technical-history":
             source = prepare_factor_technical_history_source(
                 FactorTechnicalHistoryPrepareRequest(
                     prepared_source=prepared,

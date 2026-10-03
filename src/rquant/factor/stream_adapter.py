@@ -164,12 +164,12 @@ class FactorStreamFeatureDayReceipt(BaseModel):
     panel_date: date
     input_sha256: Sha256
     raw_sha256: Sha256
-    missing_observation_count: int = Field(ge=0, le=154_000)
-    known_null_count: int = Field(ge=0, le=154_000)
+    missing_observation_count: int = Field(ge=0, le=315_000)
+    known_null_count: int = Field(ge=0, le=315_000)
     context_input_sha256: Sha256 | None = Field(default=None, exclude_if=lambda v: v is None)
     daily_feature_input_sha256: Sha256 | None = Field(default=None, exclude_if=lambda v: v is None)
     daily_feature_counts: tuple[FactorDailyFeatureCounts, ...] | None = Field(
-        default=None, max_length=16, exclude_if=lambda v: v is None
+        default=None, max_length=39, exclude_if=lambda v: v is None
     )
 
 

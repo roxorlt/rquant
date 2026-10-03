@@ -90,7 +90,13 @@ class FactorRunPageControlBackend:
                 industry_available=present[0],
                 market_cap_available=present[1],
                 daily_features_available=stored,
-                technical_history_available=stored and loaded.daily_features.schema_version == 2,
+                technical_history_available=stored
+                and loaded.daily_features.technical_history is not None,
+                stock_features_available=stored
+                and loaded.daily_features.stock_features is not None,
+                stock_base_daily_available=stored
+                and loaded.daily_features.stock_features is not None
+                and loaded.daily_features.base_daily_source is not None,
             )
 
     def availability(self, actor_id: str) -> FactorRunAvailability:

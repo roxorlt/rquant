@@ -164,7 +164,7 @@ class FactorDailyFeatureCoverageDay(BaseModel):
     trade_date: date
     panel_date: date
     computation_stock_count: int = Field(ge=1, le=7000)
-    counts: tuple[FactorDailyFeatureCounts, ...] = Field(min_length=1, max_length=16)
+    counts: tuple[FactorDailyFeatureCounts, ...] = Field(min_length=1, max_length=39)
 
     @model_validator(mode="after")
     def _grid(self) -> FactorDailyFeatureCoverageDay:

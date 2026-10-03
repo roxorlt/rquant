@@ -20,12 +20,21 @@ class DailyFactorField(BaseModel):
     name_zh: str = Field(min_length=1, max_length=32)
     description_zh: str = Field(min_length=1, max_length=120)
     unit: (
-        Literal["stored_price", "session_price", "indicator", "percent", "ratio", "CNY_10000"]
+        Literal[
+            "stored_price",
+            "session_price",
+            "indicator",
+            "percent",
+            "ratio",
+            "CNY_10000",
+            "observations",
+            "binary",
+        ]
         | None
     ) = Field(default=None, exclude_if=lambda v: v is None)
-    value_semantics: Literal["stored_not_recomputed", "history_derived"] | None = Field(
-        default=None, exclude_if=lambda v: v is None
-    )
+    value_semantics: (
+        Literal["stored_not_recomputed", "history_derived", "stock_features_derived"] | None
+    ) = Field(default=None, exclude_if=lambda v: v is None)
     tracking_supported: bool | None = Field(default=None, exclude_if=lambda v: v is None)
     tracking_unavailable_reason_zh: str | None = Field(
         default=None, min_length=1, max_length=120, exclude_if=lambda v: v is None
@@ -50,7 +59,7 @@ class DailyFactorCapabilities(BaseModel):
 
     model_config = _IMMUTABLE
 
-    version: Literal["daily_v1", "daily_stored_v1", "daily_derived_v1"]
+    version: Literal["daily_v1", "daily_stored_v1", "daily_derived_v1", "daily_stock_v1"]
     source_mode: Literal["historical_retrospective"]
     fields: tuple[DailyFactorField, ...] = Field(min_length=1)
     runnable_operators: tuple[str, ...] = Field(min_length=1)
@@ -142,6 +151,8 @@ def historical_daily_capabilities(
     market_cap_available: bool = False,
     daily_features_available: bool = False,
     technical_history_available: bool = False,
+    stock_features_available: bool = False,
+    stock_base_daily_available: bool = False,
 ) -> DailyFactorCapabilities:
     enabled = tuple(
         name
@@ -152,11 +163,25 @@ def historical_daily_capabilities(
         if present
     )
     fields = HISTORICAL_DAILY_V1.fields
-    if technical_history_available and not daily_features_available:
+    if (technical_history_available or stock_features_available) and not daily_features_available:
         raise ValueError("derived capability requires a verified daily source")
+    if stock_base_daily_available and not stock_features_available:
+        raise ValueError("stock base capability requires stock features")
+    if technical_history_available and stock_features_available and not stock_base_daily_available:
+        raise ValueError("technical stock capability requires the actual base source")
     if daily_features_available:
-        from rquant.factor.daily_feature_source import DERIVED_DAILY_FIELDS, STORED_DAILY_FIELDS
+        from rquant.factor.daily_feature_source import (
+            DERIVED_DAILY_FIELDS,
+            STOCK_FEATURE_FIELDS,
+            STORED_DAILY_FIELDS,
+        )
 
+        inventory = (
+            (DERIVED_DAILY_FIELDS if technical_history_available else STORED_DAILY_FIELDS)
+            if not stock_features_available or stock_base_daily_available
+            else ()
+        )
+        catalog = inventory + (STOCK_FEATURE_FIELDS if stock_features_available else ())
         fields += tuple(
             DailyFactorField(
                 column=f.column,
@@ -166,12 +191,14 @@ def historical_daily_capabilities(
                 value_semantics=f.value_semantics or "stored_not_recomputed",
                 tracking_supported=True,
             )
-            for f in (DERIVED_DAILY_FIELDS if technical_history_available else STORED_DAILY_FIELDS)
+            for f in catalog
         )
     return DailyFactorCapabilities.model_validate(
         {
             **HISTORICAL_DAILY_V1.model_dump(),
-            "version": "daily_derived_v1"
+            "version": "daily_stock_v1"
+            if stock_features_available
+            else "daily_derived_v1"
             if technical_history_available
             else "daily_stored_v1"
             if daily_features_available

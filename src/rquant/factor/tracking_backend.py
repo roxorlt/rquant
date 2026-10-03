@@ -84,8 +84,12 @@ class FactorTrackingPageControlBackend:
             if request.tracked:
                 columns = tuple(
                     field.column
-                    for field in historical_daily_capabilities(daily_features_available=True).fields
-                    if field.value_semantics == "stored_not_recomputed"
+                    for field in historical_daily_capabilities(
+                        daily_features_available=True,
+                        stock_features_available=True,
+                        stock_base_daily_available=True,
+                    ).fields
+                    if field.column not in ("open", "high", "low", "close", "vol", "amount")
                     and field.column in record.definition.dependency_columns
                 )
                 if columns:
