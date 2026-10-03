@@ -15,10 +15,19 @@ from contextlib import contextmanager, suppress
 from datetime import date, datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Literal
+from typing import Annotated, Literal
 
 import duckdb
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    TypeAdapter,
+    ValidationInfo,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 
 from rquant.data_metadata import DatasetSnapshotArtifact, normalize_utc_datetime, utc_now
 from rquant.factor.result_artifact import _open_private_root, _require_same_root, _root_path
@@ -34,7 +43,9 @@ from rquant.factor.source_prepare import (
 from rquant.factor.stock_feature_source import (
     STOCK_FEATURE_COLUMNS,
     STOCK_FEATURE_DESCRIPTIONS,
+    FactorStockFeatureCode,
     FactorStockFeatureDiagnostic,
+    FactorStockFeaturePolicy,
     FactorStockFeatureReceipt,
     FactorStockFeatureSummary,
     StockFeatureColumn,
@@ -43,6 +54,8 @@ from rquant.factor.stock_feature_source import (
 )
 from rquant.factor.technical_history_source import (
     TECHNICAL_COLUMNS,
+    FactorTechnicalHistoryCode,
+    FactorTechnicalHistoryPolicy,
     FactorTechnicalHistoryReceipt,
     FactorTechnicalHistorySummary,
     TechnicalHistoryReason,
@@ -268,6 +281,82 @@ class FactorDailyFeatureTable(BaseModel):
     rows_on_closed_dates: int = Field(ge=0)
 
 
+_ObservationCount = Annotated[int, Field(ge=0, le=50_000)]
+_TechnicalCodeRow = tuple[
+    _ObservationCount,
+    date | None,
+    date | None,
+    date | None,
+    _ObservationCount,
+    date | None,
+    Literal["invalid_ohlc", "invalid_factor", "non_finite_adjusted_price"] | None,
+]
+_StockCodeRow = tuple[_ObservationCount, _ObservationCount, date | None, date | None]
+_CodeCountRow = tuple[Annotated[int, Field(ge=0, le=4096)]]
+
+
+class _V3TechnicalReceipt(BaseModel):
+    model_config = _MODEL
+    code_format: Literal["scope_ordered_rows_v1"] = "scope_ordered_rows_v1"
+    policy: FactorTechnicalHistoryPolicy
+    inputs: tuple[DatasetSnapshotArtifact, ...] = Field(min_length=1, max_length=1)
+    # Parent scope supplies stock_code; the remaining seven fields retain their original order.
+    codes: tuple[_TechnicalCodeRow, ...] = Field(min_length=1, max_length=7000)
+    input_rows: int = Field(ge=0, le=16_000_000)
+    max_input_rows: int = Field(gt=0, le=16_000_000)
+    max_code_observations: int = Field(gt=0, le=50_000)
+    max_output_cells: int = Field(gt=0, le=64_000_000)
+
+
+class _V3StockReceipt(BaseModel):
+    model_config = _MODEL
+    code_format: Literal["scope_ordered_rows_v1"] = "scope_ordered_rows_v1"
+    policy: FactorStockFeaturePolicy
+    inputs: tuple[DatasetSnapshotArtifact, ...] = Field(min_length=1, max_length=1)
+    # Parent scope supplies stock_code; the remaining four fields include both raw boundaries.
+    codes: tuple[_StockCodeRow, ...] = Field(min_length=1, max_length=7000)
+    input_rows: int = Field(ge=0, le=16_000_000)
+    max_input_rows: int = Field(gt=0, le=16_000_000)
+    max_code_observations: int = Field(gt=0, le=50_000)
+    max_output_cells: int = Field(gt=0, le=64_000_000)
+
+
+class _V3Table(BaseModel):
+    model_config = _MODEL
+    code_counts_format: Literal["scope_ordered_rows_v1"] = "scope_ordered_rows_v1"
+    table_name: Literal["daily_indicator", "daily_basic", "daily_stock_feature"]
+    artifact: DatasetSnapshotArtifact
+    row_count: int = Field(ge=0)
+    code_counts: tuple[_CodeCountRow, ...] = Field(min_length=1, max_length=7000)
+    date_counts: tuple[FactorSourceDateCount, ...] = Field(min_length=1, max_length=4096)
+    counts: tuple[FactorDailyFeatureCounts, ...] = Field(min_length=1, max_length=23)
+    structural_missing_rows: int = Field(ge=0)
+    rows_on_closed_dates: int = Field(ge=0)
+
+
+class _V3BaseReference(BaseModel):
+    model_config = _MODEL
+    representation: Literal["shared_parent_v1"] = "shared_parent_v1"
+    schema_version: Literal[1, 2]
+    sha256: str = Field(pattern=_SHA)
+    read_mode: Literal["descriptor", "in_place"]
+    observed_at: datetime
+    completed_read_at: datetime
+
+
+def _validate_v3_wire(model: type[BaseModel], value: object, info: ValidationInfo) -> BaseModel:
+    if info.mode == "json":
+        return model.model_validate_json(TypeAdapter(object).dump_json(value))
+    return model.model_validate(value)
+
+
+def _scope_row_codes(rows: tuple[object, ...], info: ValidationInfo) -> tuple[StockCode, ...]:
+    scope = info.data.get("scope")
+    if not isinstance(scope, FactorComputationScope) or len(rows) != len(scope.stock_codes):
+        raise ValueError("compact rows differ from the complete validated code scope")
+    return scope.stock_codes
+
+
 class FactorDailyFeatureSources(BaseModel):
     """The actual dependency subset, omitted entirely for original six-field definitions."""
 
@@ -362,15 +451,191 @@ class FactorDailyFeatureSource(BaseModel):
     stock_features: FactorStockFeatureReceipt | None = Field(
         default=None, exclude_if=lambda v: v is None
     )
-    base_daily_source: FactorDailyFeatureSource | None = Field(
-        default=None, exclude_if=lambda v: v is None
-    )
     source_read_boundary: Literal["single_snapshot_transaction"] = "single_snapshot_transaction"
     read_mode: Literal["descriptor", "in_place"]
     observed_at: datetime
     completed_read_at: datetime
     tables: tuple[FactorDailyFeatureTable, ...] = Field(min_length=1, max_length=3)
     sha256: str = Field(pattern=_SHA)
+
+    # Its wire reference uses the already validated shared fields and tables.
+    base_daily_source: FactorDailyFeatureSource | None = Field(
+        default=None, exclude_if=lambda v: v is None
+    )
+
+    @field_validator(
+        "technical_history",
+        mode="before",
+        json_schema_input_type=FactorTechnicalHistoryReceipt | _V3TechnicalReceipt | None,
+    )
+    @classmethod
+    def _expand_technical_wire(cls, value: object, info: ValidationInfo) -> object:
+        if isinstance(value, dict) and "code_format" in value:
+            if info.data.get("schema_version") != 3:
+                raise ValueError("compact technical receipt requires a v3 source")
+            wire = _validate_v3_wire(_V3TechnicalReceipt, value, info)
+            expanded = wire.model_dump(exclude={"code_format", "codes"})
+            expanded["codes"] = tuple(
+                FactorTechnicalHistoryCode(
+                    stock_code=code,
+                    **dict(
+                        zip(tuple(FactorTechnicalHistoryCode.model_fields)[1:], row, strict=True)
+                    ),
+                )
+                for code, row in zip(_scope_row_codes(wire.codes, info), wire.codes, strict=True)
+            )
+            return FactorTechnicalHistoryReceipt.model_validate(expanded)
+        if value is not None and info.mode == "json":
+            return _validate_v3_wire(FactorTechnicalHistoryReceipt, value, info)
+        return value
+
+    @field_validator(
+        "stock_features",
+        mode="before",
+        json_schema_input_type=FactorStockFeatureReceipt | _V3StockReceipt | None,
+    )
+    @classmethod
+    def _expand_stock_wire(cls, value: object, info: ValidationInfo) -> object:
+        if isinstance(value, dict) and "code_format" in value:
+            if info.data.get("schema_version") != 3:
+                raise ValueError("compact stock receipt requires a v3 source")
+            wire = _validate_v3_wire(_V3StockReceipt, value, info)
+            expanded = wire.model_dump(exclude={"code_format", "codes"})
+            expanded["codes"] = tuple(
+                FactorStockFeatureCode(
+                    stock_code=code,
+                    **dict(zip(tuple(FactorStockFeatureCode.model_fields)[1:], row, strict=True)),
+                )
+                for code, row in zip(_scope_row_codes(wire.codes, info), wire.codes, strict=True)
+            )
+            return FactorStockFeatureReceipt.model_validate(expanded)
+        if value is not None and info.mode == "json":
+            return _validate_v3_wire(FactorStockFeatureReceipt, value, info)
+        return value
+
+    @field_validator(
+        "tables",
+        mode="before",
+        json_schema_input_type=tuple[FactorDailyFeatureTable | _V3Table, ...],
+    )
+    @classmethod
+    def _expand_tables_wire(cls, value: object, info: ValidationInfo) -> object:
+        if not isinstance(value, (list, tuple)):
+            return value
+        tables = []
+        for table in value:
+            if isinstance(table, dict) and "code_counts_format" in table:
+                if info.data.get("schema_version") != 3:
+                    raise ValueError("compact table counts require a v3 source")
+                wire = _validate_v3_wire(_V3Table, table, info)
+                expanded = wire.model_dump(exclude={"code_counts_format", "code_counts"})
+                expanded["code_counts"] = tuple(
+                    FactorSourceCodeCount(code=code, count=row[0])
+                    for code, row in zip(
+                        _scope_row_codes(wire.code_counts, info), wire.code_counts, strict=True
+                    )
+                )
+                table = FactorDailyFeatureTable.model_validate(expanded)
+            elif info.mode == "json":
+                table = _validate_v3_wire(FactorDailyFeatureTable, table, info)
+            tables.append(table)
+        return tuple(tables) if info.mode == "json" or isinstance(value, tuple) else value
+
+    @field_validator(
+        "base_daily_source",
+        mode="before",
+        json_schema_input_type="FactorDailyFeatureSource | _V3BaseReference | None",
+    )
+    @classmethod
+    def _expand_base_wire(cls, value: object, info: ValidationInfo) -> object:
+        if isinstance(value, dict) and "representation" in value:
+            if info.data.get("schema_version") != 3:
+                raise ValueError("shared base reference requires a v3 source")
+            reference = _validate_v3_wire(_V3BaseReference, value, info)
+            derived = reference.schema_version == 2
+            required = (
+                "prepared_source_sha256",
+                "prepared_snapshot_id",
+                "prepared_binding_hash",
+                "scope_content_hash",
+                "scope",
+                "generation",
+                "code_commit",
+                "calendar_open_days",
+                "tables",
+            )
+            if any(key not in info.data for key in required):
+                raise ValueError("shared base reference has an invalid parent")
+            shared = {key: info.data[key] for key in required[:-1]}
+            shared.update(
+                reference.model_dump(exclude={"representation"}),
+                fields=DERIVED_DAILY_FIELDS if derived else STORED_DAILY_FIELDS,
+                value_semantics="history_derived" if derived else "stored_not_recomputed",
+                price_basis="observation_factor_then_output_session_scale"
+                if derived
+                else "unverified",
+                recursive_initialization="first_valid_observation_no_restart"
+                if derived
+                else "unverified",
+                tables=info.data["tables"][:-1],
+            )
+            if derived:
+                shared["technical_history"] = info.data.get("technical_history")
+            # Validate the original v1/v2 digest before accepting the shared representation.
+            return cls.model_validate(shared)
+        if value is not None and info.mode == "json":
+            return _validate_v3_wire(cls, value, info)
+        return value
+
+    @field_serializer("technical_history", when_used="json")
+    def _technical_wire(
+        self, value: FactorTechnicalHistoryReceipt | None
+    ) -> FactorTechnicalHistoryReceipt | _V3TechnicalReceipt | None:
+        if value is None or self.schema_version != 3:
+            return value
+        fields = value.model_dump(exclude={"codes"})
+        fields["codes"] = tuple(
+            tuple(getattr(code, key) for key in tuple(FactorTechnicalHistoryCode.model_fields)[1:])
+            for code in value.codes
+        )
+        return _V3TechnicalReceipt.model_validate(fields)
+
+    @field_serializer("stock_features", when_used="json")
+    def _stock_wire(self, value: FactorStockFeatureReceipt | None) -> _V3StockReceipt | None:
+        if value is None:
+            return None
+        fields = value.model_dump(exclude={"codes"})
+        fields["codes"] = tuple(
+            tuple(getattr(code, key) for key in tuple(FactorStockFeatureCode.model_fields)[1:])
+            for code in value.codes
+        )
+        return _V3StockReceipt.model_validate(fields)
+
+    @field_serializer("tables", when_used="json")
+    def _tables_wire(
+        self, value: tuple[FactorDailyFeatureTable, ...]
+    ) -> tuple[FactorDailyFeatureTable | _V3Table, ...]:
+        if self.schema_version != 3:
+            return value
+        return tuple(
+            _V3Table(
+                **table.model_dump(exclude={"code_counts"}),
+                code_counts=tuple((code.count,) for code in table.code_counts),
+            )
+            for table in value
+        )
+
+    @field_serializer("base_daily_source", when_used="json")
+    def _base_wire(self, value: FactorDailyFeatureSource | None) -> _V3BaseReference | None:
+        if value is None:
+            return None
+        return _V3BaseReference(
+            schema_version=value.schema_version,
+            sha256=value.sha256,
+            read_mode=value.read_mode,
+            observed_at=value.observed_at,
+            completed_read_at=value.completed_read_at,
+        )
 
     @field_validator("observed_at", "completed_read_at")
     @classmethod
