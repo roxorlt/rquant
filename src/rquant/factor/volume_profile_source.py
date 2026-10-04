@@ -499,13 +499,14 @@ def _derive(
             raise ValueError("VP per-code row budget exceeded")
         minutes = pd.DataFrame(raw, columns=("trade_time", "close", "vol", "amount"))
         minutes["trade_time"] = pd.to_datetime(minutes["trade_time"])
-        factors = dict(
-            connection.execute(
+        factors = {
+            factor_date: None if pd.isna(adj_factor) else float(adj_factor)
+            for factor_date, adj_factor in connection.execute(
                 "SELECT trade_date,adj_factor FROM vp_adjustment_input "
                 "WHERE ts_code=? ORDER BY trade_date",
                 [code],
             ).fetchall()
-        )
+        }
         closes = dict(
             connection.execute(
                 "SELECT trade_date,close FROM vp_close_input WHERE ts_code=?", [code]

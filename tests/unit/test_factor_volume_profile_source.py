@@ -175,6 +175,49 @@ def test_unavailable_vp_keeps_original_reason(tmp_path: Path, sql: str, reason: 
         assert all(f.value is None and f.reason == reason for f in _batch(source, lease).facts)
 
 
+@pytest.mark.parametrize(
+    ("offset", "raw_factor", "reason", "status"),
+    (
+        (0, "NaN", "missing_reference_factor", "missing"),
+        (1, "NaN", "missing_required_factor", "missing"),
+        (0, "Infinity", "non_finite_reference_factor", "null"),
+        (1, "Infinity", "non_finite_required_factor", "null"),
+    ),
+    ids=("nan-reference", "nan-window", "infinity-reference", "infinity-window"),
+)
+def test_original_adjustment_nan_is_missing_and_infinity_remains_invalid(
+    tmp_path: Path, offset: int, raw_factor: str, reason: str, status: str
+) -> None:
+    from rquant.factor.daily_feature_source import open_factor_daily_feature_source
+    from rquant.storage.duckdb import DuckDBStore
+    from rquant.volume_profile import calculate_volume_profile_outcome
+
+    changed_date = _FIRST - timedelta(days=offset)
+    source, _, path = _source(
+        tmp_path,
+        count=3,
+        mutate=lambda c: c.execute(
+            "UPDATE adj_factor SET adj_factor=cast(? AS DOUBLE) "
+            "WHERE ts_code='000001.SZ' AND trade_date=?",
+            [raw_factor, changed_date],
+        ),
+    )
+    with DuckDBStore(path, read_only=True) as original:
+        outcome = calculate_volume_profile_outcome(
+            original, "000001.SZ", reference_date=_FIRST, lookback_days=90
+        )
+    assert outcome.profile is None and outcome.reason == reason
+    assert outcome.price_basis.unavailable_dates == (changed_date,)
+    with open_factor_daily_feature_source(source, lake_root=tmp_path / "lake") as lease:
+        facts = _batch(source, lease).facts
+        assert len(facts) == 11
+        for fact in facts:
+            assert fact.value is None and fact.status == status and fact.reason == reason
+            assert fact.volume_profile_diagnostic.unavailable_factor_dates == (changed_date,)
+    assert lease.closed and not lease._private_root.exists()
+    assert not list((tmp_path / "lake").glob(".vp-prepare-*"))
+
+
 def test_vp_input_and_output_budgets_fail_without_shrinking_the_domain(tmp_path: Path) -> None:
     module = _module()
     prepared, _ = _prepared(tmp_path)

@@ -84,3 +84,16 @@
 
 CLI 等价入口为 `python -m rquant.factor.run_entry seal-volume-profile`，参数包括 `--root`、`--prepared-source`、`--lake-root`，可选 `--base-daily-source` 和 `--volume-profile-lake-input`。
 真实计算缺少任一原件或权限时，记录具体缺口；不回退到零值、通配扫描或未来记录。
+
+## VP-FINAL-01 定向补修
+
+独立审查在 `a523247e` 发现一项诊断差异：新来源保留了 DuckDB 的 NaN，原接口先用 `pd.isna` 将它转为 `None`。
+现只在复权查询结果处恢复同样处理。NaN 参考因子保留 `missing_reference_factor`，NaN 窗口因子保留 `missing_required_factor`；11 个事实均为 `missing`，缺因日期与原接口一致。
+Infinity 仍为原来的非有限诊断和 `null` 状态。UI、算法、旧版本和容量未改。
+
+新增两项 NaN 回归及两个 Infinity 对照。修复前两项 NaN 失败，两个 Infinity 通过；修复后直接来源 20 项和原 VP 26 项共 46 项通过。
+本次 Ruff、格式和 diff 检查通过。未重复此前 115、148、704 和容量、浏览器整组。
+本次每条验证及提交命令的实际 stdout、stderr、退出码保存在 `data/verification/factor-volume-profile-20261005/repair-vp-final-01/`。
+
+旧工具输出中可见的片段已从会话恢复，并标明来源。完整原 stdout/stderr 无法从现存证据恢复；不将片段称作完整原日志，也不为补日志重跑旧门禁。
+原候选的参考资料、截图和失败记录保留。新候选仍交原审查者只复核这条 finding 及直接回归；真实资料验收仍由 root 处理。
