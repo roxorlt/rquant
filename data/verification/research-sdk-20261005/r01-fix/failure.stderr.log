@@ -1,0 +1,37 @@
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+    import runpy,sys; sys.path.insert(0,sys.argv[1]); sys.argv=sys.argv[2:]; runpy.run_path(sys.argv[0],run_name="__main__")
+                                                                             ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<frozen runpy>", line 287, in run_path
+  File "<frozen runpy>", line 98, in _run_module_code
+  File "<frozen runpy>", line 88, in _run_code
+  File "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/data/verification/research-sdk-20261005/r01-fix/restored/docs/examples/research_sdk.py", line 85, in <module>
+    main()
+    ~~~~^^
+  File "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/data/verification/research-sdk-20261005/r01-fix/restored/docs/examples/research_sdk.py", line 69, in main
+    inspect_research(
+    ~~~~~~~~~~~~~~~~^
+        source,
+        ^^^^^^^
+    ...<9 lines>...
+        display_sha256=args.display_sha256,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/data/verification/research-sdk-20261005/r01-fix/restored/docs/examples/research_sdk.py", line 38, in inspect_research
+    full = load_factor_research_artifact(artifact_root, research_sha256)
+  File "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/data/verification/research-sdk-20261005/r01-fix/restored/src/rquant/factor/result_artifact.py", line 330, in load_factor_research_artifact
+    artifact, _, _ = _load_factor_research_artifact_with_identity(root, sha256)
+                     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^
+  File "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/data/verification/research-sdk-20261005/r01-fix/restored/src/rquant/factor/result_artifact.py", line 313, in _load_factor_research_artifact_with_identity
+    artifact, _, descriptor, verified_stat = _read_verified(
+                                             ~~~~~~~~~~~~~~^
+        root_fd, f"{_PREFIX}{sha256}.json", sha256
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/data/verification/research-sdk-20261005/r01-fix/restored/src/rquant/factor/result_artifact.py", line 188, in _read_verified
+    before = _require_named_regular(root_fd, name, descriptor)
+  File "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/data/verification/research-sdk-20261005/r01-fix/restored/src/rquant/factor/result_artifact.py", line 179, in _require_named_regular
+    raise ValueError("factor artifact is not the owned single-link regular file")
+ValueError: factor artifact is not the owned single-link regular file

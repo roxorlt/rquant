@@ -1,0 +1,52 @@
+{
+  "finding": "SDK-R01",
+  "role": "implementer",
+  "native_agent": "/root/research_sdk_impl",
+  "parent": "/root",
+  "base": "b16d4ae6fe4c62360395a51c31a1f2e8e71a517b",
+  "worktree": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk",
+  "branch": "cdx/20261005-research-sdk",
+  "archive_command": [
+    "git",
+    "-c",
+    "tar.umask=0022",
+    "archive",
+    "--format=tar",
+    "b16d4ae6fe4c62360395a51c31a1f2e8e71a517b",
+    "src/rquant",
+    "docs/research-sdk.md",
+    "docs/examples/research_sdk.py",
+    "data/verification/research-sdk-20261005/demo"
+  ],
+  "archive_byte_sha256": "716423ea8e4796fbdf5fa493e2b8f45fedcd5d543845df078b96b12a123c887f",
+  "restored_root": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/data/verification/research-sdk-20261005/r01-fix/restored",
+  "source": "fresh git archive, not copied from already-chmodded original demo",
+  "restored_artifact_modes": {
+    "data/verification/research-sdk-20261005/demo/artifacts/factor-display-v1-7f4aacba90125fa05ca29d064a38e9dc632fbca01364e426e10905e8c3139a33.json": "0o644",
+    "data/verification/research-sdk-20261005/demo/artifacts/factor-research-v1-b51e119b3ce81528bfed3f82038da98473b8bf71c3ca440bd31248dd9b8e6f2d.json": "0o644"
+  },
+  "artifacts_byte_sha256": {
+    "data/verification/research-sdk-20261005/demo/artifacts/factor-display-v1-7f4aacba90125fa05ca29d064a38e9dc632fbca01364e426e10905e8c3139a33.json": "1544c6a91c804d53b5358c50b5fdf44956f7201b949d4a015446a2dd12311ba2",
+    "data/verification/research-sdk-20261005/demo/artifacts/factor-research-v1-b51e119b3ce81528bfed3f82038da98473b8bf71c3ca440bd31248dd9b8e6f2d.json": "750f1df4eea15b7655f21d2c76852bfa430827fd0b492eb775584fac14f62801"
+  },
+  "failure_command": "chmod 700 \\\n  /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/data/verification/research-sdk-20261005/r01-fix/restored/data/verification/research-sdk-20261005/demo/lake \\\n  /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/data/verification/research-sdk-20261005/r01-fix/restored/data/verification/research-sdk-20261005/demo/artifacts\nenv RQUANT_DISABLE_DOTENV=1 \\\n  /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-source-integration/.venv/bin/python -I -B -c \\\n  'import runpy,sys; sys.path.insert(0,sys.argv[1]); sys.argv=sys.argv[2:]; runpy.run_path(sys.argv[0],run_name=\"__main__\")' \\\n  /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/data/verification/research-sdk-20261005/r01-fix/restored/src \\\n  /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/data/verification/research-sdk-20261005/r01-fix/restored/docs/examples/research_sdk.py \\\n  --source /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/data/verification/research-sdk-20261005/r01-fix/restored/data/verification/research-sdk-20261005/demo/source.json \\\n  --lake-root /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/data/verification/research-sdk-20261005/r01-fix/restored/data/verification/research-sdk-20261005/demo/lake \\\n  --date 2026-07-03 --codes 000001.SZ 000007.SZ \\\n  --fields ma5 market_above_ma20_ratio_pct market_high_60d_ratio_pct \\\n  --artifact-root /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/data/verification/research-sdk-20261005/r01-fix/restored/data/verification/research-sdk-20261005/demo/artifacts \\\n  --research-sha256 b51e119b3ce81528bfed3f82038da98473b8bf71c3ca440bd31248dd9b8e6f2d \\\n  --display-sha256 7f4aacba90125fa05ca29d064a38e9dc632fbca01364e426e10905e8c3139a33\n",
+  "failure_exit_code": 1,
+  "failure_elapsed_seconds": 0.4517926669996086,
+  "failure_reader_scratch": 0,
+  "parent_resources_order": [
+    "FD",
+    "Python threads"
+  ],
+  "parent_resources_before": [
+    4,
+    1
+  ],
+  "parent_resources_after_failure": [
+    4,
+    1
+  ],
+  "all_failure_subprocesses_waited": true,
+  "python_executable": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-source-integration/.venv/bin/python",
+  "python_version": "3.13.12",
+  "old_sdk_smoke_and_native_resource_evidence_reused": true
+}

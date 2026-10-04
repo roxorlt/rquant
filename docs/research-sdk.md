@@ -42,12 +42,15 @@ with open_factor_daily_feature_source(source, lake_root=lake_root) as reader:
 
 本机已验证环境是 Python **3.13.12**，解释器为 `/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-source-integration/.venv/bin/python`。以下命令使用本次保留的合成封存样本，`-I -B` 并显式优先加载本树 `src`；不会安装或写入借用环境：
 
-复制或从 Git 恢复样本时，先将当前用户所有的 `demo/lake` 和 `demo/artifacts` 目录设为 `0700`；Git 不保留目录权限。使用本树样本的命令如下：
+复制或从 Git 恢复样本时，先将当前用户所有的 `demo/lake` 和 `demo/artifacts` 目录设为 `0700`，并将下列两份封存结果 JSON 设为 `0600`；Git 不保留这些私有权限。原产物 reader 要求文件属于当前用户、是普通单链接文件且权限为 `0600`。使用本树样本的命令如下：
 
 ```bash
 chmod 700 \
   /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/data/verification/research-sdk-20261005/demo/lake \
   /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/data/verification/research-sdk-20261005/demo/artifacts
+chmod 600 \
+  /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/data/verification/research-sdk-20261005/demo/artifacts/factor-research-v1-b51e119b3ce81528bfed3f82038da98473b8bf71c3ca440bd31248dd9b8e6f2d.json \
+  /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/data/verification/research-sdk-20261005/demo/artifacts/factor-display-v1-7f4aacba90125fa05ca29d064a38e9dc632fbca01364e426e10905e8c3139a33.json
 env RQUANT_DISABLE_DOTENV=1 \
   /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-source-integration/.venv/bin/python -I -B -c \
   'import runpy,sys; sys.path.insert(0,sys.argv[1]); sys.argv=sys.argv[2:]; runpy.run_path(sys.argv[0],run_name="__main__")' \
