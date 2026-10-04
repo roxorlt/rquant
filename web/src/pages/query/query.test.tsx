@@ -2,11 +2,13 @@ import { act, fireEvent, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { HttpResponse, http } from "msw";
 import type { Schemas } from "@/api/client";
+import { queryResultCsv } from "@/api/researchQuery";
 import { META_QUERY_KEY } from "@/api/useMeta";
 import { metaEnvelope } from "@/test/fixtures";
 import { findJargon } from "@/test/jargon";
 import { renderApp } from "@/test/render";
 import { server } from "@/test/server";
+import integerFixture from "./bigint-wire.fixture.json";
 
 const catalog: Schemas["QueryCatalogData"] = {
   available: true,
@@ -49,6 +51,106 @@ beforeEach(() => {
     ),
     http.post("*/api/v1/research/query", () => HttpResponse.json(envelope(result))),
   );
+});
+
+test("RQ-R02：真实 DuckDB 整数的 JSON 在页面与 CSV 中保持精确", async () => {
+  const parsed = JSON.parse(integerFixture.wire_json) as Schemas["QueryResult"];
+  server.use(http.post("*/api/v1/research/query", () => HttpResponse.json(envelope(parsed))));
+  const user = userEvent.setup();
+  renderApp("/query");
+  await waitFor(() => expect(screen.getByRole("button", { name: "运行" })).toBeEnabled());
+  await user.click(screen.getByRole("button", { name: "运行" }));
+  await screen.findByRole("columnheader", { name: "n" });
+  for (const value of integerFixture.expected_text)
+    expect(screen.getByText(value, { selector: "span" })).toBeVisible();
+  const expectedCsv = `n\r\n${integerFixture.expected_text
+    .map((value) => (value.startsWith("-") ? `'${value}` : value))
+    .join("\r\n")}\r\n`;
+  expect(queryResultCsv(parsed)).toBe(expectedCsv);
+});
+
+test.each(["载入 B", "另存为"])("RQ-R03：保存 A 的延迟回执不替换当前目标：%s", async (change) => {
+  const items: Schemas["SavedResearchQuery"][] = [
+    {
+      query_id: "query-a",
+      name: "查询 A",
+      sql: "SELECT 1",
+      version: 1,
+      updated_at: "2026-10-05T00:00:00Z",
+    },
+    {
+      query_id: "query-b",
+      name: "查询 B",
+      sql: "SELECT 2",
+      version: 7,
+      updated_at: "2026-10-05T00:00:00Z",
+    },
+  ];
+  let resolveFirst: (() => void) | undefined;
+  const submitted: Schemas["SaveResearchQuery"][] = [];
+  server.use(
+    http.get("*/api/v1/research/queries", () =>
+      HttpResponse.json(envelope({ available: true, items, message: "" })),
+    ),
+    http.post("*/api/v1/research/queries/save", async ({ request }) => {
+      const command = (await request.json()) as Schemas["SaveResearchQuery"];
+      submitted.push(command);
+      if (submitted.length === 1)
+        await new Promise<void>((resolve) => {
+          resolveFirst = resolve;
+        });
+      return HttpResponse.json(
+        envelope({
+          message: "",
+          receipt: {
+            command_id: command.command_id,
+            status: "succeeded",
+            enqueued_at: command.requested_at,
+            completed_at: command.requested_at,
+            result: {
+              query_id: command.query_id,
+              version: (command.expected_version ?? 0) + 1,
+              code: "saved",
+            },
+            error: null,
+          },
+        }),
+      );
+    }),
+  );
+  const user = userEvent.setup();
+  renderApp("/query");
+  await user.click(await screen.findByRole("button", { name: "查询 A" }));
+  await user.click(screen.getByRole("button", { name: "保存" }));
+  await waitFor(() => expect(resolveFirst).toBeDefined());
+  if (change === "载入 B") {
+    await user.click(screen.getByRole("button", { name: "查询 B" }));
+    expect(screen.getByRole("textbox", { name: "SQL 查询" })).toHaveValue("SELECT 2");
+  } else {
+    await user.click(screen.getByRole("button", { name: "另存为" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "SQL 查询" }), {
+      target: { value: "SELECT 3" },
+    });
+    await user.type(screen.getByRole("textbox", { name: "查询名称" }), "查询 C");
+  }
+  await act(async () => resolveFirst?.());
+  await waitFor(() => expect(screen.getByRole("button", { name: "保存" })).toBeEnabled());
+  await user.click(screen.getByRole("button", { name: "保存" }));
+  await waitFor(() => expect(submitted).toHaveLength(2));
+  expect(submitted[0]?.query_id).toBe("query-a");
+  expect(submitted[0]?.expected_version).toBe(1);
+  if (change === "载入 B") {
+    expect(submitted[1]?.query_id).toBe("query-b");
+    expect(submitted[1]?.expected_version).toBe(7);
+    expect(submitted[1]?.sql).toBe("SELECT 2");
+    expect(submitted[1]?.name).toBe("查询 B");
+  } else {
+    expect(submitted[1]?.query_id).not.toBe("query-a");
+    expect(submitted[1]?.query_id).not.toBe("query-b");
+    expect(submitted[1]?.expected_version).toBeNull();
+    expect(submitted[1]?.sql).toBe("SELECT 3");
+    expect(submitted[1]?.name).toBe("查询 C");
+  }
 });
 
 test("查询页可以用键盘运行，结果文本安全且重复列可见", async () => {

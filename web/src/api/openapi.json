@@ -14271,6 +14271,8 @@
                     "type": "string"
                   },
                   {
+                    "maximum": 9007199254740991.0,
+                    "minimum": -9007199254740991.0,
                     "type": "integer"
                   },
                   {
@@ -14391,6 +14393,7 @@
         "properties": {
           "kind": {
             "enum": [
+              "integer",
               "decimal",
               "date",
               "binary",

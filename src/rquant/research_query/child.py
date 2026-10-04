@@ -54,7 +54,9 @@ def enforce_limits(address_bytes: int, file_bytes: int, scratch: Path) -> None:
 
 
 def scalar(value: object) -> object:
-    if value is None or isinstance(value, (str, bool, int)):
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value if abs(value) <= 2**53 - 1 else {"kind": "integer", "text": str(value)}
+    if value is None or isinstance(value, (str, bool)):
         return value
     if isinstance(value, float):
         return value if math.isfinite(value) else {"kind": "nonfinite", "text": str(value)}

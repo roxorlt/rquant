@@ -6178,7 +6178,7 @@ export interface components {
              * Kind
              * @enum {string}
              */
-            kind: "decimal" | "date" | "binary" | "nonfinite" | "interval" | "structured";
+            kind: "integer" | "decimal" | "date" | "binary" | "nonfinite" | "interval" | "structured";
             /** Text */
             text: string;
         };

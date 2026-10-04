@@ -41,12 +41,14 @@ export default function QueryPage() {
   const [pending, setPending] = useState<SaveResearchQuery | null>(null);
   const [journalReady, setJournalReady] = useState(false);
   const sequence = useRef(0);
+  const loadSequence = useRef(0);
   const controller = useRef<AbortController | null>(null);
   const currentViewer = useRef(viewer);
   currentViewer.current = viewer;
 
   useEffect(() => {
     sequence.current += 1;
+    loadSequence.current += 1;
     controller.current?.abort();
     setBusy(false);
     setResult(null);
@@ -128,6 +130,11 @@ export default function QueryPage() {
             sql,
           };
     if (body === null) return;
+    const targetSequence = loadSequence.current;
+    const sameTarget =
+      loaded === null
+        ? body.expected_version == null
+        : loaded.query_id === body.query_id && loaded.version === body.expected_version;
     try {
       sessionStorage.setItem(queryJournalKey(actor), JSON.stringify(body));
     } catch {
@@ -172,7 +179,8 @@ export default function QueryPage() {
       sessionStorage.removeItem(queryJournalKey(actor));
       setPending(null);
       if (receipt.status === "succeeded") {
-        if (typeof receiptValue?.version === "number") {
+        const stillLoaded = sameTarget && targetSequence === loadSequence.current;
+        if (stillLoaded && typeof receiptValue?.version === "number") {
           setLoaded({
             query_id: body.query_id,
             name: body.name,
@@ -181,7 +189,7 @@ export default function QueryPage() {
             updated_at: receipt.completed_at ?? body.requested_at,
           });
         }
-        setSaveMessage("已保存");
+        setSaveMessage(stillLoaded ? "已保存" : "此前查询已保存");
         saved.refetch();
       } else {
         setSaveMessage(
@@ -201,6 +209,7 @@ export default function QueryPage() {
   }
 
   function load(item: SavedResearchQuery) {
+    loadSequence.current += 1;
     changeSql(item.sql);
     setName(item.name);
     setLoaded(item);
@@ -307,6 +316,7 @@ export default function QueryPage() {
                 <Button
                   size="sm"
                   onClick={() => {
+                    loadSequence.current += 1;
                     setLoaded(null);
                     changeSql(`SELECT * FROM ${table.name}\nLIMIT 100;`);
                   }}
@@ -403,6 +413,7 @@ export default function QueryPage() {
                 <Button
                   variant="ghost"
                   onClick={() => {
+                    loadSequence.current += 1;
                     setLoaded(null);
                     setName("");
                   }}

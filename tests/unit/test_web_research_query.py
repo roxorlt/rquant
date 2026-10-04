@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import threading
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -15,11 +16,18 @@ from tests.unit.test_research_query import _published
 from tests.unit.test_research_query_saved import _command, _service
 
 
-def test_complete_http_envelope_also_respects_16mib(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("large_metadata", [False, True])
+@pytest.mark.parametrize("prefix_size", [0, 2])
+def test_complete_http_envelope_keeps_bounded_partial_prefix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, large_metadata: bool, prefix_size: int
 ) -> None:
-    from rquant.research_query import QueryColumn, QueryPrivateClient, QueryResult
+    from fastapi import Request
+
+    from rquant.research_query import QueryPrivateClient, QueryResult
+    from rquant.research_query.child import encode
+    from rquant.web.envelope import ServingMeta
     from rquant.web.routes import research_query as route
+    from rquant.web.serving import serving_meta
 
     settings = WebSettings(
         serving_root=tmp_path / "serving",
@@ -29,12 +37,27 @@ def test_complete_http_envelope_also_respects_16mib(
         research_query_service_uid=99999,
         research_query_shared_gid=99999,
     )
-    value = QueryResult(
-        status="ready",
-        columns=(QueryColumn(name="value", data_type="VARCHAR"),),
-        rows=(("x" * (16 * 2**20 - 2048),),),
-        elapsed_ms=1,
+    base = {
+        "status": "ready",
+        "columns": [{"name": "value", "data_type": "VARCHAR"}],
+        "rows": [],
+        "elapsed_ms": 0,
+        "source_at": datetime(2026, 10, 5, tzinfo=UTC).isoformat(),
+        "snapshot_sha256": "a" * 64,
+        "message": "",
+    }
+    prefix = [("a" * 256,), ("b" * 256,)][:prefix_size]
+    wide_bytes = 16 * 2**20 - len(encode(base)) - 1024 - 5
+    wide_bytes -= sum(len(encode(row)) + 1 for row in prefix)
+    value = QueryResult.model_validate(
+        {
+            **base,
+            "status": "partial",
+            "rows": [*prefix, ("x" * wide_bytes,)],
+            "message": "结果超过限制，仅显示可返回的部分。",
+        }
     )
+    assert len(encode({"data": value.model_dump(mode="json")})) <= 16 * 2**20
 
     def result(*args: object, **kwargs: object) -> QueryResult:
         return value
@@ -42,10 +65,19 @@ def test_complete_http_envelope_also_respects_16mib(
     monkeypatch.setattr(QueryPrivateClient, "execute", result)
     original_meta = route._meta
 
-    def large_metadata(request):
-        return original_meta(request).model_copy(update={"detail": "y" * 4096})
+    def metadata(request: Request) -> ServingMeta:
+        if not large_metadata:
+            return original_meta(request)
+        data = serving_meta(
+            None,
+            now=datetime(2026, 10, 5, tzinfo=UTC),
+            stale_after=timedelta(seconds=600),
+            failure="来源核验失败" * 120,
+        )
+        assert len(data.detail) == 600
+        return data
 
-    monkeypatch.setattr(route, "_meta", large_metadata)
+    monkeypatch.setattr(route, "_meta", metadata)
     with ProofTestClient(create_proof_test_app(settings, background=False)) as client:
         response = client.post(
             "/api/v1/research/query",
@@ -53,7 +85,12 @@ def test_complete_http_envelope_also_respects_16mib(
             headers={"x-rquant-user": "alice", "x-rquant-csrf": "1", "origin": "http://testserver"},
         )
     assert len(response.content) <= 16 * 2**20
-    assert response.status_code == 503
+    assert response.status_code == 200
+    actual = QueryResult.model_validate(response.json()["data"])
+    assert actual.status == "partial"
+    assert actual.rows == (tuple(prefix) if large_metadata else value.rows)
+    assert actual.columns == value.columns
+    assert actual.source_at == value.source_at and actual.snapshot_sha256 == value.snapshot_sha256
 
 
 def test_query_routes_require_verified_user_role_and_csrf(tmp_path: Path) -> None:

@@ -85,9 +85,32 @@ def execute(
     except QueryAdmissionUnavailableError as exc:
         raise HTTPException(503, "查询服务暂时不可用，请稍后重试。") from exc
     result = Envelope(data=data, serving=_meta(request))
-    if len(result.model_dump_json().encode("utf-8")) > MAX_RESULT_BYTES:
+    if len(result.model_dump_json().encode("utf-8")) <= MAX_RESULT_BYTES:
+        return result
+    if data.status not in {"ready", "partial"}:
         raise HTTPException(503, "结果超过响应限制，请减少返回内容。")
-    return result
+    partial = data.model_copy(
+        update={
+            "status": "partial",
+            "rows": (),
+            "message": "结果超过响应限制，仅显示可返回的部分。",
+        }
+    )
+    bounded = Envelope(data=partial, serving=result.serving)
+    if len(bounded.model_dump_json().encode("utf-8")) > MAX_RESULT_BYTES:
+        raise HTTPException(503, "结果超过响应限制，请减少返回内容。")
+    # Include Serving metadata and typed cells when choosing the complete HTTP row prefix.
+    low, high = 0, len(data.rows)
+    while low < high:
+        count = (low + high + 1) // 2
+        candidate = Envelope(
+            data=partial.model_copy(update={"rows": data.rows[:count]}), serving=result.serving
+        )
+        if len(candidate.model_dump_json().encode("utf-8")) <= MAX_RESULT_BYTES:
+            low, bounded = count, candidate
+        else:
+            high = count - 1
+    return bounded
 
 
 @router.get("/queries", response_model=Envelope[QuerySavedList], summary="我的已保存查询")

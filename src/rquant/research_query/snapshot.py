@@ -87,6 +87,8 @@ def verify_public_schema(connection: object) -> None:
         "SELECT count(*) FROM duckdb_views() WHERE NOT internal",
         "SELECT count(*) FROM duckdb_functions() WHERE NOT internal",
         "SELECT count(*) FROM duckdb_sequences()",
+        "SELECT count(*) FROM duckdb_types() WHERE NOT internal",
+        "SELECT count(*) FROM duckdb_indexes()",
     ):
         if connection.execute(sql).fetchone()[0]:
             raise ValueError("查询快照包含额外对象")
