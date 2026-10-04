@@ -233,11 +233,14 @@ def read_factor_tracking_prefix(
             )
             if batch.daily_features is not None:
                 original = batch.daily_features
+                market = original.sources.market_temperature is not None
                 minute = original.sources.minute_features is not None
                 stock = original.sources.stock_features is not None
                 derived = original.sources.technical_history is not None or stock or minute
                 daily_semantic = (
-                    "minute-daily-fields-v1"
+                    "market-temperature-daily-fields-v1"
+                    if market
+                    else "minute-daily-fields-v1"
                     if minute
                     else "stock-daily-fields-v1"
                     if stock
@@ -282,6 +285,11 @@ def read_factor_tracking_prefix(
                 if minute:
                     daily_semantic += (
                         request.daily_feature_source.minute_features.causal_policy(),
+                    )
+                if market:
+                    daily_semantic += (
+                        original.market_values,
+                        request.daily_feature_source.market_temperature.causal_policy(),
                     )
                 semantic += (daily_semantic,)
                 del original

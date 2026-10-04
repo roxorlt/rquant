@@ -16,12 +16,14 @@ from pydantic import BaseModel
 from rquant.factor.daily_feature_source import (
     FactorDailyFeaturePrepareRequest,
     FactorDailyFeatureSource,
+    FactorMarketTemperaturePrepareRequest,
     FactorMinuteFeaturePrepareRequest,
     FactorStockFeaturePrepareRequest,
     prepare_factor_daily_feature_source,
 )
 from rquant.factor.industry_source import FactorIndustrySource
 from rquant.factor.market_cap_source import FactorMarketCapSource
+from rquant.factor.market_temperature_source import prepare_factor_market_temperature_source
 from rquant.factor.member_archive import _read_file
 from rquant.factor.minute_feature_source import prepare_factor_minute_feature_source
 from rquant.factor.neutralization_context import (
@@ -84,6 +86,7 @@ def main(argv: list[str] | None = None) -> int:
             "seal-technical-history",
             "seal-stock-features",
             "seal-minute-features",
+            "seal-market-temperature",
             "worker",
             "serve",
         ),
@@ -112,11 +115,24 @@ def main(argv: list[str] | None = None) -> int:
         "seal-technical-history",
         "seal-stock-features",
         "seal-minute-features",
+        "seal-market-temperature",
     ):
         if args.prepared_source is None or args.lake_root is None:
             parser.error("必须提供实际行情准备包和私有数据根")
         prepared = _input(args.prepared_source, FactorPreparedStreamSource, 16 * 1024 * 1024)
-        if args.action == "seal-minute-features":
+        if args.action == "seal-market-temperature":
+            base = (
+                None
+                if args.base_daily_source is None
+                else _input(args.base_daily_source, FactorDailyFeatureSource, 16 * 1024 * 1024)
+            )
+            source = prepare_factor_market_temperature_source(
+                FactorMarketTemperaturePrepareRequest(
+                    prepared_source=prepared, base_daily_source=base
+                ),
+                lake_root=args.lake_root,
+            )
+        elif args.action == "seal-minute-features":
             base = (
                 None
                 if args.base_daily_source is None

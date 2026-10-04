@@ -168,6 +168,14 @@ class FactorFormulaStreamRequest(BaseModel):
                 industry_available=industry,
                 market_cap_available=cap,
                 daily_features_available=self.sources.daily_features is not None,
+                market_temperature_available=self.sources.daily_features is not None
+                and self.sources.daily_features.market_temperature is not None,
+                market_temperature_base_daily_available=self.sources.daily_features is not None
+                and self.sources.daily_features.market_temperature is not None
+                and any(
+                    f.table in ("daily_indicator", "daily_basic")
+                    for f in self.sources.daily_features.fields
+                ),
                 minute_features_available=self.sources.daily_features is not None
                 and self.sources.daily_features.minute_features is not None,
                 minute_base_daily_available=self.sources.daily_features is not None
@@ -195,7 +203,10 @@ class FactorFormulaStreamRequest(BaseModel):
                     }
                 )
                 if self.sources.daily_features is not None
-                and self.sources.daily_features.minute_features is not None
+                and (
+                    self.sources.daily_features.minute_features is not None
+                    or self.sources.daily_features.market_temperature is not None
+                )
                 else self.definition
             )
             from rquant.factor.capability import HISTORICAL_DAILY_V1
@@ -261,7 +272,7 @@ class FactorFormulaStreamBatch(BaseModel):
     sources: FactorFormulaStreamSources
     universe: FactorUniverseRequest
     feature_points: tuple[FactorFormulaFeaturePoint, ...] = Field(
-        max_length=MAX_UNIVERSE_SECURITIES * 56
+        max_length=MAX_UNIVERSE_SECURITIES * 58
     )
     context: FactorNeutralizationDayBatch | None = Field(
         default=None, exclude_if=lambda v: v is None
@@ -596,10 +607,12 @@ def _checked_day(
         stored_points = {
             (row.stock_code, field.column): value
             for row in stored.rows
-            for field, value in zip(stored.sources.fields, row.values, strict=True)
+            for field, value in zip(stored.stock_fields, row.values, strict=True)
         }
         for point in batch.feature_points:
-            value = stored_points.get((point.stock_code, point.column))
+            value = stored_points.get((point.stock_code, point.column)) or stored.market_value(
+                point.column
+            )
             if value is not None and (
                 point.value != value.value
                 or point.state

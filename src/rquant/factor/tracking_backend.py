@@ -90,6 +90,8 @@ class FactorTrackingPageControlBackend:
                         stock_base_daily_available=True,
                         minute_features_available=True,
                         minute_base_daily_available=True,
+                        market_temperature_available=True,
+                        market_temperature_base_daily_available=True,
                     ).fields
                     if field.column not in ("open", "high", "low", "close", "vol", "amount")
                     and field.column in record.definition.dependency_columns

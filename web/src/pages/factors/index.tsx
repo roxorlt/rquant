@@ -25,6 +25,7 @@ import {
   Tip,
 } from "@/ui";
 import { FactorEditor, type FactorEditorDraft } from "./FactorEditor";
+import { factorFieldName } from "./FactorFieldInfo";
 import { FactorResults } from "./FactorResults";
 import { FactorRunConfirmation, FactorRunParameters, FactorRunStatus } from "./FactorRun";
 import {
@@ -850,7 +851,31 @@ export default function FactorsPage() {
                     </div>
                     <div>
                       <dt>使用字段</dt>
-                      <dd>{selected.dependency_columns.join("、") || "无"}</dd>
+                      <dd>
+                        {selected.dependency_columns.some(
+                          (column) =>
+                            column === "market_high_60d_ratio_pct" ||
+                            column === "market_above_ma20_ratio_pct",
+                        ) ? (
+                          <Tip
+                            content={selected.dependency_columns
+                              .map((column) => {
+                                const field =
+                                  capabilities.serving?.generation_id === currentGeneration
+                                    ? capabilities.data?.fields.find(
+                                        (item) => item.column === column,
+                                      )
+                                    : undefined;
+                                return field ? factorFieldName(field) : column;
+                              })
+                              .join("、")}
+                          >
+                            {selected.dependency_columns.length} 项
+                          </Tip>
+                        ) : (
+                          selected.dependency_columns.join("、") || "无"
+                        )}
+                      </dd>
                     </div>
                   </dl>
                   <div className="factor-expression">

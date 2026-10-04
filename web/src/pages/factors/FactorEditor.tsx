@@ -111,6 +111,7 @@ export function FactorEditor({
   const comparisonOpen = comparedVersion === currentVersionKey && currentDefinition !== null;
   const fields = capabilities?.fields ?? [];
   const hasMinute = fields.some((field) => field.value_semantics === "minute_features_derived");
+  const hasMarket = fields.some((field) => field.value_semantics === "market_temperature_stored");
   const search = fieldSearch.trim().toLocaleLowerCase();
   const visibleFields = search
     ? fields.filter((field) =>
@@ -121,6 +122,30 @@ export function FactorEditor({
     : allFields
       ? fields
       : fields.slice(0, 6);
+  const groups = hasMarket
+    ? [
+        {
+          label: "日线",
+          fields: visibleFields.filter(
+            (field) =>
+              field.value_semantics !== "market_temperature_stored" &&
+              field.value_semantics !== "minute_features_derived",
+          ),
+        },
+        {
+          label: "分钟",
+          fields: visibleFields.filter(
+            (field) => field.value_semantics === "minute_features_derived",
+          ),
+        },
+        {
+          label: "市场温度",
+          fields: visibleFields.filter(
+            (field) => field.value_semantics === "market_temperature_stored",
+          ),
+        },
+      ].filter((group) => group.fields.length)
+    : [{ label: null, fields: visibleFields }];
   return (
     <SideDrawer
       open={open}
@@ -258,7 +283,7 @@ export function FactorEditor({
           </label>
         </div>
         <div className="factor-editor-help">
-          <span>{hasMinute ? "字段" : "日线字段"}</span>
+          <span>{hasMinute || hasMarket ? "字段" : "日线字段"}</span>
           <div className="factor-editor-field-tools">
             <Tip
               content={
@@ -284,7 +309,7 @@ export function FactorEditor({
         <input
           className="inp factor-editor-search"
           type="search"
-          aria-label={hasMinute ? "搜索字段" : "搜索日线字段"}
+          aria-label={hasMinute || hasMarket ? "搜索字段" : "搜索日线字段"}
           placeholder="按中文名搜索字段"
           value={fieldSearch}
           maxLength={64}
@@ -293,30 +318,35 @@ export function FactorEditor({
             if (event.key === "Enter") event.preventDefault();
           }}
         />
-        <div className="factor-editor-fields">
-          {visibleFields.map((field) => (
-            <div className="factor-editor-field-choice" key={field.column}>
-              <Button
-                size="sm"
-                aria-label={`插入${factorFieldName(field)}`}
-                disabled={busy || !canSave}
-                onClick={() => insertField(field.column)}
-              >
-                {factorFieldName(field)}
-              </Button>
-              <Tip content={<FactorFieldInfo field={field} />} interactive>
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  aria-label={`${factorFieldName(field)}说明`}
-                  className="factor-editor-field-info"
-                >
-                  <span aria-hidden="true">ⓘ</span>
-                </Button>
-              </Tip>
+        {groups.map((group) => (
+          <fieldset key={group.label ?? "daily"} className="factor-editor-field-group">
+            {group.label ? <legend>{group.label}</legend> : null}
+            <div className="factor-editor-fields">
+              {group.fields.map((field) => (
+                <div className="factor-editor-field-choice" key={field.column}>
+                  <Button
+                    size="sm"
+                    aria-label={`插入${factorFieldName(field)}`}
+                    disabled={busy || !canSave}
+                    onClick={() => insertField(field.column)}
+                  >
+                    {factorFieldName(field)}
+                  </Button>
+                  <Tip content={<FactorFieldInfo field={field} />} interactive>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      aria-label={`${factorFieldName(field)}说明`}
+                      className="factor-editor-field-info"
+                    >
+                      <span aria-hidden="true">ⓘ</span>
+                    </Button>
+                  </Tip>
+                </div>
+              ))}
             </div>
-          ))}
-        </div>
+          </fieldset>
+        ))}
         {fields.length === 0 ? (
           <p className="factor-editor-note" role="status">
             字段暂时无法核对，请刷新后再插入。

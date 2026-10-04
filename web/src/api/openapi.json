@@ -3583,7 +3583,8 @@
                   "stored_not_recomputed",
                   "history_derived",
                   "stock_features_derived",
-                  "minute_features_derived"
+                  "minute_features_derived",
+                  "market_temperature_stored"
                 ],
                 "type": "string"
               },
@@ -5187,7 +5188,8 @@
               "daily_stored_v1",
               "daily_derived_v1",
               "daily_stock_v1",
-              "daily_minute_v1"
+              "daily_minute_v1",
+              "daily_market_temperature_v1"
             ],
             "title": "Version",
             "type": "string"
@@ -5321,9 +5323,24 @@
                   "signal_amount_accel_10m"
                 ],
                 "type": "string"
+              },
+              {
+                "enum": [
+                  "market_high_60d_ratio_pct",
+                  "market_above_ma20_ratio_pct"
+                ],
+                "type": "string"
               }
             ],
             "title": "Column"
+          },
+          "market_reasons": {
+            "items": {
+              "$ref": "#/components/schemas/FactorDailyFeatureReasonCount"
+            },
+            "maxItems": 4,
+            "title": "Market Reasons",
+            "type": "array"
           },
           "minute_reasons": {
             "items": {
@@ -5393,10 +5410,26 @@
             "items": {
               "$ref": "#/components/schemas/FactorDailyFeatureCounts"
             },
-            "maxItems": 50,
+            "maxItems": 52,
             "minItems": 1,
             "title": "Counts",
             "type": "array"
+          },
+          "market_temperature_values": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/FactorMarketTemperatureDayValue"
+                },
+                "maxItems": 2,
+                "minItems": 1,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Market Temperature Values"
           },
           "panel_date": {
             "format": "date",
@@ -5469,6 +5502,15 @@
                   "undefined_statistic"
                 ],
                 "type": "string"
+              },
+              {
+                "enum": [
+                  "missing_market_temperature",
+                  "market_temperature_null",
+                  "market_temperature_non_finite",
+                  "invalid_market_percentage"
+                ],
+                "type": "string"
               }
             ],
             "title": "Reason"
@@ -5494,10 +5536,20 @@
             "items": {
               "$ref": "#/components/schemas/FactorDailyStoredField"
             },
-            "maxItems": 50,
+            "maxItems": 52,
             "minItems": 1,
             "title": "Fields",
             "type": "array"
+          },
+          "market_temperature": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FactorMarketTemperatureSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "minute_features": {
             "anyOf": [
@@ -5585,7 +5637,8 @@
               "stored_not_recomputed",
               "history_derived",
               "stock_features_derived",
-              "minute_features_derived"
+              "minute_features_derived",
+              "market_temperature_stored"
             ],
             "title": "Value Semantics",
             "type": "string"
@@ -5672,6 +5725,13 @@
                   "signal_amount_accel_10m"
                 ],
                 "type": "string"
+              },
+              {
+                "enum": [
+                  "market_high_60d_ratio_pct",
+                  "market_above_ma20_ratio_pct"
+                ],
+                "type": "string"
               }
             ],
             "title": "Column"
@@ -5689,7 +5749,8 @@
               "daily_indicator",
               "daily_basic",
               "daily_stock_feature",
-              "daily_minute_feature"
+              "daily_minute_feature",
+              "market_temperature_daily"
             ],
             "title": "Table",
             "type": "string"
@@ -5715,7 +5776,8 @@
                 "enum": [
                   "history_derived",
                   "stock_features_derived",
-                  "minute_features_derived"
+                  "minute_features_derived",
+                  "market_temperature_stored"
                 ],
                 "type": "string"
               },
@@ -6418,6 +6480,242 @@
           "count"
         ],
         "title": "FactorIndustryMissingCount",
+        "type": "object"
+      },
+      "FactorMarketTemperatureDayValue": {
+        "additionalProperties": false,
+        "properties": {
+          "column": {
+            "enum": [
+              "market_high_60d_ratio_pct",
+              "market_above_ma20_ratio_pct"
+            ],
+            "title": "Column",
+            "type": "string"
+          },
+          "diagnostic": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FactorStockFeatureDiagnostic"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "minute_diagnostic": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FactorMinuteFeatureDiagnostic"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "non_finite_value": {
+            "anyOf": [
+              {
+                "enum": [
+                  "NaN",
+                  "Infinity",
+                  "-Infinity"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Non Finite Value"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "missing_market_temperature",
+                  "market_temperature_null",
+                  "market_temperature_non_finite",
+                  "invalid_market_percentage"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "status": {
+            "enum": [
+              "valid",
+              "missing",
+              "null",
+              "non_finite"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "value": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Value"
+          }
+        },
+        "required": [
+          "status",
+          "value",
+          "column"
+        ],
+        "title": "FactorMarketTemperatureDayValue",
+        "type": "object"
+      },
+      "FactorMarketTemperaturePolicy": {
+        "additionalProperties": false,
+        "properties": {
+          "evaluation_clock": {
+            "const": "previous_complete_sse_session_at_next_day_09:25",
+            "default": "previous_complete_sse_session_at_next_day_09:25",
+            "title": "Evaluation Clock",
+            "type": "string"
+          },
+          "history_mode": {
+            "const": "retrospective_no_row_first_observed_time",
+            "default": "retrospective_no_row_first_observed_time",
+            "title": "History Mode",
+            "type": "string"
+          },
+          "maximum_percentage": {
+            "const": 100,
+            "default": 100,
+            "title": "Maximum Percentage",
+            "type": "integer"
+          },
+          "minimum_percentage": {
+            "const": 0,
+            "default": 0,
+            "title": "Minimum Percentage",
+            "type": "integer"
+          },
+          "missing_policy": {
+            "const": "explicit_reason_no_zero_or_neighbor_fallback",
+            "default": "explicit_reason_no_zero_or_neighbor_fallback",
+            "title": "Missing Policy",
+            "type": "string"
+          },
+          "source_table": {
+            "const": "market_sentiment_daily",
+            "default": "market_sentiment_daily",
+            "title": "Source Table",
+            "type": "string"
+          },
+          "unit": {
+            "const": "percent",
+            "default": "percent",
+            "title": "Unit",
+            "type": "string"
+          },
+          "universe": {
+            "const": "original_market_no_pool_recalculation",
+            "default": "original_market_no_pool_recalculation",
+            "title": "Universe",
+            "type": "string"
+          },
+          "version": {
+            "const": "market-temperature-original-daily-v1",
+            "default": "market-temperature-original-daily-v1",
+            "title": "Version",
+            "type": "string"
+          }
+        },
+        "title": "FactorMarketTemperaturePolicy",
+        "type": "object"
+      },
+      "FactorMarketTemperatureSummary": {
+        "additionalProperties": false,
+        "properties": {
+          "input_content_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Input Content Sha256",
+            "type": "string"
+          },
+          "policy": {
+            "$ref": "#/components/schemas/FactorMarketTemperaturePolicy"
+          },
+          "row_count": {
+            "maximum": 4096.0,
+            "minimum": 0.0,
+            "title": "Row Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "policy",
+          "row_count",
+          "input_content_sha256"
+        ],
+        "title": "FactorMarketTemperatureSummary",
+        "type": "object"
+      },
+      "FactorMinuteFeatureDiagnostic": {
+        "additionalProperties": false,
+        "properties": {
+          "current_day_observations": {
+            "maximum": 300000.0,
+            "minimum": 0.0,
+            "title": "Current Day Observations",
+            "type": "integer"
+          },
+          "historical_days": {
+            "maximum": 20.0,
+            "minimum": 0.0,
+            "title": "Historical Days",
+            "type": "integer"
+          },
+          "panel_time": {
+            "format": "date-time",
+            "title": "Panel Time",
+            "type": "string"
+          },
+          "regular_prior_observations": {
+            "maximum": 300000.0,
+            "minimum": 0.0,
+            "title": "Regular Prior Observations",
+            "type": "integer"
+          },
+          "same_clock_days": {
+            "maximum": 20.0,
+            "minimum": 0.0,
+            "title": "Same Clock Days",
+            "type": "integer"
+          },
+          "selected_history_days": {
+            "maximum": 20.0,
+            "minimum": 0.0,
+            "title": "Selected History Days",
+            "type": "integer"
+          },
+          "target_present": {
+            "title": "Target Present",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "panel_time",
+          "target_present",
+          "current_day_observations",
+          "selected_history_days",
+          "historical_days",
+          "same_clock_days",
+          "regular_prior_observations"
+        ],
+        "title": "FactorMinuteFeatureDiagnostic",
         "type": "object"
       },
       "FactorMinuteFeaturePolicy": {
@@ -7595,6 +7893,79 @@
           "expression"
         ],
         "title": "FactorSaveDraft",
+        "type": "object"
+      },
+      "FactorStockFeatureDiagnostic": {
+        "additionalProperties": false,
+        "description": "The kernel's per-window outcome without repeating every valid factor ratio.",
+        "properties": {
+          "actual_observations": {
+            "maximum": 250.0,
+            "minimum": 0.0,
+            "title": "Actual Observations",
+            "type": "integer"
+          },
+          "available": {
+            "title": "Available",
+            "type": "boolean"
+          },
+          "feature_family": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Feature Family",
+            "type": "string"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "missing_reference_factor",
+                  "non_finite_reference_factor",
+                  "non_positive_reference_factor",
+                  "missing_required_factor",
+                  "non_finite_required_factor",
+                  "non_positive_required_factor"
+                ],
+                "type": "string"
+              },
+              {
+                "enum": [
+                  "missing_daily_data",
+                  "insufficient_history",
+                  "undefined_statistic"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "unavailable_dates": {
+            "default": [],
+            "items": {
+              "format": "date",
+              "type": "string"
+            },
+            "maxItems": 250,
+            "title": "Unavailable Dates",
+            "type": "array"
+          },
+          "window_days": {
+            "maximum": 250.0,
+            "minimum": 1.0,
+            "title": "Window Days",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "feature_family",
+          "window_days",
+          "actual_observations",
+          "available"
+        ],
+        "title": "FactorStockFeatureDiagnostic",
         "type": "object"
       },
       "FactorStockFeaturePolicy": {
