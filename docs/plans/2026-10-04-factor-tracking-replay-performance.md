@@ -10,7 +10,7 @@
 因子研究模块仍是部分完成，尚未发布到线上。
 
 下一步建议使用固定测试副本。
-[固定测试副本方案](2026-10-04-factor-proof-immutable-replica-proposal.md)等待你确认。
+[固定测试副本方案](2026-10-04-factor-proof-immutable-replica-proposal.md)已获确认，正在执行。
 决策内容直接在会话中展示。
 
 ## 修复前的测试结果
