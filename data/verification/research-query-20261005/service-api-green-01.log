@@ -1,0 +1,113 @@
+============================= test session starts ==============================
+platform darwin -- Python 3.13.12, pytest-9.0.3, pluggy-1.6.0
+rootdir: /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk
+configfile: pyproject.toml
+plugins: mock-3.15.1, anyio-4.13.0
+collected 4 items
+
+tests/unit/test_research_query_service.py FF                             [ 50%]
+tests/unit/test_web_research_query.py F.                                 [100%]
+
+=================================== FAILURES ===================================
+_________ test_actual_uds_catalog_save_recovery_and_endpoint_identity __________
+
+tmp_path = PosixPath('/private/var/folders/d8/tklkkr6x3gl8y8drmfrnmztm0000gp/T/pytest-of-roxor/pytest-28/test_actual_uds_catalog_save_r0')
+
+    def test_actual_uds_catalog_save_recovery_and_endpoint_identity(tmp_path: Path) -> None:
+        api = _api()
+        snapshot, _, _, _ = _published(tmp_path)
+        executor = api.QueryExecutor(snapshot, tmp_path / "scratch")
+        control = _service(tmp_path / "control")
+        with TemporaryDirectory(prefix="rq-uds-", dir="/private/tmp" if Path("/private/tmp").is_dir() else "/tmp") as directory:
+            parent = Path(directory)
+            os.chmod(parent, 0o710)
+            path = parent / "query.sock"
+>           server = api.QueryPrivateServer(path, executor=executor, allowed_users=frozenset({"alice"}), trusted_web_uid=os.geteuid(), shared_gid=os.getegid())
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/unit/test_research_query_service.py:33: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <rquant.research_query.service.QueryPrivateServer object at 0x11f8ac1a0>
+socket_path = PosixPath('/private/tmp/rq-uds-4__0bo8x/query.sock')
+
+    def __init__(self, socket_path: Path, *, allowed_users: frozenset[str], trusted_web_uid: int, shared_gid: int, executor: QueryExecutor | None = None, control: PageControlService | None = None) -> None:
+        if (executor is None) == (control is None) or not allowed_users or len(allowed_users) > 16 or trusted_web_uid < 0 or shared_gid < 0:
+            raise ValueError("one explicit query or save role and trusted users are required")
+        _validate_socket_path(socket_path)
+        parent = socket_path.parent.lstat()
+        if not stat.S_ISDIR(parent.st_mode) or parent.st_uid != os.geteuid() or parent.st_gid != shared_gid or stat.S_IMODE(parent.st_mode) != 0o710:
+>           raise ValueError("private query directory permissions are invalid")
+E           ValueError: private query directory permissions are invalid
+
+src/rquant/research_query/service.py:88: ValueError
+____________ test_wrong_peer_is_rejected_before_any_request_is_read ____________
+
+tmp_path = PosixPath('/private/var/folders/d8/tklkkr6x3gl8y8drmfrnmztm0000gp/T/pytest-of-roxor/pytest-28/test_wrong_peer_is_rejected_be0')
+
+    def test_wrong_peer_is_rejected_before_any_request_is_read(tmp_path: Path) -> None:
+        api = _api()
+        control = _service(tmp_path)
+        with TemporaryDirectory(prefix="rq-deny-", dir="/private/tmp" if Path("/private/tmp").is_dir() else "/tmp") as directory:
+            parent = Path(directory)
+            os.chmod(parent, 0o710)
+            path = parent / "deny.sock"
+>           server = api.QueryPrivateServer(path, control=control, allowed_users=frozenset({"alice"}), trusted_web_uid=os.geteuid()+1, shared_gid=os.getegid())
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/unit/test_research_query_service.py:84: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <rquant.research_query.service.QueryPrivateServer object at 0x11f457ed0>
+socket_path = PosixPath('/private/tmp/rq-deny-u0u16z9w/deny.sock')
+
+    def __init__(self, socket_path: Path, *, allowed_users: frozenset[str], trusted_web_uid: int, shared_gid: int, executor: QueryExecutor | None = None, control: PageControlService | None = None) -> None:
+        if (executor is None) == (control is None) or not allowed_users or len(allowed_users) > 16 or trusted_web_uid < 0 or shared_gid < 0:
+            raise ValueError("one explicit query or save role and trusted users are required")
+        _validate_socket_path(socket_path)
+        parent = socket_path.parent.lstat()
+        if not stat.S_ISDIR(parent.st_mode) or parent.st_uid != os.geteuid() or parent.st_gid != shared_gid or stat.S_IMODE(parent.st_mode) != 0o710:
+>           raise ValueError("private query directory permissions are invalid")
+E           ValueError: private query directory permissions are invalid
+
+src/rquant/research_query/service.py:88: ValueError
+____________ test_query_routes_require_verified_user_role_and_csrf _____________
+
+tmp_path = PosixPath('/private/var/folders/d8/tklkkr6x3gl8y8drmfrnmztm0000gp/T/pytest-of-roxor/pytest-28/test_query_routes_require_veri0')
+
+    def test_query_routes_require_verified_user_role_and_csrf(tmp_path: Path) -> None:
+        assert "research_query_users" in WebSettings.model_fields, "query API settings are not implemented"
+        settings = WebSettings(serving_root=tmp_path / "serving", ingress_socket_path=tmp_path / "ingress" / "web.sock", research_query_users=frozenset({"alice"}), research_query_socket_path=tmp_path / "query" / "service.sock", research_query_service_uid=99999, research_query_shared_gid=99999)
+>       app = create_proof_test_app(settings, background=False)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/unit/test_web_research_query.py:17: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/support/web_proxy_identity.py:41: in create_proof_test_app
+    return create_app(configured, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/rquant/web/app.py:215: in create_app
+    configured_research_query = configured_research_query or QueryPrivateClient(settings.research_query_socket_path, expected_service_uid=settings.research_query_service_uid, shared_gid=settings.research_query_shared_gid)
+                                                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/rquant/research_query/service.py:192: in __init__
+    _validate_socket_path(socket_path)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+path = PosixPath('/private/var/folders/d8/tklkkr6x3gl8y8drmfrnmztm0000gp/T/pytest-of-roxor/pytest-28/test_query_routes_require_veri0/query/service.sock')
+
+    def _validate_socket_path(path: Path) -> None:
+        if (
+            not path.is_absolute()
+            or ".." in path.parts
+            or path.name in {"", ".", ".."}
+            or len(os.fsencode(path)) >= 100
+        ):
+>           raise ValueError("factor archive admission socket path must be short and absolute")
+E           ValueError: factor archive admission socket path must be short and absolute
+
+src/rquant/factor_definition_admission.py:283: ValueError
+=========================== short test summary info ============================
+FAILED tests/unit/test_research_query_service.py::test_actual_uds_catalog_save_recovery_and_endpoint_identity
+FAILED tests/unit/test_research_query_service.py::test_wrong_peer_is_rejected_before_any_request_is_read
+FAILED tests/unit/test_web_research_query.py::test_query_routes_require_verified_user_role_and_csrf
+========================= 3 failed, 1 passed in 2.09s ==========================

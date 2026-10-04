@@ -1,0 +1,15 @@
+src/rquant/page_control.py:1331:101: E501 Line too long (149 > 100)
+src/rquant/research_query/executor.py:141:25: SIM105 Use `contextlib.suppress(subprocess.TimeoutExpired)` instead of `try`-`except`-`pass`
+src/rquant/research_query/saved.py:82:101: E501 Line too long (256 > 100)
+src/rquant/research_query/saved.py:100:101: E501 Line too long (182 > 100)
+src/rquant/research_query/saved.py:115:101: E501 Line too long (260 > 100)
+src/rquant/research_query/service.py:43:7: N818 Exception name `QueryAdmissionRejected` should be named with an Error suffix
+src/rquant/research_query/service.py:47:7: N818 Exception name `QueryAdmissionUnavailable` should be named with an Error suffix
+src/rquant/research_query/snapshot.py:79:101: E501 Line too long (144 > 100)
+src/rquant/research_query/snapshot.py:183:101: E501 Line too long (130 > 100)
+src/rquant/research_query/snapshot.py:190:101: E501 Line too long (101 > 100)
+tests/unit/test_research_query.py:74:101: E501 Line too long (124 > 100)
+tests/unit/test_research_query_executor.py:64:101: E501 Line too long (144 > 100)
+tests/unit/test_research_query_saved.py:86:101: E501 Line too long (143 > 100)
+Found 13 errors.
+No fixes available (1 hidden fix can be enabled with the `--unsafe-fixes` option).

@@ -1,0 +1,3 @@
+tests/unit/test_research_query.py:131:5: F841 Local variable `api` is assigned to but never used
+Found 1 error.
+No fixes available (1 hidden fix can be enabled with the `--unsafe-fixes` option).

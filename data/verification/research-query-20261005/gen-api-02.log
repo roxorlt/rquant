@@ -1,0 +1,17 @@
+
+> rquant-web@0.0.0 gen:api /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/web
+> openapi-typescript src/api/openapi.json -o src/api/schema.d.ts
+
+✨ openapi-typescript 7.13.0
+file:///Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/web/node_modules/.pnpm/openapi-typescript@7.13.0_typescript@5.9.3/node_modules/openapi-typescript/dist/lib/redoc.mjs:92
+  const openapiVersion = Number.parseFloat(document.parsed.openapi);
+                                                           ^
+
+TypeError: Cannot read properties of undefined (reading 'openapi')
+    at validateAndBundle (file:///Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/web/node_modules/.pnpm/openapi-typescript@7.13.0_typescript@5.9.3/node_modules/openapi-typescript/dist/lib/redoc.mjs:92:60)
+    at async openapiTS (file:///Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/web/node_modules/.pnpm/openapi-typescript@7.13.0_typescript@5.9.3/node_modules/openapi-typescript/dist/index.mjs:40:18)
+    at async generateSchema (file:///Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/web/node_modules/.pnpm/openapi-typescript@7.13.0_typescript@5.9.3/node_modules/openapi-typescript/bin/cli.js:143:5)
+    at async main (file:///Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/web/node_modules/.pnpm/openapi-typescript@7.13.0_typescript@5.9.3/node_modules/openapi-typescript/bin/cli.js:280:20)
+
+Node.js v22.22.2
+ ELIFECYCLE  Command failed with exit code 1.

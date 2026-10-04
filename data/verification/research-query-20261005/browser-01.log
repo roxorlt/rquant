@@ -1,0 +1,48 @@
+[WebServer] (node:55323) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+[WebServer] (Use `node --trace-warnings ...` to show where the warning was created)
+
+Running 3 tests using 1 worker
+
+(node:55324) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+  ✓  1 [chromium] › e2e/research-query.spec.ts:57:3 › 查询交互、文本、CSV 与字段提示 1440px (846ms)
+  ✓  2 [chromium] › e2e/research-query.spec.ts:57:3 › 查询交互、文本、CSV 与字段提示 390px (670ms)
+  ✘  3 [chromium] › e2e/research-query.spec.ts:92:1 › 保存失联、刷新和恢复仍使用原命令 (5.5s)
+
+
+  1) [chromium] › e2e/research-query.spec.ts:92:1 › 保存失联、刷新和恢复仍使用原命令 ───────────────────────────────
+
+    Error: expect(locator).toBeVisible() failed
+
+    Locator: getByText('保存结果尚未确认，请恢复原命令。', { exact: true })
+    Expected: visible
+    Timeout: 5000ms
+    Error: element(s) not found
+
+    Call log:
+      - Expect "toBeVisible" getByText('保存结果尚未确认，请恢复原命令。', { exact: true }) with timeout 5000ms
+      - waiting for getByText('保存结果尚未确认，请恢复原命令。', { exact: true })
+
+
+      117 |   await page.getByRole("textbox", { name: "查询名称" }).fill("我的行情");
+      118 |   await page.getByRole("button", { name: "保存", exact: true }).click();
+    > 119 |   await expect(page.getByText("保存结果尚未确认，请恢复原命令。", { exact: true })).toBeVisible();
+          |                                                                     ^
+      120 |   await page.reload();
+      121 |   await expect(page.getByRole("button", { name: "恢复保存" })).toBeVisible();
+      122 |   await page.getByRole("button", { name: "恢复保存" }).click();
+        at /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/web/e2e/research-query.spec.ts:119:69
+
+    Error Context: test-results/query/research-query-保存失联、刷新和恢复仍使用原命令-chromium/error-context.md
+
+    attachment #2: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/query/research-query-保存失联、刷新和恢复仍使用原命令-chromium/trace.zip
+    Usage:
+
+        pnpm exec playwright show-trace test-results/query/research-query-保存失联、刷新和恢复仍使用原命令-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  1 failed
+    [chromium] › e2e/research-query.spec.ts:92:1 › 保存失联、刷新和恢复仍使用原命令 ────────────────────────────────
+  2 passed (7.8s)

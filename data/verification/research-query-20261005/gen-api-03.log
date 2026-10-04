@@ -1,0 +1,6 @@
+
+> rquant-web@0.0.0 gen:api /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/web
+> openapi-typescript src/api/openapi.json -o src/api/schema.d.ts
+
+✨ openapi-typescript 7.13.0
+🚀 src/api/openapi.json → src/api/schema.d.ts [165.4ms]

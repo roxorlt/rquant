@@ -1,0 +1,9 @@
+
+ RUN  v5.0.2 /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/web
+
+
+ Test Files  2 passed (2)
+      Tests  5 passed (5)
+   Start at  03:32:10
+   Duration  2.58s (tests 31%, environment 27%, import 22%, setup 13%, transform 6%)
+

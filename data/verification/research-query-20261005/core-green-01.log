@@ -1,0 +1,49 @@
+============================= test session starts ==============================
+platform darwin -- Python 3.13.12, pytest-9.0.3, pluggy-1.6.0
+rootdir: /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk
+configfile: pyproject.toml
+plugins: mock-3.15.1, anyio-4.13.0
+collected 20 items
+
+tests/unit/test_research_query.py .F..................                   [100%]
+
+=================================== FAILURES ===================================
+__________ test_full_original_database_and_extra_objects_are_rejected __________
+
+tmp_path = PosixPath('/private/var/folders/d8/tklkkr6x3gl8y8drmfrnmztm0000gp/T/pytest-of-roxor/pytest-16/test_full_original_database_an0')
+
+    def test_full_original_database_and_extra_objects_are_rejected(tmp_path: Path) -> None:
+        api = _api()
+        source = tmp_path / "original.duckdb"
+        _source(source)
+        with pytest.raises(ValueError):
+>           api.VerifiedQuerySnapshot(tmp_path)
+
+tests/unit/test_research_query.py:67: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/rquant/research_query/snapshot.py:91: in __init__
+    self.manifest_identity = file_identity(self.manifest_path, readonly=True)
+                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/rquant/research_query/snapshot.py:39: in file_identity
+    info = path.lstat()
+           ^^^^^^^^^^^^
+/Users/roxor/.local/share/uv/python/cpython-3.13.12-macos-aarch64-none/lib/python3.13/pathlib/_abc.py:437: in lstat
+    return self.stat(follow_symlinks=False)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = PosixPath('/private/var/folders/d8/tklkkr6x3gl8y8drmfrnmztm0000gp/T/pytest-of-roxor/pytest-16/test_full_original_database_an0/manifest.json')
+
+    def stat(self, *, follow_symlinks=True):
+        """
+        Return the result of the stat() system call on this path, like
+        os.stat() does.
+        """
+>       return os.stat(self, follow_symlinks=follow_symlinks)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       FileNotFoundError: [Errno 2] No such file or directory: '/private/var/folders/d8/tklkkr6x3gl8y8drmfrnmztm0000gp/T/pytest-of-roxor/pytest-16/test_full_original_database_an0/manifest.json'
+
+/Users/roxor/.local/share/uv/python/cpython-3.13.12-macos-aarch64-none/lib/python3.13/pathlib/_local.py:515: FileNotFoundError
+=========================== short test summary info ============================
+FAILED tests/unit/test_research_query.py::test_full_original_database_and_extra_objects_are_rejected
+========================= 1 failed, 19 passed in 0.45s =========================
