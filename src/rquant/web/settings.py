@@ -137,6 +137,12 @@ class WebSettings(BaseModel):
     factor_run_admission_socket_path: Path | None = None
     factor_run_admission_service_uid: StrictInt | None = None
     factor_run_admission_shared_gid: StrictInt | None = None
+    research_query_users: frozenset[str] = frozenset()
+    research_query_socket_path: Path | None = None
+    research_query_service_uid: StrictInt | None = None
+    research_query_shared_gid: StrictInt | None = None
+    research_query_save_socket_path: Path | None = None
+    research_query_save_service_uid: StrictInt | None = None
     ingress_socket_path: Path | None = None
     proxy_proof_file: Path | None = None
     log_admin_users: frozenset[str] = frozenset()
@@ -152,6 +158,61 @@ class WebSettings(BaseModel):
 
     @model_validator(mode="after")
     def validate_sources_and_ingress(self) -> Self:
+        query_fields = (
+            self.research_query_socket_path,
+            self.research_query_service_uid,
+            self.research_query_shared_gid,
+        )
+        reserved = set()
+        if self.ingress_socket_path is not None:
+            reserved.add(self.ingress_socket_path.parent)
+        for path in (
+            self.ack_admission_socket_path,
+            self.watchlist_admission_socket_path,
+            self.factor_admission_socket_path,
+            self.factor_run_admission_socket_path,
+            self.factor_tracking_admission_socket_path,
+            self.unit_log_socket_path,
+        ):
+            if path is not None:
+                reserved.add(path.parent)
+        if any(value is not None for value in query_fields) or self.research_query_users:
+            if (
+                not all(value is not None for value in query_fields)
+                or not self.research_query_users
+                or self.ingress_socket_path is None
+            ):
+                raise ValueError(
+                    "research query requires private Web ingress, socket, IDs and exact users"
+                )
+            if (
+                self.research_query_service_uid == os.geteuid()
+                or self.research_query_service_uid < 0
+                or self.research_query_shared_gid < 0
+            ):
+                raise ValueError("research query requires a distinct service UID and GID")
+            if self.research_query_socket_path.parent in reserved:
+                raise ValueError("research query needs a separate private directory")
+        if (
+            self.research_query_save_socket_path is not None
+            or self.research_query_save_service_uid is not None
+        ):
+            if (
+                self.research_query_socket_path is None
+                or self.research_query_save_socket_path is None
+                or self.research_query_save_service_uid is None
+            ):
+                raise ValueError("query save requires explicit query and private control endpoints")
+            if (
+                self.research_query_save_service_uid
+                in {os.geteuid(), self.research_query_service_uid}
+                or self.research_query_save_service_uid < 0
+            ):
+                raise ValueError("query save control requires a distinct private identity")
+            if self.research_query_save_socket_path.parent in reserved | {
+                self.research_query_socket_path.parent
+            }:
+                raise ValueError("query save needs a separate private directory")
         if (self.nl_openai_api_key is None) != (self.nl_openai_model is None):
             raise ValueError("natural-language API key and model must be configured together")
         if self.nl_openai_api_key is not None and self.ingress_socket_path is None:
@@ -337,11 +398,19 @@ class WebSettings(BaseModel):
         "factor_editor_users",
         "factor_run_users",
         "factor_tracking_users",
+        "research_query_users",
     )
     @classmethod
     def validate_operator_users(cls, value: frozenset[str]) -> frozenset[str]:
         if len(value) > 16 or any(_ADMIN_USER_PATTERN.fullmatch(user) is None for user in value):
             raise ValueError("operator users must be a bounded list of exact user names")
+        return value
+
+    @field_validator("research_query_socket_path", "research_query_save_socket_path")
+    @classmethod
+    def validate_query_socket(cls, value: Path | None) -> Path | None:
+        if value is not None and (not value.is_absolute() or ".." in value.parts):
+            raise ValueError("query private socket path must be absolute and normalized")
         return value
 
     @field_validator("formula_market_result_root", "formula_pool_daily_result_root")
@@ -427,6 +496,27 @@ class WebSettings(BaseModel):
     def from_env(cls, environ: Mapping[str, str] | None = None, *, bind: str | None = None) -> Self:
         source = os.environ if environ is None else environ
         values: dict[str, object] = {"serving_root": Path(serving_root_from_env(source))}
+        for suffix, field in (
+            ("SOCKET", "research_query_socket_path"),
+            ("SAVE_SOCKET", "research_query_save_socket_path"),
+        ):
+            raw = source.get(f"RQUANT_WEB_RESEARCH_QUERY_{suffix}", "").strip()
+            if raw:
+                values[field] = Path(raw)
+        for suffix, field in (
+            ("SERVICE_UID", "research_query_service_uid"),
+            ("SHARED_GID", "research_query_shared_gid"),
+            ("SAVE_SERVICE_UID", "research_query_save_service_uid"),
+        ):
+            raw = source.get(f"RQUANT_WEB_RESEARCH_QUERY_{suffix}", "").strip()
+            if raw:
+                values[field] = int(raw)
+        raw_users = source.get("RQUANT_WEB_RESEARCH_QUERY_USERS", "").strip()
+        if raw_users:
+            names = tuple(name.strip() for name in raw_users.split(","))
+            if any(not name for name in names) or len(set(names)) != len(names):
+                raise ValueError("query users must be exact distinct names")
+            values["research_query_users"] = frozenset(names)
         chosen_bind = bind or source.get(BIND_ENV_VAR, "").strip()
         if chosen_bind:
             values["bind"] = chosen_bind

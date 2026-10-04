@@ -75,6 +75,7 @@ from rquant.web.routes import (
     paper,
     pool_editor,
     pools,
+    research_query,
     screen,
     service_logs,
     stocks,
@@ -93,6 +94,7 @@ if TYPE_CHECKING:
     from rquant.factor_definition_admission import FactorDefinitionAdmissionClient
     from rquant.factor_run_admission import FactorRunAdmissionClient
     from rquant.factor_tracking_admission import FactorTrackingAdmissionClient
+    from rquant.research_query.service import QueryPrivateClient
     from rquant.watchlist_admission import WatchlistAdmissionClient
 
 API_TITLE = "rQuant Web API"
@@ -110,6 +112,9 @@ _WRITE_BODY_LIMITS = {
     "/api/v1/screen/tdx/market/commands": formula_market_commands.MAX_REQUEST_BYTES,
     "/api/v1/pools/formula/commands": formula_pool_save_commands.MAX_REQUEST_BYTES,
     "/api/v1/tasks/jobs/commands": tasks_controls.MAX_REQUEST_BYTES,
+    "/api/v1/research/query": research_query.MAX_REQUEST_BYTES,
+    "/api/v1/research/queries/save": research_query.MAX_REQUEST_BYTES,
+    "/api/v1/research/queries/resume": research_query.MAX_REQUEST_BYTES,
 }
 _FACTOR_ARCHIVE_WRITE = re.compile(
     r"^/api/v1/factors/definitions/[a-z][a-z0-9_]{0,63}/archive(?:/resume)?$"
@@ -148,6 +153,8 @@ class WebContext:
     audit_report_commands: AuditReportCommandGateway
     formula_market_commands: FormulaMarketCommandGateway
     lab_controls: LabControlGateway
+    research_query_client: QueryPrivateClient | None
+    research_query_save_client: QueryPrivateClient | None
 
 
 def create_app(
@@ -170,6 +177,8 @@ def create_app(
     audit_report_command_transport: AuditReportCommandTransport | None = None,
     formula_market_command_transport: FormulaMarketCommandTransport | None = None,
     lab_control_command_transport: LabControlTransport | None = None,
+    research_query_client: QueryPrivateClient | None = None,
+    research_query_save_client: QueryPrivateClient | None = None,
 ) -> FastAPI:
     """Build the app. Nothing is opened until the first request or startup."""
 
@@ -198,6 +207,22 @@ def create_app(
         lifespan=lifespan,
     )
     cursor_key = secrets.token_bytes(32)
+    configured_research_query = research_query_client
+    configured_research_query_save = research_query_save_client
+    if settings.research_query_socket_path is not None:
+        from rquant.research_query.service import QueryPrivateClient
+
+        configured_research_query = configured_research_query or QueryPrivateClient(
+            settings.research_query_socket_path,
+            expected_service_uid=settings.research_query_service_uid,
+            shared_gid=settings.research_query_shared_gid,
+        )
+        if settings.research_query_save_socket_path is not None:
+            configured_research_query_save = configured_research_query_save or QueryPrivateClient(
+                settings.research_query_save_socket_path,
+                expected_service_uid=settings.research_query_save_service_uid,
+                shared_gid=settings.research_query_shared_gid,
+            )
     screen_replica = (
         VerifiedReplicaScreenSource(
             primary_path=settings.screen_primary_path,
@@ -340,6 +365,8 @@ def create_app(
             endpoint=settings.page_control_url,
             transport=lab_control_command_transport,
         ),
+        research_query_client=configured_research_query,
+        research_query_save_client=configured_research_query_save,
     )
     app.add_middleware(GZipMiddleware, minimum_size=1024)
 
@@ -392,6 +419,10 @@ def create_app(
         request: Request,
         error: RequestValidationError,
     ) -> Response:
+        if request.url.path.startswith("/api/v1/research/"):
+            return JSONResponse(
+                status_code=422, content={"detail": "查询或保存内容有误，请检查 SQL 和名称。"}
+            )
         if request.url.path == "/api/v1/screen/tdx/preview":
             return JSONResponse(
                 status_code=422,
@@ -433,6 +464,7 @@ def create_app(
         return await request_validation_exception_handler(request, error)
 
     app.include_router(meta.router, prefix="/api/v1", tags=["meta"])
+    app.include_router(research_query.router, prefix="/api/v1", tags=["research"])
     app.include_router(overview.router, prefix="/api/v1", tags=["overview"])
     app.include_router(pools.router, prefix="/api/v1", tags=["pools"])
     private = [Depends(require_current_user)]

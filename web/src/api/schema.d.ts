@@ -888,6 +888,91 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/research/catalog": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 可用查询表 */
+        get: operations["catalog_api_v1_research_catalog_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/research/queries": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 我的已保存查询 */
+        get: operations["saved_api_v1_research_queries_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/research/queries/resume": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 恢复原保存命令 */
+        post: operations["resume_api_v1_research_queries_resume_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/research/queries/save": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 保存常用查询 */
+        post: operations["save_api_v1_research_queries_save_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/research/query": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 运行只读查询或执行计划 */
+        post: operations["execute_api_v1_research_query_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/screen/blocks": {
         parameters: {
             query?: never;
@@ -2843,6 +2928,26 @@ export interface components {
         /** Envelope[PulseData] */
         Envelope_PulseData_: {
             data: components["schemas"]["PulseData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[QueryCatalogData] */
+        Envelope_QueryCatalogData_: {
+            data: components["schemas"]["QueryCatalogData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[QueryResult] */
+        Envelope_QueryResult_: {
+            data: components["schemas"]["QueryResult"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[QuerySaveData] */
+        Envelope_QuerySaveData_: {
+            data: components["schemas"]["QuerySaveData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[QuerySavedList] */
+        Envelope_QuerySavedList_: {
+            data: components["schemas"]["QuerySavedList"];
             serving: components["schemas"]["ServingMeta"];
         };
         /** Envelope[ResearchJobsData] */
@@ -5339,6 +5444,27 @@ export interface components {
             signals: components["schemas"]["SignalsSummary"];
             unacknowledged?: components["schemas"]["UnacknowledgedSummary"];
         };
+        /** PageControlReceipt */
+        PageControlReceipt: {
+            /** Command Id */
+            command_id: string;
+            /** Completed At */
+            completed_at?: string | null;
+            /**
+             * Enqueued At
+             * Format: date-time
+             */
+            enqueued_at: string;
+            /** Error */
+            error?: string | null;
+            result?: components["schemas"]["JsonValue"] | null;
+            status: components["schemas"]["PageControlStatus"];
+        };
+        /**
+         * PageControlStatus
+         * @enum {string}
+         */
+        PageControlStatus: "pending" | "processing" | "succeeded" | "failed" | "ambiguous";
         /**
          * PageDataStatus
          * @description The Serving generation, in the owner's words (页面数据).
@@ -5944,6 +6070,133 @@ export interface components {
             /** Up Ratio Pct */
             up_ratio_pct: number | null;
         };
+        /** QueryCatalogColumn */
+        QueryCatalogColumn: {
+            /** Data Type */
+            data_type: string;
+            /** Description */
+            description: string;
+            /** Name */
+            name: string;
+        };
+        /** QueryCatalogData */
+        QueryCatalogData: {
+            /** Available */
+            available: boolean;
+            /**
+             * Message
+             * @default
+             */
+            message: string;
+            /**
+             * Save Enabled
+             * @default false
+             */
+            save_enabled: boolean;
+            /** Source At */
+            source_at?: string | null;
+            /**
+             * Tables
+             * @default []
+             */
+            tables: components["schemas"]["QueryTableInfo"][];
+        };
+        /** QueryColumn */
+        QueryColumn: {
+            /** Data Type */
+            data_type: string;
+            /** Name */
+            name: string;
+        };
+        /** QueryRequest */
+        QueryRequest: {
+            /**
+             * Mode
+             * @default query
+             * @enum {string}
+             */
+            mode: "query" | "explain";
+            /** Sql */
+            sql: string;
+        };
+        /** QueryResult */
+        QueryResult: {
+            /**
+             * Columns
+             * @default []
+             */
+            columns: components["schemas"]["QueryColumn"][];
+            /** Elapsed Ms */
+            elapsed_ms: number;
+            /**
+             * Message
+             * @default
+             */
+            message: string;
+            /**
+             * Rows
+             * @default []
+             */
+            rows: (string | number | boolean | components["schemas"]["QuerySpecialValue"] | null)[][];
+            /** Snapshot Sha256 */
+            snapshot_sha256?: string | null;
+            /** Source At */
+            source_at?: string | null;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "ready" | "partial" | "failed" | "timeout" | "unavailable" | "busy";
+        };
+        /** QuerySaveData */
+        QuerySaveData: {
+            /**
+             * Message
+             * @default
+             */
+            message: string;
+            receipt?: components["schemas"]["PageControlReceipt"] | null;
+        };
+        /** QuerySavedList */
+        QuerySavedList: {
+            /** Available */
+            available: boolean;
+            /**
+             * Items
+             * @default []
+             */
+            items: components["schemas"]["SavedResearchQuery"][];
+            /**
+             * Message
+             * @default
+             */
+            message: string;
+        };
+        /** QuerySpecialValue */
+        QuerySpecialValue: {
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "decimal" | "date" | "binary" | "nonfinite" | "interval" | "structured";
+            /** Text */
+            text: string;
+        };
+        /** QueryTableInfo */
+        QueryTableInfo: {
+            /** Columns */
+            columns: components["schemas"]["QueryCatalogColumn"][];
+            /** Earliest Date */
+            earliest_date?: string | null;
+            /** Label */
+            label: string;
+            /** Latest Date */
+            latest_date?: string | null;
+            /** Name */
+            name: string;
+            /** Row Count */
+            row_count: number;
+        };
         /** ResearchJobItem */
         ResearchJobItem: {
             /** Available Actions */
@@ -6195,6 +6448,30 @@ export interface components {
             /** Rule Calls */
             rule_calls?: components["schemas"]["EditorRuleCall"][];
         };
+        /** SaveResearchQuery */
+        SaveResearchQuery: {
+            /** Command Id */
+            command_id: string;
+            /** Expected Version */
+            expected_version?: number | null;
+            /**
+             * Kind
+             * @default save_research_query
+             * @constant
+             */
+            kind: "save_research_query";
+            /** Name */
+            name: string;
+            /** Query Id */
+            query_id: string;
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+            /** Sql */
+            sql: string;
+        };
         /** SavedCanvas */
         SavedCanvas: {
             /** Description */
@@ -6205,6 +6482,22 @@ export interface components {
             pool_keys: string[];
             /** Refs Truncated */
             refs_truncated: boolean;
+        };
+        /** SavedResearchQuery */
+        SavedResearchQuery: {
+            /** Name */
+            name: string;
+            /** Query Id */
+            query_id: string;
+            /** Sql */
+            sql: string;
+            /**
+             * Updated At
+             * Format: date-time
+             */
+            updated_at: string;
+            /** Version */
+            version: number;
         };
         /** ScheduledTaskItem */
         ScheduledTaskItem: {
@@ -8505,6 +8798,145 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_FormulaPoolMembersData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    catalog_api_v1_research_catalog_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_QueryCatalogData_"];
+                };
+            };
+        };
+    };
+    saved_api_v1_research_queries_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_QuerySavedList_"];
+                };
+            };
+        };
+    };
+    resume_api_v1_research_queries_resume_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SaveResearchQuery"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_QuerySaveData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    save_api_v1_research_queries_save_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SaveResearchQuery"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_QuerySaveData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    execute_api_v1_research_query_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["QueryRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_QueryResult_"];
                 };
             };
             /** @description Validation Error */

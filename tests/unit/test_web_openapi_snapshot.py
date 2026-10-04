@@ -54,6 +54,9 @@ def test_every_api_path_is_versioned_and_only_defined_mutations_use_post() -> No
                 "/api/v1/factors/tracking/commands",
                 "/api/v1/factors/tracking/commands/resume",
                 "/api/v1/factors/tracking/commands/retry",
+                "/api/v1/research/query",
+                "/api/v1/research/queries/save",
+                "/api/v1/research/queries/resume",
             }
             else {"get"}
         )

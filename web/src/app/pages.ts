@@ -13,6 +13,7 @@ export type PageId =
   | "screener"
   | "pools"
   | "factors"
+  | "query"
   | "strategies"
   | "backtest"
   | "experiments"
@@ -89,6 +90,14 @@ export const PAGES: readonly PageDef[] = [
     group: "研究",
     ready: true,
     summary: "查看已发布因子的当前定义。",
+  },
+  {
+    id: "query",
+    path: "/query",
+    title: "查询",
+    group: "研究",
+    ready: true,
+    summary: "写 SQL 查看行情，导出结果并保存常用查询。",
   },
   {
     id: "strategies",

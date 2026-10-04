@@ -20,6 +20,11 @@ const NAV_ICONS: Record<IconName, ReactNode> = {
     </>
   ),
   factors: <path d="M3 20.5h18M6 17V11M10.5 17V5M15 17v-7M19.5 17v-3" />,
+  query: (
+    <>
+      <path d="M8 6L3 12l5 6M16 6l5 6-5 6M14 4l-4 16" />
+    </>
+  ),
   strategies: (
     <>
       <path d="M12 3l9 5-9 5-9-5z" />

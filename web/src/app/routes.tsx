@@ -14,6 +14,7 @@ const PAGE_COMPONENTS: Record<PageId, LazyPage> = {
   screener: lazy(() => import("@/pages/screener")),
   pools: lazy(() => import("@/pages/pools")),
   factors: lazy(() => import("@/pages/factors")),
+  query: lazy(() => import("@/pages/query")),
   strategies: lazy(() => import("@/pages/strategies")),
   backtest: lazy(() => import("@/pages/backtest")),
   experiments: lazy(() => import("@/pages/experiments")),
