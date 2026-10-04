@@ -1,0 +1,16 @@
+{
+  "argv": [
+    "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-source-integration/.venv/bin/python",
+    "-I",
+    "-B",
+    "-c",
+    "import sys,pytest; sys.path.insert(0,\"/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/src\"); raise SystemExit(pytest.main([\"tests/unit/test_research_query_review.py\",\"tests/unit/test_research_query.py\",\"-k\",\"rq_r04 or forbidden_sql or legal_sql\",\"-q\"]))"
+  ],
+  "cwd": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk",
+  "started_utc": "2026-10-04T22:05:50.323763+00:00",
+  "elapsed_seconds": 0.5104789170000004,
+  "exit_code": 0,
+  "stdout_sha256": "6c74efd16a82b9020328af4bc08d255011d853272365cf4f96102bd29b009f0d",
+  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "starting_candidate": "90b61007d47bd906bb85a3e4f67521b12cdf2cbb"
+}

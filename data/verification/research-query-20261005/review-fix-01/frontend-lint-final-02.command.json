@@ -1,0 +1,18 @@
+{
+  "argv": [
+    "/opt/homebrew/bin/pnpm",
+    "exec",
+    "biome",
+    "ci",
+    "src/pages/query/index.tsx",
+    "src/pages/query/query.test.tsx",
+    "src/pages/query/bigint-wire.fixture.json"
+  ],
+  "cwd": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/web",
+  "started_utc": "2026-10-04T22:29:32.041067+00:00",
+  "elapsed_seconds": 0.2917348749979283,
+  "exit_code": 0,
+  "stdout_sha256": "536162d60ed44d5ec5e78a6fb2012ca18a62f1c9280d96c2e0532028bb18cd4c",
+  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "starting_candidate": "90b61007d47bd906bb85a3e4f67521b12cdf2cbb"
+}

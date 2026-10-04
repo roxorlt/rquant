@@ -1,0 +1,50 @@
+I001 [*] Import block is un-sorted or un-formatted
+  --> data/verification/research-query-20261005/linux-review-boundaries-r07.py:24:1
+   |
+22 |   sys.path.insert(0, str(source_root))
+23 |
+24 | / import duckdb
+25 | |
+26 | | from rquant.research_query import (
+27 | |     PUBLIC_SCHEMA,
+28 | |     QueryExecutor,
+29 | |     QueryLimits,
+30 | |     QueryRequest,
+31 | |     VerifiedQuerySnapshot,
+32 | |     build_query_snapshot,
+33 | | )
+34 | |
+35 | | from rquant.research_query.child import encode
+   | |______________________________________________^
+36 |
+37 |   record: dict[str, object] = {
+   |
+help: Organize imports
+
+SIM105 Use `contextlib.suppress(FileNotFoundError)` instead of `try`-`except`-`pass`
+  --> data/verification/research-query-20261005/linux-review-boundaries-r07.py:63:9
+   |
+61 |       result = {}
+62 |       for path in Path("/proc/self/fd").iterdir():
+63 | /         try:
+64 | |             result[path.name] = os.readlink(path)
+65 | |         except FileNotFoundError:
+66 | |             pass
+   | |________________^
+67 |       return result
+   |
+help: Replace `try`-`except`-`pass` with `with contextlib.suppress(FileNotFoundError): ...`
+
+E501 Line too long (160 > 100)
+  --> data/verification/research-query-20261005/review-fix-01/freeze_backend.py:48:101
+   |
+46 | …ng_sha256"],
+47 | …
+48 | …ies plus r06 zero-spill/capacity/source/cleanup; RQ-R01 HTTP and RQ-R03 React verified locally",
+   |                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+49 | …
+50 | …
+   |
+
+Found 3 errors.
+[*] 1 fixable with the `--fix` option (1 hidden fix can be enabled with the `--unsafe-fixes` option).

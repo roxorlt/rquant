@@ -1,0 +1,32 @@
+E402 Module level import not at top of file
+  --> data/verification/research-query-20261005/review-fix-01/generate_integer_fixture.py:13:1
+   |
+11 | sys.path.insert(0, str(worktree / "src"))
+12 |
+13 | import duckdb
+   | ^^^^^^^^^^^^^
+14 |
+15 | from rquant.research_query.child import scalar
+   |
+
+E402 Module level import not at top of file
+  --> data/verification/research-query-20261005/review-fix-01/generate_integer_fixture.py:15:1
+   |
+13 | import duckdb
+14 |
+15 | from rquant.research_query.child import scalar
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+16 | from rquant.research_query.contracts import QueryResult
+   |
+
+E402 Module level import not at top of file
+  --> data/verification/research-query-20261005/review-fix-01/generate_integer_fixture.py:16:1
+   |
+15 | from rquant.research_query.child import scalar
+16 | from rquant.research_query.contracts import QueryResult
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+17 |
+18 | values = [-(2**53 + 1), -(2**53), -(2**53 - 1), 2**53 - 1, 2**53, 2**53 + 1]
+   |
+
+Found 3 errors.

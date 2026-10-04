@@ -1,0 +1,12 @@
+
+ RUN  v5.0.2 /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/web
+
+ ❯ src/pages/query/query.test.tsx (10 tests | 2 failed | 8 skipped) 768ms
+   × RQ-R02：真实 DuckDB 整数的 JSON 在页面与 CSV 中保持精确 545ms
+   × RQ-R03：保存 A 的延迟回执不替换已载入的 B 222ms
+
+ Test Files  1 failed (1)
+      Tests  2 failed | 8 skipped (10)
+   Start at  06:02:58
+   Duration  2.73s (import 35%, tests 30%, environment 19%, setup 9%, transform 7%)
+

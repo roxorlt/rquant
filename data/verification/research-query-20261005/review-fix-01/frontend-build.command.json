@@ -1,0 +1,13 @@
+{
+  "argv": [
+    "/opt/homebrew/bin/pnpm",
+    "build"
+  ],
+  "cwd": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/web",
+  "started_utc": "2026-10-04T22:19:43.188042+00:00",
+  "elapsed_seconds": 4.278211500000907,
+  "exit_code": 0,
+  "stdout_sha256": "dc8da016a147dd62ea56458cc044e2535e10eb71bae4ed9cbb45d97c5c2cb89c",
+  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "starting_candidate": "90b61007d47bd906bb85a3e4f67521b12cdf2cbb"
+}

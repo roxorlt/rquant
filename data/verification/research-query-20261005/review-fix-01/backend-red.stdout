@@ -1,0 +1,573 @@
+============================= test session starts ==============================
+platform darwin -- Python 3.13.12, pytest-9.0.3, pluggy-1.6.0
+rootdir: /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk
+configfile: pyproject.toml
+plugins: mock-3.15.1, anyio-4.13.0
+collected 25 items
+
+tests/unit/test_research_query_review.py FF...FFFFFFF..F.FFFFF           [ 84%]
+tests/unit/test_web_research_query.py .F.F                               [100%]
+
+=================================== FAILURES ===================================
+__ test_rq_r02_actual_integer_wire_preserves_safe_boundary[-9007199254740993] __
+
+value = -9007199254740993
+
+    @pytest.mark.parametrize("value", [-(2**53 + 1), -(2**53), -1, 0, 2**53 - 1, 2**53, 2**53 + 1])
+    def test_rq_r02_actual_integer_wire_preserves_safe_boundary(value: int) -> None:
+        with duckdb.connect(":memory:") as connection:
+            cursor = connection.execute(f"SELECT {value} AS n")
+            original = cursor.fetchone()[0]
+            kind = str(cursor.description[0][1])
+        assert original == value and kind == "BIGINT" or original == value and kind == "INTEGER"
+        encoded = scalar(original)
+        if abs(value) <= 2**53 - 1:
+            assert encoded == value and type(encoded) is int
+        else:
+>           assert encoded == {"kind": "integer", "text": str(value)}
+E           AssertionError: assert -9007199254740993 == {'kind': 'integer', 'text': '-9007199254740993'}
+
+tests/unit/test_research_query_review.py:30: AssertionError
+__ test_rq_r02_actual_integer_wire_preserves_safe_boundary[-9007199254740992] __
+
+value = -9007199254740992
+
+    @pytest.mark.parametrize("value", [-(2**53 + 1), -(2**53), -1, 0, 2**53 - 1, 2**53, 2**53 + 1])
+    def test_rq_r02_actual_integer_wire_preserves_safe_boundary(value: int) -> None:
+        with duckdb.connect(":memory:") as connection:
+            cursor = connection.execute(f"SELECT {value} AS n")
+            original = cursor.fetchone()[0]
+            kind = str(cursor.description[0][1])
+        assert original == value and kind == "BIGINT" or original == value and kind == "INTEGER"
+        encoded = scalar(original)
+        if abs(value) <= 2**53 - 1:
+            assert encoded == value and type(encoded) is int
+        else:
+>           assert encoded == {"kind": "integer", "text": str(value)}
+E           AssertionError: assert -9007199254740992 == {'kind': 'integer', 'text': '-9007199254740992'}
+
+tests/unit/test_research_query_review.py:30: AssertionError
+__ test_rq_r02_actual_integer_wire_preserves_safe_boundary[9007199254740992] ___
+
+value = 9007199254740992
+
+    @pytest.mark.parametrize("value", [-(2**53 + 1), -(2**53), -1, 0, 2**53 - 1, 2**53, 2**53 + 1])
+    def test_rq_r02_actual_integer_wire_preserves_safe_boundary(value: int) -> None:
+        with duckdb.connect(":memory:") as connection:
+            cursor = connection.execute(f"SELECT {value} AS n")
+            original = cursor.fetchone()[0]
+            kind = str(cursor.description[0][1])
+        assert original == value and kind == "BIGINT" or original == value and kind == "INTEGER"
+        encoded = scalar(original)
+        if abs(value) <= 2**53 - 1:
+            assert encoded == value and type(encoded) is int
+        else:
+>           assert encoded == {"kind": "integer", "text": str(value)}
+E           AssertionError: assert 9007199254740992 == {'kind': 'integer', 'text': '9007199254740992'}
+
+tests/unit/test_research_query_review.py:30: AssertionError
+__ test_rq_r02_actual_integer_wire_preserves_safe_boundary[9007199254740993] ___
+
+value = 9007199254740993
+
+    @pytest.mark.parametrize("value", [-(2**53 + 1), -(2**53), -1, 0, 2**53 - 1, 2**53, 2**53 + 1])
+    def test_rq_r02_actual_integer_wire_preserves_safe_boundary(value: int) -> None:
+        with duckdb.connect(":memory:") as connection:
+            cursor = connection.execute(f"SELECT {value} AS n")
+            original = cursor.fetchone()[0]
+            kind = str(cursor.description[0][1])
+        assert original == value and kind == "BIGINT" or original == value and kind == "INTEGER"
+        encoded = scalar(original)
+        if abs(value) <= 2**53 - 1:
+            assert encoded == value and type(encoded) is int
+        else:
+>           assert encoded == {"kind": "integer", "text": str(value)}
+E           AssertionError: assert 9007199254740993 == {'kind': 'integer', 'text': '9007199254740993'}
+
+tests/unit/test_research_query_review.py:30: AssertionError
+___________ test_rq_r02_raw_unsafe_integer_is_not_accepted_as_float ____________
+
+    def test_rq_r02_raw_unsafe_integer_is_not_accepted_as_float() -> None:
+        for value in (-(2**53), 2**53, 2**53 + 1):
+>           with pytest.raises(ValueError):
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^
+E           Failed: DID NOT RAISE <class 'ValueError'>
+
+tests/unit/test_research_query_review.py:43: Failed
+_ test_rq_r04_legal_literals_reach_actual_select_parser[SELECT $$COPY;$$ AS text-COPY;] _
+
+sql = 'SELECT $$COPY;$$ AS text', expected = 'COPY;'
+
+    @pytest.mark.parametrize(
+        ("sql", "expected"),
+        [
+            ("SELECT $$COPY;$$ AS text", "COPY;"),
+            ("SELECT $label$COPY; read_csv$label$ AS text", "COPY; read_csv"),
+            ("SELECT 1 /* outer /* inner */ COPY ; */", 1),
+            (r"SELECT E'\'COPY;' AS text", "'COPY;"),
+        ],
+    )
+    def test_rq_r04_legal_literals_reach_actual_select_parser(sql: str, expected: object) -> None:
+>       request = QueryRequest(sql=sql)
+                  ^^^^^^^^^^^^^^^^^^^^^
+E       pydantic_core._pydantic_core.ValidationError: 1 validation error for QueryRequest
+E       sql
+E         Value error, 只接受一条 SELECT 或 WITH 查询 [type=value_error, input_value='SELECT $$COPY;$$ AS text', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+
+tests/unit/test_research_query_review.py:58: ValidationError
+_ test_rq_r04_legal_literals_reach_actual_select_parser[SELECT $label$COPY; read_csv$label$ AS text-COPY; read_csv] _
+
+sql = 'SELECT $label$COPY; read_csv$label$ AS text', expected = 'COPY; read_csv'
+
+    @pytest.mark.parametrize(
+        ("sql", "expected"),
+        [
+            ("SELECT $$COPY;$$ AS text", "COPY;"),
+            ("SELECT $label$COPY; read_csv$label$ AS text", "COPY; read_csv"),
+            ("SELECT 1 /* outer /* inner */ COPY ; */", 1),
+            (r"SELECT E'\'COPY;' AS text", "'COPY;"),
+        ],
+    )
+    def test_rq_r04_legal_literals_reach_actual_select_parser(sql: str, expected: object) -> None:
+>       request = QueryRequest(sql=sql)
+                  ^^^^^^^^^^^^^^^^^^^^^
+E       pydantic_core._pydantic_core.ValidationError: 1 validation error for QueryRequest
+E       sql
+E         Value error, 只接受一条 SELECT 或 WITH 查询 [type=value_error, input_value='SELECT $label$COPY; read_csv$label$ AS text', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+
+tests/unit/test_research_query_review.py:58: ValidationError
+_ test_rq_r04_legal_literals_reach_actual_select_parser[SELECT 1 /* outer /* inner */ COPY ; */-1] _
+
+sql = 'SELECT 1 /* outer /* inner */ COPY ; */', expected = 1
+
+    @pytest.mark.parametrize(
+        ("sql", "expected"),
+        [
+            ("SELECT $$COPY;$$ AS text", "COPY;"),
+            ("SELECT $label$COPY; read_csv$label$ AS text", "COPY; read_csv"),
+            ("SELECT 1 /* outer /* inner */ COPY ; */", 1),
+            (r"SELECT E'\'COPY;' AS text", "'COPY;"),
+        ],
+    )
+    def test_rq_r04_legal_literals_reach_actual_select_parser(sql: str, expected: object) -> None:
+>       request = QueryRequest(sql=sql)
+                  ^^^^^^^^^^^^^^^^^^^^^
+E       pydantic_core._pydantic_core.ValidationError: 1 validation error for QueryRequest
+E       sql
+E         Value error, 只接受一条 SELECT 或 WITH 查询 [type=value_error, input_value='SELECT 1 /* outer /* inner */ COPY ; */', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+
+tests/unit/test_research_query_review.py:58: ValidationError
+_ test_rq_r04_legal_literals_reach_actual_select_parser[SELECT E'\\'COPY;' AS text-'COPY;] _
+
+sql = "SELECT E'\\'COPY;' AS text", expected = "'COPY;"
+
+    @pytest.mark.parametrize(
+        ("sql", "expected"),
+        [
+            ("SELECT $$COPY;$$ AS text", "COPY;"),
+            ("SELECT $label$COPY; read_csv$label$ AS text", "COPY; read_csv"),
+            ("SELECT 1 /* outer /* inner */ COPY ; */", 1),
+            (r"SELECT E'\'COPY;' AS text", "'COPY;"),
+        ],
+    )
+    def test_rq_r04_legal_literals_reach_actual_select_parser(sql: str, expected: object) -> None:
+>       request = QueryRequest(sql=sql)
+                  ^^^^^^^^^^^^^^^^^^^^^
+E       pydantic_core._pydantic_core.ValidationError: 1 validation error for QueryRequest
+E       sql
+E         Value error, 只接受一条 SELECT 或 WITH 查询 [type=value_error, input_value="SELECT E'\\'COPY;' AS text", input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/value_error
+
+tests/unit/test_research_query_review.py:58: ValidationError
+_ test_rq_r04_lexical_mask_never_hides_following_statements[SELECT E'\\'safe'; COPY (SELECT 1) TO '/private'] _
+
+sql = "SELECT E'\\'safe'; COPY (SELECT 1) TO '/private'"
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT $$safe$$; SELECT 2",
+            "SELECT $tag$safe$tag$; ATTACH '/private' AS p",
+            r"SELECT E'\'safe'; COPY (SELECT 1) TO '/private'",
+            "SELECT 1 /* outer /* nested */ end */; SET enable_external_access=true",
+            "SELECT 1 /* unfinished",
+            "SELECT $$unfinished",
+        ],
+    )
+    def test_rq_r04_lexical_mask_never_hides_following_statements(sql: str) -> None:
+>       with pytest.raises(ValueError):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^
+E       Failed: DID NOT RAISE <class 'ValueError'>
+
+tests/unit/test_research_query_review.py:78: Failed
+_ test_rq_r04_lexical_mask_never_hides_following_statements[SELECT 1 /* unfinished] _
+
+sql = 'SELECT 1 /* unfinished'
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT $$safe$$; SELECT 2",
+            "SELECT $tag$safe$tag$; ATTACH '/private' AS p",
+            r"SELECT E'\'safe'; COPY (SELECT 1) TO '/private'",
+            "SELECT 1 /* outer /* nested */ end */; SET enable_external_access=true",
+            "SELECT 1 /* unfinished",
+            "SELECT $$unfinished",
+        ],
+    )
+    def test_rq_r04_lexical_mask_never_hides_following_statements(sql: str) -> None:
+>       with pytest.raises(ValueError):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^
+E       Failed: DID NOT RAISE <class 'ValueError'>
+
+tests/unit/test_research_query_review.py:78: Failed
+_ test_rq_r04_lexical_mask_never_hides_following_statements[SELECT $$unfinished] _
+
+sql = 'SELECT $$unfinished'
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT $$safe$$; SELECT 2",
+            "SELECT $tag$safe$tag$; ATTACH '/private' AS p",
+            r"SELECT E'\'safe'; COPY (SELECT 1) TO '/private'",
+            "SELECT 1 /* outer /* nested */ end */; SET enable_external_access=true",
+            "SELECT 1 /* unfinished",
+            "SELECT $$unfinished",
+        ],
+    )
+    def test_rq_r04_lexical_mask_never_hides_following_statements(sql: str) -> None:
+>       with pytest.raises(ValueError):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^
+E       Failed: DID NOT RAISE <class 'ValueError'>
+
+tests/unit/test_research_query_review.py:78: Failed
+_ test_rq_r05_extra_persistent_objects_rejected_by_guard_and_loader[CREATE TYPE private_notes AS ENUM ('synthetic-bob-private-note')] _
+
+tmp_path = PosixPath('/private/var/folders/d8/tklkkr6x3gl8y8drmfrnmztm0000gp/T/pytest-of-roxor/pytest-69/test_rq_r05_extra_persistent_o0')
+ddl = "CREATE TYPE private_notes AS ENUM ('synthetic-bob-private-note')"
+
+    @pytest.mark.parametrize(
+        "ddl",
+        [
+            "CREATE TYPE private_notes AS ENUM ('synthetic-bob-private-note')",
+            "CREATE TYPE custom_id AS VARCHAR",
+            "CREATE INDEX private_index ON daily_bar(ts_code)",
+        ],
+    )
+    def test_rq_r05_extra_persistent_objects_rejected_by_guard_and_loader(
+        tmp_path: Path, ddl: str
+    ) -> None:
+        snapshot, manifest, source, source_hash = _published(tmp_path)
+        snapshot.path.chmod(0o600)
+>       with duckdb.connect(str(snapshot.path)) as connection:
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/unit/test_research_query_review.py:95: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+tmp_path = PosixPath('/private/var/folders/d8/tklkkr6x3gl8y8drmfrnmztm0000gp/T/pytest-of-roxor/pytest-69/test_rq_r05_extra_persistent_o0')
+ddl = "CREATE TYPE private_notes AS ENUM ('synthetic-bob-private-note')"
+
+    @pytest.mark.parametrize(
+        "ddl",
+        [
+            "CREATE TYPE private_notes AS ENUM ('synthetic-bob-private-note')",
+            "CREATE TYPE custom_id AS VARCHAR",
+            "CREATE INDEX private_index ON daily_bar(ts_code)",
+        ],
+    )
+    def test_rq_r05_extra_persistent_objects_rejected_by_guard_and_loader(
+        tmp_path: Path, ddl: str
+    ) -> None:
+        snapshot, manifest, source, source_hash = _published(tmp_path)
+        snapshot.path.chmod(0o600)
+        with duckdb.connect(str(snapshot.path)) as connection:
+            connection.execute(ddl)
+            if "ENUM" in ddl:
+                assert connection.execute(
+                    "SELECT unnest(enum_range(NULL::private_notes))"
+                ).fetchone() == ("synthetic-bob-private-note",)
+>           with pytest.raises(ValueError, match="额外对象"):
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           Failed: DID NOT RAISE <class 'ValueError'>
+
+tests/unit/test_research_query_review.py:101: Failed
+_ test_rq_r05_extra_persistent_objects_rejected_by_guard_and_loader[CREATE TYPE custom_id AS VARCHAR] _
+
+tmp_path = PosixPath('/private/var/folders/d8/tklkkr6x3gl8y8drmfrnmztm0000gp/T/pytest-of-roxor/pytest-69/test_rq_r05_extra_persistent_o1')
+ddl = 'CREATE TYPE custom_id AS VARCHAR'
+
+    @pytest.mark.parametrize(
+        "ddl",
+        [
+            "CREATE TYPE private_notes AS ENUM ('synthetic-bob-private-note')",
+            "CREATE TYPE custom_id AS VARCHAR",
+            "CREATE INDEX private_index ON daily_bar(ts_code)",
+        ],
+    )
+    def test_rq_r05_extra_persistent_objects_rejected_by_guard_and_loader(
+        tmp_path: Path, ddl: str
+    ) -> None:
+        snapshot, manifest, source, source_hash = _published(tmp_path)
+        snapshot.path.chmod(0o600)
+>       with duckdb.connect(str(snapshot.path)) as connection:
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/unit/test_research_query_review.py:95: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+tmp_path = PosixPath('/private/var/folders/d8/tklkkr6x3gl8y8drmfrnmztm0000gp/T/pytest-of-roxor/pytest-69/test_rq_r05_extra_persistent_o1')
+ddl = 'CREATE TYPE custom_id AS VARCHAR'
+
+    @pytest.mark.parametrize(
+        "ddl",
+        [
+            "CREATE TYPE private_notes AS ENUM ('synthetic-bob-private-note')",
+            "CREATE TYPE custom_id AS VARCHAR",
+            "CREATE INDEX private_index ON daily_bar(ts_code)",
+        ],
+    )
+    def test_rq_r05_extra_persistent_objects_rejected_by_guard_and_loader(
+        tmp_path: Path, ddl: str
+    ) -> None:
+        snapshot, manifest, source, source_hash = _published(tmp_path)
+        snapshot.path.chmod(0o600)
+        with duckdb.connect(str(snapshot.path)) as connection:
+            connection.execute(ddl)
+            if "ENUM" in ddl:
+                assert connection.execute(
+                    "SELECT unnest(enum_range(NULL::private_notes))"
+                ).fetchone() == ("synthetic-bob-private-note",)
+>           with pytest.raises(ValueError, match="额外对象"):
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           Failed: DID NOT RAISE <class 'ValueError'>
+
+tests/unit/test_research_query_review.py:101: Failed
+_ test_rq_r05_extra_persistent_objects_rejected_by_guard_and_loader[CREATE INDEX private_index ON daily_bar(ts_code)] _
+
+tmp_path = PosixPath('/private/var/folders/d8/tklkkr6x3gl8y8drmfrnmztm0000gp/T/pytest-of-roxor/pytest-69/test_rq_r05_extra_persistent_o2')
+ddl = 'CREATE INDEX private_index ON daily_bar(ts_code)'
+
+    @pytest.mark.parametrize(
+        "ddl",
+        [
+            "CREATE TYPE private_notes AS ENUM ('synthetic-bob-private-note')",
+            "CREATE TYPE custom_id AS VARCHAR",
+            "CREATE INDEX private_index ON daily_bar(ts_code)",
+        ],
+    )
+    def test_rq_r05_extra_persistent_objects_rejected_by_guard_and_loader(
+        tmp_path: Path, ddl: str
+    ) -> None:
+        snapshot, manifest, source, source_hash = _published(tmp_path)
+        snapshot.path.chmod(0o600)
+>       with duckdb.connect(str(snapshot.path)) as connection:
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/unit/test_research_query_review.py:95: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+tmp_path = PosixPath('/private/var/folders/d8/tklkkr6x3gl8y8drmfrnmztm0000gp/T/pytest-of-roxor/pytest-69/test_rq_r05_extra_persistent_o2')
+ddl = 'CREATE INDEX private_index ON daily_bar(ts_code)'
+
+    @pytest.mark.parametrize(
+        "ddl",
+        [
+            "CREATE TYPE private_notes AS ENUM ('synthetic-bob-private-note')",
+            "CREATE TYPE custom_id AS VARCHAR",
+            "CREATE INDEX private_index ON daily_bar(ts_code)",
+        ],
+    )
+    def test_rq_r05_extra_persistent_objects_rejected_by_guard_and_loader(
+        tmp_path: Path, ddl: str
+    ) -> None:
+        snapshot, manifest, source, source_hash = _published(tmp_path)
+        snapshot.path.chmod(0o600)
+        with duckdb.connect(str(snapshot.path)) as connection:
+            connection.execute(ddl)
+            if "ENUM" in ddl:
+                assert connection.execute(
+                    "SELECT unnest(enum_range(NULL::private_notes))"
+                ).fetchone() == ("synthetic-bob-private-note",)
+>           with pytest.raises(ValueError, match="额外对象"):
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           Failed: DID NOT RAISE <class 'ValueError'>
+
+tests/unit/test_research_query_review.py:101: Failed
+_______ test_complete_http_envelope_keeps_bounded_partial_prefix[0-True] _______
+
+tmp_path = PosixPath('/private/var/folders/d8/tklkkr6x3gl8y8drmfrnmztm0000gp/T/pytest-of-roxor/pytest-69/test_complete_http_envelope_ke1')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x108fb6510>
+large_metadata = True, prefix_size = 0
+
+    @pytest.mark.parametrize("large_metadata", [False, True])
+    @pytest.mark.parametrize("prefix_size", [0, 2])
+    def test_complete_http_envelope_keeps_bounded_partial_prefix(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, large_metadata: bool, prefix_size: int
+    ) -> None:
+        from rquant.research_query import QueryColumn, QueryPrivateClient, QueryResult
+        from rquant.research_query.child import encode
+        from rquant.web.routes import research_query as route
+        from rquant.web.serving import serving_meta
+    
+        settings = WebSettings(
+            serving_root=tmp_path / "serving",
+            ingress_socket_path=tmp_path / "ingress/web.sock",
+            research_query_users=frozenset({"alice"}),
+            research_query_socket_path=Path("/private/tmp/rq-absent-wire/service.sock"),
+            research_query_service_uid=99999,
+            research_query_shared_gid=99999,
+        )
+        base = {
+            "status": "ready",
+            "columns": [{"name": "value", "data_type": "VARCHAR"}],
+            "rows": [],
+            "elapsed_ms": 0,
+            "source_at": datetime(2026, 10, 5, tzinfo=UTC).isoformat(),
+            "snapshot_sha256": "a" * 64,
+            "message": "",
+        }
+        prefix = [("a" * 256,), ("b" * 256,)][:prefix_size]
+        wide_bytes = 16 * 2**20 - len(encode(base)) - 1024 - 5
+        wide_bytes -= sum(len(encode(row)) + 1 for row in prefix)
+        value = QueryResult.model_validate(
+            {
+                **base,
+                "status": "partial",
+                "rows": [*prefix, ("x" * wide_bytes,)],
+                "message": "结果超过限制，仅显示可返回的部分。",
+            }
+        )
+        assert len(encode({"data": value.model_dump(mode="json")})) <= 16 * 2**20
+    
+        def result(*args: object, **kwargs: object) -> QueryResult:
+            return value
+    
+        monkeypatch.setattr(QueryPrivateClient, "execute", result)
+        original_meta = route._meta
+    
+        def metadata(request):
+            if not large_metadata:
+                return original_meta(request)
+            data = serving_meta(
+                None,
+                now=datetime(2026, 10, 5, tzinfo=UTC),
+                stale_after=timedelta(seconds=600),
+                failure="来源核验失败" * 120,
+            )
+            assert len(data.detail) == 600
+            return data
+    
+        monkeypatch.setattr(route, "_meta", metadata)
+        with ProofTestClient(create_proof_test_app(settings, background=False)) as client:
+            response = client.post(
+                "/api/v1/research/query",
+                json={"sql": "SELECT 1"},
+                headers={"x-rquant-user": "alice", "x-rquant-csrf": "1", "origin": "http://testserver"},
+            )
+        assert len(response.content) <= 16 * 2**20
+>       assert response.status_code == 200
+E       assert 503 == 200
+E        +  where 503 = <Response [503 Service Unavailable]>.status_code
+
+tests/unit/test_web_research_query.py:85: AssertionError
+_______ test_complete_http_envelope_keeps_bounded_partial_prefix[2-True] _______
+
+tmp_path = PosixPath('/private/var/folders/d8/tklkkr6x3gl8y8drmfrnmztm0000gp/T/pytest-of-roxor/pytest-69/test_complete_http_envelope_ke3')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x108f77af0>
+large_metadata = True, prefix_size = 2
+
+    @pytest.mark.parametrize("large_metadata", [False, True])
+    @pytest.mark.parametrize("prefix_size", [0, 2])
+    def test_complete_http_envelope_keeps_bounded_partial_prefix(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, large_metadata: bool, prefix_size: int
+    ) -> None:
+        from rquant.research_query import QueryColumn, QueryPrivateClient, QueryResult
+        from rquant.research_query.child import encode
+        from rquant.web.routes import research_query as route
+        from rquant.web.serving import serving_meta
+    
+        settings = WebSettings(
+            serving_root=tmp_path / "serving",
+            ingress_socket_path=tmp_path / "ingress/web.sock",
+            research_query_users=frozenset({"alice"}),
+            research_query_socket_path=Path("/private/tmp/rq-absent-wire/service.sock"),
+            research_query_service_uid=99999,
+            research_query_shared_gid=99999,
+        )
+        base = {
+            "status": "ready",
+            "columns": [{"name": "value", "data_type": "VARCHAR"}],
+            "rows": [],
+            "elapsed_ms": 0,
+            "source_at": datetime(2026, 10, 5, tzinfo=UTC).isoformat(),
+            "snapshot_sha256": "a" * 64,
+            "message": "",
+        }
+        prefix = [("a" * 256,), ("b" * 256,)][:prefix_size]
+        wide_bytes = 16 * 2**20 - len(encode(base)) - 1024 - 5
+        wide_bytes -= sum(len(encode(row)) + 1 for row in prefix)
+        value = QueryResult.model_validate(
+            {
+                **base,
+                "status": "partial",
+                "rows": [*prefix, ("x" * wide_bytes,)],
+                "message": "结果超过限制，仅显示可返回的部分。",
+            }
+        )
+        assert len(encode({"data": value.model_dump(mode="json")})) <= 16 * 2**20
+    
+        def result(*args: object, **kwargs: object) -> QueryResult:
+            return value
+    
+        monkeypatch.setattr(QueryPrivateClient, "execute", result)
+        original_meta = route._meta
+    
+        def metadata(request):
+            if not large_metadata:
+                return original_meta(request)
+            data = serving_meta(
+                None,
+                now=datetime(2026, 10, 5, tzinfo=UTC),
+                stale_after=timedelta(seconds=600),
+                failure="来源核验失败" * 120,
+            )
+            assert len(data.detail) == 600
+            return data
+    
+        monkeypatch.setattr(route, "_meta", metadata)
+        with ProofTestClient(create_proof_test_app(settings, background=False)) as client:
+            response = client.post(
+                "/api/v1/research/query",
+                json={"sql": "SELECT 1"},
+                headers={"x-rquant-user": "alice", "x-rquant-csrf": "1", "origin": "http://testserver"},
+            )
+        assert len(response.content) <= 16 * 2**20
+>       assert response.status_code == 200
+E       assert 503 == 200
+E        +  where 503 = <Response [503 Service Unavailable]>.status_code
+
+tests/unit/test_web_research_query.py:85: AssertionError
+=========================== short test summary info ============================
+FAILED tests/unit/test_research_query_review.py::test_rq_r02_actual_integer_wire_preserves_safe_boundary[-9007199254740993]
+FAILED tests/unit/test_research_query_review.py::test_rq_r02_actual_integer_wire_preserves_safe_boundary[-9007199254740992]
+FAILED tests/unit/test_research_query_review.py::test_rq_r02_actual_integer_wire_preserves_safe_boundary[9007199254740992]
+FAILED tests/unit/test_research_query_review.py::test_rq_r02_actual_integer_wire_preserves_safe_boundary[9007199254740993]
+FAILED tests/unit/test_research_query_review.py::test_rq_r02_raw_unsafe_integer_is_not_accepted_as_float
+FAILED tests/unit/test_research_query_review.py::test_rq_r04_legal_literals_reach_actual_select_parser[SELECT $$COPY;$$ AS text-COPY;]
+FAILED tests/unit/test_research_query_review.py::test_rq_r04_legal_literals_reach_actual_select_parser[SELECT $label$COPY; read_csv$label$ AS text-COPY; read_csv]
+FAILED tests/unit/test_research_query_review.py::test_rq_r04_legal_literals_reach_actual_select_parser[SELECT 1 /* outer /* inner */ COPY ; */-1]
+FAILED tests/unit/test_research_query_review.py::test_rq_r04_legal_literals_reach_actual_select_parser[SELECT E'\\'COPY;' AS text-'COPY;]
+FAILED tests/unit/test_research_query_review.py::test_rq_r04_lexical_mask_never_hides_following_statements[SELECT E'\\'safe'; COPY (SELECT 1) TO '/private']
+FAILED tests/unit/test_research_query_review.py::test_rq_r04_lexical_mask_never_hides_following_statements[SELECT 1 /* unfinished]
+FAILED tests/unit/test_research_query_review.py::test_rq_r04_lexical_mask_never_hides_following_statements[SELECT $$unfinished]
+FAILED tests/unit/test_research_query_review.py::test_rq_r05_extra_persistent_objects_rejected_by_guard_and_loader[CREATE TYPE private_notes AS ENUM ('synthetic-bob-private-note')]
+FAILED tests/unit/test_research_query_review.py::test_rq_r05_extra_persistent_objects_rejected_by_guard_and_loader[CREATE TYPE custom_id AS VARCHAR]
+FAILED tests/unit/test_research_query_review.py::test_rq_r05_extra_persistent_objects_rejected_by_guard_and_loader[CREATE INDEX private_index ON daily_bar(ts_code)]
+FAILED tests/unit/test_web_research_query.py::test_complete_http_envelope_keeps_bounded_partial_prefix[0-True]
+FAILED tests/unit/test_web_research_query.py::test_complete_http_envelope_keeps_bounded_partial_prefix[2-True]
+========================= 17 failed, 8 passed in 2.33s =========================
