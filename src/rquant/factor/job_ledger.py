@@ -13,7 +13,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from threading import Lock
+from threading import Lock, local
 from typing import Literal
 from uuid import uuid4
 
@@ -138,6 +138,15 @@ class FactorJobLease(BaseModel):
 
 @dataclass(frozen=True, slots=True)
 class _VerifiedSpec:
+    spec: FactorEvaluationJobSpec | FactorStreamJobSpec
+
+
+@dataclass(frozen=True, slots=True)
+class _ClaimedSpec:
+    instance: FactorLedgerIdentity
+    job_id: str
+    lease_token: str
+    version: int
     spec: FactorEvaluationJobSpec | FactorStreamJobSpec
 
 
@@ -470,6 +479,7 @@ class FactorEvaluationJobLedger:
         self._expected: FactorLedgerIdentity | None = None
         self._prepared: dict[object, _PreparedStream] = {}
         self._prepared_lock = Lock()
+        self._claim_spec = local()
 
     def _now(self) -> datetime:
         return _utc(self._clock())
@@ -706,11 +716,39 @@ class FactorEvaluationJobLedger:
         captured = FactorEvaluationJobLedger._capture_job(connection, job_id)
         return None if captured is None else FactorEvaluationJobLedger._decode_captured(captured)
 
-    def _read_verified_job(self, job_id: str) -> _JobState | None:
+    @contextmanager
+    def _reuse_claimed_spec(self, claimed: FactorJobLease) -> Iterator[None]:
+        # A worker's heartbeat thread may retain only this fully checked immutable spec.
+        previous = getattr(self._claim_spec, "value", None)
+        self._claim_spec.value = _ClaimedSpec(
+            self._expected_identity(),
+            claimed.job.job_id,
+            claimed.lease_token,
+            claimed.version,
+            claimed.job.spec,
+        )
+        try:
+            yield
+        finally:
+            if previous is None:
+                del self._claim_spec.value
+            else:
+                self._claim_spec.value = previous
+
+    def _read_verified_job(
+        self,
+        job_id: str,
+        *,
+        verified_spec: FactorEvaluationJobSpec | FactorStreamJobSpec | None = None,
+    ) -> _JobState | None:
         # A rollback-journal reader must release its snapshot before expensive decoding.
         with self._reader() as connection:
             captured = self._capture_job(connection, job_id)
-        state = None if captured is None else self._decode_captured(captured)
+        state = (
+            None
+            if captured is None
+            else self._decode_captured(captured, verified_spec=verified_spec)
+        )
         self._require_path(self._expected_identity())
         return state
 
@@ -927,7 +965,18 @@ class FactorEvaluationJobLedger:
     ) -> FactorJobLease:
         if type(lease_seconds) is not int or not 1 <= lease_seconds <= _MAX_LEASE_SECONDS:
             raise ValueError("factor lease duration is invalid")
-        prior = self._read_verified_job(job_id)
+        claimed = getattr(self._claim_spec, "value", None)
+        if (
+            isinstance(claimed, _ClaimedSpec)
+            and claimed.instance == self._expected_identity()
+            and claimed.job_id == job_id
+            and claimed.lease_token == lease_token
+            and type(expected_version) is int
+            and expected_version >= claimed.version
+        ):
+            prior = self._read_verified_job(job_id, verified_spec=claimed.spec)
+        else:
+            prior = self._read_verified_job(job_id)
         if prior is None:
             raise FactorLedgerLeaseError("factor job does not exist")
         with self._writer() as connection:

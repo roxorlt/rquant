@@ -118,22 +118,23 @@ def run_one_factor_job(
 
     def heartbeat() -> None:
         nonlocal latest
-        while not stop.wait(heartbeat_interval_seconds):
-            with lock:
-                if stop.is_set():
-                    return
-                try:
-                    latest = ledger.heartbeat(
-                        claimed.job.job_id,
-                        latest.lease_token,
-                        latest.version,
-                        lease_seconds,
-                    )
-                except BaseException as exc:
-                    lost.set()
-                    stop.set()
-                    logger.opt(exception=exc).error("factor evaluation heartbeat failed")
-                    return
+        with ledger._reuse_claimed_spec(claimed):
+            while not stop.wait(heartbeat_interval_seconds):
+                with lock:
+                    if stop.is_set():
+                        return
+                    try:
+                        latest = ledger.heartbeat(
+                            claimed.job.job_id,
+                            latest.lease_token,
+                            latest.version,
+                            lease_seconds,
+                        )
+                    except BaseException as exc:
+                        lost.set()
+                        stop.set()
+                        logger.opt(exception=exc).error("factor evaluation heartbeat failed")
+                        return
 
     thread = Thread(target=heartbeat, name="factor-job-heartbeat", daemon=True)
     try:
