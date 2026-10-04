@@ -1,0 +1,418 @@
+
+ RUN  v5.0.2 /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/web
+
+ ❯ src/pages/query/query.test.tsx (4 tests | 1 failed) 1994ms
+   × 先前请求不会覆盖新 SQL 的结果 1190ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  src/pages/query/query.test.tsx > 先前请求不会覆盖新 SQL 的结果
+TestingLibraryElementError: Found multiple elements with the text: SELECT 'new'
+
+Here are the matching elements:
+
+Ignored nodes: comments, script, style
+[36m<textarea[39m
+  [33maria-label[39m=[32m"SQL 查询"[39m
+  [33mclass[39m=[32m"query-editor mono"[39m
+  [33mspellcheck[39m=[32m"false"[39m
+[36m>[39m
+  [0mSELECT 'new'[0m
+[36m</textarea>[39m
+
+Ignored nodes: comments, script, style
+[36m<span[39m
+  [33mclass[39m=[32m"mono query-cell"[39m
+[36m>[39m
+  [0mSELECT 'new'[0m
+[36m</span>[39m
+
+(If this is intentional, then use the `*AllBy*` variant of the query (like `queryAllByText`, `getAllByText`, or `findAllByText`)).
+
+Ignored nodes: comments, script, style
+[36m<body>[39m
+  [36m<div>[39m
+    [36m<div[39m
+      [33mclass[39m=[32m"shell"[39m
+    [36m>[39m
+      [36m<header[39m
+        [33mclass[39m=[32m"topbar"[39m
+      [36m>[39m
+        [36m<a[39m
+          [33mclass[39m=[32m"brand"[39m
+          [33mdata-discover[39m=[32m"true"[39m
+          [33mhref[39m=[32m"/overview"[39m
+        [36m>[39m
+          [36m<span[39m
+            [33maria-hidden[39m=[32m"true"[39m
+            [33mclass[39m=[32m"brand-mark"[39m
+          [36m>[39m
+            [36m<svg[39m
+              [33maria-hidden[39m=[32m"true"[39m
+              [33mfill[39m=[32m"none"[39m
+              [33mfocusable[39m=[32m"false"[39m
+              [33mheight[39m=[32m"16"[39m
+              [33mstroke[39m=[32m"currentColor"[39m
+              [33mstroke-linecap[39m=[32m"round"[39m
+              [33mstroke-width[39m=[32m"2"[39m
+              [33mviewBox[39m=[32m"0 0 24 24"[39m
+              [33mwidth[39m=[32m"16"[39m
+            [36m>[39m
+              [36m<path[39m
+                [33md[39m=[32m"M6 4v16M12 7v10M18 3v18"[39m
+              [36m/>[39m
+              [36m<rect[39m
+                [33mfill[39m=[32m"currentColor"[39m
+                [33mheight[39m=[32m"7"[39m
+                [33mstroke[39m=[32m"none"[39m
+                [33mwidth[39m=[32m"3"[39m
+                [33mx[39m=[32m"4.5"[39m
+                [33my[39m=[32m"8"[39m
+              [36m/>[39m
+              [36m<rect[39m
+                [33mfill[39m=[32m"currentColor"[39m
+                [33mheight[39m=[32m"9"[39m
+                [33mstroke[39m=[32m"none"[39m
+                [33mwidth[39m=[32m"3"[39m
+                [33mx[39m=[32m"16.5"[39m
+                [33my[39m=[32m"6"[39m
+              [36m/>[39m
+            [36m</svg>[39m
+          [36m</span>[39m
+          [36m<span[39m
+            [33mclass[39m=[32m"brand-name"[39m
+          [36m>[39m
+            [0mrQuant 投研[0m
+          [36m</span>[39m
+        [36m</a>[39m
+        [36m<div[39m
+          [33mclass[39m=[32m"tb-status"[39m
+        [36m>[39m
+          [36m<div[39m
+            [33mclass[39m=[32m"tb-day"[39m
+          [36m>[39m
+            [36m<span[39m
+              [33mclass[39m=[32m"mono"[39m
+            [36m>[39m
+              [0m2026-09-24[0m
+            [36m</span>[39m
+            [0m [0m
+            [0m周四[0m
+          [36m</div>[39m
+          [36m<span[39m
+            [33mclass[39m=[32m"phase"[39m
+            [33mdata-phase[39m=[32m"cont"[39m
+          [36m>[39m
+            [36m<span[39m
+              [33maria-hidden[39m=[32m"true"[39m
+              [33mclass[39m=[32m"pdot"[39m
+            [36m/>[39m
+            [36m<span[39m
+              [33mclass[39m=[32m"sr-only"[39m
+            [36m>[39m
+              [0m市场阶段：[0m
+            [36m</span>[39m
+            [36m<span>[39m
+              [0m连续竞价[0m
+            [36m</span>[39m
+          [36m</span>[39m
+          [36m<span[39m
+            [33mclass[39m=[32m"tip-anchor"[39m
+            [33mtabindex[39m=[32m"0"[39m
+          [36m>[39m
+            [36m<span[39m
+              [33mclass[39m=[32m"gen-tag"[39m
+              [33mdata-generation[39m=[32m"a1b2c3d4e5f6"[39m
+              [33mdata-state[39m=[32m"ready"[39m
+            [36m>[39m
+              [36m<span[39m
+                [33maria-hidden[39m=[32m"true"[39m
+                [33mclass[39m=[32m"gdot"[39m
+              [36m/>[39m
+              [0m数据 3 分钟前更新[0m
+            [36m</span>[39m
+          [36m</span>[39m
+        [36m</div>[39m
+        [36m<form[39m
+          [33mclass[39m=[32m"search"[39m
+          [33mrole[39m=[32m"search"[39m
+        [36m>[39m
+          [36m<svg[39m
+            [33maria-hidden[39m=[32m"true"[39m
+            [33mfill[39m=[32m"none"[39m
+            [33mfocusable[39m=[32m"false"[39m
+            [33mheight[39m=[32m"16"[39m
+            [33mstroke[39m=[32m"currentColor"[39m
+            [33mstroke-linecap[39m=[32m"round"[39m
+            [33mstroke-linejoin[39m=[32m"round"[39m
+            [33mstroke-width[39m=[32m"1.7"[39m
+            [33mviewBox[39m=[32m"0 0 24 24"[39m
+            [33mwidth[39m=[32m"16"[39m
+          [36m>[39m
+            [36m<circle[39m
+              [33mcx[39m=[32m"11"[39m
+              [33mcy[39m=[32m"11"[39m
+              [33mr[39m=[32m"6.5"[39m
+            [36m/>[39m
+            [36m<path[39m
+              [33md[39m=[32m"M16 16l4.5 4.5"[39m
+            [36m/>[39m
+          [36m</svg>[39m
+          [36m<input[39m
+            [33maria-autocomplete[39m=[32m"list"[39m
+            [33maria-expanded[39m=[32m"false"[39m
+            [33maria-label[39m=[32m"搜索股票"[39m
+            [33mautocomplete[39m=[32m"off"[39m
+            [33mmaxlength[39m=[32m"32"[39m
+            [33mplaceholder[39m=[32m"代码 / 名称"[39m
+            [33mrole[39m=[32m"combobox"[39m
+            [33mtype[39m=[32m"search"[39m
+            [33mvalue[39m=[32m""[39m
+          [36m/>[39m
+        [36m</form>[39m
+        [36m<span[39m
+          [33mclass[39m=[32m"tip-anchor"[39m
+          [33mtabindex[39m=[32m"0"[39m
+        [36m>[39m
+          [36m<button[39m
+            [33maria-description[39m=[32m"AI 助手即将上线"[39m
+            [33mclass[39m=[32m"btn ai-btn"[39m
+            [33mdisabled[39m=[32m""[39m
+            [33mtype[39m=[32m"button"[39m
+          [36m>[39m
+            [36m<svg[39m
+              [33maria-hidden[39m=[32m"true"[39m
+              [33mfill[39m=[32m"none"[39m
+              [33mfocusable[39m=[32m"false"[39m
+              [33mheight[39m=[32m"16"[39m
+              [33mstroke[39m=[32m"currentColor"[39m
+              [33mstroke-linecap[39m=[32m"round"[39m
+              [33mstroke-linejoin[39m=[32m"round"[39m
+              [33mstroke-width[39m=[32m"1.7"[39m
+              [33mviewBox[39m=[32m"0 0 24 24"[39m
+              [33mwidth[39m=[32m"16"[39m
+            [36m>[39m
+              [36m<path[39m
+                [33md[39m=[32m"M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z"[39m
+              [36m/>[39m
+              [36m<path[39m
+                [33md[39m=[32m"M19 16l.8 2.2L22 19l-2.2.8L19 22l-.8-2.2L16 19l2.2-.8z"[39m
+              [36m/>[39m
+            [36m</svg>[39m
+            [36m<span[39m
+              [33mclass[39m=[32m"lbl"[39m
+            [36m>[39m
+              [0mAI 助手[0m
+            [36m</span>[39m
+          [36m</button>[39m
+        [36m</span>[39m
+        [36m<button[39m
+          [33maria-label[39m=[32m"主题：跟随系统，点击切换"[39m
+          [33mclass[39m=[32m"icon-btn theme-btn"[39m
+          [33mtitle[39m=[32m"主题：跟随系统"[39m
+          [33mtype[39m=[32m"button"[39m
+        [36m>[39m
+          [3...
+
+Ignored nodes: comments, script, style
+[36m<body>[39m
+  [36m<div>[39m
+    [36m<div[39m
+      [33mclass[39m=[32m"shell"[39m
+    [36m>[39m
+      [36m<header[39m
+        [33mclass[39m=[32m"topbar"[39m
+      [36m>[39m
+        [36m<a[39m
+          [33mclass[39m=[32m"brand"[39m
+          [33mdata-discover[39m=[32m"true"[39m
+          [33mhref[39m=[32m"/overview"[39m
+        [36m>[39m
+          [36m<span[39m
+            [33maria-hidden[39m=[32m"true"[39m
+            [33mclass[39m=[32m"brand-mark"[39m
+          [36m>[39m
+            [36m<svg[39m
+              [33maria-hidden[39m=[32m"true"[39m
+              [33mfill[39m=[32m"none"[39m
+              [33mfocusable[39m=[32m"false"[39m
+              [33mheight[39m=[32m"16"[39m
+              [33mstroke[39m=[32m"currentColor"[39m
+              [33mstroke-linecap[39m=[32m"round"[39m
+              [33mstroke-width[39m=[32m"2"[39m
+              [33mviewBox[39m=[32m"0 0 24 24"[39m
+              [33mwidth[39m=[32m"16"[39m
+            [36m>[39m
+              [36m<path[39m
+                [33md[39m=[32m"M6 4v16M12 7v10M18 3v18"[39m
+              [36m/>[39m
+              [36m<rect[39m
+                [33mfill[39m=[32m"currentColor"[39m
+                [33mheight[39m=[32m"7"[39m
+                [33mstroke[39m=[32m"none"[39m
+                [33mwidth[39m=[32m"3"[39m
+                [33mx[39m=[32m"4.5"[39m
+                [33my[39m=[32m"8"[39m
+              [36m/>[39m
+              [36m<rect[39m
+                [33mfill[39m=[32m"currentColor"[39m
+                [33mheight[39m=[32m"9"[39m
+                [33mstroke[39m=[32m"none"[39m
+                [33mwidth[39m=[32m"3"[39m
+                [33mx[39m=[32m"16.5"[39m
+                [33my[39m=[32m"6"[39m
+              [36m/>[39m
+            [36m</svg>[39m
+          [36m</span>[39m
+          [36m<span[39m
+            [33mclass[39m=[32m"brand-name"[39m
+          [36m>[39m
+            [0mrQuant 投研[0m
+          [36m</span>[39m
+        [36m</a>[39m
+        [36m<div[39m
+          [33mclass[39m=[32m"tb-status"[39m
+        [36m>[39m
+          [36m<div[39m
+            [33mclass[39m=[32m"tb-day"[39m
+          [36m>[39m
+            [36m<span[39m
+              [33mclass[39m=[32m"mono"[39m
+            [36m>[39m
+              [0m2026-09-24[0m
+            [36m</span>[39m
+            [0m [0m
+            [0m周四[0m
+          [36m</div>[39m
+          [36m<span[39m
+            [33mclass[39m=[32m"phase"[39m
+            [33mdata-phase[39m=[32m"cont"[39m
+          [36m>[39m
+            [36m<span[39m
+              [33maria-hidden[39m=[32m"true"[39m
+              [33mclass[39m=[32m"pdot"[39m
+            [36m/>[39m
+            [36m<span[39m
+              [33mclass[39m=[32m"sr-only"[39m
+            [36m>[39m
+              [0m市场阶段：[0m
+            [36m</span>[39m
+            [36m<span>[39m
+              [0m连续竞价[0m
+            [36m</span>[39m
+          [36m</span>[39m
+          [36m<span[39m
+            [33mclass[39m=[32m"tip-anchor"[39m
+            [33mtabindex[39m=[32m"0"[39m
+          [36m>[39m
+            [36m<span[39m
+              [33mclass[39m=[32m"gen-tag"[39m
+              [33mdata-generation[39m=[32m"a1b2c3d4e5f6"[39m
+              [33mdata-state[39m=[32m"ready"[39m
+            [36m>[39m
+              [36m<span[39m
+                [33maria-hidden[39m=[32m"true"[39m
+                [33mclass[39m=[32m"gdot"[39m
+              [36m/>[39m
+              [0m数据 3 分钟前更新[0m
+            [36m</span>[39m
+          [36m</span>[39m
+        [36m</div>[39m
+        [36m<form[39m
+          [33mclass[39m=[32m"search"[39m
+          [33mrole[39m=[32m"search"[39m
+        [36m>[39m
+          [36m<svg[39m
+            [33maria-hidden[39m=[32m"true"[39m
+            [33mfill[39m=[32m"none"[39m
+            [33mfocusable[39m=[32m"false"[39m
+            [33mheight[39m=[32m"16"[39m
+            [33mstroke[39m=[32m"currentColor"[39m
+            [33mstroke-linecap[39m=[32m"round"[39m
+            [33mstroke-linejoin[39m=[32m"round"[39m
+            [33mstroke-width[39m=[32m"1.7"[39m
+            [33mviewBox[39m=[32m"0 0 24 24"[39m
+            [33mwidth[39m=[32m"16"[39m
+          [36m>[39m
+            [36m<circle[39m
+              [33mcx[39m=[32m"11"[39m
+              [33mcy[39m=[32m"11"[39m
+              [33mr[39m=[32m"6.5"[39m
+            [36m/>[39m
+            [36m<path[39m
+              [33md[39m=[32m"M16 16l4.5 4.5"[39m
+            [36m/>[39m
+          [36m</svg>[39m
+          [36m<input[39m
+            [33maria-autocomplete[39m=[32m"list"[39m
+            [33maria-expanded[39m=[32m"false"[39m
+            [33maria-label[39m=[32m"搜索股票"[39m
+            [33mautocomplete[39m=[32m"off"[39m
+            [33mmaxlength[39m=[32m"32"[39m
+            [33mplaceholder[39m=[32m"代码 / 名称"[39m
+            [33mrole[39m=[32m"combobox"[39m
+            [33mtype[39m=[32m"search"[39m
+            [33mvalue[39m=[32m""[39m
+          [36m/>[39m
+        [36m</form>[39m
+        [36m<span[39m
+          [33mclass[39m=[32m"tip-anchor"[39m
+          [33mtabindex[39m=[32m"0"[39m
+        [36m>[39m
+          [36m<button[39m
+            [33maria-description[39m=[32m"AI 助手即将上线"[39m
+            [33mclass[39m=[32m"btn ai-btn"[39m
+            [33mdisabled[39m=[32m""[39m
+            [33mtype[39m=[32m"button"[39m
+          [36m>[39m
+            [36m<svg[39m
+              [33maria-hidden[39m=[32m"true"[39m
+              [33mfill[39m=[32m"none"[39m
+              [33mfocusable[39m=[32m"false"[39m
+              [33mheight[39m=[32m"16"[39m
+              [33mstroke[39m=[32m"currentColor"[39m
+              [33mstroke-linecap[39m=[32m"round"[39m
+              [33mstroke-linejoin[39m=[32m"round"[39m
+              [33mstroke-width[39m=[32m"1.7"[39m
+              [33mviewBox[39m=[32m"0 0 24 24"[39m
+              [33mwidth[39m=[32m"16"[39m
+            [36m>[39m
+              [36m<path[39m
+                [33md[39m=[32m"M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z"[39m
+              [36m/>[39m
+              [36m<path[39m
+                [33md[39m=[32m"M19 16l.8 2.2L22 19l-2.2.8L19 22l-.8-2.2L16 19l2.2-.8z"[39m
+              [36m/>[39m
+            [36m</svg>[39m
+            [36m<span[39m
+              [33mclass[39m=[32m"lbl"[39m
+            [36m>[39m
+              [0mAI 助手[0m
+            [36m</span>[39m
+          [36m</button>[39m
+        [36m</span>[39m
+        [36m<button[39m
+          [33maria-label[39m=[32m"主题：跟随系统，点击切换"[39m
+          [33mclass[39m=[32m"icon-btn theme-btn"[39m
+          [33mtitle[39m=[32m"主题：跟随系统"[39m
+          [33mtype[39m=[32m"button"[39m
+        [36m>[39m
+          [3...
+ ❯ waitForWrapper node_modules/.pnpm/@testing-library+dom@10.4.2/node_modules/@testing-library/dom/dist/wait-for.js:163:27
+ ❯ node_modules/.pnpm/@testing-library+dom@10.4.2/node_modules/@testing-library/dom/dist/query-helpers.js:86:33
+ ❯ src/pages/query/query.test.tsx:58:23
+     56|   fireEvent.change(editor,{target:{value:"SELECT 'new'"}});
+     57|   await user.click(screen.getByRole("button",{name:"运行"}));
+     58|   expect(await screen.findByText("SELECT 'new'")).toBeVisible();
+       |                       ^
+     59|   await act(async () => firstResolve?.());
+     60|   expect(screen.queryByText("SELECT 'old'")).not.toBeInTheDocument();
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+
+
+ Test Files  1 failed | 1 passed (2)
+      Tests  1 failed | 4 passed (5)
+   Start at  03:29:03
+   Duration  3.83s (tests 46%, environment 20%, import 19%, setup 9%, transform 6%)
+

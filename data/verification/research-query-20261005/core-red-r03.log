@@ -1,0 +1,414 @@
+============================= test session starts ==============================
+platform darwin -- Python 3.13.12, pytest-9.0.3, pluggy-1.6.0
+rootdir: /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk
+configfile: pyproject.toml
+plugins: mock-3.15.1, anyio-4.13.0
+collected 20 items
+
+tests/unit/test_research_query.py FFFFFFFFFFFFFFFFFFFF                   [100%]
+
+=================================== FAILURES ===================================
+_ test_public_snapshot_contains_only_exact_public_columns_and_source_is_unchanged _
+
+tmp_path = PosixPath('/private/var/folders/d8/tklkkr6x3gl8y8drmfrnmztm0000gp/T/pytest-of-roxor/pytest-15/test_public_snapshot_contains_0')
+
+    def test_public_snapshot_contains_only_exact_public_columns_and_source_is_unchanged(tmp_path: Path) -> None:
+>       api = _api()
+              ^^^^^^
+
+tests/unit/test_research_query.py:48: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    def _api():
+>       assert find_spec("rquant.research_query") is not None, "research query is not implemented"
+E       AssertionError: research query is not implemented
+E       assert None is not None
+E        +  where None = find_spec('rquant.research_query')
+
+tests/unit/test_research_query.py:20: AssertionError
+__________ test_full_original_database_and_extra_objects_are_rejected __________
+
+tmp_path = PosixPath('/private/var/folders/d8/tklkkr6x3gl8y8drmfrnmztm0000gp/T/pytest-of-roxor/pytest-15/test_full_original_database_an0')
+
+    def test_full_original_database_and_extra_objects_are_rejected(tmp_path: Path) -> None:
+>       api = _api()
+              ^^^^^^
+
+tests/unit/test_research_query.py:63: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    def _api():
+>       assert find_spec("rquant.research_query") is not None, "research query is not implemented"
+E       AssertionError: research query is not implemented
+E       assert None is not None
+E        +  where None = find_spec('rquant.research_query')
+
+tests/unit/test_research_query.py:20: AssertionError
+________ test_snapshot_bad_digest_symlink_and_source_change_fail_closed ________
+
+tmp_path = PosixPath('/private/var/folders/d8/tklkkr6x3gl8y8drmfrnmztm0000gp/T/pytest-of-roxor/pytest-15/test_snapshot_bad_digest_symli0')
+
+    def test_snapshot_bad_digest_symlink_and_source_change_fail_closed(tmp_path: Path) -> None:
+>       api = _api()
+              ^^^^^^
+
+tests/unit/test_research_query.py:82: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    def _api():
+>       assert find_spec("rquant.research_query") is not None, "research query is not implemented"
+E       AssertionError: research query is not implemented
+E       assert None is not None
+E        +  where None = find_spec('rquant.research_query')
+
+tests/unit/test_research_query.py:20: AssertionError
+_ test_forbidden_sql_is_rejected_before_execution[INSERT INTO daily_bar VALUES (1)] _
+
+sql = 'INSERT INTO daily_bar VALUES (1)'
+
+    @pytest.mark.parametrize("sql", ["INSERT INTO daily_bar VALUES (1)", "WITH x AS (DELETE FROM daily_bar RETURNING *) SELECT * FROM x", "SELECT 1; SELECT 2", "ATTACH '/tmp/private' AS p", "COPY (SELECT 1) TO '/tmp/out'", "SELECT * FROM read_csv('/tmp/private')", "SELECT * FROM read_parquet('/tmp/private')", "INSTALL httpfs", "LOAD httpfs", "SET enable_external_access=true", "PRAGMA database_list"])
+    def test_forbidden_sql_is_rejected_before_execution(sql: str) -> None:
+        with pytest.raises(ValueError):
+>           _api().QueryRequest(sql=sql)
+            ^^^^^^
+
+tests/unit/test_research_query.py:96: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    def _api():
+>       assert find_spec("rquant.research_query") is not None, "research query is not implemented"
+E       AssertionError: research query is not implemented
+E       assert None is not None
+E        +  where None = find_spec('rquant.research_query')
+
+tests/unit/test_research_query.py:20: AssertionError
+_ test_forbidden_sql_is_rejected_before_execution[WITH x AS (DELETE FROM daily_bar RETURNING *) SELECT * FROM x] _
+
+sql = 'WITH x AS (DELETE FROM daily_bar RETURNING *) SELECT * FROM x'
+
+    @pytest.mark.parametrize("sql", ["INSERT INTO daily_bar VALUES (1)", "WITH x AS (DELETE FROM daily_bar RETURNING *) SELECT * FROM x", "SELECT 1; SELECT 2", "ATTACH '/tmp/private' AS p", "COPY (SELECT 1) TO '/tmp/out'", "SELECT * FROM read_csv('/tmp/private')", "SELECT * FROM read_parquet('/tmp/private')", "INSTALL httpfs", "LOAD httpfs", "SET enable_external_access=true", "PRAGMA database_list"])
+    def test_forbidden_sql_is_rejected_before_execution(sql: str) -> None:
+        with pytest.raises(ValueError):
+>           _api().QueryRequest(sql=sql)
+            ^^^^^^
+
+tests/unit/test_research_query.py:96: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    def _api():
+>       assert find_spec("rquant.research_query") is not None, "research query is not implemented"
+E       AssertionError: research query is not implemented
+E       assert None is not None
+E        +  where None = find_spec('rquant.research_query')
+
+tests/unit/test_research_query.py:20: AssertionError
+_____ test_forbidden_sql_is_rejected_before_execution[SELECT 1; SELECT 2] ______
+
+sql = 'SELECT 1; SELECT 2'
+
+    @pytest.mark.parametrize("sql", ["INSERT INTO daily_bar VALUES (1)", "WITH x AS (DELETE FROM daily_bar RETURNING *) SELECT * FROM x", "SELECT 1; SELECT 2", "ATTACH '/tmp/private' AS p", "COPY (SELECT 1) TO '/tmp/out'", "SELECT * FROM read_csv('/tmp/private')", "SELECT * FROM read_parquet('/tmp/private')", "INSTALL httpfs", "LOAD httpfs", "SET enable_external_access=true", "PRAGMA database_list"])
+    def test_forbidden_sql_is_rejected_before_execution(sql: str) -> None:
+        with pytest.raises(ValueError):
+>           _api().QueryRequest(sql=sql)
+            ^^^^^^
+
+tests/unit/test_research_query.py:96: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    def _api():
+>       assert find_spec("rquant.research_query") is not None, "research query is not implemented"
+E       AssertionError: research query is not implemented
+E       assert None is not None
+E        +  where None = find_spec('rquant.research_query')
+
+tests/unit/test_research_query.py:20: AssertionError
+_ test_forbidden_sql_is_rejected_before_execution[ATTACH '/tmp/private' AS p] __
+
+sql = "ATTACH '/tmp/private' AS p"
+
+    @pytest.mark.parametrize("sql", ["INSERT INTO daily_bar VALUES (1)", "WITH x AS (DELETE FROM daily_bar RETURNING *) SELECT * FROM x", "SELECT 1; SELECT 2", "ATTACH '/tmp/private' AS p", "COPY (SELECT 1) TO '/tmp/out'", "SELECT * FROM read_csv('/tmp/private')", "SELECT * FROM read_parquet('/tmp/private')", "INSTALL httpfs", "LOAD httpfs", "SET enable_external_access=true", "PRAGMA database_list"])
+    def test_forbidden_sql_is_rejected_before_execution(sql: str) -> None:
+        with pytest.raises(ValueError):
+>           _api().QueryRequest(sql=sql)
+            ^^^^^^
+
+tests/unit/test_research_query.py:96: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    def _api():
+>       assert find_spec("rquant.research_query") is not None, "research query is not implemented"
+E       AssertionError: research query is not implemented
+E       assert None is not None
+E        +  where None = find_spec('rquant.research_query')
+
+tests/unit/test_research_query.py:20: AssertionError
+_ test_forbidden_sql_is_rejected_before_execution[COPY (SELECT 1) TO '/tmp/out'] _
+
+sql = "COPY (SELECT 1) TO '/tmp/out'"
+
+    @pytest.mark.parametrize("sql", ["INSERT INTO daily_bar VALUES (1)", "WITH x AS (DELETE FROM daily_bar RETURNING *) SELECT * FROM x", "SELECT 1; SELECT 2", "ATTACH '/tmp/private' AS p", "COPY (SELECT 1) TO '/tmp/out'", "SELECT * FROM read_csv('/tmp/private')", "SELECT * FROM read_parquet('/tmp/private')", "INSTALL httpfs", "LOAD httpfs", "SET enable_external_access=true", "PRAGMA database_list"])
+    def test_forbidden_sql_is_rejected_before_execution(sql: str) -> None:
+        with pytest.raises(ValueError):
+>           _api().QueryRequest(sql=sql)
+            ^^^^^^
+
+tests/unit/test_research_query.py:96: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    def _api():
+>       assert find_spec("rquant.research_query") is not None, "research query is not implemented"
+E       AssertionError: research query is not implemented
+E       assert None is not None
+E        +  where None = find_spec('rquant.research_query')
+
+tests/unit/test_research_query.py:20: AssertionError
+_ test_forbidden_sql_is_rejected_before_execution[SELECT * FROM read_csv('/tmp/private')] _
+
+sql = "SELECT * FROM read_csv('/tmp/private')"
+
+    @pytest.mark.parametrize("sql", ["INSERT INTO daily_bar VALUES (1)", "WITH x AS (DELETE FROM daily_bar RETURNING *) SELECT * FROM x", "SELECT 1; SELECT 2", "ATTACH '/tmp/private' AS p", "COPY (SELECT 1) TO '/tmp/out'", "SELECT * FROM read_csv('/tmp/private')", "SELECT * FROM read_parquet('/tmp/private')", "INSTALL httpfs", "LOAD httpfs", "SET enable_external_access=true", "PRAGMA database_list"])
+    def test_forbidden_sql_is_rejected_before_execution(sql: str) -> None:
+        with pytest.raises(ValueError):
+>           _api().QueryRequest(sql=sql)
+            ^^^^^^
+
+tests/unit/test_research_query.py:96: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    def _api():
+>       assert find_spec("rquant.research_query") is not None, "research query is not implemented"
+E       AssertionError: research query is not implemented
+E       assert None is not None
+E        +  where None = find_spec('rquant.research_query')
+
+tests/unit/test_research_query.py:20: AssertionError
+_ test_forbidden_sql_is_rejected_before_execution[SELECT * FROM read_parquet('/tmp/private')] _
+
+sql = "SELECT * FROM read_parquet('/tmp/private')"
+
+    @pytest.mark.parametrize("sql", ["INSERT INTO daily_bar VALUES (1)", "WITH x AS (DELETE FROM daily_bar RETURNING *) SELECT * FROM x", "SELECT 1; SELECT 2", "ATTACH '/tmp/private' AS p", "COPY (SELECT 1) TO '/tmp/out'", "SELECT * FROM read_csv('/tmp/private')", "SELECT * FROM read_parquet('/tmp/private')", "INSTALL httpfs", "LOAD httpfs", "SET enable_external_access=true", "PRAGMA database_list"])
+    def test_forbidden_sql_is_rejected_before_execution(sql: str) -> None:
+        with pytest.raises(ValueError):
+>           _api().QueryRequest(sql=sql)
+            ^^^^^^
+
+tests/unit/test_research_query.py:96: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    def _api():
+>       assert find_spec("rquant.research_query") is not None, "research query is not implemented"
+E       AssertionError: research query is not implemented
+E       assert None is not None
+E        +  where None = find_spec('rquant.research_query')
+
+tests/unit/test_research_query.py:20: AssertionError
+_______ test_forbidden_sql_is_rejected_before_execution[INSTALL httpfs] ________
+
+sql = 'INSTALL httpfs'
+
+    @pytest.mark.parametrize("sql", ["INSERT INTO daily_bar VALUES (1)", "WITH x AS (DELETE FROM daily_bar RETURNING *) SELECT * FROM x", "SELECT 1; SELECT 2", "ATTACH '/tmp/private' AS p", "COPY (SELECT 1) TO '/tmp/out'", "SELECT * FROM read_csv('/tmp/private')", "SELECT * FROM read_parquet('/tmp/private')", "INSTALL httpfs", "LOAD httpfs", "SET enable_external_access=true", "PRAGMA database_list"])
+    def test_forbidden_sql_is_rejected_before_execution(sql: str) -> None:
+        with pytest.raises(ValueError):
+>           _api().QueryRequest(sql=sql)
+            ^^^^^^
+
+tests/unit/test_research_query.py:96: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    def _api():
+>       assert find_spec("rquant.research_query") is not None, "research query is not implemented"
+E       AssertionError: research query is not implemented
+E       assert None is not None
+E        +  where None = find_spec('rquant.research_query')
+
+tests/unit/test_research_query.py:20: AssertionError
+_________ test_forbidden_sql_is_rejected_before_execution[LOAD httpfs] _________
+
+sql = 'LOAD httpfs'
+
+    @pytest.mark.parametrize("sql", ["INSERT INTO daily_bar VALUES (1)", "WITH x AS (DELETE FROM daily_bar RETURNING *) SELECT * FROM x", "SELECT 1; SELECT 2", "ATTACH '/tmp/private' AS p", "COPY (SELECT 1) TO '/tmp/out'", "SELECT * FROM read_csv('/tmp/private')", "SELECT * FROM read_parquet('/tmp/private')", "INSTALL httpfs", "LOAD httpfs", "SET enable_external_access=true", "PRAGMA database_list"])
+    def test_forbidden_sql_is_rejected_before_execution(sql: str) -> None:
+        with pytest.raises(ValueError):
+>           _api().QueryRequest(sql=sql)
+            ^^^^^^
+
+tests/unit/test_research_query.py:96: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    def _api():
+>       assert find_spec("rquant.research_query") is not None, "research query is not implemented"
+E       AssertionError: research query is not implemented
+E       assert None is not None
+E        +  where None = find_spec('rquant.research_query')
+
+tests/unit/test_research_query.py:20: AssertionError
+_ test_forbidden_sql_is_rejected_before_execution[SET enable_external_access=true] _
+
+sql = 'SET enable_external_access=true'
+
+    @pytest.mark.parametrize("sql", ["INSERT INTO daily_bar VALUES (1)", "WITH x AS (DELETE FROM daily_bar RETURNING *) SELECT * FROM x", "SELECT 1; SELECT 2", "ATTACH '/tmp/private' AS p", "COPY (SELECT 1) TO '/tmp/out'", "SELECT * FROM read_csv('/tmp/private')", "SELECT * FROM read_parquet('/tmp/private')", "INSTALL httpfs", "LOAD httpfs", "SET enable_external_access=true", "PRAGMA database_list"])
+    def test_forbidden_sql_is_rejected_before_execution(sql: str) -> None:
+        with pytest.raises(ValueError):
+>           _api().QueryRequest(sql=sql)
+            ^^^^^^
+
+tests/unit/test_research_query.py:96: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    def _api():
+>       assert find_spec("rquant.research_query") is not None, "research query is not implemented"
+E       AssertionError: research query is not implemented
+E       assert None is not None
+E        +  where None = find_spec('rquant.research_query')
+
+tests/unit/test_research_query.py:20: AssertionError
+____ test_forbidden_sql_is_rejected_before_execution[PRAGMA database_list] _____
+
+sql = 'PRAGMA database_list'
+
+    @pytest.mark.parametrize("sql", ["INSERT INTO daily_bar VALUES (1)", "WITH x AS (DELETE FROM daily_bar RETURNING *) SELECT * FROM x", "SELECT 1; SELECT 2", "ATTACH '/tmp/private' AS p", "COPY (SELECT 1) TO '/tmp/out'", "SELECT * FROM read_csv('/tmp/private')", "SELECT * FROM read_parquet('/tmp/private')", "INSTALL httpfs", "LOAD httpfs", "SET enable_external_access=true", "PRAGMA database_list"])
+    def test_forbidden_sql_is_rejected_before_execution(sql: str) -> None:
+        with pytest.raises(ValueError):
+>           _api().QueryRequest(sql=sql)
+            ^^^^^^
+
+tests/unit/test_research_query.py:96: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    def _api():
+>       assert find_spec("rquant.research_query") is not None, "research query is not implemented"
+E       AssertionError: research query is not implemented
+E       assert None is not None
+E        +  where None = find_spec('rquant.research_query')
+
+tests/unit/test_research_query.py:20: AssertionError
+_ test_quoted_content_and_comments_do_not_change_actual_select[SELECT 'INSERT; COPY; read_csv' AS text;] _
+
+sql = "SELECT 'INSERT; COPY; read_csv' AS text;"
+
+    @pytest.mark.parametrize("sql", ["SELECT 'INSERT; COPY; read_csv' AS text;", "-- DROP\nWITH x AS (SELECT 1) SELECT * FROM x", "SELECT 1 /* ATTACH */", 'SELECT 1 AS "UPDATE"'])
+    def test_quoted_content_and_comments_do_not_change_actual_select(sql: str) -> None:
+>       assert _api().QueryRequest(sql=sql).sql == sql
+               ^^^^^^
+
+tests/unit/test_research_query.py:101: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    def _api():
+>       assert find_spec("rquant.research_query") is not None, "research query is not implemented"
+E       AssertionError: research query is not implemented
+E       assert None is not None
+E        +  where None = find_spec('rquant.research_query')
+
+tests/unit/test_research_query.py:20: AssertionError
+_ test_quoted_content_and_comments_do_not_change_actual_select[-- DROP\nWITH x AS (SELECT 1) SELECT * FROM x] _
+
+sql = '-- DROP\nWITH x AS (SELECT 1) SELECT * FROM x'
+
+    @pytest.mark.parametrize("sql", ["SELECT 'INSERT; COPY; read_csv' AS text;", "-- DROP\nWITH x AS (SELECT 1) SELECT * FROM x", "SELECT 1 /* ATTACH */", 'SELECT 1 AS "UPDATE"'])
+    def test_quoted_content_and_comments_do_not_change_actual_select(sql: str) -> None:
+>       assert _api().QueryRequest(sql=sql).sql == sql
+               ^^^^^^
+
+tests/unit/test_research_query.py:101: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    def _api():
+>       assert find_spec("rquant.research_query") is not None, "research query is not implemented"
+E       AssertionError: research query is not implemented
+E       assert None is not None
+E        +  where None = find_spec('rquant.research_query')
+
+tests/unit/test_research_query.py:20: AssertionError
+_ test_quoted_content_and_comments_do_not_change_actual_select[SELECT 1 /* ATTACH */] _
+
+sql = 'SELECT 1 /* ATTACH */'
+
+    @pytest.mark.parametrize("sql", ["SELECT 'INSERT; COPY; read_csv' AS text;", "-- DROP\nWITH x AS (SELECT 1) SELECT * FROM x", "SELECT 1 /* ATTACH */", 'SELECT 1 AS "UPDATE"'])
+    def test_quoted_content_and_comments_do_not_change_actual_select(sql: str) -> None:
+>       assert _api().QueryRequest(sql=sql).sql == sql
+               ^^^^^^
+
+tests/unit/test_research_query.py:101: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    def _api():
+>       assert find_spec("rquant.research_query") is not None, "research query is not implemented"
+E       AssertionError: research query is not implemented
+E       assert None is not None
+E        +  where None = find_spec('rquant.research_query')
+
+tests/unit/test_research_query.py:20: AssertionError
+_ test_quoted_content_and_comments_do_not_change_actual_select[SELECT 1 AS "UPDATE"] _
+
+sql = 'SELECT 1 AS "UPDATE"'
+
+    @pytest.mark.parametrize("sql", ["SELECT 'INSERT; COPY; read_csv' AS text;", "-- DROP\nWITH x AS (SELECT 1) SELECT * FROM x", "SELECT 1 /* ATTACH */", 'SELECT 1 AS "UPDATE"'])
+    def test_quoted_content_and_comments_do_not_change_actual_select(sql: str) -> None:
+>       assert _api().QueryRequest(sql=sql).sql == sql
+               ^^^^^^
+
+tests/unit/test_research_query.py:101: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    def _api():
+>       assert find_spec("rquant.research_query") is not None, "research query is not implemented"
+E       AssertionError: research query is not implemented
+E       assert None is not None
+E        +  where None = find_spec('rquant.research_query')
+
+tests/unit/test_research_query.py:20: AssertionError
+_____________ test_sql_byte_budget_and_client_cannot_raise_limits ______________
+
+    def test_sql_byte_budget_and_client_cannot_raise_limits() -> None:
+>       api = _api()
+              ^^^^^^
+
+tests/unit/test_research_query.py:105: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    def _api():
+>       assert find_spec("rquant.research_query") is not None, "research query is not implemented"
+E       AssertionError: research query is not implemented
+E       assert None is not None
+E        +  where None = find_spec('rquant.research_query')
+
+tests/unit/test_research_query.py:20: AssertionError
+_______ test_csv_formula_prefixes_quotes_binary_nonfinite_and_duplicates _______
+
+    def test_csv_formula_prefixes_quotes_binary_nonfinite_and_duplicates() -> None:
+>       api = _api()
+              ^^^^^^
+
+tests/unit/test_research_query.py:113: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    def _api():
+>       assert find_spec("rquant.research_query") is not None, "research query is not implemented"
+E       AssertionError: research query is not implemented
+E       assert None is not None
+E        +  where None = find_spec('rquant.research_query')
+
+tests/unit/test_research_query.py:20: AssertionError
+=========================== short test summary info ============================
+FAILED tests/unit/test_research_query.py::test_public_snapshot_contains_only_exact_public_columns_and_source_is_unchanged
+FAILED tests/unit/test_research_query.py::test_full_original_database_and_extra_objects_are_rejected
+FAILED tests/unit/test_research_query.py::test_snapshot_bad_digest_symlink_and_source_change_fail_closed
+FAILED tests/unit/test_research_query.py::test_forbidden_sql_is_rejected_before_execution[INSERT INTO daily_bar VALUES (1)]
+FAILED tests/unit/test_research_query.py::test_forbidden_sql_is_rejected_before_execution[WITH x AS (DELETE FROM daily_bar RETURNING *) SELECT * FROM x]
+FAILED tests/unit/test_research_query.py::test_forbidden_sql_is_rejected_before_execution[SELECT 1; SELECT 2]
+FAILED tests/unit/test_research_query.py::test_forbidden_sql_is_rejected_before_execution[ATTACH '/tmp/private' AS p]
+FAILED tests/unit/test_research_query.py::test_forbidden_sql_is_rejected_before_execution[COPY (SELECT 1) TO '/tmp/out']
+FAILED tests/unit/test_research_query.py::test_forbidden_sql_is_rejected_before_execution[SELECT * FROM read_csv('/tmp/private')]
+FAILED tests/unit/test_research_query.py::test_forbidden_sql_is_rejected_before_execution[SELECT * FROM read_parquet('/tmp/private')]
+FAILED tests/unit/test_research_query.py::test_forbidden_sql_is_rejected_before_execution[INSTALL httpfs]
+FAILED tests/unit/test_research_query.py::test_forbidden_sql_is_rejected_before_execution[LOAD httpfs]
+FAILED tests/unit/test_research_query.py::test_forbidden_sql_is_rejected_before_execution[SET enable_external_access=true]
+FAILED tests/unit/test_research_query.py::test_forbidden_sql_is_rejected_before_execution[PRAGMA database_list]
+FAILED tests/unit/test_research_query.py::test_quoted_content_and_comments_do_not_change_actual_select[SELECT 'INSERT; COPY; read_csv' AS text;]
+FAILED tests/unit/test_research_query.py::test_quoted_content_and_comments_do_not_change_actual_select[-- DROP\nWITH x AS (SELECT 1) SELECT * FROM x]
+FAILED tests/unit/test_research_query.py::test_quoted_content_and_comments_do_not_change_actual_select[SELECT 1 /* ATTACH */]
+FAILED tests/unit/test_research_query.py::test_quoted_content_and_comments_do_not_change_actual_select[SELECT 1 AS "UPDATE"]
+FAILED tests/unit/test_research_query.py::test_sql_byte_budget_and_client_cannot_raise_limits
+FAILED tests/unit/test_research_query.py::test_csv_formula_prefixes_quotes_binary_nonfinite_and_duplicates
+============================== 20 failed in 0.15s ==============================

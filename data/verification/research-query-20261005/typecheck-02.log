@@ -1,0 +1,8 @@
+
+> rquant-web@0.0.0 typecheck /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/web
+> tsc -p tsconfig.app.json --noEmit && tsc -p tsconfig.node.json --noEmit
+
+src/pages/query/index.tsx(301,47): error TS2339: Property 'description' does not exist on type '{ data_type: string; name: string; }'.
+src/pages/query/query.test.tsx(21,50): error TS2353: Object literal may only specify known properties, and 'description' does not exist in type '{ data_type: string; name: string; }'.
+src/pages/query/query.test.tsx(22,47): error TS2353: Object literal may only specify known properties, and 'description' does not exist in type '{ data_type: string; name: string; }'.
+ ELIFECYCLE  Command failed with exit code 2.

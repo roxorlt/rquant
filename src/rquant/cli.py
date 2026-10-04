@@ -8674,6 +8674,11 @@ def main() -> int:
 
     # The web API reads only the Serving root and never `.env` (its unit hides the file), so
     # `web-serve` / `web-openapi` are handed to `rquant.web.cli` the same way.
+    if sys.argv[1:2] == ["research-query"]:
+        from rquant.research_query.cli import main as query_main
+
+        return query_main(sys.argv[2:])
+
     if sys.argv[1:2] in (["web-serve"], ["web-openapi"]):
         from rquant.web.cli import main as web_main
 

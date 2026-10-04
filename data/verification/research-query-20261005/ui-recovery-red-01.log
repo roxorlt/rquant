@@ -1,0 +1,461 @@
+
+ RUN  v5.0.2 /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/web
+
+ ❯ src/pages/query/query.test.tsx (8 tests | 3 failed) 2522ms
+   × 切换账号后清除上个账号的 SQL 和名称 99ms
+   × 原命令尚未找到且重试失败时，保留记录并提示继续恢复 1160ms
+   × 空白 SQL 不能保存 97ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 3 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  src/pages/query/query.test.tsx > 切换账号后清除上个账号的 SQL 和名称
+Error: expect(element).not.toHaveValue(SELECT 'private-editor')
+
+Expected the element not to have value:
+  SELECT 'private-editor'
+Received:
+  SELECT 'private-editor'
+ ❯ src/pages/query/query.test.tsx:150:22
+    148|   });
+    149|   await act(async () => queryClient.setQueryData(META_QUERY_KEY, metaE…
+    150|   expect(editor).not.toHaveValue("SELECT 'private-editor'");
+       |                      ^
+    151|   expect(screen.getByRole("textbox", { name: "查询名称" })).toHaveValue(""…
+    152| });
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/3]⎯
+
+ FAIL  src/pages/query/query.test.tsx > 原命令尚未找到且重试失败时，保留记录并提示继续恢复
+TestingLibraryElementError: Unable to find an element with the text: 保存结果尚未确认，请恢复原命令。. This could be because the text is broken up by multiple elements. In this case, you can provide a function for your text matcher to make your matcher more flexible.
+
+Ignored nodes: comments, script, style
+[36m<body>[39m
+  [36m<div>[39m
+    [36m<div[39m
+      [33mclass[39m=[32m"shell"[39m
+    [36m>[39m
+      [36m<header[39m
+        [33mclass[39m=[32m"topbar"[39m
+      [36m>[39m
+        [36m<a[39m
+          [33mclass[39m=[32m"brand"[39m
+          [33mdata-discover[39m=[32m"true"[39m
+          [33mhref[39m=[32m"/overview"[39m
+        [36m>[39m
+          [36m<span[39m
+            [33maria-hidden[39m=[32m"true"[39m
+            [33mclass[39m=[32m"brand-mark"[39m
+          [36m>[39m
+            [36m<svg[39m
+              [33maria-hidden[39m=[32m"true"[39m
+              [33mfill[39m=[32m"none"[39m
+              [33mfocusable[39m=[32m"false"[39m
+              [33mheight[39m=[32m"16"[39m
+              [33mstroke[39m=[32m"currentColor"[39m
+              [33mstroke-linecap[39m=[32m"round"[39m
+              [33mstroke-width[39m=[32m"2"[39m
+              [33mviewBox[39m=[32m"0 0 24 24"[39m
+              [33mwidth[39m=[32m"16"[39m
+            [36m>[39m
+              [36m<path[39m
+                [33md[39m=[32m"M6 4v16M12 7v10M18 3v18"[39m
+              [36m/>[39m
+              [36m<rect[39m
+                [33mfill[39m=[32m"currentColor"[39m
+                [33mheight[39m=[32m"7"[39m
+                [33mstroke[39m=[32m"none"[39m
+                [33mwidth[39m=[32m"3"[39m
+                [33mx[39m=[32m"4.5"[39m
+                [33my[39m=[32m"8"[39m
+              [36m/>[39m
+              [36m<rect[39m
+                [33mfill[39m=[32m"currentColor"[39m
+                [33mheight[39m=[32m"9"[39m
+                [33mstroke[39m=[32m"none"[39m
+                [33mwidth[39m=[32m"3"[39m
+                [33mx[39m=[32m"16.5"[39m
+                [33my[39m=[32m"6"[39m
+              [36m/>[39m
+            [36m</svg>[39m
+          [36m</span>[39m
+          [36m<span[39m
+            [33mclass[39m=[32m"brand-name"[39m
+          [36m>[39m
+            [0mrQuant 投研[0m
+          [36m</span>[39m
+        [36m</a>[39m
+        [36m<div[39m
+          [33mclass[39m=[32m"tb-status"[39m
+        [36m>[39m
+          [36m<div[39m
+            [33mclass[39m=[32m"tb-day"[39m
+          [36m>[39m
+            [36m<span[39m
+              [33mclass[39m=[32m"mono"[39m
+            [36m>[39m
+              [0m2026-09-24[0m
+            [36m</span>[39m
+            [0m [0m
+            [0m周四[0m
+          [36m</div>[39m
+          [36m<span[39m
+            [33mclass[39m=[32m"phase"[39m
+            [33mdata-phase[39m=[32m"cont"[39m
+          [36m>[39m
+            [36m<span[39m
+              [33maria-hidden[39m=[32m"true"[39m
+              [33mclass[39m=[32m"pdot"[39m
+            [36m/>[39m
+            [36m<span[39m
+              [33mclass[39m=[32m"sr-only"[39m
+            [36m>[39m
+              [0m市场阶段：[0m
+            [36m</span>[39m
+            [36m<span>[39m
+              [0m连续竞价[0m
+            [36m</span>[39m
+          [36m</span>[39m
+          [36m<span[39m
+            [33mclass[39m=[32m"tip-anchor"[39m
+            [33mtabindex[39m=[32m"0"[39m
+          [36m>[39m
+            [36m<span[39m
+              [33mclass[39m=[32m"gen-tag"[39m
+              [33mdata-generation[39m=[32m"a1b2c3d4e5f6"[39m
+              [33mdata-state[39m=[32m"ready"[39m
+            [36m>[39m
+              [36m<span[39m
+                [33maria-hidden[39m=[32m"true"[39m
+                [33mclass[39m=[32m"gdot"[39m
+              [36m/>[39m
+              [0m数据 3 分钟前更新[0m
+            [36m</span>[39m
+          [36m</span>[39m
+        [36m</div>[39m
+        [36m<form[39m
+          [33mclass[39m=[32m"search"[39m
+          [33mrole[39m=[32m"search"[39m
+        [36m>[39m
+          [36m<svg[39m
+            [33maria-hidden[39m=[32m"true"[39m
+            [33mfill[39m=[32m"none"[39m
+            [33mfocusable[39m=[32m"false"[39m
+            [33mheight[39m=[32m"16"[39m
+            [33mstroke[39m=[32m"currentColor"[39m
+            [33mstroke-linecap[39m=[32m"round"[39m
+            [33mstroke-linejoin[39m=[32m"round"[39m
+            [33mstroke-width[39m=[32m"1.7"[39m
+            [33mviewBox[39m=[32m"0 0 24 24"[39m
+            [33mwidth[39m=[32m"16"[39m
+          [36m>[39m
+            [36m<circle[39m
+              [33mcx[39m=[32m"11"[39m
+              [33mcy[39m=[32m"11"[39m
+              [33mr[39m=[32m"6.5"[39m
+            [36m/>[39m
+            [36m<path[39m
+              [33md[39m=[32m"M16 16l4.5 4.5"[39m
+            [36m/>[39m
+          [36m</svg>[39m
+          [36m<input[39m
+            [33maria-autocomplete[39m=[32m"list"[39m
+            [33maria-expanded[39m=[32m"false"[39m
+            [33maria-label[39m=[32m"搜索股票"[39m
+            [33mautocomplete[39m=[32m"off"[39m
+            [33mmaxlength[39m=[32m"32"[39m
+            [33mplaceholder[39m=[32m"代码 / 名称"[39m
+            [33mrole[39m=[32m"combobox"[39m
+            [33mtype[39m=[32m"search"[39m
+            [33mvalue[39m=[32m""[39m
+          [36m/>[39m
+        [36m</form>[39m
+        [36m<span[39m
+          [33mclass[39m=[32m"tip-anchor"[39m
+          [33mtabindex[39m=[32m"0"[39m
+        [36m>[39m
+          [36m<button[39m
+            [33maria-description[39m=[32m"AI 助手即将上线"[39m
+            [33mclass[39m=[32m"btn ai-btn"[39m
+            [33mdisabled[39m=[32m""[39m
+            [33mtype[39m=[32m"button"[39m
+          [36m>[39m
+            [36m<svg[39m
+              [33maria-hidden[39m=[32m"true"[39m
+              [33mfill[39m=[32m"none"[39m
+              [33mfocusable[39m=[32m"false"[39m
+              [33mheight[39m=[32m"16"[39m
+              [33mstroke[39m=[32m"currentColor"[39m
+              [33mstroke-linecap[39m=[32m"round"[39m
+              [33mstroke-linejoin[39m=[32m"round"[39m
+              [33mstroke-width[39m=[32m"1.7"[39m
+              [33mviewBox[39m=[32m"0 0 24 24"[39m
+              [33mwidth[39m=[32m"16"[39m
+            [36m>[39m
+              [36m<path[39m
+                [33md[39m=[32m"M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z"[39m
+              [36m/>[39m
+              [36m<path[39m
+                [33md[39m=[32m"M19 16l.8 2.2L22 19l-2.2.8L19 22l-.8-2.2L16 19l2.2-.8z"[39m
+              [36m/>[39m
+            [36m</svg>[39m
+            [36m<span[39m
+              [33mclass[39m=[32m"lbl"[39m
+            [36m>[39m
+              [0mAI 助手[0m
+            [36m</span>[39m
+          [36m</button>[39m
+        [36m</span>[39m
+        [36m<button[39m
+          [33maria-label[39m=[32m"主题：跟随系统，点击切换"[39m
+          [33mclass[39m=[32m"icon-btn theme-btn"[39m
+          [33mtitle[39m=[32m"主题：跟随系统"[39m
+          [33mtype[39m=[32m"button"[39m
+        [36m>[39m
+          [3...
+
+Ignored nodes: comments, script, style
+[36m<body>[39m
+  [36m<div>[39m
+    [36m<div[39m
+      [33mclass[39m=[32m"shell"[39m
+    [36m>[39m
+      [36m<header[39m
+        [33mclass[39m=[32m"topbar"[39m
+      [36m>[39m
+        [36m<a[39m
+          [33mclass[39m=[32m"brand"[39m
+          [33mdata-discover[39m=[32m"true"[39m
+          [33mhref[39m=[32m"/overview"[39m
+        [36m>[39m
+          [36m<span[39m
+            [33maria-hidden[39m=[32m"true"[39m
+            [33mclass[39m=[32m"brand-mark"[39m
+          [36m>[39m
+            [36m<svg[39m
+              [33maria-hidden[39m=[32m"true"[39m
+              [33mfill[39m=[32m"none"[39m
+              [33mfocusable[39m=[32m"false"[39m
+              [33mheight[39m=[32m"16"[39m
+              [33mstroke[39m=[32m"currentColor"[39m
+              [33mstroke-linecap[39m=[32m"round"[39m
+              [33mstroke-width[39m=[32m"2"[39m
+              [33mviewBox[39m=[32m"0 0 24 24"[39m
+              [33mwidth[39m=[32m"16"[39m
+            [36m>[39m
+              [36m<path[39m
+                [33md[39m=[32m"M6 4v16M12 7v10M18 3v18"[39m
+              [36m/>[39m
+              [36m<rect[39m
+                [33mfill[39m=[32m"currentColor"[39m
+                [33mheight[39m=[32m"7"[39m
+                [33mstroke[39m=[32m"none"[39m
+                [33mwidth[39m=[32m"3"[39m
+                [33mx[39m=[32m"4.5"[39m
+                [33my[39m=[32m"8"[39m
+              [36m/>[39m
+              [36m<rect[39m
+                [33mfill[39m=[32m"currentColor"[39m
+                [33mheight[39m=[32m"9"[39m
+                [33mstroke[39m=[32m"none"[39m
+                [33mwidth[39m=[32m"3"[39m
+                [33mx[39m=[32m"16.5"[39m
+                [33my[39m=[32m"6"[39m
+              [36m/>[39m
+            [36m</svg>[39m
+          [36m</span>[39m
+          [36m<span[39m
+            [33mclass[39m=[32m"brand-name"[39m
+          [36m>[39m
+            [0mrQuant 投研[0m
+          [36m</span>[39m
+        [36m</a>[39m
+        [36m<div[39m
+          [33mclass[39m=[32m"tb-status"[39m
+        [36m>[39m
+          [36m<div[39m
+            [33mclass[39m=[32m"tb-day"[39m
+          [36m>[39m
+            [36m<span[39m
+              [33mclass[39m=[32m"mono"[39m
+            [36m>[39m
+              [0m2026-09-24[0m
+            [36m</span>[39m
+            [0m [0m
+            [0m周四[0m
+          [36m</div>[39m
+          [36m<span[39m
+            [33mclass[39m=[32m"phase"[39m
+            [33mdata-phase[39m=[32m"cont"[39m
+          [36m>[39m
+            [36m<span[39m
+              [33maria-hidden[39m=[32m"true"[39m
+              [33mclass[39m=[32m"pdot"[39m
+            [36m/>[39m
+            [36m<span[39m
+              [33mclass[39m=[32m"sr-only"[39m
+            [36m>[39m
+              [0m市场阶段：[0m
+            [36m</span>[39m
+            [36m<span>[39m
+              [0m连续竞价[0m
+            [36m</span>[39m
+          [36m</span>[39m
+          [36m<span[39m
+            [33mclass[39m=[32m"tip-anchor"[39m
+            [33mtabindex[39m=[32m"0"[39m
+          [36m>[39m
+            [36m<span[39m
+              [33mclass[39m=[32m"gen-tag"[39m
+              [33mdata-generation[39m=[32m"a1b2c3d4e5f6"[39m
+              [33mdata-state[39m=[32m"ready"[39m
+            [36m>[39m
+              [36m<span[39m
+                [33maria-hidden[39m=[32m"true"[39m
+                [33mclass[39m=[32m"gdot"[39m
+              [36m/>[39m
+              [0m数据 3 分钟前更新[0m
+            [36m</span>[39m
+          [36m</span>[39m
+        [36m</div>[39m
+        [36m<form[39m
+          [33mclass[39m=[32m"search"[39m
+          [33mrole[39m=[32m"search"[39m
+        [36m>[39m
+          [36m<svg[39m
+            [33maria-hidden[39m=[32m"true"[39m
+            [33mfill[39m=[32m"none"[39m
+            [33mfocusable[39m=[32m"false"[39m
+            [33mheight[39m=[32m"16"[39m
+            [33mstroke[39m=[32m"currentColor"[39m
+            [33mstroke-linecap[39m=[32m"round"[39m
+            [33mstroke-linejoin[39m=[32m"round"[39m
+            [33mstroke-width[39m=[32m"1.7"[39m
+            [33mviewBox[39m=[32m"0 0 24 24"[39m
+            [33mwidth[39m=[32m"16"[39m
+          [36m>[39m
+            [36m<circle[39m
+              [33mcx[39m=[32m"11"[39m
+              [33mcy[39m=[32m"11"[39m
+              [33mr[39m=[32m"6.5"[39m
+            [36m/>[39m
+            [36m<path[39m
+              [33md[39m=[32m"M16 16l4.5 4.5"[39m
+            [36m/>[39m
+          [36m</svg>[39m
+          [36m<input[39m
+            [33maria-autocomplete[39m=[32m"list"[39m
+            [33maria-expanded[39m=[32m"false"[39m
+            [33maria-label[39m=[32m"搜索股票"[39m
+            [33mautocomplete[39m=[32m"off"[39m
+            [33mmaxlength[39m=[32m"32"[39m
+            [33mplaceholder[39m=[32m"代码 / 名称"[39m
+            [33mrole[39m=[32m"combobox"[39m
+            [33mtype[39m=[32m"search"[39m
+            [33mvalue[39m=[32m""[39m
+          [36m/>[39m
+        [36m</form>[39m
+        [36m<span[39m
+          [33mclass[39m=[32m"tip-anchor"[39m
+          [33mtabindex[39m=[32m"0"[39m
+        [36m>[39m
+          [36m<button[39m
+            [33maria-description[39m=[32m"AI 助手即将上线"[39m
+            [33mclass[39m=[32m"btn ai-btn"[39m
+            [33mdisabled[39m=[32m""[39m
+            [33mtype[39m=[32m"button"[39m
+          [36m>[39m
+            [36m<svg[39m
+              [33maria-hidden[39m=[32m"true"[39m
+              [33mfill[39m=[32m"none"[39m
+              [33mfocusable[39m=[32m"false"[39m
+              [33mheight[39m=[32m"16"[39m
+              [33mstroke[39m=[32m"currentColor"[39m
+              [33mstroke-linecap[39m=[32m"round"[39m
+              [33mstroke-linejoin[39m=[32m"round"[39m
+              [33mstroke-width[39m=[32m"1.7"[39m
+              [33mviewBox[39m=[32m"0 0 24 24"[39m
+              [33mwidth[39m=[32m"16"[39m
+            [36m>[39m
+              [36m<path[39m
+                [33md[39m=[32m"M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z"[39m
+              [36m/>[39m
+              [36m<path[39m
+                [33md[39m=[32m"M19 16l.8 2.2L22 19l-2.2.8L19 22l-.8-2.2L16 19l2.2-.8z"[39m
+              [36m/>[39m
+            [36m</svg>[39m
+            [36m<span[39m
+              [33mclass[39m=[32m"lbl"[39m
+            [36m>[39m
+              [0mAI 助手[0m
+            [36m</span>[39m
+          [36m</button>[39m
+        [36m</span>[39m
+        [36m<button[39m
+          [33maria-label[39m=[32m"主题：跟随系统，点击切换"[39m
+          [33mclass[39m=[32m"icon-btn theme-btn"[39m
+          [33mtitle[39m=[32m"主题：跟随系统"[39m
+          [33mtype[39m=[32m"button"[39m
+        [36m>[39m
+          [3...
+ ❯ waitForWrapper node_modules/.pnpm/@testing-library+dom@10.4.2/node_modules/@testing-library/dom/dist/wait-for.js:163:27
+ ❯ node_modules/.pnpm/@testing-library+dom@10.4.2/node_modules/@testing-library/dom/dist/query-helpers.js:86:33
+ ❯ src/pages/query/query.test.tsx:174:23
+    172|   await screen.findByText("原命令尚未找到，可再次提交原命令。");
+    173|   await user.click(screen.getByRole("button", { name: "重试原保存" }));
+    174|   expect(await screen.findByText("保存结果尚未确认，请恢复原命令。")).toBeVisible();
+       |                       ^
+    175|   expect(commands).toHaveLength(2);
+    176|   expect(commands[1]).toEqual(commands[0]);
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/3]⎯
+
+ FAIL  src/pages/query/query.test.tsx > 空白 SQL 不能保存
+Error: expect(element).toBeDisabled()
+
+Received element is not disabled:
+  <button
+  class="btn"
+  type="button"
+/>
+ ❯ src/pages/query/query.test.tsx:188:54
+    186|   await user.type(screen.getByRole("textbox", { name: "查询名称" }), "空查询"…
+    187|   fireEvent.change(editor, { target: { value: "  " } });
+    188|   expect(screen.getByRole("button", { name: "保存" })).toBeDisabled();
+       |                                                      ^
+    189| });
+    190|
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[3/3]⎯
+
+⎯⎯⎯⎯⎯⎯ Unhandled Errors ⎯⎯⎯⎯⎯⎯
+
+Vitest caught 1 unhandled error during the test run.
+This might cause false positive tests. Resolve unhandled errors to make sure your tests are not affected.
+
+⎯⎯⎯⎯ Unhandled Rejection ⎯⎯⎯⎯⎯
+ApiError: 保存结果尚未确认，请恢复原命令。
+ ❯ saveQuery src/api/researchQuery.ts:63:11
+     61|     : await apiClient().POST("/api/v1/research/queries/save", options);
+     62|   if (data === undefined)
+     63|     throw new ApiError(
+       |           ^
+     64|       response.status,
+     65|       response.status === 409
+ ❯ processTicksAndRejections node:internal/process/task_queues:103:5
+ ❯ onClick src/pages/query/index.tsx:422:23
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯
+Serialized Error: { status: 503 }
+This error originated in "src/pages/query/query.test.tsx" test file. It doesn't mean the error was thrown inside the file itself, but while it was running.
+The last test to run before this error was "原命令尚未找到且重试失败时，保留记录并提示继续恢复". This means either:
+- the error was thrown while Vitest was running this test, or
+- the error was thrown after the test completed, and this was the most recent test at that point.
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯
+
+
+ Test Files  1 failed (1)
+      Tests  3 failed | 5 passed (8)
+     Errors  1 error
+   Start at  03:43:54
+   Duration  3.81s (tests 68%, import 15%, environment 8%, transform 5%, setup 4%)
+

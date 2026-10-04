@@ -1,0 +1,187 @@
+============================= test session starts ==============================
+platform darwin -- Python 3.13.12, pytest-9.0.3, pluggy-1.6.0
+rootdir: /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk
+configfile: pyproject.toml
+plugins: mock-3.15.1, anyio-4.13.0
+collected 1104 items
+
+tests/unit/test_web_alert_ack.py ....................................... [  3%]
+..                                                                       [  3%]
+tests/unit/test_web_backfill_plan_commands.py .......................... [  6%]
+.                                                                        [  6%]
+tests/unit/test_web_backfill_plans.py .............                      [  7%]
+tests/unit/test_web_backtests.py ......                                  [  7%]
+tests/unit/test_web_catalog.py ........                                  [  8%]
+tests/unit/test_web_data_audit.py ...                                    [  8%]
+tests/unit/test_web_data_audit_report.py ...........................     [ 11%]
+tests/unit/test_web_data_audit_report_calendar.py ............           [ 12%]
+tests/unit/test_web_data_audit_report_commands.py ...................... [ 14%]
+.........                                                                [ 15%]
+tests/unit/test_web_deploy_kit.py ......                                 [ 15%]
+tests/unit/test_web_experiments.py ..                                    [ 15%]
+tests/unit/test_web_factor_minute_features.py ....                       [ 16%]
+tests/unit/test_web_factor_results.py ...                                [ 16%]
+tests/unit/test_web_factor_runs.py ...........                           [ 17%]
+tests/unit/test_web_factor_stock_features.py ......                      [ 18%]
+tests/unit/test_web_factor_tracking.py .....                             [ 18%]
+tests/unit/test_web_factors.py ............                              [ 19%]
+tests/unit/test_web_formula_market_commands.py ...............           [ 21%]
+tests/unit/test_web_formula_market_read.py ........                      [ 21%]
+tests/unit/test_web_formula_pool_read.py ..........                      [ 22%]
+tests/unit/test_web_formula_pool_save_commands.py ...................... [ 24%]
+.....                                                                    [ 25%]
+tests/unit/test_web_fundamental_summary.py .......................       [ 27%]
+tests/unit/test_web_generation_tracker.py .....                          [ 27%]
+tests/unit/test_web_import_isolation.py ................................ [ 30%]
+........................................................................ [ 37%]
+..                                                                       [ 37%]
+tests/unit/test_web_lab_controls.py ...................                  [ 38%]
+tests/unit/test_web_manual_watchlist.py ...........................      [ 41%]
+tests/unit/test_web_meta.py .......................                      [ 43%]
+tests/unit/test_web_monitor.py .............                             [ 44%]
+tests/unit/test_web_monitor_channels.py .........                        [ 45%]
+tests/unit/test_web_openapi_snapshot.py .F                               [ 45%]
+tests/unit/test_web_overview_health.py ............................      [ 48%]
+tests/unit/test_web_panorama.py ................................         [ 51%]
+tests/unit/test_web_paper_accounts.py .......                            [ 51%]
+tests/unit/test_web_paper_history.py .............                       [ 52%]
+tests/unit/test_web_pool_editor.py ..................................... [ 56%]
+...............                                                          [ 57%]
+tests/unit/test_web_pool_member_return.py ..........                     [ 58%]
+tests/unit/test_web_pool_nl_preview.py .....................             [ 60%]
+tests/unit/test_web_pools.py .......................................     [ 63%]
+tests/unit/test_web_private_ingress.py ....                              [ 64%]
+tests/unit/test_web_proxy_identity.py .................................F [ 67%]
+.                                                                        [ 67%]
+tests/unit/test_web_release_script.py ............................       [ 70%]
+tests/unit/test_web_research_query.py ...                                [ 70%]
+tests/unit/test_web_screen.py .................                          [ 71%]
+tests/unit/test_web_screen_dynamic_rsi.py ....                           [ 72%]
+tests/unit/test_web_screen_fundamental.py ...                            [ 72%]
+tests/unit/test_web_screen_nl_preview.py ..............                  [ 73%]
+tests/unit/test_web_screen_replica.py .................................. [ 76%]
+..............                                                           [ 78%]
+tests/unit/test_web_security.py ....................                     [ 79%]
+tests/unit/test_web_serve_fixture_script.py ..                           [ 80%]
+tests/unit/test_web_service_log_access_audit.py ..............           [ 81%]
+tests/unit/test_web_service_logs.py ...................................  [ 84%]
+tests/unit/test_web_serving_fixture.py ............                      [ 85%]
+tests/unit/test_web_stocks.py ....                                       [ 85%]
+tests/unit/test_web_strategies.py ..                                     [ 86%]
+tests/unit/test_web_task_events.py ...............                       [ 87%]
+tests/unit/test_web_tasks.py .....                                       [ 87%]
+tests/unit/test_web_tasks_overview.py ................                   [ 89%]
+tests/unit/test_web_tdx_preview.py ....................                  [ 91%]
+tests/unit/test_page_control.py ........................................ [ 94%]
+........................                                                 [ 97%]
+tests/unit/test_page_control_service.py ..................               [ 98%]
+tests/unit/test_page_control_watchlist.py .........                      [ 99%]
+tests/unit/test_factor_save_page_control.py ...                          [ 99%]
+tests/unit/test_factor_run_page_control.py ..                            [ 99%]
+tests/unit/test_lab_page_control.py .                                    [100%]
+
+=================================== FAILURES ===================================
+_____ test_every_api_path_is_versioned_and_only_defined_mutations_use_post _____
+
+    def test_every_api_path_is_versioned_and_only_defined_mutations_use_post() -> None:
+        app = create_app(WebSettings(serving_root=Path("data/runtime/serving")), background=False)
+        paths = app.openapi()["paths"]
+        assert paths
+        for path, operations in paths.items():
+            assert path.startswith("/api/v1/")
+>           assert set(operations) == (
+                {"post"}
+                if path
+                in {
+                    "/api/v1/screen/run",
+                    "/api/v1/screen/nl-preview",
+                    "/api/v1/screen/tdx/parse",
+                    "/api/v1/screen/tdx/preview",
+                    "/api/v1/pools/editor/commands",
+                    "/api/v1/pools/editor/nl-preview",
+                    "/api/v1/monitor/ack",
+                    "/api/v1/watchlist/commands",
+                    "/api/v1/data/backfill-plans/commands",
+                    "/api/v1/data/audit-report/commands",
+                    "/api/v1/screen/tdx/market/commands",
+                    "/api/v1/pools/formula/commands",
+                    "/api/v1/tasks/jobs/commands",
+                    "/api/v1/factors/definitions/{factor_id}/archive",
+                    "/api/v1/factors/definitions/{factor_id}/archive/resume",
+                    "/api/v1/factors/definitions/save",
+                    "/api/v1/factors/definitions/save/resume",
+                    "/api/v1/factors/definitions/save/retry",
+                    "/api/v1/factors/runs",
+                    "/api/v1/factors/runs/resume",
+                    "/api/v1/factors/runs/retry",
+                    "/api/v1/factors/tracking/commands",
+                    "/api/v1/factors/tracking/commands/resume",
+                    "/api/v1/factors/tracking/commands/retry",
+                }
+                else {"get"}
+            )
+E           AssertionError: assert {'post'} == {'get'}
+E             
+E             Extra items in the left set:
+E             'post'
+E             Extra items in the right set:
+E             'get'
+E             Use -v to get more diff
+
+tests/unit/test_web_openapi_snapshot.py:29: AssertionError
+_______ test_current_user_route_inventory_matches_documented_categories ________
+
+tmp_path = PosixPath('/private/var/folders/d8/tklkkr6x3gl8y8drmfrnmztm0000gp/T/pytest-of-roxor/pytest-39/test_current_user_route_invent0')
+
+    def test_current_user_route_inventory_matches_documented_categories(tmp_path: Path) -> None:
+        document = (
+            Path(__file__).resolve().parents[2]
+            / "docs/plans/2026-09-29-web-private-identity-route-inventory.md"
+        ).read_text(encoding="utf-8")
+        documented = re.findall(r"\| (GET|POST) \| `(/api/v1[^`]+)` \|", document)
+        assert len(documented) == len(set(documented)) == 74
+    
+        app = create_app(WebSettings(serving_root=tmp_path), background=False)
+    
+        def consumes_identity(route: APIRoute) -> bool:
+            def uses(dependency: object) -> bool:
+                return getattr(dependency, "call", None) is current_user or any(
+                    uses(child) for child in getattr(dependency, "dependencies", ())
+                )
+    
+            return uses(route.dependant)
+    
+        actual = {
+            (method, included.include_context.prefix + route.path)
+            for included in app.router.routes
+            if hasattr(included, "original_router")
+            for route in included.original_router.routes
+            if isinstance(route, APIRoute) and consumes_identity(route)
+            for method in route.methods
+        }
+>       assert set(documented) == actual
+E       AssertionError: assert {('GET', '/ap...atalog'), ...} == {('GET', '/ap...atalog'), ...}
+E         
+E         Extra items in the right set:
+E         ('GET', '/api/v1/research/queries')
+E         ('POST', '/api/v1/research/query')
+E         ('POST', '/api/v1/research/queries/resume')
+E         ('GET', '/api/v1/research/catalog')
+E         ('POST', '/api/v1/research/queries/save')
+E         Use -v to get more diff
+
+tests/unit/test_web_proxy_identity.py:324: AssertionError
+=============================== warnings summary ===============================
+tests/unit/test_web_private_ingress.py::test_uvicorn_fd_serves_only_the_prebound_unix_socket
+  /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-source-integration/.venv/lib/python3.13/site-packages/websockets/legacy/__init__.py:6: DeprecationWarning: websockets.legacy is deprecated; see https://websockets.readthedocs.io/en/stable/howto/upgrade.html for upgrade instructions
+    warnings.warn(  # deprecated in 14.0 - 2024-11-09
+
+tests/unit/test_web_private_ingress.py::test_uvicorn_fd_serves_only_the_prebound_unix_socket
+  /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-source-integration/.venv/lib/python3.13/site-packages/uvicorn/protocols/websockets/websockets_impl.py:17: DeprecationWarning: websockets.server.WebSocketServerProtocol is deprecated
+    from websockets.server import WebSocketServerProtocol
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/unit/test_web_openapi_snapshot.py::test_every_api_path_is_versioned_and_only_defined_mutations_use_post
+FAILED tests/unit/test_web_proxy_identity.py::test_current_user_route_inventory_matches_documented_categories
+============ 2 failed, 1102 passed, 2 warnings in 246.41s (0:04:06) ============

@@ -1,0 +1,24 @@
+============================= test session starts ==============================
+platform darwin -- Python 3.13.12, pytest-9.0.3, pluggy-1.6.0
+rootdir: /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk
+configfile: pyproject.toml
+plugins: mock-3.15.1, anyio-4.13.0
+collected 1 item
+
+tests/unit/test_research_query_cli.py F                                  [100%]
+
+=================================== FAILURES ===================================
+_____ test_query_cli_has_explicit_separate_build_execute_and_control_roles _____
+
+capsys = <_pytest.capture.CaptureFixture object at 0x107de67b0>
+
+    def test_query_cli_has_explicit_separate_build_execute_and_control_roles(capsys) -> None:
+>       assert find_spec("rquant.research_query.cli") is not None, "configuration-free query CLI is not implemented"
+E       AssertionError: configuration-free query CLI is not implemented
+E       assert None is not None
+E        +  where None = find_spec('rquant.research_query.cli')
+
+tests/unit/test_research_query_cli.py:10: AssertionError
+=========================== short test summary info ============================
+FAILED tests/unit/test_research_query_cli.py::test_query_cli_has_explicit_separate_build_execute_and_control_roles
+============================== 1 failed in 0.14s ===============================

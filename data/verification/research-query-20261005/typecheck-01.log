@@ -1,0 +1,7 @@
+
+> rquant-web@0.0.0 typecheck /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/web
+> tsc -p tsconfig.app.json --noEmit && tsc -p tsconfig.node.json --noEmit
+
+src/pages/query/index.tsx(108,98): error TS2339: Property 'version' does not exist on type 'object'.
+src/pages/query/index.tsx(109,87): error TS2339: Property 'version' does not exist on type 'object'.
+ ELIFECYCLE  Command failed with exit code 2.

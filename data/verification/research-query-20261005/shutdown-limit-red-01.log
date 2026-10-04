@@ -1,0 +1,77 @@
+============================= test session starts ==============================
+platform darwin -- Python 3.13.12, pytest-9.0.3, pluggy-1.6.0
+rootdir: /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk
+configfile: pyproject.toml
+plugins: mock-3.15.1, anyio-4.13.0
+collected 2 items
+
+tests/unit/test_research_query_executor.py F                             [ 50%]
+tests/unit/test_research_query_cli.py F                                  [100%]
+
+=================================== FAILURES ===================================
+_ test_hard_limit_setup_failure_never_imports_duckdb_and_result_stays_private __
+
+tmp_path = PosixPath('/private/var/folders/d8/tklkkr6x3gl8y8drmfrnmztm0000gp/T/pytest-of-roxor/pytest-37/test_hard_limit_setup_failure_0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10a9ff820>
+
+    def test_hard_limit_setup_failure_never_imports_duckdb_and_result_stays_private(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        child = importlib.import_module("rquant.research_query.child")
+        request, result = tmp_path / "request.json", tmp_path / "result.json"
+        request.write_text(json.dumps({"address_bytes": 2**31, "file_bytes": 512*2**20}))
+        monkeypatch.setattr(sys, "argv", ["child.py", str(request), str(result)])
+        def failed(*args: object) -> None:
+            raise OSError("synthetic setrlimit failure")
+        monkeypatch.setattr(child, "enforce_limits", failed)
+        import builtins
+        original_import = builtins.__import__
+        def checked_import(name: str, *args: object, **kwargs: object) -> object:
+            assert name != "duckdb", "DuckDB was imported before resource limits"
+            return original_import(name, *args, **kwargs)
+        monkeypatch.setattr(builtins, "__import__", checked_import)
+        assert child.main() == 0
+        assert json.loads(result.read_bytes())["status"] == "unavailable"
+>       assert stat.S_IMODE(result.stat().st_mode) == 0o600
+E       AssertionError: assert 420 == 384
+E        +  where 420 = <built-in function S_IMODE>(33188)
+E        +    where <built-in function S_IMODE> = stat.S_IMODE
+E        +    and   33188 = os.stat_result(st_mode=33188, st_ino=310934573, st_dev=16777233, st_nlink=1, st_uid=502, st_gid=20, st_size=132, st_atime=1791143392, st_mtime=1791143392, st_ctime=1791143392).st_mode
+E        +      where os.stat_result(st_mode=33188, st_ino=310934573, st_dev=16777233, st_nlink=1, st_uid=502, st_gid=20, st_size=132, st_atime=1791143392, st_mtime=1791143392, st_ctime=1791143392) = stat()
+E        +        where stat = PosixPath('/private/var/folders/d8/tklkkr6x3gl8y8drmfrnmztm0000gp/T/pytest-of-roxor/pytest-37/test_hard_limit_setup_failure_0/result.json').stat
+
+tests/unit/test_research_query_executor.py:69: AssertionError
+___________ test_cli_sigterm_closes_private_socket_and_exits_cleanly ___________
+
+    def test_cli_sigterm_closes_private_socket_and_exits_cleanly() -> None:
+        with TemporaryDirectory(prefix="rq-stop-", dir="/private/tmp" if sys.platform == "darwin" else "/tmp") as directory:
+            root = Path(directory)
+            endpoint = root / "uds"
+            endpoint.mkdir(mode=0o710)
+            os.chown(endpoint, os.geteuid(), os.getegid())
+            endpoint.chmod(0o710)
+            socket_path = endpoint / "query.sock"
+            source = Path(__file__).resolve().parents[2] / "src"
+            bootstrap = "import sys; sys.path.insert(0,sys.argv.pop(1)); from rquant.research_query.cli import main; raise SystemExit(main(sys.argv[1:]))"
+            process = subprocess.Popen([
+                sys.executable, "-I", "-B", "-c", bootstrap, str(source), "save-serve",
+                "--socket", str(socket_path), "--web-uid", str(os.geteuid()+1), "--shared-gid", str(os.getegid()),
+                "--users", "alice", "--outbox", str(root / "state.sqlite"),
+            ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            env={"RQUANT_DISABLE_DOTENV":"1", "PATH":os.defpath}, close_fds=True)
+            try:
+                deadline = time.monotonic()+5
+                while not socket_path.exists() and process.poll() is None and time.monotonic()<deadline:
+                    time.sleep(0.01)
+                assert socket_path.exists(), "private synthetic service did not bind"
+                process.terminate()
+>               assert process.wait(timeout=5) == 0
+E               AssertionError: assert -15 == 0
+E                +  where -15 = wait(timeout=5)
+E                +    where wait = <Popen: returncode: -15 args: ['/Users/roxor/brain/30-projects/rQuant/.workt...>.wait
+
+tests/unit/test_research_query_cli.py:49: AssertionError
+=========================== short test summary info ============================
+FAILED tests/unit/test_research_query_executor.py::test_hard_limit_setup_failure_never_imports_duckdb_and_result_stays_private
+FAILED tests/unit/test_research_query_cli.py::test_cli_sigterm_closes_private_socket_and_exits_cleanly
+============================== 2 failed in 0.75s ===============================

@@ -4875,6 +4875,70 @@
         "title": "Envelope[PulseData]",
         "type": "object"
       },
+      "Envelope_QueryCatalogData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/QueryCatalogData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[QueryCatalogData]",
+        "type": "object"
+      },
+      "Envelope_QueryResult_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/QueryResult"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[QueryResult]",
+        "type": "object"
+      },
+      "Envelope_QuerySaveData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/QuerySaveData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[QuerySaveData]",
+        "type": "object"
+      },
+      "Envelope_QuerySavedList_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/QuerySavedList"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[QuerySavedList]",
+        "type": "object"
+      },
       "Envelope_ResearchJobsData_": {
         "properties": {
           "data": {
@@ -13395,6 +13459,74 @@
         "title": "OverviewData",
         "type": "object"
       },
+      "PageControlReceipt": {
+        "additionalProperties": false,
+        "properties": {
+          "command_id": {
+            "title": "Command Id",
+            "type": "string"
+          },
+          "completed_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completed At"
+          },
+          "enqueued_at": {
+            "format": "date-time",
+            "title": "Enqueued At",
+            "type": "string"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "result": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/JsonValue"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/PageControlStatus"
+          }
+        },
+        "required": [
+          "command_id",
+          "status",
+          "enqueued_at"
+        ],
+        "title": "PageControlReceipt",
+        "type": "object"
+      },
+      "PageControlStatus": {
+        "enum": [
+          "pending",
+          "processing",
+          "succeeded",
+          "failed",
+          "ambiguous"
+        ],
+        "title": "PageControlStatus",
+        "type": "string"
+      },
       "PageDataStatus": {
         "description": "The Serving generation, in the owner's words (页面数据).",
         "properties": {
@@ -15433,6 +15565,345 @@
         "title": "PulsePoint",
         "type": "object"
       },
+      "QueryCatalogColumn": {
+        "additionalProperties": false,
+        "properties": {
+          "data_type": {
+            "title": "Data Type",
+            "type": "string"
+          },
+          "description": {
+            "title": "Description",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "data_type",
+          "description"
+        ],
+        "title": "QueryCatalogColumn",
+        "type": "object"
+      },
+      "QueryCatalogData": {
+        "additionalProperties": false,
+        "properties": {
+          "available": {
+            "title": "Available",
+            "type": "boolean"
+          },
+          "message": {
+            "default": "",
+            "title": "Message",
+            "type": "string"
+          },
+          "save_enabled": {
+            "default": false,
+            "title": "Save Enabled",
+            "type": "boolean"
+          },
+          "source_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source At"
+          },
+          "tables": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/QueryTableInfo"
+            },
+            "title": "Tables",
+            "type": "array"
+          }
+        },
+        "required": [
+          "available"
+        ],
+        "title": "QueryCatalogData",
+        "type": "object"
+      },
+      "QueryColumn": {
+        "additionalProperties": false,
+        "properties": {
+          "data_type": {
+            "title": "Data Type",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "data_type"
+        ],
+        "title": "QueryColumn",
+        "type": "object"
+      },
+      "QueryRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "mode": {
+            "default": "query",
+            "enum": [
+              "query",
+              "explain"
+            ],
+            "title": "Mode",
+            "type": "string"
+          },
+          "sql": {
+            "title": "Sql",
+            "type": "string"
+          }
+        },
+        "required": [
+          "sql"
+        ],
+        "title": "QueryRequest",
+        "type": "object"
+      },
+      "QueryResult": {
+        "additionalProperties": false,
+        "properties": {
+          "columns": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/QueryColumn"
+            },
+            "title": "Columns",
+            "type": "array"
+          },
+          "elapsed_ms": {
+            "minimum": 0.0,
+            "title": "Elapsed Ms",
+            "type": "number"
+          },
+          "message": {
+            "default": "",
+            "title": "Message",
+            "type": "string"
+          },
+          "rows": {
+            "default": [],
+            "items": {
+              "items": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "maximum": 9007199254740991.0,
+                    "minimum": -9007199254740991.0,
+                    "type": "integer"
+                  },
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "boolean"
+                  },
+                  {
+                    "$ref": "#/components/schemas/QuerySpecialValue"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "type": "array"
+            },
+            "maxItems": 10000,
+            "title": "Rows",
+            "type": "array"
+          },
+          "snapshot_sha256": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Snapshot Sha256"
+          },
+          "source_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source At"
+          },
+          "status": {
+            "enum": [
+              "ready",
+              "partial",
+              "failed",
+              "timeout",
+              "unavailable",
+              "busy"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "elapsed_ms"
+        ],
+        "title": "QueryResult",
+        "type": "object"
+      },
+      "QuerySaveData": {
+        "additionalProperties": false,
+        "properties": {
+          "message": {
+            "default": "",
+            "title": "Message",
+            "type": "string"
+          },
+          "receipt": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PageControlReceipt"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "title": "QuerySaveData",
+        "type": "object"
+      },
+      "QuerySavedList": {
+        "additionalProperties": false,
+        "properties": {
+          "available": {
+            "title": "Available",
+            "type": "boolean"
+          },
+          "items": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/SavedResearchQuery"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "message": {
+            "default": "",
+            "title": "Message",
+            "type": "string"
+          }
+        },
+        "required": [
+          "available"
+        ],
+        "title": "QuerySavedList",
+        "type": "object"
+      },
+      "QuerySpecialValue": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "enum": [
+              "integer",
+              "decimal",
+              "date",
+              "binary",
+              "nonfinite",
+              "interval",
+              "structured"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "text": {
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "text"
+        ],
+        "title": "QuerySpecialValue",
+        "type": "object"
+      },
+      "QueryTableInfo": {
+        "additionalProperties": false,
+        "properties": {
+          "columns": {
+            "items": {
+              "$ref": "#/components/schemas/QueryCatalogColumn"
+            },
+            "title": "Columns",
+            "type": "array"
+          },
+          "earliest_date": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Earliest Date"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "latest_date": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Latest Date"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "row_count": {
+            "title": "Row Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "name",
+          "label",
+          "columns",
+          "row_count"
+        ],
+        "title": "QueryTableInfo",
+        "type": "object"
+      },
       "ResearchJobItem": {
         "properties": {
           "available_actions": {
@@ -16309,6 +16780,64 @@
         "title": "SaveRankedPoolCommand",
         "type": "object"
       },
+      "SaveResearchQuery": {
+        "additionalProperties": false,
+        "properties": {
+          "command_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Command Id",
+            "type": "string"
+          },
+          "expected_version": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Version"
+          },
+          "kind": {
+            "const": "save_research_query",
+            "default": "save_research_query",
+            "title": "Kind",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 60,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "query_id": {
+            "pattern": "^[A-Za-z0-9._-]{1,64}$",
+            "title": "Query Id",
+            "type": "string"
+          },
+          "requested_at": {
+            "format": "date-time",
+            "title": "Requested At",
+            "type": "string"
+          },
+          "sql": {
+            "title": "Sql",
+            "type": "string"
+          }
+        },
+        "required": [
+          "command_id",
+          "requested_at",
+          "query_id",
+          "name",
+          "sql"
+        ],
+        "title": "SaveResearchQuery",
+        "type": "object"
+      },
       "SavedCanvas": {
         "properties": {
           "description": {
@@ -16338,6 +16867,43 @@
           "refs_truncated"
         ],
         "title": "SavedCanvas",
+        "type": "object"
+      },
+      "SavedResearchQuery": {
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "maxLength": 60,
+            "title": "Name",
+            "type": "string"
+          },
+          "query_id": {
+            "title": "Query Id",
+            "type": "string"
+          },
+          "sql": {
+            "title": "Sql",
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
+            "type": "string"
+          },
+          "version": {
+            "minimum": 1.0,
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "query_id",
+          "name",
+          "sql",
+          "version",
+          "updated_at"
+        ],
+        "title": "SavedResearchQuery",
         "type": "object"
       },
       "ScheduledTaskItem": {
@@ -20929,6 +21495,171 @@
         "summary": "公式池命中代码",
         "tags": [
           "pools"
+        ]
+      }
+    },
+    "/api/v1/research/catalog": {
+      "get": {
+        "operationId": "catalog_api_v1_research_catalog_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_QueryCatalogData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "可用查询表",
+        "tags": [
+          "research"
+        ]
+      }
+    },
+    "/api/v1/research/queries": {
+      "get": {
+        "operationId": "saved_api_v1_research_queries_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_QuerySavedList_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "我的已保存查询",
+        "tags": [
+          "research"
+        ]
+      }
+    },
+    "/api/v1/research/queries/resume": {
+      "post": {
+        "operationId": "resume_api_v1_research_queries_resume_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SaveResearchQuery"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_QuerySaveData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "恢复原保存命令",
+        "tags": [
+          "research"
+        ]
+      }
+    },
+    "/api/v1/research/queries/save": {
+      "post": {
+        "operationId": "save_api_v1_research_queries_save_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SaveResearchQuery"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_QuerySaveData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "保存常用查询",
+        "tags": [
+          "research"
+        ]
+      }
+    },
+    "/api/v1/research/query": {
+      "post": {
+        "operationId": "execute_api_v1_research_query_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/QueryRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_QueryResult_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "运行只读查询或执行计划",
+        "tags": [
+          "research"
         ]
       }
     },

@@ -1,0 +1,159 @@
+============================= test session starts ==============================
+platform darwin -- Python 3.13.12, pytest-9.0.3, pluggy-1.6.0
+rootdir: /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk
+configfile: pyproject.toml
+plugins: mock-3.15.1, anyio-4.13.0
+collected 9 items / 5 deselected / 4 selected
+
+tests/unit/test_research_query_executor.py FFFF                          [100%]
+
+=================================== FAILURES ===================================
+______________ test_disk_spill_is_disabled_and_cannot_be_enabled _______________
+
+    def test_disk_spill_is_disabled_and_cannot_be_enabled() -> None:
+        api = _api()
+>       assert api.QueryLimits().spill_bytes == 0
+E       AssertionError: assert 536870912 == 0
+E        +  where 536870912 = QueryLimits(address_bytes=2147483648, file_bytes=536870912, memory_bytes=536870912, spill_bytes=536870912, seconds=30.0, rows=10000, result_bytes=16777216).spill_bytes
+E        +    where QueryLimits(address_bytes=2147483648, file_bytes=536870912, memory_bytes=536870912, spill_bytes=536870912, seconds=30.0, rows=10000, result_bytes=16777216) = <class 'rquant.research_query.executor.QueryLimits'>()
+E        +      where <class 'rquant.research_query.executor.QueryLimits'> = <module 'rquant.research_query' from '/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/src/rquant/research_query/__init__.py'>.QueryLimits
+
+tests/unit/test_research_query_executor.py:53: AssertionError
+_________ test_actual_duckdb_configuration_has_no_temporary_directory __________
+
+tmp_path = PosixPath('/private/var/folders/d8/tklkkr6x3gl8y8drmfrnmztm0000gp/T/pytest-of-roxor/pytest-46/test_actual_duckdb_configurati0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10b44b490>
+
+    def test_actual_duckdb_configuration_has_no_temporary_directory(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        api = _api()
+        child = importlib.import_module("rquant.research_query.child")
+        snapshot, _, _, _ = _published(tmp_path)
+        request, result = tmp_path / "request.json", tmp_path / "result.json"
+        payload = api.QueryLimits().model_dump()
+        payload.update(
+            query={
+                "sql": "SELECT current_setting('temp_directory'), "
+                "current_setting('max_temp_directory_size'), current_setting('lock_configuration')",
+                "mode": "query",
+            },
+            src_root=str(Path(child.__file__).resolve().parents[2]),
+            snapshot_path=str(snapshot.path),
+            snapshot_identity=snapshot.identity,
+            source_at=snapshot.manifest.source_at.isoformat(),
+            snapshot_sha256=snapshot.manifest.file_sha256,
+        )
+        request.write_text(json.dumps(payload))
+        monkeypatch.setattr(sys, "argv", ["child.py", str(request), str(result)])
+        # Configuration regression only; Linux proof separately exercises real limits.
+        monkeypatch.setattr(child, "enforce_limits", lambda *args: None)
+        assert child.main() == 0
+        actual = api.QueryResult.model_validate_json(result.read_bytes())
+        assert actual.status == "ready"
+>       assert actual.rows == [["", "0 bytes", True]]
+E       AssertionError: assert (('/private/v... MiB', True),) == [['', '0 bytes', True]]
+E         
+E         At index 0 diff: ('/private/var/folders/d8/tklkkr6x3gl8y8drmfrnmztm0000gp/T/pytest-of-roxor/pytest-46/test_actual_duckdb_configurati0/spill', '512.0 MiB', True) != ['', '0 bytes', True]
+E         Use -v to get more diff
+
+tests/unit/test_research_query_executor.py:86: AssertionError
+_____________ test_memory_failure_has_clear_scope_message[python] ______________
+
+tmp_path = PosixPath('/private/var/folders/d8/tklkkr6x3gl8y8drmfrnmztm0000gp/T/pytest-of-roxor/pytest-46/test_memory_failure_has_clear_0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x1139be690>
+kind = 'python'
+
+    @pytest.mark.parametrize("kind", ["python", "duckdb"])
+    def test_memory_failure_has_clear_scope_message(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+    ) -> None:
+        import duckdb
+    
+        api = _api()
+        child = importlib.import_module("rquant.research_query.child")
+        snapshot, _, _, _ = _published(tmp_path)
+        request, result = tmp_path / "request.json", tmp_path / "result.json"
+        payload = api.QueryLimits().model_dump()
+        payload.update(
+            query={"sql": "SELECT 1", "mode": "query"},
+            src_root=str(Path(child.__file__).resolve().parents[2]),
+            snapshot_path=str(snapshot.path),
+            snapshot_identity=snapshot.identity,
+            source_at=snapshot.manifest.source_at.isoformat(),
+            snapshot_sha256=snapshot.manifest.file_sha256,
+        )
+        request.write_text(json.dumps(payload))
+        monkeypatch.setattr(sys, "argv", ["child.py", str(request), str(result)])
+        monkeypatch.setattr(child, "enforce_limits", lambda *args: None)
+    
+        def out_of_memory(*args: object, **kwargs: object) -> None:
+            if kind == "python":
+                raise MemoryError("synthetic conversion memory failure")
+            raise duckdb.OutOfMemoryException("synthetic memory failure with a private path")
+    
+        monkeypatch.setattr(duckdb, "connect", out_of_memory)
+        assert child.main() == 0
+        actual = api.QueryResult.model_validate_json(result.read_bytes())
+        assert actual.status == "failed"
+>       assert actual.message == "查询超过可用内存，请缩小日期、股票或字段范围。"
+E       AssertionError: assert '查询未能执行，请检查 SQL 或数据规模。' == '查询超过可用内存，请缩小日期、股票或字段范围。'
+E         
+E         - 查询超过可用内存，请缩小日期、股票或字段范围。
+E         + 查询未能执行，请检查 SQL 或数据规模。
+
+tests/unit/test_research_query_executor.py:122: AssertionError
+_____________ test_memory_failure_has_clear_scope_message[duckdb] ______________
+
+tmp_path = PosixPath('/private/var/folders/d8/tklkkr6x3gl8y8drmfrnmztm0000gp/T/pytest-of-roxor/pytest-46/test_memory_failure_has_clear_1')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x113afc9e0>
+kind = 'duckdb'
+
+    @pytest.mark.parametrize("kind", ["python", "duckdb"])
+    def test_memory_failure_has_clear_scope_message(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+    ) -> None:
+        import duckdb
+    
+        api = _api()
+        child = importlib.import_module("rquant.research_query.child")
+        snapshot, _, _, _ = _published(tmp_path)
+        request, result = tmp_path / "request.json", tmp_path / "result.json"
+        payload = api.QueryLimits().model_dump()
+        payload.update(
+            query={"sql": "SELECT 1", "mode": "query"},
+            src_root=str(Path(child.__file__).resolve().parents[2]),
+            snapshot_path=str(snapshot.path),
+            snapshot_identity=snapshot.identity,
+            source_at=snapshot.manifest.source_at.isoformat(),
+            snapshot_sha256=snapshot.manifest.file_sha256,
+        )
+        request.write_text(json.dumps(payload))
+        monkeypatch.setattr(sys, "argv", ["child.py", str(request), str(result)])
+        monkeypatch.setattr(child, "enforce_limits", lambda *args: None)
+    
+        def out_of_memory(*args: object, **kwargs: object) -> None:
+            if kind == "python":
+                raise MemoryError("synthetic conversion memory failure")
+            raise duckdb.OutOfMemoryException("synthetic memory failure with a private path")
+    
+        monkeypatch.setattr(duckdb, "connect", out_of_memory)
+        assert child.main() == 0
+        actual = api.QueryResult.model_validate_json(result.read_bytes())
+        assert actual.status == "failed"
+>       assert actual.message == "查询超过可用内存，请缩小日期、股票或字段范围。"
+E       AssertionError: assert '查询未能执行，请检查 SQL 或数据规模。' == '查询超过可用内存，请缩小日期、股票或字段范围。'
+E         
+E         - 查询超过可用内存，请缩小日期、股票或字段范围。
+E         + 查询未能执行，请检查 SQL 或数据规模。
+
+tests/unit/test_research_query_executor.py:122: AssertionError
+=========================== short test summary info ============================
+FAILED tests/unit/test_research_query_executor.py::test_disk_spill_is_disabled_and_cannot_be_enabled
+FAILED tests/unit/test_research_query_executor.py::test_actual_duckdb_configuration_has_no_temporary_directory
+FAILED tests/unit/test_research_query_executor.py::test_memory_failure_has_clear_scope_message[python]
+FAILED tests/unit/test_research_query_executor.py::test_memory_failure_has_clear_scope_message[duckdb]
+======================= 4 failed, 5 deselected in 0.53s ========================
+real 0.72
+user 0.61
+sys 0.10

@@ -1,0 +1,101 @@
+============================= test session starts ==============================
+platform darwin -- Python 3.13.12, pytest-9.0.3, pluggy-1.6.0
+rootdir: /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk
+configfile: pyproject.toml
+plugins: mock-3.15.1, anyio-4.13.0
+collected 4 items
+
+tests/unit/test_research_query_service.py FF                             [ 50%]
+tests/unit/test_web_research_query.py ..                                 [100%]
+
+=================================== FAILURES ===================================
+_________ test_actual_uds_catalog_save_recovery_and_endpoint_identity __________
+
+tmp_path = PosixPath('/private/var/folders/d8/tklkkr6x3gl8y8drmfrnmztm0000gp/T/pytest-of-roxor/pytest-29/test_actual_uds_catalog_save_r0')
+
+    def test_actual_uds_catalog_save_recovery_and_endpoint_identity(tmp_path: Path) -> None:
+        api = _api()
+        snapshot, _, _, _ = _published(tmp_path)
+        executor = api.QueryExecutor(snapshot, tmp_path / "scratch")
+        control = _service(tmp_path / "control")
+        with TemporaryDirectory(prefix="rq-uds-", dir="/private/tmp" if Path("/private/tmp").is_dir() else "/tmp") as directory:
+            parent = Path(directory)
+            os.chown(parent, os.geteuid(), os.getegid())
+            os.chmod(parent, 0o710)
+            path = parent / "query.sock"
+>           server = api.QueryPrivateServer(path, executor=executor, allowed_users=frozenset({"alice"}), trusted_web_uid=os.geteuid(), shared_gid=os.getegid())
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/unit/test_research_query_service.py:34: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/rquant/research_query/service.py:97: in __init__
+    self.server_bind()
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <rquant.research_query.service.QueryPrivateServer object at 0x11bfac1a0>
+
+    def server_bind(self):
+        """Called by constructor to bind the socket.
+    
+        May be overridden.
+    
+        """
+        if self.allow_reuse_address and hasattr(socket, "SO_REUSEADDR"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # Since Linux 6.12.9, SO_REUSEPORT is not allowed
+        # on other address families than AF_INET/AF_INET6.
+        if (
+            self.allow_reuse_port and hasattr(socket, "SO_REUSEPORT")
+            and self.address_family in (socket.AF_INET, socket.AF_INET6)
+        ):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+>       self.socket.bind(self.server_address)
+E       PermissionError: [Errno 1] Operation not permitted
+
+/Users/roxor/.local/share/uv/python/cpython-3.13.12-macos-aarch64-none/lib/python3.13/socketserver.py:478: PermissionError
+____________ test_wrong_peer_is_rejected_before_any_request_is_read ____________
+
+tmp_path = PosixPath('/private/var/folders/d8/tklkkr6x3gl8y8drmfrnmztm0000gp/T/pytest-of-roxor/pytest-29/test_wrong_peer_is_rejected_be0')
+
+    def test_wrong_peer_is_rejected_before_any_request_is_read(tmp_path: Path) -> None:
+        api = _api()
+        control = _service(tmp_path)
+        with TemporaryDirectory(prefix="rq-deny-", dir="/private/tmp" if Path("/private/tmp").is_dir() else "/tmp") as directory:
+            parent = Path(directory)
+            os.chown(parent, os.geteuid(), os.getegid())
+            os.chmod(parent, 0o710)
+            path = parent / "deny.sock"
+>           server = api.QueryPrivateServer(path, control=control, allowed_users=frozenset({"alice"}), trusted_web_uid=os.geteuid()+1, shared_gid=os.getegid())
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/unit/test_research_query_service.py:86: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/rquant/research_query/service.py:97: in __init__
+    self.server_bind()
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <rquant.research_query.service.QueryPrivateServer object at 0x11bf18550>
+
+    def server_bind(self):
+        """Called by constructor to bind the socket.
+    
+        May be overridden.
+    
+        """
+        if self.allow_reuse_address and hasattr(socket, "SO_REUSEADDR"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # Since Linux 6.12.9, SO_REUSEPORT is not allowed
+        # on other address families than AF_INET/AF_INET6.
+        if (
+            self.allow_reuse_port and hasattr(socket, "SO_REUSEPORT")
+            and self.address_family in (socket.AF_INET, socket.AF_INET6)
+        ):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+>       self.socket.bind(self.server_address)
+E       PermissionError: [Errno 1] Operation not permitted
+
+/Users/roxor/.local/share/uv/python/cpython-3.13.12-macos-aarch64-none/lib/python3.13/socketserver.py:478: PermissionError
+=========================== short test summary info ============================
+FAILED tests/unit/test_research_query_service.py::test_actual_uds_catalog_save_recovery_and_endpoint_identity
+FAILED tests/unit/test_research_query_service.py::test_wrong_peer_is_rejected_before_any_request_is_read
+========================= 2 failed, 2 passed in 2.33s ==========================

@@ -1,0 +1,11 @@
+============================= test session starts ==============================
+platform darwin -- Python 3.13.12, pytest-9.0.3, pluggy-1.6.0
+rootdir: /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk
+configfile: pyproject.toml
+plugins: mock-3.15.1, anyio-4.13.0
+collected 6 items
+
+tests/unit/test_web_research_query.py ....                               [ 66%]
+tests/unit/test_web_openapi_snapshot.py ..                               [100%]
+
+============================== 6 passed in 2.64s ===============================

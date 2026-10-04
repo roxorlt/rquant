@@ -1,0 +1,208 @@
+============================= test session starts ==============================
+platform darwin -- Python 3.13.12, pytest-9.0.3, pluggy-1.6.0
+rootdir: /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk
+configfile: pyproject.toml
+plugins: mock-3.15.1, anyio-4.13.0
+collected 28 items / 3 deselected / 25 selected
+
+tests/unit/test_research_query_review.py ..................FFF           [ 84%]
+tests/unit/test_web_research_query.py ....                               [100%]
+
+=================================== FAILURES ===================================
+_ test_rq_r05_extra_persistent_objects_rejected_by_guard_and_loader[CREATE TYPE private_notes AS ENUM ('synthetic-bob-private-note')] _
+
+tmp_path = PosixPath('/private/var/folders/d8/tklkkr6x3gl8y8drmfrnmztm0000gp/T/pytest-of-roxor/pytest-70/test_rq_r05_extra_persistent_o0')
+ddl = "CREATE TYPE private_notes AS ENUM ('synthetic-bob-private-note')"
+
+    @pytest.mark.parametrize(
+        "ddl",
+        [
+            "CREATE TYPE private_notes AS ENUM ('synthetic-bob-private-note')",
+            "CREATE TYPE custom_id AS VARCHAR",
+            "CREATE INDEX private_index ON daily_bar(ts_code)",
+        ],
+    )
+    def test_rq_r05_extra_persistent_objects_rejected_by_guard_and_loader(
+        tmp_path: Path, ddl: str
+    ) -> None:
+>       snapshot, manifest, source, source_hash = _published(tmp_path)
+                                                  ^^^^^^^^^^^^^^^^^^^^
+
+tests/unit/test_research_query_review.py:93: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/test_research_query.py:54: in _published
+    manifest = api.build_query_snapshot(
+src/rquant/research_query/snapshot.py:177: in build_query_snapshot
+    _readonly(source) as original,
+    ^^^^^^^^^^^^^^^^^
+src/rquant/research_query/snapshot.py:178: in build_query_snapshot
+    duckdb.connect(
+src/rquant/research_query/snapshot.py:216: in build_query_snapshot
+    verify_public_schema(target)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+connection = <_duckdb.DuckDBPyConnection object at 0x11fbc6bb0>
+
+    def verify_public_schema(connection: object) -> None:
+        tables = connection.execute(
+            "SELECT schema_name,table_name FROM duckdb_tables() WHERE NOT internal ORDER BY table_name"
+        ).fetchall()
+        if tables != [("main", name) for name in sorted(PUBLIC_SCHEMA)]:
+            raise ValueError("查询快照包含额外或缺失数据表")
+        for table, columns in PUBLIC_SCHEMA.items():
+            actual = connection.execute(
+                "SELECT column_name,data_type FROM information_schema.columns "
+                "WHERE table_schema='main' AND table_name=? ORDER BY ordinal_position",
+                [table],
+            ).fetchall()
+            if actual != list(columns):
+                raise ValueError("查询快照字段不匹配")
+        for sql in (
+            "SELECT count(*) FROM duckdb_views() WHERE NOT internal",
+            "SELECT count(*) FROM duckdb_functions() WHERE NOT internal",
+            "SELECT count(*) FROM duckdb_sequences()",
+            "SELECT count(*) FROM duckdb_types() WHERE NOT internal",
+            "SELECT count(*) FROM duckdb_indexes() WHERE NOT internal",
+        ):
+>           if connection.execute(sql).fetchone()[0]:
+               ^^^^^^^^^^^^^^^^^^^^^^^
+E           _duckdb.BinderException: Binder Error: Referenced column "internal" not found in FROM clause!
+E           Candidate bindings: "index_name", "table_name", "index_oid", "is_primary", "expressions"
+E           
+E           LINE 1: SELECT count(*) FROM duckdb_indexes() WHERE NOT internal
+E                                                                   ^
+
+src/rquant/research_query/snapshot.py:93: BinderException
+_ test_rq_r05_extra_persistent_objects_rejected_by_guard_and_loader[CREATE TYPE custom_id AS VARCHAR] _
+
+tmp_path = PosixPath('/private/var/folders/d8/tklkkr6x3gl8y8drmfrnmztm0000gp/T/pytest-of-roxor/pytest-70/test_rq_r05_extra_persistent_o1')
+ddl = 'CREATE TYPE custom_id AS VARCHAR'
+
+    @pytest.mark.parametrize(
+        "ddl",
+        [
+            "CREATE TYPE private_notes AS ENUM ('synthetic-bob-private-note')",
+            "CREATE TYPE custom_id AS VARCHAR",
+            "CREATE INDEX private_index ON daily_bar(ts_code)",
+        ],
+    )
+    def test_rq_r05_extra_persistent_objects_rejected_by_guard_and_loader(
+        tmp_path: Path, ddl: str
+    ) -> None:
+>       snapshot, manifest, source, source_hash = _published(tmp_path)
+                                                  ^^^^^^^^^^^^^^^^^^^^
+
+tests/unit/test_research_query_review.py:93: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/test_research_query.py:54: in _published
+    manifest = api.build_query_snapshot(
+src/rquant/research_query/snapshot.py:177: in build_query_snapshot
+    _readonly(source) as original,
+    ^^^^^^^^^^^^^^^^^
+src/rquant/research_query/snapshot.py:178: in build_query_snapshot
+    duckdb.connect(
+src/rquant/research_query/snapshot.py:216: in build_query_snapshot
+    verify_public_schema(target)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+connection = <_duckdb.DuckDBPyConnection object at 0x11fdbb730>
+
+    def verify_public_schema(connection: object) -> None:
+        tables = connection.execute(
+            "SELECT schema_name,table_name FROM duckdb_tables() WHERE NOT internal ORDER BY table_name"
+        ).fetchall()
+        if tables != [("main", name) for name in sorted(PUBLIC_SCHEMA)]:
+            raise ValueError("查询快照包含额外或缺失数据表")
+        for table, columns in PUBLIC_SCHEMA.items():
+            actual = connection.execute(
+                "SELECT column_name,data_type FROM information_schema.columns "
+                "WHERE table_schema='main' AND table_name=? ORDER BY ordinal_position",
+                [table],
+            ).fetchall()
+            if actual != list(columns):
+                raise ValueError("查询快照字段不匹配")
+        for sql in (
+            "SELECT count(*) FROM duckdb_views() WHERE NOT internal",
+            "SELECT count(*) FROM duckdb_functions() WHERE NOT internal",
+            "SELECT count(*) FROM duckdb_sequences()",
+            "SELECT count(*) FROM duckdb_types() WHERE NOT internal",
+            "SELECT count(*) FROM duckdb_indexes() WHERE NOT internal",
+        ):
+>           if connection.execute(sql).fetchone()[0]:
+               ^^^^^^^^^^^^^^^^^^^^^^^
+E           _duckdb.BinderException: Binder Error: Referenced column "internal" not found in FROM clause!
+E           Candidate bindings: "index_name", "table_name", "index_oid", "is_primary", "expressions"
+E           
+E           LINE 1: SELECT count(*) FROM duckdb_indexes() WHERE NOT internal
+E                                                                   ^
+
+src/rquant/research_query/snapshot.py:93: BinderException
+_ test_rq_r05_extra_persistent_objects_rejected_by_guard_and_loader[CREATE INDEX private_index ON daily_bar(ts_code)] _
+
+tmp_path = PosixPath('/private/var/folders/d8/tklkkr6x3gl8y8drmfrnmztm0000gp/T/pytest-of-roxor/pytest-70/test_rq_r05_extra_persistent_o2')
+ddl = 'CREATE INDEX private_index ON daily_bar(ts_code)'
+
+    @pytest.mark.parametrize(
+        "ddl",
+        [
+            "CREATE TYPE private_notes AS ENUM ('synthetic-bob-private-note')",
+            "CREATE TYPE custom_id AS VARCHAR",
+            "CREATE INDEX private_index ON daily_bar(ts_code)",
+        ],
+    )
+    def test_rq_r05_extra_persistent_objects_rejected_by_guard_and_loader(
+        tmp_path: Path, ddl: str
+    ) -> None:
+>       snapshot, manifest, source, source_hash = _published(tmp_path)
+                                                  ^^^^^^^^^^^^^^^^^^^^
+
+tests/unit/test_research_query_review.py:93: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unit/test_research_query.py:54: in _published
+    manifest = api.build_query_snapshot(
+src/rquant/research_query/snapshot.py:177: in build_query_snapshot
+    _readonly(source) as original,
+    ^^^^^^^^^^^^^^^^^
+src/rquant/research_query/snapshot.py:178: in build_query_snapshot
+    duckdb.connect(
+src/rquant/research_query/snapshot.py:216: in build_query_snapshot
+    verify_public_schema(target)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+connection = <_duckdb.DuckDBPyConnection object at 0x11fdff6b0>
+
+    def verify_public_schema(connection: object) -> None:
+        tables = connection.execute(
+            "SELECT schema_name,table_name FROM duckdb_tables() WHERE NOT internal ORDER BY table_name"
+        ).fetchall()
+        if tables != [("main", name) for name in sorted(PUBLIC_SCHEMA)]:
+            raise ValueError("查询快照包含额外或缺失数据表")
+        for table, columns in PUBLIC_SCHEMA.items():
+            actual = connection.execute(
+                "SELECT column_name,data_type FROM information_schema.columns "
+                "WHERE table_schema='main' AND table_name=? ORDER BY ordinal_position",
+                [table],
+            ).fetchall()
+            if actual != list(columns):
+                raise ValueError("查询快照字段不匹配")
+        for sql in (
+            "SELECT count(*) FROM duckdb_views() WHERE NOT internal",
+            "SELECT count(*) FROM duckdb_functions() WHERE NOT internal",
+            "SELECT count(*) FROM duckdb_sequences()",
+            "SELECT count(*) FROM duckdb_types() WHERE NOT internal",
+            "SELECT count(*) FROM duckdb_indexes() WHERE NOT internal",
+        ):
+>           if connection.execute(sql).fetchone()[0]:
+               ^^^^^^^^^^^^^^^^^^^^^^^
+E           _duckdb.BinderException: Binder Error: Referenced column "internal" not found in FROM clause!
+E           Candidate bindings: "index_name", "table_name", "index_oid", "is_primary", "expressions"
+E           
+E           LINE 1: SELECT count(*) FROM duckdb_indexes() WHERE NOT internal
+E                                                                   ^
+
+src/rquant/research_query/snapshot.py:93: BinderException
+=========================== short test summary info ============================
+FAILED tests/unit/test_research_query_review.py::test_rq_r05_extra_persistent_objects_rejected_by_guard_and_loader[CREATE TYPE private_notes AS ENUM ('synthetic-bob-private-note')]
+FAILED tests/unit/test_research_query_review.py::test_rq_r05_extra_persistent_objects_rejected_by_guard_and_loader[CREATE TYPE custom_id AS VARCHAR]
+FAILED tests/unit/test_research_query_review.py::test_rq_r05_extra_persistent_objects_rejected_by_guard_and_loader[CREATE INDEX private_index ON daily_bar(ts_code)]
+================== 3 failed, 22 passed, 3 deselected in 1.79s ==================

@@ -1,0 +1,14 @@
+{
+  "argv": [
+    "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-source-integration/.venv/bin/python",
+    "-I",
+    "-B",
+    "-c",
+    "import sys,pytest; sys.path.insert(0,\"/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/src\"); raise SystemExit(pytest.main([\"tests/unit/test_research_query_review.py\",\"tests/unit/test_web_research_query.py::test_complete_http_envelope_keeps_bounded_partial_prefix\",\"-q\"]))"
+  ],
+  "started_utc": "2026-10-04T22:02:58.114196+00:00",
+  "elapsed_seconds": 3.0501617090012587,
+  "exit_code": 1,
+  "starting_candidate": "90b61007d47bd906bb85a3e4f67521b12cdf2cbb",
+  "phase": "red_before_corresponding_product_fixes"
+}

@@ -1,0 +1,16 @@
+{
+  "argv": [
+    "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-source-integration/.venv/bin/python",
+    "-I",
+    "-B",
+    "-c",
+    "import sys,pytest;sys.path.insert(0,\"/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/src\");raise SystemExit(pytest.main([\"tests/unit/test_research_query.py\",\"tests/unit/test_research_query_review.py\",\"tests/unit/test_research_query_executor.py\",\"tests/unit/test_research_query_service.py\",\"tests/unit/test_research_query_saved.py\",\"tests/unit/test_research_query_cli.py\",\"tests/unit/test_web_research_query.py\",\"tests/unit/test_web_openapi_snapshot.py\",\"tests/unit/test_web_proxy_identity.py::test_current_user_route_inventory_matches_documented_categories\",\"-q\"]))"
+  ],
+  "cwd": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk",
+  "started_utc": "2026-10-04T22:13:57.606387+00:00",
+  "elapsed_seconds": 7.300132042000769,
+  "exit_code": 0,
+  "stdout_sha256": "eb4601a4a1f171521eccd6ec0829e5453a12080aeab660916490f87e0ed8cb76",
+  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "starting_candidate": "90b61007d47bd906bb85a3e4f67521b12cdf2cbb"
+}

@@ -1,0 +1,456 @@
+
+> rquant-web@0.0.0 check /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/web
+> biome ci . && pnpm run typecheck && vitest run
+
+[0msrc/pages/factors/factors.test.tsx[0m[0m:[0m[0m780[0m[0m:[0m[0m20[0m[0m [0m[0m]8;;https://biomejs.dev/linter/rules/no-non-null-assertion\lint/style/noNonNullAssertion]8;;\[0m[0m [0m[0m━━━━━━━━━━━━━━━━━━━━━━━━━━━━[0m[0m
+
+[0m[0m  [0m[0m[1m[33m⚠[0m[0m [0m[0m[33mForbidden non-null assertion.[0m[0m
+[0m[0m  [0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m778 │ [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0mc[0m[0ma[0m[0mt[0m[0ma[0m[0ml[0m[0mo[0m[0mg[0m[0m([0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m779 │ [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m[[0m[0m
+[0m[0m  [0m[0m[1m[31m>[0m[0m [0m[0m[1m780 │ [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m{[0m[0m [0m[0m.[0m[0m.[0m[0m.[0m[0md[0m[0me[0m[0mf[0m[0mi[0m[0mn[0m[0mi[0m[0mt[0m[0mi[0m[0mo[0m[0mn[0m[0ms[0m[0m[[0m[0m0[0m[0m][0m[0m![0m[0m,[0m[0m [0m[0ma[0m[0mr[0m[0mc[0m[0mh[0m[0mi[0m[0mv[0m[0me[0m[0md[0m[0m:[0m[0m [0m[0mt[0m[0mr[0m[0mu[0m[0me[0m[0m [0m[0m}[0m[0m,[0m[0m
+[0m[0m  [0m[0m [0m[0m [0m[0m [0m[0m[1m   │ [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m781 │ [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m{[0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m782 │ [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m.[0m[0m.[0m[0m.[0m[0md[0m[0me[0m[0mf[0m[0mi[0m[0mn[0m[0mi[0m[0mt[0m[0mi[0m[0mo[0m[0mn[0m[0ms[0m[0m[[0m[0m1[0m[0m][0m[0m![0m[0m,[0m[0m
+[0m[0m  [0m[0m
+[0m
+[0msrc/pages/factors/factors.test.tsx[0m[0m:[0m[0m782[0m[0m:[0m[0m20[0m[0m [0m[0m]8;;https://biomejs.dev/linter/rules/no-non-null-assertion\lint/style/noNonNullAssertion]8;;\[0m[0m [0m[0m━━━━━━━━━━━━━━━━━━━━━━━━━━━━[0m[0m
+
+[0m[0m  [0m[0m[1m[33m⚠[0m[0m [0m[0m[33mForbidden non-null assertion.[0m[0m
+[0m[0m  [0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m780 │ [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m{[0m[0m [0m[0m.[0m[0m.[0m[0m.[0m[0md[0m[0me[0m[0mf[0m[0mi[0m[0mn[0m[0mi[0m[0mt[0m[0mi[0m[0mo[0m[0mn[0m[0ms[0m[0m[[0m[0m0[0m[0m][0m[0m![0m[0m,[0m[0m [0m[0ma[0m[0mr[0m[0mc[0m[0mh[0m[0mi[0m[0mv[0m[0me[0m[0md[0m[0m:[0m[0m [0m[0mt[0m[0mr[0m[0mu[0m[0me[0m[0m [0m[0m}[0m[0m,[0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m781 │ [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m{[0m[0m
+[0m[0m  [0m[0m[1m[31m>[0m[0m [0m[0m[1m782 │ [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m.[0m[0m.[0m[0m.[0m[0md[0m[0me[0m[0mf[0m[0mi[0m[0mn[0m[0mi[0m[0mt[0m[0mi[0m[0mo[0m[0mn[0m[0ms[0m[0m[[0m[0m1[0m[0m][0m[0m![0m[0m,[0m[0m
+[0m[0m  [0m[0m [0m[0m [0m[0m [0m[0m[1m   │ [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m783 │ [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0ma[0m[0mr[0m[0mc[0m[0mh[0m[0mi[0m[0mv[0m[0me[0m[0md[0m[0m:[0m[0m [0m[0mf[0m[0ma[0m[0ml[0m[0ms[0m[0me[0m[0m,[0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m784 │ [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0m [0m[0mf[0m[0ma[0m[0mc[0m[0mt[0m[0mo[0m[0mr[0m[0m_[0m[0mi[0m[0md[0m[0m:[0m[0m [0m[0m"[0m[0ma[0m[0mn[0m[0mo[0m[0mt[0m[0mh[0m[0me[0m[0mr[0m[0m_[0m[0mf[0m[0ma[0m[0mc[0m[0mt[0m[0mo[0m[0mr[0m[0m"[0m[0m,[0m[0m
+[0m[0m  [0m[0m
+[0m
+[0msrc/pages/pools/pools.css[0m[0m:[0m[0m525[0m[0m:[0m[0m1[0m[0m [0m[0m]8;;https://biomejs.dev/linter/rules/no-descending-specificity\lint/style/noDescendingSpecificity]8;;\[0m[0m [0m[0m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[0m[0m
+
+[0m[0m  [0m[0m[1m[33m⚠[0m[0m [0m[0m[33mDescending specificity selector found. This selector specificity is (0, 1, 1)[0m[0m
+[0m[0m  [0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m523 │ [0m[0m [0m[0m [0m[0mb[0m[0ma[0m[0mc[0m[0mk[0m[0mg[0m[0mr[0m[0mo[0m[0mu[0m[0mn[0m[0md[0m[0m:[0m[0m [0m[0mv[0m[0ma[0m[0mr[0m[0m([0m[0m-[0m[0m-[0m[0ma[0m[0mc[0m[0mc[0m[0me[0m[0mn[0m[0mt[0m[0m-[0m[0mw[0m[0me[0m[0ma[0m[0mk[0m[0m)[0m[0m;[0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m524 │ [0m[0m}[0m[0m
+[0m[0m  [0m[0m[1m[31m>[0m[0m [0m[0m[1m525 │ [0m[0m.[0m[0mp[0m[0mo[0m[0mo[0m[0ml[0m[0ms[0m[0m-[0m[0ml[0m[0mi[0m[0ms[0m[0mt[0m[0m-[0m[0mi[0m[0mt[0m[0me[0m[0mm[0m[0m [0m[0ms[0m[0mm[0m[0ma[0m[0ml[0m[0ml[0m[0m [0m[0m{[0m[0m
+[0m[0m  [0m[0m [0m[0m [0m[0m [0m[0m[1m   │ [0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m526 │ [0m[0m [0m[0m [0m[0mf[0m[0mo[0m[0mn[0m[0mt[0m[0m-[0m[0ms[0m[0mi[0m[0mz[0m[0me[0m[0m:[0m[0m [0m[0m1[0m[0m1[0m[0mp[0m[0mx[0m[0m;[0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m527 │ [0m[0m [0m[0m [0m[0mc[0m[0mo[0m[0ml[0m[0mo[0m[0mr[0m[0m:[0m[0m [0m[0mv[0m[0ma[0m[0mr[0m[0m([0m[0m-[0m[0m-[0m[0mm[0m[0mu[0m[0mt[0m[0me[0m[0md[0m[0m)[0m[0m;[0m[0m
+[0m[0m  [0m[0m
+[0m[0m  [0m[0m[1m[34mℹ[0m[0m [0m[0m[34mThis selector specificity is (0, 2, 1)[0m[0m
+[0m[0m  [0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m215 │ [0m[0m [0m[0m [0m[0mm[0m[0mi[0m[0mn[0m[0m-[0m[0mw[0m[0mi[0m[0md[0m[0mt[0m[0mh[0m[0m:[0m[0m [0m[0m0[0m[0m;[0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m216 │ [0m[0m}[0m[0m
+[0m[0m  [0m[0m[1m[31m>[0m[0m [0m[0m[1m217 │ [0m[0m.[0m[0mp[0m[0mo[0m[0mo[0m[0ml[0m[0m-[0m[0me[0m[0md[0m[0mi[0m[0mt[0m[0mo[0m[0mr[0m[0m-[0m[0mf[0m[0mi[0m[0me[0m[0ml[0m[0md[0m[0ms[0m[0m [0m[0m.[0m[0ml[0m[0mb[0m[0ml[0m[0m [0m[0ms[0m[0mm[0m[0ma[0m[0ml[0m[0ml[0m[0m [0m[0m{[0m[0m
+[0m[0m  [0m[0m [0m[0m [0m[0m [0m[0m[1m   │ [0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m218 │ [0m[0m [0m[0m [0m[0mc[0m[0mo[0m[0ml[0m[0mo[0m[0mr[0m[0m:[0m[0m [0m[0mv[0m[0ma[0m[0mr[0m[0m([0m[0m-[0m[0m-[0m[0mm[0m[0mu[0m[0mt[0m[0me[0m[0md[0m[0m)[0m[0m;[0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m219 │ [0m[0m [0m[0m [0m[0mf[0m[0mo[0m[0mn[0m[0mt[0m[0m-[0m[0mw[0m[0me[0m[0mi[0m[0mg[0m[0mh[0m[0mt[0m[0m:[0m[0m [0m[0m4[0m[0m0[0m[0m0[0m[0m;[0m[0m
+[0m[0m  [0m[0m
+[0m[0m  [0m[0m[1m[34mℹ[0m[0m [0m[0m[34mDescending specificity selector may not be applied. Consider rearranging the order of the selectors. See [0m[0m[34m]8;;https://developer.mozilla.org/en-US/docs/Web/CSS/Specificity\MDN web docs]8;;\[0m[0m[34m for more details.[0m[0m
+[0m[0m  [0m[0m
+[0m
+[0msrc/pages/pools/pools.css[0m[0m:[0m[0m618[0m[0m:[0m[0m1[0m[0m [0m[0m]8;;https://biomejs.dev/linter/rules/no-descending-specificity\lint/style/noDescendingSpecificity]8;;\[0m[0m [0m[0m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[0m[0m
+
+[0m[0m  [0m[0m[1m[33m⚠[0m[0m [0m[0m[33mDescending specificity selector found. This selector specificity is (0, 1, 1)[0m[0m
+[0m[0m  [0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m616 │ [0m[0m [0m[0m [0m[0mf[0m[0mo[0m[0mn[0m[0mt[0m[0m-[0m[0ms[0m[0mi[0m[0mz[0m[0me[0m[0m:[0m[0m [0m[0m1[0m[0m2[0m[0mp[0m[0mx[0m[0m;[0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m617 │ [0m[0m}[0m[0m
+[0m[0m  [0m[0m[1m[31m>[0m[0m [0m[0m[1m618 │ [0m[0m.[0m[0mp[0m[0mo[0m[0mo[0m[0ml[0m[0ms[0m[0m-[0m[0mr[0m[0mu[0m[0ml[0m[0me[0m[0m-[0m[0mp[0m[0ma[0m[0mr[0m[0me[0m[0mn[0m[0mt[0m[0m [0m[0m>[0m[0m [0m[0ms[0m[0mp[0m[0ma[0m[0mn[0m[0m,[0m[0m
+[0m[0m  [0m[0m [0m[0m [0m[0m [0m[0m[1m   │ [0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m619 │ [0m[0m.[0m[0mp[0m[0mo[0m[0mo[0m[0ml[0m[0ms[0m[0m-[0m[0mr[0m[0mu[0m[0ml[0m[0me[0m[0m-[0m[0mp[0m[0ma[0m[0mr[0m[0me[0m[0mn[0m[0mt[0m[0m [0m[0m>[0m[0m [0m[0ms[0m[0mm[0m[0ma[0m[0ml[0m[0ml[0m[0m [0m[0m{[0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m620 │ [0m[0m [0m[0m [0m[0mc[0m[0mo[0m[0ml[0m[0mo[0m[0mr[0m[0m:[0m[0m [0m[0mv[0m[0ma[0m[0mr[0m[0m([0m[0m-[0m[0m-[0m[0mm[0m[0mu[0m[0mt[0m[0me[0m[0md[0m[0m)[0m[0m;[0m[0m
+[0m[0m  [0m[0m
+[0m[0m  [0m[0m[1m[34mℹ[0m[0m [0m[0m[34mThis selector specificity is (0, 1, 2)[0m[0m
+[0m[0m  [0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m378 │ [0m[0m [0m[0m [0m[0mm[0m[0ma[0m[0mr[0m[0mg[0m[0mi[0m[0mn[0m[0m:[0m[0m [0m[0m4[0m[0mp[0m[0mx[0m[0m [0m[0m0[0m[0m [0m[0m0[0m[0m;[0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m379 │ [0m[0m}[0m[0m
+[0m[0m  [0m[0m[1m[31m>[0m[0m [0m[0m[1m380 │ [0m[0m.[0m[0mp[0m[0mo[0m[0mo[0m[0ml[0m[0m-[0m[0me[0m[0md[0m[0mi[0m[0mt[0m[0mo[0m[0mr[0m[0m-[0m[0mp[0m[0mr[0m[0me[0m[0mv[0m[0mi[0m[0me[0m[0mw[0m[0m [0m[0ml[0m[0mi[0m[0m [0m[0ms[0m[0mp[0m[0ma[0m[0mn[0m[0m [0m[0m{[0m[0m
+[0m[0m  [0m[0m [0m[0m [0m[0m [0m[0m[1m   │ [0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m381 │ [0m[0m [0m[0m [0m[0md[0m[0mi[0m[0ms[0m[0mp[0m[0ml[0m[0ma[0m[0my[0m[0m:[0m[0m [0m[0mb[0m[0ml[0m[0mo[0m[0mc[0m[0mk[0m[0m;[0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m382 │ [0m[0m [0m[0m [0m[0mc[0m[0mo[0m[0ml[0m[0mo[0m[0mr[0m[0m:[0m[0m [0m[0mv[0m[0ma[0m[0mr[0m[0m([0m[0m-[0m[0m-[0m[0mm[0m[0mu[0m[0mt[0m[0me[0m[0md[0m[0m)[0m[0m;[0m[0m
+[0m[0m  [0m[0m
+[0m[0m  [0m[0m[1m[34mℹ[0m[0m [0m[0m[34mDescending specificity selector may not be applied. Consider rearranging the order of the selectors. See [0m[0m[34m]8;;https://developer.mozilla.org/en-US/docs/Web/CSS/Specificity\MDN web docs]8;;\[0m[0m[34m for more details.[0m[0m
+[0m[0m  [0m[0m
+[0m
+[0msrc/pages/pools/pools.css[0m[0m:[0m[0m619[0m[0m:[0m[0m1[0m[0m [0m[0m]8;;https://biomejs.dev/linter/rules/no-descending-specificity\lint/style/noDescendingSpecificity]8;;\[0m[0m [0m[0m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[0m[0m
+
+[0m[0m  [0m[0m[1m[33m⚠[0m[0m [0m[0m[33mDescending specificity selector found. This selector specificity is (0, 1, 1)[0m[0m
+[0m[0m  [0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m617 │ [0m[0m}[0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m618 │ [0m[0m.[0m[0mp[0m[0mo[0m[0mo[0m[0ml[0m[0ms[0m[0m-[0m[0mr[0m[0mu[0m[0ml[0m[0me[0m[0m-[0m[0mp[0m[0ma[0m[0mr[0m[0me[0m[0mn[0m[0mt[0m[0m [0m[0m>[0m[0m [0m[0ms[0m[0mp[0m[0ma[0m[0mn[0m[0m,[0m[0m
+[0m[0m  [0m[0m[1m[31m>[0m[0m [0m[0m[1m619 │ [0m[0m.[0m[0mp[0m[0mo[0m[0mo[0m[0ml[0m[0ms[0m[0m-[0m[0mr[0m[0mu[0m[0ml[0m[0me[0m[0m-[0m[0mp[0m[0ma[0m[0mr[0m[0me[0m[0mn[0m[0mt[0m[0m [0m[0m>[0m[0m [0m[0ms[0m[0mm[0m[0ma[0m[0ml[0m[0ml[0m[0m [0m[0m{[0m[0m
+[0m[0m  [0m[0m [0m[0m [0m[0m [0m[0m[1m   │ [0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m620 │ [0m[0m [0m[0m [0m[0mc[0m[0mo[0m[0ml[0m[0mo[0m[0mr[0m[0m:[0m[0m [0m[0mv[0m[0ma[0m[0mr[0m[0m([0m[0m-[0m[0m-[0m[0mm[0m[0mu[0m[0mt[0m[0me[0m[0md[0m[0m)[0m[0m;[0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m621 │ [0m[0m}[0m[0m
+[0m[0m  [0m[0m
+[0m[0m  [0m[0m[1m[34mℹ[0m[0m [0m[0m[34mThis selector specificity is (0, 2, 1)[0m[0m
+[0m[0m  [0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m215 │ [0m[0m [0m[0m [0m[0mm[0m[0mi[0m[0mn[0m[0m-[0m[0mw[0m[0mi[0m[0md[0m[0mt[0m[0mh[0m[0m:[0m[0m [0m[0m0[0m[0m;[0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m216 │ [0m[0m}[0m[0m
+[0m[0m  [0m[0m[1m[31m>[0m[0m [0m[0m[1m217 │ [0m[0m.[0m[0mp[0m[0mo[0m[0mo[0m[0ml[0m[0m-[0m[0me[0m[0md[0m[0mi[0m[0mt[0m[0mo[0m[0mr[0m[0m-[0m[0mf[0m[0mi[0m[0me[0m[0ml[0m[0md[0m[0ms[0m[0m [0m[0m.[0m[0ml[0m[0mb[0m[0ml[0m[0m [0m[0ms[0m[0mm[0m[0ma[0m[0ml[0m[0ml[0m[0m [0m[0m{[0m[0m
+[0m[0m  [0m[0m [0m[0m [0m[0m [0m[0m[1m   │ [0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m218 │ [0m[0m [0m[0m [0m[0mc[0m[0mo[0m[0ml[0m[0mo[0m[0mr[0m[0m:[0m[0m [0m[0mv[0m[0ma[0m[0mr[0m[0m([0m[0m-[0m[0m-[0m[0mm[0m[0mu[0m[0mt[0m[0me[0m[0md[0m[0m)[0m[0m;[0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m219 │ [0m[0m [0m[0m [0m[0mf[0m[0mo[0m[0mn[0m[0mt[0m[0m-[0m[0mw[0m[0me[0m[0mi[0m[0mg[0m[0mh[0m[0mt[0m[0m:[0m[0m [0m[0m4[0m[0m0[0m[0m0[0m[0m;[0m[0m
+[0m[0m  [0m[0m
+[0m[0m  [0m[0m[1m[34mℹ[0m[0m [0m[0m[34mDescending specificity selector may not be applied. Consider rearranging the order of the selectors. See [0m[0m[34m]8;;https://developer.mozilla.org/en-US/docs/Web/CSS/Specificity\MDN web docs]8;;\[0m[0m[34m for more details.[0m[0m
+[0m[0m  [0m[0m
+[0m
+[0msrc/pages/pools/pools.css[0m[0m:[0m[0m628[0m[0m:[0m[0m1[0m[0m [0m[0m]8;;https://biomejs.dev/linter/rules/no-descending-specificity\lint/style/noDescendingSpecificity]8;;\[0m[0m [0m[0m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[0m[0m
+
+[0m[0m  [0m[0m[1m[33m⚠[0m[0m [0m[0m[33mDescending specificity selector found. This selector specificity is (0, 1, 1)[0m[0m
+[0m[0m  [0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m626 │ [0m[0m [0m[0m [0m[0mo[0m[0mv[0m[0me[0m[0mr[0m[0mf[0m[0ml[0m[0mo[0m[0mw[0m[0m-[0m[0mw[0m[0mr[0m[0ma[0m[0mp[0m[0m:[0m[0m [0m[0ma[0m[0mn[0m[0my[0m[0mw[0m[0mh[0m[0me[0m[0mr[0m[0me[0m[0m;[0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m627 │ [0m[0m}[0m[0m
+[0m[0m  [0m[0m[1m[31m>[0m[0m [0m[0m[1m628 │ [0m[0m.[0m[0mp[0m[0mo[0m[0mo[0m[0ml[0m[0ms[0m[0m-[0m[0mr[0m[0mu[0m[0ml[0m[0me[0m[0m-[0m[0mp[0m[0ma[0m[0mr[0m[0me[0m[0mn[0m[0mt[0m[0m [0m[0ms[0m[0mm[0m[0ma[0m[0ml[0m[0ml[0m[0m [0m[0m{[0m[0m
+[0m[0m  [0m[0m [0m[0m [0m[0m [0m[0m[1m   │ [0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m629 │ [0m[0m [0m[0m [0m[0mg[0m[0mr[0m[0mi[0m[0md[0m[0m-[0m[0mc[0m[0mo[0m[0ml[0m[0mu[0m[0mm[0m[0mn[0m[0m:[0m[0m [0m[0m1[0m[0m [0m[0m/[0m[0m [0m[0m-[0m[0m1[0m[0m;[0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m630 │ [0m[0m}[0m[0m
+[0m[0m  [0m[0m
+[0m[0m  [0m[0m[1m[34mℹ[0m[0m [0m[0m[34mThis selector specificity is (0, 2, 1)[0m[0m
+[0m[0m  [0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m215 │ [0m[0m [0m[0m [0m[0mm[0m[0mi[0m[0mn[0m[0m-[0m[0mw[0m[0mi[0m[0md[0m[0mt[0m[0mh[0m[0m:[0m[0m [0m[0m0[0m[0m;[0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m216 │ [0m[0m}[0m[0m
+[0m[0m  [0m[0m[1m[31m>[0m[0m [0m[0m[1m217 │ [0m[0m.[0m[0mp[0m[0mo[0m[0mo[0m[0ml[0m[0m-[0m[0me[0m[0md[0m[0mi[0m[0mt[0m[0mo[0m[0mr[0m[0m-[0m[0mf[0m[0mi[0m[0me[0m[0ml[0m[0md[0m[0ms[0m[0m [0m[0m.[0m[0ml[0m[0mb[0m[0ml[0m[0m [0m[0ms[0m[0mm[0m[0ma[0m[0ml[0m[0ml[0m[0m [0m[0m{[0m[0m
+[0m[0m  [0m[0m [0m[0m [0m[0m [0m[0m[1m   │ [0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m218 │ [0m[0m [0m[0m [0m[0mc[0m[0mo[0m[0ml[0m[0mo[0m[0mr[0m[0m:[0m[0m [0m[0mv[0m[0ma[0m[0mr[0m[0m([0m[0m-[0m[0m-[0m[0mm[0m[0mu[0m[0mt[0m[0me[0m[0md[0m[0m)[0m[0m;[0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m219 │ [0m[0m [0m[0m [0m[0mf[0m[0mo[0m[0mn[0m[0mt[0m[0m-[0m[0mw[0m[0me[0m[0mi[0m[0mg[0m[0mh[0m[0mt[0m[0m:[0m[0m [0m[0m4[0m[0m0[0m[0m0[0m[0m;[0m[0m
+[0m[0m  [0m[0m
+[0m[0m  [0m[0m[1m[34mℹ[0m[0m [0m[0m[34mDescending specificity selector may not be applied. Consider rearranging the order of the selectors. See [0m[0m[34m]8;;https://developer.mozilla.org/en-US/docs/Web/CSS/Specificity\MDN web docs]8;;\[0m[0m[34m for more details.[0m[0m
+[0m[0m  [0m[0m
+[0m
+[0msrc/pages/screener/screener.css[0m[0m:[0m[0m365[0m[0m:[0m[0m1[0m[0m [0m[0m]8;;https://biomejs.dev/linter/rules/no-descending-specificity\lint/style/noDescendingSpecificity]8;;\[0m[0m [0m[0m━━━━━━━━━━━━━━━━━━━━━━━━━━━[0m[0m
+
+[0m[0m  [0m[0m[1m[33m⚠[0m[0m [0m[0m[33mDescending specificity selector found. This selector specificity is (0, 1, 1)[0m[0m
+[0m[0m  [0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m363 │ [0m[0m [0m[0m [0m[0mf[0m[0mo[0m[0mn[0m[0mt[0m[0m-[0m[0ms[0m[0mi[0m[0mz[0m[0me[0m[0m:[0m[0m [0m[0m1[0m[0m2[0m[0mp[0m[0mx[0m[0m;[0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m364 │ [0m[0m}[0m[0m
+[0m[0m  [0m[0m[1m[31m>[0m[0m [0m[0m[1m365 │ [0m[0m.[0m[0mf[0m[0mo[0m[0mr[0m[0mm[0m[0mu[0m[0ml[0m[0ma[0m[0m-[0m[0mp[0m[0mo[0m[0mo[0m[0ml[0m[0m-[0m[0ms[0m[0ma[0m[0mv[0m[0me[0m[0m-[0m[0ms[0m[0mt[0m[0ma[0m[0mt[0m[0me[0m[0m [0m[0ms[0m[0mt[0m[0mr[0m[0mo[0m[0mn[0m[0mg[0m[0m [0m[0m{[0m[0m
+[0m[0m  [0m[0m [0m[0m [0m[0m [0m[0m[1m   │ [0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m366 │ [0m[0m [0m[0m [0m[0mc[0m[0mo[0m[0ml[0m[0mo[0m[0mr[0m[0m:[0m[0m [0m[0mv[0m[0ma[0m[0mr[0m[0m([0m[0m-[0m[0m-[0m[0mi[0m[0mn[0m[0mk[0m[0m)[0m[0m;[0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m367 │ [0m[0m}[0m[0m
+[0m[0m  [0m[0m
+[0m[0m  [0m[0m[1m[34mℹ[0m[0m [0m[0m[34mThis selector specificity is (0, 2, 1)[0m[0m
+[0m[0m  [0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m297 │ [0m[0m [0m[0m [0m[0mf[0m[0mo[0m[0mn[0m[0mt[0m[0m-[0m[0mw[0m[0me[0m[0mi[0m[0mg[0m[0mh[0m[0mt[0m[0m:[0m[0m [0m[0m6[0m[0m0[0m[0m0[0m[0m;[0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m298 │ [0m[0m}[0m[0m
+[0m[0m  [0m[0m[1m[31m>[0m[0m [0m[0m[1m299 │ [0m[0m.[0m[0mt[0m[0md[0m[0mx[0m[0m-[0m[0mp[0m[0mr[0m[0me[0m[0mv[0m[0mi[0m[0me[0m[0mw[0m[0m-[0m[0mr[0m[0me[0m[0ms[0m[0mu[0m[0ml[0m[0mt[0m[0m.[0m[0mo[0m[0mk[0m[0m [0m[0ms[0m[0mt[0m[0mr[0m[0mo[0m[0mn[0m[0mg[0m[0m [0m[0m{[0m[0m
+[0m[0m  [0m[0m [0m[0m [0m[0m [0m[0m[1m   │ [0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m300 │ [0m[0m [0m[0m [0m[0mc[0m[0mo[0m[0ml[0m[0mo[0m[0mr[0m[0m:[0m[0m [0m[0mv[0m[0ma[0m[0mr[0m[0m([0m[0m-[0m[0m-[0m[0mo[0m[0mk[0m[0m-[0m[0mt[0m[0m)[0m[0m;[0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m301 │ [0m[0m}[0m[0m
+[0m[0m  [0m[0m
+[0m[0m  [0m[0m[1m[34mℹ[0m[0m [0m[0m[34mDescending specificity selector may not be applied. Consider rearranging the order of the selectors. See [0m[0m[34m]8;;https://developer.mozilla.org/en-US/docs/Web/CSS/Specificity\MDN web docs]8;;\[0m[0m[34m for more details.[0m[0m
+[0m[0m  [0m[0m
+[0m
+[0msrc/pages/screener/screener.css[0m[0m:[0m[0m884[0m[0m:[0m[0m1[0m[0m [0m[0m]8;;https://biomejs.dev/linter/rules/no-descending-specificity\lint/style/noDescendingSpecificity]8;;\[0m[0m [0m[0m━━━━━━━━━━━━━━━━━━━━━━━━━━━[0m[0m
+
+[0m[0m  [0m[0m[1m[33m⚠[0m[0m [0m[0m[33mDescending specificity selector found. This selector specificity is (0, 1, 1)[0m[0m
+[0m[0m  [0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m882 │ [0m[0m}[0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m883 │ [0m[0m.[0m[0ms[0m[0mc[0m[0mr[0m[0me[0m[0me[0m[0mn[0m[0m-[0m[0ms[0m[0ma[0m[0mv[0m[0me[0m[0m-[0m[0mp[0m[0mr[0m[0me[0m[0mv[0m[0mi[0m[0me[0m[0mw[0m[0m [0m[0ml[0m[0mi[0m[0m [0m[0ms[0m[0mp[0m[0ma[0m[0mn[0m[0m,[0m[0m
+[0m[0m  [0m[0m[1m[31m>[0m[0m [0m[0m[1m884 │ [0m[0m.[0m[0ms[0m[0mc[0m[0mr[0m[0me[0m[0me[0m[0mn[0m[0m-[0m[0ms[0m[0ma[0m[0mv[0m[0me[0m[0m-[0m[0mr[0m[0ma[0m[0mn[0m[0mk[0m[0m [0m[0ms[0m[0mp[0m[0ma[0m[0mn[0m[0m [0m[0m{[0m[0m
+[0m[0m  [0m[0m [0m[0m [0m[0m [0m[0m[1m   │ [0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m885 │ [0m[0m [0m[0m [0m[0md[0m[0mi[0m[0ms[0m[0mp[0m[0ml[0m[0ma[0m[0my[0m[0m:[0m[0m [0m[0mb[0m[0ml[0m[0mo[0m[0mc[0m[0mk[0m[0m;[0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m886 │ [0m[0m [0m[0m [0m[0mc[0m[0mo[0m[0ml[0m[0mo[0m[0mr[0m[0m:[0m[0m [0m[0mv[0m[0ma[0m[0mr[0m[0m([0m[0m-[0m[0m-[0m[0mi[0m[0mn[0m[0mk[0m[0m-[0m[0m2[0m[0m)[0m[0m;[0m[0m
+[0m[0m  [0m[0m
+[0m[0m  [0m[0m[1m[34mℹ[0m[0m [0m[0m[34mThis selector specificity is (0, 1, 2)[0m[0m
+[0m[0m  [0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m881 │ [0m[0m [0m[0m [0m[0mf[0m[0mo[0m[0mn[0m[0mt[0m[0m-[0m[0ms[0m[0mi[0m[0mz[0m[0me[0m[0m:[0m[0m [0m[0m1[0m[0m2[0m[0mp[0m[0mx[0m[0m;[0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m882 │ [0m[0m}[0m[0m
+[0m[0m  [0m[0m[1m[31m>[0m[0m [0m[0m[1m883 │ [0m[0m.[0m[0ms[0m[0mc[0m[0mr[0m[0me[0m[0me[0m[0mn[0m[0m-[0m[0ms[0m[0ma[0m[0mv[0m[0me[0m[0m-[0m[0mp[0m[0mr[0m[0me[0m[0mv[0m[0mi[0m[0me[0m[0mw[0m[0m [0m[0ml[0m[0mi[0m[0m [0m[0ms[0m[0mp[0m[0ma[0m[0mn[0m[0m,[0m[0m
+[0m[0m  [0m[0m [0m[0m [0m[0m [0m[0m[1m   │ [0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m884 │ [0m[0m.[0m[0ms[0m[0mc[0m[0mr[0m[0me[0m[0me[0m[0mn[0m[0m-[0m[0ms[0m[0ma[0m[0mv[0m[0me[0m[0m-[0m[0mr[0m[0ma[0m[0mn[0m[0mk[0m[0m [0m[0ms[0m[0mp[0m[0ma[0m[0mn[0m[0m [0m[0m{[0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m885 │ [0m[0m [0m[0m [0m[0md[0m[0mi[0m[0ms[0m[0mp[0m[0ml[0m[0ma[0m[0my[0m[0m:[0m[0m [0m[0mb[0m[0ml[0m[0mo[0m[0mc[0m[0mk[0m[0m;[0m[0m
+[0m[0m  [0m[0m
+[0m[0m  [0m[0m[1m[34mℹ[0m[0m [0m[0m[34mDescending specificity selector may not be applied. Consider rearranging the order of the selectors. See [0m[0m[34m]8;;https://developer.mozilla.org/en-US/docs/Web/CSS/Specificity\MDN web docs]8;;\[0m[0m[34m for more details.[0m[0m
+[0m[0m  [0m[0m
+[0m
+[0msrc/pages/screener/screener.css[0m[0m:[0m[0m896[0m[0m:[0m[0m1[0m[0m [0m[0m]8;;https://biomejs.dev/linter/rules/no-descending-specificity\lint/style/noDescendingSpecificity]8;;\[0m[0m [0m[0m━━━━━━━━━━━━━━━━━━━━━━━━━━━[0m[0m
+
+[0m[0m  [0m[0m[1m[33m⚠[0m[0m [0m[0m[33mDescending specificity selector found. This selector specificity is (0, 1, 1)[0m[0m
+[0m[0m  [0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m894 │ [0m[0m [0m[0m [0m[0mf[0m[0mo[0m[0mn[0m[0mt[0m[0m-[0m[0ms[0m[0mi[0m[0mz[0m[0me[0m[0m:[0m[0m [0m[0m1[0m[0m2[0m[0mp[0m[0mx[0m[0m;[0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m895 │ [0m[0m}[0m[0m
+[0m[0m  [0m[0m[1m[31m>[0m[0m [0m[0m[1m896 │ [0m[0m.[0m[0ms[0m[0mc[0m[0mr[0m[0me[0m[0me[0m[0mn[0m[0m-[0m[0ms[0m[0ma[0m[0mv[0m[0me[0m[0m-[0m[0mr[0m[0ma[0m[0mn[0m[0mk[0m[0m [0m[0ms[0m[0mt[0m[0mr[0m[0mo[0m[0mn[0m[0mg[0m[0m [0m[0m{[0m[0m
+[0m[0m  [0m[0m [0m[0m [0m[0m [0m[0m[1m   │ [0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m897 │ [0m[0m [0m[0m [0m[0mf[0m[0mo[0m[0mn[0m[0mt[0m[0m-[0m[0ms[0m[0mi[0m[0mz[0m[0me[0m[0m:[0m[0m [0m[0m1[0m[0m3[0m[0mp[0m[0mx[0m[0m;[0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m898 │ [0m[0m}[0m[0m
+[0m[0m  [0m[0m
+[0m[0m  [0m[0m[1m[34mℹ[0m[0m [0m[0m[34mThis selector specificity is (0, 2, 1)[0m[0m
+[0m[0m  [0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m297 │ [0m[0m [0m[0m [0m[0mf[0m[0mo[0m[0mn[0m[0mt[0m[0m-[0m[0mw[0m[0me[0m[0mi[0m[0mg[0m[0mh[0m[0mt[0m[0m:[0m[0m [0m[0m6[0m[0m0[0m[0m0[0m[0m;[0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m298 │ [0m[0m}[0m[0m
+[0m[0m  [0m[0m[1m[31m>[0m[0m [0m[0m[1m299 │ [0m[0m.[0m[0mt[0m[0md[0m[0mx[0m[0m-[0m[0mp[0m[0mr[0m[0me[0m[0mv[0m[0mi[0m[0me[0m[0mw[0m[0m-[0m[0mr[0m[0me[0m[0ms[0m[0mu[0m[0ml[0m[0mt[0m[0m.[0m[0mo[0m[0mk[0m[0m [0m[0ms[0m[0mt[0m[0mr[0m[0mo[0m[0mn[0m[0mg[0m[0m [0m[0m{[0m[0m
+[0m[0m  [0m[0m [0m[0m [0m[0m [0m[0m[1m   │ [0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m[1m[31m^[0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m300 │ [0m[0m [0m[0m [0m[0mc[0m[0mo[0m[0ml[0m[0mo[0m[0mr[0m[0m:[0m[0m [0m[0mv[0m[0ma[0m[0mr[0m[0m([0m[0m-[0m[0m-[0m[0mo[0m[0mk[0m[0m-[0m[0mt[0m[0m)[0m[0m;[0m[0m
+[0m[0m  [0m[0m  [0m[0m[1m301 │ [0m[0m}[0m[0m
+[0m[0m  [0m[0m
+[0m[0m  [0m[0m[1m[34mℹ[0m[0m [0m[0m[34mDescending specificity selector may not be applied. Consider rearranging the order of the selectors. See [0m[0m[34m]8;;https://developer.mozilla.org/en-US/docs/Web/CSS/Specificity\MDN web docs]8;;\[0m[0m[34m for more details.[0m[0m
+[0m[0m  [0m[0m
+[0m
+[0m[34mChecked 320 files in 127[0m[0m[2m[34mms[0m[0m[34m.[0m[0m[34m No fixes applied.[0m[0m
+[0m[0m[33mFound [0m[0m[33m9[0m[0m[33m warnings.[0m
+
+> rquant-web@0.0.0 typecheck /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/web
+> tsc -p tsconfig.app.json --noEmit && tsc -p tsconfig.node.json --noEmit
+
+
+ RUN  v5.0.2 /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/web
+
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+Not implemented: Window's getComputedStyle() method: with pseudo-elements
+
+ Test Files  65 passed (65)
+      Tests  705 passed (705)
+   Start at  03:54:52
+   Duration  24.67s (tests 63%, import 17%, environment 12%, setup 6%, transform 3%)
+
+    Isolate  65 workers spawned · ~620ms startup each (spawn + environment, per file)
+             at least ~3.04s faster with isolate: false — reuses workers across files instead of one per file
+

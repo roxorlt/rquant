@@ -1,0 +1,45 @@
+[WebServer] (node:56691) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+[WebServer] (Use `node --trace-warnings ...` to show where the warning was created)
+
+Running 1 test using 1 worker
+
+(node:56692) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+  ✘  1 [chromium] › e2e/research-query.spec.ts:92:1 › 保存失联、刷新和恢复仍使用原命令 (5.7s)
+
+
+  1) [chromium] › e2e/research-query.spec.ts:92:1 › 保存失联、刷新和恢复仍使用原命令 ───────────────────────────────
+
+    Error: expect(locator).toBeVisible() failed
+
+    Locator: getByRole('button', { name: '恢复保存' })
+    Expected: visible
+    Timeout: 5000ms
+    Error: element(s) not found
+
+    Call log:
+      - Expect "toBeVisible" getByRole('button', { name: '恢复保存' }) with timeout 5000ms
+      - waiting for getByRole('button', { name: '恢复保存' })
+
+
+      119 |   await expect(page.locator(".query-save-feedback")).toContainText("保存结果尚未确认，请恢复原命令。");
+      120 |   await page.reload();
+    > 121 |   await expect(page.getByRole("button", { name: "恢复保存" })).toBeVisible();
+          |                                                            ^
+      122 |   await page.getByRole("button", { name: "恢复保存" }).click();
+      123 |   await expect(page.getByText("已保存", { exact: true })).toBeVisible();
+      124 |   expect(
+        at /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/web/e2e/research-query.spec.ts:121:60
+
+    Error Context: test-results/query/research-query-保存失联、刷新和恢复仍使用原命令-chromium/error-context.md
+
+    attachment #2: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/query/research-query-保存失联、刷新和恢复仍使用原命令-chromium/trace.zip
+    Usage:
+
+        pnpm exec playwright show-trace test-results/query/research-query-保存失联、刷新和恢复仍使用原命令-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  1 failed
+    [chromium] › e2e/research-query.spec.ts:92:1 › 保存失联、刷新和恢复仍使用原命令 ────────────────────────────────

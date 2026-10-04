@@ -1,0 +1,1789 @@
+E501 Line too long (101 > 100)
+    --> src/rquant/page_control.py:1298:101
+     |
+1296 |         return receipt
+1297 |
+1298 |     def enqueue_trusted_research_query(self, command: _OwnedSaveResearchQuery) -> PageControlReceipt:
+     |                                                                                                     ^
+1299 |         return self._enqueue(command, require_research_query_trust=True)
+     |
+
+E501 Line too long (107 > 100)
+    --> src/rquant/page_control.py:1301:101
+     |
+1299 |         return self._enqueue(command, require_research_query_trust=True)
+1300 |
+1301 |     def lookup_research_query_command(self, command: _OwnedSaveResearchQuery) -> PageControlReceipt | None:
+     |                                                                                                     ^^^^^^^
+1302 |         from contextlib import closing
+     |
+
+E501 Line too long (127 > 100)
+    --> src/rquant/page_control.py:1305:101
+     |
+1304 |         with closing(self._connect()) as connection:
+1305 |             row = connection.execute("SELECT * FROM page_control_command WHERE command_id=?", (command.command_id,)).fetchone()
+     |                                                                                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+1306 |             if row is None:
+1307 |                 return None
+     |
+
+E501 Line too long (127 > 100)
+    --> src/rquant/page_control.py:1308:101
+     |
+1306 |             if row is None:
+1307 |                 return None
+1308 |             if row["command_hash"] != _command_hash(command) or _COMMAND_ADAPTER.validate_json(row["payload_json"]) != command:
+     |                                                                                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+1309 |                 raise PageControlCommandConflictError("query command conflicts with original actor or payload")
+1310 |             return self._receipt(row)
+     |
+
+E501 Line too long (111 > 100)
+    --> src/rquant/page_control.py:1309:101
+     |
+1307 |                 return None
+1308 |             if row["command_hash"] != _command_hash(command) or _COMMAND_ADAPTER.validate_json(row["payload_json"]) != command:
+1309 |                 raise PageControlCommandConflictError("query command conflicts with original actor or payload")
+     |                                                                                                     ^^^^^^^^^^^
+1310 |             return self._receipt(row)
+     |
+
+E501 Line too long (194 > 100)
+    --> src/rquant/page_control.py:1319:101
+     |
+1317 | …
+1318 | …
+1319 | … FROM research_query_saved WHERE owner_id=? ORDER BY updated_at DESC,query_id LIMIT 100", (checked,)).fetchall()
+     |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+1320 | …ows)
+     |
+
+E501 Line too long (103 > 100)
+    --> src/rquant/page_control.py:1322:101
+     |
+1320 |             return tuple(SavedResearchQuery.model_validate(dict(row)) for row in rows)
+1321 |
+1322 |     def complete_research_query(self, claim: PageControlClaim, *, now: datetime) -> PageControlReceipt:
+     |                                                                                                     ^^^
+1323 |         from rquant.research_query.saved import complete_saved_query
+     |
+
+E501 Line too long (111 > 100)
+    --> src/rquant/page_control.py:2637:101
+     |
+2635 |             return (self.outbox.complete_price_rule(claim, now=self.clock()),)
+2636 |
+2637 |     def drain_research_query_command(self, command: _OwnedSaveResearchQuery) -> tuple[PageControlReceipt, ...]:
+     |                                                                                                     ^^^^^^^^^^^
+2638 |         with _PageControlExecutionMutex(self._consumer_mutex_path()) as acquired:
+2639 |             if not acquired:
+     |
+
+E501 Line too long (172 > 100)
+    --> src/rquant/page_control.py:2641:101
+     |
+2639 | …
+2640 | …
+2641 | …onsumer_id, lease_seconds=self.lease_seconds, now=self.clock(), target_command_id=command.command_id)
+     |                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2642 | …
+2643 | …
+     |
+
+E501 Line too long (127 > 100)
+    --> src/rquant/page_control.py:4584:101
+     |
+4582 |         return self._settle(command, self.outbox.enqueue_verified_ack(command))
+4583 |
+4584 |     def _submit_trusted_research_query(self, command: SaveResearchQuery, *, authenticated_actor_id: str) -> PageControlReceipt:
+     |                                                                                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+4585 |         if type(command) is not SaveResearchQuery:
+4586 |             raise TypeError("query save requires an unowned command")
+     |
+
+E501 Line too long (115 > 100)
+    --> src/rquant/page_control.py:4588:101
+     |
+4586 |             raise TypeError("query save requires an unowned command")
+4587 |         owned = _OwnedSaveResearchQuery(**command.model_dump(), owner_id=authenticated_actor_id)
+4588 |         return self._settle(owned, self.outbox.enqueue_trusted_research_query(owned), research_query_command=owned)
+     |                                                                                                     ^^^^^^^^^^^^^^^
+4589 |
+4590 |     def _resume_trusted_research_query(self, command: SaveResearchQuery, *, authenticated_actor_id: str) -> PageControlReceipt | Non…
+     |
+
+E501 Line too long (134 > 100)
+    --> src/rquant/page_control.py:4590:101
+     |
+4588 | …ue_trusted_research_query(owned), research_query_command=owned)
+4589 | …
+4590 | …: SaveResearchQuery, *, authenticated_actor_id: str) -> PageControlReceipt | None:
+     |                                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+4591 | …
+4592 | … original unowned command")
+     |
+
+E501 Line too long (102 > 100)
+    --> src/rquant/page_control.py:4595:101
+     |
+4593 |         owned = _OwnedSaveResearchQuery(**command.model_dump(), owner_id=authenticated_actor_id)
+4594 |         receipt = self.outbox.lookup_research_query_command(owned)
+4595 |         return None if receipt is None else self._settle(owned, receipt, research_query_command=owned)
+     |                                                                                                     ^^
+4596 |
+4597 |     def _submit_trusted_watchlist(
+     |
+
+E501 Line too long (129 > 100)
+    --> src/rquant/page_control.py:5587:101
+     |
+5586 | def parse_page_control_command(payload: object) -> PageControlCommandValue:
+5587 |     if isinstance(payload, SaveResearchQuery) or (isinstance(payload, Mapping) and payload.get("kind") == "save_research_query"):
+     |                                                                                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+5588 |         raise ValueError("research queries require trusted submission")
+5589 |     if isinstance(
+     |
+
+E501 Line too long (102 > 100)
+  --> src/rquant/research_query/__init__.py:10:101
+   |
+ 8 |     "PUBLIC_SCHEMA", "QueryColumn", "QueryRequest", "QueryResult", "VerifiedQuerySnapshot",
+ 9 |     "build_query_snapshot", "result_csv", "QueryExecutor", "QueryLimits",
+10 |     "QueryPrivateServer", "QueryPrivateClient", "QueryAdmissionRejected", "QueryAdmissionUnavailable",
+   |                                                                                                     ^^
+11 | ]
+   |
+
+E501 Line too long (115 > 100)
+  --> src/rquant/research_query/__init__.py:15:101
+   |
+14 | def __getattr__(name: str) -> object:
+15 |     if name in {"QueryPrivateServer", "QueryPrivateClient", "QueryAdmissionRejected", "QueryAdmissionUnavailable"}:
+   |                                                                                                     ^^^^^^^^^^^^^^^
+16 |         from . import service
+   |
+
+E501 Line too long (153 > 100)
+  --> src/rquant/research_query/child.py:27:101
+   |
+25 | …ddress_bytes))
+26 | …ile_bytes))
+27 | …tes, address_bytes) or resource.getrlimit(resource.RLIMIT_FSIZE) != (file_bytes, file_bytes):
+   |                                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+28 | …ed")
+29 | …
+   |
+
+E501 Line too long (110 > 100)
+  --> src/rquant/research_query/child.py:66:101
+   |
+64 |     if isinstance(value, timedelta):
+65 |         return {"kind": "interval", "text": str(value)}
+66 |     return {"kind": "structured", "text": json.dumps(value, default=str, ensure_ascii=False, allow_nan=False)}
+   |                                                                                                     ^^^^^^^^^^
+   |
+
+E501 Line too long (106 > 100)
+  --> src/rquant/research_query/child.py:70:101
+   |
+69 | def encode(payload: object) -> bytes:
+70 |     return json.dumps(payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
+   |                                                                                                     ^^^^^^
+   |
+
+E501 Line too long (154 > 100)
+  --> src/rquant/research_query/child.py:80:101
+   |
+78 | …
+79 | …
+80 | …lumns": [], "rows": [], "elapsed_ms": 0, "message": "当前环境无法限制查询资源，查询未启动。"}
+   |                                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+81 | …
+82 | …e_bytes"], result_path.parent)
+   |
+
+E501 Line too long (108 > 100)
+   --> src/rquant/research_query/child.py:112:101
+    |
+110 |         if len(statements) != 1 or statements[0].type != duckdb.StatementType.SELECT:
+111 |             raise ValueError("actual statement is not SELECT")
+112 |         cursor = connection.execute(("EXPLAIN " if sql_request.mode == "explain" else "") + sql_request.sql)
+    |                                                                                                     ^^^^^^^^
+113 |         columns = [{"name": str(item[0]), "data_type": str(item[1])} for item in cursor.description]
+114 |         result = {"status": "ready", "columns": columns, "rows": [], "elapsed_ms": 0,
+    |
+
+E501 Line too long (114 > 100)
+   --> src/rquant/research_query/child.py:115:101
+    |
+113 |         columns = [{"name": str(item[0]), "data_type": str(item[1])} for item in cursor.description]
+114 |         result = {"status": "ready", "columns": columns, "rows": [], "elapsed_ms": 0,
+115 |                   "source_at": request["source_at"], "snapshot_sha256": request["snapshot_sha256"], "message": ""}
+    |                                                                                                     ^^^^^^^^^^^^^^
+116 |         rows: list[list[object]] = []
+117 |         # Reserve full envelope overhead; actual serialized bytes are measured below.
+    |
+
+E501 Line too long (118 > 100)
+  --> src/rquant/research_query/cli.py:22:93
+   |
+20 |     build.add_argument("--out", type=Path, required=True)
+21 |     for action in ("serve", "save-serve"):
+22 |         command = commands.add_parser(action, help="私有查询服务" if action == "serve" else "独立 PageControl 保存桥")
+   |                                                                                                     ^^^^^^^^^^^^^^^^^^
+23 |         command.add_argument("--socket", type=Path, required=True)
+24 |         command.add_argument("--web-uid", type=int, required=True)
+   |
+
+E501 Line too long (107 > 100)
+  --> src/rquant/research_query/cli.py:26:91
+   |
+24 |         command.add_argument("--web-uid", type=int, required=True)
+25 |         command.add_argument("--shared-gid", type=int, required=True)
+26 |         command.add_argument("--users", required=True, help="已授权 researcher/admin 的精确账号，逗号分隔")
+   |                                                                                                      ^^^^^^
+27 |         if action == "serve":
+28 |             command.add_argument("--snapshot-root", type=Path, required=True)
+   |
+
+E501 Line too long (122 > 100)
+  --> src/rquant/research_query/cli.py:36:101
+   |
+34 |         from .snapshot import build_query_snapshot
+35 |
+36 |         manifest = build_query_snapshot(args.source, args.out, source_sha256=args.source_sha256, source_at=args.source_at)
+   |                                                                                                     ^^^^^^^^^^^^^^^^^^^^^^
+37 |         print(manifest.model_dump_json())
+38 |         return 0
+   |
+
+E501 Line too long (145 > 100)
+  --> src/rquant/research_query/cli.py:40:101
+   |
+38 | …
+39 | …lit(","))
+40 | …en(users) or any(re.fullmatch(r"[A-Za-z0-9._@-]{1,64}", user) is None for user in users):
+   |                                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+41 | …trusted account names")
+42 | …or args.shared_gid < 0:
+   |
+
+E501 Line too long (224 > 100)
+  --> src/rquant/research_query/cli.py:50:101
+   |
+48 | …
+49 | …
+50 | …rgs.snapshot_root), args.scratch_root), allowed_users=frozenset(users), trusted_web_uid=args.web_uid, shared_gid=args.shared_gid)
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+51 | …
+52 | …ice
+   |
+
+E501 Line too long (186 > 100)
+  --> src/rquant/research_query/cli.py:58:101
+   |
+56 | …
+57 | …
+58 | …mer(outbox=outbox, data_dir=args.outbox.parent / "query-state", log_dir=args.outbox.parent / "query-events"))
+   |                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+59 | …rs=frozenset(users), trusted_web_uid=args.web_uid, shared_gid=args.shared_gid)
+60 | …
+   |
+
+E501 Line too long (155 > 100)
+  --> src/rquant/research_query/cli.py:59:101
+   |
+57 | …
+58 | …PageControlConsumer(outbox=outbox, data_dir=args.outbox.parent / "query-state", log_dir=args.outbox.parent / "query-events"))
+59 | …rol, allowed_users=frozenset(users), trusted_web_uid=args.web_uid, shared_gid=args.shared_gid)
+   |                                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+60 | …
+61 | …
+   |
+
+E501 Line too long (122 > 100)
+  --> src/rquant/research_query/executor.py:39:101
+   |
+38 | class QueryExecutor:
+39 |     def __init__(self, snapshot: VerifiedQuerySnapshot, scratch_root: Path, *, limits: QueryLimits | None = None) -> None:
+   |                                                                                                     ^^^^^^^^^^^^^^^^^^^^^^
+40 |         self.snapshot = snapshot
+41 |         self.limits = limits or QueryLimits()
+   |
+
+E501 Line too long (130 > 100)
+  --> src/rquant/research_query/executor.py:45:101
+   |
+43 |         self.scratch_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+44 |         info = self.scratch_root.lstat()
+45 |         if self.scratch_root != self.scratch_root.resolve() or stat.S_IMODE(info.st_mode) != 0o700 or info.st_uid != os.geteuid():
+   |                                                                                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+46 |             raise ValueError("查询临时目录未通过核验")
+47 |         self._slots = threading.BoundedSemaphore(10)
+   |
+
+E501 Line too long (111 > 100)
+  --> src/rquant/research_query/executor.py:60:101
+   |
+58 | …     try:
+59 | …         while not acquired:
+60 | …             if (cancel is not None and cancel.is_set()) or time.monotonic()-started >= self.limits.seconds:
+   |                                                                                                   ^^^^^^^^^^^
+61 | …                 return QueryResult(status="timeout", elapsed_ms=(time.monotonic()-started)*1000, message="查询等待超时，请稍后重试。"            …
+62 | …             acquired = self._running.acquire(timeout=min(0.05, self.limits.seconds))
+   |
+
+E501 Line too long (138 > 100)
+  --> src/rquant/research_query/executor.py:61:101
+   |
+59 | …
+60 | …set()) or time.monotonic()-started >= self.limits.seconds:
+61 | …t", elapsed_ms=(time.monotonic()-started)*1000, message="查询等待超时，请稍后重试。")
+   |                                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+62 | …out=min(0.05, self.limits.seconds))
+63 | …
+   |
+
+E501 Line too long (146 > 100)
+  --> src/rquant/research_query/executor.py:68:101
+   |
+66 | …
+67 | …
+68 | …elapsed_ms=(time.monotonic()-started)*1000, message="查询数据未通过核验，请更新后重试。")
+   |                                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+69 | …y-", dir=self.scratch_root) as directory:
+70 | …
+   |
+
+E501 Line too long (307 > 100)
+  --> src/rquant/research_query/executor.py:73:101
+   |
+71 | …
+72 | …
+73 | ….resolve().parents[2]), snapshot_path=str(self.snapshot.path), snapshot_identity=self.snapshot.identity, source_at=self.snapshot.manifest.source_at.isoformat(), snapshot_sha256=self.snapshot.manifest.file_sha256)
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+74 | …8")
+75 | …
+   |
+
+E501 Line too long (394 > 100)
+  --> src/rquant/research_query/executor.py:76:101
+   |
+74 | …8")
+75 | …
+76 | …_name("child.py")), str(request_path), str(result_path)], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True, env={"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "TZ": "Asia/Shanghai", "OPENBLAS_NUM_THREADS": "1", "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"})
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+77 | …
+78 | …
+   |
+
+E501 Line too long (150 > 100)
+  --> src/rquant/research_query/executor.py:88:101
+   |
+86 | …
+87 | …
+88 | …out", elapsed_ms=(time.monotonic()-started)*1000, message="查询已停止，请缩小范围后重试。")
+   |                                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+89 | …
+90 | …
+   |
+
+SIM105 Use `contextlib.suppress(subprocess.TimeoutExpired)` instead of `try`-`except`-`pass`
+  --> src/rquant/research_query/executor.py:89:25
+   |
+87 |   …                 process.wait()
+88 |   …             return QueryResult(status="timeout", elapsed_ms=(time.monotonic()-started)*1000, message="查询已停止，请缩小范围后重试。"              …
+89 | / …         try:
+90 | | …             process.wait(timeout=0.05)
+91 | | …         except subprocess.TimeoutExpired:
+92 | | …             pass
+   | |__________________^
+93 |   …     process.wait()
+94 |   …     if process.returncode != 0 or not result_path.is_file() or result_path.stat().st_size > self.limits.result_bytes:
+   |
+help: Replace `try`-`except`-`pass` with `with contextlib.suppress(subprocess.TimeoutExpired): ...`
+
+E501 Line too long (133 > 100)
+  --> src/rquant/research_query/executor.py:94:101
+   |
+92 | …             pass
+93 | …     process.wait()
+94 | …     if process.returncode != 0 or not result_path.is_file() or result_path.stat().st_size > self.limits.result_bytes:
+   |                                                                                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+95 | …         return QueryResult(status="failed", elapsed_ms=(time.monotonic()-started)*1000, message="查询超过资源限制或未能执行。")
+96 | …     result = QueryResult.model_validate_json(result_path.read_bytes())
+   |
+
+E501 Line too long (143 > 100)
+  --> src/rquant/research_query/executor.py:95:101
+   |
+93 | …     process.wait()
+94 | …     if process.returncode != 0 or not result_path.is_file() or result_path.stat().st_size > self.limits.result_bytes:
+95 | …         return QueryResult(status="failed", elapsed_ms=(time.monotonic()-started)*1000, message="查询超过资源限制或未能执行。")
+   |                                                                                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+96 | …     result = QueryResult.model_validate_json(result_path.read_bytes())
+97 | …     self.snapshot.verify_current()
+   |
+
+E501 Line too long (146 > 100)
+   --> src/rquant/research_query/executor.py:100:101
+    |
+ 98 | …psed_ms": (time.monotonic()-started)*1000})
+ 99 | …
+100 | …e", elapsed_ms=(time.monotonic()-started)*1000, message="查询结果暂时无法核验，请重试。")
+    |                                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+101 | …
+102 | …
+    |
+
+E501 Line too long (117 > 100)
+  --> src/rquant/research_query/saved.py:26:101
+   |
+26 | def complete_saved_query(outbox: PageControlOutbox, claim: PageControlClaim, *, now: datetime) -> PageControlReceipt:
+   |                                                                                                     ^^^^^^^^^^^^^^^^^
+27 |     from rquant.page_control import (
+28 |         _COMMAND_ADAPTER,
+   |
+
+E501 Line too long (123 > 100)
+  --> src/rquant/research_query/saved.py:42:101
+   |
+40 |     with closing(outbox._connect()) as connection, connection:
+41 |         connection.execute("BEGIN IMMEDIATE")
+42 |         row = connection.execute("SELECT * FROM page_control_command WHERE command_id=?", (command.command_id,)).fetchone()
+   |                                                                                                     ^^^^^^^^^^^^^^^^^^^^^^^
+43 |         if row is None or row["command_kind"] != command.kind or row["command_hash"] != digest or _COMMAND_ADAPTER.validate_json(row["…
+44 |             raise ValueError("saved query command content changed")
+   |
+
+E501 Line too long (161 > 100)
+  --> src/rquant/research_query/saved.py:43:101
+   |
+41 | …
+42 | …mand WHERE command_id=?", (command.command_id,)).fetchone()
+43 | … row["command_hash"] != digest or _COMMAND_ADAPTER.validate_json(row["payload_json"]) != command:
+   |                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+44 | …d")
+45 | …r"] != claim.owner_id or row["claim_token"] != claim.claim_token or row["lease_expires_at"] is None or row["lease_expires_at"] <= com…
+   |
+
+E501 Line too long (207 > 100)
+  --> src/rquant/research_query/saved.py:45:101
+   |
+43 | … digest or _COMMAND_ADAPTER.validate_json(row["payload_json"]) != command:
+44 | …
+45 | …r row["claim_token"] != claim.claim_token or row["lease_expires_at"] is None or row["lease_expires_at"] <= completed_at:
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+46 | …
+47 | …wner_id=? AND query_id=?", (command.owner_id, command.query_id)).fetchone()
+   |
+
+E501 Line too long (162 > 100)
+  --> src/rquant/research_query/saved.py:47:101
+   |
+45 | …"] != claim.owner_id or row["claim_token"] != claim.claim_token or row["lease_expires_at"] is None or row["lease_expires_at"] <= comp…
+46 | …")
+47 | …ch_query_saved WHERE owner_id=? AND query_id=?", (command.owner_id, command.query_id)).fetchone()
+   |                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+48 | …
+49 | …:
+   |
+
+E501 Line too long (157 > 100)
+  --> src/rquant/research_query/saved.py:53:101
+   |
+51 | …]) != command.expected_version:
+52 | …
+53 | …ount(*) FROM research_query_saved WHERE owner_id=?", (command.owner_id,)).fetchone()[0] >= 100:
+   |                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+54 | …
+55 | …"] + 1
+   |
+
+E501 Line too long (359 > 100)
+  --> src/rquant/research_query/saved.py:57:101
+   |
+55 | …
+56 | …
+57 | …,sql,updated_at) VALUES (?,?,?,?,?,?) ON CONFLICT(owner_id,query_id) DO UPDATE SET version=excluded.version,name=excluded.name,sql=excluded.sql,updated_at=excluded.updated_at", (command.owner_id, command.query_id, version, command.name, command.sql, completed_at))
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+58 | …
+59 | …code": code or "saved"}
+   |
+
+E501 Line too long (118 > 100)
+  --> src/rquant/research_query/saved.py:59:101
+   |
+57 | …         connection.execute("INSERT INTO research_query_saved(owner_id,query_id,version,name,sql,updated_at) VALUES (?,?,?,?,?,?) ON …
+58 | …     status = PageControlStatus.SUCCEEDED if code is None else PageControlStatus.FAILED
+59 | …     result = {"query_id": command.query_id, "version": version if code is None else None, "code": code or "saved"}
+   |                                                                                                   ^^^^^^^^^^^^^^^^^^
+60 | …     result_json = json.dumps(result, ensure_ascii=True)
+61 | …     connection.execute("INSERT INTO page_control_effect(command_id,command_hash,effect_kind,status,owner_id,claim_token,started_at,c…
+   |
+
+E501 Line too long (337 > 100)
+  --> src/rquant/research_query/saved.py:61:101
+   |
+59 | …code": code or "saved"}
+60 | …
+61 | …,status,owner_id,claim_token,started_at,completed_at,result_json,error) VALUES (?,?,?,?,?,?,?,?,?,?)", (command.command_id, digest, command.kind, status.value, claim.owner_id, claim.claim_token, completed_at, completed_at, result_json, code))
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+62 | …esult_json=?,error=?,processing_owner=NULL,lease_expires_at=NULL,claim_token=NULL WHERE command_id=? AND status='processing' AND processing_owner=? AND claim_token=? AND lease_expires_at>?", (status.value, completed_at, result_json, code, command.…
+63 | …
+   |
+
+E501 Line too long (412 > 100)
+  --> src/rquant/research_query/saved.py:62:101
+   |
+60 | …
+61 | …,status,owner_id,claim_token,started_at,completed_at,result_json,error) VALUES (?,?,?,?,?,?,?,?,?,?)", (command.command_id, digest, command.kind, status.value, claim.owner_id, claim.claim_token, completed_at, completed_at, result_json, code))
+62 | …esult_json=?,error=?,processing_owner=NULL,lease_expires_at=NULL,claim_token=NULL WHERE command_id=? AND status='processing' AND processing_owner=? AND claim_token=? AND lease_expires_at>?", (status.value, completed_at, result_json, code, command.command_id, claim.owner_id, claim.claim_token, completed_at)).rowcount
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+63 | …
+64 | …
+   |
+
+E501 Line too long (129 > 100)
+  --> src/rquant/research_query/saved.py:65:101
+   |
+63 |         if changed != 1:
+64 |             raise RuntimeError("query claim changed during completion")
+65 |         completed = connection.execute("SELECT * FROM page_control_command WHERE command_id=?", (command.command_id,)).fetchone()
+   |                                                                                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+66 |         assert completed is not None
+67 |         return outbox._receipt(completed)
+   |
+
+N818 Exception name `QueryAdmissionRejected` should be named with an Error suffix
+  --> src/rquant/research_query/service.py:43:7
+   |
+43 | class QueryAdmissionRejected(ValueError):
+   |       ^^^^^^^^^^^^^^^^^^^^^^
+44 |     pass
+   |
+
+N818 Exception name `QueryAdmissionUnavailable` should be named with an Error suffix
+  --> src/rquant/research_query/service.py:47:7
+   |
+47 | class QueryAdmissionUnavailable(RuntimeError):
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^
+48 |     pass
+   |
+
+E501 Line too long (205 > 100)
+  --> src/rquant/research_query/service.py:91:101
+   |
+89 | …
+90 | …
+91 | …b_uid: int, shared_gid: int, executor: QueryExecutor | None = None, control: PageControlService | None = None) -> None:
+   |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+92 | …_users) > 16 or trusted_web_uid < 0 or shared_gid < 0:
+93 | …quired")
+   |
+
+E501 Line too long (140 > 100)
+  --> src/rquant/research_query/service.py:92:101
+   |
+91 | …sers: frozenset[str], trusted_web_uid: int, shared_gid: int, executor: QueryExecutor | None = None, control: PageControlService | Non…
+92 | …not allowed_users or len(allowed_users) > 16 or trusted_web_uid < 0 or shared_gid < 0:
+   |                                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+93 | …ve role and trusted users are required")
+94 | …
+   |
+
+E501 Line too long (149 > 100)
+  --> src/rquant/research_query/service.py:96:101
+   |
+94 | …
+95 | …
+96 | …id != os.geteuid() or parent.st_gid != shared_gid or stat.S_IMODE(parent.st_mode) != 0o710:
+   |                                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+97 | …issions are invalid")
+98 | …
+   |
+
+E501 Line too long (106 > 100)
+   --> src/rquant/research_query/service.py:157:91
+    |
+155 | …             self.executor.snapshot.verify_current()
+156 | …             manifest = self.executor.snapshot.manifest
+157 | …             labels = {"daily_bar": "日线行情", "adj_factor": "复权因子", "trade_calendar": "交易日历"}
+    |                                                                                                   ^^^^^^
+158 | …             return QueryCatalogData(available=True, source_at=manifest.source_at, tables=tuple(QueryTableInfo(name=table, label=lab…
+159 | …     if self.control is not None and message.query is None:
+    |
+
+E501 Line too long (401 > 100)
+   --> src/rquant/research_query/service.py:158:101
+    |
+156 | …
+157 | …
+158 | …ple(QueryTableInfo(name=table, label=labels[table], columns=tuple(QueryColumn(name=name, data_type=kind) for name, kind in columns), row_count=manifest.row_counts[table], earliest_date=manifest.date_ranges[table][0], latest_date=manifest.date_ranges[table][1]) for table, columns in PUBLIC_SCHEMA.items()))
+    |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+159 | …
+160 | …
+    |
+
+E501 Line too long (134 > 100)
+   --> src/rquant/research_query/service.py:161:101
+    |
+159 | …ry is None:
+160 | …e.command is None:
+161 | …e, items=self.control.outbox.list_research_queries(message.authenticated_actor_id))
+    |                                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+162 | … and message.command is not None:
+163 | …usted_research_query if message.action == "save" else self.control._resume_trusted_research_query
+    |
+
+E501 Line too long (148 > 100)
+   --> src/rquant/research_query/service.py:163:101
+    |
+161 | …s=self.control.outbox.list_research_queries(message.authenticated_actor_id))
+162 | …ssage.command is not None:
+163 | …esearch_query if message.action == "save" else self.control._resume_trusted_research_query
+    |                                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+164 | …nticated_actor_id=message.authenticated_actor_id)
+165 | …age="未找到原保存命令。" if receipt is None else "")
+    |
+
+E501 Line too long (107 > 100)
+   --> src/rquant/research_query/service.py:164:101
+    |
+162 | …         if message.action in {"save", "resume"} and message.command is not None:
+163 | …             operation = self.control._submit_trusted_research_query if message.action == "save" else self.control._resume_trusted_r…
+164 | …             receipt = operation(message.command, authenticated_actor_id=message.authenticated_actor_id)
+    |                                                                                                   ^^^^^^^
+165 | …             return QuerySaveData(receipt=receipt, message="未找到原保存命令。" if receipt is None else "")
+166 | …     raise QueryAdmissionRejected("请求不属于此服务。")
+    |
+
+E501 Line too long (110 > 100)
+   --> src/rquant/research_query/service.py:165:92
+    |
+163 | …             operation = self.control._submit_trusted_research_query if message.action == "save" else self.control._resume_trusted_r…
+164 | …             receipt = operation(message.command, authenticated_actor_id=message.authenticated_actor_id)
+165 | …             return QuerySaveData(receipt=receipt, message="未找到原保存命令。" if receipt is None else "")
+    |                                                                                                   ^^^^^^^^^^
+166 | …     raise QueryAdmissionRejected("请求不属于此服务。")
+    |
+
+E501 Line too long (236 > 100)
+   --> src/rquant/research_query/service.py:173:101
+    |
+171 | …
+172 | …
+173 | ….get("Content-Type") != "application/json" or len(lengths) != 1 or not lengths[0].isdigit() or not 1 <= int(lengths[0]) <= MAX_REQUEST_BYTES:
+    |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+174 | …
+175 | …
+    |
+
+E501 Line too long (105 > 100)
+   --> src/rquant/research_query/service.py:177:101
+    |
+175 |             return
+176 |         try:
+177 |             message = _PrivateRequest.model_validate(strict_json_loads(self.rfile.read(int(lengths[0]))))
+    |                                                                                                     ^^^^^
+178 |             result = self.server.dispatch(message)
+179 |             self._json(200, {"data": result.model_dump(mode="json")})
+    |
+
+E501 Line too long (108 > 100)
+   --> src/rquant/research_query/service.py:186:101
+    |
+185 |     def _json(self, status: int, value: object) -> None:
+186 |         body = json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
+    |                                                                                                     ^^^^^^^^
+187 |         if len(body) > MAX_RESULT_BYTES:
+188 |             status, body = 503, b'{"error":"result limit"}'
+    |
+
+E501 Line too long (141 > 100)
+   --> src/rquant/research_query/service.py:201:101
+    |
+200 | …
+201 | …ervice_uid: int, shared_gid: int, client_uid: Callable[[], int] = os.geteuid) -> None:
+    |                                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+202 | …
+203 | …r expected_service_uid == client_uid():
+    |
+
+E501 Line too long (136 > 100)
+   --> src/rquant/research_query/service.py:205:101
+    |
+203 | …0 or expected_service_uid == client_uid():
+204 | …e a distinct private identity")
+205 | …red_gid, self.client_uid = socket_path, expected_service_uid, shared_gid, client_uid
+    |                                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+206 | …
+207 | …el: type[QueryModel]) -> QueryModel:
+    |
+
+E501 Line too long (173 > 100)
+   --> src/rquant/research_query/service.py:211:101
+    |
+209 | …
+210 | …
+211 | …nds=35, expected_service_uid=self.service_uid, shared_gid=self.shared_gid, client_uid=self.client_uid)
+    |                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+212 | …
+213 | …Content-Type": "application/json"})
+    |
+
+E501 Line too long (106 > 100)
+   --> src/rquant/research_query/service.py:213:101
+    |
+211 | …     connection = _UnixHTTPConnection(self.socket_path, timeout_seconds=35, expected_service_uid=self.service_uid, shared_gid=self.s…
+212 | …     try:
+213 | …         connection.request("POST", "/v1/research", body, headers={"Content-Type": "application/json"})
+    |                                                                                                   ^^^^^^
+214 | …         response = connection.getresponse()
+215 | …         sizes = response.headers.get_all("Content-Length", [])
+    |
+
+E501 Line too long (103 > 100)
+   --> src/rquant/research_query/service.py:216:101
+    |
+214 |             response = connection.getresponse()
+215 |             sizes = response.headers.get_all("Content-Length", [])
+216 |             if len(sizes) != 1 or not sizes[0].isdigit() or not 1 <= int(sizes[0]) <= MAX_RESULT_BYTES:
+    |                                                                                                     ^^^
+217 |                 raise QueryAdmissionUnavailable("查询响应未通过核验。")
+218 |             raw = response.read(int(sizes[0])+1)
+    |
+
+E501 Line too long (128 > 100)
+   --> src/rquant/research_query/service.py:237:101
+    |
+236 |     def catalog(self, *, authenticated_actor_id: str) -> QueryCatalogData:
+237 |         return self._request(_PrivateRequest(authenticated_actor_id=authenticated_actor_id, action="catalog"), QueryCatalogData)
+    |                                                                                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+238 |
+239 |     def execute(self, query: QueryRequest, *, authenticated_actor_id: str) -> QueryResult:
+    |
+
+E501 Line too long (134 > 100)
+   --> src/rquant/research_query/service.py:240:101
+    |
+239 |     def execute(self, query: QueryRequest, *, authenticated_actor_id: str) -> QueryResult:
+240 |         return self._request(_PrivateRequest(authenticated_actor_id=authenticated_actor_id, action="query", query=query), QueryResult)
+    |                                                                                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+241 |
+242 |     def saved(self, *, authenticated_actor_id: str) -> QuerySavedList:
+    |
+
+E501 Line too long (124 > 100)
+   --> src/rquant/research_query/service.py:243:101
+    |
+242 |     def saved(self, *, authenticated_actor_id: str) -> QuerySavedList:
+243 |         return self._request(_PrivateRequest(authenticated_actor_id=authenticated_actor_id, action="saved"), QuerySavedList)
+    |                                                                                                     ^^^^^^^^^^^^^^^^^^^^^^^^
+244 |
+245 |     def save(self, command: SaveResearchQuery, *, authenticated_actor_id: str, resume: bool = False) -> QuerySaveData:
+    |
+
+E501 Line too long (118 > 100)
+   --> src/rquant/research_query/service.py:245:101
+    |
+243 |         return self._request(_PrivateRequest(authenticated_actor_id=authenticated_actor_id, action="saved"), QuerySavedList)
+244 |
+245 |     def save(self, command: SaveResearchQuery, *, authenticated_actor_id: str, resume: bool = False) -> QuerySaveData:
+    |                                                                                                     ^^^^^^^^^^^^^^^^^^
+246 |         return self._request(_PrivateRequest(authenticated_actor_id=authenticated_actor_id, action="resume" if resume else "save", co…
+    |
+
+E501 Line too long (163 > 100)
+   --> src/rquant/research_query/service.py:246:101
+    |
+245 | …tor_id: str, resume: bool = False) -> QuerySaveData:
+246 | …d=authenticated_actor_id, action="resume" if resume else "save", command=command), QuerySaveData)
+    |                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+
+E501 Line too long (187 > 100)
+  --> src/rquant/research_query/snapshot.py:18:101
+   |
+17 | …
+18 | …OUBLE"), ("high", "DOUBLE"), ("low", "DOUBLE"), ("close", "DOUBLE"), ("vol", "DOUBLE"), ("amount", "DOUBLE")),
+   |                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+19 | …or", "DOUBLE")),
+20 | …en", "BOOLEAN"), ("pretrade_date", "DATE")),
+   |
+
+E501 Line too long (121 > 100)
+  --> src/rquant/research_query/snapshot.py:20:101
+   |
+18 |     "daily_bar": (("ts_code", "VARCHAR"), ("trade_date", "DATE"), ("open", "DOUBLE"), ("high", "DOUBLE"), ("low", "DOUBLE"), ("close",…
+19 |     "adj_factor": (("ts_code", "VARCHAR"), ("trade_date", "DATE"), ("adj_factor", "DOUBLE")),
+20 |     "trade_calendar": (("exchange", "VARCHAR"), ("cal_date", "DATE"), ("is_open", "BOOLEAN"), ("pretrade_date", "DATE")),
+   |                                                                                                     ^^^^^^^^^^^^^^^^^^^^^
+21 | }
+   |
+
+E501 Line too long (135 > 100)
+  --> src/rquant/research_query/snapshot.py:58:101
+   |
+57 | def verify_public_schema(connection: object) -> None:
+58 |     tables = connection.execute("SELECT schema_name,table_name FROM duckdb_tables() WHERE NOT internal ORDER BY table_name").fetchall()
+   |                                                                                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+59 |     if tables != [("main", name) for name in sorted(PUBLIC_SCHEMA)]:
+60 |         raise ValueError("查询快照包含额外或缺失数据表")
+   |
+
+E501 Line too long (188 > 100)
+  --> src/rquant/research_query/snapshot.py:62:101
+   |
+60 | …
+61 | …
+62 | …tion_schema.columns WHERE table_schema='main' AND table_name=? ORDER BY ordinal_position", [table]).fetchall()
+   |                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+63 | …
+64 | …
+   |
+
+E501 Line too long (106 > 100)
+  --> src/rquant/research_query/snapshot.py:72:101
+   |
+70 |         if connection.execute(sql).fetchone()[0]:
+71 |             raise ValueError("查询快照包含额外对象")
+72 |     schemas = connection.execute("SELECT schema_name FROM duckdb_schemas() WHERE NOT internal").fetchall()
+   |                                                                                                     ^^^^^^
+73 |     if any(row[0] != "main" for row in schemas):
+74 |         raise ValueError("查询快照包含额外 schema")
+   |
+
+E501 Line too long (134 > 100)
+  --> src/rquant/research_query/snapshot.py:80:101
+   |
+78 |     import duckdb
+79 |
+80 |     return duckdb.connect(str(path), read_only=True, config={"enable_external_access": False, "threads": 1, "memory_limit": "512MiB"})
+   |                                                                                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+
+E501 Line too long (112 > 100)
+  --> src/rquant/research_query/snapshot.py:89:101
+   |
+87 |             raise ValueError("查询目录路径未通过核验")
+88 |         info = self.root.lstat()
+89 |         if not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o700 or info.st_uid != os.geteuid():
+   |                                                                                                     ^^^^^^^^^^^^
+90 |             raise ValueError("查询目录权限未通过核验")
+91 |         self.root_identity = (info.st_dev, info.st_ino)
+   |
+
+E501 Line too long (146 > 100)
+   --> src/rquant/research_query/snapshot.py:109:101
+    |
+107 | …ty or stat.S_IMODE(info.st_mode) != 0o700:
+108 | …
+109 | …f.identity or file_identity(self.manifest_path, readonly=True) != self.manifest_identity:
+    |                                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+110 | …
+111 | …
+    |
+
+E501 Line too long (120 > 100)
+   --> src/rquant/research_query/snapshot.py:117:101
+    |
+117 | def build_query_snapshot(source: Path, root: Path, *, source_sha256: str, source_at: datetime) -> QuerySnapshotManifest:
+    |                                                                                                     ^^^^^^^^^^^^^^^^^^^^
+118 |     """Trusted offline CLI publishes columns only after source byte verification."""
+119 |     from datetime import UTC
+    |
+
+E501 Line too long (165 > 100)
+   --> src/rquant/research_query/snapshot.py:138:101
+    |
+136 | …
+137 | …
+138 | …tch), config={"threads": 1, "memory_limit": "512MiB", "enable_external_access": False}) as target:
+    |                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+139 | …
+140 | …
+    |
+
+E501 Line too long (174 > 100)
+   --> src/rquant/research_query/snapshot.py:141:101
+    |
+139 | …
+140 | …
+141 | …_type FROM information_schema.columns WHERE table_schema='main' AND table_name=?", [table]).fetchall())
+    |                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+142 | …ns):
+143 | …
+    |
+
+E501 Line too long (109 > 100)
+   --> src/rquant/research_query/snapshot.py:144:101
+    |
+142 |                 if any(actual.get(name) != kind for name, kind in columns):
+143 |                     raise ValueError("原数据字段合同不匹配")
+144 |                 target.execute(f"CREATE TABLE {table} ({','.join(name+' '+kind for name, kind in columns)})")
+    |                                                                                                     ^^^^^^^^^
+145 |                 cursor = original.execute(f"SELECT {','.join(name for name, _ in columns)} FROM {table}")
+146 |                 count = 0
+    |
+
+E501 Line too long (105 > 100)
+   --> src/rquant/research_query/snapshot.py:145:101
+    |
+143 |                     raise ValueError("原数据字段合同不匹配")
+144 |                 target.execute(f"CREATE TABLE {table} ({','.join(name+' '+kind for name, kind in columns)})")
+145 |                 cursor = original.execute(f"SELECT {','.join(name for name, _ in columns)} FROM {table}")
+    |                                                                                                     ^^^^^
+146 |                 count = 0
+147 |                 while batch := cursor.fetchmany(1000):
+    |
+
+E501 Line too long (111 > 100)
+   --> src/rquant/research_query/snapshot.py:151:101
+    |
+149 |                     if count > 100_000_000:
+150 |                         raise ValueError("公开查询来源超过容量")
+151 |                     target.executemany(f"INSERT INTO {table} VALUES ({','.join('?' for _ in columns)})", batch)
+    |                                                                                                     ^^^^^^^^^^^
+152 |                 counts[table] = count
+153 |                 field = "cal_date" if table == "trade_calendar" else "trade_date"
+    |
+
+E501 Line too long (110 > 100)
+   --> src/rquant/research_query/snapshot.py:154:101
+    |
+152 |                 counts[table] = count
+153 |                 field = "cal_date" if table == "trade_calendar" else "trade_date"
+154 |                 earliest, latest = target.execute(f"SELECT min({field}),max({field}) FROM {table}").fetchone()
+    |                                                                                                     ^^^^^^^^^^
+155 |                 ranges[table] = (str(earliest) if earliest else None, str(latest) if latest else None)
+156 |             verify_public_schema(target)
+    |
+
+E501 Line too long (102 > 100)
+   --> src/rquant/research_query/snapshot.py:155:101
+    |
+153 |                 field = "cal_date" if table == "trade_calendar" else "trade_date"
+154 |                 earliest, latest = target.execute(f"SELECT min({field}),max({field}) FROM {table}").fetchone()
+155 |                 ranges[table] = (str(earliest) if earliest else None, str(latest) if latest else None)
+    |                                                                                                     ^^
+156 |             verify_public_schema(target)
+157 |             target.execute("COMMIT")
+    |
+
+E501 Line too long (118 > 100)
+   --> src/rquant/research_query/snapshot.py:159:101
+    |
+157 |             target.execute("COMMIT")
+158 |             target.execute("CHECKPOINT")
+159 |         if file_identity(source) != before or digest_file(source) != source_sha256 or file_identity(source) != before:
+    |                                                                                                     ^^^^^^^^^^^^^^^^^^
+160 |             raise ValueError("原来源在发布期间发生变化")
+161 |         digest = digest_file(scratch)
+    |
+
+E501 Line too long (196 > 100)
+   --> src/rquant/research_query/snapshot.py:165:101
+    |
+163 | …
+164 | …
+165 | …urce_sha256=source_sha256, source_at=source_at, built_at=datetime.now(UTC), row_counts=counts, date_ranges=ranges)
+    |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+166 | …
+167 | …
+    |
+
+E501 Line too long (225 > 100)
+   --> src/rquant/web/app.py:215:101
+    |
+213 | …
+214 | …
+215 | …search_query_socket_path, expected_service_uid=settings.research_query_service_uid, shared_gid=settings.research_query_shared_gid)
+    |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+216 | …
+217 | …nt(settings.research_query_save_socket_path, expected_service_uid=settings.research_query_save_service_uid, shared_gid=settings.researc…
+    |
+
+E501 Line too long (249 > 100)
+   --> src/rquant/web/app.py:217:101
+    |
+215 | …search_query_socket_path, expected_service_uid=settings.research_query_service_uid, shared_gid=settings.research_query_shared_gid)
+216 | …
+217 | …nt(settings.research_query_save_socket_path, expected_service_uid=settings.research_query_save_service_uid, shared_gid=settings.research_query_shared_gid)
+    |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+218 | …
+219 | …
+    |
+
+E501 Line too long (111 > 100)
+   --> src/rquant/web/app.py:415:88
+    |
+413 |     ) -> Response:
+414 |         if request.url.path.startswith("/api/v1/research/"):
+415 |             return JSONResponse(status_code=422, content={"detail": "查询或保存内容有误，请检查 SQL 和名称。"})
+    |                                                                                                     ^^^^^^^^^^^
+416 |         if request.url.path == "/api/v1/screen/tdx/preview":
+417 |             return JSONResponse(
+    |
+
+E501 Line too long (121 > 100)
+  --> src/rquant/web/routes/research_query.py:36:101
+   |
+34 |     web = request.app.state.web
+35 |     with web.tracker.borrow() as borrowed:
+36 |         return serving_meta(borrowed, now=web.clock(), stale_after=web.settings.stale_after, failure=web.tracker.failure)
+   |                                                                                                     ^^^^^^^^^^^^^^^^^^^^^
+   |
+
+E501 Line too long (114 > 100)
+  --> src/rquant/web/routes/research_query.py:40:101
+   |
+39 | @router.get("/catalog", response_model=Envelope[QueryCatalogData], summary="可用查询表")
+40 | def catalog(request: Request, viewer: Annotated[str | None, Depends(current_user)]) -> Envelope[QueryCatalogData]:
+   |                                                                                                     ^^^^^^^^^^^^^^
+41 |     actor = _actor(request, viewer)
+42 |     web = request.app.state.web
+   |
+
+E501 Line too long (117 > 100)
+  --> src/rquant/web/routes/research_query.py:44:92
+   |
+42 |     web = request.app.state.web
+43 |     if web.research_query_client is None:
+44 |         return Envelope(data=QueryCatalogData(available=False, message="查询服务尚未启用。"), serving=_meta(request))
+   |                                                                                                     ^^^^^^^^^^^^^^^^^
+45 |     try:
+46 |         data = web.research_query_client.catalog(authenticated_actor_id=actor)
+   |
+
+E501 Line too long (132 > 100)
+  --> src/rquant/web/routes/research_query.py:55:101
+   |
+55 | …ryResult], dependencies=[Depends(require_csrf)], summary="运行只读查询或执行计划")
+   |                                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+56 | … viewer: Annotated[str | None, Depends(current_user)]) -> Envelope[QueryResult]:
+57 | …
+   |
+
+E501 Line too long (130 > 100)
+  --> src/rquant/web/routes/research_query.py:56:101
+   |
+55 | …eryResult], dependencies=[Depends(require_csrf)], summary="运行只读查询或执行计划")
+56 | …, viewer: Annotated[str | None, Depends(current_user)]) -> Envelope[QueryResult]:
+   |                                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+57 | …
+58 | …_client
+   |
+
+E501 Line too long (110 > 100)
+  --> src/rquant/web/routes/research_query.py:71:101
+   |
+70 | @router.get("/queries", response_model=Envelope[QuerySavedList], summary="我的已保存查询")
+71 | def saved(request: Request, viewer: Annotated[str | None, Depends(current_user)]) -> Envelope[QuerySavedList]:
+   |                                                                                                     ^^^^^^^^^^
+72 |     actor = _actor(request, viewer)
+73 |     client = request.app.state.web.research_query_save_client
+   |
+
+E501 Line too long (115 > 100)
+  --> src/rquant/web/routes/research_query.py:75:92
+   |
+73 |     client = request.app.state.web.research_query_save_client
+74 |     if client is None:
+75 |         return Envelope(data=QuerySavedList(available=False, message="查询保存尚未启用。"), serving=_meta(request))
+   |                                                                                                     ^^^^^^^^^^^^^^^
+76 |     try:
+77 |         data = client.saved(authenticated_actor_id=actor)
+   |
+
+E501 Line too long (120 > 100)
+  --> src/rquant/web/routes/research_query.py:85:101
+   |
+85 | def _save(command: SaveResearchQuery, request: Request, viewer: str | None, *, resume: bool) -> Envelope[QuerySaveData]:
+   |                                                                                                     ^^^^^^^^^^^^^^^^^^^^
+86 |     actor = _actor(request, viewer)
+87 |     client = request.app.state.web.research_query_save_client
+   |
+
+E501 Line too long (131 > 100)
+   --> src/rquant/web/routes/research_query.py:99:101
+    |
+ 99 | …ope[QuerySaveData], dependencies=[Depends(require_csrf)], summary="保存常用查询")
+    |                                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+100 | …est, viewer: Annotated[str | None, Depends(current_user)]) -> Envelope[QuerySaveData]:
+101 | …False)
+    |
+
+E501 Line too long (136 > 100)
+   --> src/rquant/web/routes/research_query.py:100:101
+    |
+ 99 | …e[QuerySaveData], dependencies=[Depends(require_csrf)], summary="保存常用查询")
+100 | …t, viewer: Annotated[str | None, Depends(current_user)]) -> Envelope[QuerySaveData]:
+    |                                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+101 | …lse)
+    |
+
+E501 Line too long (135 > 100)
+   --> src/rquant/web/routes/research_query.py:104:101
+    |
+104 | …ope[QuerySaveData], dependencies=[Depends(require_csrf)], summary="恢复原保存命令")
+    |                                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+105 | …est, viewer: Annotated[str | None, Depends(current_user)]) -> Envelope[QuerySaveData]:
+106 | …ue)
+    |
+
+E501 Line too long (138 > 100)
+   --> src/rquant/web/routes/research_query.py:105:101
+    |
+104 | …pe[QuerySaveData], dependencies=[Depends(require_csrf)], summary="恢复原保存命令")
+105 | …st, viewer: Annotated[str | None, Depends(current_user)]) -> Envelope[QuerySaveData]:
+    |                                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+106 | …e)
+    |
+
+E501 Line too long (121 > 100)
+   --> src/rquant/web/settings.py:161:101
+    |
+159 |     @model_validator(mode="after")
+160 |     def validate_sources_and_ingress(self) -> Self:
+161 |         query_fields = (self.research_query_socket_path, self.research_query_service_uid, self.research_query_shared_gid)
+    |                                                                                                     ^^^^^^^^^^^^^^^^^^^^^
+162 |         reserved = set()
+163 |         if self.ingress_socket_path is not None:
+    |
+
+E501 Line too long (236 > 100)
+   --> src/rquant/web/settings.py:165:101
+    |
+163 | …
+164 | …
+165 | ….factor_admission_socket_path, self.factor_run_admission_socket_path, self.factor_tracking_admission_socket_path, self.unit_log_socket_path):
+    |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+166 | …
+167 | …
+    |
+
+E501 Line too long (137 > 100)
+   --> src/rquant/web/settings.py:169:101
+    |
+167 | …
+168 | …ields) or self.research_query_users:
+169 | … query_fields) or not self.research_query_users or self.ingress_socket_path is None:
+    |                                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+170 | …ires private Web ingress, socket, IDs and exact users")
+171 | …geteuid() or self.research_query_service_uid < 0 or self.research_query_shared_gid < 0:
+    |
+
+E501 Line too long (108 > 100)
+   --> src/rquant/web/settings.py:170:101
+    |
+168 | …     if any(value is not None for value in query_fields) or self.research_query_users:
+169 | …         if not all(value is not None for value in query_fields) or not self.research_query_users or self.ingress_socket_path is Non…
+170 | …             raise ValueError("research query requires private Web ingress, socket, IDs and exact users")
+    |                                                                                                   ^^^^^^^^
+171 | …         if self.research_query_service_uid == os.geteuid() or self.research_query_service_uid < 0 or self.research_query_shared_gid…
+172 | …             raise ValueError("research query requires a distinct service UID and GID")
+    |
+
+E501 Line too long (140 > 100)
+   --> src/rquant/web/settings.py:171:101
+    |
+169 | …query_fields) or not self.research_query_users or self.ingress_socket_path is None:
+170 | …res private Web ingress, socket, IDs and exact users")
+171 | …eteuid() or self.research_query_service_uid < 0 or self.research_query_shared_gid < 0:
+    |                                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+172 | …res a distinct service UID and GID")
+173 | …in reserved:
+    |
+
+E501 Line too long (112 > 100)
+   --> src/rquant/web/settings.py:175:101
+    |
+173 | …         if self.research_query_socket_path.parent in reserved:
+174 | …             raise ValueError("research query needs a separate private directory")
+175 | …     if self.research_query_save_socket_path is not None or self.research_query_save_service_uid is not None:
+    |                                                                                                   ^^^^^^^^^^^^
+176 | …         if self.research_query_socket_path is None or self.research_query_save_socket_path is None or self.research_query_save_serv…
+177 | …             raise ValueError("query save requires explicit query and private control endpoints")
+    |
+
+E501 Line too long (151 > 100)
+   --> src/rquant/web/settings.py:176:101
+    |
+174 | …arate private directory")
+175 | …or self.research_query_save_service_uid is not None:
+176 | …lf.research_query_save_socket_path is None or self.research_query_save_service_uid is None:
+    |                                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+177 | …it query and private control endpoints")
+178 | …eteuid(), self.research_query_service_uid} or self.research_query_save_service_uid < 0:
+    |
+
+E501 Line too long (147 > 100)
+   --> src/rquant/web/settings.py:178:101
+    |
+176 | …self.research_query_save_socket_path is None or self.research_query_save_service_uid is None:
+177 | …icit query and private control endpoints")
+178 | ….geteuid(), self.research_query_service_uid} or self.research_query_save_service_uid < 0:
+    |                                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+179 | …res a distinct private identity")
+180 | … in reserved | {self.research_query_socket_path.parent}:
+    |
+
+E501 Line too long (114 > 100)
+   --> src/rquant/web/settings.py:180:101
+    |
+178 | …         if self.research_query_save_service_uid in {os.geteuid(), self.research_query_service_uid} or self.research_query_save_serv…
+179 | …             raise ValueError("query save control requires a distinct private identity")
+180 | …         if self.research_query_save_socket_path.parent in reserved | {self.research_query_socket_path.parent}:
+    |                                                                                                   ^^^^^^^^^^^^^^
+181 | …             raise ValueError("query save needs a separate private directory")
+182 | …     if (self.nl_openai_api_key is None) != (self.nl_openai_model is None):
+    |
+
+E501 Line too long (124 > 100)
+   --> src/rquant/web/settings.py:465:101
+    |
+463 |         source = os.environ if environ is None else environ
+464 |         values: dict[str, object] = {"serving_root": Path(serving_root_from_env(source))}
+465 |         for suffix, field in (("SOCKET", "research_query_socket_path"), ("SAVE_SOCKET", "research_query_save_socket_path")):
+    |                                                                                                     ^^^^^^^^^^^^^^^^^^^^^^^^
+466 |             raw = source.get(f"RQUANT_WEB_RESEARCH_QUERY_{suffix}", "").strip()
+467 |             if raw:
+    |
+
+E501 Line too long (179 > 100)
+   --> src/rquant/web/settings.py:469:101
+    |
+467 | …
+468 | …
+469 | …), ("SHARED_GID", "research_query_shared_gid"), ("SAVE_SERVICE_UID", "research_query_save_service_uid")):
+    |                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+470 | …rip()
+471 | …
+    |
+
+E501 Line too long (116 > 100)
+  --> tests/unit/test_research_query.py:31:101
+   |
+29 |         for ddl in (DAILY_BAR_DDL, ADJ_FACTOR_DDL, TRADE_CALENDAR_DDL):
+30 |             connection.execute(ddl)
+31 |         connection.execute("INSERT INTO daily_bar(ts_code,trade_date,close) VALUES ('600001.SH','2026-09-30',12.5)")
+   |                                                                                                     ^^^^^^^^^^^^^^^^
+32 |         connection.execute("INSERT INTO adj_factor VALUES ('600001.SH','2026-09-30',1.2)")
+33 |         connection.execute("INSERT INTO trade_calendar VALUES ('SSE','2026-09-30',true,'2026-09-29','test',now())")
+   |
+
+E501 Line too long (115 > 100)
+  --> tests/unit/test_research_query.py:33:101
+   |
+31 |         connection.execute("INSERT INTO daily_bar(ts_code,trade_date,close) VALUES ('600001.SH','2026-09-30',12.5)")
+32 |         connection.execute("INSERT INTO adj_factor VALUES ('600001.SH','2026-09-30',1.2)")
+33 |         connection.execute("INSERT INTO trade_calendar VALUES ('SSE','2026-09-30',true,'2026-09-29','test',now())")
+   |                                                                                                     ^^^^^^^^^^^^^^^
+34 |         connection.execute("CREATE TABLE manual_watchlist(owner_id VARCHAR, secret VARCHAR)")
+35 |         connection.execute("INSERT INTO manual_watchlist VALUES ('alice','private-a'),('bob','private-b')")
+   |
+
+E501 Line too long (107 > 100)
+  --> tests/unit/test_research_query.py:35:101
+   |
+33 |         connection.execute("INSERT INTO trade_calendar VALUES ('SSE','2026-09-30',true,'2026-09-29','test',now())")
+34 |         connection.execute("CREATE TABLE manual_watchlist(owner_id VARCHAR, secret VARCHAR)")
+35 |         connection.execute("INSERT INTO manual_watchlist VALUES ('alice','private-a'),('bob','private-b')")
+   |                                                                                                     ^^^^^^^
+36 |     os.chmod(path, 0o400)
+37 |     return hashlib.sha256(path.read_bytes()).hexdigest()
+   |
+
+E501 Line too long (105 > 100)
+  --> tests/unit/test_research_query.py:44:101
+   |
+42 |     source = tmp_path / "original.duckdb"
+43 |     digest = _source(source)
+44 |     manifest = api.build_query_snapshot(source, tmp_path / "public", source_sha256=digest, source_at=NOW)
+   |                                                                                                     ^^^^^
+45 |     return api.VerifiedQuerySnapshot(tmp_path / "public"), manifest, source, digest
+   |
+
+E501 Line too long (108 > 100)
+  --> tests/unit/test_research_query.py:48:101
+   |
+48 | def test_public_snapshot_contains_only_exact_public_columns_and_source_is_unchanged(tmp_path: Path) -> None:
+   |                                                                                                     ^^^^^^^^
+49 |     api = _api()
+50 |     snapshot, manifest, source, digest = _published(tmp_path)
+   |
+
+E501 Line too long (116 > 100)
+  --> tests/unit/test_research_query.py:54:101
+   |
+52 |     assert manifest.source_sha256 == digest
+53 |     assert snapshot.manifest == manifest
+54 |     with duckdb.connect(str(snapshot.path), read_only=True, config={"enable_external_access": False}) as connection:
+   |                                                                                                     ^^^^^^^^^^^^^^^^
+55 |         assert connection.execute("SHOW TABLES").fetchall() == [("adj_factor",), ("daily_bar",), ("trade_calendar",)]
+56 |         for table, columns in api.PUBLIC_SCHEMA.items():
+   |
+
+E501 Line too long (117 > 100)
+  --> tests/unit/test_research_query.py:55:101
+   |
+53 |     assert snapshot.manifest == manifest
+54 |     with duckdb.connect(str(snapshot.path), read_only=True, config={"enable_external_access": False}) as connection:
+55 |         assert connection.execute("SHOW TABLES").fetchall() == [("adj_factor",), ("daily_bar",), ("trade_calendar",)]
+   |                                                                                                     ^^^^^^^^^^^^^^^^^
+56 |         for table, columns in api.PUBLIC_SCHEMA.items():
+57 |             assert connection.execute("SELECT column_name,data_type FROM information_schema.columns WHERE table_name=? ORDER BY ordina…
+   |
+
+E501 Line too long (183 > 100)
+  --> tests/unit/test_research_query.py:57:101
+   |
+55 | …r",), ("daily_bar",), ("trade_calendar",)]
+56 | …
+57 | …formation_schema.columns WHERE table_name=? ORDER BY ordinal_position", [table]).fetchall() == list(columns)
+   |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+58 | …CT * FROM manual_watchlist) SELECT * FROM w", "SELECT * FROM query_table('manual_watchlist')"):
+59 | …
+   |
+
+E501 Line too long (170 > 100)
+  --> tests/unit/test_research_query.py:58:101
+   |
+56 | …
+57 | …ROM information_schema.columns WHERE table_name=? ORDER BY ordinal_position", [table]).fetchall() == list(columns)
+58 | … (SELECT * FROM manual_watchlist) SELECT * FROM w", "SELECT * FROM query_table('manual_watchlist')"):
+   |                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+59 | …
+60 | …
+   |
+
+E501 Line too long (399 > 100)
+   --> tests/unit/test_research_query.py:99:101
+    |
+ 99 | …ily_bar RETURNING *) SELECT * FROM x", "SELECT 1; SELECT 2", "ATTACH '/tmp/private' AS p", "COPY (SELECT 1) TO '/tmp/out'", "SELECT * FROM read_csv('/tmp/private')", "SELECT * FROM read_parquet('/tmp/private')", "INSTALL httpfs", "LOAD httpfs", "SET enable_external_access=true", "PRAGMA database_list"])
+    |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+100 | …
+101 | …
+    |
+
+E501 Line too long (175 > 100)
+   --> tests/unit/test_research_query.py:105:101
+    |
+105 | …t;", "-- DROP\nWITH x AS (SELECT 1) SELECT * FROM x", "SELECT 1 /* ATTACH */", 'SELECT 1 AS "UPDATE"'])
+    |                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+106 | …r) -> None:
+107 | …
+    |
+
+E501 Line too long (266 > 100)
+   --> tests/unit/test_research_query.py:120:101
+    |
+118 | …
+119 | …
+120 | …ARCHAR"), api.QueryColumn(name="same", data_type="VARCHAR")), rows=(("=1+1", 'a,"b\n'), (" \t@sum(1)", "<script>")), elapsed_ms=1, source_at=NOW, snapshot_sha256="a" * 64)
+    |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+121 | …
+122 | …
+    |
+
+E501 Line too long (112 > 100)
+  --> tests/unit/test_research_query_cli.py:10:101
+   |
+ 9 | def test_query_cli_has_explicit_separate_build_execute_and_control_roles(capsys) -> None:
+10 |     assert find_spec("rquant.research_query.cli") is not None, "configuration-free query CLI is not implemented"
+   |                                                                                                     ^^^^^^^^^^^^
+11 |     cli = import_module("rquant.research_query.cli")
+12 |     with pytest.raises(SystemExit) as exc:
+   |
+
+E501 Line too long (201 > 100)
+  --> tests/unit/test_research_query_executor.py:36:101
+   |
+34 | …
+35 | …
+36 | …_bytes": 512*2**20+1}, {"spill_bytes": 512*2**20+1}, {"seconds": 31}, {"rows": 10001}, {"result_bytes": 16*2**20+1}):
+   |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+37 | …
+38 | …
+   |
+
+E501 Line too long (118 > 100)
+  --> tests/unit/test_research_query_executor.py:41:101
+   |
+41 | @pytest.mark.skipif(sys.platform != "linux", reason="Linux RLIMIT_AS enforcement is required; macOS must fail closed")
+   |                                                                                                     ^^^^^^^^^^^^^^^^^^
+42 | def test_real_child_types_caps_actual_statement_and_source_privacy(tmp_path: Path) -> None:
+43 |     api = _api()
+   |
+
+E501 Line too long (115 > 100)
+  --> tests/unit/test_research_query_executor.py:45:101
+   |
+43 |     api = _api()
+44 |     snapshot, _, source, digest = _published(tmp_path)
+45 |     executor = api.QueryExecutor(snapshot, tmp_path / "scratch", limits=api.QueryLimits(rows=3, result_bytes=4096))
+   |                                                                                                     ^^^^^^^^^^^^^^^
+46 |     result = executor.execute(api.QueryRequest(sql="SELECT * FROM range(5)"))
+47 |     assert result.status == "partial" and len(result.rows) == 3
+   |
+
+E501 Line too long (180 > 100)
+  --> tests/unit/test_research_query_executor.py:49:101
+   |
+47 | …
+48 | …)).status == "partial"
+49 | …DATE '2026-09-30' AS d, 1.25::DECIMAL(5,2) AS dec, '\\x41'::BLOB AS b, 'NaN'::DOUBLE AS nf, true AS yes"))
+   |                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+50 | …
+51 | …
+   |
+
+E501 Line too long (193 > 100)
+  --> tests/unit/test_research_query_executor.py:56:101
+   |
+54 | …
+55 | …
+56 | …e('manual_watchlist')", "SELECT * FROM query('SELECT * FROM manual_watchlist')", "SELECT * FROM glob('/etc/*')"):
+   |                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+57 | …
+58 | …t")).status == "ready"
+   |
+
+E501 Line too long (102 > 100)
+  --> tests/unit/test_research_query_executor.py:58:101
+   |
+56 |     for sql in ("SELECT * FROM main.manual_watchlist", "SELECT * FROM query_table('manual_watchlist')", "SELECT * FROM query('SELECT *…
+57 |         assert executor.execute(api.QueryRequest(sql=sql)).status == "failed"
+58 |     assert executor.execute(api.QueryRequest(sql="SELECT 'COPY; read_csv' AS text")).status == "ready"
+   |                                                                                                     ^^
+59 |     assert executor.execute(api.QueryRequest(sql="SELECT 1", mode="explain")).status == "ready"
+60 |     import hashlib
+   |
+
+E501 Line too long (101 > 100)
+  --> tests/unit/test_research_query_executor.py:69:101
+   |
+67 |     api = _api()
+68 |     snapshot, _, _, _ = _published(tmp_path)
+69 |     executor = api.QueryExecutor(snapshot, tmp_path / "scratch", limits=api.QueryLimits(seconds=0.3))
+   |                                                                                                     ^
+70 |     result = executor.execute(api.QueryRequest(sql="SELECT sum(a.i*b.i) FROM range(10000000) a(i),range(10000000) b(i)"))
+71 |     assert result.status == "timeout"
+   |
+
+E501 Line too long (121 > 100)
+  --> tests/unit/test_research_query_executor.py:70:101
+   |
+68 |     snapshot, _, _, _ = _published(tmp_path)
+69 |     executor = api.QueryExecutor(snapshot, tmp_path / "scratch", limits=api.QueryLimits(seconds=0.3))
+70 |     result = executor.execute(api.QueryRequest(sql="SELECT sum(a.i*b.i) FROM range(10000000) a(i),range(10000000) b(i)"))
+   |                                                                                                     ^^^^^^^^^^^^^^^^^^^^^
+71 |     assert result.status == "timeout"
+72 |     assert executor.active == 0 and list((tmp_path / "scratch").iterdir()) == []
+   |
+
+E501 Line too long (185 > 100)
+  --> tests/unit/test_research_query_saved.py:19:101
+   |
+17 | …mplemented"
+18 | …
+19 | …eControlConsumer(outbox=outbox, data_dir=tmp_path / "state", log_dir=tmp_path / "events", clock=lambda: NOW))
+   |                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+20 | …
+   |
+
+E501 Line too long (151 > 100)
+  --> tests/unit/test_research_query_saved.py:24:98
+   |
+23 | …):
+24 | … "query_id": "query-1", "name": "最新收盘价", "sql": "SELECT ts_code,close FROM daily_bar"}
+   |                                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+25 | …
+26 | …
+   |
+
+E501 Line too long (101 > 100)
+  --> tests/unit/test_research_query_saved.py:39:101
+   |
+37 |     assert receipt.status == control.PageControlStatus.SUCCEEDED
+38 |     assert receipt.result["version"] == 1
+39 |     assert service._resume_trusted_research_query(command, authenticated_actor_id="alice") == receipt
+   |                                                                                                     ^
+40 |     for changed, actor in ((_command(sql="SELECT 2"), "alice"), (command, "bob")):
+41 |         with pytest.raises(control.PageControlCommandConflictError):
+   |
+
+E501 Line too long (104 > 100)
+  --> tests/unit/test_research_query_saved.py:45:101
+   |
+43 |     assert len(service.outbox.list_research_queries("alice")) == 1
+44 |     assert service.outbox.list_research_queries("bob") == ()
+45 |     conflict = service._submit_trusted_research_query(_command("stale"), authenticated_actor_id="alice")
+   |                                                                                                     ^^^^
+46 |     assert conflict.status == control.PageControlStatus.FAILED
+47 |     changed = service._submit_trusted_research_query(_command("version-2", expected_version=1, sql="SELECT 2"), authenticated_actor_id…
+   |
+
+E501 Line too long (143 > 100)
+  --> tests/unit/test_research_query_saved.py:47:101
+   |
+45 | …command("stale"), authenticated_actor_id="alice")
+46 | ….FAILED
+47 | …ommand("version-2", expected_version=1, sql="SELECT 2"), authenticated_actor_id="alice")
+   |                                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+48 | …SUCCEEDED and changed.result["version"] == 2
+49 | …)[0].sql == "SELECT 2"
+   |
+
+E501 Line too long (140 > 100)
+  --> tests/unit/test_research_query_saved.py:55:101
+   |
+53 | …
+54 | …
+55 | …ry(_command(f"create-{index}", query_id=f"q-{index}"), authenticated_actor_id="alice")
+   |                                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+56 | …atus.SUCCEEDED
+57 | …command("full", query_id="new"), authenticated_actor_id="alice")
+   |
+
+E501 Line too long (118 > 100)
+  --> tests/unit/test_research_query_saved.py:57:101
+   |
+55 |         receipt = service._submit_trusted_research_query(_command(f"create-{index}", query_id=f"q-{index}"), authenticated_actor_id="a…
+56 |         assert receipt.status == control.PageControlStatus.SUCCEEDED
+57 |     receipt = service._submit_trusted_research_query(_command("full", query_id="new"), authenticated_actor_id="alice")
+   |                                                                                                     ^^^^^^^^^^^^^^^^^^
+58 |     assert receipt.status == control.PageControlStatus.FAILED
+59 |     assert len(service.outbox.list_research_queries("alice")) == 100
+   |
+
+E501 Line too long (159 > 100)
+  --> tests/unit/test_research_query_saved.py:61:101
+   |
+59 | …= 100
+60 | …
+61 | … UPDATE ON research_query_saved BEGIN SELECT RAISE(ABORT, 'injected transaction failure'); END")
+   |                                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+62 | …ersion=1, sql="SELECT 9")
+63 | …
+   |
+
+E501 Line too long (126 > 100)
+  --> tests/unit/test_research_query_saved.py:67:101
+   |
+65 |     assert service.outbox.list_research_queries("alice")[0].sql != "SELECT 9"
+66 |     with sqlite3.connect(service.outbox.path) as connection:
+67 |         assert connection.execute("SELECT count(*) FROM page_control_effect WHERE command_id='db-failure'").fetchone()[0] == 0
+   |                                                                                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+68 |         connection.execute("DROP TRIGGER reject_update")
+69 |     # An expired claim can resume; no effect committed with the failed transaction.
+   |
+
+E501 Line too long (124 > 100)
+  --> tests/unit/test_research_query_service.py:29:101
+   |
+27 |     executor = api.QueryExecutor(snapshot, tmp_path / "scratch")
+28 |     control = _service(tmp_path / "control")
+29 |     with TemporaryDirectory(prefix="rq-uds-", dir="/private/tmp" if Path("/private/tmp").is_dir() else "/tmp") as directory:
+   |                                                                                                     ^^^^^^^^^^^^^^^^^^^^^^^^
+30 |         parent = Path(directory)
+31 |         os.chown(parent, os.geteuid(), os.getegid())
+   |
+
+E501 Line too long (155 > 100)
+  --> tests/unit/test_research_query_service.py:34:101
+   |
+32 | …
+33 | …
+34 | …or, allowed_users=frozenset({"alice"}), trusted_web_uid=os.geteuid(), shared_gid=os.getegid())
+   |                                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+35 | …, daemon=True)
+36 | …
+   |
+
+E501 Line too long (140 > 100)
+  --> tests/unit/test_research_query_service.py:37:101
+   |
+35 | …forever, daemon=True)
+36 | …
+37 | …_service_uid=os.geteuid(), shared_gid=os.getegid(), client_uid=lambda: os.geteuid()+1)
+   |                                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+38 | …
+39 | …or_id="alice")
+   |
+
+E501 Line too long (106 > 100)
+  --> tests/unit/test_research_query_service.py:40:101
+   |
+38 |         try:
+39 |             catalog = client.catalog(authenticated_actor_id="alice")
+40 |             assert [item.name for item in catalog.tables] == ["daily_bar", "adj_factor", "trade_calendar"]
+   |                                                                                                     ^^^^^^
+41 |             with pytest.raises(api.QueryAdmissionRejected):
+42 |                 client.catalog(authenticated_actor_id="viewer")
+   |
+
+E501 Line too long (101 > 100)
+  --> tests/unit/test_research_query_service.py:45:101
+   |
+43 |             with pytest.raises(TypeError):
+44 |                 client.catalog(authenticated_actor_id="alice", owner_id="bob")
+45 |             result = client.execute(api.QueryRequest(sql="SELECT 1"), authenticated_actor_id="alice")
+   |                                                                                                     ^
+46 |             assert result.status in {"ready", "unavailable"}
+47 |             os.chmod(path, 0o666)
+   |
+
+E501 Line too long (159 > 100)
+  --> tests/unit/test_research_query_service.py:57:101
+   |
+55 | …
+56 | …
+57 | …allowed_users=frozenset({"alice","bob"}), trusted_web_uid=os.geteuid(), shared_gid=os.getegid())
+   |                                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+58 | …daemon=True)
+59 | …
+   |
+
+E501 Line too long (140 > 100)
+  --> tests/unit/test_research_query_service.py:60:101
+   |
+58 | …forever, daemon=True)
+59 | …
+60 | …_service_uid=os.geteuid(), shared_gid=os.getegid(), client_uid=lambda: os.geteuid()+1)
+   |                                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+61 | …
+62 | …ted_actor_id="alice")
+   |
+
+E501 Line too long (125 > 100)
+  --> tests/unit/test_research_query_service.py:81:101
+   |
+79 |     api = _api()
+80 |     control = _service(tmp_path)
+81 |     with TemporaryDirectory(prefix="rq-deny-", dir="/private/tmp" if Path("/private/tmp").is_dir() else "/tmp") as directory:
+   |                                                                                                     ^^^^^^^^^^^^^^^^^^^^^^^^^
+82 |         parent = Path(directory)
+83 |         os.chown(parent, os.geteuid(), os.getegid())
+   |
+
+E501 Line too long (155 > 100)
+  --> tests/unit/test_research_query_service.py:86:101
+   |
+84 | …
+85 | …
+86 | …, allowed_users=frozenset({"alice"}), trusted_web_uid=os.geteuid()+1, shared_gid=os.getegid())
+   |                                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+87 | …, daemon=True)
+88 | …
+   |
+
+E501 Line too long (103 > 100)
+  --> tests/unit/test_web_research_query.py:14:101
+   |
+13 | def test_query_routes_require_verified_user_role_and_csrf(tmp_path: Path) -> None:
+14 |     assert "research_query_users" in WebSettings.model_fields, "query API settings are not implemented"
+   |                                                                                                     ^^^
+15 |     settings = WebSettings(serving_root=tmp_path / "serving", ingress_socket_path=tmp_path / "ingress" / "web.sock", research_query_us…
+16 |     app = create_proof_test_app(settings, background=False)
+   |
+
+E501 Line too long (304 > 100)
+  --> tests/unit/test_web_research_query.py:15:101
+   |
+13 | …
+14 | …emented"
+15 | …ngress" / "web.sock", research_query_users=frozenset({"alice"}), research_query_socket_path=Path("/private/tmp/rq-absent-query/service.sock"), research_query_service_uid=99999, research_query_shared_gid=99999)
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+16 | …
+17 | …
+   |
+
+E501 Line too long (103 > 100)
+  --> tests/unit/test_web_research_query.py:18:101
+   |
+16 |     app = create_proof_test_app(settings, background=False)
+17 |     with ProofTestClient(app) as client:
+18 |         assert client.post("/api/v1/research/query", json={"sql": "SELECT 1"}).status_code in {401,403}
+   |                                                                                                     ^^^
+19 |         assert client.post("/api/v1/research/query", headers={"x-rquant-user":"viewer","x-rquant-csrf":"1"}, json={"sql":"SELECT 1"}).…
+20 |         assert client.post("/api/v1/research/query", headers={"x-rquant-user":"alice"}, json={"sql":"SELECT 1"}).status_code == 403
+   |
+
+E501 Line too long (152 > 100)
+  --> tests/unit/test_web_research_query.py:19:101
+   |
+17 | …
+18 | …sql": "SELECT 1"}).status_code in {401,403}
+19 | …={"x-rquant-user":"viewer","x-rquant-csrf":"1"}, json={"sql":"SELECT 1"}).status_code == 403
+   |                                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+20 | …={"x-rquant-user":"alice"}, json={"sql":"SELECT 1"}).status_code == 403
+21 | …={"x-rquant-user":"alice","x-rquant-csrf":"1","origin":"http://evil.example"}, json={"sql":"SELECT 1"}).status_code == 403
+   |
+
+E501 Line too long (131 > 100)
+  --> tests/unit/test_web_research_query.py:20:101
+   |
+18 | …     assert client.post("/api/v1/research/query", json={"sql": "SELECT 1"}).status_code in {401,403}
+19 | …     assert client.post("/api/v1/research/query", headers={"x-rquant-user":"viewer","x-rquant-csrf":"1"}, json={"sql":"SELECT 1"}).st…
+20 | …     assert client.post("/api/v1/research/query", headers={"x-rquant-user":"alice"}, json={"sql":"SELECT 1"}).status_code == 403
+   |                                                                                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+21 | …     assert client.post("/api/v1/research/query", headers={"x-rquant-user":"alice","x-rquant-csrf":"1","origin":"http://evil.example"…
+22 | …     allowed = {"x-rquant-user":"alice","x-rquant-csrf":"1","origin":"http://testserver"}
+   |
+
+E501 Line too long (182 > 100)
+  --> tests/unit/test_web_research_query.py:21:101
+   |
+19 | …r":"viewer","x-rquant-csrf":"1"}, json={"sql":"SELECT 1"}).status_code == 403
+20 | …r":"alice"}, json={"sql":"SELECT 1"}).status_code == 403
+21 | …r":"alice","x-rquant-csrf":"1","origin":"http://evil.example"}, json={"sql":"SELECT 1"}).status_code == 403
+   |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+22 | …tp://testserver"}
+23 | …{"sql":"SELECT 1", "owner_id":"bob"}).status_code == 422
+   |
+
+E501 Line too long (131 > 100)
+  --> tests/unit/test_web_research_query.py:23:101
+   |
+21 | …     assert client.post("/api/v1/research/query", headers={"x-rquant-user":"alice","x-rquant-csrf":"1","origin":"http://evil.example"…
+22 | …     allowed = {"x-rquant-user":"alice","x-rquant-csrf":"1","origin":"http://testserver"}
+23 | …     assert client.post("/api/v1/research/query", headers=allowed, json={"sql":"SELECT 1", "owner_id":"bob"}).status_code == 422
+   |                                                                                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+24 | …     response = client.post("/api/v1/research/query", headers=allowed, json={"sql":"SELECT 1"})
+25 | …     assert response.status_code == 503
+   |
+
+E501 Line too long (108 > 100)
+  --> tests/unit/test_web_research_query.py:27:101
+   |
+25 |         assert response.status_code == 503
+26 |         assert str(tmp_path) not in response.text
+27 |         assert client.get("/api/v1/research/queries", headers={"x-rquant-user":"viewer"}).status_code == 403
+   |                                                                                                     ^^^^^^^^
+28 |     default = create_proof_test_app(WebSettings(serving_root=tmp_path), background=False)
+29 |     with ProofTestClient(default) as client:
+   |
+
+E501 Line too long (151 > 100)
+  --> tests/unit/test_web_research_query.py:30:101
+   |
+28 | …t=tmp_path), background=False)
+29 | …
+30 | …s={"x-rquant-user":"alice","x-rquant-csrf":"1"}, json={"sql":"SELECT 1"}).status_code == 401
+   |                                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+
+E501 Line too long (247 > 100)
+  --> tests/unit/test_web_research_query.py:38:101
+   |
+36 | …
+37 | …
+38 | …query_socket_path=tmp_path / "query.sock", research_query_service_uid=99999, research_query_shared_gid=99999, research_query_users=frozenset({"alice"}))
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+
+Found 178 errors (9 fixed, 169 remaining).
+No fixes available (1 hidden fix can be enabled with the `--unsafe-fixes` option).

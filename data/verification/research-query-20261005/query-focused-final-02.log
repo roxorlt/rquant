@@ -1,0 +1,14 @@
+ERROR: not found: /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/tests/unit/test_web_proxy_identity.py::test_current_user_route_inventory_matches_document
+(no match in any of [<Module test_web_proxy_identity.py>])
+
+============================= test session starts ==============================
+platform darwin -- Python 3.13.12, pytest-9.0.3, pluggy-1.6.0
+rootdir: /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk
+configfile: pyproject.toml
+plugins: mock-3.15.1, anyio-4.13.0
+collected 0 items
+
+============================ no tests ran in 1.46s =============================
+real 2.08
+user 1.72
+sys 0.19

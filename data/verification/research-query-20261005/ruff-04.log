@@ -1,0 +1,143 @@
+E501 Line too long (101 > 100)
+   --> src/rquant/research_query/service.py:212:101
+    |
+210 | …                     columns=tuple(
+211 | …                         QueryCatalogColumn(
+212 | …                             name=name, data_type=kind, description=_COLUMN_DESCRIPTIONS[name]
+    |                                                                                               ^
+213 | …                         )
+214 | …                         for name, kind in columns
+    |
+
+E501 Line too long (120 > 100)
+  --> tests/unit/test_research_query_cli.py:28:101
+   |
+27 | def test_cli_sigterm_closes_private_socket_and_exits_cleanly() -> None:
+28 |     with TemporaryDirectory(prefix="rq-stop-", dir="/private/tmp" if sys.platform == "darwin" else "/tmp") as directory:
+   |                                                                                                     ^^^^^^^^^^^^^^^^^^^^
+29 |         root = Path(directory)
+30 |         endpoint = root / "uds"
+   |
+
+E501 Line too long (150 > 100)
+  --> tests/unit/test_research_query_cli.py:36:101
+   |
+34 | …
+35 | …"
+36 | ….pop(1)); from rquant.research_query.cli import main; raise SystemExit(main(sys.argv[1:]))"
+   |                                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+37 | …
+38 | …r(source), "save-serve",
+   |
+
+E501 Line too long (110 > 100)
+  --> tests/unit/test_research_query_cli.py:39:101
+   |
+37 |         process = subprocess.Popen([
+38 |             sys.executable, "-I", "-B", "-c", bootstrap, str(source), "save-serve",
+39 |             "--socket", str(socket_path), "--web-uid", str(os.geteuid()+1), "--shared-gid", str(os.getegid()),
+   |                                                                                                     ^^^^^^^^^^
+40 |             "--users", "alice", "--outbox", str(root / "state.sqlite"),
+41 |         ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+   |
+
+E501 Line too long (124 > 100)
+   --> tests/unit/test_web_research_query.py:112:101
+    |
+110 |     snapshot, _, _, _ = _published(tmp_path)
+111 |     control = _service(tmp_path / "control")
+112 |     with TemporaryDirectory(prefix="rq-api-", dir="/private/tmp" if Path("/private/tmp").is_dir() else "/tmp") as directory:
+    |                                                                                                     ^^^^^^^^^^^^^^^^^^^^^^^^
+113 |         root = Path(directory)
+114 |         sockets = []
+    |
+
+E501 Line too long (102 > 100)
+   --> tests/unit/test_web_research_query.py:138:101
+    |
+136 |                 clients.append(QueryPrivateClient(path, expected_service_uid=os.geteuid(),
+137 |                     shared_gid=os.getegid(), client_uid=lambda: os.geteuid()+1))
+138 |             # Actual same-user local sockets test the RPC; distinct OS users are an installation gate.
+    |                                                                                                     ^^
+139 |             settings = WebSettings(serving_root=tmp_path / "serving", ingress_socket_path=tmp_path / "ingress/web.sock",
+140 |                 research_query_users=frozenset({"alice", "bob"}), research_query_socket_path=sockets[0],
+    |
+
+E501 Line too long (120 > 100)
+   --> tests/unit/test_web_research_query.py:139:101
+    |
+137 |                     shared_gid=os.getegid(), client_uid=lambda: os.geteuid()+1))
+138 |             # Actual same-user local sockets test the RPC; distinct OS users are an installation gate.
+139 |             settings = WebSettings(serving_root=tmp_path / "serving", ingress_socket_path=tmp_path / "ingress/web.sock",
+    |                                                                                                     ^^^^^^^^^^^^^^^^^^^^
+140 |                 research_query_users=frozenset({"alice", "bob"}), research_query_socket_path=sockets[0],
+141 |                 research_query_service_uid=99998, research_query_shared_gid=os.getegid(),
+    |
+
+E501 Line too long (104 > 100)
+   --> tests/unit/test_web_research_query.py:140:101
+    |
+138 |             # Actual same-user local sockets test the RPC; distinct OS users are an installation gate.
+139 |             settings = WebSettings(serving_root=tmp_path / "serving", ingress_socket_path=tmp_path / "ingress/web.sock",
+140 |                 research_query_users=frozenset({"alice", "bob"}), research_query_socket_path=sockets[0],
+    |                                                                                                     ^^^^
+141 |                 research_query_service_uid=99998, research_query_shared_gid=os.getegid(),
+142 |                 research_query_save_socket_path=sockets[1], research_query_save_service_uid=99999)
+    |
+
+E501 Line too long (114 > 100)
+   --> tests/unit/test_web_research_query.py:156:101
+    |
+154 |                 command = _command().model_dump(mode="json")
+155 |                 response = client.post("/api/v1/research/queries/save", headers=alice, json=command)
+156 |                 assert response.status_code == 200 and response.json()["data"]["receipt"]["status"] == "succeeded"
+    |                                                                                                     ^^^^^^^^^^^^^^
+157 |                 assert client.post("/api/v1/research/queries/resume", headers=alice, json=command).json() == response.json()
+158 |                 assert client.get("/api/v1/research/queries", headers=bob).json()["data"]["items"] == []
+    |
+
+E501 Line too long (124 > 100)
+   --> tests/unit/test_web_research_query.py:157:101
+    |
+155 |                 response = client.post("/api/v1/research/queries/save", headers=alice, json=command)
+156 |                 assert response.status_code == 200 and response.json()["data"]["receipt"]["status"] == "succeeded"
+157 |                 assert client.post("/api/v1/research/queries/resume", headers=alice, json=command).json() == response.json()
+    |                                                                                                     ^^^^^^^^^^^^^^^^^^^^^^^^
+158 |                 assert client.get("/api/v1/research/queries", headers=bob).json()["data"]["items"] == []
+159 |                 assert len(client.get("/api/v1/research/queries", headers=alice).json()["data"]["items"]) == 1
+    |
+
+E501 Line too long (104 > 100)
+   --> tests/unit/test_web_research_query.py:158:101
+    |
+156 |                 assert response.status_code == 200 and response.json()["data"]["receipt"]["status"] == "succeeded"
+157 |                 assert client.post("/api/v1/research/queries/resume", headers=alice, json=command).json() == response.json()
+158 |                 assert client.get("/api/v1/research/queries", headers=bob).json()["data"]["items"] == []
+    |                                                                                                     ^^^^
+159 |                 assert len(client.get("/api/v1/research/queries", headers=alice).json()["data"]["items"]) == 1
+160 |                 assert client.post("/api/v1/research/queries/resume", headers=bob, json=command).status_code == 409
+    |
+
+E501 Line too long (110 > 100)
+   --> tests/unit/test_web_research_query.py:159:101
+    |
+157 |                 assert client.post("/api/v1/research/queries/resume", headers=alice, json=command).json() == response.json()
+158 |                 assert client.get("/api/v1/research/queries", headers=bob).json()["data"]["items"] == []
+159 |                 assert len(client.get("/api/v1/research/queries", headers=alice).json()["data"]["items"]) == 1
+    |                                                                                                     ^^^^^^^^^^
+160 |                 assert client.post("/api/v1/research/queries/resume", headers=bob, json=command).status_code == 409
+161 |                 assert client.post("/api/v1/research/queries/save", headers=alice,
+    |
+
+E501 Line too long (115 > 100)
+   --> tests/unit/test_web_research_query.py:160:101
+    |
+158 |                 assert client.get("/api/v1/research/queries", headers=bob).json()["data"]["items"] == []
+159 |                 assert len(client.get("/api/v1/research/queries", headers=alice).json()["data"]["items"]) == 1
+160 |                 assert client.post("/api/v1/research/queries/resume", headers=bob, json=command).status_code == 409
+    |                                                                                                     ^^^^^^^^^^^^^^^
+161 |                 assert client.post("/api/v1/research/queries/save", headers=alice,
+162 |                     json={**command, "owner_id":"bob"}).status_code == 422
+    |
+
+Found 16 errors (3 fixed, 13 remaining).

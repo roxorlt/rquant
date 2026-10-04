@@ -1,6 +1,6 @@
 # Web `current_user` 路由清单
 
-对应 [私有身份边界](2026-09-29-web-private-identity-boundary.md)。以下为当前代码中的全部 74 个 `current_user` 依赖路由；`/api/v1` 前缀已包含。公开类即使收到裸用户头，也只得到 `viewer=None`，不能据此取得身份。私有类统一使用已验证的代理身份；已有 CSRF、角色和业务条件仍单独检查。
+对应 [私有身份边界](2026-09-29-web-private-identity-boundary.md)。以下为当前代码中的全部 79 个 `current_user` 依赖路由；`/api/v1` 前缀已包含。公开类即使收到裸用户头，也只得到 `viewer=None`，不能据此取得身份。私有类统一使用已验证的代理身份；已有 CSRF、角色和业务条件仍单独检查。
 
 ## 公开读取（20）
 
@@ -27,7 +27,7 @@
 | GET | `/api/v1/data/issues` |
 | GET | `/api/v1/data/fundamentals/summary` |
 
-## 私有读取（30）
+## 私有读取（32）
 
 | 方法 | 路径 |
 |---|---|
@@ -61,10 +61,12 @@
 | GET | `/api/v1/data/audit-report/calendar` |
 | GET | `/api/v1/data/backfill-plans` |
 | GET | `/api/v1/data/backfill-plans/{plan_hash}` |
+| GET | `/api/v1/research/catalog` |
+| GET | `/api/v1/research/queries` |
 
 名单按认证 owner 过滤。服务日志能力在未登录时只返回空列表，日志正文仍拒绝；普通任务、池子、监控、研究和审计页面则直接返回 401。公开的 `meta` 在没有有效证明时不显示 viewer。
 
-## 受保护操作（24）
+## 受保护操作（27）
 
 | 方法 | 路径 |
 |---|---|
@@ -92,12 +94,17 @@
 | POST | `/api/v1/factors/tracking/commands` |
 | POST | `/api/v1/factors/tracking/commands/resume` |
 | POST | `/api/v1/factors/tracking/commands/retry` |
+| POST | `/api/v1/research/query` |
+| POST | `/api/v1/research/queries/save` |
+| POST | `/api/v1/research/queries/resume` |
 
 公式检查、单股预览、运行选股及自然语言预览不持久写入，但会消耗计算或付费模型资源，所以按受保护操作处理。其余操作由现有 CSRF 与命令准入继续约束；代理证明不替代这些条件。
 
 因子定义保存/归档使用独立编辑名单，运行检验使用独立运行名单；两端均再次核验权限。运行恢复携带完整原请求，仅核对原任务，不重新编译到新来源或新版本。未开放的账号仍可读取已发布因子结果。
 
 因子跟踪开关使用独立跟踪名单，原操作恢复携带完整原请求并核对原命令。
+
+只读查询和常用查询保存使用 researcher/admin 受信账号名单，API 与私有服务均核验。SQL 执行走独立公开三表快照；保存和列表走 PageControl，并按认证账号过滤。恢复携带完整原保存请求，不产生新命令。
 
 ## 本片与生产边界
 

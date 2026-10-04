@@ -21,7 +21,10 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, Literal, Protocol
+from typing import TYPE_CHECKING, Annotated, Literal, Protocol
+
+if TYPE_CHECKING:
+    from rquant.research_query.saved import SavedResearchQuery
 from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID, uuid4
 
@@ -125,6 +128,25 @@ class PageControlCommand(RuntimeContractModel):
     kind: str
     command_id: str = Field(min_length=1, max_length=128)
     requested_at: AwareUtcDatetime
+
+
+class SaveResearchQuery(PageControlCommand):
+    kind: Literal["save_research_query"] = "save_research_query"
+    query_id: str = Field(pattern=r"^[A-Za-z0-9._-]{1,64}$")
+    name: str = Field(min_length=1, max_length=60)
+    sql: str
+    expected_version: StrictInt | None = Field(default=None, ge=1)
+
+    @field_validator("sql")
+    @classmethod
+    def validate_research_sql(cls, value: str) -> str:
+        from rquant.research_query.contracts import validate_sql
+
+        return validate_sql(value)
+
+
+class _OwnedSaveResearchQuery(SaveResearchQuery):
+    owner_id: OwnerId
 
 
 class AckAlert(PageControlCommand):
@@ -644,6 +666,7 @@ class FactorDefinitionPageControlBackend(Protocol):
 
 PageControlCommandValue = Annotated[
     AckAlert
+    | _OwnedSaveResearchQuery
     | AddWatchlistItem
     | RemoveWatchlistItem
     | _OwnedSavePriceAlertRule
@@ -1004,6 +1027,15 @@ class PageControlOutbox:
                     confirmed_at TEXT NOT NULL,
                     generation_id TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS research_query_saved (
+                    owner_id TEXT NOT NULL,
+                    query_id TEXT NOT NULL,
+                    version INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    sql TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(owner_id, query_id)
+                );
                 """
             )
             self._ensure_column(connection, "processing_owner", "TEXT")
@@ -1108,6 +1140,8 @@ class PageControlOutbox:
         return connection
 
     def enqueue(self, command: PageControlCommandValue) -> PageControlReceipt:
+        if isinstance(command, SaveResearchQuery):
+            raise ValueError("research queries require trusted submission")
         if isinstance(command, AckAlert):
             raise ValueError("ack_alert requires verified Serving eligibility")
         if isinstance(command, (AddWatchlistItem, RemoveWatchlistItem)):
@@ -1171,7 +1205,12 @@ class PageControlOutbox:
         require_factor_definition_trust: bool = False,
         require_factor_run_trust: bool = False,
         require_factor_tracking_trust: bool = False,
+        require_research_query_trust: bool = False,
     ) -> PageControlReceipt:
+        if isinstance(command, SaveResearchQuery) != require_research_query_trust or (
+            require_research_query_trust and type(command) is not _OwnedSaveResearchQuery
+        ):
+            raise ValueError("research queries require trusted submission")
         if (
             isinstance(command, (AddWatchlistItem, RemoveWatchlistItem))
             != require_watchlist_activation
@@ -1258,6 +1297,52 @@ class PageControlOutbox:
         receipt = self.receipt(command.command_id)
         assert receipt is not None
         return receipt
+
+    def enqueue_trusted_research_query(
+        self, command: _OwnedSaveResearchQuery
+    ) -> PageControlReceipt:
+        return self._enqueue(command, require_research_query_trust=True)
+
+    def lookup_research_query_command(
+        self, command: _OwnedSaveResearchQuery
+    ) -> PageControlReceipt | None:
+        from contextlib import closing
+
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT * FROM page_control_command WHERE command_id=?", (command.command_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            if (
+                row["command_hash"] != _command_hash(command)
+                or _COMMAND_ADAPTER.validate_json(row["payload_json"]) != command
+            ):
+                raise PageControlCommandConflictError(
+                    "query command conflicts with original actor or payload"
+                )
+            return self._receipt(row)
+
+    def list_research_queries(self, owner_id: str) -> tuple[SavedResearchQuery, ...]:
+        from contextlib import closing
+
+        from rquant.research_query.saved import SavedResearchQuery
+
+        checked = TypeAdapter(OwnerId).validate_python(owner_id)
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                "SELECT query_id,name,sql,version,updated_at FROM research_query_saved "
+                "WHERE owner_id=? ORDER BY updated_at DESC,query_id LIMIT 100",
+                (checked,),
+            ).fetchall()
+            return tuple(SavedResearchQuery.model_validate(dict(row)) for row in rows)
+
+    def complete_research_query(
+        self, claim: PageControlClaim, *, now: datetime
+    ) -> PageControlReceipt:
+        from rquant.research_query.saved import complete_saved_query
+
+        return complete_saved_query(self, claim, now=now)
 
     @staticmethod
     def _manual_watchlist_activated(connection: sqlite3.Connection) -> bool:
@@ -2569,6 +2654,25 @@ class PageControlConsumer:
                 raise PageControlCommandConflictError("price rule command changed before claim")
             return (self.outbox.complete_price_rule(claim, now=self.clock()),)
 
+    def drain_research_query_command(
+        self, command: _OwnedSaveResearchQuery
+    ) -> tuple[PageControlReceipt, ...]:
+        with _PageControlExecutionMutex(self._consumer_mutex_path()) as acquired:
+            if not acquired:
+                return ()
+            claims = self.outbox.claim_records(
+                limit=1,
+                owner_id=self.consumer_id,
+                lease_seconds=self.lease_seconds,
+                now=self.clock(),
+                target_command_id=command.command_id,
+            )
+            if not claims:
+                return ()
+            if claims[0].command != command:
+                raise PageControlCommandConflictError("query command changed before claim")
+            return (self.outbox.complete_research_query(claims[0], now=self.clock()),)
+
     def drain_factor_archive_command(
         self, command: _OwnedArchiveFactor
     ) -> tuple[PageControlReceipt, ...]:
@@ -2609,6 +2713,9 @@ class PageControlConsumer:
     ) -> tuple[PageControlReceipt, ...]:
         receipts: list[PageControlReceipt] = []
         for claim in claims:
+            if isinstance(claim.command, _OwnedSaveResearchQuery):
+                receipts.append(self.outbox.complete_research_query(claim, now=self.clock()))
+                continue
             if isinstance(claim.command, (AddWatchlistItem, RemoveWatchlistItem)):
                 receipts.append(self.outbox.complete_watchlist(claim, now=self.clock()))
                 continue
@@ -4478,6 +4585,8 @@ class PageControlService:
         self.consumer = consumer
 
     def submit(self, command: PageControlCommandValue) -> PageControlReceipt:
+        if isinstance(command, SaveResearchQuery):
+            raise ValueError("research queries require trusted submission")
         if isinstance(command, (AddWatchlistItem, RemoveWatchlistItem)):
             raise ValueError("watchlist commands require trusted submission")
         if isinstance(
@@ -4499,6 +4608,27 @@ class PageControlService:
     def _submit_verified_ack(self, command: AckAlert) -> PageControlReceipt:
         """Called only after the local Serving admission checks succeed."""
         return self._settle(command, self.outbox.enqueue_verified_ack(command))
+
+    def _submit_trusted_research_query(
+        self, command: SaveResearchQuery, *, authenticated_actor_id: str
+    ) -> PageControlReceipt:
+        if type(command) is not SaveResearchQuery:
+            raise TypeError("query save requires an unowned command")
+        owned = _OwnedSaveResearchQuery(**command.model_dump(), owner_id=authenticated_actor_id)
+        return self._settle(
+            owned, self.outbox.enqueue_trusted_research_query(owned), research_query_command=owned
+        )
+
+    def _resume_trusted_research_query(
+        self, command: SaveResearchQuery, *, authenticated_actor_id: str
+    ) -> PageControlReceipt | None:
+        if type(command) is not SaveResearchQuery:
+            raise TypeError("query recovery requires original unowned command")
+        owned = _OwnedSaveResearchQuery(**command.model_dump(), owner_id=authenticated_actor_id)
+        receipt = self.outbox.lookup_research_query_command(owned)
+        return (
+            None if receipt is None else self._settle(owned, receipt, research_query_command=owned)
+        )
 
     def _submit_trusted_watchlist(
         self,
@@ -4803,11 +4933,14 @@ class PageControlService:
         factor_archive_command: _OwnedFactorDefinitionValue | None = None,
         factor_run_command: _OwnedSubmitFactorRun | None = None,
         factor_tracking_command: _OwnedSetFactorTracked | None = None,
+        research_query_command: _OwnedSaveResearchQuery | None = None,
     ) -> PageControlReceipt:
         for _ in range(100):
             if receipt.status in _PAGE_CONTROL_TERMINAL_STATUSES:
                 return receipt
-            if factor_tracking_command is not None:
+            if research_query_command is not None:
+                drained = self.consumer.drain_research_query_command(research_query_command)
+            elif factor_tracking_command is not None:
                 drained = self.consumer.drain_factor_definition_command(factor_tracking_command)
             elif factor_run_command is not None:
                 drained = self.consumer.drain_factor_definition_command(factor_run_command)
@@ -5487,6 +5620,10 @@ def _fsync_descriptor(descriptor: int) -> None:
 
 
 def parse_page_control_command(payload: object) -> PageControlCommandValue:
+    if isinstance(payload, SaveResearchQuery) or (
+        isinstance(payload, Mapping) and payload.get("kind") == "save_research_query"
+    ):
+        raise ValueError("research queries require trusted submission")
     if isinstance(
         payload, (SaveFactorDefinition, ArchiveFactor, SubmitFactorRun, SetFactorTracked)
     ):

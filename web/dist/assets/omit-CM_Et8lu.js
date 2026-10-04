@@ -1,0 +1,1 @@
+function e(e,t){let n=Object.assign({},e);return Array.isArray(t)&&t.forEach(e=>{delete n[e]}),n}export{e as t};
