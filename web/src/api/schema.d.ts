@@ -2480,7 +2480,7 @@ export interface components {
             /** Unit */
             unit?: ("stored_price" | "session_price" | "indicator" | "percent" | "ratio" | "CNY_10000" | "CNY" | "observations" | "binary") | null;
             /** Value Semantics */
-            value_semantics?: ("stored_not_recomputed" | "history_derived" | "stock_features_derived" | "minute_features_derived") | null;
+            value_semantics?: ("stored_not_recomputed" | "history_derived" | "stock_features_derived" | "minute_features_derived" | "market_temperature_stored") | null;
         };
         /** DataAuditHealthData */
         DataAuditHealthData: {
@@ -3008,7 +3008,7 @@ export interface components {
              * Version
              * @enum {string}
              */
-            version: "daily_v1" | "daily_stored_v1" | "daily_derived_v1" | "daily_stock_v1" | "daily_minute_v1";
+            version: "daily_v1" | "daily_stored_v1" | "daily_derived_v1" | "daily_stock_v1" | "daily_minute_v1" | "daily_market_temperature_v1";
         };
         /** FactorCatalogData */
         FactorCatalogData: {
@@ -3035,7 +3035,9 @@ export interface components {
         /** FactorDailyFeatureCounts */
         FactorDailyFeatureCounts: {
             /** Column */
-            column: ("ma5" | "ma10" | "ma20" | "ma60" | "rsi6" | "rsi14" | "macd" | "macd_signal" | "macd_hist" | "kdj_k" | "kdj_d" | "kdj_j" | "turnover_rate" | "volume_ratio" | "total_mv" | "circ_mv") | ("price_window_days_90d" | "price_position_90d_pct" | "price_rank_90d_pct" | "distance_to_high_90d_pct" | "distance_to_low_90d_pct" | "price_window_days_120d" | "price_position_120d_pct" | "price_rank_120d_pct" | "distance_to_high_120d_pct" | "distance_to_low_120d_pct" | "price_window_days_250d" | "price_position_250d_pct" | "price_rank_250d_pct" | "distance_to_high_250d_pct" | "distance_to_low_250d_pct" | "accum_window_days_20d" | "accum_obv_change_20d_pct" | "accum_ad_flow_20d_pct" | "accum_up_down_amount_ratio_20d" | "accum_heavy_no_drop_days_20d" | "accum_close_position_avg_20d_pct" | "ma_alignment" | "price_percentile_250d") | ("signal_minute_amount" | "signal_cum_amount_asof" | "hist_same_minute_amount_median_20d" | "hist_cum_amount_asof_median_20d" | "signal_rel_amount_same_minute_20d" | "signal_rel_cum_amount_asof_20d" | "hist_intraday_days_20d" | "signal_opening_segment" | "signal_opening_segment_amount" | "signal_amount_accel_5m" | "signal_amount_accel_10m");
+            column: ("ma5" | "ma10" | "ma20" | "ma60" | "rsi6" | "rsi14" | "macd" | "macd_signal" | "macd_hist" | "kdj_k" | "kdj_d" | "kdj_j" | "turnover_rate" | "volume_ratio" | "total_mv" | "circ_mv") | ("price_window_days_90d" | "price_position_90d_pct" | "price_rank_90d_pct" | "distance_to_high_90d_pct" | "distance_to_low_90d_pct" | "price_window_days_120d" | "price_position_120d_pct" | "price_rank_120d_pct" | "distance_to_high_120d_pct" | "distance_to_low_120d_pct" | "price_window_days_250d" | "price_position_250d_pct" | "price_rank_250d_pct" | "distance_to_high_250d_pct" | "distance_to_low_250d_pct" | "accum_window_days_20d" | "accum_obv_change_20d_pct" | "accum_ad_flow_20d_pct" | "accum_up_down_amount_ratio_20d" | "accum_heavy_no_drop_days_20d" | "accum_close_position_avg_20d_pct" | "ma_alignment" | "price_percentile_250d") | ("signal_minute_amount" | "signal_cum_amount_asof" | "hist_same_minute_amount_median_20d" | "hist_cum_amount_asof_median_20d" | "signal_rel_amount_same_minute_20d" | "signal_rel_cum_amount_asof_20d" | "hist_intraday_days_20d" | "signal_opening_segment" | "signal_opening_segment_amount" | "signal_amount_accel_5m" | "signal_amount_accel_10m") | ("market_high_60d_ratio_pct" | "market_above_ma20_ratio_pct");
+            /** Market Reasons */
+            market_reasons?: components["schemas"]["FactorDailyFeatureReasonCount"][];
             /** Minute Reasons */
             minute_reasons?: components["schemas"]["FactorDailyFeatureReasonCount"][];
             /** Missing */
@@ -3057,6 +3059,8 @@ export interface components {
             computation_stock_count: number;
             /** Counts */
             counts: components["schemas"]["FactorDailyFeatureCounts"][];
+            /** Market Temperature Values */
+            market_temperature_values?: components["schemas"]["FactorMarketTemperatureDayValue"][] | null;
             /**
              * Panel Date
              * Format: date
@@ -3073,7 +3077,7 @@ export interface components {
             /** Count */
             count: number;
             /** Reason */
-            reason: ("insufficient_window" | "no_initialization" | "history_break" | "missing_observation" | "derived_non_finite") | ("missing_reference_factor" | "non_finite_reference_factor" | "non_positive_reference_factor" | "missing_required_factor" | "non_finite_required_factor" | "non_positive_required_factor") | ("missing_daily_data" | "insufficient_history" | "undefined_statistic") | ("missing_target_minute" | "missing_history" | "missing_same_minute_history" | "zero_same_minute_baseline" | "zero_cumulative_baseline" | "not_applicable" | "no_acceleration_history" | "undefined_statistic");
+            reason: ("insufficient_window" | "no_initialization" | "history_break" | "missing_observation" | "derived_non_finite") | ("missing_reference_factor" | "non_finite_reference_factor" | "non_positive_reference_factor" | "missing_required_factor" | "non_finite_required_factor" | "non_positive_required_factor") | ("missing_daily_data" | "insufficient_history" | "undefined_statistic") | ("missing_target_minute" | "missing_history" | "missing_same_minute_history" | "zero_same_minute_baseline" | "zero_cumulative_baseline" | "not_applicable" | "no_acceleration_history" | "undefined_statistic") | ("missing_market_temperature" | "market_temperature_null" | "market_temperature_non_finite" | "invalid_market_percentage");
         };
         /**
          * FactorDailyFeatureSources
@@ -3084,6 +3088,7 @@ export interface components {
             code_commit: string;
             /** Fields */
             fields: components["schemas"]["FactorDailyStoredField"][];
+            market_temperature?: components["schemas"]["FactorMarketTemperatureSummary"] | null;
             minute_features?: components["schemas"]["FactorMinuteFeatureSummary"] | null;
             /** Prepared Binding Hash */
             prepared_binding_hash: string;
@@ -3120,12 +3125,12 @@ export interface components {
              * @default stored_not_recomputed
              * @enum {string}
              */
-            value_semantics: "stored_not_recomputed" | "history_derived" | "stock_features_derived" | "minute_features_derived";
+            value_semantics: "stored_not_recomputed" | "history_derived" | "stock_features_derived" | "minute_features_derived" | "market_temperature_stored";
         };
         /** FactorDailyStoredField */
         FactorDailyStoredField: {
             /** Column */
-            column: ("ma5" | "ma10" | "ma20" | "ma60" | "rsi6" | "rsi14" | "macd" | "macd_signal" | "macd_hist" | "kdj_k" | "kdj_d" | "kdj_j" | "turnover_rate" | "volume_ratio" | "total_mv" | "circ_mv") | ("price_window_days_90d" | "price_position_90d_pct" | "price_rank_90d_pct" | "distance_to_high_90d_pct" | "distance_to_low_90d_pct" | "price_window_days_120d" | "price_position_120d_pct" | "price_rank_120d_pct" | "distance_to_high_120d_pct" | "distance_to_low_120d_pct" | "price_window_days_250d" | "price_position_250d_pct" | "price_rank_250d_pct" | "distance_to_high_250d_pct" | "distance_to_low_250d_pct" | "accum_window_days_20d" | "accum_obv_change_20d_pct" | "accum_ad_flow_20d_pct" | "accum_up_down_amount_ratio_20d" | "accum_heavy_no_drop_days_20d" | "accum_close_position_avg_20d_pct" | "ma_alignment" | "price_percentile_250d") | ("signal_minute_amount" | "signal_cum_amount_asof" | "hist_same_minute_amount_median_20d" | "hist_cum_amount_asof_median_20d" | "signal_rel_amount_same_minute_20d" | "signal_rel_cum_amount_asof_20d" | "hist_intraday_days_20d" | "signal_opening_segment" | "signal_opening_segment_amount" | "signal_amount_accel_5m" | "signal_amount_accel_10m");
+            column: ("ma5" | "ma10" | "ma20" | "ma60" | "rsi6" | "rsi14" | "macd" | "macd_signal" | "macd_hist" | "kdj_k" | "kdj_d" | "kdj_j" | "turnover_rate" | "volume_ratio" | "total_mv" | "circ_mv") | ("price_window_days_90d" | "price_position_90d_pct" | "price_rank_90d_pct" | "distance_to_high_90d_pct" | "distance_to_low_90d_pct" | "price_window_days_120d" | "price_position_120d_pct" | "price_rank_120d_pct" | "distance_to_high_120d_pct" | "distance_to_low_120d_pct" | "price_window_days_250d" | "price_position_250d_pct" | "price_rank_250d_pct" | "distance_to_high_250d_pct" | "distance_to_low_250d_pct" | "accum_window_days_20d" | "accum_obv_change_20d_pct" | "accum_ad_flow_20d_pct" | "accum_up_down_amount_ratio_20d" | "accum_heavy_no_drop_days_20d" | "accum_close_position_avg_20d_pct" | "ma_alignment" | "price_percentile_250d") | ("signal_minute_amount" | "signal_cum_amount_asof" | "hist_same_minute_amount_median_20d" | "hist_cum_amount_asof_median_20d" | "signal_rel_amount_same_minute_20d" | "signal_rel_cum_amount_asof_20d" | "hist_intraday_days_20d" | "signal_opening_segment" | "signal_opening_segment_amount" | "signal_amount_accel_5m" | "signal_amount_accel_10m") | ("market_high_60d_ratio_pct" | "market_above_ma20_ratio_pct");
             /** Description Zh */
             description_zh: string;
             /** Name Zh */
@@ -3134,14 +3139,14 @@ export interface components {
              * Table
              * @enum {string}
              */
-            table: "daily_indicator" | "daily_basic" | "daily_stock_feature" | "daily_minute_feature";
+            table: "daily_indicator" | "daily_basic" | "daily_stock_feature" | "daily_minute_feature" | "market_temperature_daily";
             /**
              * Unit
              * @enum {string}
              */
             unit: "stored_price" | "session_price" | "indicator" | "percent" | "ratio" | "CNY_10000" | "CNY" | "observations" | "binary";
             /** Value Semantics */
-            value_semantics?: ("history_derived" | "stock_features_derived" | "minute_features_derived") | null;
+            value_semantics?: ("history_derived" | "stock_features_derived" | "minute_features_derived" | "market_temperature_stored") | null;
         };
         /**
          * FactorDailyStreamCoverage
@@ -3374,6 +3379,112 @@ export interface components {
              * @enum {string}
              */
             reason: "missing" | "ambiguous" | "boundary_unverified";
+        };
+        /** FactorMarketTemperatureDayValue */
+        FactorMarketTemperatureDayValue: {
+            /**
+             * Column
+             * @enum {string}
+             */
+            column: "market_high_60d_ratio_pct" | "market_above_ma20_ratio_pct";
+            diagnostic?: components["schemas"]["FactorStockFeatureDiagnostic"] | null;
+            minute_diagnostic?: components["schemas"]["FactorMinuteFeatureDiagnostic"] | null;
+            /** Non Finite Value */
+            non_finite_value?: ("NaN" | "Infinity" | "-Infinity") | null;
+            /** Reason */
+            reason?: ("missing_market_temperature" | "market_temperature_null" | "market_temperature_non_finite" | "invalid_market_percentage") | null;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "valid" | "missing" | "null" | "non_finite";
+            /** Value */
+            value: number | null;
+        };
+        /** FactorMarketTemperaturePolicy */
+        FactorMarketTemperaturePolicy: {
+            /**
+             * Evaluation Clock
+             * @default previous_complete_sse_session_at_next_day_09:25
+             * @constant
+             */
+            evaluation_clock: "previous_complete_sse_session_at_next_day_09:25";
+            /**
+             * History Mode
+             * @default retrospective_no_row_first_observed_time
+             * @constant
+             */
+            history_mode: "retrospective_no_row_first_observed_time";
+            /**
+             * Maximum Percentage
+             * @default 100
+             * @constant
+             */
+            maximum_percentage: 100;
+            /**
+             * Minimum Percentage
+             * @default 0
+             * @constant
+             */
+            minimum_percentage: 0;
+            /**
+             * Missing Policy
+             * @default explicit_reason_no_zero_or_neighbor_fallback
+             * @constant
+             */
+            missing_policy: "explicit_reason_no_zero_or_neighbor_fallback";
+            /**
+             * Source Table
+             * @default market_sentiment_daily
+             * @constant
+             */
+            source_table: "market_sentiment_daily";
+            /**
+             * Unit
+             * @default percent
+             * @constant
+             */
+            unit: "percent";
+            /**
+             * Universe
+             * @default original_market_no_pool_recalculation
+             * @constant
+             */
+            universe: "original_market_no_pool_recalculation";
+            /**
+             * Version
+             * @default market-temperature-original-daily-v1
+             * @constant
+             */
+            version: "market-temperature-original-daily-v1";
+        };
+        /** FactorMarketTemperatureSummary */
+        FactorMarketTemperatureSummary: {
+            /** Input Content Sha256 */
+            input_content_sha256: string;
+            policy: components["schemas"]["FactorMarketTemperaturePolicy"];
+            /** Row Count */
+            row_count: number;
+        };
+        /** FactorMinuteFeatureDiagnostic */
+        FactorMinuteFeatureDiagnostic: {
+            /** Current Day Observations */
+            current_day_observations: number;
+            /** Historical Days */
+            historical_days: number;
+            /**
+             * Panel Time
+             * Format: date-time
+             */
+            panel_time: string;
+            /** Regular Prior Observations */
+            regular_prior_observations: number;
+            /** Same Clock Days */
+            same_clock_days: number;
+            /** Selected History Days */
+            selected_history_days: number;
+            /** Target Present */
+            target_present: boolean;
         };
         /** FactorMinuteFeaturePolicy */
         FactorMinuteFeaturePolicy: {
@@ -3849,6 +3960,27 @@ export interface components {
              * Format: date-time
              */
             requested_at: string;
+        };
+        /**
+         * FactorStockFeatureDiagnostic
+         * @description The kernel's per-window outcome without repeating every valid factor ratio.
+         */
+        FactorStockFeatureDiagnostic: {
+            /** Actual Observations */
+            actual_observations: number;
+            /** Available */
+            available: boolean;
+            /** Feature Family */
+            feature_family: string;
+            /** Reason */
+            reason?: ("missing_reference_factor" | "non_finite_reference_factor" | "non_positive_reference_factor" | "missing_required_factor" | "non_finite_required_factor" | "non_positive_required_factor") | ("missing_daily_data" | "insufficient_history" | "undefined_statistic") | null;
+            /**
+             * Unavailable Dates
+             * @default []
+             */
+            unavailable_dates: string[];
+            /** Window Days */
+            window_days: number;
         };
         /** FactorStockFeaturePolicy */
         FactorStockFeaturePolicy: {

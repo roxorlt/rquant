@@ -4,11 +4,17 @@ import { formatCount } from "@/format/number";
 import { type DataColumn, DataTable } from "@/table/DataTable";
 import { EmptyState, Tip } from "@/ui";
 import { FactorFieldInfo, factorFieldName } from "./FactorFieldInfo";
+import {
+  FactorMarketTemperature,
+  FactorMarketTemperatureBasis,
+  marketTemperatureReasonLabels,
+} from "./FactorMarketTemperature";
 
 type CoverageDay = NonNullable<FactorResearchDisplayV2["daily_feature_coverage_days"]>[number];
 type CoverageReason = NonNullable<CoverageDay["counts"][number]["reasons"]>[number]["reason"];
 
 const reasonLabels: Record<CoverageReason, string> = {
+  ...marketTemperatureReasonLabels,
   insufficient_window: "窗口不足",
   no_initialization: "缺少初始化历史",
   history_break: "历史断裂",
@@ -45,8 +51,16 @@ export function FactorDailyFeatures({ research }: { research: FactorResearchDisp
   const hasMinute = source.fields.some(
     (field) => field.value_semantics === "minute_features_derived",
   );
+  const hasMarket = source.fields.some(
+    (field) => field.value_semantics === "market_temperature_stored",
+  );
+  const coverageFields = source.fields.filter(
+    (field) => field.value_semantics !== "market_temperature_stored",
+  );
   const hasDaily = source.fields.some(
-    (field) => field.value_semantics !== "minute_features_derived",
+    (field) =>
+      field.value_semantics !== "minute_features_derived" &&
+      field.value_semantics !== "market_temperature_stored",
   );
   const minute = hasMinute ? source.minute_features : null;
   const hasDerived = hasTechnicalDerived || hasStock;
@@ -58,12 +72,13 @@ export function FactorDailyFeatures({ research }: { research: FactorResearchDisp
   const otherFields = source.fields.filter(
     (field) =>
       field.value_semantics !== "stock_features_derived" &&
-      field.value_semantics !== "minute_features_derived",
+      field.value_semantics !== "minute_features_derived" &&
+      field.value_semantics !== "market_temperature_stored",
   );
   const historyFields = otherFields.filter((field) => field.value_semantics === "history_derived");
   const storedFields = otherFields.filter((field) => field.value_semantics !== "history_derived");
   const selectedField =
-    source.fields.find((field) => field.column === requestedField) ?? source.fields[0];
+    coverageFields.find((field) => field.column === requestedField) ?? coverageFields[0];
   const days = research?.daily_feature_coverage_days;
   const count = (day: CoverageDay) =>
     day.counts.find((item) => item.column === selectedField?.column);
@@ -132,9 +147,22 @@ export function FactorDailyFeatures({ research }: { research: FactorResearchDisp
     },
   ];
   return (
-    <section className="factor-result-section" aria-label={hasMinute ? "字段来源" : "日线字段来源"}>
+    <section
+      className="factor-result-section"
+      aria-label={hasMinute || hasMarket ? "字段来源" : "日线字段来源"}
+    >
       <div className="factor-section-head">
-        <h3>{hasMinute ? (hasDaily ? "字段来源" : "分钟字段") : "日线字段"}</h3>
+        <h3>
+          {hasMarket
+            ? hasDaily || hasMinute
+              ? "字段来源"
+              : "市场温度"
+            : hasMinute
+              ? hasDaily
+                ? "字段来源"
+                : "分钟字段"
+              : "日线字段"}
+        </h3>
         {hasDaily ? (
           <Tip
             content={
@@ -247,73 +275,77 @@ export function FactorDailyFeatures({ research }: { research: FactorResearchDisp
             分钟字段口径
           </Tip>
         ) : null}
+        {hasMarket ? <FactorMarketTemperatureBasis source={source} /> : null}
       </div>
-      <details className="factor-disclosure">
-        <summary>查看字段覆盖</summary>
-        <div className="factor-daily-coverage-head">
-          <label>
-            <span>字段</span>
-            <select
-              className="inp"
-              aria-label="覆盖字段"
-              value={selectedField?.column ?? ""}
-              onChange={(event) => setRequestedField(event.target.value)}
-            >
-              {source.fields.map((field) => (
-                <option key={field.column} value={field.column}>
-                  {factorFieldName(field)}
-                </option>
-              ))}
-            </select>
-          </label>
-          <Tip
-            content={
-              <>
-                <div>
-                  按本次冻结范围逐日记录；字段取自检验日前一交易日，范围内缺行、空值与非有限数值分别保留，不补零。
-                </div>
-                {selectedField ? (
+      {hasMarket ? <FactorMarketTemperature source={source} days={days} /> : null}
+      {coverageFields.length ? (
+        <details className="factor-disclosure">
+          <summary>查看字段覆盖</summary>
+          <div className="factor-daily-coverage-head">
+            <label>
+              <span>字段</span>
+              <select
+                className="inp"
+                aria-label="覆盖字段"
+                value={selectedField?.column ?? ""}
+                onChange={(event) => setRequestedField(event.target.value)}
+              >
+                {coverageFields.map((field) => (
+                  <option key={field.column} value={field.column}>
+                    {factorFieldName(field)}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <Tip
+              content={
+                <>
                   <div>
-                    {factorFieldName(selectedField)}（
-                    {selectedField.value_semantics === "minute_features_derived"
-                      ? "分钟派生"
-                      : selectedField.value_semantics === "stock_features_derived"
-                        ? "选股派生"
-                        : selectedField.value_semantics === "history_derived"
-                          ? "历史推导"
-                          : "库存原值"}
-                    ）：
-                    <FactorFieldInfo field={selectedField} />
+                    按本次冻结范围逐日记录；字段取自检验日前一交易日，范围内缺行、空值与非有限数值分别保留，不补零。
                   </div>
-                ) : null}
-                {selectedField?.value_semantics === "minute_features_derived" &&
-                selectedField.unit === "observations" ? (
-                  <div>实际历史日数可为0；计数有效不代表历史相对量可用。</div>
-                ) : null}
-                {selectedField?.column === "signal_opening_segment" ? (
-                  <div>目标分钟存在时0有效；开盘段成交额在此时点不适用。</div>
-                ) : null}
-                {selectedField?.value_semantics === "stock_features_derived" &&
-                selectedField.unit === "observations" ? (
-                  <div>计数有效不代表窗口可用；其他字段的覆盖与缺因分别保留。</div>
-                ) : null}
-              </>
-            }
-          >
-            覆盖说明
-          </Tip>
-        </div>
-        {!days || days.length === 0 ? (
-          <EmptyState title="暂无字段覆盖" hint="当前结果未提供字段覆盖记录。" />
-        ) : (
-          <DataTable
-            rows={[...days].sort((a, b) => b.trade_date.localeCompare(a.trade_date))}
-            columns={columns}
-            rowKey={(day) => day.trade_date}
-            label={hasMinute ? "字段覆盖" : "日线字段覆盖"}
-          />
-        )}
-      </details>
+                  {selectedField ? (
+                    <div>
+                      {factorFieldName(selectedField)}（
+                      {selectedField.value_semantics === "minute_features_derived"
+                        ? "分钟派生"
+                        : selectedField.value_semantics === "stock_features_derived"
+                          ? "选股派生"
+                          : selectedField.value_semantics === "history_derived"
+                            ? "历史推导"
+                            : "库存原值"}
+                      ）：
+                      <FactorFieldInfo field={selectedField} />
+                    </div>
+                  ) : null}
+                  {selectedField?.value_semantics === "minute_features_derived" &&
+                  selectedField.unit === "observations" ? (
+                    <div>实际历史日数可为0；计数有效不代表历史相对量可用。</div>
+                  ) : null}
+                  {selectedField?.column === "signal_opening_segment" ? (
+                    <div>目标分钟存在时0有效；开盘段成交额在此时点不适用。</div>
+                  ) : null}
+                  {selectedField?.value_semantics === "stock_features_derived" &&
+                  selectedField.unit === "observations" ? (
+                    <div>计数有效不代表窗口可用；其他字段的覆盖与缺因分别保留。</div>
+                  ) : null}
+                </>
+              }
+            >
+              覆盖说明
+            </Tip>
+          </div>
+          {!days || days.length === 0 ? (
+            <EmptyState title="暂无字段覆盖" hint="当前结果未提供字段覆盖记录。" />
+          ) : (
+            <DataTable
+              rows={[...days].sort((a, b) => b.trade_date.localeCompare(a.trade_date))}
+              columns={columns}
+              rowKey={(day) => day.trade_date}
+              label={hasMinute ? "字段覆盖" : "日线字段覆盖"}
+            />
+          )}
+        </details>
+      ) : null}
     </section>
   );
 }

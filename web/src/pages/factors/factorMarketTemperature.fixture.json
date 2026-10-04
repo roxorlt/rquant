@@ -1,0 +1,1879 @@
+{
+  "capability": {
+    "version": "daily_market_temperature_v1",
+    "source_mode": "historical_retrospective",
+    "fields": [
+      {
+        "column": "open",
+        "name_zh": "开盘价",
+        "description_zh": "日线记录的开盘价。"
+      },
+      {
+        "column": "high",
+        "name_zh": "最高价",
+        "description_zh": "日线记录的最高价。"
+      },
+      {
+        "column": "low",
+        "name_zh": "最低价",
+        "description_zh": "日线记录的最低价。"
+      },
+      {
+        "column": "close",
+        "name_zh": "收盘价",
+        "description_zh": "日线记录的收盘价。"
+      },
+      {
+        "column": "vol",
+        "name_zh": "成交量",
+        "description_zh": "日线记录的成交量。"
+      },
+      {
+        "column": "amount",
+        "name_zh": "成交额",
+        "description_zh": "日线记录的成交额。"
+      },
+      {
+        "column": "market_above_ma20_ratio_pct",
+        "name_zh": "20日均线上方占比",
+        "description_zh": "全市场20日均线上方股票占比，百分比原值；前一完整SSE交易日，历史回顾。",
+        "unit": "percent",
+        "value_semantics": "market_temperature_stored",
+        "tracking_supported": true
+      },
+      {
+        "column": "market_high_60d_ratio_pct",
+        "name_zh": "60日新高占比",
+        "description_zh": "全市场60日新高股票占比，百分比原值；前一完整SSE交易日，历史回顾。",
+        "unit": "percent",
+        "value_semantics": "market_temperature_stored",
+        "tracking_supported": true
+      }
+    ],
+    "runnable_operators": [
+      "+",
+      "-",
+      "*",
+      "/",
+      "<",
+      "<=",
+      ">",
+      ">=",
+      "ts_mean",
+      "ts_std",
+      "ts_delta",
+      "ts_rank",
+      "ref",
+      "ts_corr",
+      "cs_rank",
+      "cs_zscore",
+      "cs_winsorize"
+    ],
+    "unavailable_operators": [
+      {
+        "name": "industry_neutralize",
+        "reason_zh": "历史来源缺少可核验的行业归属。"
+      },
+      {
+        "name": "size_neutralize",
+        "reason_zh": "历史来源缺少可核验的市值数据。"
+      }
+    ],
+    "can_save": true,
+    "coverage_note_zh": "字段和算子支持不代表历史数据已覆盖。"
+  },
+  "mixed_capability": {
+    "version": "daily_market_temperature_v1",
+    "source_mode": "historical_retrospective",
+    "fields": [
+      {
+        "column": "open",
+        "name_zh": "开盘价",
+        "description_zh": "日线记录的开盘价。"
+      },
+      {
+        "column": "high",
+        "name_zh": "最高价",
+        "description_zh": "日线记录的最高价。"
+      },
+      {
+        "column": "low",
+        "name_zh": "最低价",
+        "description_zh": "日线记录的最低价。"
+      },
+      {
+        "column": "close",
+        "name_zh": "收盘价",
+        "description_zh": "日线记录的收盘价。"
+      },
+      {
+        "column": "vol",
+        "name_zh": "成交量",
+        "description_zh": "日线记录的成交量。"
+      },
+      {
+        "column": "amount",
+        "name_zh": "成交额",
+        "description_zh": "日线记录的成交额。"
+      },
+      {
+        "column": "circ_mv",
+        "name_zh": "流通市值",
+        "description_zh": "当日流通市值原值，单位万元。",
+        "unit": "CNY_10000",
+        "value_semantics": "stored_not_recomputed",
+        "tracking_supported": true
+      },
+      {
+        "column": "kdj_d",
+        "name_zh": "KDJ D",
+        "description_zh": "从首个有效历史观察推导；历史断裂不重置。",
+        "unit": "indicator",
+        "value_semantics": "history_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "kdj_j",
+        "name_zh": "KDJ J",
+        "description_zh": "从首个有效历史观察推导；历史断裂不重置，KDJ J保留原值。",
+        "unit": "indicator",
+        "value_semantics": "history_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "kdj_k",
+        "name_zh": "KDJ K",
+        "description_zh": "从首个有效历史观察推导；历史断裂不重置。",
+        "unit": "indicator",
+        "value_semantics": "history_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "ma10",
+        "name_zh": "10日均线",
+        "description_zh": "从首个有效历史观察推导，按观察日复权因子计算、当日因子还原价格。",
+        "unit": "session_price",
+        "value_semantics": "history_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "ma20",
+        "name_zh": "20日均线",
+        "description_zh": "从首个有效历史观察推导，按观察日复权因子计算、当日因子还原价格。",
+        "unit": "session_price",
+        "value_semantics": "history_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "ma5",
+        "name_zh": "5日均线",
+        "description_zh": "从首个有效历史观察推导，按观察日复权因子计算、当日因子还原价格。",
+        "unit": "session_price",
+        "value_semantics": "history_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "ma60",
+        "name_zh": "60日均线",
+        "description_zh": "从首个有效历史观察推导，按观察日复权因子计算、当日因子还原价格。",
+        "unit": "session_price",
+        "value_semantics": "history_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "macd",
+        "name_zh": "MACD DIF",
+        "description_zh": "从首个有效历史观察推导，按观察日复权因子计算、当日因子还原价格。",
+        "unit": "session_price",
+        "value_semantics": "history_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "macd_hist",
+        "name_zh": "MACD柱差值",
+        "description_zh": "从首个有效历史观察推导，按观察日复权因子计算、当日因子还原价格。",
+        "unit": "session_price",
+        "value_semantics": "history_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "macd_signal",
+        "name_zh": "MACD信号线",
+        "description_zh": "从首个有效历史观察推导，按观察日复权因子计算、当日因子还原价格。",
+        "unit": "session_price",
+        "value_semantics": "history_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "rsi14",
+        "name_zh": "14日RSI",
+        "description_zh": "从首个有效历史观察推导；历史断裂不重置。",
+        "unit": "indicator",
+        "value_semantics": "history_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "rsi6",
+        "name_zh": "6日RSI",
+        "description_zh": "从首个有效历史观察推导；历史断裂不重置。",
+        "unit": "indicator",
+        "value_semantics": "history_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "total_mv",
+        "name_zh": "总市值",
+        "description_zh": "当日总市值原值，单位万元。",
+        "unit": "CNY_10000",
+        "value_semantics": "stored_not_recomputed",
+        "tracking_supported": true
+      },
+      {
+        "column": "turnover_rate",
+        "name_zh": "换手率",
+        "description_zh": "百分数原值；0.5387表示0.5387%，不乘100。",
+        "unit": "percent",
+        "value_semantics": "stored_not_recomputed",
+        "tracking_supported": true
+      },
+      {
+        "column": "volume_ratio",
+        "name_zh": "量比",
+        "description_zh": "供应方当日量比原值，不由日线重算。",
+        "unit": "ratio",
+        "value_semantics": "stored_not_recomputed",
+        "tracking_supported": true
+      },
+      {
+        "column": "accum_ad_flow_20d_pct",
+        "name_zh": "20日资金流代理",
+        "description_zh": "排除参考日；原日线价格尺度不变的资金流乘数×成交量/绝对成交量，不依赖复权。",
+        "unit": "percent",
+        "value_semantics": "stock_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "accum_close_position_avg_20d_pct",
+        "name_zh": "20日收盘位置均值",
+        "description_zh": "排除参考日；原日线(收盘−最低)/(最高−最低)裁到0–1后均值百分数。",
+        "unit": "percent",
+        "value_semantics": "stock_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "accum_heavy_no_drop_days_20d",
+        "name_zh": "20日放量不跌观察数",
+        "description_zh": "排除参考日；成交额≥窗口中位数1.5倍且涨跌幅≥−1%的观察数。",
+        "unit": "observations",
+        "value_semantics": "stock_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "accum_obv_change_20d_pct",
+        "name_zh": "20日能量潮变化",
+        "description_zh": "排除参考日，完整窗口及参考日复权基准；收盘涨跌方向量变化/绝对成交量的百分数。",
+        "unit": "percent",
+        "value_semantics": "stock_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "accum_up_down_amount_ratio_20d",
+        "name_zh": "20日涨跌成交额比",
+        "description_zh": "排除参考日；按原涨跌幅正负累积成交额，跌日成交额为零时无值。",
+        "unit": "ratio",
+        "value_semantics": "stock_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "accum_window_days_20d",
+        "name_zh": "吸筹实际观察数",
+        "description_zh": "参考日之前最近最多20观察，不含参考日。",
+        "unit": "observations",
+        "value_semantics": "stock_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "distance_to_high_120d_pct",
+        "name_zh": "距120日最高价",
+        "description_zh": "窗口最高价/参考收盘价−1的百分数；按参考日复权，不二次乘100。",
+        "unit": "percent",
+        "value_semantics": "stock_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "distance_to_high_250d_pct",
+        "name_zh": "距250日最高价",
+        "description_zh": "窗口最高价/参考收盘价−1的百分数；按参考日复权，不二次乘100。",
+        "unit": "percent",
+        "value_semantics": "stock_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "distance_to_high_90d_pct",
+        "name_zh": "距90日最高价",
+        "description_zh": "窗口最高价/参考收盘价−1的百分数；按参考日复权，不二次乘100。",
+        "unit": "percent",
+        "value_semantics": "stock_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "distance_to_low_120d_pct",
+        "name_zh": "距120日最低价",
+        "description_zh": "参考收盘价/窗口最低价−1的百分数；按参考日复权，不二次乘100。",
+        "unit": "percent",
+        "value_semantics": "stock_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "distance_to_low_250d_pct",
+        "name_zh": "距250日最低价",
+        "description_zh": "参考收盘价/窗口最低价−1的百分数；按参考日复权，不二次乘100。",
+        "unit": "percent",
+        "value_semantics": "stock_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "distance_to_low_90d_pct",
+        "name_zh": "距90日最低价",
+        "description_zh": "参考收盘价/窗口最低价−1的百分数；按参考日复权，不二次乘100。",
+        "unit": "percent",
+        "value_semantics": "stock_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "ma_alignment",
+        "name_zh": "均线多头排列",
+        "description_zh": "满60个日线观察，按参考日复权，5日>10日>20日>60日均线时为1，否则为0。",
+        "unit": "binary",
+        "value_semantics": "stock_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "price_percentile_250d",
+        "name_zh": "250日收盘百分位",
+        "description_zh": "满250个日线观察，含参考日及并列；小于或等于参考价的比例，取值0–1。",
+        "unit": "ratio",
+        "value_semantics": "stock_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "price_position_120d_pct",
+        "name_zh": "120日价格位置",
+        "description_zh": "含参考日的实际观察，完整复权到参考日；平价为50%，短窗口仍计算。",
+        "unit": "percent",
+        "value_semantics": "stock_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "price_position_250d_pct",
+        "name_zh": "250日价格位置",
+        "description_zh": "含参考日的实际观察，完整复权到参考日；平价为50%，短窗口仍计算。",
+        "unit": "percent",
+        "value_semantics": "stock_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "price_position_90d_pct",
+        "name_zh": "90日价格位置",
+        "description_zh": "含参考日的实际观察，完整复权到参考日；平价为50%，短窗口仍计算。",
+        "unit": "percent",
+        "value_semantics": "stock_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "price_rank_120d_pct",
+        "name_zh": "120日价格排名",
+        "description_zh": "含参考日的最近最多120观察，复权收盘价小于或等于参考价的百分数，包含并列。",
+        "unit": "percent",
+        "value_semantics": "stock_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "price_rank_250d_pct",
+        "name_zh": "250日价格排名",
+        "description_zh": "含参考日的最近最多250观察，复权收盘价小于或等于参考价的百分数，包含并列。",
+        "unit": "percent",
+        "value_semantics": "stock_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "price_rank_90d_pct",
+        "name_zh": "90日价格排名",
+        "description_zh": "含参考日的最近最多90观察，复权收盘价小于或等于参考价的百分数，包含并列。",
+        "unit": "percent",
+        "value_semantics": "stock_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "price_window_days_120d",
+        "name_zh": "120日实际观察数",
+        "description_zh": "含参考日，最近最多120个日线观察；短窗口保留实际观察数。",
+        "unit": "observations",
+        "value_semantics": "stock_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "price_window_days_250d",
+        "name_zh": "250日实际观察数",
+        "description_zh": "含参考日，最近最多250个日线观察；短窗口保留实际观察数。",
+        "unit": "observations",
+        "value_semantics": "stock_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "price_window_days_90d",
+        "name_zh": "90日实际观察数",
+        "description_zh": "含参考日，最近最多90个日线观察；短窗口保留实际观察数。",
+        "unit": "observations",
+        "value_semantics": "stock_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "hist_cum_amount_asof_median_20d",
+        "name_zh": "历史累计成交额中位数",
+        "description_zh": "原核前最多20个实际观察日截至15:00累计成交额中位数，单位元。",
+        "unit": "CNY",
+        "value_semantics": "minute_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "hist_intraday_days_20d",
+        "name_zh": "历史分钟观察日数",
+        "description_zh": "原核截至15:00实际有分钟记录的历史日数，0有效。",
+        "unit": "observations",
+        "value_semantics": "minute_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "hist_same_minute_amount_median_20d",
+        "name_zh": "历史同分钟成交额中位数",
+        "description_zh": "前最多20个实际观察日的15:00分钟成交额中位数，单位元。",
+        "unit": "CNY",
+        "value_semantics": "minute_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "signal_amount_accel_10m",
+        "name_zh": "10观察成交额加速",
+        "description_zh": "15:00成交额/此前最近最多10个正成交额分钟中位数；短窗口仍计算。",
+        "unit": "ratio",
+        "value_semantics": "minute_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "signal_amount_accel_5m",
+        "name_zh": "5观察成交额加速",
+        "description_zh": "15:00成交额/此前最近最多5个正成交额分钟中位数；短窗口仍计算。",
+        "unit": "ratio",
+        "value_semantics": "minute_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "signal_cum_amount_asof",
+        "name_zh": "15:00累计成交额",
+        "description_zh": "目标分钟存在时，当日截至15:00实际分钟成交额累计，单位元。",
+        "unit": "CNY",
+        "value_semantics": "minute_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "signal_minute_amount",
+        "name_zh": "15:00分钟成交额",
+        "description_zh": "精确15:00分钟成交额，单位元；缺该分钟不回退。",
+        "unit": "CNY",
+        "value_semantics": "minute_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "signal_opening_segment",
+        "name_zh": "开盘段标记",
+        "description_zh": "实际15:00观察存在时为0；缺目标分钟无值。",
+        "unit": "binary",
+        "value_semantics": "minute_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "signal_opening_segment_amount",
+        "name_zh": "开盘段成交额",
+        "description_zh": "固定15:00观察不适用，保留原核无值。",
+        "unit": "CNY",
+        "value_semantics": "minute_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "signal_rel_amount_same_minute_20d",
+        "name_zh": "同分钟相对成交额",
+        "description_zh": "目标成交额/历史同分钟成交额中位数；零基准无值。",
+        "unit": "ratio",
+        "value_semantics": "minute_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "signal_rel_cum_amount_asof_20d",
+        "name_zh": "累计相对成交额",
+        "description_zh": "当日累计成交额/历史累计成交额中位数；零基准无值。",
+        "unit": "ratio",
+        "value_semantics": "minute_features_derived",
+        "tracking_supported": true
+      },
+      {
+        "column": "market_above_ma20_ratio_pct",
+        "name_zh": "20日均线上方占比",
+        "description_zh": "全市场20日均线上方股票占比，百分比原值；前一完整SSE交易日，历史回顾。",
+        "unit": "percent",
+        "value_semantics": "market_temperature_stored",
+        "tracking_supported": true
+      },
+      {
+        "column": "market_high_60d_ratio_pct",
+        "name_zh": "60日新高占比",
+        "description_zh": "全市场60日新高股票占比，百分比原值；前一完整SSE交易日，历史回顾。",
+        "unit": "percent",
+        "value_semantics": "market_temperature_stored",
+        "tracking_supported": true
+      }
+    ],
+    "runnable_operators": [
+      "+",
+      "-",
+      "*",
+      "/",
+      "<",
+      "<=",
+      ">",
+      ">=",
+      "ts_mean",
+      "ts_std",
+      "ts_delta",
+      "ts_rank",
+      "ref",
+      "ts_corr",
+      "cs_rank",
+      "cs_zscore",
+      "cs_winsorize"
+    ],
+    "unavailable_operators": [
+      {
+        "name": "industry_neutralize",
+        "reason_zh": "历史来源缺少可核验的行业归属。"
+      },
+      {
+        "name": "size_neutralize",
+        "reason_zh": "历史来源缺少可核验的市值数据。"
+      }
+    ],
+    "can_save": true,
+    "coverage_note_zh": "字段和算子支持不代表历史数据已覆盖。"
+  },
+  "research": {
+    "schema_version": 2,
+    "basis_label": "历史回溯研究；分组曲线不含撮合与交易费用。",
+    "pool_label": "全市场（沪深非 ST）",
+    "return_price_basis": "forward_adjusted",
+    "holding_sessions": 1,
+    "summary_status": "evaluated",
+    "ic_summary": {
+      "normal_ic": {
+        "status": "zero_variance",
+        "source_day_count": 2,
+        "valid_day_count": 2,
+        "insufficient_day_count": 0,
+        "zero_variance_day_count": 0,
+        "mean": 1.0,
+        "sample_std": 0.0,
+        "ir": null,
+        "positive_rate": 1.0,
+        "strong_signal_rate": 1.0,
+        "t_value": null,
+        "p_value": null,
+        "skewness": null,
+        "excess_kurtosis": null
+      },
+      "rank_ic": {
+        "status": "zero_variance",
+        "source_day_count": 2,
+        "valid_day_count": 2,
+        "insufficient_day_count": 0,
+        "zero_variance_day_count": 0,
+        "mean": 1.0,
+        "sample_std": 0.0,
+        "ir": null,
+        "positive_rate": 1.0,
+        "strong_signal_rate": 1.0,
+        "t_value": null,
+        "p_value": null,
+        "skewness": null,
+        "excess_kurtosis": null
+      }
+    },
+    "ic_points": [
+      {
+        "decision_date": "2026-07-03",
+        "normal_ic": {
+          "status": "ok",
+          "value": 1.0,
+          "source_sample_count": 12,
+          "effective_sample_count": 12
+        },
+        "rank_ic": {
+          "status": "ok",
+          "value": 1.0,
+          "source_sample_count": 12,
+          "effective_sample_count": 12
+        },
+        "normal_ic_cumulative_sum": 1.0,
+        "rank_ic_cumulative_sum": 1.0
+      },
+      {
+        "decision_date": "2026-07-04",
+        "normal_ic": {
+          "status": "ok",
+          "value": 1.0,
+          "source_sample_count": 12,
+          "effective_sample_count": 12
+        },
+        "rank_ic": {
+          "status": "ok",
+          "value": 1.0,
+          "source_sample_count": 12,
+          "effective_sample_count": 12
+        },
+        "normal_ic_cumulative_sum": 2.0,
+        "rank_ic_cumulative_sum": 2.0
+      }
+    ],
+    "decay_periods": [
+      {
+        "lag": 1,
+        "status": "evaluated",
+        "source_day_count": 2,
+        "valid_pair_count": 24,
+        "ic_summary": {
+          "normal_ic": {
+            "status": "zero_variance",
+            "source_day_count": 2,
+            "valid_day_count": 2,
+            "insufficient_day_count": 0,
+            "zero_variance_day_count": 0,
+            "mean": 1.0,
+            "sample_std": 0.0,
+            "ir": null,
+            "positive_rate": 1.0,
+            "strong_signal_rate": 1.0,
+            "t_value": null,
+            "p_value": null,
+            "skewness": null,
+            "excess_kurtosis": null
+          },
+          "rank_ic": {
+            "status": "zero_variance",
+            "source_day_count": 2,
+            "valid_day_count": 2,
+            "insufficient_day_count": 0,
+            "zero_variance_day_count": 0,
+            "mean": 1.0,
+            "sample_std": 0.0,
+            "ir": null,
+            "positive_rate": 1.0,
+            "strong_signal_rate": 1.0,
+            "t_value": null,
+            "p_value": null,
+            "skewness": null,
+            "excess_kurtosis": null
+          }
+        }
+      },
+      {
+        "lag": 2,
+        "status": "evaluated",
+        "source_day_count": 1,
+        "valid_pair_count": 12,
+        "ic_summary": {
+          "normal_ic": {
+            "status": "insufficient_samples",
+            "source_day_count": 1,
+            "valid_day_count": 1,
+            "insufficient_day_count": 0,
+            "zero_variance_day_count": 0,
+            "mean": 0.9999999999999999,
+            "sample_std": null,
+            "ir": null,
+            "positive_rate": 1.0,
+            "strong_signal_rate": 1.0,
+            "t_value": null,
+            "p_value": null,
+            "skewness": null,
+            "excess_kurtosis": null
+          },
+          "rank_ic": {
+            "status": "insufficient_samples",
+            "source_day_count": 1,
+            "valid_day_count": 1,
+            "insufficient_day_count": 0,
+            "zero_variance_day_count": 0,
+            "mean": 1.0,
+            "sample_std": null,
+            "ir": null,
+            "positive_rate": 1.0,
+            "strong_signal_rate": 1.0,
+            "t_value": null,
+            "p_value": null,
+            "skewness": null,
+            "excess_kurtosis": null
+          }
+        }
+      },
+      {
+        "lag": 3,
+        "status": "no_target_period",
+        "source_day_count": 0,
+        "valid_pair_count": 0,
+        "ic_summary": null
+      },
+      {
+        "lag": 4,
+        "status": "no_target_period",
+        "source_day_count": 0,
+        "valid_pair_count": 0,
+        "ic_summary": null
+      },
+      {
+        "lag": 5,
+        "status": "no_target_period",
+        "source_day_count": 0,
+        "valid_pair_count": 0,
+        "ic_summary": null
+      },
+      {
+        "lag": 6,
+        "status": "no_target_period",
+        "source_day_count": 0,
+        "valid_pair_count": 0,
+        "ic_summary": null
+      },
+      {
+        "lag": 7,
+        "status": "no_target_period",
+        "source_day_count": 0,
+        "valid_pair_count": 0,
+        "ic_summary": null
+      },
+      {
+        "lag": 8,
+        "status": "no_target_period",
+        "source_day_count": 0,
+        "valid_pair_count": 0,
+        "ic_summary": null
+      },
+      {
+        "lag": 9,
+        "status": "no_target_period",
+        "source_day_count": 0,
+        "valid_pair_count": 0,
+        "ic_summary": null
+      },
+      {
+        "lag": 10,
+        "status": "no_target_period",
+        "source_day_count": 0,
+        "valid_pair_count": 0,
+        "ic_summary": null
+      }
+    ],
+    "portfolio_status": "available",
+    "portfolio_days": [
+      {
+        "decision_date": "2026-07-03",
+        "groupings": [
+          {
+            "group_count": 3,
+            "status": "ok",
+            "cumulative_status": "available",
+            "source_sample_count": 12,
+            "effective_sample_count": 12,
+            "groups": [
+              {
+                "group_number": 1,
+                "member_count": 4,
+                "period_return": 0.20249999999999996,
+                "cumulative_return": 0.2024999999999999,
+                "target_weight_turnover": null
+              },
+              {
+                "group_number": 2,
+                "member_count": 4,
+                "period_return": 0.20650000000000002,
+                "cumulative_return": 0.20650000000000013,
+                "target_weight_turnover": null
+              },
+              {
+                "group_number": 3,
+                "member_count": 4,
+                "period_return": 0.21049999999999996,
+                "cumulative_return": 0.2104999999999999,
+                "target_weight_turnover": null
+              }
+            ],
+            "long_short_return": 0.008000000000000007,
+            "long_short_cumulative_spread": 0.008000000000000007
+          },
+          {
+            "group_count": 5,
+            "status": "ok",
+            "cumulative_status": "available",
+            "source_sample_count": 12,
+            "effective_sample_count": 12,
+            "groups": [
+              {
+                "group_number": 1,
+                "member_count": 3,
+                "period_return": 0.20199999999999996,
+                "cumulative_return": 0.20199999999999996,
+                "target_weight_turnover": null
+              },
+              {
+                "group_number": 2,
+                "member_count": 3,
+                "period_return": 0.20500000000000002,
+                "cumulative_return": 0.20500000000000007,
+                "target_weight_turnover": null
+              },
+              {
+                "group_number": 3,
+                "member_count": 2,
+                "period_return": 0.20750000000000002,
+                "cumulative_return": 0.20750000000000002,
+                "target_weight_turnover": null
+              },
+              {
+                "group_number": 4,
+                "member_count": 2,
+                "period_return": 0.20950000000000002,
+                "cumulative_return": 0.20950000000000002,
+                "target_weight_turnover": null
+              },
+              {
+                "group_number": 5,
+                "member_count": 2,
+                "period_return": 0.2114999999999999,
+                "cumulative_return": 0.21150000000000002,
+                "target_weight_turnover": null
+              }
+            ],
+            "long_short_return": 0.009499999999999953,
+            "long_short_cumulative_spread": 0.009500000000000064
+          },
+          {
+            "group_count": 10,
+            "status": "ok",
+            "cumulative_status": "available",
+            "source_sample_count": 12,
+            "effective_sample_count": 12,
+            "groups": [
+              {
+                "group_number": 1,
+                "member_count": 2,
+                "period_return": 0.2015,
+                "cumulative_return": 0.2015,
+                "target_weight_turnover": null
+              },
+              {
+                "group_number": 2,
+                "member_count": 2,
+                "period_return": 0.2034999999999999,
+                "cumulative_return": 0.20350000000000001,
+                "target_weight_turnover": null
+              },
+              {
+                "group_number": 3,
+                "member_count": 1,
+                "period_return": 0.20500000000000007,
+                "cumulative_return": 0.20500000000000007,
+                "target_weight_turnover": null
+              },
+              {
+                "group_number": 4,
+                "member_count": 1,
+                "period_return": 0.20599999999999996,
+                "cumulative_return": 0.20599999999999996,
+                "target_weight_turnover": null
+              },
+              {
+                "group_number": 5,
+                "member_count": 1,
+                "period_return": 0.20700000000000007,
+                "cumulative_return": 0.20700000000000007,
+                "target_weight_turnover": null
+              },
+              {
+                "group_number": 6,
+                "member_count": 1,
+                "period_return": 0.20799999999999996,
+                "cumulative_return": 0.20799999999999996,
+                "target_weight_turnover": null
+              },
+              {
+                "group_number": 7,
+                "member_count": 1,
+                "period_return": 0.20900000000000007,
+                "cumulative_return": 0.20900000000000007,
+                "target_weight_turnover": null
+              },
+              {
+                "group_number": 8,
+                "member_count": 1,
+                "period_return": 0.20999999999999996,
+                "cumulative_return": 0.20999999999999996,
+                "target_weight_turnover": null
+              },
+              {
+                "group_number": 9,
+                "member_count": 1,
+                "period_return": 0.21099999999999985,
+                "cumulative_return": 0.21099999999999985,
+                "target_weight_turnover": null
+              },
+              {
+                "group_number": 10,
+                "member_count": 1,
+                "period_return": 0.21199999999999997,
+                "cumulative_return": 0.21199999999999997,
+                "target_weight_turnover": null
+              }
+            ],
+            "long_short_return": 0.010499999999999954,
+            "long_short_cumulative_spread": 0.010499999999999954
+          }
+        ]
+      },
+      {
+        "decision_date": "2026-07-04",
+        "groupings": [
+          {
+            "group_count": 3,
+            "status": "ok",
+            "cumulative_status": "available",
+            "source_sample_count": 12,
+            "effective_sample_count": 12,
+            "groups": [
+              {
+                "group_number": 1,
+                "member_count": 4,
+                "period_return": 0.30249999999999994,
+                "cumulative_return": 0.5662562499999999,
+                "target_weight_turnover": 0.0
+              },
+              {
+                "group_number": 2,
+                "member_count": 4,
+                "period_return": 0.30650000000000005,
+                "cumulative_return": 0.5762922500000001,
+                "target_weight_turnover": 0.0
+              },
+              {
+                "group_number": 3,
+                "member_count": 4,
+                "period_return": 0.31049999999999994,
+                "cumulative_return": 0.5863602499999998,
+                "target_weight_turnover": 0.0
+              }
+            ],
+            "long_short_return": 0.008000000000000007,
+            "long_short_cumulative_spread": 0.0201039999999999
+          },
+          {
+            "group_count": 5,
+            "status": "ok",
+            "cumulative_status": "available",
+            "source_sample_count": 12,
+            "effective_sample_count": 12,
+            "groups": [
+              {
+                "group_number": 1,
+                "member_count": 3,
+                "period_return": 0.302,
+                "cumulative_return": 0.5650040000000001,
+                "target_weight_turnover": 0.0
+              },
+              {
+                "group_number": 2,
+                "member_count": 3,
+                "period_return": 0.30500000000000005,
+                "cumulative_return": 0.5725250000000004,
+                "target_weight_turnover": 0.0
+              },
+              {
+                "group_number": 3,
+                "member_count": 2,
+                "period_return": 0.3075,
+                "cumulative_return": 0.5788062500000002,
+                "target_weight_turnover": 0.0
+              },
+              {
+                "group_number": 4,
+                "member_count": 2,
+                "period_return": 0.3095,
+                "cumulative_return": 0.58384025,
+                "target_weight_turnover": 0.0
+              },
+              {
+                "group_number": 5,
+                "member_count": 2,
+                "period_return": 0.3114999999999999,
+                "cumulative_return": 0.5888822499999999,
+                "target_weight_turnover": 0.0
+              }
+            ],
+            "long_short_return": 0.009499999999999897,
+            "long_short_cumulative_spread": 0.02387824999999988
+          },
+          {
+            "group_count": 10,
+            "status": "ok",
+            "cumulative_status": "available",
+            "source_sample_count": 12,
+            "effective_sample_count": 12,
+            "groups": [
+              {
+                "group_number": 1,
+                "member_count": 2,
+                "period_return": 0.3015,
+                "cumulative_return": 0.5637522499999998,
+                "target_weight_turnover": 0.0
+              },
+              {
+                "group_number": 2,
+                "member_count": 2,
+                "period_return": 0.3034999999999999,
+                "cumulative_return": 0.5687622499999998,
+                "target_weight_turnover": 0.0
+              },
+              {
+                "group_number": 3,
+                "member_count": 1,
+                "period_return": 0.30500000000000016,
+                "cumulative_return": 0.5725250000000004,
+                "target_weight_turnover": 0.0
+              },
+              {
+                "group_number": 4,
+                "member_count": 1,
+                "period_return": 0.30600000000000005,
+                "cumulative_return": 0.5750360000000001,
+                "target_weight_turnover": 0.0
+              },
+              {
+                "group_number": 5,
+                "member_count": 1,
+                "period_return": 0.30699999999999994,
+                "cumulative_return": 0.5775490000000001,
+                "target_weight_turnover": 0.0
+              },
+              {
+                "group_number": 6,
+                "member_count": 1,
+                "period_return": 0.30800000000000005,
+                "cumulative_return": 0.5800639999999999,
+                "target_weight_turnover": 0.0
+              },
+              {
+                "group_number": 7,
+                "member_count": 1,
+                "period_return": 0.30899999999999994,
+                "cumulative_return": 0.582581,
+                "target_weight_turnover": 0.0
+              },
+              {
+                "group_number": 8,
+                "member_count": 1,
+                "period_return": 0.31000000000000005,
+                "cumulative_return": 0.5851,
+                "target_weight_turnover": 0.0
+              },
+              {
+                "group_number": 9,
+                "member_count": 1,
+                "period_return": 0.31099999999999994,
+                "cumulative_return": 0.5876209999999997,
+                "target_weight_turnover": 0.0
+              },
+              {
+                "group_number": 10,
+                "member_count": 1,
+                "period_return": 0.31199999999999983,
+                "cumulative_return": 0.5901439999999998,
+                "target_weight_turnover": 0.0
+              }
+            ],
+            "long_short_return": 0.010499999999999843,
+            "long_short_cumulative_spread": 0.026391749999999936
+          }
+        ]
+      }
+    ],
+    "coverage_days": [
+      {
+        "decision_date": "2026-07-03",
+        "status": "complete",
+        "coverage": {
+          "expected_count": 12,
+          "valid_count": 12,
+          "factor_missing_count": 0,
+          "return_missing_count": 0,
+          "factor_missing_by_reason": [],
+          "return_missing_by_reason": []
+        }
+      },
+      {
+        "decision_date": "2026-07-04",
+        "status": "complete",
+        "coverage": {
+          "expected_count": 12,
+          "valid_count": 12,
+          "factor_missing_count": 0,
+          "return_missing_count": 0,
+          "factor_missing_by_reason": [],
+          "return_missing_by_reason": []
+        }
+      }
+    ],
+    "neutralization": "none",
+    "neutralization_label": "无",
+    "context_basis_label": null,
+    "context_note": null,
+    "mad_multiple": null,
+    "extended_statistics": {
+      "ic_method": "rank",
+      "industry_status": "unavailable",
+      "industry_reason": "缺少可核验的行业来源，未生成行业 IC。",
+      "industry_summaries": [],
+      "industry_coverage_days": [],
+      "autocorrelation_points": [
+        {
+          "trade_date": "2026-07-03",
+          "previous_trade_date": null,
+          "common_count": 0,
+          "status": "first_period",
+          "value": null
+        },
+        {
+          "trade_date": "2026-07-04",
+          "previous_trade_date": "2026-07-03",
+          "common_count": 12,
+          "status": "ok",
+          "value": 1.0
+        }
+      ]
+    },
+    "daily_features": {
+      "source_sha256": "9b8c50aeb08a607c14a4cf17916aa4f7dff7fa5999ce1b538516113f659575cb",
+      "prepared_source_sha256": "6c9e7fdcc5fdf9c7ee001b3fa0a920a857e2607da2dcba05118d22dd022f2f84",
+      "prepared_snapshot_id": "a56c4583ada65644002d467c52b6d82472cedc8e1703f0580ae6fd3dd0b62084",
+      "prepared_binding_hash": "28bcbe71f586c09b912ce29e2b0f9627ff81cc3b3e23f084714ced5915cf739b",
+      "scope_content_hash": "1c9090870002df127f774542ad9b0d9ea35cad7cc90f5cb31ba012b5e903a551",
+      "code_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "fields": [
+        {
+          "column": "market_above_ma20_ratio_pct",
+          "table": "market_temperature_daily",
+          "name_zh": "20日均线上方占比",
+          "unit": "percent",
+          "description_zh": "全市场20日均线上方股票占比，百分比原值；前一完整SSE交易日，历史回顾。",
+          "value_semantics": "market_temperature_stored"
+        },
+        {
+          "column": "market_high_60d_ratio_pct",
+          "table": "market_temperature_daily",
+          "name_zh": "60日新高占比",
+          "unit": "percent",
+          "description_zh": "全市场60日新高股票占比，百分比原值；前一完整SSE交易日，历史回顾。",
+          "value_semantics": "market_temperature_stored"
+        }
+      ],
+      "source_mode": "historical_retrospective",
+      "value_semantics": "market_temperature_stored",
+      "price_basis": "field_specific",
+      "recursive_initialization": "field_specific",
+      "market_temperature": {
+        "policy": {
+          "version": "market-temperature-original-daily-v1",
+          "source_table": "market_sentiment_daily",
+          "unit": "percent",
+          "universe": "original_market_no_pool_recalculation",
+          "evaluation_clock": "previous_complete_sse_session_at_next_day_09:25",
+          "history_mode": "retrospective_no_row_first_observed_time",
+          "missing_policy": "explicit_reason_no_zero_or_neighbor_fallback",
+          "minimum_percentage": 0,
+          "maximum_percentage": 100
+        },
+        "row_count": 8,
+        "input_content_sha256": "74eda423fa55c77277936257d8becd042cbafba4898e94a18c6c5f837a154e82"
+      }
+    },
+    "daily_feature_coverage_days": [
+      {
+        "trade_date": "2026-07-03",
+        "panel_date": "2026-07-02",
+        "computation_stock_count": 12,
+        "counts": [
+          {
+            "column": "market_above_ma20_ratio_pct",
+            "valid": 12,
+            "missing": 0,
+            "null": 0,
+            "non_finite": 0
+          },
+          {
+            "column": "market_high_60d_ratio_pct",
+            "valid": 12,
+            "missing": 0,
+            "null": 0,
+            "non_finite": 0
+          }
+        ],
+        "market_temperature_values": [
+          {
+            "status": "valid",
+            "value": 99.0,
+            "column": "market_above_ma20_ratio_pct"
+          },
+          {
+            "status": "valid",
+            "value": 10.0,
+            "column": "market_high_60d_ratio_pct"
+          }
+        ]
+      },
+      {
+        "trade_date": "2026-07-04",
+        "panel_date": "2026-07-03",
+        "computation_stock_count": 12,
+        "counts": [
+          {
+            "column": "market_above_ma20_ratio_pct",
+            "valid": 12,
+            "missing": 0,
+            "null": 0,
+            "non_finite": 0
+          },
+          {
+            "column": "market_high_60d_ratio_pct",
+            "valid": 12,
+            "missing": 0,
+            "null": 0,
+            "non_finite": 0
+          }
+        ],
+        "market_temperature_values": [
+          {
+            "status": "valid",
+            "value": 98.0,
+            "column": "market_above_ma20_ratio_pct"
+          },
+          {
+            "status": "valid",
+            "value": 20.0,
+            "column": "market_high_60d_ratio_pct"
+          }
+        ]
+      }
+    ]
+  },
+  "null_research": {
+    "schema_version": 2,
+    "basis_label": "历史回溯研究；分组曲线不含撮合与交易费用。",
+    "pool_label": "全市场（沪深非 ST）",
+    "return_price_basis": "forward_adjusted",
+    "holding_sessions": 1,
+    "summary_status": "evaluated",
+    "ic_summary": {
+      "normal_ic": {
+        "status": "insufficient_samples",
+        "source_day_count": 2,
+        "valid_day_count": 1,
+        "insufficient_day_count": 1,
+        "zero_variance_day_count": 0,
+        "mean": 1.0,
+        "sample_std": null,
+        "ir": null,
+        "positive_rate": 1.0,
+        "strong_signal_rate": 1.0,
+        "t_value": null,
+        "p_value": null,
+        "skewness": null,
+        "excess_kurtosis": null
+      },
+      "rank_ic": {
+        "status": "insufficient_samples",
+        "source_day_count": 2,
+        "valid_day_count": 1,
+        "insufficient_day_count": 1,
+        "zero_variance_day_count": 0,
+        "mean": 1.0,
+        "sample_std": null,
+        "ir": null,
+        "positive_rate": 1.0,
+        "strong_signal_rate": 1.0,
+        "t_value": null,
+        "p_value": null,
+        "skewness": null,
+        "excess_kurtosis": null
+      }
+    },
+    "ic_points": [
+      {
+        "decision_date": "2026-07-03",
+        "normal_ic": {
+          "status": "insufficient_samples",
+          "value": null,
+          "source_sample_count": 0,
+          "effective_sample_count": 0
+        },
+        "rank_ic": {
+          "status": "insufficient_samples",
+          "value": null,
+          "source_sample_count": 0,
+          "effective_sample_count": 0
+        },
+        "normal_ic_cumulative_sum": null,
+        "rank_ic_cumulative_sum": null
+      },
+      {
+        "decision_date": "2026-07-04",
+        "normal_ic": {
+          "status": "ok",
+          "value": 1.0,
+          "source_sample_count": 12,
+          "effective_sample_count": 12
+        },
+        "rank_ic": {
+          "status": "ok",
+          "value": 1.0,
+          "source_sample_count": 12,
+          "effective_sample_count": 12
+        },
+        "normal_ic_cumulative_sum": 1.0,
+        "rank_ic_cumulative_sum": 1.0
+      }
+    ],
+    "decay_periods": [
+      {
+        "lag": 1,
+        "status": "evaluated",
+        "source_day_count": 2,
+        "valid_pair_count": 12,
+        "ic_summary": {
+          "normal_ic": {
+            "status": "insufficient_samples",
+            "source_day_count": 2,
+            "valid_day_count": 1,
+            "insufficient_day_count": 1,
+            "zero_variance_day_count": 0,
+            "mean": 1.0,
+            "sample_std": null,
+            "ir": null,
+            "positive_rate": 1.0,
+            "strong_signal_rate": 1.0,
+            "t_value": null,
+            "p_value": null,
+            "skewness": null,
+            "excess_kurtosis": null
+          },
+          "rank_ic": {
+            "status": "insufficient_samples",
+            "source_day_count": 2,
+            "valid_day_count": 1,
+            "insufficient_day_count": 1,
+            "zero_variance_day_count": 0,
+            "mean": 1.0,
+            "sample_std": null,
+            "ir": null,
+            "positive_rate": 1.0,
+            "strong_signal_rate": 1.0,
+            "t_value": null,
+            "p_value": null,
+            "skewness": null,
+            "excess_kurtosis": null
+          }
+        }
+      },
+      {
+        "lag": 2,
+        "status": "no_valid_days",
+        "source_day_count": 1,
+        "valid_pair_count": 0,
+        "ic_summary": {
+          "normal_ic": {
+            "status": "no_valid_days",
+            "source_day_count": 1,
+            "valid_day_count": 0,
+            "insufficient_day_count": 1,
+            "zero_variance_day_count": 0,
+            "mean": null,
+            "sample_std": null,
+            "ir": null,
+            "positive_rate": null,
+            "strong_signal_rate": null,
+            "t_value": null,
+            "p_value": null,
+            "skewness": null,
+            "excess_kurtosis": null
+          },
+          "rank_ic": {
+            "status": "no_valid_days",
+            "source_day_count": 1,
+            "valid_day_count": 0,
+            "insufficient_day_count": 1,
+            "zero_variance_day_count": 0,
+            "mean": null,
+            "sample_std": null,
+            "ir": null,
+            "positive_rate": null,
+            "strong_signal_rate": null,
+            "t_value": null,
+            "p_value": null,
+            "skewness": null,
+            "excess_kurtosis": null
+          }
+        }
+      },
+      {
+        "lag": 3,
+        "status": "no_target_period",
+        "source_day_count": 0,
+        "valid_pair_count": 0,
+        "ic_summary": null
+      },
+      {
+        "lag": 4,
+        "status": "no_target_period",
+        "source_day_count": 0,
+        "valid_pair_count": 0,
+        "ic_summary": null
+      },
+      {
+        "lag": 5,
+        "status": "no_target_period",
+        "source_day_count": 0,
+        "valid_pair_count": 0,
+        "ic_summary": null
+      },
+      {
+        "lag": 6,
+        "status": "no_target_period",
+        "source_day_count": 0,
+        "valid_pair_count": 0,
+        "ic_summary": null
+      },
+      {
+        "lag": 7,
+        "status": "no_target_period",
+        "source_day_count": 0,
+        "valid_pair_count": 0,
+        "ic_summary": null
+      },
+      {
+        "lag": 8,
+        "status": "no_target_period",
+        "source_day_count": 0,
+        "valid_pair_count": 0,
+        "ic_summary": null
+      },
+      {
+        "lag": 9,
+        "status": "no_target_period",
+        "source_day_count": 0,
+        "valid_pair_count": 0,
+        "ic_summary": null
+      },
+      {
+        "lag": 10,
+        "status": "no_target_period",
+        "source_day_count": 0,
+        "valid_pair_count": 0,
+        "ic_summary": null
+      }
+    ],
+    "portfolio_status": "available_partial",
+    "portfolio_days": [
+      {
+        "decision_date": "2026-07-03",
+        "groupings": [
+          {
+            "group_count": 3,
+            "status": "insufficient_samples",
+            "cumulative_status": "gap",
+            "source_sample_count": 0,
+            "effective_sample_count": 0,
+            "groups": [],
+            "long_short_return": null,
+            "long_short_cumulative_spread": null
+          },
+          {
+            "group_count": 5,
+            "status": "insufficient_samples",
+            "cumulative_status": "gap",
+            "source_sample_count": 0,
+            "effective_sample_count": 0,
+            "groups": [],
+            "long_short_return": null,
+            "long_short_cumulative_spread": null
+          },
+          {
+            "group_count": 10,
+            "status": "insufficient_samples",
+            "cumulative_status": "gap",
+            "source_sample_count": 0,
+            "effective_sample_count": 0,
+            "groups": [],
+            "long_short_return": null,
+            "long_short_cumulative_spread": null
+          }
+        ]
+      },
+      {
+        "decision_date": "2026-07-04",
+        "groupings": [
+          {
+            "group_count": 3,
+            "status": "ok",
+            "cumulative_status": "gap",
+            "source_sample_count": 12,
+            "effective_sample_count": 12,
+            "groups": [
+              {
+                "group_number": 1,
+                "member_count": 4,
+                "period_return": 0.30249999999999994,
+                "cumulative_return": null,
+                "target_weight_turnover": null
+              },
+              {
+                "group_number": 2,
+                "member_count": 4,
+                "period_return": 0.30650000000000005,
+                "cumulative_return": null,
+                "target_weight_turnover": null
+              },
+              {
+                "group_number": 3,
+                "member_count": 4,
+                "period_return": 0.31049999999999994,
+                "cumulative_return": null,
+                "target_weight_turnover": null
+              }
+            ],
+            "long_short_return": 0.008000000000000007,
+            "long_short_cumulative_spread": null
+          },
+          {
+            "group_count": 5,
+            "status": "ok",
+            "cumulative_status": "gap",
+            "source_sample_count": 12,
+            "effective_sample_count": 12,
+            "groups": [
+              {
+                "group_number": 1,
+                "member_count": 3,
+                "period_return": 0.302,
+                "cumulative_return": null,
+                "target_weight_turnover": null
+              },
+              {
+                "group_number": 2,
+                "member_count": 3,
+                "period_return": 0.30500000000000005,
+                "cumulative_return": null,
+                "target_weight_turnover": null
+              },
+              {
+                "group_number": 3,
+                "member_count": 2,
+                "period_return": 0.3075,
+                "cumulative_return": null,
+                "target_weight_turnover": null
+              },
+              {
+                "group_number": 4,
+                "member_count": 2,
+                "period_return": 0.3095,
+                "cumulative_return": null,
+                "target_weight_turnover": null
+              },
+              {
+                "group_number": 5,
+                "member_count": 2,
+                "period_return": 0.3114999999999999,
+                "cumulative_return": null,
+                "target_weight_turnover": null
+              }
+            ],
+            "long_short_return": 0.009499999999999897,
+            "long_short_cumulative_spread": null
+          },
+          {
+            "group_count": 10,
+            "status": "ok",
+            "cumulative_status": "gap",
+            "source_sample_count": 12,
+            "effective_sample_count": 12,
+            "groups": [
+              {
+                "group_number": 1,
+                "member_count": 2,
+                "period_return": 0.3015,
+                "cumulative_return": null,
+                "target_weight_turnover": null
+              },
+              {
+                "group_number": 2,
+                "member_count": 2,
+                "period_return": 0.3034999999999999,
+                "cumulative_return": null,
+                "target_weight_turnover": null
+              },
+              {
+                "group_number": 3,
+                "member_count": 1,
+                "period_return": 0.30500000000000016,
+                "cumulative_return": null,
+                "target_weight_turnover": null
+              },
+              {
+                "group_number": 4,
+                "member_count": 1,
+                "period_return": 0.30600000000000005,
+                "cumulative_return": null,
+                "target_weight_turnover": null
+              },
+              {
+                "group_number": 5,
+                "member_count": 1,
+                "period_return": 0.30699999999999994,
+                "cumulative_return": null,
+                "target_weight_turnover": null
+              },
+              {
+                "group_number": 6,
+                "member_count": 1,
+                "period_return": 0.30800000000000005,
+                "cumulative_return": null,
+                "target_weight_turnover": null
+              },
+              {
+                "group_number": 7,
+                "member_count": 1,
+                "period_return": 0.30899999999999994,
+                "cumulative_return": null,
+                "target_weight_turnover": null
+              },
+              {
+                "group_number": 8,
+                "member_count": 1,
+                "period_return": 0.31000000000000005,
+                "cumulative_return": null,
+                "target_weight_turnover": null
+              },
+              {
+                "group_number": 9,
+                "member_count": 1,
+                "period_return": 0.31099999999999994,
+                "cumulative_return": null,
+                "target_weight_turnover": null
+              },
+              {
+                "group_number": 10,
+                "member_count": 1,
+                "period_return": 0.31199999999999983,
+                "cumulative_return": null,
+                "target_weight_turnover": null
+              }
+            ],
+            "long_short_return": 0.010499999999999843,
+            "long_short_cumulative_spread": null
+          }
+        ]
+      }
+    ],
+    "coverage_days": [
+      {
+        "decision_date": "2026-07-03",
+        "status": "no_samples",
+        "coverage": {
+          "expected_count": 12,
+          "valid_count": 0,
+          "factor_missing_count": 12,
+          "return_missing_count": 0,
+          "factor_missing_by_reason": [
+            {
+              "reason": "missing_value",
+              "count": 12
+            }
+          ],
+          "return_missing_by_reason": []
+        }
+      },
+      {
+        "decision_date": "2026-07-04",
+        "status": "complete",
+        "coverage": {
+          "expected_count": 12,
+          "valid_count": 12,
+          "factor_missing_count": 0,
+          "return_missing_count": 0,
+          "factor_missing_by_reason": [],
+          "return_missing_by_reason": []
+        }
+      }
+    ],
+    "neutralization": "none",
+    "neutralization_label": "无",
+    "context_basis_label": null,
+    "context_note": null,
+    "mad_multiple": null,
+    "extended_statistics": {
+      "ic_method": "rank",
+      "industry_status": "unavailable",
+      "industry_reason": "缺少可核验的行业来源，未生成行业 IC。",
+      "industry_summaries": [],
+      "industry_coverage_days": [],
+      "autocorrelation_points": [
+        {
+          "trade_date": "2026-07-03",
+          "previous_trade_date": null,
+          "common_count": 0,
+          "status": "first_period",
+          "value": null
+        },
+        {
+          "trade_date": "2026-07-04",
+          "previous_trade_date": "2026-07-03",
+          "common_count": 0,
+          "status": "no_common_members",
+          "value": null
+        }
+      ]
+    },
+    "daily_features": {
+      "source_sha256": "6977c75e1043c5316c69d5ca127e342abee224af0d947e3688287c8e847e9ea7",
+      "prepared_source_sha256": "6f89c8df208cafa7540dd5fd1baac99f9e0aba491e7ac48dd8d8517f73ff3d20",
+      "prepared_snapshot_id": "ab6872072808e71456976d55c4e987c658c1c120ee3e8c975b4a33ef47884739",
+      "prepared_binding_hash": "e41c7edce2488f069e8cb51b53790a0cab56d45811c8ed8851c1afcacb5ed96b",
+      "scope_content_hash": "1c9090870002df127f774542ad9b0d9ea35cad7cc90f5cb31ba012b5e903a551",
+      "code_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "fields": [
+        {
+          "column": "market_above_ma20_ratio_pct",
+          "table": "market_temperature_daily",
+          "name_zh": "20日均线上方占比",
+          "unit": "percent",
+          "description_zh": "全市场20日均线上方股票占比，百分比原值；前一完整SSE交易日，历史回顾。",
+          "value_semantics": "market_temperature_stored"
+        },
+        {
+          "column": "market_high_60d_ratio_pct",
+          "table": "market_temperature_daily",
+          "name_zh": "60日新高占比",
+          "unit": "percent",
+          "description_zh": "全市场60日新高股票占比，百分比原值；前一完整SSE交易日，历史回顾。",
+          "value_semantics": "market_temperature_stored"
+        }
+      ],
+      "source_mode": "historical_retrospective",
+      "value_semantics": "market_temperature_stored",
+      "price_basis": "field_specific",
+      "recursive_initialization": "field_specific",
+      "market_temperature": {
+        "policy": {
+          "version": "market-temperature-original-daily-v1",
+          "source_table": "market_sentiment_daily",
+          "unit": "percent",
+          "universe": "original_market_no_pool_recalculation",
+          "evaluation_clock": "previous_complete_sse_session_at_next_day_09:25",
+          "history_mode": "retrospective_no_row_first_observed_time",
+          "missing_policy": "explicit_reason_no_zero_or_neighbor_fallback",
+          "minimum_percentage": 0,
+          "maximum_percentage": 100
+        },
+        "row_count": 8,
+        "input_content_sha256": "512f15fe83fe7944b34a1ad5190514bd8124737f7bb49b7a6a3f856f82ba1810"
+      }
+    },
+    "daily_feature_coverage_days": [
+      {
+        "trade_date": "2026-07-03",
+        "panel_date": "2026-07-02",
+        "computation_stock_count": 12,
+        "counts": [
+          {
+            "column": "market_above_ma20_ratio_pct",
+            "valid": 0,
+            "missing": 0,
+            "null": 12,
+            "non_finite": 0,
+            "market_reasons": [
+              {
+                "reason": "market_temperature_null",
+                "count": 12
+              }
+            ]
+          },
+          {
+            "column": "market_high_60d_ratio_pct",
+            "valid": 12,
+            "missing": 0,
+            "null": 0,
+            "non_finite": 0
+          }
+        ],
+        "market_temperature_values": [
+          {
+            "status": "null",
+            "value": null,
+            "reason": "market_temperature_null",
+            "column": "market_above_ma20_ratio_pct"
+          },
+          {
+            "status": "valid",
+            "value": 10.0,
+            "column": "market_high_60d_ratio_pct"
+          }
+        ]
+      },
+      {
+        "trade_date": "2026-07-04",
+        "panel_date": "2026-07-03",
+        "computation_stock_count": 12,
+        "counts": [
+          {
+            "column": "market_above_ma20_ratio_pct",
+            "valid": 12,
+            "missing": 0,
+            "null": 0,
+            "non_finite": 0
+          },
+          {
+            "column": "market_high_60d_ratio_pct",
+            "valid": 12,
+            "missing": 0,
+            "null": 0,
+            "non_finite": 0
+          }
+        ],
+        "market_temperature_values": [
+          {
+            "status": "valid",
+            "value": 98.0,
+            "column": "market_above_ma20_ratio_pct"
+          },
+          {
+            "status": "valid",
+            "value": 20.0,
+            "column": "market_high_60d_ratio_pct"
+          }
+        ]
+      }
+    ]
+  }
+}
