@@ -160,11 +160,13 @@ def _apply_price_basis(df: pd.DataFrame, basis: PriceFactorBasis) -> pd.DataFram
     if not basis.available:
         raise ValueError("cannot adjust prices with an unavailable basis")
     out = df.copy()
-    out["trade_date_obj"] = out["trade_date"].apply(_as_date)
-    out["basis_ratio"] = out["trade_date_obj"].map(basis.ratio_by_date())
+    trade_dates = out["trade_date"].apply(_as_date)
+    basis_ratios = trade_dates.map(basis.ratio_by_date())
     for col in ["open", "high", "low", "close", "pre_close"]:
-        out[col] = pd.to_numeric(out[col], errors="coerce") * out["basis_ratio"]
-    return out.drop(columns=["trade_date_obj", "basis_ratio"])
+        out[col] = pd.to_numeric(out[col], errors="coerce") * basis_ratios
+    # Preserve cleanup for frames that already contain the legacy auxiliary labels.
+    legacy_columns = [column for column in ("trade_date_obj", "basis_ratio") if column in out]
+    return out.drop(columns=legacy_columns) if legacy_columns else out
 
 
 def _basis_diagnostic(
