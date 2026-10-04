@@ -40,6 +40,7 @@ class DailyFactorField(BaseModel):
             "stock_features_derived",
             "minute_features_derived",
             "market_temperature_stored",
+            "auction_derived",
         ]
         | None
     ) = Field(default=None, exclude_if=lambda v: v is None)
@@ -74,6 +75,7 @@ class DailyFactorCapabilities(BaseModel):
         "daily_stock_v1",
         "daily_minute_v1",
         "daily_market_temperature_v1",
+        "daily_auction_v1",
     ]
     source_mode: Literal["historical_retrospective"]
     fields: tuple[DailyFactorField, ...] = Field(min_length=1)
@@ -172,6 +174,8 @@ def historical_daily_capabilities(
     minute_base_daily_available: bool = False,
     market_temperature_available: bool = False,
     market_temperature_base_daily_available: bool = False,
+    auction_available: bool = False,
+    auction_base_daily_available: bool = False,
 ) -> DailyFactorCapabilities:
     enabled = tuple(
         name
@@ -187,6 +191,7 @@ def historical_daily_capabilities(
         or stock_features_available
         or minute_features_available
         or market_temperature_available
+        or auction_available
     ) and not daily_features_available:
         raise ValueError("derived capability requires a verified daily source")
     if stock_base_daily_available and not stock_features_available:
@@ -197,8 +202,11 @@ def historical_daily_capabilities(
         raise ValueError("minute base capability requires minute features")
     if market_temperature_base_daily_available and not market_temperature_available:
         raise ValueError("market temperature base capability requires market temperature")
+    if auction_base_daily_available and not auction_available:
+        raise ValueError("auction base capability requires auction source")
     if daily_features_available:
         from rquant.factor.daily_feature_source import (
+            AUCTION_FIELDS,
             DERIVED_DAILY_FIELDS,
             MARKET_TEMPERATURE_FIELDS,
             MINUTE_FEATURE_FIELDS,
@@ -211,6 +219,7 @@ def historical_daily_capabilities(
             if (not minute_features_available or minute_base_daily_available)
             and (not stock_features_available or stock_base_daily_available)
             and (not market_temperature_available or market_temperature_base_daily_available)
+            and (not auction_available or auction_base_daily_available)
             else ()
         )
         catalog = (
@@ -218,6 +227,7 @@ def historical_daily_capabilities(
             + (STOCK_FEATURE_FIELDS if stock_features_available else ())
             + (MINUTE_FEATURE_FIELDS if minute_features_available else ())
             + (MARKET_TEMPERATURE_FIELDS if market_temperature_available else ())
+            + (AUCTION_FIELDS if auction_available else ())
         )
         fields += tuple(
             DailyFactorField(
@@ -233,7 +243,9 @@ def historical_daily_capabilities(
     return DailyFactorCapabilities.model_validate(
         {
             **HISTORICAL_DAILY_V1.model_dump(),
-            "version": "daily_market_temperature_v1"
+            "version": "daily_auction_v1"
+            if auction_available
+            else "daily_market_temperature_v1"
             if market_temperature_available
             else "daily_minute_v1"
             if minute_features_available
