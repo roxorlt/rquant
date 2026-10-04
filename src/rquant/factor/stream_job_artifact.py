@@ -20,8 +20,10 @@ from typing import Literal
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
 from rquant.factor.daily_feature_source import (
+    MARKET_TEMPERATURE_COLUMNS,
     FactorDailyFeatureCounts,
     FactorDailyFeatureSources,
+    FactorMarketTemperatureDayValue,
     open_factor_daily_feature_source,
     read_factor_daily_feature_input,
 )
@@ -164,7 +166,10 @@ class FactorDailyFeatureCoverageDay(BaseModel):
     trade_date: date
     panel_date: date
     computation_stock_count: int = Field(ge=1, le=7000)
-    counts: tuple[FactorDailyFeatureCounts, ...] = Field(min_length=1, max_length=50)
+    counts: tuple[FactorDailyFeatureCounts, ...] = Field(min_length=1, max_length=52)
+    market_temperature_values: tuple[FactorMarketTemperatureDayValue, ...] | None = Field(
+        default=None, min_length=1, max_length=2, exclude_if=lambda v: v is None
+    )
 
     @model_validator(mode="after")
     def _grid(self) -> FactorDailyFeatureCoverageDay:
@@ -173,6 +178,13 @@ class FactorDailyFeatureCoverageDay(BaseModel):
             for c in self.counts
         ):
             raise ValueError("display stored daily coverage differs from code grid")
+        market = tuple(c for c in self.counts if c.column in MARKET_TEMPERATURE_COLUMNS)
+        values = self.market_temperature_values or ()
+        if tuple(v.column for v in values) != tuple(c.column for c in market) or any(
+            getattr(c, v.status) != self.computation_stock_count
+            for c, v in zip(market, values, strict=True)
+        ):
+            raise ValueError("display market daily values differ from broadcast coverage")
         return self
 
 
@@ -430,6 +442,7 @@ def project_factor_stream_display(full: FactorStreamFullArtifact) -> FactorStrea
                 panel_date=day.panel_date,
                 computation_stock_count=len(request.source.scope.stock_codes),
                 counts=day.daily_feature_counts,
+                market_temperature_values=day.market_temperature_values,
             )
             for day in result.research.research.adapter_completion.feature_days
             if day.trade_date in request.evaluation_days
@@ -624,6 +637,7 @@ def verify_factor_stream_artifacts(
                     if (
                         original.sha256 != feature.daily_feature_input_sha256
                         or original.counts != feature.daily_feature_counts
+                        or original.market_temperature_values != feature.market_temperature_values
                     ):
                         raise ValueError(
                             "completed stored daily inputs differ from sealed original values"
@@ -678,6 +692,8 @@ def verify_factor_stream_artifacts(
                             if (
                                 original.sha256 != feature.daily_feature_input_sha256
                                 or original.counts != feature.daily_feature_counts
+                                or original.market_temperature_values
+                                != feature.market_temperature_values
                             ):
                                 raise ValueError(
                                     "completed stored daily inputs "

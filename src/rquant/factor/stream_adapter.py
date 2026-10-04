@@ -15,11 +15,13 @@ from typing import Literal, cast
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from rquant.factor.daily_feature_source import (
+    MARKET_TEMPERATURE_COLUMNS,
     FactorDailyFeatureCounts,
     FactorDailyFeatureInput,
     FactorDailyFeatureReadLease,
     FactorDailyFeatureSource,
     FactorDailyFeatureSources,
+    FactorMarketTemperatureDayValue,
     read_factor_daily_feature_input,
 )
 from rquant.factor.daily_stream import (
@@ -164,13 +166,27 @@ class FactorStreamFeatureDayReceipt(BaseModel):
     panel_date: date
     input_sha256: Sha256
     raw_sha256: Sha256
-    missing_observation_count: int = Field(ge=0, le=315_000)
-    known_null_count: int = Field(ge=0, le=315_000)
+    missing_observation_count: int = Field(ge=0, le=7000 * 58)
+    known_null_count: int = Field(ge=0, le=7000 * 58)
     context_input_sha256: Sha256 | None = Field(default=None, exclude_if=lambda v: v is None)
     daily_feature_input_sha256: Sha256 | None = Field(default=None, exclude_if=lambda v: v is None)
     daily_feature_counts: tuple[FactorDailyFeatureCounts, ...] | None = Field(
-        default=None, max_length=50, exclude_if=lambda v: v is None
+        default=None, max_length=52, exclude_if=lambda v: v is None
     )
+    market_temperature_values: tuple[FactorMarketTemperatureDayValue, ...] | None = Field(
+        default=None, min_length=1, max_length=2, exclude_if=lambda v: v is None
+    )
+
+    @model_validator(mode="after")
+    def _market_columns(self) -> FactorStreamFeatureDayReceipt:
+        market = tuple(
+            c.column
+            for c in self.daily_feature_counts or ()
+            if c.column in MARKET_TEMPERATURE_COLUMNS
+        )
+        if tuple(v.column for v in self.market_temperature_values or ()) != market:
+            raise ValueError("market day values differ from selected daily coverage fields")
+        return self
 
 
 class FactorStreamReturnDayReceipt(BaseModel):
@@ -218,6 +234,15 @@ class FactorStreamAdapterCompletion(BaseModel):
     def _receipt_digest(self) -> FactorStreamAdapterCompletion:
         if self.processed_days != len(self.feature_days):
             raise ValueError("adapter completion count differs from feature schedule")
+        market_queries = int(
+            self.daily_features is not None and self.daily_features.market_temperature is not None
+        )
+        stock_queries = (
+            (len(self.admission.scope.stock_codes) + 499) // 500
+            if self.daily_features is not None
+            and any(f.column not in MARKET_TEMPERATURE_COLUMNS for f in self.daily_features.fields)
+            else 0
+        )
         if (
             (self.daily_features is None) != (self.daily_feature_read_query_count is None)
             or any(
@@ -231,7 +256,7 @@ class FactorStreamAdapterCompletion(BaseModel):
                 or self.daily_features.prepared_binding_hash != self.admission.binding_hash
                 or self.daily_features.scope_content_hash != self.admission.scope_content_hash
                 or self.daily_feature_read_query_count
-                != self.processed_days * ((len(self.admission.scope.stock_codes) + 499) // 500)
+                != self.processed_days * (market_queries + stock_queries)
             )
         ):
             raise ValueError("stored daily completion differs from complete daily grid")
@@ -606,9 +631,7 @@ class FactorStreamAdapter(Iterator[FactorFormulaStreamBatch]):
                     stored_values = {
                         (row.stock_code, field.column): value
                         for row in stored_input.rows
-                        for field, value in zip(
-                            stored_input.sources.fields, row.values, strict=True
-                        )
+                        for field, value in zip(stored_input.stock_fields, row.values, strict=True)
                     }
                     raw_sha = canonical_sha256((raw_sha, stored_input.sha256))
                     self._current_daily_features = (
@@ -618,8 +641,10 @@ class FactorStreamAdapter(Iterator[FactorFormulaStreamBatch]):
                 for code in self.request.formula.computation_stock_codes:
                     bar = bars.get((panel, code))
                     for column in self.request.formula.definition.dependency_columns:
-                        if (code, column) in stored_values:
-                            fact = stored_values[code, column]
+                        fact = stored_values.get((code, column))
+                        if fact is None and stored_input is not None:
+                            fact = stored_input.market_value(column)
+                        if fact is not None:
                             value = fact.value
                             state = (
                                 "value"
@@ -685,6 +710,9 @@ class FactorStreamAdapter(Iterator[FactorFormulaStreamBatch]):
                         if stored_input is None
                         else stored_input.sha256,
                         daily_feature_counts=None if stored_input is None else stored_input.counts,
+                        market_temperature_values=None
+                        if stored_input is None
+                        else stored_input.market_temperature_values,
                         context_input_sha256=None
                         if batch.context is None
                         else batch.context.sha256,
