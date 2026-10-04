@@ -168,6 +168,14 @@ class FactorFormulaStreamRequest(BaseModel):
                 industry_available=industry,
                 market_cap_available=cap,
                 daily_features_available=self.sources.daily_features is not None,
+                volume_profile_available=self.sources.daily_features is not None
+                and self.sources.daily_features.volume_profile is not None,
+                volume_profile_base_daily_available=self.sources.daily_features is not None
+                and self.sources.daily_features.volume_profile is not None
+                and any(
+                    f.table in ("daily_indicator", "daily_basic")
+                    for f in self.sources.daily_features.fields
+                ),
                 auction_available=self.sources.daily_features is not None
                 and self.sources.daily_features.auction is not None,
                 auction_base_daily_available=self.sources.daily_features is not None
@@ -215,6 +223,7 @@ class FactorFormulaStreamRequest(BaseModel):
                     self.sources.daily_features.minute_features is not None
                     or self.sources.daily_features.market_temperature is not None
                     or self.sources.daily_features.auction is not None
+                    or self.sources.daily_features.volume_profile is not None
                 )
                 else self.definition
             )

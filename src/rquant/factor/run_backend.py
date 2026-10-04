@@ -90,6 +90,14 @@ class FactorRunPageControlBackend:
                 industry_available=present[0],
                 market_cap_available=present[1],
                 daily_features_available=stored,
+                volume_profile_available=stored
+                and loaded.daily_features.volume_profile is not None,
+                volume_profile_base_daily_available=stored
+                and loaded.daily_features.volume_profile is not None
+                and any(
+                    f.table in ("daily_indicator", "daily_basic")
+                    for f in loaded.daily_features.fields
+                ),
                 auction_available=stored and loaded.daily_features.auction is not None,
                 auction_base_daily_available=stored
                 and loaded.daily_features.auction is not None

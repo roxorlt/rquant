@@ -92,6 +92,8 @@ class FactorTrackingPageControlBackend:
                         minute_base_daily_available=True,
                         market_temperature_available=True,
                         market_temperature_base_daily_available=True,
+                        volume_profile_available=True,
+                        volume_profile_base_daily_available=True,
                         auction_available=True,
                         auction_base_daily_available=True,
                     ).fields

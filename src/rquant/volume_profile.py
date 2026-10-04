@@ -4,14 +4,16 @@ from __future__ import annotations
 
 from datetime import date, datetime, time
 from decimal import ROUND_FLOOR, ROUND_HALF_UP, Decimal
-from typing import Literal, Self
+from typing import TYPE_CHECKING, Literal, Self
 
 import pandas as pd
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from rquant.paper import PaperRiskPlan
 from rquant.price_adjustment import PriceFactorBasis, resolve_price_factor_basis
-from rquant.storage.duckdb import DuckDBStore
+
+if TYPE_CHECKING:
+    from rquant.storage.duckdb import DuckDBStore
 
 
 class VolumeProfile(BaseModel):
@@ -288,6 +290,39 @@ def calculate_volume_profile_outcome(
     if minutes.empty:
         return VolumeProfileCalculation(status="no_data", reason="missing_minute_data")
 
+    minute_dates = set(pd.to_datetime(minutes["trade_time"]).dt.date.tolist())
+    price_basis = _adj_factor_basis(
+        store,
+        ts_code,
+        required_dates=minute_dates,
+        reference_date=reference_date,
+    )
+    return calculate_volume_profile_from_minutes(
+        ts_code,
+        reference_date=reference_date,
+        lookback_days=lookback_days,
+        dates=dates,
+        ref_price=ref_price,
+        minutes=minutes,
+        price_basis=price_basis,
+        bin_pct=bin_pct,
+        bin_ratio=bin_ratio,
+    )
+
+
+def calculate_volume_profile_from_minutes(
+    ts_code: str,
+    *,
+    reference_date: date,
+    lookback_days: int,
+    dates: list[date],
+    ref_price: float,
+    minutes: pd.DataFrame,
+    price_basis: PriceFactorBasis,
+    bin_pct: float = 0.005,
+    bin_ratio: float | None = None,
+) -> VolumeProfileCalculation:
+    """原分钟计算核；输入由调用者按原日期窗口和参考基准提供。"""
     payload = minutes.copy()
     vol = pd.to_numeric(payload["vol"], errors="coerce").fillna(0.0)
     amount = pd.to_numeric(payload["amount"], errors="coerce").fillna(0.0)
@@ -298,22 +333,13 @@ def calculate_volume_profile_outcome(
         amount.loc[valid_trade_amount] / vol.loc[valid_trade_amount]
     )
     payload["trade_date"] = pd.to_datetime(payload["trade_time"]).dt.date
-    minute_dates = set(payload["trade_date"].tolist())
-    price_basis = _adj_factor_basis(
-        store,
-        ts_code,
-        required_dates=minute_dates,
-        reference_date=reference_date,
-    )
     if not price_basis.available:
         return VolumeProfileCalculation(
             status="price_basis_unavailable",
             reason=price_basis.unavailable_reason,
             price_basis=price_basis,
         )
-    payload["basis_ratio"] = payload["trade_date"].map(
-        price_basis.ratio_by_date()
-    )
+    payload["basis_ratio"] = payload["trade_date"].map(price_basis.ratio_by_date())
     if payload["basis_ratio"].isna().any():
         return VolumeProfileCalculation(
             status="invalid_data",
@@ -323,9 +349,7 @@ def calculate_volume_profile_outcome(
     payload["qfq_price"] = payload["raw_trade_price"] * payload["basis_ratio"]
     payload["comparable_volume"] = vol / payload["basis_ratio"]
     bin_size = _resolve_bin_size(ref_price, bin_pct=bin_pct, bin_ratio=bin_ratio)
-    payload["price_bin"] = (
-        (payload["qfq_price"] / bin_size).round() * bin_size
-    ).round(2)
+    payload["price_bin"] = ((payload["qfq_price"] / bin_size).round() * bin_size).round(2)
     bins = (
         payload.groupby("price_bin", as_index=False)
         .agg(
@@ -346,9 +370,7 @@ def calculate_volume_profile_outcome(
             reason="non_positive_profile_totals",
             price_basis=price_basis,
         )
-    adjusted_vwap = float(
-        (payload["qfq_price"] * payload["comparable_volume"]).sum()
-    ) / total_vol
+    adjusted_vwap = float((payload["qfq_price"] * payload["comparable_volume"]).sum()) / total_vol
 
     # POC 与价值区共用同一套并列裁决，保证 value_low ≤ poc_price ≤ value_high 恒成立
     bin_prices = [float(value) for value in bins["price_bin"]]
@@ -360,18 +382,12 @@ def calculate_volume_profile_outcome(
         reference_price=ref_price,
     )
     top5_volume = float(
-        bins.sort_values("comparable_volume", ascending=False)
-        .head(5)["comparable_volume"]
-        .sum()
+        bins.sort_values("comparable_volume", ascending=False).head(5)["comparable_volume"].sum()
     )
     below_amount = float(bins.loc[bins["price_bin"] < ref_price, "amount"].sum())
     above_amount = float(bins.loc[bins["price_bin"] > ref_price, "amount"].sum())
-    below_volume = float(
-        bins.loc[bins["price_bin"] < ref_price, "comparable_volume"].sum()
-    )
-    above_volume = float(
-        bins.loc[bins["price_bin"] > ref_price, "comparable_volume"].sum()
-    )
+    below_volume = float(bins.loc[bins["price_bin"] < ref_price, "comparable_volume"].sum())
+    above_volume = float(bins.loc[bins["price_bin"] > ref_price, "comparable_volume"].sum())
 
     return VolumeProfileCalculation(
         status="available",
@@ -504,18 +520,15 @@ def build_volume_profile_risk_plan(
             payload={"reject_reason": "missing_volume_profile"},
         )
 
-    reclaimed_poc_count = sum(
-        1 for profile in valid_profiles if entry_price >= profile.poc_price
-    )
+    reclaimed_poc_count = sum(1 for profile in valid_profiles if entry_price >= profile.poc_price)
     lookbacks_used = [profile.lookback_days for profile in valid_profiles]
     payload: dict[str, object] = {
         "lookbacks_used": lookbacks_used,
         "reclaimed_poc_count": reclaimed_poc_count,
         "profiles_count": len(valid_profiles),
     }
-    if (
-        config.filter_entry
-        and reclaimed_poc_count < min(config.min_reclaimed_poc_count, len(valid_profiles))
+    if config.filter_entry and reclaimed_poc_count < min(
+        config.min_reclaimed_poc_count, len(valid_profiles)
     ):
         payload["reject_reason"] = "below_major_poc"
         return PaperRiskPlan(
@@ -545,19 +558,17 @@ def build_volume_profile_risk_plan(
     )
     min_target_price = entry_price * (1 + config.min_take_profit_pct)
     close_resistance = next(
-        (
-            (basis, price)
-            for basis, price in resistances
-            if entry_price < price < min_target_price
-        ),
+        ((basis, price) for basis, price in resistances if entry_price < price < min_target_price),
         None,
     )
     if config.filter_entry and close_resistance is not None:
-        payload.update({
-            "reject_reason": "overhead_resistance_too_close",
-            "resistance_basis": close_resistance[0],
-            "resistance_price": close_resistance[1],
-        })
+        payload.update(
+            {
+                "reject_reason": "overhead_resistance_too_close",
+                "resistance_basis": close_resistance[0],
+                "resistance_price": close_resistance[1],
+            }
+        )
         return PaperRiskPlan(
             entry_allowed=False,
             reject_reason="overhead_resistance_too_close",
@@ -578,14 +589,16 @@ def build_volume_profile_risk_plan(
     risk = entry_price - capped_stop
     reward = take_profit_price - entry_price
     reward_risk = reward / risk if risk > 0 else 0
-    payload.update({
-        "support_basis": support_basis,
-        "support_price": _round_price(support_stop),
-        "stop_loss_price": _round_price(capped_stop),
-        "take_profit_basis": take_profit_basis,
-        "take_profit_price": _round_price(take_profit_price),
-        "reward_risk": round(reward_risk, 4),
-    })
+    payload.update(
+        {
+            "support_basis": support_basis,
+            "support_price": _round_price(support_stop),
+            "stop_loss_price": _round_price(capped_stop),
+            "take_profit_basis": take_profit_basis,
+            "take_profit_price": _round_price(take_profit_price),
+            "reward_risk": round(reward_risk, 4),
+        }
+    )
     if config.filter_entry and reward_risk < config.min_reward_risk:
         payload["reject_reason"] = "reward_risk_too_low"
         return PaperRiskPlan(
