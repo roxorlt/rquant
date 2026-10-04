@@ -92,6 +92,8 @@ class FactorTrackingPageControlBackend:
                         minute_base_daily_available=True,
                         market_temperature_available=True,
                         market_temperature_base_daily_available=True,
+                        auction_available=True,
+                        auction_base_daily_available=True,
                     ).fields
                     if field.column not in ("open", "high", "low", "close", "vol", "amount")
                     and field.column in record.definition.dependency_columns

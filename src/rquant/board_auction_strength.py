@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import statistics
 from datetime import date, datetime, time, timedelta
+from typing import TYPE_CHECKING
 
 import pandas as pd
 from loguru import logger
@@ -21,7 +22,9 @@ from rquant.pit_visibility import (
     VisibilityQueryScope,
     query_visible_rows,
 )
-from rquant.storage.duckdb import DuckDBStore
+
+if TYPE_CHECKING:
+    from rquant.storage.duckdb import DuckDBStore
 
 _AUCTION_TYPE = "open_realtime"
 
@@ -101,10 +104,14 @@ def _board_members(
             columns=("board_code", "con_code", "trade_date"),
         ),
     )
-    return visible.loc[
-        visible["board_code"] == board_code,
-        "con_code",
-    ].astype(str).tolist()
+    return (
+        visible.loc[
+            visible["board_code"] == board_code,
+            "con_code",
+        ]
+        .astype(str)
+        .tolist()
+    )
 
 
 def _board_gap_up_ratio(
@@ -129,6 +136,11 @@ def _board_gap_up_ratio(
         "WHERE trade_date = ? AND ts_code IN (SELECT UNNEST(?))",
         [prev_date, members],
     ).fetchdf()
+    return gap_up_ratio_from_rows(auctions, closes)
+
+
+def gap_up_ratio_from_rows(auctions: pd.DataFrame, closes: pd.DataFrame) -> float | None:
+    """Pure form of the existing board gap calculation, after visibility selection."""
     joined = auctions.merge(closes, on="ts_code", how="inner")
     valid = [
         (float(row.price), float(row.close))
@@ -159,6 +171,13 @@ def _board_auction_amount_ratio(
         return None
     auctions = auctions.loc[auctions["auction_type"] == _AUCTION_TYPE].copy()
     auctions["trade_date"] = pd.to_datetime(auctions["trade_date"]).dt.date
+    return auction_amount_ratio_from_rows(auctions, signal_date, hist_days)
+
+
+def auction_amount_ratio_from_rows(
+    auctions: pd.DataFrame, signal_date: date, hist_days: int
+) -> float | None:
+    """Pure form of the existing amount calculation with the same short-history rule."""
     signal_amount = auctions.loc[
         auctions["trade_date"] == signal_date,
         "amount",
@@ -237,25 +256,27 @@ def board_auction_strength(
         )
         if not members:
             continue
-        metrics.append({
-            "board_code": board_code,
-            "board_name": board_name,
-            "board_gap_up_ratio": _board_gap_up_ratio(
-                store,
-                members,
-                signal_date,
-                prev_date,
-                resolved_decision_at,
-            ),
-            "board_auction_amount_ratio": _board_auction_amount_ratio(
-                store,
-                members,
-                signal_date,
-                hist_days,
-                resolved_decision_at,
-            ),
-            "board_member_count": len(members),
-        })
+        metrics.append(
+            {
+                "board_code": board_code,
+                "board_name": board_name,
+                "board_gap_up_ratio": _board_gap_up_ratio(
+                    store,
+                    members,
+                    signal_date,
+                    prev_date,
+                    resolved_decision_at,
+                ),
+                "board_auction_amount_ratio": _board_auction_amount_ratio(
+                    store,
+                    members,
+                    signal_date,
+                    hist_days,
+                    resolved_decision_at,
+                ),
+                "board_member_count": len(members),
+            }
+        )
     if not metrics:
         return None
 

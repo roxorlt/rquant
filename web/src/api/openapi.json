@@ -3584,7 +3584,8 @@
                   "history_derived",
                   "stock_features_derived",
                   "minute_features_derived",
-                  "market_temperature_stored"
+                  "market_temperature_stored",
+                  "auction_derived"
                 ],
                 "type": "string"
               },
@@ -3782,6 +3783,171 @@
           "issues"
         ],
         "title": "DataAuditReportData",
+        "type": "object"
+      },
+      "DatasetSnapshotArtifact": {
+        "additionalProperties": false,
+        "properties": {
+          "artifact_key": {
+            "minLength": 1,
+            "title": "Artifact Key",
+            "type": "string"
+          },
+          "artifact_type": {
+            "enum": [
+              "lake_partition",
+              "materialized_table"
+            ],
+            "title": "Artifact Type",
+            "type": "string"
+          },
+          "catalog_updated_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Catalog Updated At"
+          },
+          "content_hash": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Content Hash",
+            "type": "string"
+          },
+          "dataset_id": {
+            "minLength": 1,
+            "title": "Dataset Id",
+            "type": "string"
+          },
+          "earliest_time": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Earliest Time"
+          },
+          "event_column": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Event Column"
+          },
+          "file_hash": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "File Hash",
+            "type": "string"
+          },
+          "file_size": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "File Size"
+          },
+          "latest_time": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Latest Time"
+          },
+          "partition_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Partition Id"
+          },
+          "primary_key": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Primary Key",
+            "type": "array"
+          },
+          "relative_path": {
+            "minLength": 1,
+            "title": "Relative Path",
+            "type": "string"
+          },
+          "revision_created_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Revision Created At"
+          },
+          "row_count": {
+            "minimum": 0.0,
+            "title": "Row Count",
+            "type": "integer"
+          },
+          "schema_hash": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Schema Hash",
+            "type": "string"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source"
+          },
+          "table_name": {
+            "minLength": 1,
+            "title": "Table Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "artifact_type",
+          "dataset_id",
+          "table_name",
+          "artifact_key",
+          "relative_path",
+          "row_count",
+          "schema_hash",
+          "content_hash",
+          "file_hash"
+        ],
+        "title": "DatasetSnapshotArtifact",
         "type": "object"
       },
       "DatasetWatermarkInfo": {
@@ -5141,6 +5307,512 @@
         "title": "FactorArchiveCommandRequest",
         "type": "object"
       },
+      "FactorAuctionDiagnostic": {
+        "additionalProperties": false,
+        "properties": {
+          "auction_sources": {
+            "items": {
+              "enum": [
+                "tushare",
+                "minute_0930_fallback"
+              ],
+              "type": "string"
+            },
+            "title": "Auction Sources",
+            "type": "array"
+          },
+          "board_code": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Board Code"
+          },
+          "board_name": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Board Name"
+          },
+          "historical_observation_days": {
+            "maximum": 20.0,
+            "minimum": 0.0,
+            "title": "Historical Observation Days",
+            "type": "integer"
+          },
+          "latest_available_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Latest Available At"
+          },
+          "member_count": {
+            "maximum": 50000.0,
+            "minimum": 0.0,
+            "title": "Member Count",
+            "type": "integer"
+          },
+          "membership_date": {
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Membership Date"
+          },
+          "previous_close_date": {
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Previous Close Date"
+          },
+          "valid_gap_members": {
+            "maximum": 50000.0,
+            "minimum": 0.0,
+            "title": "Valid Gap Members",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "member_count",
+          "valid_gap_members",
+          "historical_observation_days",
+          "auction_sources"
+        ],
+        "title": "FactorAuctionDiagnostic",
+        "type": "object"
+      },
+      "FactorAuctionFrozenFile": {
+        "additionalProperties": false,
+        "properties": {
+          "byte_count": {
+            "exclusiveMinimum": 0.0,
+            "maximum": 268435456.0,
+            "title": "Byte Count",
+            "type": "integer"
+          },
+          "identity": {
+            "$ref": "#/components/schemas/FactorSourceFileIdentity"
+          },
+          "path": {
+            "format": "path",
+            "title": "Path",
+            "type": "string"
+          },
+          "sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Sha256",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "sha256",
+          "byte_count",
+          "identity"
+        ],
+        "title": "FactorAuctionFrozenFile",
+        "type": "object"
+      },
+      "FactorAuctionLakeReceipt": {
+        "additionalProperties": false,
+        "properties": {
+          "artifact": {
+            "$ref": "#/components/schemas/DatasetSnapshotArtifact"
+          },
+          "candidate_marker": {
+            "$ref": "#/components/schemas/FactorAuctionFrozenFile"
+          },
+          "candidate_marker_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Candidate Marker Sha256",
+            "type": "string"
+          },
+          "catalog_file": {
+            "$ref": "#/components/schemas/FactorAuctionFrozenFile"
+          },
+          "catalog_issues": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 64,
+            "title": "Catalog Issues",
+            "type": "array"
+          },
+          "catalog_role": {
+            "enum": [
+              "catalog",
+              "readonly_catalog"
+            ],
+            "title": "Catalog Role",
+            "type": "string"
+          },
+          "catalog_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Catalog Sha256",
+            "type": "string"
+          },
+          "catalog_status": {
+            "enum": [
+              "candidate",
+              "degraded"
+            ],
+            "title": "Catalog Status",
+            "type": "string"
+          },
+          "current_marker": {
+            "$ref": "#/components/schemas/FactorAuctionFrozenFile"
+          },
+          "current_marker_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Current Marker Sha256",
+            "type": "string"
+          },
+          "manifest_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Manifest Sha256",
+            "type": "string"
+          },
+          "observation_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Observation Id",
+            "type": "string"
+          },
+          "partition_count": {
+            "exclusiveMinimum": 0.0,
+            "maximum": 4096.0,
+            "title": "Partition Count",
+            "type": "integer"
+          },
+          "snapshot_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Snapshot Id",
+            "type": "string"
+          },
+          "verification_scope": {
+            "const": "named_partitions_current_observation_not_full_authority_chain_or_pit",
+            "default": "named_partitions_current_observation_not_full_authority_chain_or_pit",
+            "title": "Verification Scope",
+            "type": "string"
+          }
+        },
+        "required": [
+          "snapshot_id",
+          "observation_id",
+          "catalog_role",
+          "catalog_file",
+          "current_marker",
+          "candidate_marker",
+          "catalog_sha256",
+          "current_marker_sha256",
+          "candidate_marker_sha256",
+          "manifest_sha256",
+          "catalog_status",
+          "catalog_issues",
+          "partition_count",
+          "artifact"
+        ],
+        "title": "FactorAuctionLakeReceipt",
+        "type": "object"
+      },
+      "FactorAuctionPolicy": {
+        "additionalProperties": false,
+        "properties": {
+          "evaluation_clock": {
+            "const": "previous_complete_sse_session_at_next_day_09:25",
+            "default": "previous_complete_sse_session_at_next_day_09:25",
+            "title": "Evaluation Clock",
+            "type": "string"
+          },
+          "historical_days": {
+            "const": 20,
+            "default": 20,
+            "title": "Historical Days",
+            "type": "integer"
+          },
+          "historical_members": {
+            "const": "fixed_signal_members_complete_board_domain",
+            "default": "fixed_signal_members_complete_board_domain",
+            "title": "Historical Members",
+            "type": "string"
+          },
+          "history_mode": {
+            "const": "retrospective_no_row_first_observed_time",
+            "default": "retrospective_no_row_first_observed_time",
+            "title": "History Mode",
+            "type": "string"
+          },
+          "implementation_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Implementation Sha256",
+            "type": "string"
+          },
+          "membership_lookback_days": {
+            "const": 30,
+            "default": 30,
+            "title": "Membership Lookback Days",
+            "type": "integer"
+          },
+          "minute_fallback_available_clock": {
+            "const": "09:31:00",
+            "default": "09:31:00",
+            "title": "Minute Fallback Available Clock",
+            "type": "string"
+          },
+          "missing_policy": {
+            "const": "explicit_reason_no_zero_or_neighbor_fallback",
+            "default": "explicit_reason_no_zero_or_neighbor_fallback",
+            "title": "Missing Policy",
+            "type": "string"
+          },
+          "official_available_clock": {
+            "const": "09:26:00",
+            "default": "09:26:00",
+            "title": "Official Available Clock",
+            "type": "string"
+          },
+          "selection": {
+            "const": "highest_amount_ratio_first_input_board_on_tie",
+            "default": "highest_amount_ratio_first_input_board_on_tie",
+            "title": "Selection",
+            "type": "string"
+          },
+          "signal_clock": {
+            "const": "09:30:00",
+            "default": "09:30:00",
+            "title": "Signal Clock",
+            "type": "string"
+          },
+          "version": {
+            "const": "original-board-auction-v1",
+            "default": "original-board-auction-v1",
+            "title": "Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "implementation_sha256"
+        ],
+        "title": "FactorAuctionPolicy",
+        "type": "object"
+      },
+      "FactorAuctionPreviewStock": {
+        "additionalProperties": false,
+        "properties": {
+          "diagnostic": {
+            "$ref": "#/components/schemas/FactorAuctionDiagnostic"
+          },
+          "stock_code": {
+            "title": "Stock Code",
+            "type": "string"
+          },
+          "values": {
+            "items": {
+              "$ref": "#/components/schemas/FactorAuctionPreviewValue"
+            },
+            "maxItems": 3,
+            "minItems": 1,
+            "title": "Values",
+            "type": "array"
+          }
+        },
+        "required": [
+          "stock_code",
+          "values",
+          "diagnostic"
+        ],
+        "title": "FactorAuctionPreviewStock",
+        "type": "object"
+      },
+      "FactorAuctionPreviewValue": {
+        "additionalProperties": false,
+        "properties": {
+          "auction_diagnostic": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FactorAuctionDiagnostic"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "column": {
+            "enum": [
+              "board_gap_up_ratio",
+              "board_auction_amount_ratio",
+              "board_member_count"
+            ],
+            "title": "Column",
+            "type": "string"
+          },
+          "diagnostic": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FactorStockFeatureDiagnostic"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "minute_diagnostic": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FactorMinuteFeatureDiagnostic"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "non_finite_value": {
+            "anyOf": [
+              {
+                "enum": [
+                  "NaN",
+                  "Infinity",
+                  "-Infinity"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Non Finite Value"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "missing_board_membership",
+                  "missing_board_auction",
+                  "missing_previous_close",
+                  "missing_auction_history",
+                  "zero_auction_baseline",
+                  "auction_null",
+                  "auction_non_finite",
+                  "invalid_auction_price",
+                  "invalid_auction_amount",
+                  "invalid_previous_close"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "status": {
+            "enum": [
+              "valid",
+              "missing",
+              "null",
+              "non_finite"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "value": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Value"
+          }
+        },
+        "required": [
+          "status",
+          "value",
+          "column"
+        ],
+        "title": "FactorAuctionPreviewValue",
+        "type": "object"
+      },
+      "FactorAuctionSummary": {
+        "additionalProperties": false,
+        "properties": {
+          "input_content_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Input Content Sha256",
+            "type": "string"
+          },
+          "input_rows": {
+            "maximum": 16000000.0,
+            "minimum": 0.0,
+            "title": "Input Rows",
+            "type": "integer"
+          },
+          "lake": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FactorAuctionLakeReceipt"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "output_content_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Output Content Sha256",
+            "type": "string"
+          },
+          "output_rows": {
+            "maximum": 28672000.0,
+            "minimum": 0.0,
+            "title": "Output Rows",
+            "type": "integer"
+          },
+          "policy": {
+            "$ref": "#/components/schemas/FactorAuctionPolicy"
+          }
+        },
+        "required": [
+          "policy",
+          "input_content_sha256",
+          "output_content_sha256",
+          "input_rows",
+          "output_rows"
+        ],
+        "title": "FactorAuctionSummary",
+        "type": "object"
+      },
       "FactorCapabilitiesData": {
         "additionalProperties": false,
         "properties": {
@@ -5189,7 +5861,8 @@
               "daily_derived_v1",
               "daily_stock_v1",
               "daily_minute_v1",
-              "daily_market_temperature_v1"
+              "daily_market_temperature_v1",
+              "daily_auction_v1"
             ],
             "title": "Version",
             "type": "string"
@@ -5257,6 +5930,14 @@
       "FactorDailyFeatureCounts": {
         "additionalProperties": false,
         "properties": {
+          "auction_reasons": {
+            "items": {
+              "$ref": "#/components/schemas/FactorDailyFeatureReasonCount"
+            },
+            "maxItems": 10,
+            "title": "Auction Reasons",
+            "type": "array"
+          },
           "column": {
             "anyOf": [
               {
@@ -5330,6 +6011,14 @@
                   "market_above_ma20_ratio_pct"
                 ],
                 "type": "string"
+              },
+              {
+                "enum": [
+                  "board_gap_up_ratio",
+                  "board_auction_amount_ratio",
+                  "board_member_count"
+                ],
+                "type": "string"
               }
             ],
             "title": "Column"
@@ -5400,6 +6089,22 @@
       "FactorDailyFeatureCoverageDay": {
         "additionalProperties": false,
         "properties": {
+          "auction_values": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/FactorAuctionPreviewStock"
+                },
+                "maxItems": 10,
+                "minItems": 1,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Auction Values"
+          },
           "computation_stock_count": {
             "maximum": 7000.0,
             "minimum": 1.0,
@@ -5511,6 +6216,21 @@
                   "invalid_market_percentage"
                 ],
                 "type": "string"
+              },
+              {
+                "enum": [
+                  "missing_board_membership",
+                  "missing_board_auction",
+                  "missing_previous_close",
+                  "missing_auction_history",
+                  "zero_auction_baseline",
+                  "auction_null",
+                  "auction_non_finite",
+                  "invalid_auction_price",
+                  "invalid_auction_amount",
+                  "invalid_previous_close"
+                ],
+                "type": "string"
               }
             ],
             "title": "Reason"
@@ -5527,6 +6247,16 @@
         "additionalProperties": false,
         "description": "The actual dependency subset, omitted entirely for original six-field definitions.",
         "properties": {
+          "auction": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FactorAuctionSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "code_commit": {
             "pattern": "^[0-9a-f]{40}$",
             "title": "Code Commit",
@@ -5638,7 +6368,8 @@
               "history_derived",
               "stock_features_derived",
               "minute_features_derived",
-              "market_temperature_stored"
+              "market_temperature_stored",
+              "auction_derived"
             ],
             "title": "Value Semantics",
             "type": "string"
@@ -5732,6 +6463,14 @@
                   "market_above_ma20_ratio_pct"
                 ],
                 "type": "string"
+              },
+              {
+                "enum": [
+                  "board_gap_up_ratio",
+                  "board_auction_amount_ratio",
+                  "board_member_count"
+                ],
+                "type": "string"
               }
             ],
             "title": "Column"
@@ -5750,7 +6489,8 @@
               "daily_basic",
               "daily_stock_feature",
               "daily_minute_feature",
-              "market_temperature_daily"
+              "market_temperature_daily",
+              "daily_auction_feature"
             ],
             "title": "Table",
             "type": "string"
@@ -5777,7 +6517,8 @@
                   "history_derived",
                   "stock_features_derived",
                   "minute_features_derived",
-                  "market_temperature_stored"
+                  "market_temperature_stored",
+                  "auction_derived"
                 ],
                 "type": "string"
               },
@@ -6485,6 +7226,16 @@
       "FactorMarketTemperatureDayValue": {
         "additionalProperties": false,
         "properties": {
+          "auction_diagnostic": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FactorAuctionDiagnostic"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "column": {
             "enum": [
               "market_high_60d_ratio_pct",
@@ -7893,6 +8644,45 @@
           "expression"
         ],
         "title": "FactorSaveDraft",
+        "type": "object"
+      },
+      "FactorSourceFileIdentity": {
+        "additionalProperties": false,
+        "properties": {
+          "ctime_ns": {
+            "minimum": 0.0,
+            "title": "Ctime Ns",
+            "type": "integer"
+          },
+          "device": {
+            "minimum": 0.0,
+            "title": "Device",
+            "type": "integer"
+          },
+          "inode": {
+            "minimum": 0.0,
+            "title": "Inode",
+            "type": "integer"
+          },
+          "mtime_ns": {
+            "minimum": 0.0,
+            "title": "Mtime Ns",
+            "type": "integer"
+          },
+          "size": {
+            "minimum": 0.0,
+            "title": "Size",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "device",
+          "inode",
+          "size",
+          "mtime_ns",
+          "ctime_ns"
+        ],
+        "title": "FactorSourceFileIdentity",
         "type": "object"
       },
       "FactorStockFeatureDiagnostic": {

@@ -234,11 +234,16 @@ def read_factor_tracking_prefix(
             if batch.daily_features is not None:
                 original = batch.daily_features
                 market = original.sources.market_temperature is not None
+                auction = original.sources.auction is not None
                 minute = original.sources.minute_features is not None
                 stock = original.sources.stock_features is not None
-                derived = original.sources.technical_history is not None or stock or minute
+                derived = (
+                    original.sources.technical_history is not None or stock or minute or auction
+                )
                 daily_semantic = (
-                    "market-temperature-daily-fields-v1"
+                    "auction-daily-fields-v1"
+                    if auction
+                    else "market-temperature-daily-fields-v1"
                     if market
                     else "minute-daily-fields-v1"
                     if minute
@@ -255,6 +260,16 @@ def read_factor_tracking_prefix(
                             row.stock_code,
                             tuple(
                                 (
+                                    v.status,
+                                    v.value,
+                                    v.non_finite_value,
+                                    v.reason,
+                                    v.diagnostic,
+                                    v.minute_diagnostic,
+                                    v.auction_diagnostic,
+                                )
+                                if auction
+                                else (
                                     v.status,
                                     v.value,
                                     v.non_finite_value,
@@ -291,6 +306,8 @@ def read_factor_tracking_prefix(
                         original.market_values,
                         request.daily_feature_source.market_temperature.causal_policy(),
                     )
+                if auction:
+                    daily_semantic += (request.daily_feature_source.auction.causal_policy(),)
                 semantic += (daily_semantic,)
                 del original
             result.append(

@@ -2480,7 +2480,7 @@ export interface components {
             /** Unit */
             unit?: ("stored_price" | "session_price" | "indicator" | "percent" | "ratio" | "CNY_10000" | "CNY" | "observations" | "binary") | null;
             /** Value Semantics */
-            value_semantics?: ("stored_not_recomputed" | "history_derived" | "stock_features_derived" | "minute_features_derived" | "market_temperature_stored") | null;
+            value_semantics?: ("stored_not_recomputed" | "history_derived" | "stock_features_derived" | "minute_features_derived" | "market_temperature_stored" | "auction_derived") | null;
         };
         /** DataAuditHealthData */
         DataAuditHealthData: {
@@ -2540,6 +2540,51 @@ export interface components {
              * @enum {string}
              */
             source_state: "ready" | "not_published" | "unavailable";
+        };
+        /** DatasetSnapshotArtifact */
+        DatasetSnapshotArtifact: {
+            /** Artifact Key */
+            artifact_key: string;
+            /**
+             * Artifact Type
+             * @enum {string}
+             */
+            artifact_type: "lake_partition" | "materialized_table";
+            /** Catalog Updated At */
+            catalog_updated_at?: string | null;
+            /** Content Hash */
+            content_hash: string;
+            /** Dataset Id */
+            dataset_id: string;
+            /** Earliest Time */
+            earliest_time?: string | null;
+            /** Event Column */
+            event_column?: string | null;
+            /** File Hash */
+            file_hash: string;
+            /** File Size */
+            file_size?: number | null;
+            /** Latest Time */
+            latest_time?: string | null;
+            /** Partition Id */
+            partition_id?: string | null;
+            /**
+             * Primary Key
+             * @default []
+             */
+            primary_key: string[];
+            /** Relative Path */
+            relative_path: string;
+            /** Revision Created At */
+            revision_created_at?: string | null;
+            /** Row Count */
+            row_count: number;
+            /** Schema Hash */
+            schema_hash: string;
+            /** Source */
+            source?: string | null;
+            /** Table Name */
+            table_name: string;
         };
         /** DatasetWatermarkInfo */
         DatasetWatermarkInfo: {
@@ -2981,6 +3026,193 @@ export interface components {
              */
             requested_at: string;
         };
+        /** FactorAuctionDiagnostic */
+        FactorAuctionDiagnostic: {
+            /** Auction Sources */
+            auction_sources: ("tushare" | "minute_0930_fallback")[];
+            /** Board Code */
+            board_code?: string | null;
+            /** Board Name */
+            board_name?: string | null;
+            /** Historical Observation Days */
+            historical_observation_days: number;
+            /** Latest Available At */
+            latest_available_at?: string | null;
+            /** Member Count */
+            member_count: number;
+            /** Membership Date */
+            membership_date?: string | null;
+            /** Previous Close Date */
+            previous_close_date?: string | null;
+            /** Valid Gap Members */
+            valid_gap_members: number;
+        };
+        /** FactorAuctionFrozenFile */
+        FactorAuctionFrozenFile: {
+            /** Byte Count */
+            byte_count: number;
+            identity: components["schemas"]["FactorSourceFileIdentity"];
+            /**
+             * Path
+             * Format: path
+             */
+            path: string;
+            /** Sha256 */
+            sha256: string;
+        };
+        /** FactorAuctionLakeReceipt */
+        FactorAuctionLakeReceipt: {
+            artifact: components["schemas"]["DatasetSnapshotArtifact"];
+            candidate_marker: components["schemas"]["FactorAuctionFrozenFile"];
+            /** Candidate Marker Sha256 */
+            candidate_marker_sha256: string;
+            catalog_file: components["schemas"]["FactorAuctionFrozenFile"];
+            /** Catalog Issues */
+            catalog_issues: string[];
+            /**
+             * Catalog Role
+             * @enum {string}
+             */
+            catalog_role: "catalog" | "readonly_catalog";
+            /** Catalog Sha256 */
+            catalog_sha256: string;
+            /**
+             * Catalog Status
+             * @enum {string}
+             */
+            catalog_status: "candidate" | "degraded";
+            current_marker: components["schemas"]["FactorAuctionFrozenFile"];
+            /** Current Marker Sha256 */
+            current_marker_sha256: string;
+            /** Manifest Sha256 */
+            manifest_sha256: string;
+            /** Observation Id */
+            observation_id: string;
+            /** Partition Count */
+            partition_count: number;
+            /** Snapshot Id */
+            snapshot_id: string;
+            /**
+             * Verification Scope
+             * @default named_partitions_current_observation_not_full_authority_chain_or_pit
+             * @constant
+             */
+            verification_scope: "named_partitions_current_observation_not_full_authority_chain_or_pit";
+        };
+        /** FactorAuctionPolicy */
+        FactorAuctionPolicy: {
+            /**
+             * Evaluation Clock
+             * @default previous_complete_sse_session_at_next_day_09:25
+             * @constant
+             */
+            evaluation_clock: "previous_complete_sse_session_at_next_day_09:25";
+            /**
+             * Historical Days
+             * @default 20
+             * @constant
+             */
+            historical_days: 20;
+            /**
+             * Historical Members
+             * @default fixed_signal_members_complete_board_domain
+             * @constant
+             */
+            historical_members: "fixed_signal_members_complete_board_domain";
+            /**
+             * History Mode
+             * @default retrospective_no_row_first_observed_time
+             * @constant
+             */
+            history_mode: "retrospective_no_row_first_observed_time";
+            /** Implementation Sha256 */
+            implementation_sha256: string;
+            /**
+             * Membership Lookback Days
+             * @default 30
+             * @constant
+             */
+            membership_lookback_days: 30;
+            /**
+             * Minute Fallback Available Clock
+             * @default 09:31:00
+             * @constant
+             */
+            minute_fallback_available_clock: "09:31:00";
+            /**
+             * Missing Policy
+             * @default explicit_reason_no_zero_or_neighbor_fallback
+             * @constant
+             */
+            missing_policy: "explicit_reason_no_zero_or_neighbor_fallback";
+            /**
+             * Official Available Clock
+             * @default 09:26:00
+             * @constant
+             */
+            official_available_clock: "09:26:00";
+            /**
+             * Selection
+             * @default highest_amount_ratio_first_input_board_on_tie
+             * @constant
+             */
+            selection: "highest_amount_ratio_first_input_board_on_tie";
+            /**
+             * Signal Clock
+             * @default 09:30:00
+             * @constant
+             */
+            signal_clock: "09:30:00";
+            /**
+             * Version
+             * @default original-board-auction-v1
+             * @constant
+             */
+            version: "original-board-auction-v1";
+        };
+        /** FactorAuctionPreviewStock */
+        FactorAuctionPreviewStock: {
+            diagnostic: components["schemas"]["FactorAuctionDiagnostic"];
+            /** Stock Code */
+            stock_code: string;
+            /** Values */
+            values: components["schemas"]["FactorAuctionPreviewValue"][];
+        };
+        /** FactorAuctionPreviewValue */
+        FactorAuctionPreviewValue: {
+            auction_diagnostic?: components["schemas"]["FactorAuctionDiagnostic"] | null;
+            /**
+             * Column
+             * @enum {string}
+             */
+            column: "board_gap_up_ratio" | "board_auction_amount_ratio" | "board_member_count";
+            diagnostic?: components["schemas"]["FactorStockFeatureDiagnostic"] | null;
+            minute_diagnostic?: components["schemas"]["FactorMinuteFeatureDiagnostic"] | null;
+            /** Non Finite Value */
+            non_finite_value?: ("NaN" | "Infinity" | "-Infinity") | null;
+            /** Reason */
+            reason?: ("missing_board_membership" | "missing_board_auction" | "missing_previous_close" | "missing_auction_history" | "zero_auction_baseline" | "auction_null" | "auction_non_finite" | "invalid_auction_price" | "invalid_auction_amount" | "invalid_previous_close") | null;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "valid" | "missing" | "null" | "non_finite";
+            /** Value */
+            value: number | null;
+        };
+        /** FactorAuctionSummary */
+        FactorAuctionSummary: {
+            /** Input Content Sha256 */
+            input_content_sha256: string;
+            /** Input Rows */
+            input_rows: number;
+            lake?: components["schemas"]["FactorAuctionLakeReceipt"] | null;
+            /** Output Content Sha256 */
+            output_content_sha256: string;
+            /** Output Rows */
+            output_rows: number;
+            policy: components["schemas"]["FactorAuctionPolicy"];
+        };
         /** FactorCapabilitiesData */
         FactorCapabilitiesData: {
             /**
@@ -3008,7 +3240,7 @@ export interface components {
              * Version
              * @enum {string}
              */
-            version: "daily_v1" | "daily_stored_v1" | "daily_derived_v1" | "daily_stock_v1" | "daily_minute_v1" | "daily_market_temperature_v1";
+            version: "daily_v1" | "daily_stored_v1" | "daily_derived_v1" | "daily_stock_v1" | "daily_minute_v1" | "daily_market_temperature_v1" | "daily_auction_v1";
         };
         /** FactorCatalogData */
         FactorCatalogData: {
@@ -3034,8 +3266,10 @@ export interface components {
         };
         /** FactorDailyFeatureCounts */
         FactorDailyFeatureCounts: {
+            /** Auction Reasons */
+            auction_reasons?: components["schemas"]["FactorDailyFeatureReasonCount"][];
             /** Column */
-            column: ("ma5" | "ma10" | "ma20" | "ma60" | "rsi6" | "rsi14" | "macd" | "macd_signal" | "macd_hist" | "kdj_k" | "kdj_d" | "kdj_j" | "turnover_rate" | "volume_ratio" | "total_mv" | "circ_mv") | ("price_window_days_90d" | "price_position_90d_pct" | "price_rank_90d_pct" | "distance_to_high_90d_pct" | "distance_to_low_90d_pct" | "price_window_days_120d" | "price_position_120d_pct" | "price_rank_120d_pct" | "distance_to_high_120d_pct" | "distance_to_low_120d_pct" | "price_window_days_250d" | "price_position_250d_pct" | "price_rank_250d_pct" | "distance_to_high_250d_pct" | "distance_to_low_250d_pct" | "accum_window_days_20d" | "accum_obv_change_20d_pct" | "accum_ad_flow_20d_pct" | "accum_up_down_amount_ratio_20d" | "accum_heavy_no_drop_days_20d" | "accum_close_position_avg_20d_pct" | "ma_alignment" | "price_percentile_250d") | ("signal_minute_amount" | "signal_cum_amount_asof" | "hist_same_minute_amount_median_20d" | "hist_cum_amount_asof_median_20d" | "signal_rel_amount_same_minute_20d" | "signal_rel_cum_amount_asof_20d" | "hist_intraday_days_20d" | "signal_opening_segment" | "signal_opening_segment_amount" | "signal_amount_accel_5m" | "signal_amount_accel_10m") | ("market_high_60d_ratio_pct" | "market_above_ma20_ratio_pct");
+            column: ("ma5" | "ma10" | "ma20" | "ma60" | "rsi6" | "rsi14" | "macd" | "macd_signal" | "macd_hist" | "kdj_k" | "kdj_d" | "kdj_j" | "turnover_rate" | "volume_ratio" | "total_mv" | "circ_mv") | ("price_window_days_90d" | "price_position_90d_pct" | "price_rank_90d_pct" | "distance_to_high_90d_pct" | "distance_to_low_90d_pct" | "price_window_days_120d" | "price_position_120d_pct" | "price_rank_120d_pct" | "distance_to_high_120d_pct" | "distance_to_low_120d_pct" | "price_window_days_250d" | "price_position_250d_pct" | "price_rank_250d_pct" | "distance_to_high_250d_pct" | "distance_to_low_250d_pct" | "accum_window_days_20d" | "accum_obv_change_20d_pct" | "accum_ad_flow_20d_pct" | "accum_up_down_amount_ratio_20d" | "accum_heavy_no_drop_days_20d" | "accum_close_position_avg_20d_pct" | "ma_alignment" | "price_percentile_250d") | ("signal_minute_amount" | "signal_cum_amount_asof" | "hist_same_minute_amount_median_20d" | "hist_cum_amount_asof_median_20d" | "signal_rel_amount_same_minute_20d" | "signal_rel_cum_amount_asof_20d" | "hist_intraday_days_20d" | "signal_opening_segment" | "signal_opening_segment_amount" | "signal_amount_accel_5m" | "signal_amount_accel_10m") | ("market_high_60d_ratio_pct" | "market_above_ma20_ratio_pct") | ("board_gap_up_ratio" | "board_auction_amount_ratio" | "board_member_count");
             /** Market Reasons */
             market_reasons?: components["schemas"]["FactorDailyFeatureReasonCount"][];
             /** Minute Reasons */
@@ -3055,6 +3289,8 @@ export interface components {
         };
         /** FactorDailyFeatureCoverageDay */
         FactorDailyFeatureCoverageDay: {
+            /** Auction Values */
+            auction_values?: components["schemas"]["FactorAuctionPreviewStock"][] | null;
             /** Computation Stock Count */
             computation_stock_count: number;
             /** Counts */
@@ -3077,13 +3313,14 @@ export interface components {
             /** Count */
             count: number;
             /** Reason */
-            reason: ("insufficient_window" | "no_initialization" | "history_break" | "missing_observation" | "derived_non_finite") | ("missing_reference_factor" | "non_finite_reference_factor" | "non_positive_reference_factor" | "missing_required_factor" | "non_finite_required_factor" | "non_positive_required_factor") | ("missing_daily_data" | "insufficient_history" | "undefined_statistic") | ("missing_target_minute" | "missing_history" | "missing_same_minute_history" | "zero_same_minute_baseline" | "zero_cumulative_baseline" | "not_applicable" | "no_acceleration_history" | "undefined_statistic") | ("missing_market_temperature" | "market_temperature_null" | "market_temperature_non_finite" | "invalid_market_percentage");
+            reason: ("insufficient_window" | "no_initialization" | "history_break" | "missing_observation" | "derived_non_finite") | ("missing_reference_factor" | "non_finite_reference_factor" | "non_positive_reference_factor" | "missing_required_factor" | "non_finite_required_factor" | "non_positive_required_factor") | ("missing_daily_data" | "insufficient_history" | "undefined_statistic") | ("missing_target_minute" | "missing_history" | "missing_same_minute_history" | "zero_same_minute_baseline" | "zero_cumulative_baseline" | "not_applicable" | "no_acceleration_history" | "undefined_statistic") | ("missing_market_temperature" | "market_temperature_null" | "market_temperature_non_finite" | "invalid_market_percentage") | ("missing_board_membership" | "missing_board_auction" | "missing_previous_close" | "missing_auction_history" | "zero_auction_baseline" | "auction_null" | "auction_non_finite" | "invalid_auction_price" | "invalid_auction_amount" | "invalid_previous_close");
         };
         /**
          * FactorDailyFeatureSources
          * @description The actual dependency subset, omitted entirely for original six-field definitions.
          */
         FactorDailyFeatureSources: {
+            auction?: components["schemas"]["FactorAuctionSummary"] | null;
             /** Code Commit */
             code_commit: string;
             /** Fields */
@@ -3125,12 +3362,12 @@ export interface components {
              * @default stored_not_recomputed
              * @enum {string}
              */
-            value_semantics: "stored_not_recomputed" | "history_derived" | "stock_features_derived" | "minute_features_derived" | "market_temperature_stored";
+            value_semantics: "stored_not_recomputed" | "history_derived" | "stock_features_derived" | "minute_features_derived" | "market_temperature_stored" | "auction_derived";
         };
         /** FactorDailyStoredField */
         FactorDailyStoredField: {
             /** Column */
-            column: ("ma5" | "ma10" | "ma20" | "ma60" | "rsi6" | "rsi14" | "macd" | "macd_signal" | "macd_hist" | "kdj_k" | "kdj_d" | "kdj_j" | "turnover_rate" | "volume_ratio" | "total_mv" | "circ_mv") | ("price_window_days_90d" | "price_position_90d_pct" | "price_rank_90d_pct" | "distance_to_high_90d_pct" | "distance_to_low_90d_pct" | "price_window_days_120d" | "price_position_120d_pct" | "price_rank_120d_pct" | "distance_to_high_120d_pct" | "distance_to_low_120d_pct" | "price_window_days_250d" | "price_position_250d_pct" | "price_rank_250d_pct" | "distance_to_high_250d_pct" | "distance_to_low_250d_pct" | "accum_window_days_20d" | "accum_obv_change_20d_pct" | "accum_ad_flow_20d_pct" | "accum_up_down_amount_ratio_20d" | "accum_heavy_no_drop_days_20d" | "accum_close_position_avg_20d_pct" | "ma_alignment" | "price_percentile_250d") | ("signal_minute_amount" | "signal_cum_amount_asof" | "hist_same_minute_amount_median_20d" | "hist_cum_amount_asof_median_20d" | "signal_rel_amount_same_minute_20d" | "signal_rel_cum_amount_asof_20d" | "hist_intraday_days_20d" | "signal_opening_segment" | "signal_opening_segment_amount" | "signal_amount_accel_5m" | "signal_amount_accel_10m") | ("market_high_60d_ratio_pct" | "market_above_ma20_ratio_pct");
+            column: ("ma5" | "ma10" | "ma20" | "ma60" | "rsi6" | "rsi14" | "macd" | "macd_signal" | "macd_hist" | "kdj_k" | "kdj_d" | "kdj_j" | "turnover_rate" | "volume_ratio" | "total_mv" | "circ_mv") | ("price_window_days_90d" | "price_position_90d_pct" | "price_rank_90d_pct" | "distance_to_high_90d_pct" | "distance_to_low_90d_pct" | "price_window_days_120d" | "price_position_120d_pct" | "price_rank_120d_pct" | "distance_to_high_120d_pct" | "distance_to_low_120d_pct" | "price_window_days_250d" | "price_position_250d_pct" | "price_rank_250d_pct" | "distance_to_high_250d_pct" | "distance_to_low_250d_pct" | "accum_window_days_20d" | "accum_obv_change_20d_pct" | "accum_ad_flow_20d_pct" | "accum_up_down_amount_ratio_20d" | "accum_heavy_no_drop_days_20d" | "accum_close_position_avg_20d_pct" | "ma_alignment" | "price_percentile_250d") | ("signal_minute_amount" | "signal_cum_amount_asof" | "hist_same_minute_amount_median_20d" | "hist_cum_amount_asof_median_20d" | "signal_rel_amount_same_minute_20d" | "signal_rel_cum_amount_asof_20d" | "hist_intraday_days_20d" | "signal_opening_segment" | "signal_opening_segment_amount" | "signal_amount_accel_5m" | "signal_amount_accel_10m") | ("market_high_60d_ratio_pct" | "market_above_ma20_ratio_pct") | ("board_gap_up_ratio" | "board_auction_amount_ratio" | "board_member_count");
             /** Description Zh */
             description_zh: string;
             /** Name Zh */
@@ -3139,14 +3376,14 @@ export interface components {
              * Table
              * @enum {string}
              */
-            table: "daily_indicator" | "daily_basic" | "daily_stock_feature" | "daily_minute_feature" | "market_temperature_daily";
+            table: "daily_indicator" | "daily_basic" | "daily_stock_feature" | "daily_minute_feature" | "market_temperature_daily" | "daily_auction_feature";
             /**
              * Unit
              * @enum {string}
              */
             unit: "stored_price" | "session_price" | "indicator" | "percent" | "ratio" | "CNY_10000" | "CNY" | "observations" | "binary";
             /** Value Semantics */
-            value_semantics?: ("history_derived" | "stock_features_derived" | "minute_features_derived" | "market_temperature_stored") | null;
+            value_semantics?: ("history_derived" | "stock_features_derived" | "minute_features_derived" | "market_temperature_stored" | "auction_derived") | null;
         };
         /**
          * FactorDailyStreamCoverage
@@ -3382,6 +3619,7 @@ export interface components {
         };
         /** FactorMarketTemperatureDayValue */
         FactorMarketTemperatureDayValue: {
+            auction_diagnostic?: components["schemas"]["FactorAuctionDiagnostic"] | null;
             /**
              * Column
              * @enum {string}
@@ -3960,6 +4198,19 @@ export interface components {
              * Format: date-time
              */
             requested_at: string;
+        };
+        /** FactorSourceFileIdentity */
+        FactorSourceFileIdentity: {
+            /** Ctime Ns */
+            ctime_ns: number;
+            /** Device */
+            device: number;
+            /** Inode */
+            inode: number;
+            /** Mtime Ns */
+            mtime_ns: number;
+            /** Size */
+            size: number;
         };
         /**
          * FactorStockFeatureDiagnostic

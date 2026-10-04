@@ -15,7 +15,10 @@ from typing import Literal, cast
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from rquant.factor.daily_feature_source import (
+    AUCTION_COLUMNS,
     MARKET_TEMPERATURE_COLUMNS,
+    MAX_AUCTION_PREVIEW_DAYS,
+    FactorAuctionPreviewStock,
     FactorDailyFeatureCounts,
     FactorDailyFeatureInput,
     FactorDailyFeatureReadLease,
@@ -176,6 +179,9 @@ class FactorStreamFeatureDayReceipt(BaseModel):
     market_temperature_values: tuple[FactorMarketTemperatureDayValue, ...] | None = Field(
         default=None, min_length=1, max_length=2, exclude_if=lambda v: v is None
     )
+    auction_values: tuple[FactorAuctionPreviewStock, ...] | None = Field(
+        default=None, min_length=1, max_length=10, exclude_if=lambda v: v is None
+    )
 
     @model_validator(mode="after")
     def _market_columns(self) -> FactorStreamFeatureDayReceipt:
@@ -186,6 +192,15 @@ class FactorStreamFeatureDayReceipt(BaseModel):
         )
         if tuple(v.column for v in self.market_temperature_values or ()) != market:
             raise ValueError("market day values differ from selected daily coverage fields")
+        auction = tuple(
+            c.column for c in self.daily_feature_counts or () if c.column in AUCTION_COLUMNS
+        )
+        if self.auction_values is not None and (
+            any(tuple(v.column for v in row.values) != auction for row in self.auction_values)
+            or tuple(row.stock_code for row in self.auction_values)
+            != tuple(sorted(set(row.stock_code for row in self.auction_values)))
+        ):
+            raise ValueError("auction preview differs from selected daily coverage fields")
         return self
 
 
@@ -713,6 +728,10 @@ class FactorStreamAdapter(Iterator[FactorFormulaStreamBatch]):
                         market_temperature_values=None
                         if stored_input is None
                         else stored_input.market_temperature_values,
+                        auction_values=None
+                        if stored_input is None
+                        or day not in self.request.evaluation_days[-MAX_AUCTION_PREVIEW_DAYS:]
+                        else stored_input.auction_values,
                         context_input_sha256=None
                         if batch.context is None
                         else batch.context.sha256,

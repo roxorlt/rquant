@@ -44,15 +44,21 @@ export function FactorFieldInfo({ field }: { field: FieldInfo }) {
           ? "固定15:00观察不适用；与缺少目标分钟分别记录。"
           : field.description_zh;
   const unit =
-    field.value_semantics === "market_temperature_stored" && field.unit === "percent"
-      ? "百分比（%）"
-      : minute && field.unit === "ratio"
-        ? "倍数"
-        : minute && field.unit === "observations"
-          ? "观察日数"
-          : field.unit
-            ? units[field.unit]
-            : null;
+    field.value_semantics === "auction_derived"
+      ? field.column === "board_gap_up_ratio"
+        ? "比例（0–1）"
+        : field.column === "board_member_count"
+          ? "家"
+          : "倍数"
+      : field.value_semantics === "market_temperature_stored" && field.unit === "percent"
+        ? "百分比（%）"
+        : minute && field.unit === "ratio"
+          ? "倍数"
+          : minute && field.unit === "observations"
+            ? "观察日数"
+            : field.unit
+              ? units[field.unit]
+              : null;
   return (
     <>
       <div>{description}</div>

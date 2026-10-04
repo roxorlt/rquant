@@ -37,7 +37,7 @@ class FactorRunFileReference(BaseModel):
     model_config = RUN_IMMUTABLE
 
     kind: str = Field(
-        pattern=r"^factor-((prepared-source|run-configuration|neutralization-context)-v1|daily-feature-source-v[12345])$"
+        pattern=r"^factor-((prepared-source|run-configuration|neutralization-context)-v1|daily-feature-source-v[123456])$"
     )
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     filename: str
@@ -94,6 +94,7 @@ class FactorRunConfiguration(BaseModel):
             "factor-daily-feature-source-v3",
             "factor-daily-feature-source-v4",
             "factor-daily-feature-source-v5",
+            "factor-daily-feature-source-v6",
         ):
             raise ValueError("配置缺少库存日线事实包")
         for path in (

@@ -112,6 +112,7 @@ export function FactorEditor({
   const fields = capabilities?.fields ?? [];
   const hasMinute = fields.some((field) => field.value_semantics === "minute_features_derived");
   const hasMarket = fields.some((field) => field.value_semantics === "market_temperature_stored");
+  const hasAuction = fields.some((field) => field.value_semantics === "auction_derived");
   const search = fieldSearch.trim().toLocaleLowerCase();
   const visibleFields = search
     ? fields.filter((field) =>
@@ -122,30 +123,36 @@ export function FactorEditor({
     : allFields
       ? fields
       : fields.slice(0, 6);
-  const groups = hasMarket
-    ? [
-        {
-          label: "日线",
-          fields: visibleFields.filter(
-            (field) =>
-              field.value_semantics !== "market_temperature_stored" &&
-              field.value_semantics !== "minute_features_derived",
-          ),
-        },
-        {
-          label: "分钟",
-          fields: visibleFields.filter(
-            (field) => field.value_semantics === "minute_features_derived",
-          ),
-        },
-        {
-          label: "市场温度",
-          fields: visibleFields.filter(
-            (field) => field.value_semantics === "market_temperature_stored",
-          ),
-        },
-      ].filter((group) => group.fields.length)
-    : [{ label: null, fields: visibleFields }];
+  const groups =
+    hasMarket || hasAuction
+      ? [
+          {
+            label: "日线",
+            fields: visibleFields.filter(
+              (field) =>
+                field.value_semantics !== "market_temperature_stored" &&
+                field.value_semantics !== "auction_derived" &&
+                field.value_semantics !== "minute_features_derived",
+            ),
+          },
+          {
+            label: "分钟",
+            fields: visibleFields.filter(
+              (field) => field.value_semantics === "minute_features_derived",
+            ),
+          },
+          {
+            label: "竞价",
+            fields: visibleFields.filter((field) => field.value_semantics === "auction_derived"),
+          },
+          {
+            label: "市场温度",
+            fields: visibleFields.filter(
+              (field) => field.value_semantics === "market_temperature_stored",
+            ),
+          },
+        ].filter((group) => group.fields.length)
+      : [{ label: null, fields: visibleFields }];
   return (
     <SideDrawer
       open={open}
@@ -309,7 +316,7 @@ export function FactorEditor({
         <input
           className="inp factor-editor-search"
           type="search"
-          aria-label={hasMinute || hasMarket ? "搜索字段" : "搜索日线字段"}
+          aria-label={hasMinute || hasMarket || hasAuction ? "搜索字段" : "搜索日线字段"}
           placeholder="按中文名搜索字段"
           value={fieldSearch}
           maxLength={64}

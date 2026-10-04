@@ -13,7 +13,9 @@ from pathlib import Path
 
 from pydantic import BaseModel
 
+from rquant.factor.auction_source import FactorAuctionLakeInput, prepare_factor_auction_source
 from rquant.factor.daily_feature_source import (
+    FactorAuctionPrepareRequest,
     FactorDailyFeaturePrepareRequest,
     FactorDailyFeatureSource,
     FactorMarketTemperaturePrepareRequest,
@@ -87,6 +89,7 @@ def main(argv: list[str] | None = None) -> int:
             "seal-stock-features",
             "seal-minute-features",
             "seal-market-temperature",
+            "seal-auction",
             "worker",
             "serve",
         ),
@@ -103,6 +106,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--industry-source", type=Path)
     parser.add_argument("--market-cap-source", type=Path)
     parser.add_argument("--lake-root", type=Path)
+    parser.add_argument(
+        "--auction-lake-input", type=Path, help="具名竞价分区、catalog和marker的冻结清单"
+    )
     parser.add_argument("--max-input-rows", type=int)
     parser.add_argument("--max-code-observations", type=int, default=50_000)
     parser.add_argument("--max-output-cells", type=int, default=32_000_000)
@@ -116,11 +122,33 @@ def main(argv: list[str] | None = None) -> int:
         "seal-stock-features",
         "seal-minute-features",
         "seal-market-temperature",
+        "seal-auction",
     ):
         if args.prepared_source is None or args.lake_root is None:
             parser.error("必须提供实际行情准备包和私有数据根")
         prepared = _input(args.prepared_source, FactorPreparedStreamSource, 16 * 1024 * 1024)
-        if args.action == "seal-market-temperature":
+        if args.action == "seal-auction":
+            base = (
+                None
+                if args.base_daily_source is None
+                else _input(args.base_daily_source, FactorDailyFeatureSource, 16 * 1024 * 1024)
+            )
+            lake = (
+                None
+                if args.auction_lake_input is None
+                else _input(args.auction_lake_input, FactorAuctionLakeInput, 4 * 1024 * 1024)
+            )
+            source = prepare_factor_auction_source(
+                FactorAuctionPrepareRequest(
+                    prepared_source=prepared,
+                    base_daily_source=base,
+                    lake_input=lake,
+                    max_input_rows=args.max_input_rows,
+                    max_output_cells=args.max_output_cells,
+                ),
+                lake_root=args.lake_root,
+            )
+        elif args.action == "seal-market-temperature":
             base = (
                 None
                 if args.base_daily_source is None

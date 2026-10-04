@@ -1014,17 +1014,20 @@ def test_minute_maximum_formula_batch_grid(minute: bool, native: bool, width: in
 
 
 def test_minute_formula_batch_rejects_one_point_over_finite_limit() -> None:
+    from rquant.factor.daily_feature_source import MARKET_TEMPERATURE_COLUMNS
     from rquant.factor.formula_stream import FactorFormulaStreamBatch
 
-    batch = _maximum_formula_batch(_minute_batch_columns(minute=True, native=True))
+    batch = _maximum_formula_batch(
+        _minute_batch_columns(minute=True, native=True) + MARKET_TEMPERATURE_COLUMNS
+    )
     payload = {name: getattr(batch, name) for name in FactorFormulaStreamBatch.model_fields}
     payload["feature_points"] = batch.feature_points + (batch.feature_points[0],)
     with pytest.raises(ValidationError) as caught:
         FactorFormulaStreamBatch.model_validate(payload)
     (error,) = caught.value.errors(include_input=False, include_url=False)
     assert error["loc"] == ("feature_points",) and error["type"] == "too_long"
-    assert error["ctx"]["max_length"] == 7000 * 56
-    assert error["ctx"]["actual_length"] == 7000 * 56 + 1
+    assert error["ctx"]["max_length"] == 7000 * 58
+    assert error["ctx"]["actual_length"] == 7000 * 58 + 1
 
 
 def test_original_six_formula_batch_canonical_bytes_unchanged() -> None:

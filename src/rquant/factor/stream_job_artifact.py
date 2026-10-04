@@ -20,7 +20,10 @@ from typing import Literal
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
 from rquant.factor.daily_feature_source import (
+    AUCTION_COLUMNS,
     MARKET_TEMPERATURE_COLUMNS,
+    MAX_AUCTION_PREVIEW_DAYS,
+    FactorAuctionPreviewStock,
     FactorDailyFeatureCounts,
     FactorDailyFeatureSources,
     FactorMarketTemperatureDayValue,
@@ -170,6 +173,9 @@ class FactorDailyFeatureCoverageDay(BaseModel):
     market_temperature_values: tuple[FactorMarketTemperatureDayValue, ...] | None = Field(
         default=None, min_length=1, max_length=2, exclude_if=lambda v: v is None
     )
+    auction_values: tuple[FactorAuctionPreviewStock, ...] | None = Field(
+        default=None, min_length=1, max_length=10, exclude_if=lambda v: v is None
+    )
 
     @model_validator(mode="after")
     def _grid(self) -> FactorDailyFeatureCoverageDay:
@@ -185,6 +191,12 @@ class FactorDailyFeatureCoverageDay(BaseModel):
             for c, v in zip(market, values, strict=True)
         ):
             raise ValueError("display market daily values differ from broadcast coverage")
+        auction = tuple(c.column for c in self.counts if c.column in AUCTION_COLUMNS)
+        if self.auction_values is not None and (
+            len(self.auction_values) > self.computation_stock_count
+            or any(tuple(v.column for v in row.values) != auction for row in self.auction_values)
+        ):
+            raise ValueError("display auction preview differs from complete grid coverage")
         return self
 
 
@@ -443,6 +455,7 @@ def project_factor_stream_display(full: FactorStreamFullArtifact) -> FactorStrea
                 computation_stock_count=len(request.source.scope.stock_codes),
                 counts=day.daily_feature_counts,
                 market_temperature_values=day.market_temperature_values,
+                auction_values=day.auction_values,
             )
             for day in result.research.research.adapter_completion.feature_days
             if day.trade_date in request.evaluation_days
@@ -638,6 +651,7 @@ def verify_factor_stream_artifacts(
                         original.sha256 != feature.daily_feature_input_sha256
                         or original.counts != feature.daily_feature_counts
                         or original.market_temperature_values != feature.market_temperature_values
+                        or feature.auction_values is not None
                     ):
                         raise ValueError(
                             "completed stored daily inputs differ from sealed original values"
@@ -694,6 +708,15 @@ def verify_factor_stream_artifacts(
                                 or original.counts != feature.daily_feature_counts
                                 or original.market_temperature_values
                                 != feature.market_temperature_values
+                                or (
+                                    original.auction_values
+                                    if day.trade_date
+                                    in spec.adapter_request.evaluation_days[
+                                        -MAX_AUCTION_PREVIEW_DAYS:
+                                    ]
+                                    else None
+                                )
+                                != feature.auction_values
                             ):
                                 raise ValueError(
                                     "completed stored daily inputs "
