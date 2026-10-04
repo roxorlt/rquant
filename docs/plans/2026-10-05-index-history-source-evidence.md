@@ -1,0 +1,33 @@
+# 历史指数成员：来源检查
+
+目标：补齐沪深 300 和中证 1000 的历史有效成员。先用现有账号和官方公开资料。
+本次只读检查没有更改生产数据，也没有开通付费服务。
+
+## 已取得的事实
+
+- 现有 Tushare 账号调用 `idx_anns` 返回权限不足。该接口暂不能作为正式来源。
+- 中证指数官网有[调样公告归档](https://www.csindex.com.cn/#/about/newsCenter?typelist=announcement&related_topics=index_rebalance)，也有各指数的公开样本下载。
+- 已下载两份官方样本表。文件内日期均为 2026-09-30：沪深 300 有 300 个成员，中证 1000 有 1,000 个成员。
+- 已下载 2026-05-29 定期调整附件和 2026-09-09 临时调整附件。保留原文件、摘要和本次实际下载时间。
+- [定期调整公告](https://www.csindex.com.cn/#/about/newsDetail?id=3006137)明确本次调整于 2026-06-12 收市后生效。
+- [临时调整公告](https://www.csindex.com.cn/#/about/newsDetail?id=3006227)使用退市事件作为生效条件。不能把公告日直接当作成员切换日。
+
+## 后续做法
+
+用完整名单作为锚点，再核对区间内全部相关调整公告及其实际生效时间。
+只有成员数量、调入调出和日期都核对一致后，才生成每天的研究名单。
+公告缺失或生效时间不明的区间保持不可用，不能把最新名单回填历史。
+
+本次下载时间是 2026-10-05。历史回顾资料不能证明项目在历史决策时已取得这些文件。
+目前已取得公开来源原件；尚未证明完整历史覆盖，也未关闭指数成员的验收缺口。
+
+## 证据
+
+验收目录：
+`/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-source-integration/data/verification/next-index-and-concept-metadata-20261005/`。
+
+`csi-public-assets/capture-receipt.json` 的 SHA-256：
+`05d40e0da84ccd291eec628853bb69a48ca481847c361d422b7a44bc38a1220a`。
+四份原件共 451,089 字节。下载实际耗时约 0.82 秒。
+
+该检查是局部来源证据，不代替历史区间验收、正式配置或生产安装。
