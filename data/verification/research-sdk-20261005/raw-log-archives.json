@@ -1,0 +1,12 @@
+{
+  "red.log": {
+    "archive": "red.log.gz",
+    "uncompressed_byte_sha256": "1c0a5bd83f1a698ac3ab9a3e72007ac3f2197cd4eb225d47590a72a750f61d7a",
+    "reason": "preserve exact pytest output including its trailing spaces"
+  },
+  "green-initial.log": {
+    "archive": "green-initial.log.gz",
+    "uncompressed_byte_sha256": "a7604af38ea69e2fc55dd9dd7d5adb030c1843723499c4c81b508d0baf275efe",
+    "reason": "preserve exact pytest output including its trailing spaces"
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "at": "2026-10-04T17:21:10.235853+00:00",
+  "removed": [
+    "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/data/verification/research-sdk-20261005/pytest-tmp",
+    "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/data/verification/research-sdk-20261005/test-config"
+  ],
+  "retained": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/data/verification/research-sdk-20261005/demo",
+  "retained_reason": "synthetic sealed demonstration and source traceability; candidate pending root review/integration",
+  "reader_scratch_remaining": 0,
+  "corrupt_scratch_remaining": 0,
+  "all_owned_validation_sessions_finished": true
+}

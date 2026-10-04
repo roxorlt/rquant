@@ -1,0 +1,35 @@
+{
+  "resources_before": [
+    4,
+    1,
+    14
+  ],
+  "resources_after_success": [
+    4,
+    1,
+    14
+  ],
+  "resources_after_query_error": [
+    4,
+    1,
+    14
+  ],
+  "resources_after_artifact_error": [
+    4,
+    1,
+    14
+  ],
+  "resources_after_example": [
+    4,
+    1,
+    14
+  ],
+  "example_exit_code": 0,
+  "example_elapsed_seconds": 0.48151612500078045,
+  "sample_fact_count": 6
+}
+{
+  "date": "2026-07-03",
+  "research_content_sha256": "b51e119b3ce81528bfed3f82038da98473b8bf71c3ca440bd31248dd9b8e6f2d",
+  "display_content_sha256": "7f4aacba90125fa05ca29d064a38e9dc632fbca01364e426e10905e8c3139a33"
+}

@@ -1,0 +1,42 @@
+{
+  "finding": "SDK-R01",
+  "base": "b16d4ae6fe4c62360395a51c31a1f2e8e71a517b",
+  "docs_git_blob": "d677939afd661b43eaf12143811ab4830eafb2e6",
+  "doc_change": "Only restore two explicit synthetic sealed artifact JSON files to 0600; original reader checks preserved",
+  "restored_root": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/data/verification/research-sdk-20261005/r01-fix/restored",
+  "restored_artifact_modes": {
+    "data/verification/research-sdk-20261005/demo/artifacts/factor-display-v1-7f4aacba90125fa05ca29d064a38e9dc632fbca01364e426e10905e8c3139a33.json": "0o600",
+    "data/verification/research-sdk-20261005/demo/artifacts/factor-research-v1-b51e119b3ce81528bfed3f82038da98473b8bf71c3ca440bd31248dd9b8e6f2d.json": "0o600"
+  },
+  "success_command": "chmod 700 \\\n  /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/data/verification/research-sdk-20261005/r01-fix/restored/data/verification/research-sdk-20261005/demo/lake \\\n  /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/data/verification/research-sdk-20261005/r01-fix/restored/data/verification/research-sdk-20261005/demo/artifacts\nchmod 600 \\\n  /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/data/verification/research-sdk-20261005/r01-fix/restored/data/verification/research-sdk-20261005/demo/artifacts/factor-research-v1-b51e119b3ce81528bfed3f82038da98473b8bf71c3ca440bd31248dd9b8e6f2d.json \\\n  /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/data/verification/research-sdk-20261005/r01-fix/restored/data/verification/research-sdk-20261005/demo/artifacts/factor-display-v1-7f4aacba90125fa05ca29d064a38e9dc632fbca01364e426e10905e8c3139a33.json\nenv RQUANT_DISABLE_DOTENV=1 \\\n  /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-source-integration/.venv/bin/python -I -B -c \\\n  'import runpy,sys; sys.path.insert(0,sys.argv[1]); sys.argv=sys.argv[2:]; runpy.run_path(sys.argv[0],run_name=\"__main__\")' \\\n  /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/data/verification/research-sdk-20261005/r01-fix/restored/src \\\n  /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/data/verification/research-sdk-20261005/r01-fix/restored/docs/examples/research_sdk.py \\\n  --source /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/data/verification/research-sdk-20261005/r01-fix/restored/data/verification/research-sdk-20261005/demo/source.json \\\n  --lake-root /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/data/verification/research-sdk-20261005/r01-fix/restored/data/verification/research-sdk-20261005/demo/lake \\\n  --date 2026-07-03 --codes 000001.SZ 000007.SZ \\\n  --fields ma5 market_above_ma20_ratio_pct market_high_60d_ratio_pct \\\n  --artifact-root /Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/data/verification/research-sdk-20261005/r01-fix/restored/data/verification/research-sdk-20261005/demo/artifacts \\\n  --research-sha256 b51e119b3ce81528bfed3f82038da98473b8bf71c3ca440bd31248dd9b8e6f2d \\\n  --display-sha256 7f4aacba90125fa05ca29d064a38e9dc632fbca01364e426e10905e8c3139a33\n",
+  "example_command_after_permission_steps_unchanged": true,
+  "success_exit_code": 0,
+  "success_stderr": "",
+  "success_elapsed_seconds": 0.44794220800031326,
+  "artifact_bytes_unchanged": true,
+  "selected_sealed_source_hashes_unchanged": true,
+  "success_reader_scratch": 0,
+  "parent_resources_order": [
+    "FD",
+    "Python threads"
+  ],
+  "parent_resources_before": [
+    4,
+    1
+  ],
+  "parent_resources_after_success": [
+    4,
+    1
+  ],
+  "all_success_subprocesses_waited": true,
+  "reused_prior_smoke": "3 passed in 2.83s, no skip/deselect",
+  "reused_prior_native_resources": [
+    4,
+    1,
+    14
+  ],
+  "no_sdk_reader_test_or_statistical_code_changed": true,
+  "no_smoke_or_full_suite_rerun": true,
+  "restored_snapshot_cleanup_complete": true,
+  "all_owned_validation_processes_finished": true
+}
