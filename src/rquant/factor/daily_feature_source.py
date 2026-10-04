@@ -94,6 +94,16 @@ from rquant.factor.technical_history_source import (
     _verify_technical_history_input,
 )
 from rquant.factor.universe import StockCode
+from rquant.factor.volume_profile_source import (
+    VOLUME_PROFILE_COLUMNS,
+    VOLUME_PROFILE_DESCRIPTIONS,
+    FactorVolumeProfileDiagnostic,
+    FactorVolumeProfileLakeInput,
+    FactorVolumeProfileReceipt,
+    FactorVolumeProfileSummary,
+    VolumeProfileColumn,
+    VolumeProfileReason,
+)
 from rquant.readside_replica_gate import connect_pinned_readonly
 from rquant.research_lake import _quoted_literal
 from rquant.research_snapshot import (
@@ -131,6 +141,7 @@ DailyStoredColumn = (
     | MinuteFeatureColumn
     | MarketTemperatureColumn
     | AuctionColumn
+    | VolumeProfileColumn
 )
 DailyFeatureStatus = Literal["valid", "missing", "null", "non_finite"]
 
@@ -145,6 +156,7 @@ class FactorDailyStoredField(BaseModel):
         "daily_minute_feature",
         "market_temperature_daily",
         "daily_auction_feature",
+        "daily_volume_profile_feature",
     ]
     name_zh: str
     unit: Literal[
@@ -157,6 +169,7 @@ class FactorDailyStoredField(BaseModel):
         "CNY",
         "observations",
         "binary",
+        "shares",
     ]
     description_zh: str
     value_semantics: (
@@ -166,6 +179,7 @@ class FactorDailyStoredField(BaseModel):
             "minute_features_derived",
             "market_temperature_stored",
             "auction_derived",
+            "volume_profile_derived",
         ]
         | None
     ) = Field(default=None, exclude_if=lambda v: v is None)
@@ -316,6 +330,20 @@ _AUCTION_FIELDS = {f.column: f for f in AUCTION_FIELDS}
 _TABLES = ("daily_indicator", "daily_basic")
 
 
+VOLUME_PROFILE_FIELDS = tuple(
+    FactorDailyStoredField(
+        column=c,
+        table="daily_volume_profile_feature",
+        name_zh=name,
+        unit=unit,
+        description_zh=description,
+        value_semantics="volume_profile_derived",
+    )
+    for c, name, unit, description in VOLUME_PROFILE_DESCRIPTIONS
+)
+_VOLUME_PROFILE_FIELDS = {f.column: f for f in VOLUME_PROFILE_FIELDS}
+
+
 class FactorDailyFeaturePrepareRequest(BaseModel):
     model_config = _MODEL
     prepared_source: FactorPreparedStreamSource
@@ -361,10 +389,19 @@ class FactorDailyFeatureCounts(BaseModel):
         json_schema_extra=lambda schema: schema.pop("default", None),
     )
 
+    volume_profile_reasons: tuple[FactorDailyFeatureReasonCount, ...] = Field(
+        default=(),
+        max_length=14,
+        exclude_if=lambda v: not v,
+        json_schema_extra=lambda schema: schema.pop("default", None),
+    )
+
     @model_validator(mode="after")
     def _reason_family(self) -> FactorDailyFeatureCounts:
         family = (
-            "auction"
+            "volume_profile"
+            if self.column in VOLUME_PROFILE_COLUMNS
+            else "auction"
             if self.column in AUCTION_COLUMNS
             else "market"
             if self.column in MARKET_TEMPERATURE_COLUMNS
@@ -380,6 +417,7 @@ class FactorDailyFeatureCounts(BaseModel):
             or (family != "minute" and self.minute_reasons)
             or (family != "market" and self.market_reasons)
             or (family != "auction" and self.auction_reasons)
+            or (family != "volume_profile" and self.volume_profile_reasons)
         ):
             raise ValueError("daily coverage reasons differ from the field family")
         return self
@@ -393,6 +431,7 @@ class FactorDailyFeatureReasonCount(BaseModel):
         | MinuteFeatureReason
         | MarketTemperatureReason
         | AuctionReason
+        | VolumeProfileReason
     )
     count: int = Field(gt=0)
 
@@ -535,6 +574,13 @@ class _AuctionBaseReference(_V3BaseReference):
     )
 
 
+class _VolumeProfileBaseReference(_V3BaseReference):
+    schema_version: Literal[1, 2, 3, 4, 5, 6]
+    base_daily_source: _VolumeProfileBaseReference | None = Field(
+        default=None, exclude_if=lambda v: v is None
+    )
+
+
 def _v4_receipt_wire(
     value: BaseModel, wire_type: type[BaseModel], date_positions: tuple[int, ...]
 ) -> BaseModel:
@@ -620,6 +666,7 @@ class FactorDailyFeatureSources(BaseModel):
         "minute_features_derived",
         "market_temperature_stored",
         "auction_derived",
+        "volume_profile_derived",
     ] = "stored_not_recomputed"
     price_basis: Literal[
         "unverified", "observation_factor_then_output_session_scale", "field_specific"
@@ -641,6 +688,9 @@ class FactorDailyFeatureSources(BaseModel):
         default=None, exclude_if=lambda v: v is None
     )
     auction: FactorAuctionSummary | None = Field(default=None, exclude_if=lambda v: v is None)
+    volume_profile: FactorVolumeProfileSummary | None = Field(
+        default=None, exclude_if=lambda v: v is None
+    )
 
     @model_validator(mode="after")
     def _fields(self) -> FactorDailyFeatureSources:
@@ -649,9 +699,12 @@ class FactorDailyFeatureSources(BaseModel):
         stock = self.stock_features is not None
         technical = self.technical_history is not None
         market = self.market_temperature is not None
+        volume_profile = self.volume_profile is not None
         auction = self.auction is not None
         semantic = (
-            "auction_derived"
+            "volume_profile_derived"
+            if volume_profile
+            else "auction_derived"
             if auction
             else "market_temperature_stored"
             if market
@@ -669,6 +722,7 @@ class FactorDailyFeatureSources(BaseModel):
             **(_MINUTE_FIELDS if minute else {}),
             **(_MARKET_FIELDS if market else {}),
             **(_AUCTION_FIELDS if auction else {}),
+            **(_VOLUME_PROFILE_FIELDS if volume_profile else {}),
         }
         if (
             self.value_semantics != semantic
@@ -676,10 +730,11 @@ class FactorDailyFeatureSources(BaseModel):
             or (stock and not set(columns) & set(STOCK_FEATURE_COLUMNS))
             or (market and not set(columns) & set(MARKET_TEMPERATURE_COLUMNS))
             or (auction and not set(columns) & set(AUCTION_COLUMNS))
+            or (volume_profile and not set(columns) & set(VOLUME_PROFILE_COLUMNS))
             or self.price_basis
             != (
                 "field_specific"
-                if minute or stock or market or auction
+                if minute or stock or market or auction or volume_profile
                 else "observation_factor_then_output_session_scale"
                 if technical
                 else "unverified"
@@ -687,7 +742,7 @@ class FactorDailyFeatureSources(BaseModel):
             or self.recursive_initialization
             != (
                 "field_specific"
-                if minute or stock or market or auction
+                if minute or stock or market or auction or volume_profile
                 else "first_valid_observation_no_restart"
                 if technical
                 else "unverified"
@@ -702,7 +757,7 @@ class FactorDailyFeatureSources(BaseModel):
 
 class FactorDailyFeatureSource(BaseModel):
     model_config = _MODEL
-    schema_version: Literal[1, 2, 3, 4, 5, 6] = 1
+    schema_version: Literal[1, 2, 3, 4, 5, 6, 7] = 1
     prepared_source_sha256: str = Field(pattern=_SHA)
     prepared_snapshot_id: str
     prepared_binding_hash: str = Field(pattern=_SHA)
@@ -720,6 +775,7 @@ class FactorDailyFeatureSource(BaseModel):
         "minute_features_derived",
         "market_temperature_stored",
         "auction_derived",
+        "volume_profile_derived",
     ] = "stored_not_recomputed"
     price_basis: Literal[
         "unverified", "observation_factor_then_output_session_scale", "field_specific"
@@ -740,6 +796,9 @@ class FactorDailyFeatureSource(BaseModel):
         default=None, exclude_if=lambda v: v is None
     )
     auction: FactorAuctionReceipt | None = Field(default=None, exclude_if=lambda v: v is None)
+    volume_profile: FactorVolumeProfileReceipt | None = Field(
+        default=None, exclude_if=lambda v: v is None
+    )
     source_read_boundary: Literal["single_snapshot_transaction"] = "single_snapshot_transaction"
     read_mode: Literal["descriptor", "in_place"]
     observed_at: datetime
@@ -763,7 +822,7 @@ class FactorDailyFeatureSource(BaseModel):
     @classmethod
     def _expand_technical_wire(cls, value: object, info: ValidationInfo) -> object:
         if isinstance(value, dict) and "code_format" in value:
-            if info.data.get("schema_version") in (4, 5, 6):
+            if info.data.get("schema_version") in (4, 5, 6, 7):
                 wire = _validate_v3_wire(_V4TechnicalReceipt, value, info)
                 return _v4_receipt_expand(
                     wire,
@@ -798,7 +857,7 @@ class FactorDailyFeatureSource(BaseModel):
     @classmethod
     def _expand_stock_wire(cls, value: object, info: ValidationInfo) -> object:
         if isinstance(value, dict) and "code_format" in value:
-            if info.data.get("schema_version") in (4, 5, 6):
+            if info.data.get("schema_version") in (4, 5, 6, 7):
                 wire = _validate_v3_wire(_V4StockReceipt, value, info)
                 return _v4_receipt_expand(
                     wire, FactorStockFeatureCode, FactorStockFeatureReceipt, (2, 3), info
@@ -827,7 +886,7 @@ class FactorDailyFeatureSource(BaseModel):
     @classmethod
     def _expand_minute_wire(cls, value: object, info: ValidationInfo) -> object:
         if isinstance(value, dict) and "code_format" in value:
-            if info.data.get("schema_version") not in (4, 5, 6):
+            if info.data.get("schema_version") not in (4, 5, 6, 7):
                 raise ValueError("compact minute receipt requires a v4 source")
             wire = _validate_v3_wire(_V4MinuteReceipt, value, info)
             return _v4_receipt_expand(
@@ -849,7 +908,7 @@ class FactorDailyFeatureSource(BaseModel):
         tables = []
         for table in value:
             if isinstance(table, dict) and "code_counts_format" in table:
-                if info.data.get("schema_version") not in (3, 4, 5, 6):
+                if info.data.get("schema_version") not in (3, 4, 5, 6, 7):
                     raise ValueError("compact table counts require a v3/v4 source")
                 wire = _validate_v3_wire(_V3Table, table, info)
                 expanded = wire.model_dump(exclude={"code_counts_format", "code_counts"})
@@ -869,12 +928,16 @@ class FactorDailyFeatureSource(BaseModel):
         "base_daily_source",
         mode="before",
         json_schema_input_type="FactorDailyFeatureSource | _V3BaseReference | "
-        "_V4BaseReference | _MarketBaseReference | _AuctionBaseReference | None",
+        "_V4BaseReference | _MarketBaseReference | _AuctionBaseReference | "
+        "_VolumeProfileBaseReference | None",
     )
     @classmethod
     def _expand_base_wire(cls, value: object, info: ValidationInfo) -> object:
         if isinstance(value, dict) and "representation" in value:
             version = info.data.get("schema_version")
+            if version == 7:
+                reference = _validate_v3_wire(_VolumeProfileBaseReference, value, info)
+                return cls._expand_volume_profile_base(reference, info.data, info.data["tables"])
             if version == 6:
                 reference = _validate_v3_wire(_AuctionBaseReference, value, info)
                 return cls._expand_auction_base(reference, info.data, info.data["tables"])
@@ -960,6 +1023,59 @@ class FactorDailyFeatureSource(BaseModel):
         if value is not None and info.mode == "json":
             return _validate_v3_wire(cls, value, info)
         return value
+
+    @classmethod
+    def _expand_volume_profile_base(
+        cls,
+        reference: _VolumeProfileBaseReference,
+        shared: dict[str, object],
+        tables: tuple[FactorDailyFeatureTable, ...],
+    ) -> FactorDailyFeatureSource:
+        if reference.schema_version != 6:
+            return cls._expand_auction_base(
+                _AuctionBaseReference.model_validate(reference.model_dump()), shared, tables
+            )
+        fields = {
+            key: shared[key]
+            for key in (
+                "prepared_source_sha256",
+                "prepared_snapshot_id",
+                "prepared_binding_hash",
+                "scope_content_hash",
+                "scope",
+                "generation",
+                "code_commit",
+                "calendar_open_days",
+            )
+        }
+        base = None
+        if reference.base_daily_source is not None:
+            base = cls._expand_volume_profile_base(reference.base_daily_source, shared, tables)
+        fields.update(
+            reference.model_dump(exclude={"representation", "base_daily_source"}),
+            fields=tuple(
+                sorted(
+                    (() if base is None else base.fields) + AUCTION_FIELDS,
+                    key=lambda f: f.column,
+                )
+            ),
+            value_semantics="auction_derived",
+            price_basis="field_specific",
+            recursive_initialization="field_specific",
+            tables=tables,
+            auction=shared["auction"],
+        )
+        if base is not None:
+            fields["base_daily_source"] = base
+            for key in (
+                "technical_history",
+                "stock_features",
+                "minute_features",
+                "market_temperature",
+            ):
+                if getattr(base, key) is not None:
+                    fields[key] = getattr(base, key)
+        return cls.model_validate(fields)
 
     @classmethod
     def _expand_auction_base(
@@ -1080,7 +1196,7 @@ class FactorDailyFeatureSource(BaseModel):
     ) -> FactorTechnicalHistoryReceipt | _V3TechnicalReceipt | _V4TechnicalReceipt | None:
         if value is None:
             return value
-        if self.schema_version in (4, 5, 6):
+        if self.schema_version in (4, 5, 6, 7):
             return _v4_receipt_wire(value, _V4TechnicalReceipt, (1, 2, 3, 5))
         if self.schema_version != 3:
             return value
@@ -1097,7 +1213,7 @@ class FactorDailyFeatureSource(BaseModel):
     ) -> _V3StockReceipt | _V4StockReceipt | None:
         if value is None:
             return None
-        if self.schema_version in (4, 5, 6):
+        if self.schema_version in (4, 5, 6, 7):
             return _v4_receipt_wire(value, _V4StockReceipt, (2, 3))
         fields = value.model_dump(exclude={"codes"})
         fields["codes"] = tuple(
@@ -1114,7 +1230,7 @@ class FactorDailyFeatureSource(BaseModel):
     def _tables_wire(
         self, value: tuple[FactorDailyFeatureTable, ...]
     ) -> tuple[FactorDailyFeatureTable | _V3Table, ...]:
-        if self.schema_version not in (3, 4, 5, 6):
+        if self.schema_version not in (3, 4, 5, 6, 7):
             return value
         return tuple(
             _V3Table(
@@ -1127,9 +1243,18 @@ class FactorDailyFeatureSource(BaseModel):
     @field_serializer("base_daily_source", when_used="json")
     def _base_wire(
         self, value: FactorDailyFeatureSource | None
-    ) -> _V3BaseReference | _V4BaseReference | _MarketBaseReference | _AuctionBaseReference | None:
+    ) -> (
+        _V3BaseReference
+        | _V4BaseReference
+        | _MarketBaseReference
+        | _AuctionBaseReference
+        | _VolumeProfileBaseReference
+        | None
+    ):
         if value is None:
             return None
+        if self.schema_version == 7:
+            return self._volume_profile_base_wire(value)
         if self.schema_version == 6:
             return self._auction_base_wire(value)
         if self.schema_version == 5:
@@ -1153,6 +1278,24 @@ class FactorDailyFeatureSource(BaseModel):
                 )
             return _V4BaseReference(**fields)
         return _V3BaseReference(**fields)
+
+    @classmethod
+    def _volume_profile_base_wire(
+        cls, value: FactorDailyFeatureSource
+    ) -> _VolumeProfileBaseReference:
+        fields = {
+            key: getattr(value, key)
+            for key in (
+                "schema_version",
+                "sha256",
+                "read_mode",
+                "observed_at",
+                "completed_read_at",
+            )
+        }
+        if value.base_daily_source is not None:
+            fields["base_daily_source"] = cls._volume_profile_base_wire(value.base_daily_source)
+        return _VolumeProfileBaseReference(**fields)
 
     @classmethod
     def _auction_base_wire(cls, value: FactorDailyFeatureSource) -> _AuctionBaseReference:
@@ -1194,6 +1337,10 @@ class FactorDailyFeatureSource(BaseModel):
     @model_validator(mode="after")
     def _binding(self) -> FactorDailyFeatureSource:
         dates = _dates(self.scope)
+        if (self.schema_version == 7) != (self.volume_profile is not None):
+            raise ValueError("VP facts require the explicit v7 source")
+        if self.schema_version == 7:
+            return self._volume_profile_binding(dates)
         if (self.schema_version == 6) != (self.auction is not None):
             raise ValueError("auction facts require the explicit v6 source")
         if self.schema_version == 6:
@@ -1342,6 +1489,58 @@ class FactorDailyFeatureSource(BaseModel):
             raise ValueError("daily feature source digest mismatch")
         return self
 
+    def _volume_profile_binding(self, dates: tuple[date, ...]) -> FactorDailyFeatureSource:
+        base, receipt = self.base_daily_source, self.volume_profile
+        if (
+            self.fields
+            != tuple(
+                sorted(
+                    (() if base is None else base.fields) + VOLUME_PROFILE_FIELDS,
+                    key=lambda f: f.column,
+                )
+            )
+            or self.value_semantics != "volume_profile_derived"
+            or self.price_basis != "field_specific"
+            or self.recursive_initialization != "field_specific"
+            or self.completed_read_at < self.observed_at
+            or self.calendar_open_days != tuple(sorted(set(self.calendar_open_days)))
+            or not set(self.calendar_open_days) <= set(dates)
+            or self.tables != (() if base is None else base.tables)
+            or receipt.output_rows != len(self.scope.stock_codes) * len(self.calendar_open_days)
+            or receipt.output_rows * len(self.fields) > receipt.max_output_cells
+            or receipt.artifact.earliest_time
+            != (self.calendar_open_days[0].isoformat() if self.calendar_open_days else None)
+            or receipt.artifact.latest_time
+            != (self.calendar_open_days[-1].isoformat() if self.calendar_open_days else None)
+            or self.sha256 != canonical_sha256(self.model_dump(exclude={"sha256"}))
+        ):
+            raise ValueError("VP source contract, clock, scope or digest mismatch")
+        for key in (
+            "technical_history",
+            "stock_features",
+            "minute_features",
+            "market_temperature",
+            "auction",
+        ):
+            if getattr(self, key) != (None if base is None else getattr(base, key)):
+                raise ValueError("VP base receipt differs")
+        if base is not None:
+            if base.schema_version == 7 or self.observed_at < base.completed_read_at:
+                raise ValueError("VP base read boundary differs")
+            for key in (
+                "prepared_source_sha256",
+                "prepared_snapshot_id",
+                "prepared_binding_hash",
+                "scope_content_hash",
+                "scope",
+                "generation",
+                "code_commit",
+                "calendar_open_days",
+            ):
+                if getattr(base, key) != getattr(self, key):
+                    raise ValueError("VP base differs from paired prepared source")
+        return self
+
     def _auction_binding(self, dates: tuple[date, ...]) -> FactorDailyFeatureSource:
         base, receipt = self.base_daily_source, self.auction
         if (
@@ -1454,6 +1653,7 @@ class FactorDailyFeatureSource(BaseModel):
             set(selected) & set(TECHNICAL_COLUMNS)
         )
         market = bool(set(selected) & set(MARKET_TEMPERATURE_COLUMNS))
+        volume_profile = bool(set(selected) & set(VOLUME_PROFILE_COLUMNS))
         auction = bool(set(selected) & set(AUCTION_COLUMNS))
         return FactorDailyFeatureSources(
             source_sha256=self.sha256,
@@ -1463,7 +1663,9 @@ class FactorDailyFeatureSource(BaseModel):
             scope_content_hash=self.scope_content_hash,
             code_commit=self.code_commit,
             fields=tuple(available[c] for c in selected),
-            value_semantics="auction_derived"
+            value_semantics="volume_profile_derived"
+            if volume_profile
+            else "auction_derived"
             if auction
             else "market_temperature_stored"
             if market
@@ -1475,12 +1677,12 @@ class FactorDailyFeatureSource(BaseModel):
             if technical
             else "stored_not_recomputed",
             price_basis="field_specific"
-            if stock or minute or market or auction
+            if stock or minute or market or auction or volume_profile
             else "observation_factor_then_output_session_scale"
             if technical
             else "unverified",
             recursive_initialization="field_specific"
-            if stock or minute or market or auction
+            if stock or minute or market or auction or volume_profile
             else "first_valid_observation_no_restart"
             if technical
             else "unverified",
@@ -1489,6 +1691,7 @@ class FactorDailyFeatureSource(BaseModel):
             minute_features=self.minute_features.summary() if minute else None,
             market_temperature=self.market_temperature.summary() if market else None,
             auction=self.auction.summary() if auction else None,
+            volume_profile=self.volume_profile.summary() if volume_profile else None,
         )
 
     def input_artifacts(self) -> tuple[DatasetSnapshotArtifact, ...]:
@@ -1504,6 +1707,13 @@ class FactorDailyFeatureSource(BaseModel):
                 else self.auction.inputs
                 + (self.auction.artifact,)
                 + (() if self.auction.lake is None else (self.auction.lake.artifact,))
+            )
+            + (
+                ()
+                if self.volume_profile is None
+                else self.volume_profile.inputs
+                + (self.volume_profile.artifact,)
+                + (() if self.volume_profile.lake is None else (self.volume_profile.lake.artifact,))
             )
         )
 
@@ -1541,6 +1751,16 @@ class FactorAuctionPrepareRequest(BaseModel):
     max_output_cells: int = Field(default=32_000_000, gt=0, le=128_000_000)
 
 
+class FactorVolumeProfilePrepareRequest(BaseModel):
+    model_config = _MODEL
+    prepared_source: FactorPreparedStreamSource
+    base_daily_source: FactorDailyFeatureSource | None = None
+    lake_input: FactorVolumeProfileLakeInput | None = None
+    max_input_rows: int = Field(default=64_000_000, gt=0, le=128_000_000)
+    max_code_rows: int = Field(default=300_000, gt=0, le=300_000)
+    max_output_cells: int = Field(default=32_000_000, gt=0, le=128_000_000)
+
+
 class FactorDailyFeatureQuery(BaseModel):
     model_config = _MODEL
     source_sha256: str = Field(pattern=_SHA)
@@ -1569,6 +1789,7 @@ class FactorDailyFeatureValue(BaseModel):
         | MinuteFeatureReason
         | MarketTemperatureReason
         | AuctionReason
+        | VolumeProfileReason
         | None
     ) = Field(default=None, exclude_if=lambda v: v is None)
 
@@ -1583,6 +1804,10 @@ class FactorDailyFeatureValue(BaseModel):
         default=None, exclude_if=lambda v: v is None
     )
 
+    volume_profile_diagnostic: FactorVolumeProfileDiagnostic | None = Field(
+        default=None, exclude_if=lambda v: v is None
+    )
+
     @model_validator(mode="after")
     def _value(self) -> FactorDailyFeatureValue:
         if (self.status == "valid") != (self.value is not None) or (
@@ -1593,7 +1818,12 @@ class FactorDailyFeatureValue(BaseModel):
             self.status == "valid"
             or (
                 self.reason
-                in ("derived_non_finite", "market_temperature_non_finite", "auction_non_finite")
+                in (
+                    "derived_non_finite",
+                    "market_temperature_non_finite",
+                    "auction_non_finite",
+                    "volume_profile_non_finite",
+                )
             )
             != (self.status == "non_finite")
         ):
@@ -1605,6 +1835,33 @@ class FactorDailyFeatureFact(FactorDailyFeatureValue):
     stock_code: StockCode
     trade_date: date
     column: DailyStoredColumn
+
+    @model_validator(mode="after")
+    def _volume_profile_fact(self) -> FactorDailyFeatureFact:
+        if self.column not in VOLUME_PROFILE_COLUMNS:
+            if self.volume_profile_diagnostic is not None:
+                raise ValueError("VP diagnostic attached to another field family")
+            return self
+        if (
+            self.volume_profile_diagnostic is None
+            or self.volume_profile_diagnostic.reference_date != self.trade_date
+        ):
+            raise ValueError("VP fact requires the exact original reference date")
+        missing = (
+            "no_trading_dates",
+            "missing_minute_data",
+            "missing_reference_factor",
+            "missing_required_factor",
+        )
+        if self.status == "valid" and (
+            self.reason is not None or self.volume_profile_diagnostic.minute_rows == 0
+        ):
+            raise ValueError("valid VP fact differs from calculation diagnostic")
+        if self.status != "valid" and (
+            self.reason is None or (self.status == "missing") != (self.reason in missing)
+        ):
+            raise ValueError("VP missing state differs from original calculation reason")
+        return self
 
     @model_validator(mode="after")
     def _auction_fact(self) -> FactorDailyFeatureFact:
@@ -1713,6 +1970,30 @@ class FactorAuctionPreviewStock(BaseModel):
         return self
 
 
+class FactorVolumeProfilePreviewValue(FactorDailyFeatureValue):
+    column: VolumeProfileColumn
+    reason: VolumeProfileReason | None = Field(default=None, exclude_if=lambda v: v is None)
+
+
+class FactorVolumeProfilePreviewStock(BaseModel):
+    model_config = _MODEL
+    stock_code: StockCode
+    values: tuple[FactorVolumeProfilePreviewValue, ...] = Field(min_length=1, max_length=11)
+    diagnostic: FactorVolumeProfileDiagnostic
+
+    @model_validator(mode="after")
+    def _columns(self) -> FactorVolumeProfilePreviewStock:
+        columns = tuple(v.column for v in self.values)
+        if columns != tuple(sorted(set(columns))) or any(
+            v.volume_profile_diagnostic is not None
+            or v.diagnostic is not None
+            or v.minute_diagnostic is not None
+            for v in self.values
+        ):
+            raise ValueError("VP preview repeats fields or duplicates shared diagnostic")
+        return self
+
+
 MAX_AUCTION_PREVIEW_DAYS = 32
 
 
@@ -1773,6 +2054,30 @@ class FactorDailyFeatureInput(BaseModel):
                     for i, column in indexes
                 ),
                 diagnostic=row.values[indexes[0][0]].auction_diagnostic,
+            )
+            for row in self.rows[:10]
+        )
+
+    @property
+    def volume_profile_values(self) -> tuple[FactorVolumeProfilePreviewStock, ...] | None:
+        indexes = tuple(
+            (i, f.column)
+            for i, f in enumerate(self.stock_fields)
+            if f.column in VOLUME_PROFILE_COLUMNS
+        )
+        if not indexes:
+            return None
+        return tuple(
+            FactorVolumeProfilePreviewStock(
+                stock_code=row.stock_code,
+                values=tuple(
+                    FactorVolumeProfilePreviewValue(
+                        column=column,
+                        **row.values[i].model_dump(exclude={"volume_profile_diagnostic"}),
+                    )
+                    for i, column in indexes
+                ),
+                diagnostic=row.values[indexes[0][0]].volume_profile_diagnostic,
             )
             for row in self.rows[:10]
         )
@@ -1860,6 +2165,7 @@ def read_factor_daily_feature_input(
                             diagnostic=f.diagnostic,
                             minute_diagnostic=f.minute_diagnostic,
                             auction_diagnostic=f.auction_diagnostic,
+                            volume_profile_diagnostic=f.volume_profile_diagnostic,
                         )
                         for f in batch.facts[i * len(stock_columns) : (i + 1) * len(stock_columns)]
                     ),
@@ -1921,7 +2227,9 @@ def _count_reasons(
     column: str, values: tuple[FactorDailyFeatureValue, ...]
 ) -> dict[str, tuple[FactorDailyFeatureReasonCount, ...]]:
     return {
-        "auction_reasons"
+        "volume_profile_reasons"
+        if column in VOLUME_PROFILE_COLUMNS
+        else "auction_reasons"
         if column in AUCTION_COLUMNS
         else "market_reasons"
         if column in MARKET_TEMPERATURE_COLUMNS
@@ -2229,6 +2537,7 @@ class FactorDailyFeatureReadLease:
         ):
             raise ValueError("daily feature query exceeds source or scope")
         values, reasons, diagnostics, minute_diagnostics = {}, {}, {}, {}
+        volume_profile_diagnostics = {}
         auction_diagnostics, auction_tags = {}, {}
         auction_fields = tuple(c for c in query.fields if c in AUCTION_COLUMNS)
         if auction_fields:
@@ -2255,6 +2564,23 @@ class FactorDailyFeatureReadLease:
                         auction_tags[row[0], column],
                     ) = row[1 + i * 3 : 4 + i * 3]
                     auction_diagnostics[row[0], column] = diagnostic
+        volume_profile_fields = tuple(c for c in query.fields if c in VOLUME_PROFILE_COLUMNS)
+        if volume_profile_fields:
+            selected = tuple(v for c in volume_profile_fields for v in (c, c + "__reason"))
+            rows = self._connection.execute(
+                "SELECT ts_code,"
+                + ",".join(selected)
+                + ",volume_profile_diagnostic FROM daily_volume_profile_feature "
+                "WHERE trade_date=? AND ts_code IN (SELECT unnest(?)) ORDER BY ts_code",
+                [query.trade_date, list(query.stock_codes)],
+            ).fetchmany(501)
+            if len(rows) > len(query.stock_codes) or len({r[0] for r in rows}) != len(rows):
+                raise ValueError("VP private query exceeds unique bounded grid")
+            for row in rows:
+                diagnostic = FactorVolumeProfileDiagnostic.model_validate_json(row[-1])
+                for i, column in enumerate(volume_profile_fields):
+                    values[row[0], column], reasons[row[0], column] = row[1 + i * 2 : 3 + i * 2]
+                    volume_profile_diagnostics[row[0], column] = diagnostic
         market_columns = tuple(c for c in query.fields if c in MARKET_TEMPERATURE_COLUMNS)
         market_row = None
         if market_columns:
@@ -2314,7 +2640,27 @@ class FactorDailyFeatureReadLease:
             for column in query.fields:
                 value = values.get((code, column))
                 tag = None
-                if column in auction_fields:
+                if column in volume_profile_fields:
+                    reason = reasons.get((code, column))
+                    if (code, column) not in values:
+                        raise ValueError("VP private sealed output is missing a grid cell")
+                    if reason == "volume_profile_non_finite":
+                        status, tag = "non_finite", "NaN"
+                    elif value is None:
+                        status = (
+                            "missing"
+                            if reason
+                            in (
+                                "no_trading_dates",
+                                "missing_minute_data",
+                                "missing_reference_factor",
+                                "missing_required_factor",
+                            )
+                            else "null"
+                        )
+                    else:
+                        status = "valid"
+                elif column in auction_fields:
                     reason, tag = reasons.get((code, column)), auction_tags.get((code, column))
                     if (code, column) not in values:
                         status = "missing"
@@ -2396,6 +2742,7 @@ class FactorDailyFeatureReadLease:
                         diagnostic=diagnostics.get((code, column)),
                         minute_diagnostic=minute_diagnostics.get((code, column)),
                         auction_diagnostic=auction_diagnostics.get((code, column)),
+                        volume_profile_diagnostic=volume_profile_diagnostics.get((code, column)),
                     )
                 )
         self.query_count += 1
@@ -2472,6 +2819,54 @@ def open_factor_daily_feature_source(
             try:
                 connection.execute("SET threads=1")
                 connection.execute("SET temp_directory = ?", [scratch])
+                if source.volume_profile is not None:
+                    receipt = source.volume_profile
+                    path = private_root / receipt.artifact.relative_path
+                    connection.execute(
+                        "CREATE VIEW daily_volume_profile_feature AS SELECT * FROM read_parquet("
+                        + _quoted_literal(str(path))
+                        + ",hive_partitioning=false)"
+                    )
+                    columns = tuple(
+                        (str(r[0]), str(r[1]))
+                        for r in connection.execute(
+                            "DESCRIBE daily_volume_profile_feature"
+                        ).fetchall()
+                    )
+                    expected = (
+                        (("ts_code", "VARCHAR"), ("trade_date", "DATE"))
+                        + tuple(
+                            v
+                            for c in VOLUME_PROFILE_COLUMNS
+                            for v in (
+                                (c, "DOUBLE"),
+                                (c + "__reason", "VARCHAR"),
+                            )
+                        )
+                        + (("volume_profile_diagnostic", "VARCHAR"),)
+                    )
+                    invalid = connection.execute(
+                        (
+                            "SELECT count(*) FROM daily_volume_profile_feature "
+                            "WHERE ts_code NOT IN (SELECT unnest(?)) "
+                            "OR trade_date NOT IN (SELECT unnest(?))"
+                        ),
+                        [list(source.scope.stock_codes), list(source.calendar_open_days)],
+                    ).fetchone()[0]
+                    duplicates = connection.execute(
+                        "SELECT count(*) FROM (SELECT ts_code,trade_date "
+                        "FROM daily_volume_profile_feature GROUP BY ALL HAVING count(*)>1)"
+                    ).fetchone()[0]
+                    if (
+                        columns != expected
+                        or invalid
+                        or duplicates
+                        or connection.execute(
+                            "SELECT count(*) FROM daily_volume_profile_feature"
+                        ).fetchone()[0]
+                        != receipt.output_rows
+                    ):
+                        raise ValueError("VP private output differs from complete sealed grid")
                 if source.auction is not None:
                     receipt = source.auction
                     path = private_root / receipt.artifact.relative_path

@@ -23,10 +23,12 @@ from rquant.factor.daily_feature_source import (
     AUCTION_COLUMNS,
     MARKET_TEMPERATURE_COLUMNS,
     MAX_AUCTION_PREVIEW_DAYS,
+    VOLUME_PROFILE_COLUMNS,
     FactorAuctionPreviewStock,
     FactorDailyFeatureCounts,
     FactorDailyFeatureSources,
     FactorMarketTemperatureDayValue,
+    FactorVolumeProfilePreviewStock,
     open_factor_daily_feature_source,
     read_factor_daily_feature_input,
 )
@@ -177,6 +179,13 @@ class FactorDailyFeatureCoverageDay(BaseModel):
         default=None, min_length=1, max_length=10, exclude_if=lambda v: v is None
     )
 
+    volume_profile_values: tuple[FactorVolumeProfilePreviewStock, ...] | None = Field(
+        default=None,
+        min_length=1,
+        max_length=10,
+        exclude_if=lambda v: v is None,
+    )
+
     @model_validator(mode="after")
     def _grid(self) -> FactorDailyFeatureCoverageDay:
         if self.panel_date >= self.trade_date or any(
@@ -197,6 +206,13 @@ class FactorDailyFeatureCoverageDay(BaseModel):
             or any(tuple(v.column for v in row.values) != auction for row in self.auction_values)
         ):
             raise ValueError("display auction preview differs from complete grid coverage")
+        vp = tuple(c.column for c in self.counts if c.column in VOLUME_PROFILE_COLUMNS)
+        if self.volume_profile_values is not None and (
+            any(tuple(v.column for v in row.values) != vp for row in self.volume_profile_values)
+            or tuple(r.stock_code for r in self.volume_profile_values)
+            != tuple(sorted(set(r.stock_code for r in self.volume_profile_values)))
+        ):
+            raise ValueError("VP preview differs from selected complete coverage grid")
         return self
 
 
@@ -456,6 +472,7 @@ def project_factor_stream_display(full: FactorStreamFullArtifact) -> FactorStrea
                 counts=day.daily_feature_counts,
                 market_temperature_values=day.market_temperature_values,
                 auction_values=day.auction_values,
+                volume_profile_values=day.volume_profile_values,
             )
             for day in result.research.research.adapter_completion.feature_days
             if day.trade_date in request.evaluation_days
@@ -652,6 +669,7 @@ def verify_factor_stream_artifacts(
                         or original.counts != feature.daily_feature_counts
                         or original.market_temperature_values != feature.market_temperature_values
                         or feature.auction_values is not None
+                        or feature.volume_profile_values is not None
                     ):
                         raise ValueError(
                             "completed stored daily inputs differ from sealed original values"
@@ -717,6 +735,15 @@ def verify_factor_stream_artifacts(
                                     else None
                                 )
                                 != feature.auction_values
+                                or (
+                                    original.volume_profile_values
+                                    if day.trade_date
+                                    in spec.adapter_request.evaluation_days[
+                                        -MAX_AUCTION_PREVIEW_DAYS:
+                                    ]
+                                    else None
+                                )
+                                != feature.volume_profile_values
                             ):
                                 raise ValueError(
                                     "completed stored daily inputs "

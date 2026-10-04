@@ -113,6 +113,9 @@ export function FactorEditor({
   const hasMinute = fields.some((field) => field.value_semantics === "minute_features_derived");
   const hasMarket = fields.some((field) => field.value_semantics === "market_temperature_stored");
   const hasAuction = fields.some((field) => field.value_semantics === "auction_derived");
+  const hasVolumeProfile = fields.some(
+    (field) => field.value_semantics === "volume_profile_derived",
+  );
   const search = fieldSearch.trim().toLocaleLowerCase();
   const visibleFields = search
     ? fields.filter((field) =>
@@ -124,7 +127,7 @@ export function FactorEditor({
       ? fields
       : fields.slice(0, 6);
   const groups =
-    hasMarket || hasAuction
+    hasMarket || hasAuction || hasVolumeProfile
       ? [
           {
             label: "日线",
@@ -132,6 +135,7 @@ export function FactorEditor({
               (field) =>
                 field.value_semantics !== "market_temperature_stored" &&
                 field.value_semantics !== "auction_derived" &&
+                field.value_semantics !== "volume_profile_derived" &&
                 field.value_semantics !== "minute_features_derived",
             ),
           },
@@ -144,6 +148,12 @@ export function FactorEditor({
           {
             label: "竞价",
             fields: visibleFields.filter((field) => field.value_semantics === "auction_derived"),
+          },
+          {
+            label: "成交分布",
+            fields: visibleFields.filter(
+              (field) => field.value_semantics === "volume_profile_derived",
+            ),
           },
           {
             label: "市场温度",
@@ -290,7 +300,7 @@ export function FactorEditor({
           </label>
         </div>
         <div className="factor-editor-help">
-          <span>{hasMinute || hasMarket ? "字段" : "日线字段"}</span>
+          <span>{hasMinute || hasMarket || hasVolumeProfile ? "字段" : "日线字段"}</span>
           <div className="factor-editor-field-tools">
             <Tip
               content={
@@ -316,7 +326,9 @@ export function FactorEditor({
         <input
           className="inp factor-editor-search"
           type="search"
-          aria-label={hasMinute || hasMarket || hasAuction ? "搜索字段" : "搜索日线字段"}
+          aria-label={
+            hasMinute || hasMarket || hasAuction || hasVolumeProfile ? "搜索字段" : "搜索日线字段"
+          }
           placeholder="按中文名搜索字段"
           value={fieldSearch}
           maxLength={64}

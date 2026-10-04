@@ -2478,9 +2478,9 @@ export interface components {
             /** Tracking Unavailable Reason Zh */
             tracking_unavailable_reason_zh?: string | null;
             /** Unit */
-            unit?: ("stored_price" | "session_price" | "indicator" | "percent" | "ratio" | "CNY_10000" | "CNY" | "observations" | "binary") | null;
+            unit?: ("stored_price" | "session_price" | "indicator" | "percent" | "ratio" | "CNY_10000" | "CNY" | "observations" | "binary" | "shares") | null;
             /** Value Semantics */
-            value_semantics?: ("stored_not_recomputed" | "history_derived" | "stock_features_derived" | "minute_features_derived" | "market_temperature_stored" | "auction_derived") | null;
+            value_semantics?: ("stored_not_recomputed" | "history_derived" | "stock_features_derived" | "minute_features_derived" | "market_temperature_stored" | "auction_derived" | "volume_profile_derived") | null;
         };
         /** DataAuditHealthData */
         DataAuditHealthData: {
@@ -3199,6 +3199,7 @@ export interface components {
             status: "valid" | "missing" | "null" | "non_finite";
             /** Value */
             value: number | null;
+            volume_profile_diagnostic?: components["schemas"]["FactorVolumeProfileDiagnostic"] | null;
         };
         /** FactorAuctionSummary */
         FactorAuctionSummary: {
@@ -3240,7 +3241,7 @@ export interface components {
              * Version
              * @enum {string}
              */
-            version: "daily_v1" | "daily_stored_v1" | "daily_derived_v1" | "daily_stock_v1" | "daily_minute_v1" | "daily_market_temperature_v1" | "daily_auction_v1";
+            version: "daily_v1" | "daily_stored_v1" | "daily_derived_v1" | "daily_stock_v1" | "daily_minute_v1" | "daily_market_temperature_v1" | "daily_auction_v1" | "daily_volume_profile_v1";
         };
         /** FactorCatalogData */
         FactorCatalogData: {
@@ -3269,7 +3270,7 @@ export interface components {
             /** Auction Reasons */
             auction_reasons?: components["schemas"]["FactorDailyFeatureReasonCount"][];
             /** Column */
-            column: ("ma5" | "ma10" | "ma20" | "ma60" | "rsi6" | "rsi14" | "macd" | "macd_signal" | "macd_hist" | "kdj_k" | "kdj_d" | "kdj_j" | "turnover_rate" | "volume_ratio" | "total_mv" | "circ_mv") | ("price_window_days_90d" | "price_position_90d_pct" | "price_rank_90d_pct" | "distance_to_high_90d_pct" | "distance_to_low_90d_pct" | "price_window_days_120d" | "price_position_120d_pct" | "price_rank_120d_pct" | "distance_to_high_120d_pct" | "distance_to_low_120d_pct" | "price_window_days_250d" | "price_position_250d_pct" | "price_rank_250d_pct" | "distance_to_high_250d_pct" | "distance_to_low_250d_pct" | "accum_window_days_20d" | "accum_obv_change_20d_pct" | "accum_ad_flow_20d_pct" | "accum_up_down_amount_ratio_20d" | "accum_heavy_no_drop_days_20d" | "accum_close_position_avg_20d_pct" | "ma_alignment" | "price_percentile_250d") | ("signal_minute_amount" | "signal_cum_amount_asof" | "hist_same_minute_amount_median_20d" | "hist_cum_amount_asof_median_20d" | "signal_rel_amount_same_minute_20d" | "signal_rel_cum_amount_asof_20d" | "hist_intraday_days_20d" | "signal_opening_segment" | "signal_opening_segment_amount" | "signal_amount_accel_5m" | "signal_amount_accel_10m") | ("market_high_60d_ratio_pct" | "market_above_ma20_ratio_pct") | ("board_gap_up_ratio" | "board_auction_amount_ratio" | "board_member_count");
+            column: ("ma5" | "ma10" | "ma20" | "ma60" | "rsi6" | "rsi14" | "macd" | "macd_signal" | "macd_hist" | "kdj_k" | "kdj_d" | "kdj_j" | "turnover_rate" | "volume_ratio" | "total_mv" | "circ_mv") | ("price_window_days_90d" | "price_position_90d_pct" | "price_rank_90d_pct" | "distance_to_high_90d_pct" | "distance_to_low_90d_pct" | "price_window_days_120d" | "price_position_120d_pct" | "price_rank_120d_pct" | "distance_to_high_120d_pct" | "distance_to_low_120d_pct" | "price_window_days_250d" | "price_position_250d_pct" | "price_rank_250d_pct" | "distance_to_high_250d_pct" | "distance_to_low_250d_pct" | "accum_window_days_20d" | "accum_obv_change_20d_pct" | "accum_ad_flow_20d_pct" | "accum_up_down_amount_ratio_20d" | "accum_heavy_no_drop_days_20d" | "accum_close_position_avg_20d_pct" | "ma_alignment" | "price_percentile_250d") | ("signal_minute_amount" | "signal_cum_amount_asof" | "hist_same_minute_amount_median_20d" | "hist_cum_amount_asof_median_20d" | "signal_rel_amount_same_minute_20d" | "signal_rel_cum_amount_asof_20d" | "hist_intraday_days_20d" | "signal_opening_segment" | "signal_opening_segment_amount" | "signal_amount_accel_5m" | "signal_amount_accel_10m") | ("market_high_60d_ratio_pct" | "market_above_ma20_ratio_pct") | ("board_gap_up_ratio" | "board_auction_amount_ratio" | "board_member_count") | ("vp90_vwap" | "vp90_poc_price" | "vp90_value_area_low" | "vp90_value_area_high" | "vp90_concentration_top5_pct" | "vp90_below_reference_amount_pct" | "vp90_above_reference_amount_pct" | "vp90_below_reference_volume_pct" | "vp90_above_reference_volume_pct" | "vp90_total_vol" | "vp90_total_amount");
             /** Market Reasons */
             market_reasons?: components["schemas"]["FactorDailyFeatureReasonCount"][];
             /** Minute Reasons */
@@ -3286,6 +3287,8 @@ export interface components {
             stock_reasons?: components["schemas"]["FactorDailyFeatureReasonCount"][];
             /** Valid */
             valid: number;
+            /** Volume Profile Reasons */
+            volume_profile_reasons?: components["schemas"]["FactorDailyFeatureReasonCount"][];
         };
         /** FactorDailyFeatureCoverageDay */
         FactorDailyFeatureCoverageDay: {
@@ -3307,13 +3310,15 @@ export interface components {
              * Format: date
              */
             trade_date: string;
+            /** Volume Profile Values */
+            volume_profile_values?: components["schemas"]["FactorVolumeProfilePreviewStock"][] | null;
         };
         /** FactorDailyFeatureReasonCount */
         FactorDailyFeatureReasonCount: {
             /** Count */
             count: number;
             /** Reason */
-            reason: ("insufficient_window" | "no_initialization" | "history_break" | "missing_observation" | "derived_non_finite") | ("missing_reference_factor" | "non_finite_reference_factor" | "non_positive_reference_factor" | "missing_required_factor" | "non_finite_required_factor" | "non_positive_required_factor") | ("missing_daily_data" | "insufficient_history" | "undefined_statistic") | ("missing_target_minute" | "missing_history" | "missing_same_minute_history" | "zero_same_minute_baseline" | "zero_cumulative_baseline" | "not_applicable" | "no_acceleration_history" | "undefined_statistic") | ("missing_market_temperature" | "market_temperature_null" | "market_temperature_non_finite" | "invalid_market_percentage") | ("missing_board_membership" | "missing_board_auction" | "missing_previous_close" | "missing_auction_history" | "zero_auction_baseline" | "auction_null" | "auction_non_finite" | "invalid_auction_price" | "invalid_auction_amount" | "invalid_previous_close");
+            reason: ("insufficient_window" | "no_initialization" | "history_break" | "missing_observation" | "derived_non_finite") | ("missing_reference_factor" | "non_finite_reference_factor" | "non_positive_reference_factor" | "missing_required_factor" | "non_finite_required_factor" | "non_positive_required_factor") | ("missing_daily_data" | "insufficient_history" | "undefined_statistic") | ("missing_target_minute" | "missing_history" | "missing_same_minute_history" | "zero_same_minute_baseline" | "zero_cumulative_baseline" | "not_applicable" | "no_acceleration_history" | "undefined_statistic") | ("missing_market_temperature" | "market_temperature_null" | "market_temperature_non_finite" | "invalid_market_percentage") | ("missing_board_membership" | "missing_board_auction" | "missing_previous_close" | "missing_auction_history" | "zero_auction_baseline" | "auction_null" | "auction_non_finite" | "invalid_auction_price" | "invalid_auction_amount" | "invalid_previous_close") | ("no_trading_dates" | "missing_or_invalid_reference_price" | "missing_minute_data" | "unmapped_price_basis_ratio" | "empty_price_bins" | "non_positive_profile_totals" | "volume_profile_non_finite" | "invalid_volume_profile_data");
         };
         /**
          * FactorDailyFeatureSources
@@ -3362,12 +3367,13 @@ export interface components {
              * @default stored_not_recomputed
              * @enum {string}
              */
-            value_semantics: "stored_not_recomputed" | "history_derived" | "stock_features_derived" | "minute_features_derived" | "market_temperature_stored" | "auction_derived";
+            value_semantics: "stored_not_recomputed" | "history_derived" | "stock_features_derived" | "minute_features_derived" | "market_temperature_stored" | "auction_derived" | "volume_profile_derived";
+            volume_profile?: components["schemas"]["FactorVolumeProfileSummary"] | null;
         };
         /** FactorDailyStoredField */
         FactorDailyStoredField: {
             /** Column */
-            column: ("ma5" | "ma10" | "ma20" | "ma60" | "rsi6" | "rsi14" | "macd" | "macd_signal" | "macd_hist" | "kdj_k" | "kdj_d" | "kdj_j" | "turnover_rate" | "volume_ratio" | "total_mv" | "circ_mv") | ("price_window_days_90d" | "price_position_90d_pct" | "price_rank_90d_pct" | "distance_to_high_90d_pct" | "distance_to_low_90d_pct" | "price_window_days_120d" | "price_position_120d_pct" | "price_rank_120d_pct" | "distance_to_high_120d_pct" | "distance_to_low_120d_pct" | "price_window_days_250d" | "price_position_250d_pct" | "price_rank_250d_pct" | "distance_to_high_250d_pct" | "distance_to_low_250d_pct" | "accum_window_days_20d" | "accum_obv_change_20d_pct" | "accum_ad_flow_20d_pct" | "accum_up_down_amount_ratio_20d" | "accum_heavy_no_drop_days_20d" | "accum_close_position_avg_20d_pct" | "ma_alignment" | "price_percentile_250d") | ("signal_minute_amount" | "signal_cum_amount_asof" | "hist_same_minute_amount_median_20d" | "hist_cum_amount_asof_median_20d" | "signal_rel_amount_same_minute_20d" | "signal_rel_cum_amount_asof_20d" | "hist_intraday_days_20d" | "signal_opening_segment" | "signal_opening_segment_amount" | "signal_amount_accel_5m" | "signal_amount_accel_10m") | ("market_high_60d_ratio_pct" | "market_above_ma20_ratio_pct") | ("board_gap_up_ratio" | "board_auction_amount_ratio" | "board_member_count");
+            column: ("ma5" | "ma10" | "ma20" | "ma60" | "rsi6" | "rsi14" | "macd" | "macd_signal" | "macd_hist" | "kdj_k" | "kdj_d" | "kdj_j" | "turnover_rate" | "volume_ratio" | "total_mv" | "circ_mv") | ("price_window_days_90d" | "price_position_90d_pct" | "price_rank_90d_pct" | "distance_to_high_90d_pct" | "distance_to_low_90d_pct" | "price_window_days_120d" | "price_position_120d_pct" | "price_rank_120d_pct" | "distance_to_high_120d_pct" | "distance_to_low_120d_pct" | "price_window_days_250d" | "price_position_250d_pct" | "price_rank_250d_pct" | "distance_to_high_250d_pct" | "distance_to_low_250d_pct" | "accum_window_days_20d" | "accum_obv_change_20d_pct" | "accum_ad_flow_20d_pct" | "accum_up_down_amount_ratio_20d" | "accum_heavy_no_drop_days_20d" | "accum_close_position_avg_20d_pct" | "ma_alignment" | "price_percentile_250d") | ("signal_minute_amount" | "signal_cum_amount_asof" | "hist_same_minute_amount_median_20d" | "hist_cum_amount_asof_median_20d" | "signal_rel_amount_same_minute_20d" | "signal_rel_cum_amount_asof_20d" | "hist_intraday_days_20d" | "signal_opening_segment" | "signal_opening_segment_amount" | "signal_amount_accel_5m" | "signal_amount_accel_10m") | ("market_high_60d_ratio_pct" | "market_above_ma20_ratio_pct") | ("board_gap_up_ratio" | "board_auction_amount_ratio" | "board_member_count") | ("vp90_vwap" | "vp90_poc_price" | "vp90_value_area_low" | "vp90_value_area_high" | "vp90_concentration_top5_pct" | "vp90_below_reference_amount_pct" | "vp90_above_reference_amount_pct" | "vp90_below_reference_volume_pct" | "vp90_above_reference_volume_pct" | "vp90_total_vol" | "vp90_total_amount");
             /** Description Zh */
             description_zh: string;
             /** Name Zh */
@@ -3376,14 +3382,14 @@ export interface components {
              * Table
              * @enum {string}
              */
-            table: "daily_indicator" | "daily_basic" | "daily_stock_feature" | "daily_minute_feature" | "market_temperature_daily" | "daily_auction_feature";
+            table: "daily_indicator" | "daily_basic" | "daily_stock_feature" | "daily_minute_feature" | "market_temperature_daily" | "daily_auction_feature" | "daily_volume_profile_feature";
             /**
              * Unit
              * @enum {string}
              */
-            unit: "stored_price" | "session_price" | "indicator" | "percent" | "ratio" | "CNY_10000" | "CNY" | "observations" | "binary";
+            unit: "stored_price" | "session_price" | "indicator" | "percent" | "ratio" | "CNY_10000" | "CNY" | "observations" | "binary" | "shares";
             /** Value Semantics */
-            value_semantics?: ("history_derived" | "stock_features_derived" | "minute_features_derived" | "market_temperature_stored" | "auction_derived") | null;
+            value_semantics?: ("history_derived" | "stock_features_derived" | "minute_features_derived" | "market_temperature_stored" | "auction_derived" | "volume_profile_derived") | null;
         };
         /**
          * FactorDailyStreamCoverage
@@ -3638,6 +3644,7 @@ export interface components {
             status: "valid" | "missing" | "null" | "non_finite";
             /** Value */
             value: number | null;
+            volume_profile_diagnostic?: components["schemas"]["FactorVolumeProfileDiagnostic"] | null;
         };
         /** FactorMarketTemperaturePolicy */
         FactorMarketTemperaturePolicy: {
@@ -4577,6 +4584,157 @@ export interface components {
             yesterday_ic: number | null;
             /** Yesterday Long Short */
             yesterday_long_short: number | null;
+        };
+        /** FactorVolumeProfileDiagnostic */
+        FactorVolumeProfileDiagnostic: {
+            /** Minute Rows */
+            minute_rows: number;
+            /** Observed Days */
+            observed_days: number;
+            /** Outside Window Days */
+            outside_window_days: number;
+            /**
+             * Reference Date
+             * Format: date
+             */
+            reference_date: string;
+            /** Reference Factor */
+            reference_factor?: number | null;
+            /**
+             * Unavailable Factor Dates
+             * @default []
+             */
+            unavailable_factor_dates: string[];
+            /** Window Days */
+            window_days: number;
+            /** Window End Date */
+            window_end_date: string | null;
+            /** Window Start Date */
+            window_start_date: string | null;
+        };
+        /** FactorVolumeProfilePolicy */
+        FactorVolumeProfilePolicy: {
+            /**
+             * Amount Unit
+             * @default CNY_unadjusted
+             * @constant
+             */
+            amount_unit: "CNY_unadjusted";
+            /**
+             * Bin Pct
+             * @default 0.005
+             * @constant
+             */
+            bin_pct: 0.005;
+            /**
+             * Evaluation Clock
+             * @default previous_complete_sse_session_at_next_day_09:25
+             * @constant
+             */
+            evaluation_clock: "previous_complete_sse_session_at_next_day_09:25";
+            /**
+             * Frequency
+             * @default 1min
+             * @constant
+             */
+            frequency: "1min";
+            /**
+             * History Mode
+             * @default retrospective_no_row_first_observed_time
+             * @constant
+             */
+            history_mode: "retrospective_no_row_first_observed_time";
+            /** Implementation Sha256 */
+            implementation_sha256: string;
+            /**
+             * Lookback Days
+             * @default 90
+             * @constant
+             */
+            lookback_days: 90;
+            /**
+             * Minute Price
+             * @default positive_amount_divided_by_positive_shares_else_close
+             * @constant
+             */
+            minute_price: "positive_amount_divided_by_positive_shares_else_close";
+            /**
+             * Source Priority
+             * @default [
+             *       "tushare",
+             *       "tushare_rt",
+             *       "other"
+             *     ]
+             */
+            source_priority: ("tushare" | "tushare_rt" | "other")[];
+            /**
+             * Value Area Ratio
+             * @default 0.7
+             * @constant
+             */
+            value_area_ratio: 0.7;
+            /**
+             * Version
+             * @default original-volume-profile-v1
+             * @constant
+             */
+            version: "original-volume-profile-v1";
+            /**
+             * Weight Basis
+             * @default adjusted_share_volume
+             * @constant
+             */
+            weight_basis: "adjusted_share_volume";
+            /**
+             * Window Selection
+             * @default previous_global_actual_daily_dates_strictly_before_reference
+             * @constant
+             */
+            window_selection: "previous_global_actual_daily_dates_strictly_before_reference";
+        };
+        /** FactorVolumeProfilePreviewStock */
+        FactorVolumeProfilePreviewStock: {
+            diagnostic: components["schemas"]["FactorVolumeProfileDiagnostic"];
+            /** Stock Code */
+            stock_code: string;
+            /** Values */
+            values: components["schemas"]["FactorVolumeProfilePreviewValue"][];
+        };
+        /** FactorVolumeProfilePreviewValue */
+        FactorVolumeProfilePreviewValue: {
+            auction_diagnostic?: components["schemas"]["FactorAuctionDiagnostic"] | null;
+            /**
+             * Column
+             * @enum {string}
+             */
+            column: "vp90_vwap" | "vp90_poc_price" | "vp90_value_area_low" | "vp90_value_area_high" | "vp90_concentration_top5_pct" | "vp90_below_reference_amount_pct" | "vp90_above_reference_amount_pct" | "vp90_below_reference_volume_pct" | "vp90_above_reference_volume_pct" | "vp90_total_vol" | "vp90_total_amount";
+            diagnostic?: components["schemas"]["FactorStockFeatureDiagnostic"] | null;
+            minute_diagnostic?: components["schemas"]["FactorMinuteFeatureDiagnostic"] | null;
+            /** Non Finite Value */
+            non_finite_value?: ("NaN" | "Infinity" | "-Infinity") | null;
+            /** Reason */
+            reason?: ("missing_reference_factor" | "non_finite_reference_factor" | "non_positive_reference_factor" | "missing_required_factor" | "non_finite_required_factor" | "non_positive_required_factor") | ("no_trading_dates" | "missing_or_invalid_reference_price" | "missing_minute_data" | "unmapped_price_basis_ratio" | "empty_price_bins" | "non_positive_profile_totals" | "volume_profile_non_finite" | "invalid_volume_profile_data") | null;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "valid" | "missing" | "null" | "non_finite";
+            /** Value */
+            value: number | null;
+            volume_profile_diagnostic?: components["schemas"]["FactorVolumeProfileDiagnostic"] | null;
+        };
+        /** FactorVolumeProfileSummary */
+        FactorVolumeProfileSummary: {
+            /** Input Content Sha256 */
+            input_content_sha256: string;
+            /** Input Rows */
+            input_rows: number;
+            lake?: components["schemas"]["NamedLakeReceipt"] | null;
+            /** Output Content Sha256 */
+            output_content_sha256: string;
+            /** Output Rows */
+            output_rows: number;
+            policy: components["schemas"]["FactorVolumeProfilePolicy"];
         };
         /** FieldExpr */
         FieldExpr: {
@@ -5564,6 +5722,58 @@ export interface components {
             price: number | null;
             /** Status Label */
             status_label: string;
+        };
+        /** NamedLakeFrozenFile */
+        NamedLakeFrozenFile: {
+            /** Byte Count */
+            byte_count: number;
+            identity: components["schemas"]["FactorSourceFileIdentity"];
+            /**
+             * Path
+             * Format: path
+             */
+            path: string;
+            /** Sha256 */
+            sha256: string;
+        };
+        /** NamedLakeReceipt */
+        NamedLakeReceipt: {
+            artifact: components["schemas"]["DatasetSnapshotArtifact"];
+            candidate_marker: components["schemas"]["NamedLakeFrozenFile"];
+            /** Candidate Marker Sha256 */
+            candidate_marker_sha256: string;
+            catalog_file: components["schemas"]["NamedLakeFrozenFile"];
+            /** Catalog Issues */
+            catalog_issues: string[];
+            /**
+             * Catalog Role
+             * @enum {string}
+             */
+            catalog_role: "catalog" | "readonly_catalog";
+            /** Catalog Sha256 */
+            catalog_sha256: string;
+            /**
+             * Catalog Status
+             * @enum {string}
+             */
+            catalog_status: "candidate" | "degraded";
+            current_marker: components["schemas"]["NamedLakeFrozenFile"];
+            /** Current Marker Sha256 */
+            current_marker_sha256: string;
+            /** Manifest Sha256 */
+            manifest_sha256: string;
+            /** Observation Id */
+            observation_id: string;
+            /** Partition Count */
+            partition_count: number;
+            /** Snapshot Id */
+            snapshot_id: string;
+            /**
+             * Verification Scope
+             * @default named_partitions_current_observation_not_full_authority_chain_or_pit
+             * @constant
+             */
+            verification_scope: "named_partitions_current_observation_not_full_authority_chain_or_pit";
         };
         /** NumberExpr */
         NumberExpr: {

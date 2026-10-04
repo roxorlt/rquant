@@ -18,6 +18,7 @@ from rquant.factor.daily_feature_source import (
     AUCTION_COLUMNS,
     MARKET_TEMPERATURE_COLUMNS,
     MAX_AUCTION_PREVIEW_DAYS,
+    VOLUME_PROFILE_COLUMNS,
     FactorAuctionPreviewStock,
     FactorDailyFeatureCounts,
     FactorDailyFeatureInput,
@@ -25,6 +26,7 @@ from rquant.factor.daily_feature_source import (
     FactorDailyFeatureSource,
     FactorDailyFeatureSources,
     FactorMarketTemperatureDayValue,
+    FactorVolumeProfilePreviewStock,
     read_factor_daily_feature_input,
 )
 from rquant.factor.daily_stream import (
@@ -183,6 +185,13 @@ class FactorStreamFeatureDayReceipt(BaseModel):
         default=None, min_length=1, max_length=10, exclude_if=lambda v: v is None
     )
 
+    volume_profile_values: tuple[FactorVolumeProfilePreviewStock, ...] | None = Field(
+        default=None,
+        min_length=1,
+        max_length=10,
+        exclude_if=lambda v: v is None,
+    )
+
     @model_validator(mode="after")
     def _market_columns(self) -> FactorStreamFeatureDayReceipt:
         market = tuple(
@@ -201,6 +210,15 @@ class FactorStreamFeatureDayReceipt(BaseModel):
             != tuple(sorted(set(row.stock_code for row in self.auction_values)))
         ):
             raise ValueError("auction preview differs from selected daily coverage fields")
+        vp = tuple(
+            c.column for c in self.daily_feature_counts or () if c.column in VOLUME_PROFILE_COLUMNS
+        )
+        if self.volume_profile_values is not None and (
+            any(tuple(v.column for v in row.values) != vp for row in self.volume_profile_values)
+            or tuple(r.stock_code for r in self.volume_profile_values)
+            != tuple(sorted(set(r.stock_code for r in self.volume_profile_values)))
+        ):
+            raise ValueError("VP preview differs from selected complete coverage grid")
         return self
 
 
@@ -728,6 +746,10 @@ class FactorStreamAdapter(Iterator[FactorFormulaStreamBatch]):
                         market_temperature_values=None
                         if stored_input is None
                         else stored_input.market_temperature_values,
+                        volume_profile_values=None
+                        if stored_input is None
+                        or day not in self.request.evaluation_days[-MAX_AUCTION_PREVIEW_DAYS:]
+                        else stored_input.volume_profile_values,
                         auction_values=None
                         if stored_input is None
                         or day not in self.request.evaluation_days[-MAX_AUCTION_PREVIEW_DAYS:]

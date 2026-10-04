@@ -10,6 +10,11 @@ import {
   FactorMarketTemperatureBasis,
   marketTemperatureReasonLabels,
 } from "./FactorMarketTemperature";
+import {
+  FactorVolumeProfile,
+  FactorVolumeProfileBasis,
+  volumeProfileReasonLabels,
+} from "./FactorVolumeProfile";
 
 type CoverageDay = NonNullable<FactorResearchDisplayV2["daily_feature_coverage_days"]>[number];
 type CoverageReason = NonNullable<CoverageDay["counts"][number]["reasons"]>[number]["reason"];
@@ -17,6 +22,7 @@ type CoverageReason = NonNullable<CoverageDay["counts"][number]["reasons"]>[numb
 const reasonLabels: Record<CoverageReason, string> = {
   ...marketTemperatureReasonLabels,
   ...auctionReasonLabels,
+  ...volumeProfileReasonLabels,
   insufficient_window: "窗口不足",
   no_initialization: "缺少初始化历史",
   history_break: "历史断裂",
@@ -57,6 +63,9 @@ export function FactorDailyFeatures({ research }: { research: FactorResearchDisp
     (field) => field.value_semantics === "market_temperature_stored",
   );
   const hasAuction = source.fields.some((field) => field.value_semantics === "auction_derived");
+  const hasVolumeProfile = source.fields.some(
+    (field) => field.value_semantics === "volume_profile_derived",
+  );
   const coverageFields = source.fields.filter(
     (field) => field.value_semantics !== "market_temperature_stored",
   );
@@ -64,6 +73,7 @@ export function FactorDailyFeatures({ research }: { research: FactorResearchDisp
     (field) =>
       field.value_semantics !== "minute_features_derived" &&
       field.value_semantics !== "auction_derived" &&
+      field.value_semantics !== "volume_profile_derived" &&
       field.value_semantics !== "market_temperature_stored",
   );
   const minute = hasMinute ? source.minute_features : null;
@@ -77,6 +87,7 @@ export function FactorDailyFeatures({ research }: { research: FactorResearchDisp
     (field) =>
       field.value_semantics !== "stock_features_derived" &&
       field.value_semantics !== "auction_derived" &&
+      field.value_semantics !== "volume_profile_derived" &&
       field.value_semantics !== "minute_features_derived" &&
       field.value_semantics !== "market_temperature_stored",
   );
@@ -113,6 +124,7 @@ export function FactorDailyFeatures({ research }: { research: FactorResearchDisp
           ...(item?.stock_reasons ?? []),
           ...(item?.minute_reasons ?? []),
           ...(item?.auction_reasons ?? []),
+          ...(item?.volume_profile_reasons ?? []),
         ];
         return reasons.length ? (
           <Tip
@@ -155,23 +167,29 @@ export function FactorDailyFeatures({ research }: { research: FactorResearchDisp
   return (
     <section
       className="factor-result-section"
-      aria-label={hasMinute || hasMarket || hasAuction ? "字段来源" : "日线字段来源"}
+      aria-label={
+        hasMinute || hasMarket || hasAuction || hasVolumeProfile ? "字段来源" : "日线字段来源"
+      }
     >
       <div className="factor-section-head">
         <h3>
-          {hasAuction
-            ? hasDaily || hasMinute || hasMarket
+          {hasVolumeProfile
+            ? hasDaily || hasMinute || hasMarket || hasAuction
               ? "字段来源"
-              : "竞价字段"
-            : hasMarket
-              ? hasDaily || hasMinute
+              : "90日成交分布"
+            : hasAuction
+              ? hasDaily || hasMinute || hasMarket
                 ? "字段来源"
-                : "市场温度"
-              : hasMinute
-                ? hasDaily
+                : "竞价字段"
+              : hasMarket
+                ? hasDaily || hasMinute
                   ? "字段来源"
-                  : "分钟字段"
-                : "日线字段"}
+                  : "市场温度"
+                : hasMinute
+                  ? hasDaily
+                    ? "字段来源"
+                    : "分钟字段"
+                  : "日线字段"}
         </h3>
         {hasDaily ? (
           <Tip
@@ -287,9 +305,11 @@ export function FactorDailyFeatures({ research }: { research: FactorResearchDisp
         ) : null}
         {hasMarket ? <FactorMarketTemperatureBasis source={source} /> : null}
         {hasAuction ? <FactorAuctionBasis source={source} /> : null}
+        {hasVolumeProfile ? <FactorVolumeProfileBasis source={source} /> : null}
       </div>
       {hasMarket ? <FactorMarketTemperature source={source} days={days} /> : null}
       {hasAuction ? <FactorAuction source={source} days={days} /> : null}
+      {hasVolumeProfile ? <FactorVolumeProfile source={source} days={days} /> : null}
       {coverageFields.length ? (
         <details className="factor-disclosure">
           <summary>查看字段覆盖</summary>
@@ -320,13 +340,15 @@ export function FactorDailyFeatures({ research }: { research: FactorResearchDisp
                       {factorFieldName(selectedField)}（
                       {selectedField.value_semantics === "minute_features_derived"
                         ? "分钟派生"
-                        : selectedField.value_semantics === "auction_derived"
-                          ? "竞价派生"
-                          : selectedField.value_semantics === "stock_features_derived"
-                            ? "选股派生"
-                            : selectedField.value_semantics === "history_derived"
-                              ? "历史推导"
-                              : "库存原值"}
+                        : selectedField.value_semantics === "volume_profile_derived"
+                          ? "成交分布"
+                          : selectedField.value_semantics === "auction_derived"
+                            ? "竞价派生"
+                            : selectedField.value_semantics === "stock_features_derived"
+                              ? "选股派生"
+                              : selectedField.value_semantics === "history_derived"
+                                ? "历史推导"
+                                : "库存原值"}
                       ）：
                       <FactorFieldInfo field={selectedField} />
                     </div>
@@ -355,7 +377,7 @@ export function FactorDailyFeatures({ research }: { research: FactorResearchDisp
               rows={[...days].sort((a, b) => b.trade_date.localeCompare(a.trade_date))}
               columns={columns}
               rowKey={(day) => day.trade_date}
-              label={hasMinute || hasAuction ? "字段覆盖" : "日线字段覆盖"}
+              label={hasMinute || hasAuction || hasVolumeProfile ? "字段覆盖" : "日线字段覆盖"}
             />
           )}
         </details>

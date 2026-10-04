@@ -21,6 +21,7 @@ from rquant.factor.daily_feature_source import (
     FactorMarketTemperaturePrepareRequest,
     FactorMinuteFeaturePrepareRequest,
     FactorStockFeaturePrepareRequest,
+    FactorVolumeProfilePrepareRequest,
     prepare_factor_daily_feature_source,
 )
 from rquant.factor.industry_source import FactorIndustrySource
@@ -49,6 +50,10 @@ from rquant.factor.stock_feature_source import prepare_factor_stock_feature_sour
 from rquant.factor.technical_history_source import (
     FactorTechnicalHistoryPrepareRequest,
     prepare_factor_technical_history_source,
+)
+from rquant.factor.volume_profile_source import (
+    FactorVolumeProfileLakeInput,
+    prepare_factor_volume_profile_source,
 )
 from rquant.strict_json import canonical_json_bytes, strict_canonical_json_loads
 
@@ -90,6 +95,7 @@ def main(argv: list[str] | None = None) -> int:
             "seal-minute-features",
             "seal-market-temperature",
             "seal-auction",
+            "seal-volume-profile",
             "worker",
             "serve",
         ),
@@ -110,12 +116,19 @@ def main(argv: list[str] | None = None) -> int:
         "--auction-lake-input", type=Path, help="具名竞价分区、catalog和marker的冻结清单"
     )
     parser.add_argument("--max-input-rows", type=int)
+    parser.add_argument(
+        "--volume-profile-lake-input", type=Path, help="具名分钟分区、catalog和marker的冻结清单"
+    )
     parser.add_argument("--max-code-observations", type=int, default=50_000)
     parser.add_argument("--max-output-cells", type=int, default=32_000_000)
     parser.add_argument("--max-code-rows", type=int, default=300_000)
     args = parser.parse_args(argv)
     if args.max_input_rows is None:
-        args.max_input_rows = 64_000_000 if args.action == "seal-minute-features" else 16_000_000
+        args.max_input_rows = (
+            64_000_000
+            if args.action in ("seal-minute-features", "seal-volume-profile")
+            else 16_000_000
+        )
     if args.action in (
         "seal-daily-features",
         "seal-technical-history",
@@ -123,11 +136,36 @@ def main(argv: list[str] | None = None) -> int:
         "seal-minute-features",
         "seal-market-temperature",
         "seal-auction",
+        "seal-volume-profile",
     ):
         if args.prepared_source is None or args.lake_root is None:
             parser.error("必须提供实际行情准备包和私有数据根")
         prepared = _input(args.prepared_source, FactorPreparedStreamSource, 16 * 1024 * 1024)
-        if args.action == "seal-auction":
+        if args.action == "seal-volume-profile":
+            base = (
+                None
+                if args.base_daily_source is None
+                else _input(args.base_daily_source, FactorDailyFeatureSource, 16 * 1024 * 1024)
+            )
+            lake = (
+                None
+                if args.volume_profile_lake_input is None
+                else _input(
+                    args.volume_profile_lake_input, FactorVolumeProfileLakeInput, 4 * 1024 * 1024
+                )
+            )
+            source = prepare_factor_volume_profile_source(
+                FactorVolumeProfilePrepareRequest(
+                    prepared_source=prepared,
+                    base_daily_source=base,
+                    lake_input=lake,
+                    max_input_rows=args.max_input_rows,
+                    max_code_rows=args.max_code_rows,
+                    max_output_cells=args.max_output_cells,
+                ),
+                lake_root=args.lake_root,
+            )
+        elif args.action == "seal-auction":
             base = (
                 None
                 if args.base_daily_source is None
