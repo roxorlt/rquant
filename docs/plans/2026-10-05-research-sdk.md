@@ -36,3 +36,14 @@
 验收要求：三类入口可实际调用；同一来源数值与缺因一致；非法范围拒绝；示例可运行；句柄及自有临时资料收尾。API、网页、SQL 查询服务和 Notebook 云端装机不在本片写集，M2 只有全部能力及装机验收后才能标完成。
 
 子代理限本树离线开发，不访问网络、`.env`、凭据或生产，不继续委派，不调用外部模型。本 goal 不设行政时长或修复次数上限；每轮只处理实际验收问题。
+
+## 实施记录（2026-10-05）
+
+- 实际执行为 Codex 原生子代理 `/root/research_sdk_impl`，角色 implementer，父任务 `/root`。开始时本树 tracked/untracked 均 clean；完整计划基准为 `51d1dc5a0a3c009e05d13de184ea78723a66c429`。
+- 三类公开能力已存在。SDK 直接公开原 reader、Pydantic 模型、因子库和产物 reader，没有 wrapper、指标/统计副本或新配置层。SDK 只公开一天、500 代码、50 字段的 reader；不公开 7000 代码的决策面板捷径。
+- 已保留 SDK 缺失时的实际红测（3 failed），随后三个贯穿入口的 smoke 通过。首次绿测暴露示例启动命令误把 `-c` 当成脚本路径（1 failed / 2 passed）；已修正参数转交，失败原始记录保留。
+- 使用现有真实结构测试工厂和生产封存函数创建独立合成样本。按最新日期 2026-07-03 向前核验：最新日缺市场记录；前推 1 日为 NULL/NaN；前推 2 日为有效 0/100。8 代码、3 日、18 实际字段的 SDK 批读取与原 reader 逐值一致。
+- 本机 Python 3.13.12，以 `-I -B` 与本树显式 `src` 运行。原有因子统计证据仍有效；本次仅运行 SDK 直接 smoke 和等价 Notebook 脚本，未重复全仓回归。
+- 独立脚本实际运行 0.482 秒，退出码 0。成功、范围错误、损坏产物及示例子进程后，FD/Python 线程/macOS 原生线程均为 `4/1/14`，新增量为 0；reader scratch 和损坏样本临时目录均为 0，封存源文件字节 hash 未变。macOS `/bin/ps` 在沙箱中不可用，原生线程读数来自标准 `proc_pidinfo` 对当前 PID 的只读查询。
+- 使用文档为 `docs/research-sdk.md`，可执行示例为 `docs/examples/research_sdk.py`；原始日志、输入 manifest、资源报告和保留的合成封存样本在 `data/verification/research-sdk-20261005`。最终候选独立集中审查及合版由 root 安排，M2 整体继续标部分。
+- 最终直接 smoke 为 `3 passed in 2.83s`，无 skip/deselect；SDK、测试与示例的 Ruff lint 和 format check 通过。测试 scratch 与仅供测试设置使用的私有目录在保存日志后清理；保留 `demo` 作为可执行示例输入及追溯样本，没有遗留验证进程。

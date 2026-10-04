@@ -1,0 +1,73 @@
+{
+  "python": "3.13.12 (main, Mar 10 2026, 18:26:32) [Clang 21.1.4 ]",
+  "executable": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-source-integration/.venv/bin/python",
+  "parent_commit": "51d1dc5a0a3c009e05d13de184ea78723a66c429",
+  "product_base": "09b11f4407ccd9703baa6981d25224cc71390516",
+  "resources_order": [
+    "file_descriptors",
+    "python_threads",
+    "native_threads"
+  ],
+  "native_thread_measurement": "macOS proc_pidinfo PROC_PIDTASKINFO for own PID only",
+  "ps_capability": "/bin/ps denied by sandbox; own-PID API available",
+  "resources_before": [
+    4,
+    1,
+    14
+  ],
+  "resources_after_success": [
+    4,
+    1,
+    14
+  ],
+  "resources_after_query_error": [
+    4,
+    1,
+    14
+  ],
+  "resources_after_artifact_error": [
+    4,
+    1,
+    14
+  ],
+  "resources_after_example": [
+    4,
+    1,
+    14
+  ],
+  "temporary_reader_directories": 0,
+  "temporary_corrupt_roots": 0,
+  "source_files_unchanged": true,
+  "example_command": [
+    "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-source-integration/.venv/bin/python",
+    "-I",
+    "-B",
+    "-c",
+    "import runpy,sys; sys.path.insert(0,sys.argv[1]); sys.argv=sys.argv[2:]; runpy.run_path(sys.argv[0],run_name='__main__')",
+    "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/src",
+    "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/docs/examples/research_sdk.py",
+    "--source",
+    "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/data/verification/research-sdk-20261005/demo/source.json",
+    "--lake-root",
+    "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/data/verification/research-sdk-20261005/demo/lake",
+    "--date",
+    "2026-07-03",
+    "--codes",
+    "000001.SZ",
+    "000007.SZ",
+    "--fields",
+    "ma5",
+    "market_above_ma20_ratio_pct",
+    "market_high_60d_ratio_pct",
+    "--artifact-root",
+    "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/data/verification/research-sdk-20261005/demo/artifacts",
+    "--research-sha256",
+    "b51e119b3ce81528bfed3f82038da98473b8bf71c3ca440bd31248dd9b8e6f2d",
+    "--display-sha256",
+    "7f4aacba90125fa05ca29d064a38e9dc632fbca01364e426e10905e8c3139a33"
+  ],
+  "example_exit_code": 0,
+  "example_elapsed_seconds": 0.48151612500078045,
+  "sample_fact_count": 6,
+  "synthetic_input_manifest": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-research-sdk/data/verification/research-sdk-20261005/demo/inputs.json"
+}

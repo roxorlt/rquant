@@ -1,0 +1,13 @@
+{
+  "source_sha256": "00167995370a0e31b8ad68675277203db8c0bfbb9e67b13138ed01cf69803d61",
+  "source_file_byte_sha256": "8cfc80d7069a2d447063e97295108bd00be5fea074eeb5af515e0c2353c00fc0",
+  "date": "2026-07-03",
+  "research_content_sha256": "b51e119b3ce81528bfed3f82038da98473b8bf71c3ca440bd31248dd9b8e6f2d",
+  "display_content_sha256": "7f4aacba90125fa05ca29d064a38e9dc632fbca01364e426e10905e8c3139a33",
+  "sealed_files": {
+    "tables/daily_indicator/versions/93d7918426c3c41e4d1f16fd41bc39f4133a8a0c7c17b314796288f79b7f1ade.parquet": "93d7918426c3c41e4d1f16fd41bc39f4133a8a0c7c17b314796288f79b7f1ade",
+    "tables/daily_basic/versions/2e5dbf2fbdfa3c3f8b9c33dd73884e435dd39f8c70f2e462a2077de60ac44147.parquet": "2e5dbf2fbdfa3c3f8b9c33dd73884e435dd39f8c70f2e462a2077de60ac44147",
+    "tables/market_temperature_daily/versions/65f39bd7c8ff33f6b0032726c0d0c9c4f985970232498d5e60e2467bea987279.parquet": "65f39bd7c8ff33f6b0032726c0d0c9c4f985970232498d5e60e2467bea987279"
+  },
+  "origin": "Existing test_factor_daily_feature_source and test_factor_result_artifact factories; production prepare_factor_market_temperature_source and original artifact publishers. Eight synthetic codes, three source days; market table has two shared day rows (0/100, NULL/NaN, absent latest day)."
+}
