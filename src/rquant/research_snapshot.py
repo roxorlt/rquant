@@ -787,6 +787,13 @@ def build_dataset_snapshot_binding(
     if selected_dependencies.strategy_id != snapshot.strategy_name:
         raise ValueError("dependency contract does not match snapshot strategy")
 
+    if selected_dependencies.template_definition is not None:
+        from rquant.strategy_template_source import verify_template_snapshot_source
+
+        if eligibility_resolution is not None or lake_artifacts or ts_codes is not None:
+            raise ValueError("template source cannot include unrelated artifacts or filters")
+        verify_template_snapshot_source(source_connection, version=selected_dependencies.template_definition, code_sha=snapshot.code_commit, start_date=start_date, end_date=end_date, input_hash=snapshot.table_watermarks.get("template_input_hash", ""), as_of=snapshot.as_of_time)
+
     if snapshot.strategy_name == "portfolio_backtest":
         from rquant.portfolio_backtest_adapter import verify_portfolio_snapshot_source
 

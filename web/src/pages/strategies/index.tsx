@@ -8,6 +8,7 @@ import { useCurrentMeta } from "@/api/useMeta";
 import { type DataColumn, DataTable } from "@/table/DataTable";
 import { Button, EmptyState, PageHeader, PageSkeleton, Panel, RelativeTime, Tip } from "@/ui";
 import "./strategies.css";
+import { TemplateWorkspace } from "./TemplateWorkspace";
 
 const strategyColumns: DataColumn<StrategyCatalogItem>[] = [
   {
@@ -68,6 +69,14 @@ export default function StrategiesPage() {
   return (
     <>
       <PageHeader eyebrow="策略与验证" title="策略" note="已核验的策略定义与当前参数" />
+      {!meta.isError && meta.data?.data.viewer ? (
+        <TemplateWorkspace
+          key={`${meta.data.data.viewer}:${currentGeneration ?? "unavailable"}`}
+          viewer={meta.data.data.viewer}
+          generation={currentGeneration ?? null}
+          ready={meta.data.serving.state === "ready"}
+        />
+      ) : null}
       {meta.isError ? (
         <Panel>
           <div className="strategy-state" role="alert">

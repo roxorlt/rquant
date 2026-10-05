@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Annotated, Self
 
 if TYPE_CHECKING:
     from rquant.factor.tracking import FactorTrackingIdentity
+    from rquant.strategy_authoring_projection import StrategyAuthoringProjectionSource
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -177,6 +178,7 @@ from rquant.serving_price_alert_rule_projection import (
 from rquant.serving_read_models import ProjectionScalar, ServingProjectionPayload
 from rquant.storage.duckdb import DuckDBStore
 from rquant.strict_json import StrictJsonError, strict_json_loads
+from rquant.strategy_authoring_projection_contract import STRATEGY_TEMPLATE_PROJECTION_TABLES
 
 Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 CommitSha = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{40}$")]
@@ -3611,6 +3613,7 @@ class DuckDBLabPageProjectionSource:
         factor_registry: FactorDefinitionRegistry | None = None,
         factor_registry_identity: FactorRegistryIdentity | None = None,
         factor_tracking_identity: FactorTrackingIdentity | None = None,
+        strategy_authoring_source: StrategyAuthoringProjectionSource | None = None,
     ) -> None:
         self.database_path = Path(os.path.abspath(database_path))
         #: this role's own state directory; see `_StableReadonlyDuckDB` (#255)
@@ -3664,6 +3667,12 @@ class DuckDBLabPageProjectionSource:
         if factor_tracking_identity is not None and factor_registry_identity is None:
             raise ValueError("tracking projection requires its fixed factor registry")
         self.factor_tracking_identity = factor_tracking_identity
+        if strategy_authoring_source is not None:
+            from rquant.strategy_authoring_projection import StrategyAuthoringProjectionSource
+
+            if type(strategy_authoring_source) is not StrategyAuthoringProjectionSource:
+                raise TypeError("strategy source must be the concrete committed projection source")
+        self.strategy_authoring_source = strategy_authoring_source
 
     def _factor_tracking_projections(
         self, observed: datetime
@@ -4020,6 +4029,7 @@ class DuckDBLabPageProjectionSource:
             formula_market_projections=self._formula_market_projections(observed),
             factor_definition_projections=self._factor_definition_projections(observed),
             factor_tracking_projections=self._factor_tracking_projections(observed),
+            strategy_definition_projections=() if self.strategy_authoring_source is None else self.strategy_authoring_source(observed),
         )
 
     @staticmethod
@@ -5295,6 +5305,7 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
             FACTOR_DEFINITION_PROJECTION_TABLES,
             FACTOR_RESULT_PROJECTION_TABLES,
             FACTOR_TRACKING_PROJECTION_TABLES,
+            STRATEGY_TEMPLATE_PROJECTION_TABLES,
         )
         if (
             not required.issubset(names)
@@ -5314,6 +5325,10 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
             validate_factor_result_projections(projections)
         if names >= FACTOR_TRACKING_PROJECTION_TABLES:
             validate_factor_tracking_projections(projections)
+        if names >= STRATEGY_TEMPLATE_PROJECTION_TABLES:
+            from rquant.strategy_authoring_projection import validate_strategy_authoring_projections
+
+            validate_strategy_authoring_projections(projections)
         status = projections["data_audit_status"].rows
         issues = projections["data_audit_issue"].rows
         if len(status) != 1 or len(issues) != status[0]["finding_count"]:
@@ -5510,6 +5525,7 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
         factor_definition_projections: tuple[ServingProjectionPayload, ...] = (),
         factor_result_projections: tuple[ServingProjectionPayload, ...] = (),
         factor_tracking_projections: tuple[ServingProjectionPayload, ...] = (),
+        strategy_definition_projections: tuple[ServingProjectionPayload, ...] = (),
     ) -> LabPageProjectionSnapshot:
         from rquant.factor.result_serving import FACTOR_RESULT_PROJECTION_TABLES
 
@@ -5567,6 +5583,8 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
             != FACTOR_RESULT_PROJECTION_TABLES
         ):
             raise ValueError("factor result projections must be complete")
+        if strategy_definition_projections and {p.table_name for p in strategy_definition_projections} != STRATEGY_TEMPLATE_PROJECTION_TABLES:
+            raise ValueError("strategy projections are incomplete")
         projections = tuple(
             sorted(
                 (
@@ -5578,6 +5596,7 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
                     *factor_definition_projections,
                     *factor_result_projections,
                     *factor_tracking_projections,
+                    *strategy_definition_projections,
                 ),
                 key=lambda item: item.table_name,
             )

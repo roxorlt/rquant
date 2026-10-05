@@ -26,7 +26,7 @@ from multiprocessing.context import AuthenticationError
 from multiprocessing.process import BaseProcess
 from pathlib import Path
 from types import FrameType
-from typing import Literal, TypeVar
+from typing import TYPE_CHECKING, Literal, TypeVar
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import pandas as pd
@@ -128,6 +128,10 @@ from rquant.strict_json import (
     strict_canonical_json_loads,
     strict_model_validate_canonical_json,
 )
+
+if TYPE_CHECKING:
+    from rquant.strategy_template_adapter import StrategyTemplateAdapterCatalog
+    from rquant.strategy_template_runtime import StrategyTemplateRuntimeDirectory
 
 LAB_WORKER_MAX_SHARDS_PER_TICK = 1
 _HASH_PATTERN = r"^[0-9a-f]{64}$"
@@ -492,6 +496,7 @@ def build_builtin_shard_runtime_manifest(
     forbidden_paths: tuple[Path, ...],
     snapshot_root: Path,
     research_lake_root: Path,
+    template_catalog: StrategyTemplateAdapterCatalog | None = None,
 ) -> LabShardRuntimeManifest:
     from rquant.lab_worker_registry import builtin_lab_shard_configuration
 
@@ -500,6 +505,7 @@ def build_builtin_shard_runtime_manifest(
         forbidden_paths=forbidden_paths,
         snapshot_root=snapshot_root,
         research_lake_root=research_lake_root,
+        template_catalog=template_catalog,
     )
     return LabShardRuntimeManifest(
         registry=LabClosedRegistryBinding(
@@ -2748,6 +2754,7 @@ class LabWorker:
         report_spool: LabReportSpool,
         artifact_root: Path,
         adapter_registry: StrategyJobAdapterRegistry | None = None,
+        template_directory: StrategyTemplateRuntimeDirectory | None = None,
         exploratory_store_factory: StoreFactory | None = None,
         metadata_store_factory: StoreFactory | None = None,
         research_lake_root: Path | None = None,
@@ -2822,6 +2829,19 @@ class LabWorker:
                 "V2 claim publication requires a published-claim verifier"
             )
         closed_adapter_registry = default_strategy_job_adapter_registry()
+        if (
+            shard_runtime_manifest is not None
+            and shard_runtime_manifest.registry.registry_id == _BUILTIN_SHARD_REGISTRY_ID
+        ):
+            from rquant.lab_worker_registry import (
+                BuiltinLabShardRuntimeConfig,
+                resolve_builtin_adapter_registry,
+            )
+
+            shard_configuration = BuiltinLabShardRuntimeConfig.model_validate_json(
+                shard_runtime_manifest.registry.configuration_json, strict=True
+            )
+            closed_adapter_registry = resolve_builtin_adapter_registry(shard_configuration)
         if adapter_registry is not None and adapter_registry is not closed_adapter_registry:
             raise LabDaemonConfigurationError(
                 "legacy or third-party adapter registry is not registered"
@@ -2923,6 +2943,8 @@ class LabWorker:
         self.report_spool = report_spool
         self.artifact_root = Path(artifact_root).resolve()
         self.adapter_registry = closed_adapter_registry
+        from rquant.strategy_template_runtime import require_template_runtime_directory
+        self.template_directory = require_template_runtime_directory(template_directory)
         self.heartbeat_interval_microseconds = heartbeat_interval_microseconds
         self.resource_recheck_interval_microseconds = resource_recheck_interval_microseconds
         self.resource_probe_timeout_microseconds = resource_probe_timeout_microseconds
@@ -5191,7 +5213,11 @@ class LabWorker:
                     spec=payload.spec,
                     shard=payload.shard,
                 )
-        return self.adapter_registry.validate_claim(claim)
+        registry = self.adapter_registry
+        if self.template_directory is not None:
+            payload = StrategyShardPayload.model_validate_json(claim.definition.payload_json)
+            registry = self.template_directory.registry_for_spec(payload.spec)
+        return registry.validate_claim(claim)
 
     def _heartbeat_loop(
         self,
@@ -5474,7 +5500,7 @@ class LabWorker:
             hard_limit_microseconds if initial_session in _LIVE_TRADING_SESSIONS else None
         )
         request = _ShardWireRequest(
-            manifest=self.shard_runtime_manifest,
+            manifest=self.shard_runtime_manifest if self.template_directory is None else self.template_directory.manifest_for_spec(validated.spec, self.shard_runtime_manifest),
             validated=validated,
             runtime_code_sha=runtime_code_sha,
         )

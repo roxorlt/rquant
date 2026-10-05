@@ -9,6 +9,7 @@ import duckdb
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from rquant.research_lake import ResearchDataset
+from rquant.strategy_template_definition import StrategyTemplateExecutionVersion
 
 SUSPENSION_SESSION_EVIDENCE_DATASET = "stock_suspend_session_evidence"
 FACTOR_EVAL_CONTRACT_VERSION = "factor-eval-v1"
@@ -115,9 +116,13 @@ class StrategyExecutionDependencies(_DependencyModel):
     contract_version: str = Field(min_length=1)
     lake_datasets: tuple[ResearchDataset, ...]
     materialized_tables: tuple[StrategyTableDependency, ...] = Field(min_length=1)
+    template_definition: StrategyTemplateExecutionVersion | None = None
 
     @model_validator(mode="after")
     def validate_unique_dependencies(self) -> StrategyExecutionDependencies:
+        if self.template_definition is not None:
+            if (self.strategy_id, self.contract_version, self.lake_datasets, self.materialized_tables) != (self.template_definition.strategy_id, "strategy-template-input/v1", (), (StrategyTableDependency(dataset_id="strategy_template_input", table_name="strategy_template_input"),)):
+                raise ValueError("template source requires its exact committed definition and input table")
         materialized_only = (
             self.strategy_id == "factor_eval"
             and self.contract_version == FACTOR_EVAL_CONTRACT_VERSION
@@ -126,7 +131,7 @@ class StrategyExecutionDependencies(_DependencyModel):
             self.strategy_id == "portfolio_backtest"
             and self.contract_version == PORTFOLIO_BACKTEST_CONTRACT_VERSION
             and self.materialized_tables == _PORTFOLIO_TABLE_DEPENDENCIES
-        )
+        ) or self.template_definition is not None
         if not self.lake_datasets and not materialized_only:
             raise ValueError(
                 "lake_datasets may be empty only for an exact approved materialized contract"

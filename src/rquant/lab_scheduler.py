@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Event
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -54,6 +54,8 @@ from rquant.lab_jobs import (
     SchedulerLeaseFencedError,
 )
 from rquant.lab_logging import _safe_structured_log
+if TYPE_CHECKING:
+    from rquant.strategy_template_runtime import StrategyTemplateRuntimeDirectory
 from rquant.lab_result_digest import LabResultDigestPolicy
 from rquant.lab_shard_protocol import LabClaimSpool, LabReportSpool, LabShardClaim, LabShardClaimV2
 from rquant.lab_source_stage import (
@@ -337,6 +339,7 @@ class LabScheduler:
         shard_lease_seconds: int = 300,
         max_reports_per_tick: int = 64,
         adapter_registry: StrategyJobAdapterRegistry | None = None,
+        template_directory: StrategyTemplateRuntimeDirectory | None = None,
         max_plans_per_tick: int = 64,
         max_claims_per_tick: int = 16,
         max_claim_authority_per_tick: int = 128,
@@ -487,6 +490,8 @@ class LabScheduler:
         self.shard_lease_seconds = shard_lease_seconds
         self.max_reports_per_tick = max_reports_per_tick
         self.adapter_registry = adapter_registry
+        from rquant.strategy_template_runtime import require_template_runtime_directory
+        self.template_directory = require_template_runtime_directory(template_directory)
         self.max_plans_per_tick = max_plans_per_tick
         self.max_claims_per_tick = max_claims_per_tick
         self.max_claim_authority_per_tick = max_claim_authority_per_tick
@@ -2006,11 +2011,12 @@ class LabScheduler:
                 self.artifact_commit_spool.ack(entry, receipt)
         plans_created = 0
         plans_failed = 0
-        if self.adapter_registry is not None:
+        if self.adapter_registry is not None or self.template_directory is not None:
             for job in self.store.list_unplanned_jobs(limit=self.max_plans_per_tick):
                 self._verify_runtime()
                 try:
-                    definitions = self.adapter_registry.plan(job.spec)
+                    registry = self.adapter_registry if self.template_directory is None else self.template_directory.registry_for_spec(job.spec)
+                    definitions = registry.plan(job.spec)
                 except Exception as exc:
                     lease, mutation_now = self._mutation_context()
                     authority_now = mutation_now

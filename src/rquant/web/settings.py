@@ -135,6 +135,11 @@ class WebSettings(BaseModel):
     factor_tracking_admission_socket_path: Path | None = None
     factor_tracking_admission_service_uid: StrictInt | None = None
     factor_tracking_admission_shared_gid: StrictInt | None = None
+    strategy_authoring_enabled: bool = False
+    strategy_authoring_users: frozenset[str] = frozenset()
+    strategy_authoring_socket_path: Path | None = None
+    strategy_authoring_service_uid: StrictInt | None = Field(default=None, ge=0)
+    strategy_authoring_shared_gid: StrictInt | None = Field(default=None, ge=0)
     factor_run_enabled: bool = False
     factor_run_users: frozenset[str] = frozenset()
     factor_run_admission_socket_path: Path | None = None
@@ -161,6 +166,21 @@ class WebSettings(BaseModel):
 
     @model_validator(mode="after")
     def validate_sources_and_ingress(self) -> Self:
+        template_fields = (self.strategy_authoring_socket_path, self.strategy_authoring_service_uid, self.strategy_authoring_shared_gid)
+        if self.strategy_authoring_enabled or self.strategy_authoring_users or any(value is not None for value in template_fields):
+            if self.ingress_socket_path is None or self.proxy_proof_file is None or not self.strategy_authoring_users:
+                raise ValueError("strategy templates require private ingress, proof and exact users")
+            if any(value is not None for value in template_fields):
+                if not all(value is not None for value in template_fields):
+                    raise ValueError("strategy template private socket and IDs must be configured together")
+                path = self.strategy_authoring_socket_path
+                if not path.is_absolute() or ".." in path.parts or len(os.fsencode(path)) >= 100:
+                    raise ValueError("strategy template private socket must be short and canonical")
+                if self.strategy_authoring_service_uid == os.geteuid():
+                    raise ValueError("strategy template service UID must differ from Web UID")
+                others = (self.ingress_socket_path, self.ack_admission_socket_path, self.watchlist_admission_socket_path, self.price_alert_admission_socket_path, self.factor_admission_socket_path, self.factor_run_admission_socket_path, self.factor_tracking_admission_socket_path, self.research_query_socket_path, self.research_query_save_socket_path, self.unit_log_socket_path)
+                if any(other is not None and path.parent == other.parent for other in others):
+                    raise ValueError("strategy template private socket needs a separate directory")
         price_fields = (
             self.price_alert_admission_socket_path,
             self.price_alert_admission_service_uid,
@@ -434,6 +454,7 @@ class WebSettings(BaseModel):
         "factor_run_users",
         "factor_tracking_users",
         "research_query_users",
+        "strategy_authoring_users",
     )
     @classmethod
     def validate_operator_users(cls, value: frozenset[str]) -> frozenset[str]:
@@ -531,6 +552,24 @@ class WebSettings(BaseModel):
     def from_env(cls, environ: Mapping[str, str] | None = None, *, bind: str | None = None) -> Self:
         source = os.environ if environ is None else environ
         values: dict[str, object] = {"serving_root": Path(serving_root_from_env(source))}
+        raw = source.get("RQUANT_WEB_STRATEGY_AUTHORING_ENABLED", "").strip().lower()
+        if raw:
+            if raw not in {"true", "false"}:
+                raise ValueError("strategy authoring enabled must be true or false")
+            values["strategy_authoring_enabled"] = raw == "true"
+        raw = source.get("RQUANT_WEB_STRATEGY_AUTHORING_USERS", "").strip()
+        if raw:
+            names = tuple(name.strip() for name in raw.split(","))
+            if any(not name for name in names) or len(set(names)) != len(names):
+                raise ValueError("strategy authoring users must be exact distinct names")
+            values["strategy_authoring_users"] = frozenset(names)
+        raw = source.get("RQUANT_WEB_STRATEGY_AUTHORING_SOCKET", "").strip()
+        if raw:
+            values["strategy_authoring_socket_path"] = Path(raw)
+        for suffix, field in (("SERVICE_UID", "strategy_authoring_service_uid"), ("SHARED_GID", "strategy_authoring_shared_gid")):
+            raw = source.get(f"RQUANT_WEB_STRATEGY_AUTHORING_{suffix}", "").strip()
+            if raw:
+                values[field] = int(raw)
         for suffix, field in (
             ("SOCKET", "research_query_socket_path"),
             ("SAVE_SOCKET", "research_query_save_socket_path"),

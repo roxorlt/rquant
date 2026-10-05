@@ -1535,6 +1535,142 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/strategy-templates": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 我的策略模板 */
+        get: operations["templates_api_v1_strategy_templates_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/strategy-templates/commands": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 保存版本或归档策略 */
+        post: operations["command_api_v1_strategy_templates_commands_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/strategy-templates/commands/resume": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 续查原策略操作 */
+        post: operations["resume_command_api_v1_strategy_templates_commands_resume_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/strategy-templates/sources": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 策略入场来源 */
+        get: operations["sources_api_v1_strategy_templates_sources_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/strategy-templates/{strategy_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 策略规则与版本 */
+        get: operations["detail_api_v1_strategy_templates__strategy_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/strategy-templates/{strategy_id}/runs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 回测指定策略版本 */
+        post: operations["run_command_api_v1_strategy_templates__strategy_id__runs_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/strategy-templates/{strategy_id}/runs/resume": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 续查原策略回测 */
+        post: operations["resume_run_command_api_v1_strategy_templates__strategy_id__runs_resume_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/strategy-templates/{strategy_id}/versions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 策略版本历史 */
+        get: operations["versions_api_v1_strategy_templates__strategy_id__versions_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/tasks/jobs": {
         parameters: {
             query?: never;
@@ -1772,6 +1908,26 @@ export interface components {
              * @enum {string}
              */
             state: "unavailable" | "historical" | "unconfirmed" | "confirmed";
+        };
+        /** ArchiveStrategyTemplate */
+        ArchiveStrategyTemplate: {
+            /** Command Id */
+            command_id: string;
+            expected_head: components["schemas"]["StrategyTemplateHead"];
+            /** Generation Id */
+            generation_id: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "archive_strategy_template";
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+            /** Strategy Id */
+            strategy_id: string;
         };
         /** Assignment */
         Assignment: {
@@ -3069,6 +3225,16 @@ export interface components {
             /** Row Count */
             row_count: number;
         };
+        /** ConditionTemplateEntry */
+        ConditionTemplateEntry: {
+            /** Conditions */
+            conditions: components["schemas"]["TemplateCondition"][];
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "conditions";
+        };
         /**
          * CorrelationResult
          * @description One cross-sectional correlation, including an explicit unavailable state.
@@ -3789,6 +3955,36 @@ export interface components {
         /** Envelope[StrategyCatalogData] */
         Envelope_StrategyCatalogData_: {
             data: components["schemas"]["StrategyCatalogData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[StrategyTemplateCatalogData] */
+        Envelope_StrategyTemplateCatalogData_: {
+            data: components["schemas"]["StrategyTemplateCatalogData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[StrategyTemplateCommandData] */
+        Envelope_StrategyTemplateCommandData_: {
+            data: components["schemas"]["StrategyTemplateCommandData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[StrategyTemplateDetailData] */
+        Envelope_StrategyTemplateDetailData_: {
+            data: components["schemas"]["StrategyTemplateDetailData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[StrategyTemplateRunCommandData] */
+        Envelope_StrategyTemplateRunCommandData_: {
+            data: components["schemas"]["StrategyTemplateRunCommandData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[StrategyTemplateSourcesData] */
+        Envelope_StrategyTemplateSourcesData_: {
+            data: components["schemas"]["StrategyTemplateSourcesData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[StrategyTemplateVersionsData] */
+        Envelope_StrategyTemplateVersionsData_: {
+            data: components["schemas"]["StrategyTemplateVersionsData"];
             serving: components["schemas"]["ServingMeta"];
         };
         /** Envelope[SurgeData] */
@@ -7819,6 +8015,20 @@ export interface components {
             /** Step Index */
             step_index: number;
         };
+        /** PoolTemplateEntry */
+        PoolTemplateEntry: {
+            /** Body Hash */
+            body_hash: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "pool";
+            /** Pool Key */
+            pool_key: string;
+            /** Version */
+            version: number;
+        };
         /** PoolsData */
         PoolsData: {
             /** Canvases */
@@ -9173,6 +9383,40 @@ export interface components {
             /** Win Rate */
             win_rate: number | null;
         };
+        /** RunStrategyTemplate */
+        RunStrategyTemplate: {
+            /** Command Id */
+            command_id: string;
+            /**
+             * End Date
+             * Format: date
+             */
+            end_date: string;
+            expected_head: components["schemas"]["StrategyTemplateHead"];
+            /** Generation Id */
+            generation_id: string;
+            head: components["schemas"]["StrategyTemplateHead"];
+            /** Initial Cash */
+            initial_cash: number | string;
+            /**
+             * Kind
+             * @default run_strategy_template
+             * @constant
+             */
+            kind: "run_strategy_template";
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+            /**
+             * Start Date
+             * Format: date
+             */
+            start_date: string;
+            /** Strategy Id */
+            strategy_id: string;
+        };
         /** RuntimeServiceItem */
         RuntimeServiceItem: {
             /** Heartbeat At */
@@ -9304,6 +9548,34 @@ export interface components {
             requested_at: string;
             /** Sql */
             sql: string;
+        };
+        /** SaveStrategyTemplate */
+        SaveStrategyTemplate: {
+            /**
+             * Change Note
+             * @default
+             */
+            change_note: string;
+            /** Command Id */
+            command_id: string;
+            expected_head?: components["schemas"]["StrategyTemplateHead"] | null;
+            /** Generation Id */
+            generation_id: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "save_strategy_template";
+            /** Name */
+            name: string;
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+            rules: components["schemas"]["StrategyTemplate-Input"];
+            /** Strategy Id */
+            strategy_id?: string | null;
         };
         /** SavedCanvas */
         SavedCanvas: {
@@ -9708,6 +9980,25 @@ export interface components {
             /** Strategy Name */
             strategy_name: string;
         };
+        /** SignalTemplateEntry */
+        SignalTemplateEntry: {
+            /**
+             * Action
+             * @enum {string}
+             */
+            action: "watch" | "b_intent" | "b_confirm" | "reduce" | "s_intent" | "s_confirm";
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "signal";
+            /** Source Hash */
+            source_hash: string;
+            /** Strategy Id */
+            strategy_id: string;
+            /** Version */
+            version: number;
+        };
         /** SignalsSummary */
         SignalsSummary: {
             /** By Action */
@@ -9834,6 +10125,250 @@ export interface components {
             key: string;
             /** Label */
             label: string;
+        };
+        /** StrategyTemplate */
+        "StrategyTemplate-Input": {
+            /** Entry */
+            entry: components["schemas"]["PoolTemplateEntry"] | components["schemas"]["ConditionTemplateEntry"] | components["schemas"]["SignalTemplateEntry"];
+            exit?: components["schemas"]["TemplateExitRules-Input"];
+            index_filter?: components["schemas"]["TemplateIndexFilter"] | null;
+            rebalance_rule: components["schemas"]["RebalanceRule"];
+            /**
+             * Template Contract
+             * @default strategy-template/v1
+             * @constant
+             */
+            template_contract: "strategy-template/v1";
+            weight_rule: components["schemas"]["PortfolioWeightRule-Input"];
+        };
+        /** StrategyTemplate */
+        "StrategyTemplate-Output": {
+            /** Entry */
+            entry: components["schemas"]["PoolTemplateEntry"] | components["schemas"]["ConditionTemplateEntry"] | components["schemas"]["SignalTemplateEntry"];
+            exit?: components["schemas"]["TemplateExitRules-Output"];
+            index_filter?: components["schemas"]["TemplateIndexFilter"] | null;
+            rebalance_rule: components["schemas"]["RebalanceRule"];
+            /**
+             * Template Contract
+             * @default strategy-template/v1
+             * @constant
+             */
+            template_contract: "strategy-template/v1";
+            weight_rule: components["schemas"]["PortfolioWeightRule-Output"];
+        };
+        /** StrategyTemplateCatalogData */
+        StrategyTemplateCatalogData: {
+            /**
+             * Availability
+             * @enum {string}
+             */
+            availability: "unavailable" | "empty" | "populated";
+            /** Available At */
+            available_at: string | null;
+            /**
+             * Can Create
+             * @default false
+             */
+            can_create: boolean;
+            /** Templates */
+            templates: components["schemas"]["StrategyTemplateItem"][];
+        };
+        /** StrategyTemplateCommandData */
+        StrategyTemplateCommandData: {
+            /**
+             * Command Id
+             * Format: uuid
+             */
+            command_id: string;
+            /**
+             * Current Head Updated
+             * @default false
+             */
+            current_head_updated: boolean;
+            head?: components["schemas"]["StrategyTemplateHead"] | null;
+            /** Message */
+            message: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "rejected" | "pending" | "succeeded_waiting_publication" | "published" | "uncertain";
+            /** Strategy Id */
+            strategy_id?: string | null;
+        };
+        /** StrategyTemplateConditionChoice */
+        StrategyTemplateConditionChoice: {
+            block: components["schemas"]["ScreenBlock"];
+            /** Key */
+            key: string;
+            /** Label */
+            label: string;
+            /** Parameter Schema */
+            parameter_schema: {
+                [key: string]: components["schemas"]["JsonValue"];
+            };
+        };
+        /** StrategyTemplateDetailData */
+        StrategyTemplateDetailData: {
+            /** Archived */
+            archived: boolean;
+            /**
+             * Can Archive
+             * @default false
+             */
+            can_archive: boolean;
+            /**
+             * Can Run
+             * @default false
+             */
+            can_run: boolean;
+            /**
+             * Can Save
+             * @default false
+             */
+            can_save: boolean;
+            /** Change Note */
+            change_note: string;
+            current_head: components["schemas"]["StrategyTemplateHead"];
+            head: components["schemas"]["StrategyTemplateHead"];
+            latest_run?: components["schemas"]["StrategyTemplateRecentRun"] | null;
+            /** Name */
+            name: string;
+            rules: components["schemas"]["StrategyTemplate-Output"];
+            /**
+             * Saved At
+             * Format: date-time
+             */
+            saved_at: string;
+            /** Strategy Id */
+            strategy_id: string;
+        };
+        /** StrategyTemplateHead */
+        StrategyTemplateHead: {
+            /** Record Hash */
+            record_hash: string;
+            /** Registration Fingerprint */
+            registration_fingerprint: string;
+            /** Spec Fingerprint */
+            spec_fingerprint: string;
+            /** Version */
+            version: number;
+        };
+        /** StrategyTemplateItem */
+        StrategyTemplateItem: {
+            /** Archived */
+            archived: boolean;
+            /**
+             * Entry Kind
+             * @enum {string}
+             */
+            entry_kind: "pool" | "conditions" | "signal";
+            head: components["schemas"]["StrategyTemplateHead"];
+            latest_run?: components["schemas"]["StrategyTemplateRecentRun"] | null;
+            /** Name */
+            name: string;
+            /**
+             * Phase
+             * @enum {string}
+             */
+            phase: "未评估" | "已有回测";
+            /**
+             * Saved At
+             * Format: date-time
+             */
+            saved_at: string;
+            /** Strategy Id */
+            strategy_id: string;
+        };
+        /** StrategyTemplateRecentRun */
+        StrategyTemplateRecentRun: {
+            /** Complete Result Hash */
+            complete_result_hash: string;
+            /**
+             * Completed At
+             * Format: date-time
+             */
+            completed_at: string;
+            head: components["schemas"]["StrategyTemplateHead"];
+            /** Input Hash */
+            input_hash: string;
+            /**
+             * Job Id
+             * Format: uuid
+             */
+            job_id: string;
+            /** Manifest Hash */
+            manifest_hash: string;
+            /** Owner Id */
+            owner_id: string;
+            /** Result Hash */
+            result_hash: string;
+            /** Spec Hash */
+            spec_hash: string;
+            /** Strategy Id */
+            strategy_id: string;
+        };
+        /** StrategyTemplateRunCommandData */
+        StrategyTemplateRunCommandData: {
+            /**
+             * Command Id
+             * Format: uuid
+             */
+            command_id: string;
+            /** Job Id */
+            job_id?: string | null;
+            /** Message */
+            message: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "rejected" | "pending" | "submitted" | "uncertain";
+        };
+        /** StrategyTemplateSourcesData */
+        StrategyTemplateSourcesData: {
+            /**
+             * Availability
+             * @enum {string}
+             */
+            availability: "unavailable" | "empty" | "populated";
+            /**
+             * Can Create
+             * @default false
+             */
+            can_create: boolean;
+            /** Comparison Fields */
+            comparison_fields: string[];
+            /** Conditions */
+            conditions: components["schemas"]["StrategyTemplateConditionChoice"][];
+            /** Pools */
+            pools: components["schemas"]["TemplatePoolReference"][];
+            /** Signals */
+            signals: components["schemas"]["TemplateSignalReference"][];
+        };
+        /** StrategyTemplateVersionItem */
+        StrategyTemplateVersionItem: {
+            /** Change Note */
+            change_note: string;
+            head: components["schemas"]["StrategyTemplateHead"];
+            /** Is Head */
+            is_head: boolean;
+            latest_run?: components["schemas"]["StrategyTemplateRecentRun"] | null;
+            /**
+             * Saved At
+             * Format: date-time
+             */
+            saved_at: string;
+        };
+        /** StrategyTemplateVersionsData */
+        StrategyTemplateVersionsData: {
+            current_head: components["schemas"]["StrategyTemplateHead"];
+            /** Next Before Version */
+            next_before_version?: number | null;
+            /** Strategy Id */
+            strategy_id: string;
+            /** Versions */
+            versions: components["schemas"]["StrategyTemplateVersionItem"][];
         };
         /** StreakSummary */
         StreakSummary: {
@@ -10028,6 +10563,81 @@ export interface components {
             /** Dates */
             dates: string[];
             source: components["schemas"]["ScreenSourceInfo"] | null;
+        };
+        /** TemplateCondition */
+        TemplateCondition: {
+            /** Args */
+            args?: {
+                [key: string]: components["schemas"]["JsonValue"];
+            };
+            /** Key */
+            key: string;
+        };
+        /** TemplateExitRules */
+        "TemplateExitRules-Input": {
+            /** Exit Time */
+            exit_time?: string | null;
+            /** Max Holding Days */
+            max_holding_days?: number | null;
+            /** Stop Loss */
+            stop_loss?: number | string | null;
+            /** Take Profit */
+            take_profit?: number | string | null;
+            /** Trailing Profit */
+            trailing_profit?: number | string | null;
+        };
+        /** TemplateExitRules */
+        "TemplateExitRules-Output": {
+            /** Exit Time */
+            exit_time?: string | null;
+            /** Max Holding Days */
+            max_holding_days?: number | null;
+            /** Stop Loss */
+            stop_loss?: string | null;
+            /** Take Profit */
+            take_profit?: string | null;
+            /** Trailing Profit */
+            trailing_profit?: string | null;
+        };
+        /** TemplateIndexFilter */
+        TemplateIndexFilter: {
+            /** Benchmark Code */
+            benchmark_code: string;
+            /**
+             * Direction
+             * @enum {string}
+             */
+            direction: "above" | "below";
+            /** Ma Days */
+            ma_days: number;
+        };
+        /** TemplatePoolReference */
+        TemplatePoolReference: {
+            /** Body Hash */
+            body_hash: string;
+            /** Name */
+            name: string;
+            /** Owner Id */
+            owner_id: string | null;
+            /** Pool Key */
+            pool_key: string;
+            /** Version */
+            version: number;
+        };
+        /** TemplateSignalReference */
+        TemplateSignalReference: {
+            /** Actions */
+            actions: string[];
+            /** Name */
+            name: string;
+            /** Owner Id */
+            owner_id: string | null;
+            /** Source Hash */
+            source_hash: string;
+            /** Strategy Id */
+            strategy_id: string;
+            /** Version */
+            version: number;
         };
         /** TradingDayGap */
         TradingDayGap: {
@@ -12897,6 +13507,273 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_StrategyCatalogData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    templates_api_v1_strategy_templates_get: {
+        parameters: {
+            query?: {
+                generation_id?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_StrategyTemplateCatalogData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    command_api_v1_strategy_templates_commands_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SaveStrategyTemplate"] | components["schemas"]["ArchiveStrategyTemplate"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_StrategyTemplateCommandData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    resume_command_api_v1_strategy_templates_commands_resume_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SaveStrategyTemplate"] | components["schemas"]["ArchiveStrategyTemplate"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_StrategyTemplateCommandData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    sources_api_v1_strategy_templates_sources_get: {
+        parameters: {
+            query?: {
+                generation_id?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_StrategyTemplateSourcesData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    detail_api_v1_strategy_templates__strategy_id__get: {
+        parameters: {
+            query?: {
+                generation_id?: string | null;
+                version?: number | null;
+            };
+            header?: never;
+            path: {
+                strategy_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_StrategyTemplateDetailData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    run_command_api_v1_strategy_templates__strategy_id__runs_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                strategy_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RunStrategyTemplate"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_StrategyTemplateRunCommandData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    resume_run_command_api_v1_strategy_templates__strategy_id__runs_resume_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                strategy_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RunStrategyTemplate"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_StrategyTemplateRunCommandData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    versions_api_v1_strategy_templates__strategy_id__versions_get: {
+        parameters: {
+            query?: {
+                generation_id?: string | null;
+                before_version?: number | null;
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                strategy_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_StrategyTemplateVersionsData_"];
                 };
             };
             /** @description Validation Error */

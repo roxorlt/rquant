@@ -27,7 +27,7 @@
 | GET | `/api/v1/data/issues` |
 | GET | `/api/v1/data/fundamentals/summary` |
 
-## 私有读取（48）
+## 私有读取（52）
 
 | 方法 | 路径 |
 |---|---|
@@ -54,6 +54,10 @@
 | GET | `/api/v1/backtests/portfolio/runs/{job_id}/report.html` |
 | GET | `/api/v1/backtests/portfolio/runs/{job_id}/exports/{request_id}.zip` |
 | GET | `/api/v1/strategies` |
+| GET | `/api/v1/strategy-templates` |
+| GET | `/api/v1/strategy-templates/sources` |
+| GET | `/api/v1/strategy-templates/{strategy_id}` |
+| GET | `/api/v1/strategy-templates/{strategy_id}/versions` |
 | GET | `/api/v1/factors/definitions` |
 | GET | `/api/v1/factors/capabilities` |
 | GET | `/api/v1/factors/results` |
@@ -82,7 +86,7 @@
 
 名单按认证 owner 过滤。服务日志能力在未登录时只返回空列表，日志正文仍拒绝；普通任务、池子、监控、研究和审计页面则直接返回 401。公开的 `meta` 在没有有效证明时不显示 viewer。
 
-## 受保护操作（32）
+## 受保护操作（36）
 
 | 方法 | 路径 |
 |---|---|
@@ -118,6 +122,10 @@
 | POST | `/api/v1/research/query` |
 | POST | `/api/v1/research/queries/save` |
 | POST | `/api/v1/research/queries/resume` |
+| POST | `/api/v1/strategy-templates/commands` |
+| POST | `/api/v1/strategy-templates/commands/resume` |
+| POST | `/api/v1/strategy-templates/{strategy_id}/runs` |
+| POST | `/api/v1/strategy-templates/{strategy_id}/runs/resume` |
 
 公式检查、单股预览、运行选股及自然语言预览不持久写入，但会消耗计算或付费模型资源，所以按受保护操作处理。其余操作由现有 CSRF 与命令准入继续约束；代理证明不替代这些条件。
 
@@ -128,6 +136,8 @@
 只读查询和常用查询保存使用 researcher/admin 受信账号名单，API 与私有服务均核验。SQL 执行走独立公开三表快照；保存和列表走 PageControl，并按认证账号过滤。恢复携带完整原保存请求，不产生新命令。
 
 组合回测读取和下载使用私有身份。运行和 ZIP 准备另核原任务操作名单、CSRF 和完整原请求；结果按原任务与封存摘要读取，未知回执只恢复原操作。没有可用来源时，运行能力明确不可用。
+
+策略模板列表、来源、详情和版本按本人读取。保存、归档及运行另核编辑名单、CSRF 和完整原请求；未知回执只续查原操作。运行须有原任务链及已核验的来源。
 
 ## 本片与生产边界
 
