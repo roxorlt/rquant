@@ -26,6 +26,14 @@ class StrategyTableDependency(_DependencyModel):
     available_at_column: str | None = None
 
 
+PORTFOLIO_BACKTEST_CONTRACT_VERSION = "portfolio-daily-v1"
+_PORTFOLIO_TABLE_DEPENDENCIES = (
+    StrategyTableDependency(
+        dataset_id="portfolio_backtest_input", table_name="portfolio_backtest_input"
+    ),
+)
+
+
 _FACTOR_TABLE_DEPENDENCIES = (
     StrategyTableDependency(
         dataset_id="daily_bar",
@@ -110,12 +118,19 @@ class StrategyExecutionDependencies(_DependencyModel):
 
     @model_validator(mode="after")
     def validate_unique_dependencies(self) -> StrategyExecutionDependencies:
-        if not self.lake_datasets and (
-            self.strategy_id != "factor_eval"
-            or self.contract_version != FACTOR_EVAL_CONTRACT_VERSION
-            or self.materialized_tables != _FACTOR_TABLE_DEPENDENCIES
-        ):
-            raise ValueError("lake_datasets may be empty only for the exact factor_eval contract")
+        materialized_only = (
+            self.strategy_id == "factor_eval"
+            and self.contract_version == FACTOR_EVAL_CONTRACT_VERSION
+            and self.materialized_tables == _FACTOR_TABLE_DEPENDENCIES
+        ) or (
+            self.strategy_id == "portfolio_backtest"
+            and self.contract_version == PORTFOLIO_BACKTEST_CONTRACT_VERSION
+            and self.materialized_tables == _PORTFOLIO_TABLE_DEPENDENCIES
+        )
+        if not self.lake_datasets and not materialized_only:
+            raise ValueError(
+                "lake_datasets may be empty only for an exact approved materialized contract"
+            )
         if len(self.lake_datasets) != len(set(self.lake_datasets)):
             raise ValueError("lake_datasets must be unique")
         table_names = [item.table_name for item in self.materialized_tables]
@@ -170,6 +185,12 @@ _COMMON_DAILY_TABLES = (
 
 
 STRATEGY_EXECUTION_DEPENDENCIES: dict[str, StrategyExecutionDependencies] = {
+    "portfolio_backtest": StrategyExecutionDependencies(
+        strategy_id="portfolio_backtest",
+        contract_version=PORTFOLIO_BACKTEST_CONTRACT_VERSION,
+        lake_datasets=(),
+        materialized_tables=_PORTFOLIO_TABLE_DEPENDENCIES,
+    ),
     "n_shape": StrategyExecutionDependencies(
         strategy_id="n_shape",
         contract_version="stage1-v1",

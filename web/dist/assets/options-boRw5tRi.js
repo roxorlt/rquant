@@ -1,0 +1,1 @@
+function e(e,t=!0){return{animation:t,animationDuration:380,textStyle:{fontFamily:e.fontSans,color:e.muted,fontSize:12},tooltip:{trigger:`axis`,confine:!0,backgroundColor:e.surface,borderColor:e.rule,borderWidth:1,textStyle:{color:e.text,fontSize:12,fontFamily:e.fontSans},axisPointer:{type:`line`,lineStyle:{color:e.ruleStrong,width:1}}}}}export{e as t};

@@ -22,6 +22,7 @@ from rquant.backtest.contracts import (
 )
 from rquant.paper_broker import BrokerCostPolicy, BrokerExecutionContext, PaperBrokerStore
 from rquant.paper_contracts import PaperOrderIntent, PaperOrderType, PaperSide
+from rquant.portfolio.drawdown import DrawdownDecision, DrawdownState, evaluate_drawdown
 from rquant.portfolio.weights import allocate_target_weights
 from rquant.runtime_contracts import canonical_sha256
 
@@ -106,18 +107,19 @@ def _decision(
     entry_signal_id: str | None = None,
 ) -> BacktestDecision:
     assert instrument.decision_price is not None
+    strategy_config = {
+        "weight_rule": request.weight_rule,
+        "rebalance_rule": request.rebalance_rule,
+        "initial_cash": request.initial_cash,
+        "cost_spec_id": request.execution_cost_spec.cost_spec_id,
+        "calendar_source_identity": request.calendar.source_identity,
+    }
+    if request.drawdown_rule is not None:
+        strategy_config["drawdown_rule"] = request.drawdown_rule
     return BacktestDecision(
         decided_at=_local_at(day.trade_date, 9, 25),
         producer_commit=request.producer_commit,
-        strategy_config_id=canonical_sha256(
-            {
-                "weight_rule": request.weight_rule,
-                "rebalance_rule": request.rebalance_rule,
-                "initial_cash": request.initial_cash,
-                "cost_spec_id": request.execution_cost_spec.cost_spec_id,
-                "calendar_source_identity": request.calendar.source_identity,
-            }
-        ),
+        strategy_config_id=canonical_sha256(strategy_config),
         ranking_source_identity=day.ranking.source_identity,
         reference_price_snapshot_id=canonical_sha256(
             {
@@ -218,17 +220,37 @@ def _replay_day(
     next_trade_date: date,
     previous_nav: Decimal,
     entries: list[_Entry],
+    risk: DrawdownDecision | None = None,
 ) -> tuple[tuple[BacktestDecision, ...], tuple[BacktestOrder, ...], tuple[SkippedTarget, ...]]:
     instruments = {item.ts_code: item for item in day.instruments}
     target_quantities: dict[str, int] = {}
     protected: set[str] = set()
     skipped: list[SkippedTarget] = []
+    held_before = _quantity_by_code(entries)
     if day.ranking.candidates:
+        weight_rule = request.weight_rule
+        if risk is not None and risk.max_total_risk_weight is not None:
+            weight_rule = weight_rule.model_copy(
+                update={
+                    "cash_reserve": max(
+                        weight_rule.cash_reserve, Decimal("1") - risk.max_total_risk_weight
+                    )
+                }
+            )
         allocation = allocate_target_weights(
-            day.ranking.candidates, request.weight_rule, capital=previous_nav
+            day.ranking.candidates, weight_rule, capital=previous_nav
         )
         for target in allocation.positions:
             if target.status != "selected" or target.target_amount == 0:
+                continue
+            if (
+                risk is not None
+                and not risk.allow_new_positions
+                and held_before.get(target.ts_code, 0) == 0
+            ):
+                skipped.append(
+                    SkippedTarget(ts_code=target.ts_code, side="BUY", reason="drawdown_blocked")
+                )
                 continue
             instrument = instruments.get(target.ts_code)
             if instrument is None or instrument.decision_price is None:
@@ -350,6 +372,16 @@ def run_portfolio_backtest(request: BacktestRequest, *, research_root: Path) -> 
     results: list[BacktestDayResult] = []
     previous_nav = request.initial_cash
     previous_cash = request.initial_cash
+    risk_state: DrawdownState | None = None
+    risk: DrawdownDecision | None = None
+    if request.drawdown_rule is not None:
+        first_index = request.calendar.dates.index(request.days[0].trade_date)
+        risk = evaluate_drawdown(
+            previous_nav,
+            _local_at(request.calendar.dates[first_index - 1], 15, 1),
+            request.drawdown_rule,
+        )
+        risk_state = risk.state
     with tempfile.TemporaryDirectory(prefix="portfolio-backtest-", dir=root) as private_dir:
         broker = PaperBrokerStore(
             Path(private_dir) / "ledger.sqlite3",
@@ -359,6 +391,8 @@ def run_portfolio_backtest(request: BacktestRequest, *, research_root: Path) -> 
         )
         for index, day in enumerate(request.days):
             rebalanced = _should_rebalance(index, request.days, request.rebalance_rule)
+            if risk is not None and risk.max_total_risk_weight is not None:
+                rebalanced = True
             if rebalanced:
                 calendar_index = request.calendar.dates.index(day.trade_date)
                 decisions, orders, skipped = _replay_day(
@@ -368,6 +402,7 @@ def run_portfolio_backtest(request: BacktestRequest, *, research_root: Path) -> 
                     next_trade_date=request.calendar.dates[calendar_index + 1],
                     previous_nav=previous_nav,
                     entries=entries,
+                    risk=risk,
                 )
             else:
                 decisions, orders, skipped = (), (), ()
@@ -391,6 +426,7 @@ def run_portfolio_backtest(request: BacktestRequest, *, research_root: Path) -> 
                         skipped=skipped,
                         fees=fees,
                         account=None,
+                        risk=risk,
                         incomplete_reason="missing_held_close",
                     )
                 )
@@ -430,10 +466,16 @@ def run_portfolio_backtest(request: BacktestRequest, *, research_root: Path) -> 
                     ),
                     daily_return=account.nav / previous_nav - Decimal("1"),
                     normalized_nav=account.nav / request.initial_cash,
+                    risk=risk,
                 )
             )
             previous_nav = account.nav
             previous_cash = account.cash
+            if request.drawdown_rule is not None:
+                risk = evaluate_drawdown(
+                    account.nav, _local_at(day.trade_date, 15, 1), request.drawdown_rule, risk_state
+                )
+                risk_state = risk.state
     return BacktestResult(
         request_id=request.request_id,
         producer_commit=request.producer_commit,

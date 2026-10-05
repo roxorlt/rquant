@@ -114,7 +114,10 @@ def _feature_contracts(
     *,
     producer_commit: str,
 ) -> tuple[FeatureContract, ...]:
-    definitions = tuple(registry.definitions.values())
+    definitions = tuple(
+        registry.load_definition(strategy_id, 1)
+        for strategy_id in ("auction_gap", "growth_board_surge", "n_shape")
+    )
     feature_names = sorted(
         {
             requirement.name
@@ -205,7 +208,10 @@ def plan_builtin_definitions(*, producer_commit: str) -> BuiltinDefinitionBootst
 
     strategies: list[BuiltinDefinitionStrategyBinding] = []
     for definition in sorted(
-        registry.definitions.values(),
+        (
+            registry.load_definition(strategy_id, 1)
+            for strategy_id in ("auction_gap", "growth_board_surge", "n_shape")
+        ),
         key=lambda item: item.strategy_id,
     ):
         spec = _canonical_strategy_spec(definition.spec)
@@ -282,7 +288,10 @@ def bootstrap_builtin_definitions(
 
     planned_by_id = {binding.strategy_id: binding for binding in plan.strategies}
     for definition in sorted(
-        evaluator_registry.definitions.values(),
+        (
+            evaluator_registry.load_definition(strategy_id, 1)
+            for strategy_id in ("auction_gap", "growth_board_surge", "n_shape")
+        ),
         key=lambda item: item.strategy_id,
     ):
         record = definition_registry.register_strategy_spec(
