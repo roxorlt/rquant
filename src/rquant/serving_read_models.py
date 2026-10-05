@@ -50,6 +50,7 @@ from rquant.signal_contracts import (
     parse_signal_envelope,
 )
 from rquant.strict_json import canonical_json_bytes, strict_canonical_json_loads
+from rquant.strategy_authoring_projection_contract import STRATEGY_TEMPLATE_PROJECTION_LAYOUTS
 
 GenerationId = Annotated[StrictStr, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 ProjectionScalar = StrictStr | StrictInt | StrictFloat | StrictBool | None
@@ -163,6 +164,10 @@ def _contract(
 
 PAGE_PROJECTION_CONTRACTS: Mapping[str, ServingProjectionContract] = MappingProxyType(
     {
+        **{
+            name: _contract("lab_jobs", columns, keys, max_rows=max_rows, max_bytes=max_bytes, event_time_columns=times)
+            for name, (columns, keys, max_rows, max_bytes, times) in STRATEGY_TEMPLATE_PROJECTION_LAYOUTS.items()
+        },
         "experiment_attempt": _contract(
             "promotions",
             (
@@ -1968,6 +1973,10 @@ class ServingReadModelInput(RuntimeContractModel):
             validate_factor_tracking_projections({p.table_name: p for p in self.projections})
 
         signal_ids = {record.signal.signal_id for record in self.signals}
+        if any(p.table_name in STRATEGY_TEMPLATE_PROJECTION_LAYOUTS for p in self.projections):
+            from rquant.strategy_authoring_projection import validate_strategy_authoring_projections
+
+            validate_strategy_authoring_projections({p.table_name: p for p in self.projections})
         if any(record.signal_id not in signal_ids for record in self.routes):
             raise ValueError("route references a signal outside the serving snapshot")
         routes = {record.signal_id: record for record in self.routes}

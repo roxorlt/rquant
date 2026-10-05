@@ -81,6 +81,7 @@ from rquant.web.routes import (
     service_logs,
     stocks,
     strategies,
+    strategy_authoring,
     tasks,
     tasks_controls,
 )
@@ -89,6 +90,7 @@ from rquant.web.security import require_current_user
 from rquant.web.service_log_access_audit import ServiceLogAccessAudit
 from rquant.web.serving import GenerationTracker
 from rquant.web.settings import WebSettings
+from rquant.web.strategy_authoring_gateway import StrategyAuthoringGateway
 
 if TYPE_CHECKING:
     from rquant.alert_ack_admission import AckAdmissionClient
@@ -119,6 +121,8 @@ _WRITE_BODY_LIMITS = {
     "/api/v1/research/query": research_query.MAX_REQUEST_BYTES,
     "/api/v1/research/queries/save": research_query.MAX_REQUEST_BYTES,
     "/api/v1/research/queries/resume": research_query.MAX_REQUEST_BYTES,
+    "/api/v1/strategy-templates/commands": strategy_authoring.MAX_TEMPLATE_REQUEST_BYTES,
+    "/api/v1/strategy-templates/commands/resume": strategy_authoring.MAX_TEMPLATE_REQUEST_BYTES,
 }
 _FACTOR_ARCHIVE_WRITE = re.compile(
     r"^/api/v1/factors/definitions/[a-z][a-z0-9_]{0,63}/archive(?:/resume)?$"
@@ -151,6 +155,7 @@ class WebContext:
     factor_admission: FactorDefinitionAdmissionClient | None
     factor_run_admission: FactorRunAdmissionClient | None
     factor_tracking_admission: FactorTrackingAdmissionClient | None
+    strategy_authoring_gateway: StrategyAuthoringGateway | None
     unit_log_client: UnitLogClient | None
     unit_log_access_audit: ServiceLogAccessAudit | None
     unit_log_gate: threading.BoundedSemaphore
@@ -177,6 +182,7 @@ def create_app(
     factor_admission_client: FactorDefinitionAdmissionClient | None = None,
     factor_run_admission_client: FactorRunAdmissionClient | None = None,
     factor_tracking_admission_client: FactorTrackingAdmissionClient | None = None,
+    strategy_authoring_gateway: StrategyAuthoringGateway | None = None,
     unit_log_client: UnitLogClient | None = None,
     unit_log_access_audit: ServiceLogAccessAudit | None = None,
     backfill_plan_command_transport: BackfillPlanCommandTransport | None = None,
@@ -325,6 +331,13 @@ def create_app(
             )
         )
     configured_nl_parser = nl_parser
+    configured_strategy_authoring = strategy_authoring_gateway
+    if configured_strategy_authoring is not None and not isinstance(configured_strategy_authoring, StrategyAuthoringGateway):
+        raise TypeError("strategy templates require a typed private gateway")
+    if configured_strategy_authoring is None and settings.strategy_authoring_enabled and settings.strategy_authoring_socket_path is not None:
+        from rquant.strategy_authoring_admission import StrategyAuthoringAdmissionClient
+
+        configured_strategy_authoring = StrategyAuthoringAdmissionClient(settings.strategy_authoring_socket_path, expected_service_uid=settings.strategy_authoring_service_uid, shared_gid=settings.strategy_authoring_shared_gid)
     if configured_nl_parser is None and settings.nl_openai_api_key is not None:
         assert settings.nl_openai_model is not None
         configured_nl_parser = OpenAiScreenPlanParser(
@@ -365,6 +378,7 @@ def create_app(
         factor_admission=configured_factor_admission,
         factor_run_admission=configured_factor_run,
         factor_tracking_admission=configured_factor_tracking,
+        strategy_authoring_gateway=configured_strategy_authoring,
         unit_log_client=configured_unit_log,
         unit_log_access_audit=unit_log_access_audit,
         unit_log_gate=threading.BoundedSemaphore(1),
@@ -438,6 +452,8 @@ def create_app(
         request: Request,
         error: RequestValidationError,
     ) -> Response:
+        if request.url.path.startswith("/api/v1/strategy-templates"):
+            return JSONResponse(status_code=422, content={"detail": "策略内容有误，请检查后重试。"})
         if request.url.path.startswith("/api/v1/research/"):
             return JSONResponse(
                 status_code=422, content={"detail": "查询或保存内容有误，请检查 SQL 和名称。"}
@@ -505,6 +521,7 @@ def create_app(
         strategies.router, prefix="/api/v1", tags=["strategies"], dependencies=private
     )
     app.include_router(factors.router, prefix="/api/v1", tags=["factors"], dependencies=private)
+    app.include_router(strategy_authoring.router, prefix="/api/v1", tags=["strategies"], dependencies=private)
     app.include_router(factor_runs.router, prefix="/api/v1", tags=["factors"], dependencies=private)
     app.include_router(
         factor_tracking.router, prefix="/api/v1", tags=["factors"], dependencies=private

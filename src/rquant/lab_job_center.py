@@ -63,6 +63,12 @@ from rquant.strategy_job_adapters import (
     build_adapter_execution_contract,
     default_strategy_job_adapter_registry,
 )
+from rquant.strategy_template_adapter import (
+    StrategyTemplateAdapterCatalog,
+    StrategyTemplateRunInput,
+    strategy_template_adapter_registry,
+    template_adapter_id,
+)
 from rquant.strict_json import canonical_json_bytes
 
 _CLEAN_CODE_SHA = re.compile(r"^[0-9a-f]{40}$")
@@ -130,7 +136,8 @@ ResearchRunInput: TypeAlias = Annotated[
     NShapeComparisonRunInput
     | NShapeOptimizationRunInput
     | AuctionGapRunInput
-    | GrowthBoardSurgeRunInput,
+    | GrowthBoardSurgeRunInput
+    | StrategyTemplateRunInput,
     Field(discriminator="kind"),
 ]
 
@@ -220,6 +227,13 @@ def _run_identity(
             "growth-board-surge",
             run_input.parameters,
         )
+    if isinstance(run_input, StrategyTemplateRunInput):
+        return (
+            run_input.parameters.strategy_id,
+            ResearchJobType.STRATEGY_REPLAY,
+            template_adapter_id(run_input.parameters.strategy_id),
+            run_input.parameters,
+        )
     raise TypeError(f"unsupported research run input: {type(run_input).__name__}")
 
 
@@ -285,9 +299,18 @@ def _validate_run_input_bounds(run_input: ResearchRunInput) -> None:
             )
 
 
-def _preflight_research_plan(spec: ResearchRunSpec) -> None:
+def _preflight_research_plan(
+    spec: ResearchRunSpec,
+    *,
+    template_catalog: StrategyTemplateAdapterCatalog | None = None,
+) -> None:
     try:
-        definitions = default_strategy_job_adapter_registry().plan(spec)
+        registry = (
+            default_strategy_job_adapter_registry()
+            if template_catalog is None
+            else strategy_template_adapter_registry(template_catalog)
+        )
+        definitions = registry.plan(spec)
     except (OverflowError, TypeError, ValueError, ValidationError) as exc:
         raise ResearchJobSubmissionError("adapter_plan", str(exc)) from exc
     if len(definitions) > MAX_JOB_SHARDS:
@@ -334,6 +357,7 @@ def build_research_job_submission(
     max_attempts: int = 1,
     trusted_strategy_registration: StrategySpecRegistration | None = None,
     formal_experiment_plan: FormalExperimentPlan | None = None,
+    template_catalog: StrategyTemplateAdapterCatalog | None = None,
 ) -> ResearchJobSubmission:
     decision = ResearchGateDecision.model_validate(gate_decision)
     if not decision.allowed:
@@ -390,7 +414,7 @@ def build_research_job_submission(
         )
     except (TypeError, ValueError, ValidationError) as exc:
         raise ResearchJobSubmissionError("input_bounds", str(exc)) from exc
-    _preflight_research_plan(spec)
+    _preflight_research_plan(spec, template_catalog=template_catalog)
     command = SubmitJobCommand(
         job_id=job_id,
         spec=spec,

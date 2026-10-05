@@ -26,7 +26,7 @@ from multiprocessing.context import AuthenticationError
 from multiprocessing.process import BaseProcess
 from pathlib import Path
 from types import FrameType
-from typing import Literal, TypeVar
+from typing import TYPE_CHECKING, Literal, TypeVar
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import pandas as pd
@@ -128,6 +128,9 @@ from rquant.strict_json import (
     strict_canonical_json_loads,
     strict_model_validate_canonical_json,
 )
+
+if TYPE_CHECKING:
+    from rquant.strategy_template_adapter import StrategyTemplateAdapterCatalog
 
 LAB_WORKER_MAX_SHARDS_PER_TICK = 1
 _HASH_PATTERN = r"^[0-9a-f]{64}$"
@@ -492,6 +495,7 @@ def build_builtin_shard_runtime_manifest(
     forbidden_paths: tuple[Path, ...],
     snapshot_root: Path,
     research_lake_root: Path,
+    template_catalog: StrategyTemplateAdapterCatalog | None = None,
 ) -> LabShardRuntimeManifest:
     from rquant.lab_worker_registry import builtin_lab_shard_configuration
 
@@ -500,6 +504,7 @@ def build_builtin_shard_runtime_manifest(
         forbidden_paths=forbidden_paths,
         snapshot_root=snapshot_root,
         research_lake_root=research_lake_root,
+        template_catalog=template_catalog,
     )
     return LabShardRuntimeManifest(
         registry=LabClosedRegistryBinding(
@@ -2822,6 +2827,19 @@ class LabWorker:
                 "V2 claim publication requires a published-claim verifier"
             )
         closed_adapter_registry = default_strategy_job_adapter_registry()
+        if (
+            shard_runtime_manifest is not None
+            and shard_runtime_manifest.registry.registry_id == _BUILTIN_SHARD_REGISTRY_ID
+        ):
+            from rquant.lab_worker_registry import (
+                BuiltinLabShardRuntimeConfig,
+                resolve_builtin_adapter_registry,
+            )
+
+            shard_configuration = BuiltinLabShardRuntimeConfig.model_validate_json(
+                shard_runtime_manifest.registry.configuration_json, strict=True
+            )
+            closed_adapter_registry = resolve_builtin_adapter_registry(shard_configuration)
         if adapter_registry is not None and adapter_registry is not closed_adapter_registry:
             raise LabDaemonConfigurationError(
                 "legacy or third-party adapter registry is not registered"

@@ -25,6 +25,8 @@ from typing import TYPE_CHECKING, Annotated, Literal, Protocol
 
 if TYPE_CHECKING:
     from rquant.research_query.saved import SavedResearchQuery
+    from rquant.strategy_authoring import StrategyAuthoringPageControlBackend
+    from rquant.strategy_authoring_source import StrategySourceCatalog
 from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID, uuid4
 
@@ -85,6 +87,15 @@ from rquant.runtime_contracts import (
     canonical_sha256,
 )
 from rquant.screen.pool_ranking import PoolRankingPlan
+from rquant.strategy_authoring_commands import (
+    ArchiveStrategyTemplate,
+    OwnedArchiveStrategyTemplate,
+    OwnedSaveStrategyTemplate,
+    OwnedStrategyTemplateCommand,
+    SaveStrategyTemplate,
+    StrategyAuthoringIdentity,
+    StrategyTemplateCommand,
+)
 
 _SAFE_NAME = re.compile(r"^[\w\u4e00-\u9fff-]+$")
 _CANVAS_CATALOG_SCHEMA_VERSION = 1
@@ -109,6 +120,7 @@ _PRICE_RULE_KINDS = frozenset(
 _FACTOR_DEFINITION_KINDS = frozenset({"save_factor_definition", "archive_factor"})
 _FACTOR_RUN_KINDS = frozenset({"submit_factor_run"})
 _FACTOR_TRACKING_KINDS = frozenset({"set_factor_tracked"})
+_STRATEGY_AUTHORING_KINDS = frozenset({"save_strategy_template", "archive_strategy_template"})
 _FACTOR_REGISTRY_EFFECT_IDENTITY = "factor-registry-identity/v1"
 _LOCAL_FILESYSTEM_FENCE_SCHEMA_VERSION = 1
 _CANVAS_HEAD_CONTRACT = "canvas-current-head/v1"
@@ -676,6 +688,8 @@ PageControlCommandValue = Annotated[
     | _OwnedArchiveFactor
     | _OwnedSubmitFactorRun
     | _OwnedSetFactorTracked
+    | OwnedSaveStrategyTemplate
+    | OwnedArchiveStrategyTemplate
     | SaveCanvas
     | CreateCanvas
     | DeleteCanvas
@@ -1140,6 +1154,8 @@ class PageControlOutbox:
         return connection
 
     def enqueue(self, command: PageControlCommandValue) -> PageControlReceipt:
+        if isinstance(command, (SaveStrategyTemplate, ArchiveStrategyTemplate)):
+            raise ValueError("strategy authoring requires trusted submission")
         if isinstance(command, SaveResearchQuery):
             raise ValueError("research queries require trusted submission")
         if isinstance(command, AckAlert):
@@ -1196,6 +1212,13 @@ class PageControlOutbox:
             raise TypeError("tracking requires an owned command")
         return self._enqueue(command, require_factor_tracking_trust=True)
 
+    def enqueue_trusted_strategy_authoring(
+        self, command: OwnedStrategyTemplateCommand
+    ) -> PageControlReceipt:
+        if type(command) not in (OwnedSaveStrategyTemplate, OwnedArchiveStrategyTemplate):
+            raise TypeError("strategy authoring requires an owned command")
+        return self._enqueue(command, require_strategy_authoring_trust=True)
+
     def _enqueue(
         self,
         command: PageControlCommandValue,
@@ -1206,7 +1229,12 @@ class PageControlOutbox:
         require_factor_run_trust: bool = False,
         require_factor_tracking_trust: bool = False,
         require_research_query_trust: bool = False,
+        require_strategy_authoring_trust: bool = False,
     ) -> PageControlReceipt:
+        if isinstance(command, (SaveStrategyTemplate, ArchiveStrategyTemplate)) != require_strategy_authoring_trust or (
+            require_strategy_authoring_trust and type(command) not in (OwnedSaveStrategyTemplate, OwnedArchiveStrategyTemplate)
+        ):
+            raise ValueError("strategy authoring requires trusted submission")
         if isinstance(command, SaveResearchQuery) != require_research_query_trust or (
             require_research_query_trust and type(command) is not _OwnedSaveResearchQuery
         ):
@@ -1267,7 +1295,7 @@ class PageControlOutbox:
                     raise PageControlCommandConflictError(
                         "command_id already exists with different payload"
                     )
-                if require_price_rule_activation or require_factor_definition_trust:
+                if require_price_rule_activation or require_factor_definition_trust or require_strategy_authoring_trust:
                     stored = _COMMAND_ADAPTER.validate_json(existing["payload_json"])
                     if (
                         stored != command
@@ -1551,6 +1579,31 @@ class PageControlOutbox:
             raise PageControlCommandConflictError(
                 "command_id already exists with different payload or actor"
             )
+        return stored, self._receipt(row)
+
+    def lookup_strategy_authoring_command(
+        self, request: StrategyTemplateCommand, *, authenticated_actor_id: str
+    ) -> tuple[OwnedStrategyTemplateCommand, PageControlReceipt] | None:
+        if type(request) not in (SaveStrategyTemplate, ArchiveStrategyTemplate):
+            raise TypeError("strategy lookup requires an ownerless original request")
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM page_control_command WHERE command_id = ?", (request.command_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            stored = _COMMAND_ADAPTER.validate_json(row["payload_json"])
+        except ValueError as exc:
+            raise PageControlCommandConflictError("stored strategy command is invalid") from exc
+        if (
+            not isinstance(stored, (OwnedSaveStrategyTemplate, OwnedArchiveStrategyTemplate))
+            or stored.owner_id != authenticated_actor_id
+            or row["command_kind"] != request.kind
+            or stored.original() != request
+            or _command_hash(stored) != row["command_hash"]
+        ):
+            raise PageControlCommandConflictError("command_id already exists with different payload or actor")
         return stored, self._receipt(row)
 
     def lookup_factor_save_command(
@@ -2597,6 +2650,7 @@ class PageControlConsumer:
         factor_definition_backend: FactorDefinitionPageControlBackend | None = None,
         factor_run_backend: FactorRunPageControlBackend | None = None,
         factor_tracking_backend: FactorTrackingPageControlBackend | None = None,
+        strategy_authoring_backend: StrategyAuthoringPageControlBackend | None = None,
         clock: Callable[[], datetime] | None = None,
         lease_seconds: int = _DEFAULT_LEASE_SECONDS,
         consumer_id: str | None = None,
@@ -2618,6 +2672,7 @@ class PageControlConsumer:
         self.factor_definition_backend = factor_definition_backend
         self.factor_run_backend = factor_run_backend
         self.factor_tracking_backend = factor_tracking_backend
+        self.strategy_authoring_backend = strategy_authoring_backend
         self.clock = clock or (lambda: datetime.now(UTC))
         self.lease_seconds = lease_seconds
         self.consumer_service_id = consumer_service_id
@@ -2677,6 +2732,22 @@ class PageControlConsumer:
         self, command: _OwnedArchiveFactor
     ) -> tuple[PageControlReceipt, ...]:
         return self.drain_factor_definition_command(command)
+
+    def drain_strategy_authoring_command(
+        self, command: OwnedStrategyTemplateCommand
+    ) -> tuple[PageControlReceipt, ...]:
+        with _PageControlExecutionMutex(self._consumer_mutex_path()) as acquired:
+            if not acquired:
+                return ()
+            claims = self.outbox.claim_records(
+                limit=1, owner_id=self.consumer_id, lease_seconds=self.lease_seconds,
+                now=self.clock(), target_command_id=command.command_id,
+            )
+            if not claims:
+                return ()
+            if claims[0].command != command:
+                raise PageControlCommandConflictError("strategy command changed before claim")
+            return self._complete_claims(claims)
 
     def drain_factor_definition_command(
         self, command: _OwnedFactorDefinitionValue | _OwnedSubmitFactorRun | _OwnedSetFactorTracked
@@ -2796,6 +2867,19 @@ class PageControlConsumer:
         terminal = self._outcome_from_effect(effect)
         if terminal is not None:
             return terminal
+        if isinstance(command, (OwnedSaveStrategyTemplate, OwnedArchiveStrategyTemplate)):
+            marker = {"contract": "strategy-authoring-identity/v1", "identity": command.metadata_identity.model_dump(mode="json")}
+            try:
+                self._strategy_authoring_backend().validate(command)
+                if effect.result is None:
+                    effect = self.outbox.record_started_effect_result(
+                        command.command_id, result=marker,
+                        owner_id=claim.owner_id, claim_token=claim.claim_token,
+                    )
+                if effect.result != marker:
+                    raise ValueError("strategy original metadata identity differs")
+            except Exception as exc:
+                raise _RetryableUncertainEffectError(f"strategy original identity cannot be verified: {exc}") from exc
         if isinstance(command, _OwnedSetFactorTracked):
             marker = {
                 "contract": "factor-tracking-identities/v1",
@@ -3101,6 +3185,8 @@ class PageControlConsumer:
     def _must_recover_before_failure(
         self, command: PageControlCommandValue, *, created: bool
     ) -> bool:
+        if isinstance(command, (OwnedSaveStrategyTemplate, OwnedArchiveStrategyTemplate)):
+            return not created or self.strategy_authoring_backend is not None
         if isinstance(command, _OwnedSetFactorTracked):
             return not created or self.factor_tracking_backend is not None
         if isinstance(command, _OwnedSubmitFactorRun):
@@ -3169,6 +3255,8 @@ class PageControlConsumer:
         return _ExecutionOutcome(PageControlStatus.FAILED, effect.result, effect.error)
 
     def _execute(self, command: PageControlCommandValue) -> JsonValue:
+        if isinstance(command, (OwnedSaveStrategyTemplate, OwnedArchiveStrategyTemplate)):
+            return self._strategy_authoring_backend().submit(command)
         if isinstance(command, _OwnedSetFactorTracked):
             return self._factor_tracking_backend().submit(command)
         if isinstance(command, _OwnedSubmitFactorRun):
@@ -3293,6 +3381,11 @@ class PageControlConsumer:
         if self.factor_definition_backend is None:
             raise RuntimeError("factor definition backend is unavailable")
         return self.factor_definition_backend
+
+    def _strategy_authoring_backend(self) -> StrategyAuthoringPageControlBackend:
+        if self.strategy_authoring_backend is None:
+            raise RuntimeError("strategy authoring backend is unavailable")
+        return self.strategy_authoring_backend
 
     @staticmethod
     def _factor_effect_identity(effect: PageControlEffectRecord) -> FactorRegistryIdentity:
@@ -3519,6 +3612,8 @@ class PageControlConsumer:
         return None
 
     def _recover_started_effect(self, command: PageControlCommandValue) -> JsonValue | None:
+        if isinstance(command, (OwnedSaveStrategyTemplate, OwnedArchiveStrategyTemplate)):
+            return self._strategy_authoring_backend().recover(command)
         if isinstance(command, _OwnedSetFactorTracked):
             return self._factor_tracking_backend().recover(command)
         if isinstance(command, _OwnedSubmitFactorRun):
@@ -4585,6 +4680,8 @@ class PageControlService:
         self.consumer = consumer
 
     def submit(self, command: PageControlCommandValue) -> PageControlReceipt:
+        if isinstance(command, (SaveStrategyTemplate, ArchiveStrategyTemplate)):
+            raise ValueError("strategy authoring requires trusted submission")
         if isinstance(command, SaveResearchQuery):
             raise ValueError("research queries require trusted submission")
         if isinstance(command, (AddWatchlistItem, RemoveWatchlistItem)):
@@ -4915,6 +5012,36 @@ class PageControlService:
         owned = _owned_price_rule_command(command, authenticated_owner_id=authenticated_owner_id)
         return self.outbox.lookup_price_rule_command(owned)
 
+    def _lookup_trusted_strategy_authoring(
+        self, request: StrategyTemplateCommand, *, authenticated_actor_id: str
+    ) -> PageControlReceipt | None:
+        self.consumer._strategy_authoring_backend().authorize(authenticated_actor_id)
+        matched = self.outbox.lookup_strategy_authoring_command(request, authenticated_actor_id=authenticated_actor_id)
+        return None if matched is None else matched[1]
+
+    def _resume_trusted_strategy_authoring(
+        self, request: StrategyTemplateCommand, *, authenticated_actor_id: str
+    ) -> PageControlReceipt:
+        self.consumer._strategy_authoring_backend().authorize(authenticated_actor_id)
+        matched = self.outbox.lookup_strategy_authoring_command(request, authenticated_actor_id=authenticated_actor_id)
+        if matched is None:
+            raise KeyError("strategy original command not found")
+        owned, receipt = matched
+        return self._settle(owned, receipt, strategy_authoring_command=owned)
+
+    def _submit_trusted_strategy_authoring(
+        self, request: StrategyTemplateCommand, *, authenticated_actor_id: str,
+        verified_metadata_identity: StrategyAuthoringIdentity, catalog: StrategySourceCatalog,
+    ) -> PageControlReceipt:
+        backend = self.consumer._strategy_authoring_backend()
+        backend.authorize(authenticated_actor_id)
+        matched = self.outbox.lookup_strategy_authoring_command(request, authenticated_actor_id=authenticated_actor_id)
+        if matched is not None:
+            return self._settle(matched[0], matched[1], strategy_authoring_command=matched[0])
+        owned = backend.compile(request, authenticated_actor_id=authenticated_actor_id, catalog=catalog, expected_identity=verified_metadata_identity)
+        backend.validate(owned)
+        return self._settle(owned, self.outbox.enqueue_trusted_strategy_authoring(owned), strategy_authoring_command=owned)
+
     def _resume_trusted_price_rule(
         self, command: PriceAlertRuleRequestValue, *, authenticated_owner_id: str
     ) -> PageControlReceipt:
@@ -4934,11 +5061,18 @@ class PageControlService:
         factor_run_command: _OwnedSubmitFactorRun | None = None,
         factor_tracking_command: _OwnedSetFactorTracked | None = None,
         research_query_command: _OwnedSaveResearchQuery | None = None,
+        strategy_authoring_command: OwnedStrategyTemplateCommand | None = None,
     ) -> PageControlReceipt:
         for _ in range(100):
             if receipt.status in _PAGE_CONTROL_TERMINAL_STATUSES:
+                if strategy_authoring_command is not None and receipt.status is PageControlStatus.SUCCEEDED:
+                    recovered = self.consumer._strategy_authoring_backend().recover(strategy_authoring_command)
+                    if recovered != receipt.result:
+                        raise RuntimeError("strategy original metadata receipt differs from journal")
                 return receipt
-            if research_query_command is not None:
+            if strategy_authoring_command is not None:
+                drained = self.consumer.drain_strategy_authoring_command(strategy_authoring_command)
+            elif research_query_command is not None:
                 drained = self.consumer.drain_research_query_command(research_query_command)
             elif factor_tracking_command is not None:
                 drained = self.consumer.drain_factor_definition_command(factor_tracking_command)
@@ -5620,6 +5754,10 @@ def _fsync_descriptor(descriptor: int) -> None:
 
 
 def parse_page_control_command(payload: object) -> PageControlCommandValue:
+    if isinstance(payload, (SaveStrategyTemplate, ArchiveStrategyTemplate)) or (
+        isinstance(payload, Mapping) and payload.get("kind") in _STRATEGY_AUTHORING_KINDS
+    ):
+        raise ValueError("strategy authoring requires trusted submission")
     if isinstance(payload, SaveResearchQuery) or (
         isinstance(payload, Mapping) and payload.get("kind") == "save_research_query"
     ):
