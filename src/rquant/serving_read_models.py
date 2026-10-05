@@ -1931,7 +1931,6 @@ class ServingReadModelInput(RuntimeContractModel):
                 "price_alert_runtime_attempt",
             }:
                 price_size += _projection_json_bytes(projection)
-                continue
             owner_sizes[projection.owner_dataset_id] = owner_sizes.get(
                 projection.owner_dataset_id,
                 0,

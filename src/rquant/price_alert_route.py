@@ -214,6 +214,23 @@ class PriceAlertBusRoutedRecord(PriceAlertBusEventRecord):
         return self
 
 
+_HISTORY_SQL = (
+    "CREATE TABLE price_alert_route_activation (singleton INTEGER PRIMARY KEY "
+    "CHECK(singleton=1),body BLOB NOT NULL)",
+    "CREATE TABLE price_alert_route_source (source_id TEXT PRIMARY KEY,body BLOB NOT NULL,"
+    "high_watermark INTEGER NOT NULL,last_sequence INTEGER NOT NULL)",
+    "CREATE TABLE price_alert_route_receipt (event_id TEXT PRIMARY KEY REFERENCES "
+    "signal_envelope(signal_id),source_id TEXT NOT NULL,source_sequence INTEGER NOT NULL,"
+    "source_body BLOB NOT NULL,body BLOB NOT NULL,bus_generation_id TEXT NOT NULL,"
+    "UNIQUE(source_id,source_sequence))",
+)
+_HISTORY_TABLES = (
+    "price_alert_route_activation",
+    "price_alert_route_source",
+    "price_alert_route_receipt",
+)
+
+
 def _history_installed(connection: sqlite3.Connection) -> None:
     marker = connection.execute(
         "SELECT metadata_value FROM signal_bus_metadata WHERE me"
@@ -221,18 +238,15 @@ def _history_installed(connection: sqlite3.Connection) -> None:
     ).fetchone()
     if marker is None or marker[0] != HISTORY_PROTOCOL:
         raise ValueError("mixed notification history is not explicitly installed")
-    tables = {
-        row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    actual = {
+        row[0]
+        for row in connection.execute(
+            "SELECT sql FROM sqlite_master WHERE tbl_name IN (?,?,?) AND sql IS NOT NULL",
+            _HISTORY_TABLES,
+        )
     }
-    if (
-        not {
-            "price_alert_route_activation",
-            "price_alert_route_source",
-            "price_alert_route_receipt",
-        }
-        <= tables
-    ):
-        raise ValueError("mixed notification history marker and tables disagree")
+    if actual != set(_HISTORY_SQL):
+        raise ValueError("mixed notification history installed schema differs")
 
 
 def _install_price_alert_history(connection: sqlite3.Connection) -> None:
@@ -252,25 +266,7 @@ def _install_price_alert_history(connection: sqlite3.Connection) -> None:
     if marker is not None or present:
         _history_installed(connection)
         return
-    for ddl in (
-        (
-            "CREATE TABLE price_alert_route_activation (singleton IN"
-            "TEGER PRIMARY KEY CHECK(singleton=1),body BLOB NOT NULL"
-            ")"
-        ),
-        (
-            "CREATE TABLE price_alert_route_source (source_id TEXT P"
-            "RIMARY KEY,body BLOB NOT NULL,high_watermark INTEGER NO"
-            "T NULL,last_sequence INTEGER NOT NULL)"
-        ),
-        (
-            "CREATE TABLE price_alert_route_receipt (event_id TEXT P"
-            "RIMARY KEY REFERENCES signal_envelope(signal_id),source"
-            "_id TEXT NOT NULL,source_sequence INTEGER NOT NULL,sour"
-            "ce_body BLOB NOT NULL,body BLOB NOT NULL,bus_generation"
-            "_id TEXT NOT NULL,UNIQUE(source_id,source_sequence))"
-        ),
-    ):
+    for ddl in _HISTORY_SQL:
         connection.execute(ddl)
     connection.execute(
         "INSERT INTO signal_bus_metadata VALUES('mixed_notification_history',?)",

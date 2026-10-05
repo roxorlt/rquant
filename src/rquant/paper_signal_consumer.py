@@ -35,6 +35,13 @@ from rquant.signal_bus import (
 from rquant.signal_contracts import SignalEnvelopeFamily
 
 Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
+_MIXED_HISTORY_SQL = (
+    "CREATE TABLE paper_notification_history(singleton INTEGER PRIMARY KEY "
+    "CHECK(singleton=1), protocol TEXT NOT NULL, consumer_fingerprint TEXT NOT NULL)",
+    "CREATE TABLE paper_price_non_trading_receipt(global_sequence INTEGER PRIMARY KEY, "
+    "event_id TEXT NOT NULL UNIQUE, body_json BLOB NOT NULL)",
+)
+_MIXED_HISTORY_TABLES = ("paper_notification_history", "paper_price_non_trading_receipt")
 
 
 class PaperSignalConsumerSourceError(RuntimeError):
@@ -615,28 +622,23 @@ class PaperSignalConsumerStateStore:
             if tables & expected:
                 self._require_mixed_history(connection)
                 return
-            connection.execute(
-                "CREATE TABLE paper_notification_history(singleton INTEG"
-                "ER PRIMARY KEY CHECK(singleton=1), protocol TEXT NOT NU"
-                "LL, consumer_fingerprint TEXT NOT NULL)"
-            )
-            connection.execute(
-                "CREATE TABLE paper_price_non_trading_receipt(global_seq"
-                "uence INTEGER PRIMARY KEY, event_id TEXT NOT NULL UNIQU"
-                "E, body_json BLOB NOT NULL)"
-            )
+            for statement in _MIXED_HISTORY_SQL:
+                connection.execute(statement)
             connection.execute(
                 "INSERT INTO paper_notification_history VALUES(1,?,?)",
                 ("mixed-notification-history/v1", self.consumer_fingerprint),
             )
 
     def _require_mixed_history(self, connection: sqlite3.Connection) -> None:
-        tables = {
+        actual = {
             row[0]
-            for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            for row in connection.execute(
+                "SELECT sql FROM sqlite_master WHERE tbl_name IN (?,?) AND sql IS NOT NULL",
+                _MIXED_HISTORY_TABLES,
+            )
         }
-        if not {"paper_notification_history", "paper_price_non_trading_receipt"} <= tables:
-            raise ValueError("paper mixed history was not explicitly installed")
+        if actual != set(_MIXED_HISTORY_SQL):
+            raise ValueError("paper mixed history installed schema differs")
         marker = connection.execute(
             "SELECT protocol,consumer_fingerprint FROM paper_notification_history WHERE singleton=1"
         ).fetchone()

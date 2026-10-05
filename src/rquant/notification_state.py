@@ -1547,14 +1547,16 @@ class NotificationStateStore(SignalBusStore):
     def claim_due_with_price_activation(
         self, worker_id: str, *, activation: object, now: datetime, lease_for: timedelta, limit: int
     ) -> tuple:
-        from rquant.price_alert_runtime_contracts import require_price_alert_activation
+        from rquant.price_alert_runtime_contracts import require_verified_price_alert_activation
         from rquant.price_alert_runtime_projection import (
             PriceAlertAuthorityUnavailable,
             _fresh_authority,
             _head,
         )
 
-        require_price_alert_activation(activation, "delivery")
+        binding = require_verified_price_alert_activation(activation, "notifier")
+        if not binding.delivery_enabled:
+            return self.claim_due(worker_id, now=now, lease_for=lease_for, limit=limit)
         try:
             with self._read_snapshot() as connection:
                 _fresh_authority(_head(connection), normalize_aware_utc(now))
@@ -1648,7 +1650,14 @@ class NotificationStateStore(SignalBusStore):
         price_domain_unavailable: bool = False,
     ) -> NotificationServingSnapshot:
         from rquant.runtime_serving_snapshot import SignalDeliveryReadPayload
-        from rquant.serving_read_models import ServingReadModelInput, ServingSignalRecord
+        from rquant.serving_read_models import (
+            _MAX_OWNER_PROJECTION_BYTES,
+            PAGE_PROJECTION_CONTRACTS,
+            ServingProjectionInput,
+            ServingReadModelInput,
+            ServingSignalRecord,
+            _projection_json_bytes,
+        )
 
         observed = normalize_aware_utc(observed_at)
         if (
@@ -1842,6 +1851,21 @@ class NotificationStateStore(SignalBusStore):
                     unavailable_price_runtime_projections,
                 )
 
+                def require_joint_projection_budget(
+                    values: tuple[ServingProjectionPayload, ...],
+                ) -> None:
+                    owners: dict[str, int] = {}
+                    legacy = () if projection_snapshot is None else projection_snapshot.projections
+                    for value in legacy + values:
+                        owner = PAGE_PROJECTION_CONTRACTS[value.table_name].owner_dataset_id
+                        # The real source generation has this exact 64-byte width.
+                        bound = ServingProjectionInput.bind(
+                            value, owner_dataset_id=owner, owner_generation_id="0" * 64
+                        )
+                        owners[owner] = owners.get(owner, 0) + _projection_json_bytes(bound)
+                    if any(size > _MAX_OWNER_PROJECTION_BYTES for size in owners.values()):
+                        raise ValueError("notification projections exceed their owner byte budget")
+
                 try:
                     if price_domain_unavailable:
                         price_projections = unavailable_price_runtime_projections(
@@ -1854,10 +1878,12 @@ class NotificationStateStore(SignalBusStore):
                             observed_at=observed,
                             shadow=price_shadow,
                         )
+                    require_joint_projection_budget(price_projections)
                 except (TypeError, ValueError, OSError, sqlite3.Error):
                     price_projections = unavailable_price_runtime_projections(
                         observed_at=observed, shadow=price_shadow
                     )
+                    require_joint_projection_budget(price_projections)
             connection.execute("COMMIT")
         except BaseException:
             if connection.in_transaction:

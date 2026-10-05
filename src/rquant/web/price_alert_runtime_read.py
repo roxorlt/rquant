@@ -22,7 +22,7 @@ from rquant.web.models.price_alert_runtime import (
     PriceAlertRuntimeData,
     PriceAlertRuntimeItem,
 )
-from rquant.web.price_alert_read import read_price_alert_rules
+from rquant.web.price_alert_read import read_price_alert_rules, rule_item
 from rquant.web.serving import BorrowedGeneration
 
 
@@ -182,7 +182,11 @@ def read_price_alert_runtime(
             ):
                 raise PriceAlertRuntimeDrift("price evaluated rule version changed")
             facts[fact.rule_id] = fact
-    active = tuple(rule for rule in current.rules if not rule.deleted and rule.enabled)
+    active = tuple(
+        rule
+        for rule in current.rules
+        if not rule.deleted and rule_item(rule, current, now=now).scope_status == "bound"
+    )
     waiting = bool(active) and all(
         rule.rule_id in facts
         and facts[rule.rule_id].reason in {"outside_continuous_session", "market_closed"}
@@ -277,6 +281,11 @@ def read_price_alert_runtime(
                 state=None if fact is None or availability != "ready" else fact.state,
             )
         )
+    if status == "normal":
+        if any(rule.rule_id not in facts for rule in active):
+            status, label, message = "attention", "注意", "部分规则等待本轮评估。"
+        elif any(facts[rule.rule_id].state == "unavailable" for rule in active):
+            status, label, message = "attention", "注意", "部分行情暂不可用，等待更新。"
     all_attempts = [
         PriceAlertAttemptFact.model_validate_json(row["body_json"])
         for row in domain[PRICE_RUNTIME_TABLES[3]].rows
