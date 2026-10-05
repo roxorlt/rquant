@@ -8,6 +8,10 @@
 读取回放目录。正式 serving 根目前没有 `current.json`，按正式配置运行 `web-serve --self-check` 返回失败。
 切换前先用 `--target <tag> --prepare` 建好并自检发行版，不改现有页面或 API；只有正式 serving 根自检通过，才能停临时 API 并切换。
 
+## 2026-10-05 当前核对
+
+线上仍指向 CC 临时网页；正式 `rquant-web.service`、`current` 链接和 Serving `current.json` 尚未建立。旧 dashboard 实测内存约 1.78 GiB。基础前端 PR 的必需 CI 已通过，基础设施合并决定已在内联会话提出；安装与切流另验收。证据与下一步见[发布门槛](../plans/2026-10-05-web-release-readiness.md)。
+
 ## 切换边界与硬门槛
 
 这次从临时进程切到 systemd 属于高风险发布：保护对象是现有 `/app/`、`/preview/`、8506、登录保护和生产 serving 数据。
