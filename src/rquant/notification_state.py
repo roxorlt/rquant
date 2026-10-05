@@ -22,6 +22,7 @@ from rquant.delivery_contracts import (
     OutboxStatus,
     RouterDisposition,
 )
+from rquant.price_alert_route import PriceAlertBusRoutedRecord
 from rquant.runtime_contracts import (
     AwareUtcDatetime,
     RuntimeContractModel,
@@ -50,6 +51,11 @@ from rquant.signal_route_spool import (
 )
 
 if TYPE_CHECKING:
+    from rquant.price_alert_runtime_contracts import PriceAlertRuntimeActivation
+    from rquant.price_alert_runtime_store import (
+        PriceProducerRuntimeSnapshot,
+        ReadonlyPriceAlertRuntimeStore,
+    )
     from rquant.runtime_serving_snapshot import SignalDeliveryReadPayload
     from rquant.serving_read_models import ServingSignalRecord
 
@@ -1144,6 +1150,244 @@ class NotificationStateStore(SignalBusStore):
             replicated_count=replicated_count,
         )
 
+    def replicate_mixed_notification_events(
+        self,
+        source: SignalBusSourceDescriptor,
+        records: tuple[SignalBusRoutedRecord | PriceAlertBusRoutedRecord, ...],
+        *,
+        observed_at: datetime,
+        source_inspected_at: datetime,
+    ) -> NotificationReplicationSummary:
+        from rquant.price_alert_route import (
+            _history_installed,
+            _price_ingest,
+            _price_outbox,
+            _price_record,
+        )
+        from rquant.strict_json import canonical_json_bytes
+
+        observed = normalize_aware_utc(observed_at)
+        inspected = normalize_aware_utc(source_inspected_at)
+        if (
+            type(source) is not SignalBusSourceDescriptor
+            or type(records) is not tuple
+            or len(records) > 100
+        ):
+            raise TypeError("mixed replication requires exact source and bounded tuple records")
+        source = SignalBusSourceDescriptor.model_validate(source)
+        if inspected > observed:
+            raise ValueError("mixed source inspection follows the replication clock")
+        previous = None
+        checked = []
+        for record in records:
+            if type(record) is SignalBusRoutedRecord:
+                record = SignalBusRoutedRecord.model_validate(record)
+                require_legacy_signal_write(
+                    record.signal, operation="mixed committed legacy replication"
+                )
+                available = record.signal.available_at
+            elif type(record) is PriceAlertBusRoutedRecord:
+                record = PriceAlertBusRoutedRecord.model_validate(record)
+                if record.bus_generation_id != source.generation_id:
+                    raise ValueError("mixed price proof belongs to another actual bus")
+                available = record.event.available_at
+            else:
+                raise TypeError("mixed replication rejects substituted and current-family records")
+            if (
+                record.global_sequence > source.high_watermark
+                or max(available, record.received_at, record.receipt.routed_at) > inspected
+                or (previous is not None and record.global_sequence != previous + 1)
+            ):
+                raise ValueError("mixed replication input is future or discontinuous")
+            previous = record.global_sequence
+            checked.append(record)
+        with self._write_transaction() as connection:
+            _history_installed(connection)
+            cursor_row = connection.execute(
+                "SELECT * FROM notification_replication_source WHERE singleton=1"
+            ).fetchone()
+            if cursor_row is None:
+                started_after = source.first_global_sequence - 1
+                observed_high = started_after
+                last_id = None
+            else:
+                cursor = self._cursor_from_row(cursor_row)
+                if (
+                    cursor.source_id != self.replication_source_id
+                    or cursor.source_generation_id != source.generation_id
+                    or cursor.first_global_sequence != source.first_global_sequence
+                    or source.high_watermark < cursor.observed_high_watermark
+                ):
+                    raise ValueError("mixed replication original source changed or regressed")
+                started_after, observed_high, last_id = (
+                    cursor.last_global_sequence,
+                    cursor.observed_high_watermark,
+                    cursor.last_signal_id,
+                )
+            expected = started_after + 1
+            replicated = 0
+            for record in checked:
+                is_price = type(record) is PriceAlertBusRoutedRecord
+                if record.global_sequence <= started_after:
+                    if is_price:
+                        if _price_record(connection, record.event_id) != record:
+                            raise ValueError(
+                                "mixed price replay differs from original sealed proof"
+                            )
+                    else:
+                        self._verify_replayed_record(connection, record)
+                    continue
+                if record.global_sequence != expected:
+                    raise ValueError(
+                        "mixed replication must advance the original contiguous cursor"
+                    )
+                if is_price:
+                    sequence, added = _price_ingest(connection, record.event, record.received_at)
+                    if not added or sequence != record.global_sequence:
+                        raise ValueError(
+                            "mixed price local identity/sequence conflicts with its actual source"
+                        )
+                    descriptor = record.source
+                    immutable = canonical_json_bytes(
+                        descriptor.model_dump(mode="json", exclude={"high_watermark"})
+                    )
+                    source_row = connection.execute(
+                        "SELECT * FROM price_alert_route_source WHERE source_id=?",
+                        (descriptor.source_id,),
+                    ).fetchone()
+                    if source_row is None:
+                        if record.source_sequence != descriptor.first_sequence:
+                            raise ValueError("mixed price source begins with a gap")
+                        connection.execute(
+                            "INSERT INTO price_alert_route_source VALUES(?,?,?,?)",
+                            (
+                                descriptor.source_id,
+                                immutable,
+                                descriptor.high_watermark,
+                                record.source_sequence,
+                            ),
+                        )
+                    else:
+                        if (
+                            bytes(source_row["body"]) != immutable
+                            or record.source_sequence != source_row["last_sequence"] + 1
+                            or descriptor.high_watermark < source_row["high_watermark"]
+                        ):
+                            raise ValueError(
+                                "mixed price producer source changed or is discontinuous"
+                            )
+                        connection.execute(
+                            (
+                                "UPDATE price_alert_route_source SET high_watermark=?,la"
+                                "st_sequence=? WHERE source_id=?"
+                            ),
+                            (
+                                descriptor.high_watermark,
+                                record.source_sequence,
+                                descriptor.source_id,
+                            ),
+                        )
+                    connection.execute(
+                        "INSERT INTO price_alert_route_receipt VALUES(?,?,?,?,?,?)",
+                        (
+                            record.event_id,
+                            descriptor.source_id,
+                            record.source_sequence,
+                            descriptor.wire_bytes(),
+                            record.receipt.wire_bytes(),
+                            record.bus_generation_id,
+                        ),
+                    )
+                    _price_outbox(connection, record)
+                    last_id = record.event_id
+                else:
+                    receipt, _changed = self._ingest_in_transaction(
+                        connection, record.signal, received_at=record.received_at
+                    )
+                    if (
+                        receipt.disposition is RouterDisposition.QUARANTINED
+                        or receipt.global_sequence != record.global_sequence
+                    ):
+                        raise ValueError("mixed legacy local identity or sequence conflicts")
+                    self._store_source_receipt(connection, record)
+                    if record.receipt.targets:
+                        self._route_in_transaction(
+                            connection,
+                            signal_id=record.signal_id,
+                            targets=record.receipt.targets,
+                            routed_at=record.receipt.routed_at,
+                        )
+                    last_id = record.signal_id
+                self._after_replicated_signal()
+                expected += 1
+                replicated += 1
+            ended_at = expected - 1
+            high = max(observed_high, source.high_watermark)
+            if (
+                cursor_row is None
+                or cursor_row["last_global_sequence"] != ended_at
+                or cursor_row["observed_high_watermark"] != high
+            ):
+                connection.execute(
+                    (
+                        "INSERT INTO notification_replication_source "
+                        "VALUES(1,?,?,?,?,?,?,?) ON CONFLICT(singleton) DO UPDATE "
+                        "SET observed_high_watermark=excluded.observed_high_watermark"
+                        ",last_global_sequence=excluded.last_global_sequence,last_sig"
+                        "nal_id=excluded.last_signal_id,updated_at=excluded.updated_a"
+                        "t"
+                    ),
+                    (
+                        self.replication_source_id,
+                        source.generation_id,
+                        source.first_global_sequence,
+                        high,
+                        ended_at,
+                        last_id,
+                        observed.isoformat(timespec="microseconds"),
+                    ),
+                )
+            previous_observation = connection.execute(
+                "SELECT * FROM notification_source_observation WHERE singleton=1"
+            ).fetchone()
+            if (
+                previous_observation is None
+                or previous_observation["source_id"] != self.replication_source_id
+                or previous_observation["source_generation_id"] != source.generation_id
+                or previous_observation["first_global_sequence"] != source.first_global_sequence
+                or previous_observation["source_high_watermark"] != source.high_watermark
+                or inspected
+                - normalize_aware_utc(
+                    datetime.fromisoformat(str(previous_observation["inspected_at"]))
+                )
+                >= _SIGNAL_OBSERVATION_INTERVAL
+            ):
+                connection.execute(
+                    (
+                        "INSERT INTO notification_source_observation "
+                        "VALUES(1,?,?,?,?,?) ON CONFLICT(singleton) DO UPDATE SET "
+                        "source_id=excluded.source_id,source_generation_id=excluded.s"
+                        "ource_generation_id,first_global_sequence=excluded.first_glo"
+                        "bal_sequence,source_high_watermark=excluded.source_high_wate"
+                        "rmark,inspected_at=excluded.inspected_at"
+                    ),
+                    (
+                        self.replication_source_id,
+                        source.generation_id,
+                        source.first_global_sequence,
+                        source.high_watermark,
+                        inspected.isoformat(timespec="microseconds"),
+                    ),
+                )
+            self._before_commit(connection)
+        return NotificationReplicationSummary(
+            source_generation_id=source.generation_id,
+            source_high_watermark=source.high_watermark,
+            started_after_sequence=started_after,
+            ended_at_sequence=ended_at,
+            replicated_count=replicated,
+        )
+
     def _observed_signal_prefix_from_transaction(
         self,
         connection: sqlite3.Connection,
@@ -1270,14 +1514,150 @@ class NotificationStateStore(SignalBusStore):
             ),
         )
 
+    def install_price_alert_delivery_v1(self, activation: object) -> None:
+        from rquant.price_alert_runtime_projection import install_price_alert_delivery
+
+        install_price_alert_delivery(self, activation)
+
+    def apply_price_alert_delivery_authority(
+        self, value: object, *, activation: object, expected_revision: int, applied_at: datetime
+    ) -> object:
+        from rquant.price_alert_runtime_projection import apply_price_alert_delivery_authority
+
+        return apply_price_alert_delivery_authority(
+            self,
+            value,
+            activation=activation,
+            expected_revision=expected_revision,
+            applied_at=applied_at,
+        )
+
+    def price_alert_delivery_authority(self) -> object:
+        from rquant.price_alert_runtime_projection import _head
+
+        with self._read_snapshot() as connection:
+            return _head(connection)
+
+    def price_alert_send_admission(self, outbox_id: str, attempt_no: int) -> object:
+        from rquant.price_alert_runtime_projection import _admission
+
+        with self._read_snapshot() as connection:
+            return _admission(connection, outbox_id, attempt_no)
+
+    def claim_due_with_price_activation(
+        self, worker_id: str, *, activation: object, now: datetime, lease_for: timedelta, limit: int
+    ) -> tuple:
+        from rquant.price_alert_runtime_contracts import require_verified_price_alert_activation
+        from rquant.price_alert_runtime_projection import (
+            PriceAlertAuthorityUnavailable,
+            _fresh_authority,
+            _head,
+        )
+
+        binding = require_verified_price_alert_activation(activation, "notifier")
+        if not binding.delivery_enabled:
+            return self.claim_due(worker_id, now=now, lease_for=lease_for, limit=limit)
+        try:
+            with self._read_snapshot() as connection:
+                _fresh_authority(_head(connection), normalize_aware_utc(now))
+        except PriceAlertAuthorityUnavailable:
+            return self.claim_due(worker_id, now=now, lease_for=lease_for, limit=limit)
+        return self._claim_due(
+            worker_id, now=now, lease_for=lease_for, limit=limit, include_price=True
+        )
+
+    def admit_price_alert_delivery(
+        self,
+        record: object,
+        *,
+        activation: object,
+        worker_id: str,
+        expected_revision: int,
+        admitted_at: datetime,
+    ) -> object:
+        from rquant.price_alert_runtime_projection import admit_price_alert_delivery
+
+        return admit_price_alert_delivery(
+            self,
+            record,
+            activation=activation,
+            worker_id=worker_id,
+            expected_revision=expected_revision,
+            admitted_at=admitted_at,
+        )
+
+    def cancel_price_unadmitted(
+        self,
+        outbox_id: str,
+        *,
+        expected_revision: int,
+        cancelled_at: datetime,
+        worker_id: str | None = None,
+    ) -> object:
+        from rquant.price_alert_runtime_projection import cancel_price_unadmitted
+
+        return cancel_price_unadmitted(
+            self,
+            outbox_id,
+            expected_revision=expected_revision,
+            cancelled_at=cancelled_at,
+            worker_id=worker_id,
+        )
+
     def serving_snapshot(
         self,
         *,
         observed_at: datetime,
         history_limit: int,
     ) -> NotificationServingSnapshot:
+        return self._serving_snapshot(observed_at=observed_at, history_limit=history_limit)
+
+    def serving_price_enabled_snapshot(
+        self,
+        *,
+        producer: ReadonlyPriceAlertRuntimeStore,
+        activation: PriceAlertRuntimeActivation,
+        observed_at: datetime,
+        history_limit: int,
+        shadow: bool,
+    ) -> NotificationServingSnapshot:
+        from rquant.price_alert_runtime_contracts import require_verified_price_alert_activation
+        from rquant.price_alert_runtime_store import ReadonlyPriceAlertRuntimeStore
+
+        require_verified_price_alert_activation(activation, "notifier")
+        if type(producer) is not ReadonlyPriceAlertRuntimeStore or type(shadow) is not bool:
+            raise TypeError("price Serving requires its actual registered read-only producer")
+        unavailable = False
+        try:
+            facts = producer.runtime_snapshot(observed_at=observed_at)
+        except (OSError, ValueError, sqlite3.Error):
+            facts, unavailable = None, True
+        return self._serving_snapshot(
+            observed_at=observed_at,
+            history_limit=history_limit,
+            price_facts=facts,
+            price_shadow=shadow,
+            price_domain_unavailable=unavailable,
+        )
+
+    def _serving_snapshot(
+        self,
+        *,
+        observed_at: datetime,
+        history_limit: int,
+        price_facts: PriceProducerRuntimeSnapshot | None = None,
+        price_shadow: bool = False,
+        price_domain_unavailable: bool = False,
+    ) -> NotificationServingSnapshot:
         from rquant.runtime_serving_snapshot import SignalDeliveryReadPayload
-        from rquant.serving_read_models import ServingReadModelInput, ServingSignalRecord
+        from rquant.serving_read_models import (
+            _MAX_OWNER_PROJECTION_BYTES,
+            PAGE_PROJECTION_CONTRACTS,
+            ServingProjectionInput,
+            ServingReadModelInput,
+            ServingSignalRecord,
+            _projection_json_bytes,
+        )
 
         observed = normalize_aware_utc(observed_at)
         if (
@@ -1464,6 +1844,46 @@ class NotificationStateStore(SignalBusStore):
                 selected=signal_records,
                 truncated=omitted > 0,
             )
+            price_projections = ()
+            if price_facts is not None or price_domain_unavailable:
+                from rquant.price_alert_runtime_projection import (
+                    price_runtime_projections,
+                    unavailable_price_runtime_projections,
+                )
+
+                def require_joint_projection_budget(
+                    values: tuple[ServingProjectionPayload, ...],
+                ) -> None:
+                    owners: dict[str, int] = {}
+                    legacy = () if projection_snapshot is None else projection_snapshot.projections
+                    for value in legacy + values:
+                        owner = PAGE_PROJECTION_CONTRACTS[value.table_name].owner_dataset_id
+                        # The real source generation has this exact 64-byte width.
+                        bound = ServingProjectionInput.bind(
+                            value, owner_dataset_id=owner, owner_generation_id="0" * 64
+                        )
+                        owners[owner] = owners.get(owner, 0) + _projection_json_bytes(bound)
+                    if any(size > _MAX_OWNER_PROJECTION_BYTES for size in owners.values()):
+                        raise ValueError("notification projections exceed their owner byte budget")
+
+                try:
+                    if price_domain_unavailable:
+                        price_projections = unavailable_price_runtime_projections(
+                            observed_at=observed, shadow=price_shadow
+                        )
+                    else:
+                        price_projections = price_runtime_projections(
+                            connection,
+                            producer=price_facts,
+                            observed_at=observed,
+                            shadow=price_shadow,
+                        )
+                    require_joint_projection_budget(price_projections)
+                except (TypeError, ValueError, OSError, sqlite3.Error):
+                    price_projections = unavailable_price_runtime_projections(
+                        observed_at=observed, shadow=price_shadow
+                    )
+                    require_joint_projection_budget(price_projections)
             connection.execute("COMMIT")
         except BaseException:
             if connection.in_transaction:
@@ -1482,7 +1902,8 @@ class NotificationStateStore(SignalBusStore):
             signals=coherent.signals,
             routes=coherent.routes,
             deliveries=coherent.deliveries,
-            projections=(() if projection_snapshot is None else projection_snapshot.projections),
+            projections=(() if projection_snapshot is None else projection_snapshot.projections)
+            + price_projections,
         )
         return NotificationServingSnapshot(
             observed_at=observed,
@@ -1558,7 +1979,10 @@ class NotificationStateStore(SignalBusStore):
                     )
 
             rows = connection.execute(
-                "SELECT * FROM delivery_outbox ORDER BY global_sequence, outbox_id"
+                "SELECT * FROM delivery_outbox WHERE signal_id NOT IN "
+                "(SELECT signal_id FROM signal_envelope WHERE "
+                "json_extract(payload_json,'$.envelope_schema')='rquant.price"
+                "-alert-event/v1') ORDER BY global_sequence, outbox_id"
             ).fetchall()
             for row in rows:
                 channel = DeliveryChannel(row["channel"])

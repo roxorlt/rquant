@@ -67,6 +67,7 @@ class RuntimeServiceKind(StrEnum):
     AUCTION_MATCH_SOURCE = "auction_match_source"
     MARKET_MINUTE_SOURCE = "market_minute_source"
     WATCHLIST_QUOTE_SOURCE = "watchlist_quote_source"
+    PRICE_ALERT_RUNTIME = "price_alert_runtime"
     DAILY_CLOSE_SOURCE = "daily_close_source"
     SHADOW_SESSION = "shadow_session"
     DAILY_PIPELINE_ORCHESTRATOR = "daily_pipeline_orchestrator"

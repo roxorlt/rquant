@@ -77,6 +77,7 @@ from rquant.web.routes import (
     pool_editor,
     pools,
     price_alert_rules,
+    price_alert_runtime,
     research_query,
     screen,
     service_logs,
@@ -521,6 +522,7 @@ def create_app(
     app.include_router(monitor.router, prefix="/api/v1", tags=["monitor"], dependencies=private)
     app.include_router(manual_watchlist.router, prefix="/api/v1", tags=["watchlist"])
     app.include_router(price_alert_rules.router, prefix="/api/v1", tags=["monitor"])
+    app.include_router(price_alert_runtime.router, prefix="/api/v1", tags=["monitor"])
     app.include_router(tasks.router, prefix="/api/v1", tags=["tasks"], dependencies=private)
     app.include_router(
         tasks_controls.router, prefix="/api/v1", tags=["tasks"], dependencies=private

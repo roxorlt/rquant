@@ -1,6 +1,6 @@
 # Web `current_user` 路由清单
 
-对应 [私有身份边界](2026-09-29-web-private-identity-boundary.md)。以下为当前代码中的全部 100 个 `current_user` 依赖路由；`/api/v1` 前缀已包含。公开类即使收到裸用户头，也只得到 `viewer=None`，不能据此取得身份。私有类统一使用已验证的代理身份；已有 CSRF、角色和业务条件仍单独检查。
+对应 [私有身份边界](2026-09-29-web-private-identity-boundary.md)。以下为当前代码中的全部 102 个 `current_user` 依赖路由；`/api/v1` 前缀已包含。公开类即使收到裸用户头，也只得到 `viewer=None`，不能据此取得身份。私有类统一使用已验证的代理身份；已有 CSRF、角色和业务条件仍单独检查。
 
 ## 公开读取（20）
 
@@ -27,7 +27,7 @@
 | GET | `/api/v1/data/issues` |
 | GET | `/api/v1/data/fundamentals/summary` |
 
-## 私有读取（45）
+## 私有读取（47）
 
 | 方法 | 路径 |
 |---|---|
@@ -37,6 +37,8 @@
 | GET | `/api/v1/monitor/timeline` |
 | GET | `/api/v1/monitor/price-rules` |
 | GET | `/api/v1/monitor/price-rules/head` |
+| GET | `/api/v1/monitor/price-rules/runtime` |
+| GET | `/api/v1/monitor/price-rules/events` |
 | GET | `/api/v1/watchlist` |
 | GET | `/api/v1/watchlist/{ts_code}` |
 | GET | `/api/v1/tasks/jobs` |

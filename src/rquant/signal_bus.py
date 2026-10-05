@@ -24,6 +24,16 @@ from rquant.delivery_contracts import (
     RouterDisposition,
     RouterReceipt,
 )
+from rquant.price_alert_route import (
+    PriceAlertBusEventRecord,
+    PriceAlertBusRoutedRecord,
+    PriceAlertRecipientPolicy,
+)
+from rquant.price_alert_runtime_contracts import (
+    PriceAlertRuntimeActivation,
+    PriceAlertSourceDescriptor,
+)
+from rquant.price_alert_runtime_store import PriceAlertProducerEventRecord
 from rquant.runtime_contracts import (
     AwareUtcDatetime,
     RuntimeContractModel,
@@ -2054,6 +2064,19 @@ class SignalBusStore:
         lease_for: timedelta,
         limit: int,
     ) -> tuple[OutboxRecord, ...]:
+        return self._claim_due(
+            worker_id, now=now, lease_for=lease_for, limit=limit, include_price=False
+        )
+
+    def _claim_due(
+        self,
+        worker_id: str,
+        *,
+        now: datetime,
+        lease_for: timedelta,
+        limit: int,
+        include_price: bool,
+    ) -> tuple[OutboxRecord, ...]:
         worker = worker_id.strip()
         claimed_at = _normalize_time(now)
         if not worker:
@@ -2081,21 +2104,25 @@ class SignalBusStore:
                 ),
             )
             candidates = connection.execute(
-                """
-                SELECT *
-                FROM delivery_outbox
-                WHERE status IN (?, ?)
-                  AND expires_at > ?
-                  AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
-                ORDER BY COALESCE(next_attempt_at, created_at),
-                         global_sequence, created_at, outbox_id
-                LIMIT ?
-                """,
+                (
+                    "\n                SELECT *\n                FROM "
+                    "delivery_outbox\n                WHERE status IN (?, ?)\n     "
+                    "             AND expires_at > ?\n                  AND "
+                    "(next_attempt_at IS NULL OR next_attempt_at <= ?)\n          "
+                    "        AND (? OR signal_id NOT IN (\n                    "
+                    "SELECT signal_id FROM signal_envelope\n                    "
+                    "WHERE json_extract(payload_json, '$.envelope_schema') = "
+                    "'rquant.price-alert-event/v1'\n                  ))\n         "
+                    "       ORDER BY COALESCE(next_attempt_at, created_at),\n     "
+                    "                    global_sequence, created_at, outbox_id\n "
+                    "               LIMIT ?\n                "
+                ),
                 (
                     OutboxStatus.PENDING.value,
                     OutboxStatus.RETRY.value,
                     now_text,
                     now_text,
+                    include_price,
                     limit,
                 ),
             ).fetchall()
@@ -2125,6 +2152,132 @@ class SignalBusStore:
                 self._before_commit(connection)
             rows = self._rows_for_outbox_ids(connection, claimed_ids)
             return tuple(self._outbox_from_row(row) for row in rows)
+
+    def install_price_alert_route_v1(self, activation: PriceAlertRuntimeActivation) -> None:
+        from rquant.price_alert_route import install_price_alert_route
+
+        install_price_alert_route(self, activation)
+
+    def _price_alert_failpoint(self, _point: str) -> None:
+        """Fault-injection boundary for the dedicated price transaction."""
+
+    def commit_price_alert_route(
+        self,
+        *,
+        activation: PriceAlertRuntimeActivation,
+        policy: PriceAlertRecipientPolicy,
+        source: PriceAlertSourceDescriptor,
+        record: PriceAlertProducerEventRecord,
+        source_inspected_at: datetime,
+        routed_at: datetime,
+    ) -> PriceAlertBusRoutedRecord:
+        from rquant.price_alert_route import route_price_alert_event
+
+        return route_price_alert_event(
+            self,
+            activation=activation,
+            policy=policy,
+            source=source,
+            record=record,
+            source_inspected_at=source_inspected_at,
+            routed_at=routed_at,
+        )
+
+    def notification_event(
+        self, identifier: int | str
+    ) -> SignalBusSignalRecord | PriceAlertBusEventRecord | None:
+        from rquant.price_alert_route import notification_record
+
+        with self._read_snapshot() as connection:
+            return notification_record(connection, identifier)
+
+    def notification_events_after_global_sequence(
+        self,
+        *,
+        after_sequence: int,
+        through_sequence: int,
+        observed_at: datetime,
+        limit: int,
+    ) -> tuple[SignalBusSignalRecord | PriceAlertBusEventRecord, ...]:
+        return self._notification_events(
+            after_sequence=after_sequence,
+            through_sequence=through_sequence,
+            observed_at=observed_at,
+            limit=limit,
+            routed=False,
+        )
+
+    def routed_notification_events_after_global_sequence(
+        self,
+        *,
+        after_sequence: int,
+        through_sequence: int,
+        observed_at: datetime,
+        limit: int,
+    ) -> tuple[SignalBusRoutedRecord | PriceAlertBusRoutedRecord, ...]:
+        return self._notification_events(
+            after_sequence=after_sequence,
+            through_sequence=through_sequence,
+            observed_at=observed_at,
+            limit=limit,
+            routed=True,
+        )
+
+    def _notification_events(
+        self,
+        *,
+        after_sequence: int,
+        through_sequence: int,
+        observed_at: datetime,
+        limit: int,
+        routed: bool,
+    ) -> tuple[
+        SignalBusSignalRecord
+        | SignalBusRoutedRecord
+        | PriceAlertBusEventRecord
+        | PriceAlertBusRoutedRecord,
+        ...,
+    ]:
+        from rquant.price_alert_route import PriceAlertBusEventRecord, notification_record
+
+        if (
+            type(after_sequence) is not int
+            or after_sequence < 0
+            or type(through_sequence) is not int
+            or through_sequence < after_sequence
+            or type(limit) is not int
+            or not 1 <= limit <= 100
+        ):
+            raise ValueError("mixed notification read range is outside its bounded prefix")
+        visible_at = _normalize_time(observed_at)
+        with self._read_snapshot() as connection:
+            _require_consistent_high_watermark(connection)
+            high = int(
+                connection.execute(
+                    "SELECT metadata_value FROM signal_bus_metadata WHERE me"
+                    "tadata_key='signal_high_watermark'"
+                ).fetchone()[0]
+            )
+            if through_sequence > high:
+                raise ValueError("mixed notification source watermark regressed")
+            records = []
+            for sequence in range(
+                after_sequence + 1, min(through_sequence, after_sequence + limit) + 1
+            ):
+                record = notification_record(connection, sequence, routed=routed)
+                if record is None:
+                    raise ValueError("mixed notification source has a sequence gap")
+                available_at = (
+                    record.event.available_at
+                    if isinstance(record, PriceAlertBusEventRecord)
+                    else record.signal.available_at
+                )
+                if record.received_at > visible_at or available_at > visible_at:
+                    raise ValueError("mixed notification source event is not visible")
+                if routed and record.receipt.routed_at > visible_at:
+                    raise ValueError("mixed notification route receipt is not visible")
+                records.append(record)
+            return tuple(records)
 
     def complete_success(
         self,

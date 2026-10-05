@@ -14,7 +14,7 @@ from rquant.paper_broker import BrokerCostPolicy, PaperBrokerStore
 from rquant.paper_ledger_anchor import Ed25519PaperLedgerAnchorVerifier
 from rquant.paper_signal_consumer import (
     PaperSignalConsumerStateStore,
-    consume_signal_bus_to_paper,
+    consume_notification_events_to_paper,
 )
 from rquant.paper_signal_worker import (
     PaperSignalPolicy,
@@ -33,7 +33,7 @@ from rquant.runtime_service_entrypoint import (
 )
 from rquant.signal_bus import SignalBusStore
 from rquant.signal_contracts import SignalAction
-from rquant.signal_route_spool import ReadonlySignalRouteSpool
+from rquant.signal_route_spool import ReadonlyNotificationEventRouteSpool
 
 
 class PaperSignalPolicySettings(RuntimeContractModel):
@@ -208,7 +208,7 @@ def paper_consumer_builder(*, clock: Callable[[], datetime]) -> RuntimeServiceBu
                     # A paused consumer never observes the source, so nothing moved.
                     watermark_advanced=False,
                 )
-            summary = consume_signal_bus_to_paper(
+            summary = consume_notification_events_to_paper(
                 bus,
                 queue,
                 state,
@@ -218,7 +218,9 @@ def paper_consumer_builder(*, clock: Callable[[], datetime]) -> RuntimeServiceBu
             return RuntimeStepResult(
                 input_sequence=summary.started_after_sequence,
                 output_sequence=summary.ended_at_sequence,
-                processed_count=summary.delegated_count + summary.replayed_count,
+                processed_count=summary.delegated_count
+                + summary.replayed_count
+                + summary.ignored_non_trading_count,
                 backlog_count=max(
                     0,
                     summary.source_high_watermark - summary.ended_at_sequence,
@@ -285,7 +287,7 @@ def paper_broker_builder(
             constraint_generation_resolver = None
         policy = settings.signal_policy(manifest.producer_commit)
         cost_policy = settings.cost_policy()
-        source = ReadonlySignalRouteSpool(settings.signal_spool_root)
+        source = ReadonlyNotificationEventRouteSpool(settings.signal_spool_root)
         queue = PaperSignalQueueStore(
             settings.queue_path,
             policy=policy,
@@ -427,7 +429,7 @@ def paper_broker_builder(
                     # A paused broker never observes the spool source, so nothing moved.
                     watermark_advanced=False,
                 )
-            consumed = consume_signal_bus_to_paper(
+            consumed = consume_notification_events_to_paper(
                 source,
                 queue,
                 state,

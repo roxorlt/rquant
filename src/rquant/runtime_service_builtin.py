@@ -916,9 +916,7 @@ def auction_match_source_builder(
             try:
                 decision = decide_market_session(calendar, observed_at)
             except MarketSessionCalendarError as error:
-                return idle_result(
-                    (raise_or_label_calendar_refusal(calendar, observed_at, error),)
-                )
+                return idle_result((raise_or_label_calendar_refusal(calendar, observed_at, error),))
             if attempt_trade_date != decision.local_trade_date:
                 attempt_trade_date = decision.local_trade_date
                 attempts = 0
@@ -1224,6 +1222,9 @@ class WatchlistQuoteSourceSettings(RuntimeContractModel):
     calendar_expected_commit: str | None = Field(default=None, pattern=r"^[0-9a-f]{40}$")
     calendar_content_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     candidate_authorities: tuple[CandidateUniverseAuthority, ...] = ()
+    domain_mode: Literal["candidate", "price_rules"] = "candidate"
+    price_scope_serving_root: Path | None = None
+    price_request_root: Path | None = None
 
     @field_validator("spool_root", "quota_path", "calendar_path")
     @classmethod
@@ -1251,8 +1252,34 @@ def watchlist_quote_source_builder(
         if manifest.plane is not RuntimeServicePlane.LIVE:
             raise ValueError("watchlist quote source must run on the live plane")
         settings = WatchlistQuoteSourceSettings.model_validate(dict(manifest.settings))
+        price_domain = settings.domain_mode == "price_rules"
         authoritative_universe = universe_loader is None
-        if authoritative_universe:
+        if price_domain:
+            if (
+                universe_loader is not None
+                or settings.rollout_mode != "published"
+                or settings.schema_version != 2
+                or settings.minimum_cadence_seconds < 5
+                or settings.price_scope_serving_root is None
+                or settings.price_request_root is None
+                or settings.calendar_path is None
+                or settings.calendar_expected_commit is None
+                or settings.calendar_content_sha256 is None
+                or settings.candidate_authorities
+            ):
+                raise ValueError(
+                    "price quote domain requires the complete trusted scope and published gateway"
+                )
+            from rquant.price_alert_runtime_store import _private_parent
+
+            _private_parent(settings.price_request_root / "binding.json")
+            calendar = load_market_calendar_authority(
+                settings.calendar_path, expected_commit=settings.calendar_expected_commit
+            )
+            if calendar.content_sha256 != settings.calendar_content_sha256:
+                raise ValueError("price quote calendar content identity mismatch")
+            candidate_loader = None
+        elif authoritative_universe:
             if (
                 settings.calendar_path is None
                 or settings.calendar_expected_commit is None
@@ -1314,7 +1341,62 @@ def watchlist_quote_source_builder(
             nonlocal last_result
             scheduled_at = clock()
             evidence: dict[str, str] = {}
-            if candidate_loader is not None and calendar is not None:
+            if price_domain:
+                from rquant.price_alert_runtime_source import (
+                    PriceAlertScopeSnapshot,
+                    PriceQuoteRequestBinding,
+                    freeze_price_quote_request,
+                    read_price_alert_scope,
+                )
+                from rquant.serving_publisher import ServingReader
+
+                with ServingReader(settings.price_scope_serving_root).acquire_generation() as lease:
+                    scope = read_price_alert_scope(lease, evaluated_at=scheduled_at)
+                    if type(scope) is not PriceAlertScopeSnapshot:
+                        return RuntimeStepResult(
+                            batch_published=False, degraded_reasons=(f"price_alert:{scope.reason}",)
+                        )
+                    decision = decide_market_session(calendar, scheduled_at)
+                    if not decision.is_open_date or not _watchlist_quote_session_active(
+                        scheduled_at=scheduled_at
+                    ):
+                        return RuntimeStepResult(
+                            batch_published=False,
+                            source_generations={"market_calendar": calendar.content_sha256},
+                        )
+                    if not scope.codes:
+                        return RuntimeStepResult(
+                            batch_published=False,
+                            source_generations={"price_alert_scope": scope.generation_id},
+                        )
+                    codes, universe_as_of, trade_date = (
+                        scope.codes,
+                        scope.available_at,
+                        decision.local_trade_date,
+                    )
+                    request = PriceQuoteRequestBinding.create(
+                        source=settings.source,
+                        quote_source_generation_id=gateway.spool._source_generation(
+                            LiveChannel.WATCHLIST_QUOTE
+                        ),
+                        scope_generation_id=scope.generation_id,
+                        scope_manifest_sha256=scope.manifest_sha256,
+                        codes=codes,
+                        scheduled_at=scheduled_at,
+                        universe_as_of=universe_as_of,
+                        trade_date=trade_date,
+                        schema_version=2,
+                    )
+                    freeze_price_quote_request(settings.price_request_root, request)
+                    if (
+                        ServingReader(settings.price_scope_serving_root).current_pointer()
+                        != lease.pointer
+                    ):
+                        raise ValueError(
+                            "price quote scope changed before the original gateway call"
+                        )
+                    evidence["price_alert_scope"] = scope.generation_id
+            elif candidate_loader is not None and calendar is not None:
                 decision = decide_market_session(calendar, scheduled_at)
                 evidence["market_calendar"] = calendar.content_sha256
                 if not decision.is_open_date or not _watchlist_quote_session_active(
@@ -1561,6 +1643,12 @@ def build_builtin_registry(
         )(manifest)
 
     registry.register(RuntimeServiceKind.NOTIFIER, build_notifier)
+    from rquant.runtime_builder_price_alert import price_alert_runtime_builder
+
+    registry.register(
+        RuntimeServiceKind.PRICE_ALERT_RUNTIME,
+        price_alert_runtime_builder(clock=resolved_clock, runtime_root=runtime_root),
+    )
     registry.register(
         RuntimeServiceKind.PAPER_CONSTRAINT_PUBLISHER,
         paper_execution_constraint_publisher_builder(clock=resolved_clock),

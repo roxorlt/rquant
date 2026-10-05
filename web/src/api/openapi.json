@@ -5819,6 +5819,22 @@
         "title": "Envelope[PortfolioSummaryData]",
         "type": "object"
       },
+      "Envelope_PriceAlertRecentEventsData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/PriceAlertRecentEventsData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[PriceAlertRecentEventsData]",
+        "type": "object"
+      },
       "Envelope_PriceAlertRuleHeadData_": {
         "properties": {
           "data": {
@@ -5849,6 +5865,22 @@
           "serving"
         ],
         "title": "Envelope[PriceAlertRuleListData]",
+        "type": "object"
+      },
+      "Envelope_PriceAlertRuntimeData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/PriceAlertRuntimeData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[PriceAlertRuntimeData]",
         "type": "object"
       },
       "Envelope_PulseData_": {
@@ -18346,6 +18378,179 @@
         "title": "PortfolioWeightRule",
         "type": "object"
       },
+      "PriceAlertNotificationFact": {
+        "additionalProperties": false,
+        "properties": {
+          "channel": {
+            "enum": [
+              "pushdeer",
+              "pushplus"
+            ],
+            "title": "Channel",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "pending",
+              "admitted",
+              "accepted",
+              "recorded",
+              "unknown",
+              "cancelled",
+              "rejected",
+              "expired",
+              "unavailable"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "channel",
+          "state",
+          "label",
+          "message",
+          "updated_at"
+        ],
+        "title": "PriceAlertNotificationFact",
+        "type": "object"
+      },
+      "PriceAlertRecentEvent": {
+        "additionalProperties": false,
+        "properties": {
+          "comparison": {
+            "enum": [
+              "gte",
+              "lte"
+            ],
+            "title": "Comparison",
+            "type": "string"
+          },
+          "event_id": {
+            "title": "Event Id",
+            "type": "string"
+          },
+          "membership_version": {
+            "title": "Membership Version",
+            "type": "integer"
+          },
+          "notifications": {
+            "items": {
+              "$ref": "#/components/schemas/PriceAlertNotificationFact"
+            },
+            "maxItems": 2,
+            "title": "Notifications",
+            "type": "array"
+          },
+          "price": {
+            "title": "Price",
+            "type": "string"
+          },
+          "route_message": {
+            "title": "Route Message",
+            "type": "string"
+          },
+          "rule_id": {
+            "title": "Rule Id",
+            "type": "string"
+          },
+          "rule_name": {
+            "title": "Rule Name",
+            "type": "string"
+          },
+          "rule_version": {
+            "title": "Rule Version",
+            "type": "integer"
+          },
+          "threshold": {
+            "title": "Threshold",
+            "type": "string"
+          },
+          "triggered_at": {
+            "format": "date-time",
+            "title": "Triggered At",
+            "type": "string"
+          },
+          "ts_code": {
+            "title": "Ts Code",
+            "type": "string"
+          }
+        },
+        "required": [
+          "event_id",
+          "rule_id",
+          "rule_version",
+          "membership_version",
+          "rule_name",
+          "ts_code",
+          "comparison",
+          "threshold",
+          "price",
+          "triggered_at",
+          "notifications",
+          "route_message"
+        ],
+        "title": "PriceAlertRecentEvent",
+        "type": "object"
+      },
+      "PriceAlertRecentEventsData": {
+        "additionalProperties": false,
+        "properties": {
+          "availability": {
+            "enum": [
+              "ready",
+              "unavailable",
+              "not_running"
+            ],
+            "title": "Availability",
+            "type": "string"
+          },
+          "generation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Generation Id"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/PriceAlertRecentEvent"
+            },
+            "maxItems": 20,
+            "title": "Items",
+            "type": "array"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          }
+        },
+        "required": [
+          "availability",
+          "generation_id",
+          "message",
+          "items"
+        ],
+        "title": "PriceAlertRecentEventsData",
+        "type": "object"
+      },
       "PriceAlertRuleCommandReceipt": {
         "additionalProperties": false,
         "properties": {
@@ -18883,6 +19088,232 @@
           "label"
         ],
         "title": "PriceAlertRulePriorityOption",
+        "type": "object"
+      },
+      "PriceAlertRuntimeData": {
+        "additionalProperties": false,
+        "properties": {
+          "applied_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Applied At"
+          },
+          "availability": {
+            "enum": [
+              "ready",
+              "unavailable",
+              "not_running"
+            ],
+            "title": "Availability",
+            "type": "string"
+          },
+          "evaluated_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Evaluated At"
+          },
+          "generation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Generation Id"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/PriceAlertRuntimeItem"
+            },
+            "maxItems": 100,
+            "title": "Items",
+            "type": "array"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "mode": {
+            "enum": [
+              "record_only",
+              "notification",
+              "disabled"
+            ],
+            "title": "Mode",
+            "type": "string"
+          },
+          "quote_updated_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Quote Updated At"
+          },
+          "status": {
+            "enum": [
+              "normal",
+              "attention",
+              "error",
+              "not_running"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "status_label": {
+            "enum": [
+              "正常",
+              "注意",
+              "异常",
+              "未运行"
+            ],
+            "title": "Status Label",
+            "type": "string"
+          }
+        },
+        "required": [
+          "availability",
+          "generation_id",
+          "status",
+          "status_label",
+          "message",
+          "evaluated_at",
+          "quote_updated_at",
+          "applied_at",
+          "mode",
+          "items"
+        ],
+        "title": "PriceAlertRuntimeData",
+        "type": "object"
+      },
+      "PriceAlertRuntimeItem": {
+        "additionalProperties": false,
+        "properties": {
+          "evaluated_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Evaluated At"
+          },
+          "last_triggered_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Triggered At"
+          },
+          "membership_version": {
+            "title": "Membership Version",
+            "type": "integer"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "next_allowed_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Allowed At"
+          },
+          "rule_id": {
+            "title": "Rule Id",
+            "type": "string"
+          },
+          "state": {
+            "anyOf": [
+              {
+                "enum": [
+                  "triggered",
+                  "not_triggered",
+                  "unavailable"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "State"
+          },
+          "status": {
+            "enum": [
+              "normal",
+              "attention",
+              "error",
+              "not_running"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "status_label": {
+            "enum": [
+              "正常",
+              "注意",
+              "异常",
+              "未运行",
+              "等待开盘",
+              "已收盘",
+              "午间休市"
+            ],
+            "title": "Status Label",
+            "type": "string"
+          },
+          "version": {
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "rule_id",
+          "version",
+          "membership_version",
+          "status",
+          "status_label",
+          "message",
+          "evaluated_at",
+          "last_triggered_at",
+          "next_allowed_at",
+          "state"
+        ],
+        "title": "PriceAlertRuntimeItem",
         "type": "object"
       },
       "ProjectionInfo": {
@@ -26580,6 +27011,27 @@
         ]
       }
     },
+    "/api/v1/monitor/price-rules/events": {
+      "get": {
+        "operationId": "price_events_api_v1_monitor_price_rules_events_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_PriceAlertRecentEventsData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "我的最近到价提醒",
+        "tags": [
+          "monitor"
+        ]
+      }
+    },
     "/api/v1/monitor/price-rules/head": {
       "get": {
         "operationId": "price_rule_head_api_v1_monitor_price_rules_head_get",
@@ -26619,6 +27071,27 @@
           }
         },
         "summary": "到价规则当前设置",
+        "tags": [
+          "monitor"
+        ]
+      }
+    },
+    "/api/v1/monitor/price-rules/runtime": {
+      "get": {
+        "operationId": "price_runtime_api_v1_monitor_price_rules_runtime_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_PriceAlertRuntimeData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "我的到价提醒运行状态",
         "tags": [
           "monitor"
         ]

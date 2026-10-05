@@ -27,6 +27,7 @@ export interface ConfirmDialogProps {
   disabled?: boolean;
   onConfirm: () => void;
   onCancel: () => void;
+  afterClose?: () => void;
   /** Injectable clock for tests. */
   now?: () => Date;
 }
@@ -43,6 +44,7 @@ export function ConfirmDialog({
   disabled = false,
   onConfirm,
   onCancel,
+  afterClose,
   now = () => new Date(),
 }: ConfirmDialogProps) {
   const [typed, setTyped] = useState("");
@@ -75,6 +77,7 @@ export function ConfirmDialog({
       title={title}
       onCancel={onCancel}
       onOk={onConfirm}
+      afterClose={afterClose}
       okText={confirmLabel}
       cancelText="取消"
       okButtonProps={{

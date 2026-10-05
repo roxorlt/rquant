@@ -787,6 +787,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/monitor/price-rules/events": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 我的最近到价提醒 */
+        get: operations["price_events_api_v1_monitor_price_rules_events_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/monitor/price-rules/head": {
         parameters: {
             query?: never;
@@ -796,6 +813,23 @@ export interface paths {
         };
         /** 到价规则当前设置 */
         get: operations["price_rule_head_api_v1_monitor_price_rules_head_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/monitor/price-rules/runtime": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 我的到价提醒运行状态 */
+        get: operations["price_runtime_api_v1_monitor_price_rules_runtime_get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -3632,6 +3666,11 @@ export interface components {
             data: components["schemas"]["PortfolioSummaryData"];
             serving: components["schemas"]["ServingMeta"];
         };
+        /** Envelope[PriceAlertRecentEventsData] */
+        Envelope_PriceAlertRecentEventsData_: {
+            data: components["schemas"]["PriceAlertRecentEventsData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
         /** Envelope[PriceAlertRuleHeadData] */
         Envelope_PriceAlertRuleHeadData_: {
             data: components["schemas"]["PriceAlertRuleHeadData"];
@@ -3640,6 +3679,11 @@ export interface components {
         /** Envelope[PriceAlertRuleListData] */
         Envelope_PriceAlertRuleListData_: {
             data: components["schemas"]["PriceAlertRuleListData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[PriceAlertRuntimeData] */
+        Envelope_PriceAlertRuntimeData_: {
+            data: components["schemas"]["PriceAlertRuntimeData"];
             serving: components["schemas"]["ServingMeta"];
         };
         /** Envelope[PulseData] */
@@ -7883,6 +7927,75 @@ export interface components {
              */
             min_target_amount: string;
         };
+        /** PriceAlertNotificationFact */
+        PriceAlertNotificationFact: {
+            /**
+             * Channel
+             * @enum {string}
+             */
+            channel: "pushdeer" | "pushplus";
+            /** Label */
+            label: string;
+            /** Message */
+            message: string;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "pending" | "admitted" | "accepted" | "recorded" | "unknown" | "cancelled" | "rejected" | "expired" | "unavailable";
+            /**
+             * Updated At
+             * Format: date-time
+             */
+            updated_at: string;
+        };
+        /** PriceAlertRecentEvent */
+        PriceAlertRecentEvent: {
+            /**
+             * Comparison
+             * @enum {string}
+             */
+            comparison: "gte" | "lte";
+            /** Event Id */
+            event_id: string;
+            /** Membership Version */
+            membership_version: number;
+            /** Notifications */
+            notifications: components["schemas"]["PriceAlertNotificationFact"][];
+            /** Price */
+            price: string;
+            /** Route Message */
+            route_message: string;
+            /** Rule Id */
+            rule_id: string;
+            /** Rule Name */
+            rule_name: string;
+            /** Rule Version */
+            rule_version: number;
+            /** Threshold */
+            threshold: string;
+            /**
+             * Triggered At
+             * Format: date-time
+             */
+            triggered_at: string;
+            /** Ts Code */
+            ts_code: string;
+        };
+        /** PriceAlertRecentEventsData */
+        PriceAlertRecentEventsData: {
+            /**
+             * Availability
+             * @enum {string}
+             */
+            availability: "ready" | "unavailable" | "not_running";
+            /** Generation Id */
+            generation_id: string | null;
+            /** Items */
+            items: components["schemas"]["PriceAlertRecentEvent"][];
+            /** Message */
+            message: string;
+        };
         /** PriceAlertRuleCommandReceipt */
         PriceAlertRuleCommandReceipt: {
             /**
@@ -8069,6 +8182,70 @@ export interface components {
              * @enum {string}
              */
             value: "P0" | "P1" | "P2" | "P3";
+        };
+        /** PriceAlertRuntimeData */
+        PriceAlertRuntimeData: {
+            /** Applied At */
+            applied_at: string | null;
+            /**
+             * Availability
+             * @enum {string}
+             */
+            availability: "ready" | "unavailable" | "not_running";
+            /** Evaluated At */
+            evaluated_at: string | null;
+            /** Generation Id */
+            generation_id: string | null;
+            /** Items */
+            items: components["schemas"]["PriceAlertRuntimeItem"][];
+            /** Message */
+            message: string;
+            /**
+             * Mode
+             * @enum {string}
+             */
+            mode: "record_only" | "notification" | "disabled";
+            /** Quote Updated At */
+            quote_updated_at: string | null;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "normal" | "attention" | "error" | "not_running";
+            /**
+             * Status Label
+             * @enum {string}
+             */
+            status_label: "正常" | "注意" | "异常" | "未运行";
+        };
+        /** PriceAlertRuntimeItem */
+        PriceAlertRuntimeItem: {
+            /** Evaluated At */
+            evaluated_at: string | null;
+            /** Last Triggered At */
+            last_triggered_at: string | null;
+            /** Membership Version */
+            membership_version: number;
+            /** Message */
+            message: string;
+            /** Next Allowed At */
+            next_allowed_at: string | null;
+            /** Rule Id */
+            rule_id: string;
+            /** State */
+            state: ("triggered" | "not_triggered" | "unavailable") | null;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "normal" | "attention" | "error" | "not_running";
+            /**
+             * Status Label
+             * @enum {string}
+             */
+            status_label: "正常" | "注意" | "异常" | "未运行" | "等待开盘" | "已收盘" | "午间休市";
+            /** Version */
+            version: number;
         };
         /** ProjectionInfo */
         ProjectionInfo: {
@@ -11318,6 +11495,26 @@ export interface operations {
             };
         };
     };
+    price_events_api_v1_monitor_price_rules_events_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_PriceAlertRecentEventsData_"];
+                };
+            };
+        };
+    };
     price_rule_head_api_v1_monitor_price_rules_head_get: {
         parameters: {
             query: {
@@ -11345,6 +11542,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    price_runtime_api_v1_monitor_price_rules_runtime_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_PriceAlertRuntimeData_"];
                 };
             };
         };
