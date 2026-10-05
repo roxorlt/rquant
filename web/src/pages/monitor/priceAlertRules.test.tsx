@@ -9,6 +9,15 @@ import { PRICE_RULE_JOURNAL } from "./priceAlertRuleCommandSession";
 type Command = Schemas["PriceAlertRuleCommandRequest"];
 type List = Schemas["Envelope_PriceAlertRuleListData_"];
 const PREFIX = "*/api/v1/monitor/price-rules";
+const confirmationLifecycle = vi.hoisted(() => ({ closed: (): void => undefined }));
+vi.mock("@/ui", async (importOriginal) => {
+  const original = await importOriginal<typeof import("@/ui")>();
+  function LifecycleConfirm(props: Parameters<typeof original.ConfirmDialog>[0]) {
+    if (!props.open && props.afterClose) confirmationLifecycle.closed = props.afterClose;
+    return <original.ConfirmDialog {...props} />;
+  }
+  return { ...original, ConfirmDialog: LifecycleConfirm };
+});
 const list = (): List => ({
   serving: metaEnvelope().serving,
   data: {
@@ -55,7 +64,37 @@ beforeEach(() => {
         callback(),
     },
   });
-  server.use(http.get(PREFIX, () => HttpResponse.json(list())));
+  server.use(
+    http.get(PREFIX, () => HttpResponse.json(list())),
+    http.get(`${PREFIX}/runtime`, () =>
+      HttpResponse.json({
+        serving: metaEnvelope().serving,
+        data: {
+          availability: "ready",
+          generation_id: metaEnvelope().serving.generation_id,
+          status: "not_running",
+          status_label: "未运行",
+          message: "价格提醒尚未运行。",
+          evaluated_at: null,
+          quote_updated_at: null,
+          applied_at: null,
+          mode: "disabled",
+          items: [],
+        },
+      }),
+    ),
+    http.get(`${PREFIX}/events`, () =>
+      HttpResponse.json({
+        serving: metaEnvelope().serving,
+        data: {
+          availability: "ready",
+          generation_id: metaEnvelope().serving.generation_id,
+          message: "",
+          items: [],
+        },
+      }),
+    ),
+  );
 });
 
 it("opens an editor with exact original price and seconds, and guards unsaved drafts", async () => {
@@ -69,6 +108,8 @@ it("opens an editor with exact original price and seconds, and guards unsaved dr
   fireEvent.click(screen.getByRole("button", { name: "取消编辑" }));
   expect(await screen.findByText("放弃未保存的修改？")).toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: "放弃修改" }));
+  // JSDOM 不完成 CSS 关闭动画；模拟 Modal 的原关闭回调。
+  act(() => confirmationLifecycle.closed());
   await waitFor(() => expect(screen.queryByLabelText("阈值价格")).toBeNull());
   await waitFor(() => expect(screen.getByRole("button", { name: "编辑 突破提醒" })).toHaveFocus());
 });
@@ -222,9 +263,10 @@ it.each(["empty", "unavailable", "not_activated"])(
 
 it("keyboard focus exposes the reason and preserves distinct enable intent", async () => {
   renderApp("/monitor");
-  const status = await screen.findByText("未运行");
+  const row = await screen.findByRole("row", { name: /突破提醒/ });
+  const status = await within(row).findByText("未运行");
   fireEvent.focus(status.closest(".tip-anchor") ?? status);
-  expect(await screen.findByRole("tooltip")).toHaveTextContent("行情评估接通后才会提醒。");
+  expect(await screen.findByRole("tooltip")).toHaveTextContent("价格提醒尚未运行。");
   expect(await screen.findByRole("switch", { name: "启停 突破提醒" })).toHaveAttribute(
     "aria-checked",
     "true",

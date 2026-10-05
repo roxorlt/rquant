@@ -5,7 +5,6 @@ import {
   postPriceRule,
   usePriceRules,
 } from "@/api/priceAlertRules";
-import { formatPrice } from "@/format/number";
 import { type DataColumn, DataTable } from "@/table/DataTable";
 import {
   Button,
@@ -14,10 +13,15 @@ import {
   PageSkeleton,
   Panel,
   SideDrawer,
-  StatusBadge,
   Switch,
   Tip,
 } from "@/ui";
+import {
+  PriceAlertRuntimeFacts,
+  PriceAlertRuntimeStatus,
+  priceText,
+  usePriceAlertRuntimeFacts,
+} from "./PriceAlertRuntimeFacts";
 import {
   type EditingIdentity,
   matchesEditingSession,
@@ -88,6 +92,7 @@ function wallTimeKey(value: string): string | null {
 
 export function PriceAlertRules() {
   const result = usePriceRules();
+  const runtimeFacts = usePriceAlertRuntimeFacts(result.owner, result.generation);
   const session = useMemo(
     () => new PriceAlertRuleCommandSession(storage(), result.owner, postPriceRule, browserLock()),
     [result.owner],
@@ -98,6 +103,7 @@ export function PriceAlertRules() {
   draftRef.current = draft;
   const [sending, setSending] = useState(false);
   const [discard, setDiscard] = useState(false);
+  const discardClose = useRef<Draft | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<PriceRuleItem | null>(null);
   const [error, setError] = useState<string | null>(null);
   const editTargets = useRef(new Map<string, HTMLDivElement>());
@@ -159,6 +165,7 @@ export function PriceAlertRules() {
     setDraft(null);
     setSending(false);
     setDeleteTarget(null);
+    discardClose.current = null;
     setDiscard(false);
     setError(null);
   }, [result.owner]);
@@ -180,6 +187,7 @@ export function PriceAlertRules() {
 
   function close() {
     const closing = draftRef.current?.identity;
+    discardClose.current = null;
     setDraft(null);
     setSending(false);
     setDiscard(false);
@@ -342,7 +350,7 @@ export function PriceAlertRules() {
       cell: (row) => (
         <Tip content={`完整价格 ${row.threshold}`}>
           <span>
-            {row.comparison === "gte" ? "不低于" : "不高于"} {formatPrice(Number(row.threshold))}
+            {row.comparison === "gte" ? "不低于" : "不高于"} {priceText(row.threshold)}
           </span>
         </Tip>
       ),
@@ -358,9 +366,7 @@ export function PriceAlertRules() {
       header: "状态",
       value: (row) => row.status_label,
       secondary: true,
-      cell: (row) => (
-        <StatusBadge state="idle" label={row.status_label} reason={row.scope_message} />
-      ),
+      cell: (row) => <PriceAlertRuntimeStatus facts={runtimeFacts} rule={row} />,
     },
     {
       id: "enabled",
@@ -514,6 +520,7 @@ export function PriceAlertRules() {
           </ul>
         ) : null}
       </Panel>
+      <PriceAlertRuntimeFacts facts={runtimeFacts} />
       <SideDrawer
         open={openDraft !== null}
         title={openDraft?.identity.readVersion === null ? "新建到价规则" : "编辑到价规则"}
@@ -665,8 +672,25 @@ export function PriceAlertRules() {
         title="放弃未保存的修改？"
         description="本次草稿会丢失。已提交的操作仍可继续核对。"
         confirmLabel="放弃修改"
-        onCancel={() => setDiscard(false)}
-        onConfirm={close}
+        onCancel={() => {
+          discardClose.current = null;
+          setDiscard(false);
+        }}
+        onConfirm={() => {
+          discardClose.current = draftRef.current;
+          setDiscard(false);
+        }}
+        afterClose={() => {
+          if (
+            !openDraft ||
+            discardClose.current !== openDraft ||
+            draftRef.current !== openDraft ||
+            openDraft.identity.owner !== ownerRef.current
+          )
+            return;
+          discardClose.current = null;
+          close();
+        }}
       />
       <ConfirmDialog
         open={deleteTarget !== null}

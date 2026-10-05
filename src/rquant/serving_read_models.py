@@ -578,6 +578,44 @@ PAGE_PROJECTION_CONTRACTS: Mapping[str, ServingProjectionContract] = MappingProx
             max_bytes=4096,
             event_time_columns=("activated_at",),
         ),
+        "price_alert_runtime_state": _contract(
+            "signals",
+            (("snapshot_key", "string"), ("body_json", "string")),
+            ("snapshot_key",),
+            max_rows=1,
+            max_bytes=64 * 1024,
+        ),
+        "price_alert_runtime": _contract(
+            "signals",
+            (("owner_id", "string"), ("rule_id", "string"), ("body_json", "string")),
+            ("owner_id", "rule_id"),
+            max_rows=3200,
+            max_bytes=2 * 1024 * 1024,
+        ),
+        "price_alert_runtime_event": _contract(
+            "signals",
+            (
+                ("owner_id", "string"),
+                ("event_id", "string"),
+                ("global_sequence", "int"),
+                ("body_json", "string"),
+            ),
+            ("owner_id", "global_sequence"),
+            max_rows=640,
+            max_bytes=2 * 1024 * 1024,
+        ),
+        "price_alert_runtime_attempt": _contract(
+            "signals",
+            (
+                ("owner_id", "string"),
+                ("event_id", "string"),
+                ("outbox_id", "string"),
+                ("body_json", "string"),
+            ),
+            ("owner_id", "outbox_id"),
+            max_rows=6400,
+            max_bytes=2 * 1024 * 1024,
+        ),
         "price_alert_rule": _contract(
             "signals",
             (
@@ -1884,11 +1922,28 @@ class ServingReadModelInput(RuntimeContractModel):
             raise ValueError("serving snapshot contains future evidence")
 
         owner_sizes: dict[str, int] = {}
+        price_size = 0
         for projection in self.projections:
+            if projection.table_name in {
+                "price_alert_runtime_state",
+                "price_alert_runtime",
+                "price_alert_runtime_event",
+                "price_alert_runtime_attempt",
+            }:
+                price_size += _projection_json_bytes(projection)
+                continue
             owner_sizes[projection.owner_dataset_id] = owner_sizes.get(
                 projection.owner_dataset_id,
                 0,
             ) + _projection_json_bytes(projection)
+        if price_size > 2 * 1024 * 1024:
+            raise ValueError("price runtime projections exceed their 2 MiB domain")
+        if price_size:
+            from rquant.price_alert_runtime_projection import validate_price_runtime_projections
+
+            validate_price_runtime_projections(
+                {projection.table_name: projection for projection in self.projections}
+            )
         oversized_owners = tuple(
             sorted(
                 owner for owner, size in owner_sizes.items() if size > _MAX_OWNER_PROJECTION_BYTES

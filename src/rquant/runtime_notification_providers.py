@@ -4,15 +4,17 @@ from __future__ import annotations
 
 import json
 import os
+import unicodedata
 from collections.abc import Callable, Iterator, Mapping
 from datetime import datetime
 from enum import StrEnum
 from types import MappingProxyType
 from typing import Protocol, Self
 from urllib.parse import urlsplit
+from weakref import WeakKeyDictionary
 from zoneinfo import ZoneInfo
 
-from rquant.delivery_contracts import DeliveryChannel
+from rquant.delivery_contracts import DeliveryChannel, OutboxRecord
 from rquant.notification_worker import (
     ConfirmedDeliveryFailureError,
     NotificationDelivery,
@@ -20,6 +22,8 @@ from rquant.notification_worker import (
     UnknownDeliveryOutcomeError,
 )
 from rquant.notify.client import PushDeerClient, PushPlusClient
+from rquant.price_alert_route import PriceAlertBusEventRecord
+from rquant.price_alert_runtime_contracts import PriceAlertEventEnvelope, parse_price_alert_event
 from rquant.runtime_contracts import RuntimeContractModel, canonical_sha256
 from rquant.signal_contracts import SignalAction, SignalEnvelopeFamily
 
@@ -325,6 +329,84 @@ def format_signal_notification(signal: SignalEnvelopeFamily) -> tuple[str, str]:
     return title, body
 
 
+def format_price_alert_notification(event: PriceAlertEventEnvelope) -> tuple[str, str]:
+    value = parse_price_alert_event(event)
+    name = "".join(
+        " " if unicodedata.category(char).startswith("C") else char
+        for char in value.rule_name
+        if char not in "[]()*_~<>`!\\"
+    ).strip()
+    name = " ".join(name.split())[:80] or "到价提醒"
+    direction = "达到" if value.comparison == "gte" else "低于或等于"
+    body = (
+        f"{name} · {value.ts_code} · 价格 {value.price} {direction} {value.threshold} · "
+        f"{value.quote_observed_at.astimezone(_SHANGHAI):%H:%M:%S}"
+    )
+    title = "rQuant 到价提醒"
+    if len((title + body).encode("utf-8")) > 1024:
+        raise ValueError("price notification exceeds 1 KiB")
+    return title, body
+
+
+class PriceAlertPreparedNotification:
+    __slots__ = ("__weakref__",)
+
+    def __init__(self) -> None:
+        raise TypeError("price notification preparation belongs to its actual provider")
+
+
+_PRICE_PREPARED: WeakKeyDictionary[
+    PriceAlertPreparedNotification,
+    tuple[object, PriceAlertBusEventRecord, OutboxRecord, str, str, str | None],
+] = WeakKeyDictionary()
+
+
+def _prepare_price(
+    provider: object,
+    event: PriceAlertBusEventRecord,
+    record: OutboxRecord,
+    *,
+    credential: str | None,
+) -> PriceAlertPreparedNotification:
+    if (
+        type(event) is not PriceAlertBusEventRecord
+        or type(record) is not OutboxRecord
+        or event.event_id != record.signal_id
+    ):
+        raise TypeError("price preparation requires the exact sealed event and original leased row")
+    title, body = format_price_alert_notification(event.event)
+    value = object.__new__(PriceAlertPreparedNotification)
+    _PRICE_PREPARED[value] = provider, event, record, title, body, credential
+    return value
+
+
+def _consume_prepared_price(
+    provider: object,
+    prepared: object,
+    admitted: object,
+    *,
+    store: object,
+    record: OutboxRecord,
+    now: datetime,
+) -> tuple[str, str, str | None]:
+    from rquant.price_alert_runtime_projection import consume_price_alert_admitted_delivery
+
+    if type(prepared) is not PriceAlertPreparedNotification or prepared not in _PRICE_PREPARED:
+        raise TypeError("price provider requires its own unconsumed preparation")
+    issuer, event, original, title, body, credential = _PRICE_PREPARED[prepared]
+    if issuer is not provider or original != record:
+        raise TypeError("price preparation belongs to a different provider or original lease")
+    receipt = consume_price_alert_admitted_delivery(admitted, store=store, record=record, now=now)
+    if (receipt.event_id, receipt.payload_sha256, receipt.target) != (
+        event.event_id,
+        event.payload_hash,
+        record.target,
+    ):
+        raise ValueError("price admission differs from the prepared event and target")
+    del _PRICE_PREPARED[prepared]
+    return title, body, credential
+
+
 class RecipientScopedNotificationProvider(NotificationProvider):
     def __init__(
         self,
@@ -386,6 +468,61 @@ class RecipientScopedNotificationProvider(NotificationProvider):
         )
         return f"{self._channel.value}:{receipt}"
 
+    def prepare_price(
+        self, event: PriceAlertBusEventRecord, record: OutboxRecord
+    ) -> PriceAlertPreparedNotification:
+        target = record.target
+        if target.channel is not self._channel:
+            raise ConfirmedDeliveryFailureError("price channel mismatch")
+        credential = self._capabilities.credential_for(self._channel, target.recipient_id)
+        if credential is None:
+            raise ConfirmedDeliveryFailureError("price recipient capability is unavailable")
+        return _prepare_price(self, event, record, credential=credential)
+
+    def deliver_price(
+        self,
+        prepared: PriceAlertPreparedNotification,
+        admitted: object,
+        *,
+        store: object,
+        record: OutboxRecord,
+        now: datetime,
+    ) -> str:
+        title, body, credential = _consume_prepared_price(
+            self, prepared, admitted, store=store, record=record, now=now
+        )
+        if credential is None or record.target.channel is not self._channel:
+            raise ConfirmedDeliveryFailureError("price recipient preparation is invalid")
+        try:
+            result = self._transport.send(
+                channel=self._channel,
+                endpoint=self._endpoint,
+                credential=credential,
+                title=title,
+                body=body,
+            )
+        except Exception:
+            raise UnknownDeliveryOutcomeError("notification delivery outcome is unknown") from None
+        if (
+            type(result) is not NotificationTransportResult
+            or result.disposition is NotificationTransportDisposition.UNKNOWN
+        ):
+            raise UnknownDeliveryOutcomeError("notification delivery outcome is unknown")
+        if result.disposition is NotificationTransportDisposition.REJECTED:
+            raise ConfirmedDeliveryFailureError("provider rejected delivery")
+        receipt = canonical_sha256(
+            {
+                "contract": "runtime-price-notification-receipt/v1",
+                "channel": self._channel,
+                "recipient_id": record.target.recipient_id,
+                "outbox_id": record.outbox_id,
+                "event_id": record.signal_id,
+                "title": title,
+                "body": body,
+            }
+        )
+        return f"{self._channel.value}:{receipt}"
+
 
 class SuppressedNotificationProvider(NotificationProvider):
     """The shadow transport: the batch runs in full and no byte leaves the host.
@@ -410,6 +547,23 @@ class SuppressedNotificationProvider(NotificationProvider):
 
     def deliver(self, delivery: NotificationDelivery) -> str:
         return f"shadow:{delivery.record.outbox_id}"
+
+    def prepare_price(
+        self, event: PriceAlertBusEventRecord, record: OutboxRecord
+    ) -> PriceAlertPreparedNotification:
+        return _prepare_price(self, event, record, credential=None)
+
+    def deliver_price(
+        self,
+        prepared: PriceAlertPreparedNotification,
+        admitted: object,
+        *,
+        store: object,
+        record: OutboxRecord,
+        now: datetime,
+    ) -> str:
+        _consume_prepared_price(self, prepared, admitted, store=store, record=record, now=now)
+        return f"shadow:{record.outbox_id}"
 
 
 CapabilityInput = RecipientNotificationCapabilities | Mapping[DeliveryChannel, Mapping[str, str]]

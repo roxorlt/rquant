@@ -13,7 +13,7 @@ from contextlib import contextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import RLock
-from typing import Self, TypeAlias
+from typing import Literal, Self, TypeAlias
 
 from pydantic import (
     ConfigDict,
@@ -25,6 +25,8 @@ from pydantic import (
     model_validator,
 )
 
+from rquant.price_alert_route import PriceAlertBusRoutedRecord
+from rquant.price_alert_runtime_contracts import PriceRuntimeModel, PriceSha256
 from rquant.runtime_contracts import (
     AwareUtcDatetime,
     RuntimeContractModel,
@@ -1230,6 +1232,374 @@ class ReadonlySignalRouteSpool:
                 limit=limit,
             )
         )
+
+
+class PriceAlertRouteSpoolRecord(PriceRuntimeModel):
+    schema_version: Literal[4] = 4
+    record_schema: Literal["rquant.price-alert-route-record/v1"] = (
+        "rquant.price-alert-route-record/v1"
+    )
+    global_sequence: StrictInt = Field(ge=1)
+    previous_record_hash: PriceSha256 | None = None
+    payload_hash: PriceSha256
+    record_hash: PriceSha256
+    record: PriceAlertBusRoutedRecord
+
+    @field_validator("record", mode="before")
+    @classmethod
+    def exact_price_record(cls, value: object) -> PriceAlertBusRoutedRecord:
+        if isinstance(value, dict):
+            return PriceAlertBusRoutedRecord.model_validate_json(canonical_json_bytes(value))
+        if type(value) is not PriceAlertBusRoutedRecord:
+            raise TypeError("price spool requires an exact committed price routed record")
+        return PriceAlertBusRoutedRecord.model_validate(value)
+
+    @model_validator(mode="after")
+    def verify_price_chain(self) -> Self:
+        if (
+            self.record.global_sequence != self.global_sequence
+            or self.payload_hash != self.record.sha256
+        ):
+            raise ValueError("price spool payload hash or sequence differs")
+        expected = _sha256_bytes(
+            canonical_json_bytes(self.model_dump(mode="json", exclude={"record", "record_hash"}))
+        )
+        if expected != self.record_hash:
+            raise ValueError("price spool chain hash differs")
+        return self
+
+    @classmethod
+    def create(
+        cls, *, record: PriceAlertBusRoutedRecord, previous_record_hash: str | None
+    ) -> PriceAlertRouteSpoolRecord:
+        if type(record) is not PriceAlertBusRoutedRecord:
+            raise TypeError("price spool requires the exact price routed record type")
+        body = dict(
+            schema_version=4,
+            record_schema="rquant.price-alert-route-record/v1",
+            global_sequence=record.global_sequence,
+            previous_record_hash=previous_record_hash,
+            payload_hash=record.sha256,
+        )
+        return cls(**body, record_hash=_sha256_bytes(canonical_json_bytes(body)), record=record)
+
+
+NotificationRouteSpoolRecord: TypeAlias = SignalRouteSpoolRecord | PriceAlertRouteSpoolRecord
+NotificationBusRoutedRecord: TypeAlias = SignalBusRoutedRecord | PriceAlertBusRoutedRecord
+
+
+class NotificationEventObservedPrefixReceipt(PriceRuntimeModel):
+    source_generation_id: PriceSha256
+    source_high_watermark: StrictInt = Field(ge=0)
+    prefix_row_count: StrictInt = Field(ge=0)
+    prefix_rows_sha256: PriceSha256
+    source_inspected_at: AwareUtcDatetime
+    upstream_complete: Literal[False] = False
+
+    @model_validator(mode="after")
+    def complete_durable_prefix(self) -> Self:
+        if self.prefix_row_count != self.source_high_watermark:
+            raise ValueError("mixed durable prefix count differs from the actual pointer")
+        return self
+
+
+class NotificationEventRouteSpoolPublishSummary(PriceRuntimeModel):
+    source_generation_id: PriceSha256
+    source_high_watermark: StrictInt = Field(ge=0)
+    published_high_watermark: StrictInt = Field(ge=0)
+    published_count: StrictInt = Field(ge=0, le=100)
+    upstream_complete: Literal[False] = False
+
+
+def _decode_notification_spool_record(
+    payload: bytes, *, sequence: int
+) -> NotificationRouteSpoolRecord:
+    from rquant.strict_json import strict_json_loads
+
+    body = strict_json_loads(payload)
+    if not isinstance(body, dict):
+        raise ValueError("mixed routed record is not an object")
+    if body.get("schema_version") == 2:
+        entry = _parse_record(payload, sequence=sequence)
+        if (
+            type(entry) is not SignalRouteSpoolRecord
+            or type(entry.record) is not SignalBusRoutedRecord
+        ):
+            raise TypeError("mixed history requires the exact original legacy wrapper")
+        require_legacy_signal_write(entry.record.signal, operation="mixed history legacy record")
+        if _canonical_bytes(entry) != payload:
+            raise ValueError("mixed history legacy bytes differ from the frozen v2 codec")
+    elif body.get("schema_version") == 4:
+        strict_canonical_json_loads(payload)
+        entry = PriceAlertRouteSpoolRecord.model_validate_json(payload)
+        if entry.wire_bytes() != payload:
+            raise ValueError("price spool record is not canonical")
+    else:
+        raise TypeError("mixed notification history rejects current v3 or unknown schemas")
+    if entry.global_sequence != sequence:
+        raise ValueError("mixed routed record sequence differs")
+    return entry
+
+
+class ReadonlyNotificationEventRouteSpool:
+    """The same pointer/chain, with a thin verified hash index and bounded record reads."""
+
+    def __init__(self, root: Path, *, _allow_unpublished: bool = False) -> None:
+        self.paths = _SignalRouteSpoolPaths(root)
+        self._lock = RLock()
+        self._identity: SignalBusSourceDescriptor | None = None
+        self._pointer: SignalRouteSpoolPointer | None = None
+        self._hashes: list[str] = []
+        self._latest_time = datetime(1970, 1, 1, tzinfo=UTC)
+        self._allow_unpublished = _allow_unpublished
+
+    def _refresh(self, root_descriptor: int, records_descriptor: int) -> SignalRouteSpoolPointer:
+        identity, pointer = _load_spool_metadata(
+            root_descriptor,
+            records_descriptor,
+            reject_unpublished_records=not self._allow_unpublished,
+        )
+        if self._identity is not None and identity != self._identity:
+            raise ValueError("mixed notification spool source generation changed")
+        previous_high = 0 if self._pointer is None else self._pointer.source.high_watermark
+        if pointer.source.high_watermark < previous_high:
+            raise ValueError("mixed notification spool pointer regressed")
+        previous_hash = None if self._pointer is None else self._pointer.last_record_hash
+        hashes = []
+        latest_time = self._latest_time
+        for sequence in range(previous_high + 1, pointer.source.high_watermark + 1):
+            entry = _decode_notification_spool_record(
+                _read_file_at(
+                    records_descriptor,
+                    self.paths.record_name(sequence),
+                    label="mixed routed record",
+                    max_bytes=_MAX_RECORD_BYTES,
+                ),
+                sequence=sequence,
+            )
+            if entry.previous_record_hash != previous_hash:
+                raise ValueError("mixed notification spool hash chain differs")
+            if (
+                type(entry) is PriceAlertRouteSpoolRecord
+                and entry.record.bus_generation_id != identity.generation_id
+            ):
+                raise ValueError("price spool proof belongs to another actual bus")
+            available = (
+                entry.record.event.available_at
+                if type(entry) is PriceAlertRouteSpoolRecord
+                else entry.record.signal.available_at
+            )
+            latest_time = max(
+                latest_time, available, entry.record.received_at, entry.record.receipt.routed_at
+            )
+            hashes.append(entry.record_hash)
+            previous_hash = entry.record_hash
+        if previous_hash != pointer.last_record_hash:
+            raise ValueError("mixed notification spool pointer head differs")
+        self._identity, self._pointer = identity, pointer
+        self._hashes.extend(hashes)
+        self._latest_time = latest_time
+        return pointer
+
+    def source_descriptor(self) -> SignalBusSourceDescriptor:
+        with self._lock:
+            root_descriptor = _open_root_directory(self.paths.root)
+            try:
+                records_descriptor = _open_records_directory(root_descriptor)
+                try:
+                    return self._refresh(root_descriptor, records_descriptor).source
+                finally:
+                    os.close(records_descriptor)
+            finally:
+                os.close(root_descriptor)
+
+    def routed_after_global_sequence(
+        self,
+        *,
+        after_sequence: int,
+        through_sequence: int,
+        limit: int,
+        observed_at: datetime | None = None,
+    ) -> tuple[NotificationBusRoutedRecord, ...]:
+        if (
+            type(after_sequence) is not int
+            or after_sequence < 0
+            or type(through_sequence) is not int
+            or through_sequence < after_sequence
+            or type(limit) is not int
+            or not 1 <= limit <= 100
+        ):
+            raise ValueError("mixed notification spool read range exceeds the route budget")
+        cutoff = _utc_now() if observed_at is None else normalize_aware_utc(observed_at)
+        with self._lock:
+            root_descriptor = _open_root_directory(self.paths.root)
+            try:
+                records_descriptor = _open_records_directory(root_descriptor)
+                try:
+                    pointer = self._refresh(root_descriptor, records_descriptor)
+                    if through_sequence > pointer.source.high_watermark:
+                        raise ValueError(
+                            "mixed notification requested watermark exceeds the actual pointer"
+                        )
+                    output = []
+                    for sequence in range(
+                        after_sequence + 1, min(through_sequence, after_sequence + limit) + 1
+                    ):
+                        entry = _decode_notification_spool_record(
+                            _read_file_at(
+                                records_descriptor,
+                                self.paths.record_name(sequence),
+                                label="mixed routed record",
+                                max_bytes=_MAX_RECORD_BYTES,
+                            ),
+                            sequence=sequence,
+                        )
+                        expected_previous = None if sequence == 1 else self._hashes[sequence - 2]
+                        if (
+                            entry.record_hash != self._hashes[sequence - 1]
+                            or entry.previous_record_hash != expected_previous
+                        ):
+                            raise ValueError("mixed immutable record changed after inspection")
+                        record = entry.record
+                        available = (
+                            record.event.available_at
+                            if type(record) is PriceAlertBusRoutedRecord
+                            else record.signal.available_at
+                        )
+                        if max(available, record.received_at, record.receipt.routed_at) > cutoff:
+                            break
+                        output.append(record)
+                    return tuple(output)
+                finally:
+                    os.close(records_descriptor)
+            finally:
+                os.close(root_descriptor)
+
+    def observed_prefix_receipt(
+        self, *, observed_at: datetime
+    ) -> NotificationEventObservedPrefixReceipt | None:
+        inspected = normalize_aware_utc(observed_at)
+        with self._lock:
+            source = self.source_descriptor()
+            if self._latest_time > inspected:
+                return None
+            return NotificationEventObservedPrefixReceipt(
+                source_generation_id=source.generation_id,
+                source_high_watermark=source.high_watermark,
+                prefix_row_count=len(self._hashes),
+                prefix_rows_sha256=_sha256_bytes(canonical_json_bytes(self._hashes)),
+                source_inspected_at=inspected,
+            )
+
+    def notification_events_after_global_sequence(
+        self, *, after_sequence: int, through_sequence: int, observed_at: datetime, limit: int
+    ) -> tuple:
+        from rquant.price_alert_route import PriceAlertBusEventRecord
+
+        records = self.routed_after_global_sequence(
+            after_sequence=after_sequence,
+            through_sequence=through_sequence,
+            observed_at=observed_at,
+            limit=limit,
+        )
+        output = []
+        for record in records:
+            body = record.model_dump(mode="json", exclude={"receipt"})
+            if type(record) is PriceAlertBusRoutedRecord:
+                output.append(
+                    PriceAlertBusEventRecord.model_validate_json(canonical_json_bytes(body))
+                )
+            else:
+                output.append(
+                    SignalBusSignalRecord.model_validate_json(_canonical_object_bytes(body))
+                )
+        return tuple(output)
+
+
+def publish_mixed_notification_bus_prefix(
+    *, bus: SignalBusStore, spool: SignalRouteSpool, limit: int, observed_at: datetime
+) -> NotificationEventRouteSpoolPublishSummary:
+    if type(bus) is not SignalBusStore or type(spool) is not SignalRouteSpool:
+        raise TypeError("mixed prefix publisher requires the actual original bus and spool types")
+    if type(limit) is not int or not 1 <= limit <= 100:
+        raise ValueError("mixed prefix publication exceeds 100 events")
+    source = bus.source_descriptor()
+    root_descriptor = _open_root_directory(spool.paths.root)
+    try:
+        records_descriptor = _open_records_directory(root_descriptor)
+        try:
+            with spool._exclusive_lock(root_descriptor):
+                identity = source.model_copy(update={"high_watermark": 0})
+                if not _file_exists_at(root_descriptor, "source.json"):
+                    _immutable_write_at(
+                        root_descriptor,
+                        "source.json",
+                        _canonical_bytes(identity),
+                        label="mixed bus source",
+                        max_bytes=_MAX_METADATA_BYTES,
+                    )
+                reader = getattr(spool, "_notification_event_reader", None)
+                if reader is None:
+                    reader = ReadonlyNotificationEventRouteSpool(
+                        spool.paths.root, _allow_unpublished=True
+                    )
+                    spool._notification_event_reader = reader
+                pointer = reader._refresh(root_descriptor, records_descriptor)
+                if (
+                    pointer.source.model_copy(update={"high_watermark": 0}) != identity
+                    or source.high_watermark < pointer.source.high_watermark
+                ):
+                    raise ValueError("mixed prefix actual bus source changed or regressed")
+                records = bus.routed_notification_events_after_global_sequence(
+                    after_sequence=pointer.source.high_watermark,
+                    through_sequence=source.high_watermark,
+                    observed_at=observed_at,
+                    limit=limit,
+                )
+                previous_hash = pointer.last_record_hash
+                for record in records:
+                    if type(record) is SignalBusRoutedRecord:
+                        require_legacy_signal_write(
+                            record.signal, operation="mixed committed legacy relay"
+                        )
+                        entry = SignalRouteSpoolRecord.create(
+                            record=record, previous_record_hash=previous_hash
+                        )
+                        payload = _canonical_bytes(entry)
+                    elif type(record) is PriceAlertBusRoutedRecord:
+                        if record.bus_generation_id != source.generation_id:
+                            raise ValueError("price routed record belongs to another actual bus")
+                        entry = PriceAlertRouteSpoolRecord.create(
+                            record=record, previous_record_hash=previous_hash
+                        )
+                        payload = entry.wire_bytes()
+                    else:
+                        raise TypeError("mixed prefix cannot write a substituted or current record")
+                    _immutable_write_at(
+                        records_descriptor,
+                        spool.paths.record_name(record.global_sequence),
+                        payload,
+                        label="mixed immutable routed record",
+                        max_bytes=_MAX_RECORD_BYTES,
+                    )
+                    previous_hash = entry.record_hash
+                high = pointer.source.high_watermark + len(records)
+                updated = SignalRouteSpoolPointer(
+                    source=source.model_copy(update={"high_watermark": high}),
+                    last_record_hash=previous_hash,
+                )
+                if updated != pointer:
+                    _atomic_replace_at(root_descriptor, "current.json", _canonical_bytes(updated))
+                return NotificationEventRouteSpoolPublishSummary(
+                    source_generation_id=source.generation_id,
+                    source_high_watermark=source.high_watermark,
+                    published_high_watermark=high,
+                    published_count=len(records),
+                )
+        finally:
+            os.close(records_descriptor)
+    finally:
+        os.close(root_descriptor)
 
 
 def publish_signal_bus_prefix(

@@ -19,6 +19,13 @@ from rquant.notification_worker import (
     NotificationProvider,
     run_notification_batch,
 )
+from rquant.price_alert_runtime_contracts import PriceAlertActivationSettings
+from rquant.runtime_builder_price_alert import (
+    PriceAlertPeerSettings,
+    apply_price_role_scope,
+    open_price_role_peer,
+    route_price_role,
+)
 from rquant.runtime_contracts import (
     RuntimeContractModel,
     canonical_sha256,
@@ -47,9 +54,9 @@ from rquant.signal_bus import (
     SignalRouteConflictError,
 )
 from rquant.signal_route_spool import (
-    ReadonlySignalRouteSpool,
+    ReadonlyNotificationEventRouteSpool,
     SignalRouteSpool,
-    publish_signal_bus_prefix,
+    publish_mixed_notification_bus_prefix,
 )
 from rquant.signal_router_runtime import (
     ReadonlyStrategyRunnerSignalSource,
@@ -62,6 +69,8 @@ from rquant.signal_router_runtime import (
 )
 
 if TYPE_CHECKING:
+    from rquant.price_alert_runtime_contracts import PriceAlertRuntimeActivation
+    from rquant.price_alert_runtime_store import ReadonlyPriceAlertRuntimeStore
     from rquant.runtime_serving_authority import (
         ServingSourceAuthorityPublisher,
         ServingSourceAuthorityReader,
@@ -166,6 +175,9 @@ class SignalRouterSourceSettings(RuntimeContractModel):
 
 
 class SignalRouterSettings(_SignalBusSettings):
+    price_alert_runtime: PriceAlertActivationSettings | None = None
+    price_alert_runtime_manifest_path: Path | None = None
+    price_alert_peer: PriceAlertPeerSettings | None = None
     signal_spool_root: Path
     source_id: str | None = Field(default=None, min_length=1)
     sources: tuple[SignalRouterSourceSettings, ...] = ()
@@ -201,6 +213,22 @@ class SignalRouterSettings(_SignalBusSettings):
 
     @model_validator(mode="after")
     def validate_source_group(self) -> SignalRouterSettings:
+        if any(
+            value is not None
+            for value in (
+                self.price_alert_runtime,
+                self.price_alert_runtime_manifest_path,
+                self.price_alert_peer,
+            )
+        ) and not all(
+            value is not None
+            for value in (
+                self.price_alert_runtime,
+                self.price_alert_runtime_manifest_path,
+                self.price_alert_peer,
+            )
+        ):
+            raise ValueError("price router authority must be complete")
         if self.sources and self.source_id is not None:
             raise ValueError("signal router must use either source_id or sources")
         if not self.sources and self.source_id is None:
@@ -255,6 +283,9 @@ class SignalRouterSettings(_SignalBusSettings):
 
 
 class NotifierSettings(RuntimeContractModel):
+    price_alert_runtime: PriceAlertActivationSettings | None = None
+    price_alert_runtime_manifest_path: Path | None = None
+    price_alert_peer: PriceAlertPeerSettings | None = None
     signal_spool_root: Path
     notification_state_path: Path
     worker_id: str = Field(min_length=1)
@@ -341,6 +372,29 @@ class NotifierSettings(RuntimeContractModel):
 
     @model_validator(mode="after")
     def validate_retry_window(self) -> NotifierSettings:
+        if any(
+            value is not None
+            for value in (
+                self.price_alert_runtime,
+                self.price_alert_runtime_manifest_path,
+                self.price_alert_peer,
+            )
+        ) and not all(
+            value is not None
+            for value in (
+                self.price_alert_runtime,
+                self.price_alert_runtime_manifest_path,
+                self.price_alert_peer,
+            )
+        ):
+            raise ValueError("price notifier authority must be complete")
+        if self.price_alert_peer is not None and (
+            self.batch_limit > 100
+            or self.max_attempts != 5
+            or self.retry_base_seconds != 5
+            or self.retry_max_seconds != 300
+        ):
+            raise ValueError("price notifier requires the frozen batch and retry bounds")
         if self.retry_max_seconds < self.retry_base_seconds:
             raise ValueError("retry_max_seconds must be at least retry_base_seconds")
         if self.page_projection_database_path is not None and self.serving_authority_root is None:
@@ -492,7 +546,7 @@ def _inspect_signal_source(
 
 
 def _read_routed_prefix_at(
-    source: ReadonlySignalRouteSpool,
+    source: ReadonlyNotificationEventRouteSpool,
     *,
     after_sequence: int,
     through_sequence: int,
@@ -507,7 +561,8 @@ def _read_routed_prefix_at(
         limit=limit,
     ):
         if (
-            record.signal.available_at > cutoff
+            (record.event.available_at if hasattr(record, "event") else record.signal.available_at)
+            > cutoff
             or record.received_at > cutoff
             or record.receipt.routed_at > cutoff
         ):
@@ -574,16 +629,35 @@ def _publish_signal_authority(
     previous_reader: ServingSourceAuthorityReader | None,
     observed_at: datetime,
     history_limit: int,
+    price_peer: ReadonlyPriceAlertRuntimeStore | None = None,
+    price_activation: PriceAlertRuntimeActivation | None = None,
+    price_shadow: bool = False,
+    price_paused: bool = False,
 ) -> tuple[str, int]:
     from rquant.runtime_serving_authority import (
         ServingSourceAuthorityIntegrityError,
         ServingSourceAuthorityUnavailableError,
     )
 
-    snapshot = store.serving_snapshot(
-        observed_at=observed_at,
-        history_limit=history_limit,
-    )
+    def read_snapshot() -> NotificationServingSnapshot:
+        if price_peer is not None:
+            return store.serving_price_enabled_snapshot(
+                producer=price_peer,
+                activation=price_activation,
+                observed_at=observed_at,
+                history_limit=history_limit,
+                shadow=price_shadow,
+            )
+        return store.serving_snapshot(observed_at=observed_at, history_limit=history_limit)
+
+    if price_paused and price_peer is not None:
+        try:
+            prior = reader(observed_at)
+        except ServingSourceAuthorityUnavailableError:
+            prior = None
+        if prior is not None:
+            return prior.generation_id, 0
+    snapshot = read_snapshot()
     result = _signal_source_result(snapshot, published_at=observed_at)
     try:
         current = reader(observed_at)
@@ -621,10 +695,7 @@ def _publish_signal_authority(
                 previous_sequence=current.sequence,
                 observed_at=observed_at,
             )
-            snapshot = store.serving_snapshot(
-                observed_at=observed_at,
-                history_limit=history_limit,
-            )
+            snapshot = read_snapshot()
             result = _signal_source_result(snapshot, published_at=observed_at)
     if current is not None and current.sequence == result.sequence:
         if (
@@ -700,7 +771,14 @@ def signal_router_builder(
 
     def build(manifest: RuntimeServiceManifest) -> RuntimeServiceStep:
         _require_manifest(manifest, kind=RuntimeServiceKind.SIGNAL_ROUTER)
-        settings = SignalRouterSettings.model_validate(dict(manifest.settings))
+        settings = SignalRouterSettings.model_validate(
+            manifest.model_dump(mode="python")["settings"]
+        )
+        price_activation, price_peer, price_policy = None, None, None
+        if settings.price_alert_peer is not None:
+            price_activation, price_peer, price_policy = open_price_role_peer(
+                manifest, settings.price_alert_peer, runtime_root=runtime_root
+            )
         injected = source_loader is not None and target_resolver is not None
         if injected and settings.has_manifest_authority:
             raise ValueError(
@@ -804,10 +882,11 @@ def signal_router_builder(
 
         def step() -> RuntimeStepResult:
             nonlocal last_prefix_attempt_tick
-            before_publish = publish_signal_bus_prefix(
+            before_publish = publish_mixed_notification_bus_prefix(
                 bus=bus,
                 spool=signal_spool,
-                limit=settings.batch_limit,
+                limit=min(settings.batch_limit, 100),
+                observed_at=clock(),
             )
             if before_publish.published_high_watermark < before_publish.source_high_watermark:
                 return RuntimeStepResult(
@@ -926,10 +1005,23 @@ def signal_router_builder(
                     remaining -= processed
                 if not made_progress:
                     break
-            published = publish_signal_bus_prefix(
+            if price_peer is not None:
+                price_high, price_last, price_count = route_price_role(
+                    bus,
+                    peer=price_peer,
+                    activation=price_activation,
+                    policy=price_policy,
+                    observed_at=observed_at,
+                    limit=min(remaining, 100),
+                )
+                input_sequence += price_high
+                output_sequence += price_last
+                processed_count += price_count
+            published = publish_mixed_notification_bus_prefix(
                 bus=bus,
                 spool=signal_spool,
-                limit=settings.batch_limit,
+                limit=min(settings.batch_limit, 100),
+                observed_at=observed_at,
             )
             if published.published_high_watermark >= published.source_high_watermark:
                 try:
@@ -960,6 +1052,8 @@ def signal_router_builder(
                 watermark_advanced=watermark_advanced,
             )
 
+        if price_peer is not None:
+            step.close = price_peer.close
         return step
 
     return build
@@ -1024,9 +1118,14 @@ def notifier_builder(
 ) -> RuntimeServiceBuilder:
     def build(manifest: RuntimeServiceManifest) -> RuntimeServiceStep:
         _require_manifest(manifest, kind=RuntimeServiceKind.NOTIFIER)
-        settings = NotifierSettings.model_validate(dict(manifest.settings))
+        settings = NotifierSettings.model_validate(manifest.model_dump(mode="python")["settings"])
+        price_activation, price_peer, price_policy = None, None, None
+        if settings.price_alert_peer is not None:
+            price_activation, price_peer, price_policy = open_price_role_peer(
+                manifest, settings.price_alert_peer, runtime_root=runtime_root
+            )
         store = settings.open_store()
-        source = ReadonlySignalRouteSpool(settings.signal_spool_root)
+        source = ReadonlyNotificationEventRouteSpool(settings.signal_spool_root)
         authority_publisher: ServingSourceAuthorityPublisher | None = None
         authority_reader: ServingSourceAuthorityReader | None = None
         previous_authority_reader: ServingSourceAuthorityReader | None = None
@@ -1213,6 +1312,10 @@ def notifier_builder(
                         previous_reader=previous_authority_reader,
                         observed_at=authority_observed_at,
                         history_limit=settings.serving_history_limit,
+                        price_peer=price_peer,
+                        price_activation=price_activation,
+                        price_shadow=settings.suppress_delivery,
+                        price_paused=True,
                     )
                     source_generations["signals_serving_authority"] = generation_id
                     if omitted:
@@ -1232,14 +1335,33 @@ def notifier_builder(
                 )
 
             observed_at = clock()
+            if price_activation is not None:
+                apply_price_role_scope(
+                    store,
+                    activation=price_activation,
+                    policy=price_policy,
+                    serving_root=settings.price_alert_peer.scope_serving_root,
+                    observed_at=observed_at,
+                )
             visible_records = _read_routed_prefix_at(
                 source,
                 after_sequence=cursor.last_global_sequence,
                 through_sequence=descriptor.high_watermark,
                 observed_at=observed_at,
-                limit=settings.batch_limit,
+                limit=min(settings.batch_limit, 100),
             )
-            replicated = store.replicate(
+            with store._read_snapshot() as connection:
+                mixed_installed = (
+                    connection.execute(
+                        "SELECT 1 FROM signal_bus_metadata WHERE metadata_key='m"
+                        "ixed_notification_history'"
+                    ).fetchone()
+                    is not None
+                )
+            replicate = (
+                store.replicate_mixed_notification_events if mixed_installed else store.replicate
+            )
+            replicated = replicate(
                 descriptor,
                 visible_records,
                 observed_at=observed_at,
@@ -1270,6 +1392,7 @@ def notifier_builder(
                 lease_for=timedelta(seconds=settings.lease_seconds),
                 limit=settings.batch_limit,
                 clock=clock,
+                price_activation=price_activation,
             )
             degraded: list[str] = []
             if settings.suppress_delivery:
@@ -1306,6 +1429,9 @@ def notifier_builder(
                     previous_reader=previous_authority_reader,
                     observed_at=authority_observed_at,
                     history_limit=settings.serving_history_limit,
+                    price_peer=price_peer,
+                    price_activation=price_activation,
+                    price_shadow=settings.suppress_delivery,
                 )
                 source_generations["signals_serving_authority"] = generation_id
                 if omitted:
@@ -1341,6 +1467,8 @@ def notifier_builder(
             step.replica_iteration_skipped_by_floor = (
                 page_projection_producer.source.replica_iteration_skipped_by_floor
             )
+        if price_peer is not None:
+            step.close = price_peer.close
 
         return step
 
