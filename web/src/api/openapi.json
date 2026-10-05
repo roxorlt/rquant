@@ -4872,6 +4872,113 @@
         "title": "DeliveriesSummary",
         "type": "object"
       },
+      "DrawdownRule-Input": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "enum": [
+              "block_new_positions",
+              "cap_total_risk_weight"
+            ],
+            "title": "Action",
+            "type": "string"
+          },
+          "release_drawdown": {
+            "anyOf": [
+              {
+                "exclusiveMaximum": 1.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              }
+            ],
+            "default": "0",
+            "title": "Release Drawdown"
+          },
+          "total_risk_weight_cap": {
+            "anyOf": [
+              {
+                "exclusiveMaximum": 1.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Total Risk Weight Cap"
+          },
+          "trigger_drawdown": {
+            "anyOf": [
+              {
+                "exclusiveMaximum": 1.0,
+                "exclusiveMinimum": 0.0,
+                "type": "number"
+              },
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              }
+            ],
+            "title": "Trigger Drawdown"
+          }
+        },
+        "required": [
+          "trigger_drawdown",
+          "action"
+        ],
+        "title": "DrawdownRule",
+        "type": "object"
+      },
+      "DrawdownRule-Output": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "enum": [
+              "block_new_positions",
+              "cap_total_risk_weight"
+            ],
+            "title": "Action",
+            "type": "string"
+          },
+          "release_drawdown": {
+            "default": "0",
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Release Drawdown",
+            "type": "string"
+          },
+          "total_risk_weight_cap": {
+            "anyOf": [
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Total Risk Weight Cap"
+          },
+          "trigger_drawdown": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Trigger Drawdown",
+            "type": "string"
+          }
+        },
+        "required": [
+          "trigger_drawdown",
+          "action"
+        ],
+        "title": "DrawdownRule",
+        "type": "object"
+      },
       "EditableCanvas": {
         "properties": {
           "command_id": {
@@ -5657,6 +5764,86 @@
         "title": "Envelope[PoolsData]",
         "type": "object"
       },
+      "Envelope_PortfolioCapabilities_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/PortfolioCapabilities"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[PortfolioCapabilities]",
+        "type": "object"
+      },
+      "Envelope_PortfolioJobsData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/PortfolioJobsData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[PortfolioJobsData]",
+        "type": "object"
+      },
+      "Envelope_PortfolioNavData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/PortfolioNavData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[PortfolioNavData]",
+        "type": "object"
+      },
+      "Envelope_PortfolioRowsData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/PortfolioRowsData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[PortfolioRowsData]",
+        "type": "object"
+      },
+      "Envelope_PortfolioSummaryData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/PortfolioSummaryData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[PortfolioSummaryData]",
+        "type": "object"
+      },
       "Envelope_PriceAlertRuleHeadData_": {
         "properties": {
           "data": {
@@ -6032,6 +6219,260 @@
           "message"
         ],
         "title": "ErrorItem",
+        "type": "object"
+      },
+      "ExecutionCostApplicability": {
+        "enum": [
+          "BUY",
+          "SELL",
+          "BOTH"
+        ],
+        "title": "ExecutionCostApplicability",
+        "type": "string"
+      },
+      "ExecutionCostFeeRule-Input": {
+        "additionalProperties": false,
+        "properties": {
+          "applies_to": {
+            "$ref": "#/components/schemas/ExecutionCostApplicability"
+          },
+          "minimum_amount": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              }
+            ],
+            "title": "Minimum Amount"
+          },
+          "rate_bps": {
+            "anyOf": [
+              {
+                "exclusiveMaximum": 10000.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              }
+            ],
+            "title": "Rate Bps"
+          },
+          "rule_id": {
+            "minLength": 1,
+            "title": "Rule Id",
+            "type": "string"
+          },
+          "selector_id": {
+            "minLength": 1,
+            "title": "Selector Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "rule_id",
+          "selector_id",
+          "rate_bps",
+          "minimum_amount",
+          "applies_to"
+        ],
+        "title": "ExecutionCostFeeRule",
+        "type": "object"
+      },
+      "ExecutionCostFeeRule-Output": {
+        "additionalProperties": false,
+        "properties": {
+          "applies_to": {
+            "$ref": "#/components/schemas/ExecutionCostApplicability"
+          },
+          "minimum_amount": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Minimum Amount",
+            "type": "string"
+          },
+          "rate_bps": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Rate Bps",
+            "type": "string"
+          },
+          "rule_id": {
+            "minLength": 1,
+            "title": "Rule Id",
+            "type": "string"
+          },
+          "selector_id": {
+            "minLength": 1,
+            "title": "Selector Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "rule_id",
+          "selector_id",
+          "rate_bps",
+          "minimum_amount",
+          "applies_to"
+        ],
+        "title": "ExecutionCostFeeRule",
+        "type": "object"
+      },
+      "ExecutionCostMoney-Input": {
+        "additionalProperties": false,
+        "properties": {
+          "quantum": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "type": "number"
+              },
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              }
+            ],
+            "title": "Quantum"
+          },
+          "rounding": {
+            "const": "HALF_UP",
+            "title": "Rounding",
+            "type": "string"
+          }
+        },
+        "required": [
+          "quantum",
+          "rounding"
+        ],
+        "title": "ExecutionCostMoney",
+        "type": "object"
+      },
+      "ExecutionCostMoney-Output": {
+        "additionalProperties": false,
+        "properties": {
+          "quantum": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Quantum",
+            "type": "string"
+          },
+          "rounding": {
+            "const": "HALF_UP",
+            "title": "Rounding",
+            "type": "string"
+          }
+        },
+        "required": [
+          "quantum",
+          "rounding"
+        ],
+        "title": "ExecutionCostMoney",
+        "type": "object"
+      },
+      "ExecutionCostSlippage-Input": {
+        "additionalProperties": false,
+        "properties": {
+          "buy_bps": {
+            "anyOf": [
+              {
+                "exclusiveMaximum": 10000.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              }
+            ],
+            "title": "Buy Bps"
+          },
+          "owner": {
+            "const": "shared_cost_engine",
+            "title": "Owner",
+            "type": "string"
+          },
+          "price_rounding": {
+            "const": "HALF_UP",
+            "title": "Price Rounding",
+            "type": "string"
+          },
+          "price_tick": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "type": "number"
+              },
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              }
+            ],
+            "title": "Price Tick"
+          },
+          "sell_bps": {
+            "anyOf": [
+              {
+                "exclusiveMaximum": 10000.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              }
+            ],
+            "title": "Sell Bps"
+          }
+        },
+        "required": [
+          "owner",
+          "buy_bps",
+          "sell_bps",
+          "price_tick",
+          "price_rounding"
+        ],
+        "title": "ExecutionCostSlippage",
+        "type": "object"
+      },
+      "ExecutionCostSlippage-Output": {
+        "additionalProperties": false,
+        "properties": {
+          "buy_bps": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Buy Bps",
+            "type": "string"
+          },
+          "owner": {
+            "const": "shared_cost_engine",
+            "title": "Owner",
+            "type": "string"
+          },
+          "price_rounding": {
+            "const": "HALF_UP",
+            "title": "Price Rounding",
+            "type": "string"
+          },
+          "price_tick": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Price Tick",
+            "type": "string"
+          },
+          "sell_bps": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Sell Bps",
+            "type": "string"
+          }
+        },
+        "required": [
+          "owner",
+          "buy_bps",
+          "sell_bps",
+          "price_tick",
+          "price_rounding"
+        ],
+        "title": "ExecutionCostSlippage",
         "type": "object"
       },
       "ExperimentItem": {
@@ -12287,6 +12728,29 @@
         "title": "HealthData",
         "type": "object"
       },
+      "HistogramBin": {
+        "properties": {
+          "count": {
+            "title": "Count",
+            "type": "integer"
+          },
+          "lower": {
+            "title": "Lower",
+            "type": "number"
+          },
+          "upper": {
+            "title": "Upper",
+            "type": "number"
+          }
+        },
+        "required": [
+          "lower",
+          "upper",
+          "count"
+        ],
+        "title": "HistogramBin",
+        "type": "object"
+      },
       "HoldingItem": {
         "properties": {
           "available_quantity": {
@@ -12506,6 +12970,46 @@
           "excess_kurtosis"
         ],
         "title": "ICSeriesSummary",
+        "type": "object"
+      },
+      "InstrumentSelector": {
+        "additionalProperties": false,
+        "description": "One exact, ordered instrument-scope selector for a v3 cost contract.",
+        "properties": {
+          "exchange": {
+            "minLength": 1,
+            "title": "Exchange",
+            "type": "string"
+          },
+          "instrument_class": {
+            "minLength": 1,
+            "title": "Instrument Class",
+            "type": "string"
+          },
+          "market": {
+            "minLength": 1,
+            "title": "Market",
+            "type": "string"
+          },
+          "security_class": {
+            "minLength": 1,
+            "title": "Security Class",
+            "type": "string"
+          },
+          "selector_id": {
+            "minLength": 1,
+            "title": "Selector Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "selector_id",
+          "market",
+          "exchange",
+          "instrument_class",
+          "security_class"
+        ],
+        "title": "InstrumentSelector",
         "type": "object"
       },
       "IntradayData": {
@@ -15196,6 +15700,139 @@
         "title": "ParseIssue",
         "type": "object"
       },
+      "PerformanceSummary": {
+        "properties": {
+          "annualized_return": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Annualized Return"
+          },
+          "annualized_volatility": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Annualized Volatility"
+          },
+          "calmar": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Calmar"
+          },
+          "max_drawdown": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Drawdown"
+          },
+          "max_drawdown_duration": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Drawdown Duration"
+          },
+          "observations": {
+            "title": "Observations",
+            "type": "integer"
+          },
+          "payoff_ratio": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Payoff Ratio"
+          },
+          "sharpe": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sharpe"
+          },
+          "sortino": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sortino"
+          },
+          "total_return": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Total Return"
+          },
+          "win_rate": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Win Rate"
+          }
+        },
+        "required": [
+          "observations",
+          "total_return",
+          "annualized_return",
+          "annualized_volatility",
+          "sharpe",
+          "sortino",
+          "calmar",
+          "max_drawdown",
+          "max_drawdown_duration",
+          "win_rate",
+          "payoff_ratio"
+        ],
+        "title": "PerformanceSummary",
+        "type": "object"
+      },
       "PipelineStage": {
         "properties": {
           "hint": {
@@ -16034,6 +16671,555 @@
         "title": "PoolsData",
         "type": "object"
       },
+      "PortfolioCapabilities": {
+        "additionalProperties": false,
+        "properties": {
+          "available": {
+            "title": "Available",
+            "type": "boolean"
+          },
+          "benchmarks": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Benchmarks",
+            "type": "array"
+          },
+          "can_export": {
+            "title": "Can Export",
+            "type": "boolean"
+          },
+          "can_run": {
+            "title": "Can Run",
+            "type": "boolean"
+          },
+          "default_config": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PortfolioEditableConfig-Output"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Message"
+          },
+          "sources": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/PortfolioSourceOption"
+            },
+            "title": "Sources",
+            "type": "array"
+          }
+        },
+        "required": [
+          "available",
+          "can_run",
+          "can_export",
+          "message"
+        ],
+        "title": "PortfolioCapabilities",
+        "type": "object"
+      },
+      "PortfolioCommandReceipt": {
+        "additionalProperties": false,
+        "properties": {
+          "byte_size": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Byte Size"
+          },
+          "command_id": {
+            "format": "uuid",
+            "title": "Command Id",
+            "type": "string"
+          },
+          "job_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Job Id"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "result_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Result Hash"
+          },
+          "sha256": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sha256"
+          },
+          "status": {
+            "enum": [
+              "submitted",
+              "pending",
+              "processing",
+              "unknown",
+              "failed",
+              "conflict",
+              "exported"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "zip_request_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Zip Request Id"
+          }
+        },
+        "required": [
+          "command_id",
+          "status",
+          "message"
+        ],
+        "title": "PortfolioCommandReceipt",
+        "type": "object"
+      },
+      "PortfolioCostConfig-Input": {
+        "additionalProperties": false,
+        "description": "Exact v3 JSON; validation remains owned by the shared cost contract.",
+        "properties": {
+          "assessment_unit": {
+            "const": "FILL",
+            "title": "Assessment Unit",
+            "type": "string"
+          },
+          "commission_rules": {
+            "items": {
+              "$ref": "#/components/schemas/ExecutionCostFeeRule-Input"
+            },
+            "title": "Commission Rules",
+            "type": "array"
+          },
+          "cost_engine_version": {
+            "title": "Cost Engine Version",
+            "type": "string"
+          },
+          "cost_spec_id": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cost Spec Id"
+          },
+          "fee_notional_basis": {
+            "const": "EXECUTED_NOTIONAL",
+            "title": "Fee Notional Basis",
+            "type": "string"
+          },
+          "instrument_selectors": {
+            "items": {
+              "$ref": "#/components/schemas/InstrumentSelector"
+            },
+            "title": "Instrument Selectors",
+            "type": "array"
+          },
+          "money": {
+            "$ref": "#/components/schemas/ExecutionCostMoney-Input"
+          },
+          "research_notional_per_trade": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Research Notional Per Trade"
+          },
+          "schema_version": {
+            "const": 3,
+            "default": 3,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "slippage": {
+            "$ref": "#/components/schemas/ExecutionCostSlippage-Input"
+          },
+          "stamp_duty_rules": {
+            "items": {
+              "$ref": "#/components/schemas/ExecutionCostFeeRule-Input"
+            },
+            "title": "Stamp Duty Rules",
+            "type": "array"
+          },
+          "transfer_fee_rules": {
+            "items": {
+              "$ref": "#/components/schemas/ExecutionCostFeeRule-Input"
+            },
+            "title": "Transfer Fee Rules",
+            "type": "array"
+          }
+        },
+        "required": [
+          "cost_engine_version",
+          "instrument_selectors",
+          "commission_rules",
+          "transfer_fee_rules",
+          "stamp_duty_rules",
+          "fee_notional_basis",
+          "assessment_unit",
+          "slippage",
+          "money"
+        ],
+        "title": "PortfolioCostConfig",
+        "type": "object"
+      },
+      "PortfolioCostConfig-Output": {
+        "additionalProperties": false,
+        "description": "Exact v3 JSON; validation remains owned by the shared cost contract.",
+        "properties": {
+          "assessment_unit": {
+            "const": "FILL",
+            "title": "Assessment Unit",
+            "type": "string"
+          },
+          "commission_rules": {
+            "items": {
+              "$ref": "#/components/schemas/ExecutionCostFeeRule-Output"
+            },
+            "title": "Commission Rules",
+            "type": "array"
+          },
+          "cost_engine_version": {
+            "title": "Cost Engine Version",
+            "type": "string"
+          },
+          "cost_spec_id": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cost Spec Id"
+          },
+          "fee_notional_basis": {
+            "const": "EXECUTED_NOTIONAL",
+            "title": "Fee Notional Basis",
+            "type": "string"
+          },
+          "instrument_selectors": {
+            "items": {
+              "$ref": "#/components/schemas/InstrumentSelector"
+            },
+            "title": "Instrument Selectors",
+            "type": "array"
+          },
+          "money": {
+            "$ref": "#/components/schemas/ExecutionCostMoney-Output"
+          },
+          "research_notional_per_trade": {
+            "anyOf": [
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Research Notional Per Trade"
+          },
+          "schema_version": {
+            "const": 3,
+            "default": 3,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "slippage": {
+            "$ref": "#/components/schemas/ExecutionCostSlippage-Output"
+          },
+          "stamp_duty_rules": {
+            "items": {
+              "$ref": "#/components/schemas/ExecutionCostFeeRule-Output"
+            },
+            "title": "Stamp Duty Rules",
+            "type": "array"
+          },
+          "transfer_fee_rules": {
+            "items": {
+              "$ref": "#/components/schemas/ExecutionCostFeeRule-Output"
+            },
+            "title": "Transfer Fee Rules",
+            "type": "array"
+          }
+        },
+        "required": [
+          "cost_engine_version",
+          "instrument_selectors",
+          "commission_rules",
+          "transfer_fee_rules",
+          "stamp_duty_rules",
+          "fee_notional_basis",
+          "assessment_unit",
+          "slippage",
+          "money"
+        ],
+        "title": "PortfolioCostConfig",
+        "type": "object"
+      },
+      "PortfolioCreateRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "command_id": {
+            "format": "uuid",
+            "title": "Command Id",
+            "type": "string"
+          },
+          "config": {
+            "$ref": "#/components/schemas/PortfolioEditableConfig-Input"
+          },
+          "requested_at": {
+            "format": "date-time",
+            "title": "Requested At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "command_id",
+          "requested_at",
+          "config"
+        ],
+        "title": "PortfolioCreateRequest",
+        "type": "object"
+      },
+      "PortfolioEditableConfig-Input": {
+        "additionalProperties": false,
+        "properties": {
+          "benchmark_code": {
+            "default": "000300.SH",
+            "title": "Benchmark Code",
+            "type": "string"
+          },
+          "drawdown_rule": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DrawdownRule-Input"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "end_date": {
+            "format": "date",
+            "title": "End Date",
+            "type": "string"
+          },
+          "execution_cost_spec": {
+            "$ref": "#/components/schemas/PortfolioCostConfig-Input"
+          },
+          "initial_cash": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "maximum": 1000000000000.0,
+                "type": "number"
+              },
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              }
+            ],
+            "title": "Initial Cash"
+          },
+          "rebalance_rule": {
+            "$ref": "#/components/schemas/RebalanceRule"
+          },
+          "source_key": {
+            "default": "verified-screen",
+            "pattern": "^[a-zA-Z0-9_.:-]{1,128}$",
+            "title": "Source Key",
+            "type": "string"
+          },
+          "source_version": {
+            "default": 1,
+            "minimum": 1.0,
+            "title": "Source Version",
+            "type": "integer"
+          },
+          "start_date": {
+            "format": "date",
+            "title": "Start Date",
+            "type": "string"
+          },
+          "weight_rule": {
+            "$ref": "#/components/schemas/PortfolioWeightRule-Input"
+          }
+        },
+        "required": [
+          "start_date",
+          "end_date",
+          "initial_cash",
+          "weight_rule",
+          "rebalance_rule",
+          "execution_cost_spec"
+        ],
+        "title": "PortfolioEditableConfig",
+        "type": "object"
+      },
+      "PortfolioEditableConfig-Output": {
+        "additionalProperties": false,
+        "properties": {
+          "benchmark_code": {
+            "default": "000300.SH",
+            "title": "Benchmark Code",
+            "type": "string"
+          },
+          "drawdown_rule": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DrawdownRule-Output"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "end_date": {
+            "format": "date",
+            "title": "End Date",
+            "type": "string"
+          },
+          "execution_cost_spec": {
+            "$ref": "#/components/schemas/PortfolioCostConfig-Output"
+          },
+          "initial_cash": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Initial Cash",
+            "type": "string"
+          },
+          "rebalance_rule": {
+            "$ref": "#/components/schemas/RebalanceRule"
+          },
+          "source_key": {
+            "default": "verified-screen",
+            "pattern": "^[a-zA-Z0-9_.:-]{1,128}$",
+            "title": "Source Key",
+            "type": "string"
+          },
+          "source_version": {
+            "default": 1,
+            "minimum": 1.0,
+            "title": "Source Version",
+            "type": "integer"
+          },
+          "start_date": {
+            "format": "date",
+            "title": "Start Date",
+            "type": "string"
+          },
+          "weight_rule": {
+            "$ref": "#/components/schemas/PortfolioWeightRule-Output"
+          }
+        },
+        "required": [
+          "start_date",
+          "end_date",
+          "initial_cash",
+          "weight_rule",
+          "rebalance_rule",
+          "execution_cost_spec"
+        ],
+        "title": "PortfolioEditableConfig",
+        "type": "object"
+      },
+      "PortfolioExportRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "command_id": {
+            "format": "uuid",
+            "title": "Command Id",
+            "type": "string"
+          },
+          "job_id": {
+            "format": "uuid",
+            "title": "Job Id",
+            "type": "string"
+          },
+          "requested_at": {
+            "format": "date-time",
+            "title": "Requested At",
+            "type": "string"
+          },
+          "result_hash": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Result Hash",
+            "type": "string"
+          }
+        },
+        "required": [
+          "command_id",
+          "requested_at",
+          "job_id",
+          "result_hash"
+        ],
+        "title": "PortfolioExportRequest",
+        "type": "object"
+      },
       "PortfolioGroupPoint": {
         "additionalProperties": false,
         "description": "One group's completed return, compounded return and target-weight change.",
@@ -16140,6 +17326,894 @@
           "long_short_cumulative_spread"
         ],
         "title": "PortfolioGroupingDay",
+        "type": "object"
+      },
+      "PortfolioHoldingRow": {
+        "additionalProperties": false,
+        "properties": {
+          "available_quantity": {
+            "title": "Available Quantity",
+            "type": "integer"
+          },
+          "average_cost": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Average Cost",
+            "type": "string"
+          },
+          "code": {
+            "title": "Code",
+            "type": "string"
+          },
+          "frozen_quantity": {
+            "title": "Frozen Quantity",
+            "type": "integer"
+          },
+          "market_price": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Market Price",
+            "type": "string"
+          },
+          "quantity": {
+            "title": "Quantity",
+            "type": "integer"
+          },
+          "trade_date": {
+            "format": "date",
+            "title": "Trade Date",
+            "type": "string"
+          }
+        },
+        "required": [
+          "trade_date",
+          "code",
+          "quantity",
+          "available_quantity",
+          "frozen_quantity",
+          "average_cost",
+          "market_price"
+        ],
+        "title": "PortfolioHoldingRow",
+        "type": "object"
+      },
+      "PortfolioJob": {
+        "additionalProperties": false,
+        "properties": {
+          "can_cancel": {
+            "default": false,
+            "title": "Can Cancel",
+            "type": "boolean"
+          },
+          "can_pause": {
+            "default": false,
+            "title": "Can Pause",
+            "type": "boolean"
+          },
+          "can_resume": {
+            "default": false,
+            "title": "Can Resume",
+            "type": "boolean"
+          },
+          "can_retry": {
+            "default": false,
+            "title": "Can Retry",
+            "type": "boolean"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "end_date": {
+            "format": "date",
+            "title": "End Date",
+            "type": "string"
+          },
+          "job_id": {
+            "format": "uuid",
+            "title": "Job Id",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "progress": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Progress"
+          },
+          "result_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Result Hash"
+          },
+          "start_date": {
+            "format": "date",
+            "title": "Start Date",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "queued",
+              "running",
+              "paused",
+              "cancelled",
+              "failed",
+              "completed",
+              "sealing"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
+            "type": "string"
+          },
+          "version": {
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "job_id",
+          "status",
+          "label",
+          "version",
+          "start_date",
+          "end_date",
+          "created_at",
+          "updated_at",
+          "result_hash",
+          "progress"
+        ],
+        "title": "PortfolioJob",
+        "type": "object"
+      },
+      "PortfolioJobsData": {
+        "additionalProperties": false,
+        "properties": {
+          "available": {
+            "title": "Available",
+            "type": "boolean"
+          },
+          "jobs": {
+            "items": {
+              "$ref": "#/components/schemas/PortfolioJob"
+            },
+            "title": "Jobs",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          }
+        },
+        "required": [
+          "available",
+          "jobs",
+          "next_cursor"
+        ],
+        "title": "PortfolioJobsData",
+        "type": "object"
+      },
+      "PortfolioLogRow": {
+        "additionalProperties": false,
+        "properties": {
+          "level": {
+            "enum": [
+              "normal",
+              "note",
+              "error"
+            ],
+            "title": "Level",
+            "type": "string"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "trade_date": {
+            "format": "date",
+            "title": "Trade Date",
+            "type": "string"
+          },
+          "ts_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ts Code"
+          }
+        },
+        "required": [
+          "trade_date",
+          "ts_code",
+          "level",
+          "message"
+        ],
+        "title": "PortfolioLogRow",
+        "type": "object"
+      },
+      "PortfolioMonthRow": {
+        "additionalProperties": false,
+        "properties": {
+          "month": {
+            "title": "Month",
+            "type": "integer"
+          },
+          "return_rate": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Return Rate"
+          },
+          "year": {
+            "title": "Year",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "year",
+          "month",
+          "return_rate"
+        ],
+        "title": "PortfolioMonthRow",
+        "type": "object"
+      },
+      "PortfolioNavData": {
+        "additionalProperties": false,
+        "properties": {
+          "result_hash": {
+            "title": "Result Hash",
+            "type": "string"
+          },
+          "rows": {
+            "items": {
+              "$ref": "#/components/schemas/PortfolioNavRow"
+            },
+            "title": "Rows",
+            "type": "array"
+          }
+        },
+        "required": [
+          "result_hash",
+          "rows"
+        ],
+        "title": "PortfolioNavData",
+        "type": "object"
+      },
+      "PortfolioNavRow": {
+        "additionalProperties": false,
+        "properties": {
+          "benchmark_nav": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Benchmark Nav"
+          },
+          "benchmark_return": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Benchmark Return"
+          },
+          "cash": {
+            "anyOf": [
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cash"
+          },
+          "daily_return": {
+            "anyOf": [
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Daily Return"
+          },
+          "drawdown": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Drawdown"
+          },
+          "fees": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Fees",
+            "type": "string"
+          },
+          "incomplete_reason": {
+            "anyOf": [
+              {
+                "const": "missing_held_close",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Incomplete Reason"
+          },
+          "market_value": {
+            "anyOf": [
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Market Value"
+          },
+          "nav": {
+            "anyOf": [
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Nav"
+          },
+          "normalized_nav": {
+            "anyOf": [
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Normalized Nav"
+          },
+          "rebalanced": {
+            "title": "Rebalanced",
+            "type": "boolean"
+          },
+          "trade_date": {
+            "format": "date",
+            "title": "Trade Date",
+            "type": "string"
+          }
+        },
+        "required": [
+          "trade_date",
+          "nav",
+          "normalized_nav",
+          "daily_return",
+          "cash",
+          "market_value",
+          "fees",
+          "benchmark_nav",
+          "benchmark_return",
+          "drawdown",
+          "rebalanced",
+          "incomplete_reason"
+        ],
+        "title": "PortfolioNavRow",
+        "type": "object"
+      },
+      "PortfolioPerformanceData": {
+        "additionalProperties": false,
+        "properties": {
+          "annualized_turnover": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Annualized Turnover"
+          },
+          "benchmark_summary": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PerformanceSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "distribution": {
+            "$ref": "#/components/schemas/ReturnDistribution"
+          },
+          "overfit_state": {
+            "const": "not_evaluated",
+            "title": "Overfit State",
+            "type": "string"
+          },
+          "relative": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RelativeMetrics"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "rolling": {
+            "items": {
+              "$ref": "#/components/schemas/PortfolioRollingMetric"
+            },
+            "title": "Rolling",
+            "type": "array"
+          },
+          "round_trip_analysis": {
+            "$ref": "#/components/schemas/RoundTripAnalysis"
+          },
+          "streaks": {
+            "$ref": "#/components/schemas/StreakSummary"
+          },
+          "summary": {
+            "$ref": "#/components/schemas/PerformanceSummary"
+          }
+        },
+        "required": [
+          "summary",
+          "benchmark_summary",
+          "relative",
+          "annualized_turnover",
+          "rolling",
+          "round_trip_analysis",
+          "distribution",
+          "streaks",
+          "overfit_state"
+        ],
+        "title": "PortfolioPerformanceData",
+        "type": "object"
+      },
+      "PortfolioRollingMetric": {
+        "additionalProperties": false,
+        "properties": {
+          "sharpe": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sharpe"
+          },
+          "trade_date": {
+            "format": "date",
+            "title": "Trade Date",
+            "type": "string"
+          },
+          "volatility": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Volatility"
+          }
+        },
+        "required": [
+          "trade_date",
+          "volatility",
+          "sharpe"
+        ],
+        "title": "PortfolioRollingMetric",
+        "type": "object"
+      },
+      "PortfolioRowsData": {
+        "additionalProperties": false,
+        "properties": {
+          "daily": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/PortfolioNavRow"
+            },
+            "title": "Daily",
+            "type": "array"
+          },
+          "holdings": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/PortfolioHoldingRow"
+            },
+            "title": "Holdings",
+            "type": "array"
+          },
+          "log": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/PortfolioLogRow"
+            },
+            "title": "Log",
+            "type": "array"
+          },
+          "monthly": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/PortfolioMonthRow"
+            },
+            "title": "Monthly",
+            "type": "array"
+          },
+          "next_offset": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Offset"
+          },
+          "result_hash": {
+            "title": "Result Hash",
+            "type": "string"
+          },
+          "total": {
+            "title": "Total",
+            "type": "integer"
+          },
+          "trades": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/PortfolioTradeRow"
+            },
+            "title": "Trades",
+            "type": "array"
+          },
+          "view": {
+            "enum": [
+              "trades",
+              "holdings",
+              "daily",
+              "monthly",
+              "log"
+            ],
+            "title": "View",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result_hash",
+          "view",
+          "total",
+          "next_offset"
+        ],
+        "title": "PortfolioRowsData",
+        "type": "object"
+      },
+      "PortfolioSourceOption": {
+        "additionalProperties": false,
+        "properties": {
+          "end_date": {
+            "format": "date",
+            "title": "End Date",
+            "type": "string"
+          },
+          "industry_available": {
+            "title": "Industry Available",
+            "type": "boolean"
+          },
+          "key": {
+            "title": "Key",
+            "type": "string"
+          },
+          "label": {
+            "maxLength": 60,
+            "minLength": 1,
+            "title": "Label",
+            "type": "string"
+          },
+          "opening_verified": {
+            "title": "Opening Verified",
+            "type": "boolean"
+          },
+          "ranking_available": {
+            "title": "Ranking Available",
+            "type": "boolean"
+          },
+          "start_date": {
+            "format": "date",
+            "title": "Start Date",
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
+            "type": "string"
+          },
+          "version": {
+            "minimum": 1.0,
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "key",
+          "version",
+          "label",
+          "start_date",
+          "end_date",
+          "updated_at",
+          "ranking_available",
+          "industry_available",
+          "opening_verified"
+        ],
+        "title": "PortfolioSourceOption",
+        "type": "object"
+      },
+      "PortfolioSummaryData": {
+        "additionalProperties": false,
+        "properties": {
+          "available": {
+            "title": "Available",
+            "type": "boolean"
+          },
+          "benchmark_available": {
+            "title": "Benchmark Available",
+            "type": "boolean"
+          },
+          "benchmark_message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Benchmark Message"
+          },
+          "can_report": {
+            "title": "Can Report",
+            "type": "boolean"
+          },
+          "completed_days": {
+            "title": "Completed Days",
+            "type": "integer"
+          },
+          "config": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PortfolioEditableConfig-Output"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "job": {
+            "$ref": "#/components/schemas/PortfolioJob"
+          },
+          "message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Message"
+          },
+          "performance": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PortfolioPerformanceData"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "result_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Result Hash"
+          },
+          "result_status": {
+            "anyOf": [
+              {
+                "enum": [
+                  "complete",
+                  "incomplete"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Result Status"
+          },
+          "source_updated_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Updated At"
+          }
+        },
+        "required": [
+          "available",
+          "job",
+          "result_hash",
+          "result_status",
+          "config",
+          "performance",
+          "benchmark_available",
+          "benchmark_message",
+          "source_updated_at",
+          "completed_days",
+          "message",
+          "can_report"
+        ],
+        "title": "PortfolioSummaryData",
+        "type": "object"
+      },
+      "PortfolioTradeRow": {
+        "additionalProperties": false,
+        "properties": {
+          "amount": {
+            "anyOf": [
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Amount"
+          },
+          "fees": {
+            "anyOf": [
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fees"
+          },
+          "price": {
+            "anyOf": [
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Price"
+          },
+          "quantity": {
+            "title": "Quantity",
+            "type": "integer"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "side": {
+            "enum": [
+              "BUY",
+              "SELL"
+            ],
+            "title": "Side",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "trade_date": {
+            "format": "date",
+            "title": "Trade Date",
+            "type": "string"
+          },
+          "ts_code": {
+            "title": "Ts Code",
+            "type": "string"
+          }
+        },
+        "required": [
+          "trade_date",
+          "ts_code",
+          "side",
+          "quantity",
+          "price",
+          "amount",
+          "fees",
+          "status",
+          "reason"
+        ],
+        "title": "PortfolioTradeRow",
         "type": "object"
       },
       "PortfolioWeightRule-Input": {
@@ -17606,6 +19680,91 @@
         "title": "RebalanceRule",
         "type": "object"
       },
+      "RelativeMetrics": {
+        "properties": {
+          "aligned_observations": {
+            "title": "Aligned Observations",
+            "type": "integer"
+          },
+          "alpha": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Alpha"
+          },
+          "beta": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Beta"
+          },
+          "excess_annualized_return": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Excess Annualized Return"
+          },
+          "excess_total_return": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Excess Total Return"
+          },
+          "information_ratio": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Information Ratio"
+          },
+          "tracking_error": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tracking Error"
+          }
+        },
+        "required": [
+          "aligned_observations",
+          "excess_total_return",
+          "excess_annualized_return",
+          "alpha",
+          "beta",
+          "tracking_error",
+          "information_ratio"
+        ],
+        "title": "RelativeMetrics",
+        "type": "object"
+      },
       "ResearchJobItem": {
         "properties": {
           "available_actions": {
@@ -18138,6 +20297,75 @@
         "title": "ResourcesData",
         "type": "object"
       },
+      "ReturnDistribution": {
+        "properties": {
+          "bins": {
+            "items": {
+              "$ref": "#/components/schemas/HistogramBin"
+            },
+            "title": "Bins",
+            "type": "array"
+          },
+          "count": {
+            "title": "Count",
+            "type": "integer"
+          },
+          "mean": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mean"
+          },
+          "median": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Median"
+          },
+          "p05": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "P05"
+          },
+          "p95": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "P95"
+          }
+        },
+        "required": [
+          "count",
+          "mean",
+          "median",
+          "p05",
+          "p95",
+          "bins"
+        ],
+        "title": "ReturnDistribution",
+        "type": "object"
+      },
       "ReturnMissingCount": {
         "additionalProperties": false,
         "properties": {
@@ -18163,6 +20391,96 @@
           "count"
         ],
         "title": "ReturnMissingCount",
+        "type": "object"
+      },
+      "RoundTripAnalysis": {
+        "properties": {
+          "by_holding_days": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/RoundTripStats"
+            },
+            "title": "By Holding Days",
+            "type": "object"
+          },
+          "by_industry": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/RoundTripStats"
+            },
+            "title": "By Industry",
+            "type": "object"
+          },
+          "by_symbol": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/RoundTripStats"
+            },
+            "title": "By Symbol",
+            "type": "object"
+          },
+          "overall": {
+            "$ref": "#/components/schemas/RoundTripStats"
+          }
+        },
+        "required": [
+          "overall",
+          "by_symbol",
+          "by_industry",
+          "by_holding_days"
+        ],
+        "title": "RoundTripAnalysis",
+        "type": "object"
+      },
+      "RoundTripStats": {
+        "properties": {
+          "average_holding_days": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Average Holding Days"
+          },
+          "count": {
+            "title": "Count",
+            "type": "integer"
+          },
+          "net_pnl": {
+            "title": "Net Pnl",
+            "type": "number"
+          },
+          "payoff_ratio": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Payoff Ratio"
+          },
+          "win_rate": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Win Rate"
+          }
+        },
+        "required": [
+          "count",
+          "net_pnl",
+          "win_rate",
+          "payoff_ratio",
+          "average_holding_days"
+        ],
+        "title": "RoundTripStats",
         "type": "object"
       },
       "RuntimeServiceItem": {
@@ -20770,6 +23088,34 @@
         "title": "StrategyTemplateVersionsData",
         "type": "object"
       },
+      "StreakSummary": {
+        "properties": {
+          "current_loss": {
+            "title": "Current Loss",
+            "type": "integer"
+          },
+          "current_win": {
+            "title": "Current Win",
+            "type": "integer"
+          },
+          "longest_loss": {
+            "title": "Longest Loss",
+            "type": "integer"
+          },
+          "longest_win": {
+            "title": "Longest Win",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "longest_win",
+          "longest_loss",
+          "current_win",
+          "current_loss"
+        ],
+        "title": "StreakSummary",
+        "type": "object"
+      },
       "SurgeConfig": {
         "properties": {
           "boards": {
@@ -21995,6 +24341,480 @@
           }
         },
         "summary": "最近分钟回放",
+        "tags": [
+          "backtests"
+        ]
+      }
+    },
+    "/api/v1/backtests/portfolio/capabilities": {
+      "get": {
+        "operationId": "capabilities_api_v1_backtests_portfolio_capabilities_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_PortfolioCapabilities_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "组合回测来源与操作权限",
+        "tags": [
+          "backtests"
+        ]
+      }
+    },
+    "/api/v1/backtests/portfolio/exports": {
+      "post": {
+        "operationId": "submit_export_api_v1_backtests_portfolio_exports_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PortfolioExportRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PortfolioCommandReceipt"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PortfolioCommandReceipt"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "准备组合回测 ZIP",
+        "tags": [
+          "backtests"
+        ]
+      }
+    },
+    "/api/v1/backtests/portfolio/runs": {
+      "get": {
+        "operationId": "list_runs_api_v1_backtests_portfolio_runs_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "maximum": 50,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 4096,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_PortfolioJobsData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "组合回测记录",
+        "tags": [
+          "backtests"
+        ]
+      },
+      "post": {
+        "operationId": "submit_run_api_v1_backtests_portfolio_runs_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PortfolioCreateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PortfolioCommandReceipt"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PortfolioCommandReceipt"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "运行组合回测",
+        "tags": [
+          "backtests"
+        ]
+      }
+    },
+    "/api/v1/backtests/portfolio/runs/{job_id}": {
+      "get": {
+        "operationId": "summary_api_v1_backtests_portfolio_runs__job_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Job Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_PortfolioSummaryData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "组合回测绩效",
+        "tags": [
+          "backtests"
+        ]
+      }
+    },
+    "/api/v1/backtests/portfolio/runs/{job_id}/exports/{request_id}.zip": {
+      "get": {
+        "operationId": "download_zip_api_v1_backtests_portfolio_runs__job_id__exports__request_id__zip_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Job Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Request Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "result_hash",
+            "required": true,
+            "schema": {
+              "pattern": "^[0-9a-f]{64}$",
+              "title": "Result Hash",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "下载组合回测完整 ZIP",
+        "tags": [
+          "backtests"
+        ]
+      }
+    },
+    "/api/v1/backtests/portfolio/runs/{job_id}/nav": {
+      "get": {
+        "operationId": "nav_api_v1_backtests_portfolio_runs__job_id__nav_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Job Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "result_hash",
+            "required": true,
+            "schema": {
+              "pattern": "^[0-9a-f]{64}$",
+              "title": "Result Hash",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_PortfolioNavData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "组合净值与回撤",
+        "tags": [
+          "backtests"
+        ]
+      }
+    },
+    "/api/v1/backtests/portfolio/runs/{job_id}/report.html": {
+      "get": {
+        "operationId": "report_api_v1_backtests_portfolio_runs__job_id__report_html_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Job Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "result_hash",
+            "required": true,
+            "schema": {
+              "pattern": "^[0-9a-f]{64}$",
+              "title": "Result Hash",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "下载组合回测 HTML 报告",
+        "tags": [
+          "backtests"
+        ]
+      }
+    },
+    "/api/v1/backtests/portfolio/runs/{job_id}/rows": {
+      "get": {
+        "operationId": "rows_api_v1_backtests_portfolio_runs__job_id__rows_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Job Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "result_hash",
+            "required": true,
+            "schema": {
+              "pattern": "^[0-9a-f]{64}$",
+              "title": "Result Hash",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "view",
+            "required": true,
+            "schema": {
+              "enum": [
+                "trades",
+                "holdings",
+                "daily",
+                "monthly",
+                "log"
+              ],
+              "title": "View",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "exclusiveMaximum": 80000,
+              "minimum": 0,
+              "title": "Offset",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "maximum": 50,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_PortfolioRowsData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "组合回测明细",
         "tags": [
           "backtests"
         ]

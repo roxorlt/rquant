@@ -129,15 +129,23 @@ def resolve_builtin_adapter_registry(
     return registry
 
 
+def _read_builtin_runtime_configuration(configuration: object) -> BuiltinLabShardRuntimeConfig:
+    if isinstance(configuration, BuiltinLabShardRuntimeConfig):
+        return BuiltinLabShardRuntimeConfig.model_validate(configuration, strict=True)
+    # The child has already authenticated canonical JSON. JSON-mode strict
+    # validation restores its Path/tuple representations without scalar coercion.
+    return BuiltinLabShardRuntimeConfig.model_validate_json(
+        canonical_json_bytes(configuration), strict=True
+    )
+
+
 def execute_builtin_lab_shard(
     configuration: object,
     validated: ValidatedStrategyShard,
     *,
     runtime_code_sha: str,
 ) -> LabShardExecutionResult:
-    config = BuiltinLabShardRuntimeConfig.model_validate_json(
-        canonical_json_bytes(configuration), strict=True
-    )
+    config = _read_builtin_runtime_configuration(configuration)
     if not config.configured:
         raise LabDaemonConfigurationError("built-in shard runtime is not configured")
     registry = resolve_builtin_adapter_registry(config)
@@ -161,6 +169,13 @@ def execute_builtin_lab_shard(
         dataset_binding_hash=identity.binding_hash,
         code_commit=runtime_code_sha,
     )
+    if adapter.strategy_name == "portfolio_backtest":
+        from rquant.portfolio_backtest_source import open_gated_portfolio_store
+
+        with open_gated_portfolio_store(
+            request, metadata_store_factory=store_factory, lake_root=config.research_lake_root
+        ) as (store, _decision):
+            return registry.execute_shard(validated, store)
     with open_gated_research_store(
         request,
         metadata_store_factory=store_factory,

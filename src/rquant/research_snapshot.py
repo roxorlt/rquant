@@ -102,18 +102,14 @@ def _source_table_schema(
     table_name: str,
 ) -> tuple[tuple[tuple[str, str], ...], tuple[str, ...]]:
     try:
-        rows = connection.execute(
-            f"PRAGMA table_info({_quoted_literal(table_name)})"
-        ).fetchall()
+        rows = connection.execute(f"PRAGMA table_info({_quoted_literal(table_name)})").fetchall()
     except duckdb.CatalogException as exc:
         raise ValueError(f"source table missing: {table_name}") from exc
     if not rows:
         raise ValueError(f"source table missing: {table_name}")
     columns = tuple((str(row[1]), str(row[2])) for row in rows)
     primary_key = tuple(
-        str(row[1])
-        for row in sorted(rows, key=lambda item: int(item[5]))
-        if int(row[5]) > 0
+        str(row[1]) for row in sorted(rows, key=lambda item: int(item[5])) if int(row[5]) > 0
     )
     if not primary_key:
         raise ValueError(f"source table requires a primary key: {table_name}")
@@ -166,9 +162,7 @@ def materialize_table_dependency(
     if dependency.code_column is not None and selected_codes is not None:
         if selected_codes:
             placeholders = ",".join("?" for _ in selected_codes)
-            predicates.append(
-                f"{_quoted_identifier(dependency.code_column)} IN ({placeholders})"
-            )
+            predicates.append(f"{_quoted_identifier(dependency.code_column)} IN ({placeholders})")
             parameters.extend(selected_codes)
         else:
             predicates.append("FALSE")
@@ -176,19 +170,11 @@ def materialize_table_dependency(
     selected = ", ".join(_quoted_identifier(name) for name, _ in columns)
     ordered = ", ".join(_quoted_identifier(name) for name in primary_key)
     where = "" if not predicates else " WHERE " + " AND ".join(predicates)
-    query = (
-        f"SELECT {selected} FROM {_quoted_identifier(source_table)}"
-        f"{where} ORDER BY {ordered}"
-    )
+    query = f"SELECT {selected} FROM {_quoted_identifier(source_table)}{where} ORDER BY {ordered}"
     row = connection.execute(f"SELECT COUNT(*) FROM ({query})", parameters).fetchone()
     row_count = 0 if row is None else int(row[0])
 
-    versions_root = (
-        Path(artifact_root)
-        / "tables"
-        / dependency.table_name
-        / "versions"
-    )
+    versions_root = Path(artifact_root) / "tables" / dependency.table_name / "versions"
     versions_root.mkdir(parents=True, exist_ok=True)
     temp_path = versions_root / f".data.parquet.tmp-{uuid.uuid4().hex}"
     try:
@@ -201,12 +187,7 @@ def materialize_table_dependency(
         )
         _fsync_file(temp_path)
         file_hash = _file_sha256(temp_path)
-        relative_path = (
-            Path("tables")
-            / dependency.table_name
-            / "versions"
-            / f"{file_hash}.parquet"
-        )
+        relative_path = Path("tables") / dependency.table_name / "versions" / f"{file_hash}.parquet"
         final_path = Path(artifact_root) / relative_path
         if final_path.is_file():
             if _file_sha256(final_path) != file_hash:
@@ -231,8 +212,7 @@ def materialize_table_dependency(
             date_column = _quoted_identifier(dependency.date_column)
             with duckdb.connect() as validation:
                 bounds = validation.execute(
-                    f"SELECT MIN({date_column}), MAX({date_column}) "
-                    "FROM read_parquet(?)",
+                    f"SELECT MIN({date_column}), MAX({date_column}) FROM read_parquet(?)",
                     [str(final_path)],
                 ).fetchone()
             if bounds is not None and bounds[0] is not None:
@@ -243,8 +223,7 @@ def materialize_table_dependency(
             dataset_id=dependency.dataset_id,
             table_name=dependency.table_name,
             artifact_key=(
-                f"{dependency.dataset_id}:{start_date.isoformat()}:"
-                f"{end_date.isoformat()}"
+                f"{dependency.dataset_id}:{start_date.isoformat()}:{end_date.isoformat()}"
             ),
             relative_path=relative_path.as_posix(),
             row_count=row_count,
@@ -330,9 +309,7 @@ def materialize_suspension_session_evidence(
             as_of_time=as_of_time,
         )
     finally:
-        connection.execute(
-            f"DROP TABLE IF EXISTS {_quoted_identifier(temp_table)}"
-        )
+        connection.execute(f"DROP TABLE IF EXISTS {_quoted_identifier(temp_table)}")
 
 
 def materialize_eligibility_resolution(
@@ -396,16 +373,10 @@ def materialize_eligibility_resolution(
             as_of_time=as_of_time,
         )
         return artifact.model_copy(
-            update={
-                "artifact_key": (
-                    f"strategy_eligibility:{resolution.resolution_hash}"
-                )
-            }
+            update={"artifact_key": (f"strategy_eligibility:{resolution.resolution_hash}")}
         )
     finally:
-        connection.execute(
-            f"DROP TABLE IF EXISTS {_quoted_identifier(temp_table)}"
-        )
+        connection.execute(f"DROP TABLE IF EXISTS {_quoted_identifier(temp_table)}")
 
 
 def verify_materialized_table_artifact(
@@ -415,42 +386,26 @@ def verify_materialized_table_artifact(
     as_of_time: datetime,
 ) -> Path:
     if artifact.artifact_type != "materialized_table":
-        raise ValueError(
-            "verify_materialized_table_artifact requires materialized_table"
-        )
+        raise ValueError("verify_materialized_table_artifact requires materialized_table")
     expected_relative = (
-        Path("tables")
-        / artifact.table_name
-        / "versions"
-        / f"{artifact.file_hash}.parquet"
+        Path("tables") / artifact.table_name / "versions" / f"{artifact.file_hash}.parquet"
     )
     if Path(artifact.relative_path) != expected_relative:
         raise ValueError(
-            f"materialized artifact path is not content-addressed: "
-            f"{artifact.artifact_key}"
+            f"materialized artifact path is not content-addressed: {artifact.artifact_key}"
         )
     root = Path(lake_root).resolve()
     path = (root / expected_relative).resolve()
     if not path.is_relative_to(root):
-        raise ValueError(
-            f"materialized artifact escapes lake root: {artifact.artifact_key}"
-        )
+        raise ValueError(f"materialized artifact escapes lake root: {artifact.artifact_key}")
     if not path.is_file():
-        raise ValueError(
-            f"materialized artifact file missing: {artifact.artifact_key}"
-        )
+        raise ValueError(f"materialized artifact file missing: {artifact.artifact_key}")
     if artifact.file_size is not None and path.stat().st_size != artifact.file_size:
-        raise ValueError(
-            f"materialized artifact file size mismatch: {artifact.artifact_key}"
-        )
+        raise ValueError(f"materialized artifact file size mismatch: {artifact.artifact_key}")
     if _file_sha256(path) != artifact.file_hash:
-        raise ValueError(
-            f"materialized artifact file hash mismatch: {artifact.artifact_key}"
-        )
+        raise ValueError(f"materialized artifact file hash mismatch: {artifact.artifact_key}")
     if not artifact.primary_key:
-        raise ValueError(
-            f"materialized artifact primary key missing: {artifact.artifact_key}"
-        )
+        raise ValueError(f"materialized artifact primary key missing: {artifact.artifact_key}")
 
     parquet = _quoted_literal(str(path))
     reader = f"read_parquet({parquet}, hive_partitioning = false)"
@@ -458,20 +413,12 @@ def verify_materialized_table_artifact(
         described = validation.execute(f"DESCRIBE SELECT * FROM {reader}").fetchall()
         columns = tuple((str(row[0]), str(row[1])) for row in described)
         if _schema_hash(columns) != artifact.schema_hash:
-            raise ValueError(
-                f"materialized artifact schema hash mismatch: "
-                f"{artifact.artifact_key}"
-            )
+            raise ValueError(f"materialized artifact schema hash mismatch: {artifact.artifact_key}")
         row = validation.execute(f"SELECT COUNT(*) FROM {reader}").fetchone()
         row_count = 0 if row is None else int(row[0])
         if row_count != artifact.row_count:
-            raise ValueError(
-                f"materialized artifact row count mismatch: "
-                f"{artifact.artifact_key}"
-            )
-        keys = ", ".join(
-            _quoted_identifier(column) for column in artifact.primary_key
-        )
+            raise ValueError(f"materialized artifact row count mismatch: {artifact.artifact_key}")
+        keys = ", ".join(_quoted_identifier(column) for column in artifact.primary_key)
         duplicate = validation.execute(
             f"""
             SELECT COUNT(*) FROM (
@@ -482,8 +429,7 @@ def verify_materialized_table_artifact(
         ).fetchone()
         if duplicate is not None and int(duplicate[0]) > 0:
             raise ValueError(
-                f"materialized artifact duplicate primary key: "
-                f"{artifact.artifact_key}"
+                f"materialized artifact duplicate primary key: {artifact.artifact_key}"
             )
         bounds: tuple[object, object] | None = None
         if artifact.event_column is not None:
@@ -500,33 +446,18 @@ def verify_materialized_table_artifact(
         )
         != artifact.content_hash
     ):
-        raise ValueError(
-            f"materialized artifact content hash mismatch: {artifact.artifact_key}"
-        )
+        raise ValueError(f"materialized artifact content hash mismatch: {artifact.artifact_key}")
     if bounds is not None and bounds[0] is not None:
         earliest = cast(date | datetime, bounds[0])
         latest = cast(date | datetime, bounds[1])
-        if (
-            artifact.earliest_time is not None
-            and earliest.isoformat() != artifact.earliest_time
-        ):
+        if artifact.earliest_time is not None and earliest.isoformat() != artifact.earliest_time:
             raise ValueError(
-                f"materialized artifact earliest_time mismatch: "
-                f"{artifact.artifact_key}"
+                f"materialized artifact earliest_time mismatch: {artifact.artifact_key}"
             )
-        if (
-            artifact.latest_time is not None
-            and latest.isoformat() != artifact.latest_time
-        ):
-            raise ValueError(
-                f"materialized artifact latest_time mismatch: "
-                f"{artifact.artifact_key}"
-            )
+        if artifact.latest_time is not None and latest.isoformat() != artifact.latest_time:
+            raise ValueError(f"materialized artifact latest_time mismatch: {artifact.artifact_key}")
         if _event_is_after_as_of(latest, normalize_utc_datetime(as_of_time)):
-            raise ValueError(
-                f"materialized artifact contains future data: "
-                f"{artifact.artifact_key}"
-            )
+            raise ValueError(f"materialized artifact contains future data: {artifact.artifact_key}")
     return path
 
 
@@ -557,9 +488,7 @@ def _manifest_from_record(
         manifest.schema_hash,
     )
     if record_payload != manifest_payload:
-        raise ValueError(
-            f"research catalog manifest mismatch: {record.partition_id}"
-        )
+        raise ValueError(f"research catalog manifest mismatch: {record.partition_id}")
     return manifest
 
 
@@ -567,9 +496,7 @@ def _partition_key_from_artifact(
     artifact: DatasetSnapshotArtifact,
 ) -> ResearchPartitionKey:
     if artifact.partition_id is None:
-        raise ValueError(
-            f"lake artifact is missing partition_id: {artifact.artifact_key}"
-        )
+        raise ValueError(f"lake artifact is missing partition_id: {artifact.artifact_key}")
     parts = artifact.partition_id.split(":")
     if len(parts) not in {2, 3}:
         raise ValueError(f"invalid research partition id: {artifact.partition_id}")
@@ -591,19 +518,13 @@ def verify_snapshot_artifact(
 ) -> Path:
     """Verify a bound lake artifact using only immutable manifest evidence."""
     if artifact.artifact_type != "lake_partition":
-        raise ValueError(
-            "verify_snapshot_artifact currently requires a lake_partition"
-        )
+        raise ValueError("verify_snapshot_artifact currently requires a lake_partition")
     key = _partition_key_from_artifact(artifact)
     if key.dataset != artifact.dataset_id:
-        raise ValueError(
-            f"artifact dataset disagrees with partition: {artifact.artifact_key}"
-        )
+        raise ValueError(f"artifact dataset disagrees with partition: {artifact.artifact_key}")
     expected_relative = partition_version_relative_path(key, artifact.file_hash)
     if Path(artifact.relative_path) != expected_relative:
-        raise ValueError(
-            f"artifact path is not content-addressed: {artifact.artifact_key}"
-        )
+        raise ValueError(f"artifact path is not content-addressed: {artifact.artifact_key}")
     root = lake_root.resolve()
     path = (root / expected_relative).resolve()
     if not path.is_relative_to(root):
@@ -628,10 +549,7 @@ def verify_snapshot_artifact(
         expected_columns=columns,
         contract=contract,
     )
-    if (
-        artifact.earliest_time is not None
-        and earliest.isoformat() != artifact.earliest_time
-    ):
+    if artifact.earliest_time is not None and earliest.isoformat() != artifact.earliest_time:
         raise ValueError(f"artifact earliest_time mismatch: {artifact.artifact_key}")
     if artifact.latest_time is not None and latest.isoformat() != artifact.latest_time:
         raise ValueError(f"artifact latest_time mismatch: {artifact.artifact_key}")
@@ -645,9 +563,7 @@ def verify_snapshot_artifact(
     ):
         raise ValueError(f"artifact content hash mismatch: {artifact.artifact_key}")
     if _event_is_after_as_of(latest, as_of_time):
-        raise ValueError(
-            f"artifact contains future data after as_of_time: {artifact.artifact_key}"
-        )
+        raise ValueError(f"artifact contains future data after as_of_time: {artifact.artifact_key}")
     return path
 
 
@@ -725,13 +641,10 @@ def _shadow_lake_table(
     selected = tuple(
         artifact
         for artifact in artifacts
-        if artifact.dataset_id == table_name
-        and artifact.table_name == table_name
+        if artifact.dataset_id == table_name and artifact.table_name == table_name
     )
     if not selected or len(selected) != len(artifacts):
-        raise ValueError(
-            f"eligibility input must contain only {table_name} artifacts"
-        )
+        raise ValueError(f"eligibility input must contain only {table_name} artifacts")
     paths = tuple(
         verify_snapshot_artifact(
             artifact,
@@ -752,9 +665,7 @@ def _shadow_lake_table(
     try:
         yield
     finally:
-        connection.execute(
-            f"DROP VIEW IF EXISTS {_quoted_identifier(table_name)}"
-        )
+        connection.execute(f"DROP VIEW IF EXISTS {_quoted_identifier(table_name)}")
 
 
 def resolve_strategy_eligibility_from_artifacts(
@@ -775,9 +686,7 @@ def resolve_strategy_eligibility_from_artifacts(
 
     if strategy_id != "auction_gap":
         if input_artifacts:
-            raise ValueError(
-                "non-auction eligibility cannot use auction lake artifacts"
-            )
+            raise ValueError("non-auction eligibility cannot use auction lake artifacts")
         return resolve_strategy_eligibility(
             store,
             strategy_id=strategy_id,
@@ -831,9 +740,7 @@ def _publish_binding_manifest(
             path.read_text(encoding="utf-8")
         )
         if existing != binding.manifest:
-            raise ValueError(
-                f"immutable binding manifest conflict: {binding.snapshot_id}"
-            )
+            raise ValueError(f"immutable binding manifest conflict: {binding.snapshot_id}")
         return path
 
     temp_path = path.parent / f".manifest.json.tmp-{uuid.uuid4().hex}"
@@ -847,13 +754,9 @@ def _publish_binding_manifest(
     finally:
         if temp_path.exists():
             temp_path.unlink()
-    published = DatasetSnapshotBindingManifest.model_validate_json(
-        path.read_text(encoding="utf-8")
-    )
+    published = DatasetSnapshotBindingManifest.model_validate_json(path.read_text(encoding="utf-8"))
     if published != binding.manifest:
-        raise ValueError(
-            f"published binding manifest verification failed: {binding.snapshot_id}"
-        )
+        raise ValueError(f"published binding manifest verification failed: {binding.snapshot_id}")
     return path
 
 
@@ -880,25 +783,31 @@ def build_dataset_snapshot_binding(
         raise ValueError(f"dataset snapshot is not ready: {snapshot_id}")
     if snapshot.strategy_name == "factor_eval":
         raise ValueError("factor_eval requires the dedicated single-transaction builder")
-    selected_dependencies = dependencies or strategy_execution_dependencies(
-        snapshot.strategy_name
-    )
+    selected_dependencies = dependencies or strategy_execution_dependencies(snapshot.strategy_name)
     if selected_dependencies.strategy_id != snapshot.strategy_name:
         raise ValueError("dependency contract does not match snapshot strategy")
 
+    if snapshot.strategy_name == "portfolio_backtest":
+        from rquant.portfolio_backtest_adapter import verify_portfolio_snapshot_source
+
+        if selected_dependencies != strategy_execution_dependencies("portfolio_backtest"):
+            raise ValueError("portfolio requires its exact source contract")
+        if eligibility_resolution is not None or lake_artifacts:
+            raise ValueError("portfolio cannot include unrelated source artifacts")
+        verify_portfolio_snapshot_source(
+            source_connection,
+            code_sha=snapshot.code_commit,
+            start_date=start_date,
+            end_date=end_date,
+            input_hash=snapshot.table_watermarks.get("portfolio_input_hash", ""),
+        )
     artifacts: list[DatasetSnapshotArtifact] = []
     if eligibility_resolution is not None:
         if eligibility_resolution.strategy_id != snapshot.strategy_name:
-            raise ValueError(
-                "eligibility resolution does not match snapshot strategy"
-            )
-        expected_resolution_hash = snapshot.table_watermarks.get(
-            "eligibility_resolution_hash"
-        )
+            raise ValueError("eligibility resolution does not match snapshot strategy")
+        expected_resolution_hash = snapshot.table_watermarks.get("eligibility_resolution_hash")
         if expected_resolution_hash != eligibility_resolution.resolution_hash:
-            raise ValueError(
-                "eligibility resolution does not match snapshot watermark"
-            )
+            raise ValueError("eligibility resolution does not match snapshot watermark")
         if not eligibility_resolution.requested_dates:
             raise ValueError("eligibility resolution has no requested dates")
         artifacts.append(
@@ -923,15 +832,11 @@ def build_dataset_snapshot_binding(
                 as_of_time=snapshot.as_of_time,
             )
             if not resolved:
-                raise ValueError(
-                    f"research lake has no {dataset} partitions in requested range"
-                )
+                raise ValueError(f"research lake has no {dataset} partitions in requested range")
             artifacts.extend(resolved)
     else:
         required_datasets = set(selected_dependencies.lake_datasets)
-        observed_datasets = {
-            artifact.dataset_id for artifact in lake_artifacts
-        }
+        observed_datasets = {artifact.dataset_id for artifact in lake_artifacts}
         if observed_datasets != required_datasets:
             raise ValueError(
                 "pinned lake artifacts do not match strategy dependencies: "
@@ -941,20 +846,16 @@ def build_dataset_snapshot_binding(
         keys: set[str] = set()
         for artifact in lake_artifacts:
             if artifact.artifact_key in keys:
-                raise ValueError(
-                    f"duplicate pinned lake artifact: {artifact.artifact_key}"
-                )
+                raise ValueError(f"duplicate pinned lake artifact: {artifact.artifact_key}")
             keys.add(artifact.artifact_key)
             key = _partition_key_from_artifact(artifact)
             if not start_date <= key.trade_date <= end_date:
                 raise ValueError(
-                    "pinned lake artifact is outside binding range: "
-                    f"{artifact.artifact_key}"
+                    f"pinned lake artifact is outside binding range: {artifact.artifact_key}"
                 )
             if key.dataset == "minute_bar" and key.freq != "1min":
                 raise ValueError(
-                    "pinned minute artifact has unexpected frequency: "
-                    f"{artifact.artifact_key}"
+                    f"pinned minute artifact has unexpected frequency: {artifact.artifact_key}"
                 )
             verify_snapshot_artifact(
                 artifact,
@@ -996,23 +897,15 @@ def build_dataset_snapshot_binding(
         dependency_contract_version=selected_dependencies.contract_version,
         builder_version="snapshot-builder-v2",
         eligibility_resolution_hash=(
-            None
-            if eligibility_resolution is None
-            else eligibility_resolution.resolution_hash
+            None if eligibility_resolution is None else eligibility_resolution.resolution_hash
         ),
         eligibility_expected_dates=(
-            None
-            if eligibility_resolution is None
-            else eligibility_resolution.expected_count
+            None if eligibility_resolution is None else eligibility_resolution.expected_count
         ),
         eligibility_complete_dates=(
-            None
-            if eligibility_resolution is None
-            else eligibility_resolution.available_count
+            None if eligibility_resolution is None else eligibility_resolution.available_count
         ),
-        artifacts=tuple(
-            sorted(artifacts, key=lambda artifact: artifact.artifact_key)
-        ),
+        artifacts=tuple(sorted(artifacts, key=lambda artifact: artifact.artifact_key)),
     )
     built_at = normalize_utc_datetime(now())
     provisional = DatasetSnapshotBinding.create(
@@ -1022,10 +915,7 @@ def build_dataset_snapshot_binding(
         created_at=built_at,
     )
     manifest_relative_path = (
-        Path("snapshots")
-        / snapshot.snapshot_id
-        / provisional.binding_hash
-        / "manifest.json"
+        Path("snapshots") / snapshot.snapshot_id / provisional.binding_hash / "manifest.json"
     ).as_posix()
     binding = DatasetSnapshotBinding.create(
         manifest=manifest,
@@ -1041,9 +931,7 @@ def build_dataset_snapshot_binding(
         return stored
     return metadata_store.finalize_dataset_snapshot_binding(
         snapshot.snapshot_id,
-        DatasetSnapshotBindingFinalization(
-            completed_at=normalize_utc_datetime(now())
-        ),
+        DatasetSnapshotBindingFinalization(completed_at=normalize_utc_datetime(now())),
     )
 
 
@@ -1362,22 +1250,15 @@ class ResearchExecutionSession:
                     as_of_time=published.as_of_time,
                 )
             )
-            session_path = (
-                self._session_dir
-                / f"{index:06d}-{artifact.file_hash}.parquet"
-            )
-            if published.strategy_name == "factor_eval":
+            session_path = self._session_dir / f"{index:06d}-{artifact.file_hash}.parquet"
+            if published.strategy_name in {"factor_eval", "portfolio_backtest"}:
                 # Factor reads need an independent inode throughout one lease.
                 shutil.copyfile(path, session_path)
             else:
                 os.link(path, session_path)
             if (
-                (
-                    artifact.file_size is not None
-                    and session_path.stat().st_size != artifact.file_size
-                )
-                or _file_sha256(session_path) != artifact.file_hash
-            ):
+                artifact.file_size is not None and session_path.stat().st_size != artifact.file_size
+            ) or _file_sha256(session_path) != artifact.file_hash:
                 raise ValueError(
                     "bound artifact changed while opening execution session: "
                     f"{artifact.artifact_key}"

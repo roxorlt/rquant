@@ -1,0 +1,250 @@
+.pb-page {
+  display: grid;
+  gap: 16px;
+}
+.pb-page .ph {
+  margin-bottom: 0;
+}
+.pb-workspace {
+  display: grid;
+  grid-template-columns: 270px minmax(0, 1fr);
+  gap: 18px;
+  align-items: start;
+}
+.pb-workspace > .panel {
+  position: sticky;
+  top: 18px;
+}
+.pb-result {
+  display: grid;
+  gap: 16px;
+  min-width: 0;
+}
+.pb-job-range {
+  display: grid;
+  gap: 3px;
+  font: 12px var(--font-mono);
+  white-space: nowrap;
+}
+.pb-job-range small {
+  color: var(--muted);
+  font: inherit;
+}
+.pb-context {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  align-items: center;
+  color: var(--muted);
+  font-size: 12px;
+}
+.pb-context b {
+  font-weight: 500;
+  color: var(--ink-2);
+}
+.pb-result progress {
+  width: 100%;
+  height: 5px;
+  margin-top: 14px;
+  accent-color: var(--accent);
+}
+.pb-assumption {
+  color: var(--accent-t);
+  cursor: help;
+  font-size: 12px;
+}
+.pb-notice {
+  font-size: 12px;
+  color: var(--muted);
+  margin: 0;
+  line-height: 1.7;
+}
+.pb-command {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+}
+.pb-kpis .kpis {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+.pb-report-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+.pb-pagination {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  justify-content: flex-end;
+  border-top: 1px solid var(--rule);
+  padding: 10px 14px;
+}
+.pb-pagination .hint {
+  margin-right: auto;
+}
+.pb-nav-chart {
+  height: 260px;
+}
+.pb-dd-chart {
+  height: 150px;
+}
+.pb-config {
+  border: 0;
+  margin: 0;
+  padding: 0;
+  min-width: 0;
+}
+.pb-config h3 {
+  font-size: 13px;
+  margin: 24px 0 13px;
+  font-weight: 600;
+}
+.pb-config h3:first-of-type {
+  margin-top: 0;
+}
+.pb-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 15px 16px;
+}
+.pb-field {
+  position: relative;
+  min-width: 0;
+}
+.pb-field label {
+  display: block;
+  margin-bottom: 7px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.pb-field input,
+.pb-field select {
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 36px;
+  border: 1px solid var(--rule-strong);
+  border-radius: 5px;
+  background: var(--surface);
+  color: var(--ink-2);
+  padding: 7px 9px;
+  font-size: 13px;
+}
+.pb-field input {
+  font-family: var(--font-mono);
+}
+.pb-field select {
+  font-family: var(--font-sans);
+}
+.pb-field input:disabled,
+.pb-field select:disabled {
+  opacity: 0.55;
+}
+.pb-help {
+  color: var(--accent-t);
+  font-size: 12px;
+  cursor: help;
+}
+.pb-field > .tip-anchor {
+  position: absolute;
+  right: 0;
+  top: 0;
+}
+.pb-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 16px;
+  font-size: 13px;
+}
+.pb-check input {
+  accent-color: var(--accent);
+  width: 16px;
+  height: 16px;
+}
+.pb-config-footer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+}
+.pb-config-footer p {
+  width: 100%;
+  margin: 0 0 4px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.pb-detail {
+  display: grid;
+  gap: 16px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin: 0;
+}
+.pb-detail dt {
+  font-size: 12px;
+  color: var(--muted);
+}
+.pb-detail dd {
+  margin: 5px 0 0;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.pb-metrics {
+  display: grid;
+  gap: 16px;
+}
+.pb-mode {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 16px;
+}
+@media (max-width: 1080px) {
+  .pb-workspace {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .pb-workspace > .panel {
+    position: static;
+  }
+}
+@media (max-width: 760px) {
+  .pb-page {
+    gap: 12px;
+  }
+  .pb-workspace,
+  .pb-result {
+    gap: 12px;
+  }
+  .pb-kpis .kpis {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .pb-report-actions {
+    justify-content: flex-start;
+  }
+  .pb-nav-chart {
+    height: 220px;
+  }
+  .pb-dd-chart {
+    height: 130px;
+  }
+  .pb-context {
+    gap: 8px 14px;
+  }
+  .pb-mode {
+    justify-content: flex-start;
+  }
+  .pb-fields {
+    gap: 16px 12px;
+  }
+  .pb-field input,
+  .pb-field select {
+    font-size: 16px;
+    min-height: 40px;
+  }
+  .pb-config-footer .btn {
+    min-height: 40px;
+  }
+}

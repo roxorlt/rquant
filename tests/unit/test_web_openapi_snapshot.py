@@ -27,7 +27,9 @@ def test_every_api_path_is_versioned_and_only_defined_mutations_use_post() -> No
     for path, operations in paths.items():
         assert path.startswith("/api/v1/")
         assert set(operations) == (
-            {"post"}
+            {"get", "post"}
+            if path == "/api/v1/backtests/portfolio/runs"
+            else {"post"}
             if path
             in {
                 "/api/v1/screen/run",
@@ -39,6 +41,7 @@ def test_every_api_path_is_versioned_and_only_defined_mutations_use_post() -> No
                 "/api/v1/monitor/ack",
                 "/api/v1/monitor/price-rules/commands",
                 "/api/v1/monitor/price-rules/commands/resume",
+                "/api/v1/backtests/portfolio/exports",
                 "/api/v1/watchlist/commands",
                 "/api/v1/data/backfill-plans/commands",
                 "/api/v1/data/audit-report/commands",
@@ -59,6 +62,8 @@ def test_every_api_path_is_versioned_and_only_defined_mutations_use_post() -> No
                 "/api/v1/research/query",
                 "/api/v1/research/queries/save",
                 "/api/v1/research/queries/resume",
+                "/api/v1/strategy-templates/commands",
+                "/api/v1/strategy-templates/commands/resume",
             }
             else {"get"}
         )

@@ -5,7 +5,7 @@ import { expectNoHorizontalOverflow, watch } from "./watch.ts";
 test("已发布分钟回放的记录、配置和交易在桌面与手机可用", async ({ page }, testInfo) => {
   const watcher = watch(page);
   await page.setViewportSize({ width: 1440, height: 900 });
-  await page.goto("./#/backtest");
+  await page.goto("./#/backtest?view=minute");
   await expect(page.getByRole("heading", { level: 1, name: "回测" })).toBeVisible();
   await expect(page.getByText("这次回放没有触发交易")).toBeVisible();
   await page.getByRole("combobox", { name: "回放记录" }).selectOption("run-earlier");

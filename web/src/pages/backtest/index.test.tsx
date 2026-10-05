@@ -139,7 +139,7 @@ describe("回测结果", () => {
     const requests = results();
     stockDrawer();
     const user = userEvent.setup();
-    const { container } = renderApp("/backtest");
+    const { container } = renderApp("/backtest?view=minute");
 
     expect(await screen.findByRole("heading", { level: 1, name: "回测" })).toBeInTheDocument();
     expect(await screen.findByText("这次回放没有触发交易")).toBeInTheDocument();
@@ -180,7 +180,7 @@ describe("回测结果", () => {
         }),
       ),
     );
-    renderApp("/backtest");
+    renderApp("/backtest?view=minute");
     expect(await screen.findByText("还没有可查看的回放结果")).toBeInTheDocument();
   });
 
@@ -237,7 +237,7 @@ describe("回测结果", () => {
       }),
     );
     const user = userEvent.setup();
-    renderApp("/backtest");
+    renderApp("/backtest?view=minute");
     const stats = await screen.findByRole("table", { name: "配置统计" });
     await user.click(within(stats).getByText("第一次突破"));
     await user.click(screen.getByRole("button", { name: "下一页" }));
@@ -292,7 +292,7 @@ describe("回测结果", () => {
       }),
     );
     const user = userEvent.setup();
-    renderApp("/backtest");
+    renderApp("/backtest?view=minute");
     const stats = await screen.findByRole("table", { name: "配置统计" });
     await user.click(within(stats).getByText("第一次突破"));
     await user.click(screen.getByRole("button", { name: "下一页" }));

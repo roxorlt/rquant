@@ -309,12 +309,15 @@ class BuiltinStrategyEvaluatorRegistry:
             raise TypeError("producer_commit must be a string")
         if _COMMIT_PATTERN.fullmatch(producer_commit) is None:
             raise ValueError("producer_commit must be a 40-character lowercase SHA")
+        from rquant.portfolio_backtest_definition import build_portfolio_definition
+
         definitions = tuple(
             builder(producer_commit)
             for builder in (
                 _build_n_shape_definition,
                 _build_growth_board_surge_definition,
                 _build_auction_gap_definition,
+                build_portfolio_definition,
             )
         )
         by_identity = {

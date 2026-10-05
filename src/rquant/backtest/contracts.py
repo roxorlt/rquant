@@ -7,9 +7,10 @@ from decimal import Decimal
 from typing import Annotated, Literal, Self
 from zoneinfo import ZoneInfo
 
-from pydantic import Field, model_validator
+from pydantic import Field, SerializerFunctionWrapHandler, model_serializer, model_validator
 
 from rquant.paper_contracts import PaperAccountSnapshot, PaperExecutionReceipt, PaperOrderIntent
+from rquant.portfolio.drawdown import DrawdownDecision, DrawdownRule
 from rquant.portfolio.weights import PortfolioCandidate, PortfolioWeightRule
 from rquant.research_run_spec import ExecutionCostSpec, InstrumentContext
 from rquant.runtime_contracts import AwareUtcDatetime, RuntimeContractModel, canonical_sha256
@@ -134,6 +135,14 @@ class BacktestRequest(RuntimeContractModel):
     weight_rule: PortfolioWeightRule
     rebalance_rule: RebalanceRule
     execution_cost_spec: ExecutionCostSpec
+    drawdown_rule: DrawdownRule | None = None
+
+    @model_serializer(mode="wrap")
+    def serialize_optional_risk(self, handler: SerializerFunctionWrapHandler) -> object:
+        payload = handler(self)
+        if self.drawdown_rule is None:
+            payload.pop("drawdown_rule", None)
+        return payload
 
     @model_validator(mode="after")
     def validate_timeline(self) -> Self:
@@ -190,7 +199,11 @@ class SkippedTarget(RuntimeContractModel):
     ts_code: str = Field(min_length=1)
     side: Literal["BUY", "SELL"]
     reason: Literal[
-        "unverified_conditions", "missing_decision_price", "missing_open_price", "below_lot"
+        "unverified_conditions",
+        "missing_decision_price",
+        "missing_open_price",
+        "below_lot",
+        "drawdown_blocked",
     ]
 
 
@@ -251,9 +264,24 @@ class BacktestDayResult(RuntimeContractModel):
     daily_return: Decimal | None = Field(default=None, allow_inf_nan=False)
     normalized_nav: Decimal | None = Field(default=None, allow_inf_nan=False)
     incomplete_reason: Literal["missing_held_close"] | None = None
+    risk: DrawdownDecision | None = None
+
+    @model_serializer(mode="wrap")
+    def preserve_unconfigured_result(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, object]:
+        value = handler(self)
+        if self.risk is None:
+            value.pop("risk", None)
+        return value
 
     @model_validator(mode="after")
     def validate_account(self) -> Self:
+        if (
+            self.risk is not None
+            and self.risk.state.last_at.astimezone(_SHANGHAI).date() >= self.trade_date
+        ):
+            raise ValueError("risk must use a prior-day NAV observation")
         decision_ids = {item.decision_id for item in self.decisions}
         if len(decision_ids) != len(self.decisions) or any(
             item.decision.decision_id not in decision_ids for item in self.orders

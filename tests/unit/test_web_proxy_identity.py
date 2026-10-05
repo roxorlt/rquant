@@ -201,8 +201,19 @@ def test_proxy_proof_path_requires_an_explicit_private_ingress(tmp_path: Path) -
         "/api/v1/monitor/timeline",
         "/api/v1/monitor/price-rules",
         "/api/v1/monitor/price-rules/head?rule_id=synthetic-rule",
+        "/api/v1/strategy-templates",
+        "/api/v1/strategy-templates/sources",
+        "/api/v1/strategy-templates/template_synthetic",
+        "/api/v1/strategy-templates/template_synthetic/versions",
         "/api/v1/tasks/jobs",
         "/api/v1/backtests",
+        "/api/v1/backtests/portfolio/capabilities",
+        "/api/v1/backtests/portfolio/runs",
+        "/api/v1/backtests/portfolio/runs/12345678-1234-5678-9abc-123456789012",
+        "/api/v1/backtests/portfolio/runs/12345678-1234-5678-9abc-123456789012/nav",
+        "/api/v1/backtests/portfolio/runs/12345678-1234-5678-9abc-123456789012/rows",
+        "/api/v1/backtests/portfolio/runs/12345678-1234-5678-9abc-123456789012/report.html",
+        "/api/v1/backtests/portfolio/runs/12345678-1234-5678-9abc-123456789012/exports/12345678-1234-5678-9abc-123456789013.zip",
         "/api/v1/screen/tdx/market/jobs",
         "/api/v1/pools/formula",
         "/api/v1/data/report",
@@ -303,7 +314,7 @@ def test_current_user_route_inventory_matches_documented_categories(tmp_path: Pa
         / "docs/plans/2026-09-29-web-private-identity-route-inventory.md"
     ).read_text(encoding="utf-8")
     documented = re.findall(r"\| (GET|POST) \| `(/api/v1[^`]+)` \|", document)
-    assert len(documented) == len(set(documented)) == 83
+    assert len(documented) == len(set(documented)) == 98
 
     app = create_app(WebSettings(serving_root=tmp_path), background=False)
 
