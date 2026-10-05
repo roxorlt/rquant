@@ -57,6 +57,7 @@ from rquant.strict_json import canonical_json_bytes
 if TYPE_CHECKING:
     from rquant.config import Settings
     from rquant.experiment_platform_commands import ExperimentPageControlBackend
+    from rquant.paper_portfolio_commands import PaperPortfolioPageControlBackend
     from rquant.strategy_authoring import StrategyAuthoringPageControlBackend
 
 PRODUCTION_CANVAS_SIGNER_COMMAND = (
@@ -148,6 +149,7 @@ def build_page_control_service(
     formula_pool_backend: FormulaPoolPageControlBackend | None = None,
     factor_definition_backend: FactorDefinitionPageControlBackend | None = None,
     strategy_authoring_backend: StrategyAuthoringPageControlBackend | None = None,
+    paper_portfolio_backend: PaperPortfolioPageControlBackend | None = None,
     load_default_lab_backend: bool = True,
     clock: Callable[[], datetime] | None = None,
     lease_seconds: int = 30,
@@ -169,6 +171,7 @@ def build_page_control_service(
         formula_pool_backend=formula_pool_backend,
         factor_definition_backend=factor_definition_backend,
         strategy_authoring_backend=strategy_authoring_backend,
+        paper_portfolio_backend=paper_portfolio_backend,
         load_default_lab_backend=load_default_lab_backend,
         clock=clock,
         lease_seconds=lease_seconds,
@@ -193,6 +196,7 @@ def build_page_control_service_with_dependencies(
     formula_pool_backend: FormulaPoolPageControlBackend | None = None,
     factor_definition_backend: FactorDefinitionPageControlBackend | None = None,
     strategy_authoring_backend: StrategyAuthoringPageControlBackend | None = None,
+    paper_portfolio_backend: PaperPortfolioPageControlBackend | None = None,
     load_default_lab_backend: bool = True,
     clock: Callable[[], datetime] | None = None,
     lease_seconds: int = 30,
@@ -240,6 +244,7 @@ def build_page_control_service_with_dependencies(
             formula_pool_backend=formula_pool_backend,
             factor_definition_backend=factor_definition_backend,
             strategy_authoring_backend=strategy_authoring_backend,
+            paper_portfolio_backend=paper_portfolio_backend,
             clock=clock,
             lease_seconds=lease_seconds,
             consumer_id=consumer_instance_id,

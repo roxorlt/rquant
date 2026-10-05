@@ -34,6 +34,7 @@ from rquant.experiment_registry import PromotionDecision
 from rquant.lab_eta import LabEtaEstimate
 from rquant.lab_jobs import LabJobSummary
 from rquant.paper_contracts import PaperAccountSnapshot
+from rquant.paper_portfolio_projection_contract import PAPER_PORTFOLIO_PROJECTION_LAYOUTS
 from rquant.runtime_contracts import AwareUtcDatetime, RuntimeContractModel, canonical_sha256
 from rquant.runtime_service_control import RuntimeServiceHealth
 from rquant.screen.ranking import RankingCondition, rank_screen_results
@@ -204,21 +205,12 @@ PAGE_PROJECTION_CONTRACTS: Mapping[str, ServingProjectionContract] = MappingProx
             event_time_columns=("oldest_registered_at",),
         ),
         **{
-            name: _contract(
-                "lab_jobs",
-                columns,
-                keys,
-                max_rows=max_rows,
-                max_bytes=max_bytes,
-                event_time_columns=times,
-            )
-            for name, (
-                columns,
-                keys,
-                max_rows,
-                max_bytes,
-                times,
-            ) in STRATEGY_TEMPLATE_PROJECTION_LAYOUTS.items()
+            name: _contract("paper_accounts", columns, keys, max_rows=max_rows, max_bytes=max_bytes, event_time_columns=times)
+            for name, (columns, keys, max_rows, max_bytes, times) in PAPER_PORTFOLIO_PROJECTION_LAYOUTS.items()
+        },
+        **{
+            name: _contract("lab_jobs", columns, keys, max_rows=max_rows, max_bytes=max_bytes, event_time_columns=times)
+            for name, (columns, keys, max_rows, max_bytes, times) in STRATEGY_TEMPLATE_PROJECTION_LAYOUTS.items()
         },
         "experiment_attempt": _contract(
             "promotions",
@@ -2093,6 +2085,10 @@ class ServingReadModelInput(RuntimeContractModel):
 
             validate_factor_tracking_projections({p.table_name: p for p in self.projections})
 
+        if any(p.table_name in PAPER_PORTFOLIO_PROJECTION_LAYOUTS for p in self.projections):
+            from rquant.paper_portfolio_projection import validate_paper_portfolio_projections
+
+            validate_paper_portfolio_projections({p.table_name: p for p in self.projections})
         signal_ids = {record.signal.signal_id for record in self.signals}
         if any(p.table_name in STRATEGY_TEMPLATE_PROJECTION_LAYOUTS for p in self.projections):
             from rquant.strategy_authoring_projection import validate_strategy_authoring_projections

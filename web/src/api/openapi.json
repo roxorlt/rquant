@@ -379,6 +379,138 @@
         "title": "AttentionItem",
         "type": "object"
       },
+      "AttributionResult": {
+        "additionalProperties": false,
+        "properties": {
+          "active_return": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Active Return",
+            "type": "string"
+          },
+          "attributed_return": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Attributed Return",
+            "type": "string"
+          },
+          "benchmark_return": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Benchmark Return",
+            "type": "string"
+          },
+          "portfolio_return": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Portfolio Return",
+            "type": "string"
+          },
+          "residual": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Residual",
+            "type": "string"
+          },
+          "rows": {
+            "items": {
+              "$ref": "#/components/schemas/AttributionSlice"
+            },
+            "title": "Rows",
+            "type": "array"
+          }
+        },
+        "required": [
+          "rows",
+          "portfolio_return",
+          "benchmark_return",
+          "active_return",
+          "attributed_return",
+          "residual"
+        ],
+        "title": "AttributionResult",
+        "type": "object"
+      },
+      "AttributionSlice": {
+        "additionalProperties": false,
+        "properties": {
+          "allocation": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Allocation",
+            "type": "string"
+          },
+          "benchmark_return": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Benchmark Return",
+            "type": "string"
+          },
+          "benchmark_weight": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Benchmark Weight",
+            "type": "string"
+          },
+          "deviation": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Deviation",
+            "type": "string"
+          },
+          "industry_l1": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Industry L1"
+          },
+          "kind": {
+            "enum": [
+              "industry",
+              "cash"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "portfolio_return": {
+            "anyOf": [
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Portfolio Return"
+          },
+          "portfolio_weight": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Portfolio Weight",
+            "type": "string"
+          },
+          "selection_and_interaction": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Selection And Interaction",
+            "type": "string"
+          },
+          "total": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Total",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "industry_l1",
+          "portfolio_weight",
+          "benchmark_weight",
+          "deviation",
+          "portfolio_return",
+          "benchmark_return",
+          "allocation",
+          "selection_and_interaction",
+          "total"
+        ],
+        "title": "AttributionSlice",
+        "type": "object"
+      },
       "AuditAttempt": {
         "additionalProperties": false,
         "properties": {
@@ -3394,6 +3526,34 @@
         "title": "BoardsData",
         "type": "object"
       },
+      "BootstrapPoint": {
+        "additionalProperties": false,
+        "properties": {
+          "day_index": {
+            "maximum": 2520.0,
+            "minimum": 1.0,
+            "title": "Day Index",
+            "type": "integer"
+          },
+          "lower": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Lower",
+            "type": "string"
+          },
+          "upper": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Upper",
+            "type": "string"
+          }
+        },
+        "required": [
+          "day_index",
+          "lower",
+          "upper"
+        ],
+        "title": "BootstrapPoint",
+        "type": "object"
+      },
       "BuiltinPoolCopySource": {
         "properties": {
           "copy_block_reason": {
@@ -5069,6 +5229,43 @@
         "title": "DeliveriesSummary",
         "type": "object"
       },
+      "DrawdownDecision": {
+        "additionalProperties": false,
+        "properties": {
+          "allow_new_positions": {
+            "title": "Allow New Positions",
+            "type": "boolean"
+          },
+          "drawdown": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Drawdown",
+            "type": "string"
+          },
+          "max_total_risk_weight": {
+            "anyOf": [
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Total Risk Weight"
+          },
+          "state": {
+            "$ref": "#/components/schemas/DrawdownState"
+          }
+        },
+        "required": [
+          "state",
+          "drawdown",
+          "allow_new_positions",
+          "max_total_risk_weight"
+        ],
+        "title": "DrawdownDecision",
+        "type": "object"
+      },
       "DrawdownRule-Input": {
         "additionalProperties": false,
         "properties": {
@@ -5174,6 +5371,48 @@
           "action"
         ],
         "title": "DrawdownRule",
+        "type": "object"
+      },
+      "DrawdownState": {
+        "additionalProperties": false,
+        "properties": {
+          "active": {
+            "title": "Active",
+            "type": "boolean"
+          },
+          "last_at": {
+            "format": "date-time",
+            "title": "Last At",
+            "type": "string"
+          },
+          "last_nav": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Last Nav",
+            "type": "string"
+          },
+          "peak_at": {
+            "format": "date-time",
+            "title": "Peak At",
+            "type": "string"
+          },
+          "peak_nav": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Peak Nav",
+            "type": "string"
+          },
+          "rule": {
+            "$ref": "#/components/schemas/DrawdownRule-Output"
+          }
+        },
+        "required": [
+          "rule",
+          "peak_nav",
+          "peak_at",
+          "last_nav",
+          "last_at",
+          "active"
+        ],
+        "title": "DrawdownState",
         "type": "object"
       },
       "EditableCanvas": {
@@ -6041,6 +6280,102 @@
         "title": "Envelope[PaperAccountsData]",
         "type": "object"
       },
+      "Envelope_PaperPausePreparationData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/PaperPausePreparationData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[PaperPausePreparationData]",
+        "type": "object"
+      },
+      "Envelope_PaperPortfolioCatalogData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/PaperPortfolioCatalogData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[PaperPortfolioCatalogData]",
+        "type": "object"
+      },
+      "Envelope_PaperPortfolioCommandData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/PaperPortfolioCommandData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[PaperPortfolioCommandData]",
+        "type": "object"
+      },
+      "Envelope_PaperPortfolioDetailData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/PaperPortfolioDetailData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[PaperPortfolioDetailData]",
+        "type": "object"
+      },
+      "Envelope_PaperPortfolioHistoryPageView_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/PaperPortfolioHistoryPageView"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[PaperPortfolioHistoryPageView]",
+        "type": "object"
+      },
+      "Envelope_PaperResearchSummary_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/PaperResearchSummary"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[PaperResearchSummary]",
+        "type": "object"
+      },
       "Envelope_PoolEditorData_": {
         "properties": {
           "data": {
@@ -6832,6 +7167,7 @@
         "title": "ExecutionCostSlippage",
         "type": "object"
       },
+      "ExecutionCostSpec": {},
       "ExperimentAttemptRow": {
         "additionalProperties": false,
         "properties": {
@@ -8613,6 +8949,72 @@
           "message"
         ],
         "title": "ExperimentWriteReceipt",
+        "type": "object"
+      },
+      "ExposureResult": {
+        "additionalProperties": false,
+        "properties": {
+          "rows": {
+            "items": {
+              "$ref": "#/components/schemas/ExposureSlice"
+            },
+            "title": "Rows",
+            "type": "array"
+          }
+        },
+        "required": [
+          "rows"
+        ],
+        "title": "ExposureResult",
+        "type": "object"
+      },
+      "ExposureSlice": {
+        "additionalProperties": false,
+        "properties": {
+          "benchmark_weight": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Benchmark Weight",
+            "type": "string"
+          },
+          "deviation": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Deviation",
+            "type": "string"
+          },
+          "industry_l1": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Industry L1"
+          },
+          "kind": {
+            "enum": [
+              "industry",
+              "unknown",
+              "cash"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "portfolio_weight": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Portfolio Weight",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "industry_l1",
+          "portfolio_weight",
+          "benchmark_weight",
+          "deviation"
+        ],
+        "title": "ExposureSlice",
         "type": "object"
       },
       "FactorArchiveCommandData": {
@@ -15114,6 +15516,18 @@
         "title": "JobCounts",
         "type": "object"
       },
+      "JobStatus": {
+        "enum": [
+          "queued",
+          "running",
+          "checkpointed",
+          "succeeded",
+          "failed",
+          "cancelled"
+        ],
+        "title": "JobStatus",
+        "type": "string"
+      },
       "JournalEntry": {
         "additionalProperties": false,
         "properties": {
@@ -17172,6 +17586,83 @@
         "title": "PaperAccountItem",
         "type": "object"
       },
+      "PaperAccountSnapshot": {
+        "additionalProperties": false,
+        "properties": {
+          "account_id": {
+            "minLength": 1,
+            "title": "Account Id",
+            "type": "string"
+          },
+          "as_of_time": {
+            "format": "date-time",
+            "title": "As Of Time",
+            "type": "string"
+          },
+          "available_cash": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Available Cash",
+            "type": "string"
+          },
+          "cash": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Cash",
+            "type": "string"
+          },
+          "frozen_cash": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Frozen Cash",
+            "type": "string"
+          },
+          "holdings": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/PaperHolding"
+            },
+            "title": "Holdings",
+            "type": "array"
+          },
+          "nav": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Nav",
+            "type": "string"
+          },
+          "realized_pnl": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Realized Pnl",
+            "type": "string"
+          },
+          "snapshot_id": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Snapshot Id"
+          },
+          "unrealized_pnl": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Unrealized Pnl",
+            "type": "string"
+          }
+        },
+        "required": [
+          "account_id",
+          "as_of_time",
+          "cash",
+          "available_cash",
+          "frozen_cash",
+          "realized_pnl",
+          "unrealized_pnl",
+          "nav"
+        ],
+        "title": "PaperAccountSnapshot",
+        "type": "object"
+      },
       "PaperAccountsData": {
         "properties": {
           "accounts": {
@@ -17238,6 +17729,300 @@
           "history"
         ],
         "title": "PaperAccountsData",
+        "type": "object"
+      },
+      "PaperBacktestBandResult": {
+        "additionalProperties": false,
+        "properties": {
+          "algorithm": {
+            "const": "paper-bootstrap-splitmix64-day-major-nearest-rank-v1",
+            "default": "paper-bootstrap-splitmix64-day-major-nearest-rank-v1",
+            "title": "Algorithm",
+            "type": "string"
+          },
+          "backtest_source_hash": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Backtest Source Hash",
+            "type": "string"
+          },
+          "configuration_fingerprint": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Configuration Fingerprint",
+            "type": "string"
+          },
+          "contract": {
+            "const": "paper-backtest-band-result/v1",
+            "default": "paper-backtest-band-result/v1",
+            "title": "Contract",
+            "type": "string"
+          },
+          "dates": {
+            "items": {
+              "format": "date",
+              "type": "string"
+            },
+            "title": "Dates",
+            "type": "array"
+          },
+          "input_hash": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Input Hash",
+            "type": "string"
+          },
+          "paths": {
+            "const": 2048,
+            "default": 2048,
+            "title": "Paths",
+            "type": "integer"
+          },
+          "points": {
+            "items": {
+              "$ref": "#/components/schemas/BootstrapPoint"
+            },
+            "title": "Points",
+            "type": "array"
+          },
+          "seed": {
+            "const": 20261005,
+            "default": 20261005,
+            "title": "Seed",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "input_hash",
+          "configuration_fingerprint",
+          "backtest_source_hash",
+          "dates",
+          "points"
+        ],
+        "title": "PaperBacktestBandResult",
+        "type": "object"
+      },
+      "PaperBacktestChoice": {
+        "additionalProperties": false,
+        "properties": {
+          "completed_at": {
+            "format": "date-time",
+            "title": "Completed At",
+            "type": "string"
+          },
+          "job_id": {
+            "format": "uuid",
+            "title": "Job Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "job_id",
+          "completed_at",
+          "name"
+        ],
+        "title": "PaperBacktestChoice",
+        "type": "object"
+      },
+      "PaperConfigurationView": {
+        "additionalProperties": false,
+        "properties": {
+          "account_id": {
+            "title": "Account Id",
+            "type": "string"
+          },
+          "configured_at": {
+            "format": "date-time",
+            "title": "Configured At",
+            "type": "string"
+          },
+          "drawdown_rule": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DrawdownRule-Output"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "execution_cost_spec": {
+            "$ref": "#/components/schemas/ExecutionCostSpec"
+          },
+          "fingerprint": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Fingerprint",
+            "type": "string"
+          },
+          "strategy_id": {
+            "title": "Strategy Id",
+            "type": "string"
+          },
+          "strategy_name": {
+            "title": "Strategy Name",
+            "type": "string"
+          },
+          "strategy_version": {
+            "title": "Strategy Version",
+            "type": "string"
+          },
+          "version": {
+            "maximum": 4096.0,
+            "minimum": 1.0,
+            "title": "Version",
+            "type": "integer"
+          },
+          "weight_rule": {
+            "$ref": "#/components/schemas/PortfolioWeightRule-Output"
+          }
+        },
+        "required": [
+          "weight_rule",
+          "account_id",
+          "strategy_id",
+          "strategy_version",
+          "strategy_name",
+          "fingerprint",
+          "version",
+          "configured_at",
+          "execution_cost_spec"
+        ],
+        "title": "PaperConfigurationView",
+        "type": "object"
+      },
+      "PaperCostProvenanceState": {
+        "enum": [
+          "KNOWN_V3",
+          "LEGACY_UNKNOWN"
+        ],
+        "title": "PaperCostProvenanceState",
+        "type": "string"
+      },
+      "PaperDailyNavPoint": {
+        "additionalProperties": false,
+        "properties": {
+          "calendar_source_identity": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Calendar Source Identity",
+            "type": "string"
+          },
+          "cash": {
+            "anyOf": [
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cash"
+          },
+          "close_at": {
+            "format": "date-time",
+            "title": "Close At",
+            "type": "string"
+          },
+          "configuration_fingerprint": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Configuration Fingerprint",
+            "type": "string"
+          },
+          "daily_return": {
+            "anyOf": [
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Daily Return"
+          },
+          "ledger_head_fingerprint": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Ledger Head Fingerprint",
+            "type": "string"
+          },
+          "ledger_revision": {
+            "minimum": 1.0,
+            "title": "Ledger Revision",
+            "type": "integer"
+          },
+          "material_fingerprint": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Material Fingerprint",
+            "type": "string"
+          },
+          "nav": {
+            "anyOf": [
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Nav"
+          },
+          "normalized_nav": {
+            "anyOf": [
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Normalized Nav"
+          },
+          "published_at": {
+            "format": "date-time",
+            "title": "Published At",
+            "type": "string"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "status": {
+            "enum": [
+              "complete",
+              "unavailable"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "trade_date": {
+            "format": "date",
+            "title": "Trade Date",
+            "type": "string"
+          }
+        },
+        "required": [
+          "trade_date",
+          "configuration_fingerprint",
+          "calendar_source_identity",
+          "ledger_revision",
+          "ledger_head_fingerprint",
+          "material_fingerprint",
+          "close_at",
+          "published_at",
+          "status"
+        ],
+        "title": "PaperDailyNavPoint",
         "type": "object"
       },
       "PaperFillItem": {
@@ -17430,6 +18215,200 @@
         "title": "PaperHistoryData",
         "type": "object"
       },
+      "PaperHistoryFill": {
+        "additionalProperties": false,
+        "properties": {
+          "commission": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Commission",
+            "type": "string"
+          },
+          "cost_context_fingerprint": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cost Context Fingerprint"
+          },
+          "cost_provenance_state": {
+            "$ref": "#/components/schemas/PaperCostProvenanceState",
+            "default": "LEGACY_UNKNOWN"
+          },
+          "cost_spec_id": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cost Spec Id"
+          },
+          "cost_spec_schema_version": {
+            "anyOf": [
+              {
+                "const": 3,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cost Spec Schema Version"
+          },
+          "executed_at": {
+            "format": "date-time",
+            "title": "Executed At",
+            "type": "string"
+          },
+          "execution_id": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Execution Id",
+            "type": "string"
+          },
+          "fill_id": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fill Id"
+          },
+          "order_id": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Order Id",
+            "type": "string"
+          },
+          "persisted_at": {
+            "format": "date-time",
+            "title": "Persisted At",
+            "type": "string"
+          },
+          "price": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Price",
+            "type": "string"
+          },
+          "price_snapshot_id": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Price Snapshot Id",
+            "type": "string"
+          },
+          "quantity": {
+            "exclusiveMinimum": 0.0,
+            "multipleOf": 100.0,
+            "title": "Quantity",
+            "type": "integer"
+          },
+          "sequence": {
+            "minimum": 1.0,
+            "title": "Sequence",
+            "type": "integer"
+          },
+          "tax": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Tax",
+            "type": "string"
+          },
+          "total_fees": {
+            "anyOf": [
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Total Fees"
+          },
+          "transfer_fee": {
+            "anyOf": [
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Transfer Fee"
+          }
+        },
+        "required": [
+          "execution_id",
+          "order_id",
+          "sequence",
+          "quantity",
+          "price",
+          "commission",
+          "tax",
+          "executed_at",
+          "price_snapshot_id",
+          "persisted_at"
+        ],
+        "title": "PaperHistoryFill",
+        "type": "object"
+      },
+      "PaperHolding": {
+        "additionalProperties": false,
+        "properties": {
+          "available_quantity": {
+            "minimum": 0.0,
+            "multipleOf": 100.0,
+            "title": "Available Quantity",
+            "type": "integer"
+          },
+          "average_cost": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Average Cost",
+            "type": "string"
+          },
+          "code": {
+            "minLength": 1,
+            "title": "Code",
+            "type": "string"
+          },
+          "frozen_quantity": {
+            "minimum": 0.0,
+            "multipleOf": 100.0,
+            "title": "Frozen Quantity",
+            "type": "integer"
+          },
+          "market_price": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Market Price",
+            "type": "string"
+          },
+          "quantity": {
+            "minimum": 0.0,
+            "multipleOf": 100.0,
+            "title": "Quantity",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "code",
+          "quantity",
+          "available_quantity",
+          "frozen_quantity",
+          "average_cost",
+          "market_price"
+        ],
+        "title": "PaperHolding",
+        "type": "object"
+      },
       "PaperHoldingItem": {
         "properties": {
           "available_quantity": {
@@ -17500,6 +18479,307 @@
           "unrealized_pct"
         ],
         "title": "PaperHoldingItem",
+        "type": "object"
+      },
+      "PaperOperatorApplication": {
+        "additionalProperties": false,
+        "properties": {
+          "account_id": {
+            "title": "Account Id",
+            "type": "string"
+          },
+          "configuration_fingerprint": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Configuration Fingerprint",
+            "type": "string"
+          },
+          "control_fingerprint": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Control Fingerprint"
+          },
+          "observed_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Observed At"
+          },
+          "paused": {
+            "default": true,
+            "title": "Paused",
+            "type": "boolean"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "sequence": {
+            "maximum": 2147483647.0,
+            "minimum": 0.0,
+            "title": "Sequence",
+            "type": "integer"
+          },
+          "status": {
+            "enum": [
+              "waiting",
+              "applied",
+              "unavailable"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "account_id",
+          "configuration_fingerprint",
+          "sequence",
+          "status"
+        ],
+        "title": "PaperOperatorApplication",
+        "type": "object"
+      },
+      "PaperOrder": {
+        "additionalProperties": false,
+        "properties": {
+          "account_id": {
+            "minLength": 1,
+            "title": "Account Id",
+            "type": "string"
+          },
+          "average_fill_price": {
+            "anyOf": [
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Average Fill Price"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "filled_quantity": {
+            "default": 0,
+            "minimum": 0.0,
+            "multipleOf": 100.0,
+            "title": "Filled Quantity",
+            "type": "integer"
+          },
+          "intent_id": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Intent Id",
+            "type": "string"
+          },
+          "order_id": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Order Id"
+          },
+          "order_type": {
+            "$ref": "#/components/schemas/PaperOrderType"
+          },
+          "quantity": {
+            "exclusiveMinimum": 0.0,
+            "multipleOf": 100.0,
+            "title": "Quantity",
+            "type": "integer"
+          },
+          "reject_reason": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PaperRejectReason"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "side": {
+            "$ref": "#/components/schemas/PaperSide"
+          },
+          "status": {
+            "$ref": "#/components/schemas/PaperOrderStatus"
+          },
+          "ts_code": {
+            "minLength": 1,
+            "title": "Ts Code",
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "intent_id",
+          "account_id",
+          "ts_code",
+          "side",
+          "order_type",
+          "quantity",
+          "status",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "PaperOrder",
+        "type": "object"
+      },
+      "PaperOrderIntent": {
+        "additionalProperties": false,
+        "properties": {
+          "account_id": {
+            "minLength": 1,
+            "title": "Account Id",
+            "type": "string"
+          },
+          "available_at": {
+            "format": "date-time",
+            "title": "Available At",
+            "type": "string"
+          },
+          "earliest_execution_at": {
+            "format": "date-time",
+            "title": "Earliest Execution At",
+            "type": "string"
+          },
+          "entry_signal_id": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Entry Signal Id"
+          },
+          "event_time": {
+            "format": "date-time",
+            "title": "Event Time",
+            "type": "string"
+          },
+          "expires_at": {
+            "format": "date-time",
+            "title": "Expires At",
+            "type": "string"
+          },
+          "intent_id": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Intent Id"
+          },
+          "limit_price": {
+            "anyOf": [
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Limit Price"
+          },
+          "order_type": {
+            "$ref": "#/components/schemas/PaperOrderType"
+          },
+          "price_snapshot_id": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Price Snapshot Id",
+            "type": "string"
+          },
+          "producer_commit": {
+            "pattern": "^[0-9a-f]{40}$",
+            "title": "Producer Commit",
+            "type": "string"
+          },
+          "quantity": {
+            "exclusiveMinimum": 0.0,
+            "multipleOf": 100.0,
+            "title": "Quantity",
+            "type": "integer"
+          },
+          "sell_quantity_authority": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PaperSellQuantityAuthority"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "side": {
+            "$ref": "#/components/schemas/PaperSide"
+          },
+          "signal_id": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Signal Id",
+            "type": "string"
+          },
+          "ts_code": {
+            "minLength": 1,
+            "title": "Ts Code",
+            "type": "string"
+          }
+        },
+        "required": [
+          "signal_id",
+          "account_id",
+          "ts_code",
+          "side",
+          "order_type",
+          "quantity",
+          "event_time",
+          "available_at",
+          "expires_at",
+          "earliest_execution_at",
+          "price_snapshot_id",
+          "producer_commit"
+        ],
+        "title": "PaperOrderIntent",
         "type": "object"
       },
       "PaperOrderItem": {
@@ -17644,6 +18924,856 @@
         "title": "PaperOrderType",
         "type": "string"
       },
+      "PaperPauseConfirmBody": {
+        "additionalProperties": false,
+        "properties": {
+          "confirmation_id": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Confirmation Id",
+            "type": "string"
+          },
+          "request": {
+            "$ref": "#/components/schemas/SetPaperAccountPaused"
+          }
+        },
+        "required": [
+          "request",
+          "confirmation_id"
+        ],
+        "title": "PaperPauseConfirmBody",
+        "type": "object"
+      },
+      "PaperPausePreparationData": {
+        "additionalProperties": false,
+        "properties": {
+          "command": {
+            "$ref": "#/components/schemas/SetPaperAccountPaused"
+          },
+          "confirmation_id": {
+            "title": "Confirmation Id",
+            "type": "string"
+          },
+          "expires_at": {
+            "format": "date-time",
+            "title": "Expires At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "confirmation_id",
+          "command",
+          "expires_at"
+        ],
+        "title": "PaperPausePreparationData",
+        "type": "object"
+      },
+      "PaperPeriodAttributionView": {
+        "additionalProperties": false,
+        "properties": {
+          "end_at": {
+            "format": "date-time",
+            "title": "End At",
+            "type": "string"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "result": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AttributionResult"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "start_at": {
+            "format": "date-time",
+            "title": "Start At",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "complete",
+              "unavailable"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "start_at",
+          "end_at",
+          "status",
+          "result"
+        ],
+        "title": "PaperPeriodAttributionView",
+        "type": "object"
+      },
+      "PaperPortfolioCatalogData": {
+        "additionalProperties": false,
+        "properties": {
+          "accounts": {
+            "items": {
+              "$ref": "#/components/schemas/PaperPortfolioItem"
+            },
+            "maxItems": 64,
+            "title": "Accounts",
+            "type": "array"
+          },
+          "availability": {
+            "enum": [
+              "unavailable",
+              "empty",
+              "populated"
+            ],
+            "title": "Availability",
+            "type": "string"
+          },
+          "available_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Available At"
+          }
+        },
+        "required": [
+          "availability",
+          "available_at",
+          "accounts"
+        ],
+        "title": "PaperPortfolioCatalogData",
+        "type": "object"
+      },
+      "PaperPortfolioCommandData": {
+        "additionalProperties": false,
+        "properties": {
+          "account_id": {
+            "title": "Account Id",
+            "type": "string"
+          },
+          "command_id": {
+            "format": "uuid",
+            "title": "Command Id",
+            "type": "string"
+          },
+          "configuration_fingerprint": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Configuration Fingerprint"
+          },
+          "configuration_version": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Configuration Version"
+          },
+          "job_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Job Id"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "sequence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sequence"
+          },
+          "status": {
+            "enum": [
+              "rejected",
+              "pending",
+              "uncertain",
+              "waiting_application",
+              "waiting_publication",
+              "applied",
+              "published",
+              "submitted"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "command_id",
+          "account_id",
+          "status",
+          "message"
+        ],
+        "title": "PaperPortfolioCommandData",
+        "type": "object"
+      },
+      "PaperPortfolioDetailData": {
+        "additionalProperties": false,
+        "properties": {
+          "account": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PaperAccountSnapshot"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "attribution": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PaperPeriodAttributionView"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "backtests": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/PaperBacktestChoice"
+            },
+            "title": "Backtests",
+            "type": "array"
+          },
+          "band": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PaperBacktestBandResult"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "band_position": {
+            "default": "unavailable",
+            "enum": [
+              "inside",
+              "outside",
+              "unavailable"
+            ],
+            "title": "Band Position",
+            "type": "string"
+          },
+          "can_band": {
+            "default": false,
+            "title": "Can Band",
+            "type": "boolean"
+          },
+          "can_configure": {
+            "default": false,
+            "title": "Can Configure",
+            "type": "boolean"
+          },
+          "can_pause": {
+            "default": false,
+            "title": "Can Pause",
+            "type": "boolean"
+          },
+          "can_reconcile": {
+            "default": false,
+            "title": "Can Reconcile",
+            "type": "boolean"
+          },
+          "configuration": {
+            "$ref": "#/components/schemas/PaperConfigurationView"
+          },
+          "exposure": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ExposureResult"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "exposure_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Exposure Reason"
+          },
+          "history_available": {
+            "default": false,
+            "title": "History Available",
+            "type": "boolean"
+          },
+          "metrics": {
+            "$ref": "#/components/schemas/PaperPortfolioMetrics"
+          },
+          "nav": {
+            "items": {
+              "$ref": "#/components/schemas/PaperDailyNavPoint"
+            },
+            "maxItems": 2520,
+            "title": "Nav",
+            "type": "array"
+          },
+          "operator": {
+            "$ref": "#/components/schemas/PaperOperatorApplication"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "recent_research": {
+            "items": {
+              "$ref": "#/components/schemas/PaperResearchSummary"
+            },
+            "maxItems": 20,
+            "title": "Recent Research",
+            "type": "array"
+          },
+          "reduction": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PaperReductionStatus"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "risk": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PaperRiskObservation"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "status": {
+            "enum": [
+              "complete",
+              "unavailable"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "configuration",
+          "status",
+          "account",
+          "operator",
+          "metrics",
+          "nav",
+          "recent_research"
+        ],
+        "title": "PaperPortfolioDetailData",
+        "type": "object"
+      },
+      "PaperPortfolioHistoryPageView": {
+        "additionalProperties": false,
+        "properties": {
+          "account_id": {
+            "title": "Account Id",
+            "type": "string"
+          },
+          "coverage": {
+            "const": "complete",
+            "default": "complete",
+            "title": "Coverage",
+            "type": "string"
+          },
+          "generation_id": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Generation Id",
+            "type": "string"
+          },
+          "ledger_revision": {
+            "title": "Ledger Revision",
+            "type": "integer"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          },
+          "records": {
+            "items": {
+              "$ref": "#/components/schemas/PaperPortfolioHistoryRecordView"
+            },
+            "maxItems": 200,
+            "title": "Records",
+            "type": "array"
+          },
+          "total_orders": {
+            "title": "Total Orders",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "account_id",
+          "generation_id",
+          "ledger_revision",
+          "total_orders",
+          "records"
+        ],
+        "title": "PaperPortfolioHistoryPageView",
+        "type": "object"
+      },
+      "PaperPortfolioHistoryRecordView": {
+        "additionalProperties": false,
+        "properties": {
+          "fills": {
+            "items": {
+              "$ref": "#/components/schemas/PaperHistoryFill"
+            },
+            "title": "Fills",
+            "type": "array"
+          },
+          "intent": {
+            "$ref": "#/components/schemas/PaperOrderIntent"
+          },
+          "order": {
+            "$ref": "#/components/schemas/PaperOrder"
+          },
+          "reject_message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reject Message"
+          },
+          "sequence": {
+            "minimum": 2.0,
+            "title": "Sequence",
+            "type": "integer"
+          },
+          "side_label": {
+            "title": "Side Label",
+            "type": "string"
+          },
+          "status_label": {
+            "title": "Status Label",
+            "type": "string"
+          }
+        },
+        "required": [
+          "sequence",
+          "order",
+          "intent",
+          "fills",
+          "side_label",
+          "status_label",
+          "reject_message"
+        ],
+        "title": "PaperPortfolioHistoryRecordView",
+        "type": "object"
+      },
+      "PaperPortfolioItem": {
+        "additionalProperties": false,
+        "properties": {
+          "account": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PaperAccountSnapshot"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "can_band": {
+            "default": false,
+            "title": "Can Band",
+            "type": "boolean"
+          },
+          "can_configure": {
+            "default": false,
+            "title": "Can Configure",
+            "type": "boolean"
+          },
+          "can_pause": {
+            "default": false,
+            "title": "Can Pause",
+            "type": "boolean"
+          },
+          "can_reconcile": {
+            "default": false,
+            "title": "Can Reconcile",
+            "type": "boolean"
+          },
+          "configuration": {
+            "$ref": "#/components/schemas/PaperConfigurationView"
+          },
+          "metrics": {
+            "$ref": "#/components/schemas/PaperPortfolioMetrics"
+          },
+          "operator": {
+            "$ref": "#/components/schemas/PaperOperatorApplication"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "status": {
+            "enum": [
+              "complete",
+              "unavailable"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "configuration",
+          "status",
+          "account",
+          "operator",
+          "metrics"
+        ],
+        "title": "PaperPortfolioItem",
+        "type": "object"
+      },
+      "PaperPortfolioMetrics": {
+        "additionalProperties": false,
+        "properties": {
+          "max_drawdown": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Drawdown"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "running_days": {
+            "maximum": 2520.0,
+            "minimum": 0.0,
+            "title": "Running Days",
+            "type": "integer"
+          },
+          "status": {
+            "enum": [
+              "complete",
+              "unavailable"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "total_return": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Total Return"
+          },
+          "verified_days": {
+            "maximum": 2520.0,
+            "minimum": 0.0,
+            "title": "Verified Days",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "status",
+          "running_days",
+          "verified_days"
+        ],
+        "title": "PaperPortfolioMetrics",
+        "type": "object"
+      },
+      "PaperReconcileDifference": {
+        "additionalProperties": false,
+        "properties": {
+          "actual": {
+            "maxLength": 2048,
+            "title": "Actual",
+            "type": "string"
+          },
+          "expected": {
+            "maxLength": 2048,
+            "title": "Expected",
+            "type": "string"
+          },
+          "path": {
+            "maxLength": 512,
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "expected",
+          "actual"
+        ],
+        "title": "PaperReconcileDifference",
+        "type": "object"
+      },
+      "PaperReconcileResult": {
+        "additionalProperties": false,
+        "properties": {
+          "account": {
+            "$ref": "#/components/schemas/PaperAccountSnapshot"
+          },
+          "actual_fingerprint": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Actual Fingerprint",
+            "type": "string"
+          },
+          "configuration_fingerprint": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Configuration Fingerprint",
+            "type": "string"
+          },
+          "contract": {
+            "const": "paper-reconcile-result/v1",
+            "default": "paper-reconcile-result/v1",
+            "title": "Contract",
+            "type": "string"
+          },
+          "copy_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Copy Sha256",
+            "type": "string"
+          },
+          "difference_count": {
+            "minimum": 0.0,
+            "title": "Difference Count",
+            "type": "integer"
+          },
+          "differences": {
+            "items": {
+              "$ref": "#/components/schemas/PaperReconcileDifference"
+            },
+            "maxItems": 1000,
+            "title": "Differences",
+            "type": "array"
+          },
+          "expected_fingerprint": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Expected Fingerprint",
+            "type": "string"
+          },
+          "head_fingerprint": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Head Fingerprint",
+            "type": "string"
+          },
+          "input_hash": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Input Hash",
+            "type": "string"
+          },
+          "ledger_revision": {
+            "minimum": 1.0,
+            "title": "Ledger Revision",
+            "type": "integer"
+          },
+          "status": {
+            "enum": [
+              "consistent",
+              "differences"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "truncated": {
+            "title": "Truncated",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "input_hash",
+          "configuration_fingerprint",
+          "ledger_revision",
+          "head_fingerprint",
+          "copy_sha256",
+          "expected_fingerprint",
+          "actual_fingerprint",
+          "status",
+          "difference_count",
+          "differences",
+          "truncated",
+          "account"
+        ],
+        "title": "PaperReconcileResult",
+        "type": "object"
+      },
+      "PaperReductionStatus": {
+        "additionalProperties": false,
+        "properties": {
+          "as_of": {
+            "format": "date-time",
+            "title": "As Of",
+            "type": "string"
+          },
+          "configuration_fingerprint": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Configuration Fingerprint",
+            "type": "string"
+          },
+          "ledger_frame_fingerprint": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Ledger Frame Fingerprint",
+            "type": "string"
+          },
+          "plan_fingerprint": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Plan Fingerprint"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "risk_weight": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Risk Weight",
+            "type": "string"
+          },
+          "signal_ids": {
+            "items": {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            "maxItems": 5000,
+            "title": "Signal Ids",
+            "type": "array"
+          },
+          "status": {
+            "enum": [
+              "not_required",
+              "waiting",
+              "complete",
+              "incomplete"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "target_risk_weight": {
+            "anyOf": [
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Target Risk Weight"
+          }
+        },
+        "required": [
+          "configuration_fingerprint",
+          "ledger_frame_fingerprint",
+          "as_of",
+          "status",
+          "risk_weight",
+          "signal_ids"
+        ],
+        "title": "PaperReductionStatus",
+        "type": "object"
+      },
       "PaperRejectReason": {
         "enum": [
           "T_PLUS_ONE",
@@ -17657,6 +19787,329 @@
         ],
         "title": "PaperRejectReason",
         "type": "string"
+      },
+      "PaperResearchSealedAnalysis": {
+        "additionalProperties": false,
+        "properties": {
+          "account_id": {
+            "title": "Account Id",
+            "type": "string"
+          },
+          "band": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PaperBacktestBandResult"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "complete_result_hash": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Complete Result Hash",
+            "type": "string"
+          },
+          "completed_at": {
+            "format": "date-time",
+            "title": "Completed At",
+            "type": "string"
+          },
+          "configuration_fingerprint": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Configuration Fingerprint",
+            "type": "string"
+          },
+          "configuration_version": {
+            "maximum": 4096.0,
+            "minimum": 1.0,
+            "title": "Configuration Version",
+            "type": "integer"
+          },
+          "job_id": {
+            "format": "uuid",
+            "title": "Job Id",
+            "type": "string"
+          },
+          "manifest_hash": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Manifest Hash",
+            "type": "string"
+          },
+          "reconcile": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PaperReconcileResult"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "result_hash": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Result Hash",
+            "type": "string"
+          },
+          "spec_hash": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Spec Hash",
+            "type": "string"
+          },
+          "task_name": {
+            "enum": [
+              "paper_reconcile",
+              "paper_backtest_band"
+            ],
+            "title": "Task Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "task_name",
+          "job_id",
+          "account_id",
+          "configuration_fingerprint",
+          "configuration_version",
+          "spec_hash",
+          "manifest_hash",
+          "complete_result_hash",
+          "result_hash",
+          "completed_at"
+        ],
+        "title": "PaperResearchSealedAnalysis",
+        "type": "object"
+      },
+      "PaperResearchSummary": {
+        "additionalProperties": false,
+        "properties": {
+          "accepted_at": {
+            "format": "date-time",
+            "title": "Accepted At",
+            "type": "string"
+          },
+          "account_id": {
+            "title": "Account Id",
+            "type": "string"
+          },
+          "configuration_fingerprint": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Configuration Fingerprint",
+            "type": "string"
+          },
+          "configuration_version": {
+            "maximum": 4096.0,
+            "minimum": 1.0,
+            "title": "Configuration Version",
+            "type": "integer"
+          },
+          "job_id": {
+            "format": "uuid",
+            "title": "Job Id",
+            "type": "string"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "sealed": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PaperResearchSealedAnalysis"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "status": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/JobStatus"
+              },
+              {
+                "const": "submitted",
+                "type": "string"
+              }
+            ],
+            "title": "Status"
+          },
+          "task_name": {
+            "enum": [
+              "paper_reconcile",
+              "paper_backtest_band"
+            ],
+            "title": "Task Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "task_name",
+          "job_id",
+          "account_id",
+          "configuration_fingerprint",
+          "configuration_version",
+          "status",
+          "accepted_at"
+        ],
+        "title": "PaperResearchSummary",
+        "type": "object"
+      },
+      "PaperRiskObservation": {
+        "additionalProperties": false,
+        "properties": {
+          "account_id": {
+            "title": "Account Id",
+            "type": "string"
+          },
+          "configuration_fingerprint": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Configuration Fingerprint",
+            "type": "string"
+          },
+          "decision": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DrawdownDecision"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "ledger_revision": {
+            "minimum": 1.0,
+            "title": "Ledger Revision",
+            "type": "integer"
+          },
+          "nav": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Nav",
+            "type": "string"
+          },
+          "observed_at": {
+            "format": "date-time",
+            "title": "Observed At",
+            "type": "string"
+          },
+          "source_fingerprint": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Source Fingerprint",
+            "type": "string"
+          }
+        },
+        "required": [
+          "account_id",
+          "configuration_fingerprint",
+          "observed_at",
+          "ledger_revision",
+          "source_fingerprint",
+          "nav",
+          "decision"
+        ],
+        "title": "PaperRiskObservation",
+        "type": "object"
+      },
+      "PaperSellQuantityAuthority": {
+        "additionalProperties": false,
+        "properties": {
+          "account_id": {
+            "minLength": 1,
+            "title": "Account Id",
+            "type": "string"
+          },
+          "action": {
+            "enum": [
+              "REDUCE",
+              "S_INTENT"
+            ],
+            "title": "Action",
+            "type": "string"
+          },
+          "available_quantity": {
+            "minimum": 0.0,
+            "multipleOf": 100.0,
+            "title": "Available Quantity",
+            "type": "integer"
+          },
+          "decision_cutoff": {
+            "format": "date-time",
+            "title": "Decision Cutoff",
+            "type": "string"
+          },
+          "entry_signal_id": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Entry Signal Id",
+            "type": "string"
+          },
+          "exit_signal_id": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Exit Signal Id",
+            "type": "string"
+          },
+          "remaining_quantity": {
+            "exclusiveMinimum": 0.0,
+            "multipleOf": 100.0,
+            "title": "Remaining Quantity",
+            "type": "integer"
+          },
+          "requested_quantity": {
+            "exclusiveMinimum": 0.0,
+            "multipleOf": 100.0,
+            "title": "Requested Quantity",
+            "type": "integer"
+          },
+          "snapshot_id": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Snapshot Id"
+          },
+          "source_lot_fingerprint": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Source Lot Fingerprint",
+            "type": "string"
+          },
+          "tranche_fraction": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Tranche Fraction",
+            "type": "string"
+          },
+          "ts_code": {
+            "minLength": 1,
+            "title": "Ts Code",
+            "type": "string"
+          }
+        },
+        "required": [
+          "exit_signal_id",
+          "entry_signal_id",
+          "account_id",
+          "ts_code",
+          "action",
+          "decision_cutoff",
+          "remaining_quantity",
+          "available_quantity",
+          "tranche_fraction",
+          "requested_quantity",
+          "source_lot_fingerprint"
+        ],
+        "title": "PaperSellQuantityAuthority",
+        "type": "object"
       },
       "PaperSide": {
         "enum": [
@@ -23138,6 +25591,72 @@
         "title": "RoundTripStats",
         "type": "object"
       },
+      "RunPaperPortfolioResearch": {
+        "additionalProperties": false,
+        "properties": {
+          "account_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Account Id",
+            "type": "string"
+          },
+          "backtest_job_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Backtest Job Id"
+          },
+          "command_id": {
+            "title": "Command Id",
+            "type": "string"
+          },
+          "configuration_fingerprint": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Configuration Fingerprint",
+            "type": "string"
+          },
+          "generation_id": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Generation Id",
+            "type": "string"
+          },
+          "kind": {
+            "const": "run_paper_portfolio_research",
+            "default": "run_paper_portfolio_research",
+            "title": "Kind",
+            "type": "string"
+          },
+          "requested_at": {
+            "format": "date-time",
+            "title": "Requested At",
+            "type": "string"
+          },
+          "task_name": {
+            "enum": [
+              "paper_reconcile",
+              "paper_backtest_band"
+            ],
+            "title": "Task Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "command_id",
+          "requested_at",
+          "generation_id",
+          "account_id",
+          "configuration_fingerprint",
+          "task_name"
+        ],
+        "title": "RunPaperPortfolioResearch",
+        "type": "object"
+      },
       "RunStrategyTemplate": {
         "additionalProperties": false,
         "properties": {
@@ -23321,6 +25840,66 @@
         ],
         "title": "SampleState",
         "type": "string"
+      },
+      "SavePaperPortfolioConfiguration": {
+        "additionalProperties": false,
+        "properties": {
+          "account_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Account Id",
+            "type": "string"
+          },
+          "command_id": {
+            "title": "Command Id",
+            "type": "string"
+          },
+          "drawdown_rule": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DrawdownRule-Input"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "expected_configuration_fingerprint": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Expected Configuration Fingerprint",
+            "type": "string"
+          },
+          "generation_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Generation Id",
+            "type": "string"
+          },
+          "kind": {
+            "const": "save_paper_portfolio_configuration",
+            "default": "save_paper_portfolio_configuration",
+            "title": "Kind",
+            "type": "string"
+          },
+          "requested_at": {
+            "format": "date-time",
+            "title": "Requested At",
+            "type": "string"
+          },
+          "weight_rule": {
+            "$ref": "#/components/schemas/PortfolioWeightRule-Input"
+          }
+        },
+        "required": [
+          "weight_rule",
+          "command_id",
+          "requested_at",
+          "generation_id",
+          "account_id",
+          "expected_configuration_fingerprint"
+        ],
+        "title": "SavePaperPortfolioConfiguration",
+        "type": "object"
       },
       "SavePoolCommand": {
         "additionalProperties": false,
@@ -24803,6 +27382,69 @@
           "next_trading_day"
         ],
         "title": "SessionInfo",
+        "type": "object"
+      },
+      "SetPaperAccountPaused": {
+        "additionalProperties": false,
+        "properties": {
+          "account_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Account Id",
+            "type": "string"
+          },
+          "command_id": {
+            "title": "Command Id",
+            "type": "string"
+          },
+          "configuration_fingerprint": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Configuration Fingerprint",
+            "type": "string"
+          },
+          "expected_paused": {
+            "title": "Expected Paused",
+            "type": "boolean"
+          },
+          "expected_sequence": {
+            "maximum": 2147483646.0,
+            "minimum": 0.0,
+            "title": "Expected Sequence",
+            "type": "integer"
+          },
+          "generation_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Generation Id",
+            "type": "string"
+          },
+          "kind": {
+            "const": "set_paper_account_paused",
+            "default": "set_paper_account_paused",
+            "title": "Kind",
+            "type": "string"
+          },
+          "paused": {
+            "title": "Paused",
+            "type": "boolean"
+          },
+          "requested_at": {
+            "format": "date-time",
+            "title": "Requested At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "command_id",
+          "requested_at",
+          "generation_id",
+          "account_id",
+          "configuration_fingerprint",
+          "expected_sequence",
+          "expected_paused",
+          "paused"
+        ],
+        "title": "SetPaperAccountPaused",
         "type": "object"
       },
       "SignalItem": {
@@ -30308,6 +32950,685 @@
         "summary": "爆量记录（跨日搜索）",
         "tags": [
           "panorama"
+        ]
+      }
+    },
+    "/api/v1/paper-portfolios": {
+      "get": {
+        "operationId": "accounts_api_v1_paper_portfolios_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "generation_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "pattern": "^[0-9a-f]{64}$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Generation Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_PaperPortfolioCatalogData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "我的模拟账户",
+        "tags": [
+          "paper"
+        ]
+      }
+    },
+    "/api/v1/paper-portfolios/{account_id}": {
+      "get": {
+        "operationId": "detail_api_v1_paper_portfolios__account_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "account_id",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Account Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "generation_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "pattern": "^[0-9a-f]{64}$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Generation Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_PaperPortfolioDetailData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "模拟账户与组合风控",
+        "tags": [
+          "paper"
+        ]
+      }
+    },
+    "/api/v1/paper-portfolios/{account_id}/band": {
+      "post": {
+        "operationId": "band_api_v1_paper_portfolios__account_id__band_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "account_id",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Account Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RunPaperPortfolioResearch"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_PaperPortfolioCommandData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "计算同版本回测对照区间",
+        "tags": [
+          "paper"
+        ]
+      }
+    },
+    "/api/v1/paper-portfolios/{account_id}/configuration": {
+      "post": {
+        "operationId": "configuration_api_v1_paper_portfolios__account_id__configuration_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "account_id",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Account Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SavePaperPortfolioConfiguration"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_PaperPortfolioCommandData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "保存模拟仓位与回撤限制",
+        "tags": [
+          "paper"
+        ]
+      }
+    },
+    "/api/v1/paper-portfolios/{account_id}/history": {
+      "get": {
+        "operationId": "history_api_v1_paper_portfolios__account_id__history_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "account_id",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Account Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "generation_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "pattern": "^[0-9a-f]{64}$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Generation Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 2048,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 200,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_PaperPortfolioHistoryPageView_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "完整模拟指令历史",
+        "tags": [
+          "paper"
+        ]
+      }
+    },
+    "/api/v1/paper-portfolios/{account_id}/pause/confirm": {
+      "post": {
+        "operationId": "confirm_api_v1_paper_portfolios__account_id__pause_confirm_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "account_id",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Account Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PaperPauseConfirmBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_PaperPortfolioCommandData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "确认模拟账户暂停或恢复",
+        "tags": [
+          "paper"
+        ]
+      }
+    },
+    "/api/v1/paper-portfolios/{account_id}/pause/prepare": {
+      "post": {
+        "operationId": "prepare_api_v1_paper_portfolios__account_id__pause_prepare_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "account_id",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Account Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetPaperAccountPaused"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_PaperPausePreparationData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "核对模拟账户暂停或恢复",
+        "tags": [
+          "paper"
+        ]
+      }
+    },
+    "/api/v1/paper-portfolios/{account_id}/reconcile": {
+      "post": {
+        "operationId": "reconcile_api_v1_paper_portfolios__account_id__reconcile_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "account_id",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Account Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RunPaperPortfolioResearch"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_PaperPortfolioCommandData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "运行只读模拟账户对账",
+        "tags": [
+          "paper"
+        ]
+      }
+    },
+    "/api/v1/paper-portfolios/{account_id}/recover": {
+      "post": {
+        "operationId": "recover_api_v1_paper_portfolios__account_id__recover_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "account_id",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Account Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "discriminator": {
+                  "mapping": {
+                    "run_paper_portfolio_research": "#/components/schemas/RunPaperPortfolioResearch",
+                    "save_paper_portfolio_configuration": "#/components/schemas/SavePaperPortfolioConfiguration",
+                    "set_paper_account_paused": "#/components/schemas/SetPaperAccountPaused"
+                  },
+                  "propertyName": "kind"
+                },
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/SetPaperAccountPaused"
+                  },
+                  {
+                    "$ref": "#/components/schemas/SavePaperPortfolioConfiguration"
+                  },
+                  {
+                    "$ref": "#/components/schemas/RunPaperPortfolioResearch"
+                  }
+                ],
+                "title": "Body"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_PaperPortfolioCommandData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "续查原模拟账户操作",
+        "tags": [
+          "paper"
+        ]
+      }
+    },
+    "/api/v1/paper-portfolios/{account_id}/research/{job_id}": {
+      "get": {
+        "operationId": "research_api_v1_paper_portfolios__account_id__research__job_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "account_id",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Account Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Job Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "generation_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "pattern": "^[0-9a-f]{64}$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Generation Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_PaperResearchSummary_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "模拟账户研究结果",
+        "tags": [
+          "paper"
+        ]
+      }
+    },
+    "/api/v1/paper-portfolios/{account_id}/research/{job_id}/download": {
+      "get": {
+        "operationId": "download_api_v1_paper_portfolios__account_id__research__job_id__download_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "account_id",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Account Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Job Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "generation_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "pattern": "^[0-9a-f]{64}$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Generation Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "下载已封存模拟研究",
+        "tags": [
+          "paper"
         ]
       }
     },

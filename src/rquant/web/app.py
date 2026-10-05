@@ -74,6 +74,7 @@ from rquant.web.routes import (
     overview,
     panorama,
     paper,
+    paper_portfolio,
     pool_editor,
     pools,
     price_alert_rules,
@@ -93,6 +94,7 @@ from rquant.web.service_log_access_audit import ServiceLogAccessAudit
 from rquant.web.serving import GenerationTracker
 from rquant.web.settings import WebSettings
 from rquant.web.strategy_authoring_gateway import StrategyAuthoringGateway
+from rquant.web.paper_portfolio_gateway import PaperPortfolioGateway
 
 if TYPE_CHECKING:
     from rquant.alert_ack_admission import AckAdmissionClient
@@ -163,6 +165,7 @@ class WebContext:
     factor_run_admission: FactorRunAdmissionClient | None
     factor_tracking_admission: FactorTrackingAdmissionClient | None
     strategy_authoring_gateway: StrategyAuthoringGateway | None
+    paper_portfolio_gateway: PaperPortfolioGateway | None
     unit_log_client: UnitLogClient | None
     unit_log_access_audit: ServiceLogAccessAudit | None
     unit_log_gate: threading.BoundedSemaphore
@@ -192,6 +195,7 @@ def create_app(
     factor_run_admission_client: FactorRunAdmissionClient | None = None,
     factor_tracking_admission_client: FactorTrackingAdmissionClient | None = None,
     strategy_authoring_gateway: StrategyAuthoringGateway | None = None,
+    paper_portfolio_gateway: PaperPortfolioGateway | None = None,
     unit_log_client: UnitLogClient | None = None,
     unit_log_access_audit: ServiceLogAccessAudit | None = None,
     backfill_plan_command_transport: BackfillPlanCommandTransport | None = None,
@@ -342,6 +346,13 @@ def create_app(
             )
         )
     configured_nl_parser = nl_parser
+    configured_paper_portfolio = paper_portfolio_gateway
+    if configured_paper_portfolio is not None and not isinstance(configured_paper_portfolio, PaperPortfolioGateway):
+        raise TypeError("paper portfolios require a typed private gateway")
+    if configured_paper_portfolio is None and settings.paper_portfolio_enabled and settings.paper_portfolio_socket_path is not None:
+        from rquant.paper_portfolio_admission import PaperPortfolioAdmissionClient
+
+        configured_paper_portfolio = PaperPortfolioAdmissionClient(settings.paper_portfolio_socket_path, expected_service_uid=settings.paper_portfolio_service_uid, shared_gid=settings.paper_portfolio_shared_gid)
     configured_strategy_authoring = strategy_authoring_gateway
     if configured_strategy_authoring is not None and not isinstance(configured_strategy_authoring, StrategyAuthoringGateway):
         raise TypeError("strategy templates require a typed private gateway")
@@ -390,6 +401,7 @@ def create_app(
         factor_run_admission=configured_factor_run,
         factor_tracking_admission=configured_factor_tracking,
         strategy_authoring_gateway=configured_strategy_authoring,
+        paper_portfolio_gateway=configured_paper_portfolio,
         unit_log_client=configured_unit_log,
         unit_log_access_audit=unit_log_access_audit,
         unit_log_gate=threading.BoundedSemaphore(1),
@@ -419,6 +431,9 @@ def create_app(
     @app.middleware("http")
     async def security_headers(request: Request, call_next: Callable[..., Any]) -> Response:
         body_limit = _WRITE_BODY_LIMITS.get(request.url.path)
+        paper_write = re.fullmatch(r"/api/v1/paper-portfolios/[^/]{1,128}/(configuration|pause/prepare|pause/confirm|recover|reconcile|band)", request.url.path)
+        if body_limit is None and paper_write is not None:
+            body_limit = {"configuration": paper_portfolio.MAX_CONFIGURATION_BYTES, "recover": paper_portfolio.MAX_PAPER_RECOVERY_BYTES}.get(paper_write.group(1), paper_portfolio.MAX_PAPER_CONTROL_BYTES)
         if body_limit is None and _FACTOR_ARCHIVE_WRITE.fullmatch(request.url.path):
             body_limit = factors.MAX_ARCHIVE_REQUEST_BYTES
         if body_limit is None and _FACTOR_SAVE_WRITE.fullmatch(request.url.path):
@@ -524,6 +539,7 @@ def create_app(
     private = [Depends(require_current_user)]
     app.include_router(pool_editor.router, prefix="/api/v1", tags=["pools"], dependencies=private)
     app.include_router(paper.router, prefix="/api/v1", tags=["paper"], dependencies=private)
+    app.include_router(paper_portfolio.router, prefix="/api/v1", tags=["paper"], dependencies=private)
     app.include_router(monitor.router, prefix="/api/v1", tags=["monitor"], dependencies=private)
     app.include_router(manual_watchlist.router, prefix="/api/v1", tags=["watchlist"])
     app.include_router(price_alert_rules.router, prefix="/api/v1", tags=["monitor"])

@@ -7,6 +7,24 @@ import { findJargon } from "@/test/jargon";
 import { renderApp } from "@/test/render";
 import { metaHandler, paperHandler, server } from "@/test/server";
 
+beforeEach(() => {
+  server.use(
+    http.get("*/api/v1/paper-portfolios", ({ request }) => {
+      const envelope = paperEnvelope();
+      return HttpResponse.json({
+        ...envelope,
+        serving: {
+          ...envelope.serving,
+          generation_id:
+            new URL(request.url).searchParams.get("generation_id") ??
+            envelope.serving.generation_id,
+        },
+        data: { availability: "unavailable", available_at: null, accounts: [] },
+      });
+    }),
+  );
+});
+
 function readyHistory(): PaperAccountsData["history"] {
   return {
     source_state: "ready",

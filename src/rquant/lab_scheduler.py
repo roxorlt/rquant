@@ -55,6 +55,7 @@ from rquant.lab_jobs import (
 )
 from rquant.lab_logging import _safe_structured_log
 if TYPE_CHECKING:
+    from rquant.paper_research_runtime import PaperResearchRuntimeDirectory
     from rquant.strategy_template_runtime import StrategyTemplateRuntimeDirectory
     from rquant.experiment_platform_templates import ExperimentTemplateRuntimeBinding
 from rquant.lab_result_digest import LabResultDigestPolicy
@@ -342,6 +343,7 @@ class LabScheduler:
         adapter_registry: StrategyJobAdapterRegistry | None = None,
         template_directory: StrategyTemplateRuntimeDirectory | None = None,
         experiment_template_binding: ExperimentTemplateRuntimeBinding | None = None,
+        paper_directory: PaperResearchRuntimeDirectory | None = None,
         max_plans_per_tick: int = 64,
         max_claims_per_tick: int = 16,
         max_claim_authority_per_tick: int = 128,
@@ -496,6 +498,8 @@ class LabScheduler:
         self.template_directory = require_template_runtime_directory(template_directory)
         from rquant.experiment_platform_templates import require_experiment_template_runtime_binding
         self.experiment_template_binding = require_experiment_template_runtime_binding(experiment_template_binding)
+        from rquant.paper_research_runtime import require_paper_runtime_directory
+        self.paper_directory = require_paper_runtime_directory(paper_directory)
         self.max_plans_per_tick = max_plans_per_tick
         self.max_claims_per_tick = max_claims_per_tick
         self.max_claim_authority_per_tick = max_claim_authority_per_tick
@@ -2015,14 +2019,26 @@ class LabScheduler:
                 self.artifact_commit_spool.ack(entry, receipt)
         plans_created = 0
         plans_failed = 0
-        if self.adapter_registry is not None or self.template_directory is not None or self.experiment_template_binding is not None:
+        if (
+            self.adapter_registry is not None
+            or self.template_directory is not None
+            or self.experiment_template_binding is not None
+            or self.paper_directory is not None
+        ):
             for job in self.store.list_unplanned_jobs(limit=self.max_plans_per_tick):
                 self._verify_runtime()
                 try:
-                    directory = self.template_directory
-                    if self.experiment_template_binding is not None:
-                        directory = self.experiment_template_binding.directory_for_job(job.job_id, job.spec) or directory
-                    registry = self.adapter_registry if directory is None else directory.registry_for_spec(job.spec)
+                    if self.paper_directory is not None and job.spec.parameters.strategy_name in {"paper_reconcile", "paper_backtest_band"}:
+                        registry = self.paper_directory.registry_for_spec(job.spec)
+                    else:
+                        directory = self.template_directory
+                        if self.experiment_template_binding is not None:
+                            directory = self.experiment_template_binding.directory_for_job(job.job_id, job.spec) or directory
+                        if directory is not None:
+                            registry = directory.registry_for_spec(job.spec)
+                        else:
+                            from rquant.strategy_job_adapters import default_strategy_job_adapter_registry
+                            registry = self.adapter_registry or default_strategy_job_adapter_registry()
                     definitions = registry.plan(job.spec)
                 except Exception as exc:
                     lease, mutation_now = self._mutation_context()

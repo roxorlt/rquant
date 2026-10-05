@@ -40,6 +40,7 @@ from rquant.runtime_service_entrypoint import (
 )
 
 if TYPE_CHECKING:
+    from rquant.paper_portfolio_runtime import PaperPortfolioRuntimeCatalog
     from rquant.runtime_artifact_terminal_lifecycle import (
         ProductionArtifactTerminalLifecycle,
     )
@@ -155,8 +156,13 @@ def build_builtin_registry(
     completion_attestation_active_key_id: str | None = None,
     startup_degraded_reasons: tuple[str, ...] = (),
     runtime_root: Path | None = None,
+    paper_portfolio_catalog: PaperPortfolioRuntimeCatalog | None = None,
 ) -> RuntimeServiceRegistry:
+    from rquant.paper_portfolio_runtime import PaperPortfolioRuntimeCatalog
     from rquant.runtime_service_builtin import build_builtin_registry as factory
+
+    if paper_portfolio_catalog is not None and type(paper_portfolio_catalog) is not PaperPortfolioRuntimeCatalog:
+        raise TypeError("paper host requires its finite concrete portfolio catalog")
 
     kwargs: dict[str, object] = {
         "runtime_capabilities": runtime_capabilities,
@@ -164,6 +170,8 @@ def build_builtin_registry(
         "artifact_terminal_lifecycle_factory": artifact_terminal_lifecycle_factory,
         "runtime_root": runtime_root,
     }
+    if paper_portfolio_catalog is not None:
+        kwargs["paper_portfolio_catalog"] = paper_portfolio_catalog
     if completion_attestation_signer is not None:
         kwargs["completion_attestation_signer"] = completion_attestation_signer
         kwargs["completion_attestation_active_key_id"] = completion_attestation_active_key_id

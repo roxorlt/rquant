@@ -1127,6 +1127,193 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/paper-portfolios": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 我的模拟账户 */
+        get: operations["accounts_api_v1_paper_portfolios_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/paper-portfolios/{account_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 模拟账户与组合风控 */
+        get: operations["detail_api_v1_paper_portfolios__account_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/paper-portfolios/{account_id}/band": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 计算同版本回测对照区间 */
+        post: operations["band_api_v1_paper_portfolios__account_id__band_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/paper-portfolios/{account_id}/configuration": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 保存模拟仓位与回撤限制 */
+        post: operations["configuration_api_v1_paper_portfolios__account_id__configuration_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/paper-portfolios/{account_id}/history": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 完整模拟指令历史 */
+        get: operations["history_api_v1_paper_portfolios__account_id__history_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/paper-portfolios/{account_id}/pause/confirm": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 确认模拟账户暂停或恢复 */
+        post: operations["confirm_api_v1_paper_portfolios__account_id__pause_confirm_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/paper-portfolios/{account_id}/pause/prepare": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 核对模拟账户暂停或恢复 */
+        post: operations["prepare_api_v1_paper_portfolios__account_id__pause_prepare_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/paper-portfolios/{account_id}/reconcile": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 运行只读模拟账户对账 */
+        post: operations["reconcile_api_v1_paper_portfolios__account_id__reconcile_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/paper-portfolios/{account_id}/recover": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 续查原模拟账户操作 */
+        post: operations["recover_api_v1_paper_portfolios__account_id__recover_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/paper-portfolios/{account_id}/research/{job_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 模拟账户研究结果 */
+        get: operations["research_api_v1_paper_portfolios__account_id__research__job_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/paper-portfolios/{account_id}/research/{job_id}/download": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 下载已封存模拟研究 */
+        get: operations["download_api_v1_paper_portfolios__account_id__research__job_id__download_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/paper/accounts": {
         parameters: {
             query?: never;
@@ -2006,6 +2193,47 @@ export interface components {
             title: string;
             /** To */
             to: string;
+        };
+        /** AttributionResult */
+        AttributionResult: {
+            /** Active Return */
+            active_return: string;
+            /** Attributed Return */
+            attributed_return: string;
+            /** Benchmark Return */
+            benchmark_return: string;
+            /** Portfolio Return */
+            portfolio_return: string;
+            /** Residual */
+            residual: string;
+            /** Rows */
+            rows: components["schemas"]["AttributionSlice"][];
+        };
+        /** AttributionSlice */
+        AttributionSlice: {
+            /** Allocation */
+            allocation: string;
+            /** Benchmark Return */
+            benchmark_return: string;
+            /** Benchmark Weight */
+            benchmark_weight: string;
+            /** Deviation */
+            deviation: string;
+            /** Industry L1 */
+            industry_l1: string | null;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "industry" | "cash";
+            /** Portfolio Return */
+            portfolio_return: string | null;
+            /** Portfolio Weight */
+            portfolio_weight: string;
+            /** Selection And Interaction */
+            selection_and_interaction: string;
+            /** Total */
+            total: string;
         };
         /** AuditAttempt */
         AuditAttempt: {
@@ -3037,6 +3265,15 @@ export interface components {
             /** Systems */
             systems: string[];
         };
+        /** BootstrapPoint */
+        BootstrapPoint: {
+            /** Day Index */
+            day_index: number;
+            /** Lower */
+            lower: string;
+            /** Upper */
+            upper: string;
+        };
         /** BuiltinPoolCopySource */
         BuiltinPoolCopySource: {
             /** Copy Block Reason */
@@ -3582,6 +3819,16 @@ export interface components {
             /** Total */
             total: number;
         };
+        /** DrawdownDecision */
+        DrawdownDecision: {
+            /** Allow New Positions */
+            allow_new_positions: boolean;
+            /** Drawdown */
+            drawdown: string;
+            /** Max Total Risk Weight */
+            max_total_risk_weight: string | null;
+            state: components["schemas"]["DrawdownState"];
+        };
         /** DrawdownRule */
         "DrawdownRule-Input": {
             /**
@@ -3615,6 +3862,26 @@ export interface components {
             total_risk_weight_cap?: string | null;
             /** Trigger Drawdown */
             trigger_drawdown: string;
+        };
+        /** DrawdownState */
+        DrawdownState: {
+            /** Active */
+            active: boolean;
+            /**
+             * Last At
+             * Format: date-time
+             */
+            last_at: string;
+            /** Last Nav */
+            last_nav: string;
+            /**
+             * Peak At
+             * Format: date-time
+             */
+            peak_at: string;
+            /** Peak Nav */
+            peak_nav: string;
+            rule: components["schemas"]["DrawdownRule-Output"];
         };
         /** EditableCanvas */
         EditableCanvas: {
@@ -3891,6 +4158,36 @@ export interface components {
             data: components["schemas"]["PaperAccountsData"];
             serving: components["schemas"]["ServingMeta"];
         };
+        /** Envelope[PaperPausePreparationData] */
+        Envelope_PaperPausePreparationData_: {
+            data: components["schemas"]["PaperPausePreparationData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[PaperPortfolioCatalogData] */
+        Envelope_PaperPortfolioCatalogData_: {
+            data: components["schemas"]["PaperPortfolioCatalogData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[PaperPortfolioCommandData] */
+        Envelope_PaperPortfolioCommandData_: {
+            data: components["schemas"]["PaperPortfolioCommandData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[PaperPortfolioDetailData] */
+        Envelope_PaperPortfolioDetailData_: {
+            data: components["schemas"]["PaperPortfolioDetailData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[PaperPortfolioHistoryPageView] */
+        Envelope_PaperPortfolioHistoryPageView_: {
+            data: components["schemas"]["PaperPortfolioHistoryPageView"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[PaperResearchSummary] */
+        Envelope_PaperResearchSummary_: {
+            data: components["schemas"]["PaperResearchSummary"];
+            serving: components["schemas"]["ServingMeta"];
+        };
         /** Envelope[PoolEditorData] */
         Envelope_PoolEditorData_: {
             data: components["schemas"]["PoolEditorData"];
@@ -4146,6 +4443,7 @@ export interface components {
             /** Sell Bps */
             sell_bps: string;
         };
+        ExecutionCostSpec: unknown;
         /** ExperimentAttemptRow */
         ExperimentAttemptRow: {
             /**
@@ -4805,6 +5103,27 @@ export interface components {
             status: "pending" | "processing" | "unknown" | "failed" | "registered" | "cancellation_pending" | "cancelled" | "already_completed" | "already_finished" | "note_saved" | "policy_saved" | "outer_admitted";
             /** Version */
             version?: number | null;
+        };
+        /** ExposureResult */
+        ExposureResult: {
+            /** Rows */
+            rows: components["schemas"]["ExposureSlice"][];
+        };
+        /** ExposureSlice */
+        ExposureSlice: {
+            /** Benchmark Weight */
+            benchmark_weight: string;
+            /** Deviation */
+            deviation: string;
+            /** Industry L1 */
+            industry_l1: string | null;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "industry" | "unknown" | "cash";
+            /** Portfolio Weight */
+            portfolio_weight: string;
         };
         /** FactorArchiveCommandData */
         FactorArchiveCommandData: {
@@ -7071,6 +7390,11 @@ export interface components {
             /** Succeeded */
             succeeded: number;
         };
+        /**
+         * JobStatus
+         * @enum {string}
+         */
+        JobStatus: "queued" | "running" | "checkpointed" | "succeeded" | "failed" | "cancelled";
         /** JournalEntry */
         JournalEntry: {
             /**
@@ -7753,6 +8077,35 @@ export interface components {
             /** Unrealized Pnl */
             unrealized_pnl: number;
         };
+        /** PaperAccountSnapshot */
+        PaperAccountSnapshot: {
+            /** Account Id */
+            account_id: string;
+            /**
+             * As Of Time
+             * Format: date-time
+             */
+            as_of_time: string;
+            /** Available Cash */
+            available_cash: string;
+            /** Cash */
+            cash: string;
+            /** Frozen Cash */
+            frozen_cash: string;
+            /**
+             * Holdings
+             * @default []
+             */
+            holdings: components["schemas"]["PaperHolding"][];
+            /** Nav */
+            nav: string;
+            /** Realized Pnl */
+            realized_pnl: string;
+            /** Snapshot Id */
+            snapshot_id?: string | null;
+            /** Unrealized Pnl */
+            unrealized_pnl: string;
+        };
         /** PaperAccountsData */
         PaperAccountsData: {
             /** Accounts */
@@ -7769,6 +8122,129 @@ export interface components {
             source_updated_at: string | null;
             /** Valuation Note */
             valuation_note: string | null;
+        };
+        /** PaperBacktestBandResult */
+        PaperBacktestBandResult: {
+            /**
+             * Algorithm
+             * @default paper-bootstrap-splitmix64-day-major-nearest-rank-v1
+             * @constant
+             */
+            algorithm: "paper-bootstrap-splitmix64-day-major-nearest-rank-v1";
+            /** Backtest Source Hash */
+            backtest_source_hash: string;
+            /** Configuration Fingerprint */
+            configuration_fingerprint: string;
+            /**
+             * Contract
+             * @default paper-backtest-band-result/v1
+             * @constant
+             */
+            contract: "paper-backtest-band-result/v1";
+            /** Dates */
+            dates: string[];
+            /** Input Hash */
+            input_hash: string;
+            /**
+             * Paths
+             * @default 2048
+             * @constant
+             */
+            paths: 2048;
+            /** Points */
+            points: components["schemas"]["BootstrapPoint"][];
+            /**
+             * Seed
+             * @default 20261005
+             * @constant
+             */
+            seed: 20261005;
+        };
+        /** PaperBacktestChoice */
+        PaperBacktestChoice: {
+            /**
+             * Completed At
+             * Format: date-time
+             */
+            completed_at: string;
+            /**
+             * Job Id
+             * Format: uuid
+             */
+            job_id: string;
+            /** Name */
+            name: string;
+        };
+        /** PaperConfigurationView */
+        PaperConfigurationView: {
+            /** Account Id */
+            account_id: string;
+            /**
+             * Configured At
+             * Format: date-time
+             */
+            configured_at: string;
+            drawdown_rule?: components["schemas"]["DrawdownRule-Output"] | null;
+            execution_cost_spec: components["schemas"]["ExecutionCostSpec"];
+            /** Fingerprint */
+            fingerprint: string;
+            /** Strategy Id */
+            strategy_id: string;
+            /** Strategy Name */
+            strategy_name: string;
+            /** Strategy Version */
+            strategy_version: string;
+            /** Version */
+            version: number;
+            weight_rule: components["schemas"]["PortfolioWeightRule-Output"];
+        };
+        /**
+         * PaperCostProvenanceState
+         * @enum {string}
+         */
+        PaperCostProvenanceState: "KNOWN_V3" | "LEGACY_UNKNOWN";
+        /** PaperDailyNavPoint */
+        PaperDailyNavPoint: {
+            /** Calendar Source Identity */
+            calendar_source_identity: string;
+            /** Cash */
+            cash?: string | null;
+            /**
+             * Close At
+             * Format: date-time
+             */
+            close_at: string;
+            /** Configuration Fingerprint */
+            configuration_fingerprint: string;
+            /** Daily Return */
+            daily_return?: string | null;
+            /** Ledger Head Fingerprint */
+            ledger_head_fingerprint: string;
+            /** Ledger Revision */
+            ledger_revision: number;
+            /** Material Fingerprint */
+            material_fingerprint: string;
+            /** Nav */
+            nav?: string | null;
+            /** Normalized Nav */
+            normalized_nav?: string | null;
+            /**
+             * Published At
+             * Format: date-time
+             */
+            published_at: string;
+            /** Reason */
+            reason?: string | null;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "complete" | "unavailable";
+            /**
+             * Trade Date
+             * Format: date
+             */
+            trade_date: string;
         };
         /** PaperFillItem */
         PaperFillItem: {
@@ -7823,6 +8299,64 @@ export interface components {
             /** Total Orders */
             total_orders: number | null;
         };
+        /** PaperHistoryFill */
+        PaperHistoryFill: {
+            /** Commission */
+            commission: string;
+            /** Cost Context Fingerprint */
+            cost_context_fingerprint?: string | null;
+            /** @default LEGACY_UNKNOWN */
+            cost_provenance_state: components["schemas"]["PaperCostProvenanceState"];
+            /** Cost Spec Id */
+            cost_spec_id?: string | null;
+            /** Cost Spec Schema Version */
+            cost_spec_schema_version?: 3 | null;
+            /**
+             * Executed At
+             * Format: date-time
+             */
+            executed_at: string;
+            /** Execution Id */
+            execution_id: string;
+            /** Fill Id */
+            fill_id?: string | null;
+            /** Order Id */
+            order_id: string;
+            /**
+             * Persisted At
+             * Format: date-time
+             */
+            persisted_at: string;
+            /** Price */
+            price: string;
+            /** Price Snapshot Id */
+            price_snapshot_id: string;
+            /** Quantity */
+            quantity: number;
+            /** Sequence */
+            sequence: number;
+            /** Tax */
+            tax: string;
+            /** Total Fees */
+            total_fees?: string | null;
+            /** Transfer Fee */
+            transfer_fee?: string | null;
+        };
+        /** PaperHolding */
+        PaperHolding: {
+            /** Available Quantity */
+            available_quantity: number;
+            /** Average Cost */
+            average_cost: string;
+            /** Code */
+            code: string;
+            /** Frozen Quantity */
+            frozen_quantity: number;
+            /** Market Price */
+            market_price: string;
+            /** Quantity */
+            quantity: number;
+        };
         /** PaperHoldingItem */
         PaperHoldingItem: {
             /** Available Quantity */
@@ -7843,6 +8377,109 @@ export interface components {
             unrealized_pct: number | null;
             /** Unrealized Pnl */
             unrealized_pnl: number;
+        };
+        /** PaperOperatorApplication */
+        PaperOperatorApplication: {
+            /** Account Id */
+            account_id: string;
+            /** Configuration Fingerprint */
+            configuration_fingerprint: string;
+            /** Control Fingerprint */
+            control_fingerprint?: string | null;
+            /** Observed At */
+            observed_at?: string | null;
+            /**
+             * Paused
+             * @default true
+             */
+            paused: boolean;
+            /** Reason */
+            reason?: string | null;
+            /** Sequence */
+            sequence: number;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "waiting" | "applied" | "unavailable";
+        };
+        /** PaperOrder */
+        PaperOrder: {
+            /** Account Id */
+            account_id: string;
+            /** Average Fill Price */
+            average_fill_price?: string | null;
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /**
+             * Filled Quantity
+             * @default 0
+             */
+            filled_quantity: number;
+            /** Intent Id */
+            intent_id: string;
+            /** Order Id */
+            order_id?: string | null;
+            order_type: components["schemas"]["PaperOrderType"];
+            /** Quantity */
+            quantity: number;
+            reject_reason?: components["schemas"]["PaperRejectReason"] | null;
+            side: components["schemas"]["PaperSide"];
+            status: components["schemas"]["PaperOrderStatus"];
+            /** Ts Code */
+            ts_code: string;
+            /**
+             * Updated At
+             * Format: date-time
+             */
+            updated_at: string;
+        };
+        /** PaperOrderIntent */
+        PaperOrderIntent: {
+            /** Account Id */
+            account_id: string;
+            /**
+             * Available At
+             * Format: date-time
+             */
+            available_at: string;
+            /**
+             * Earliest Execution At
+             * Format: date-time
+             */
+            earliest_execution_at: string;
+            /** Entry Signal Id */
+            entry_signal_id?: string | null;
+            /**
+             * Event Time
+             * Format: date-time
+             */
+            event_time: string;
+            /**
+             * Expires At
+             * Format: date-time
+             */
+            expires_at: string;
+            /** Intent Id */
+            intent_id?: string | null;
+            /** Limit Price */
+            limit_price?: string | null;
+            order_type: components["schemas"]["PaperOrderType"];
+            /** Price Snapshot Id */
+            price_snapshot_id: string;
+            /** Producer Commit */
+            producer_commit: string;
+            /** Quantity */
+            quantity: number;
+            sell_quantity_authority?: components["schemas"]["PaperSellQuantityAuthority"] | null;
+            side: components["schemas"]["PaperSide"];
+            /** Signal Id */
+            signal_id: string;
+            /** Ts Code */
+            ts_code: string;
         };
         /** PaperOrderItem */
         PaperOrderItem: {
@@ -7891,11 +8528,421 @@ export interface components {
          * @enum {string}
          */
         PaperOrderType: "MARKET" | "LIMIT";
+        /** PaperPauseConfirmBody */
+        PaperPauseConfirmBody: {
+            /** Confirmation Id */
+            confirmation_id: string;
+            request: components["schemas"]["SetPaperAccountPaused"];
+        };
+        /** PaperPausePreparationData */
+        PaperPausePreparationData: {
+            command: components["schemas"]["SetPaperAccountPaused"];
+            /** Confirmation Id */
+            confirmation_id: string;
+            /**
+             * Expires At
+             * Format: date-time
+             */
+            expires_at: string;
+        };
+        /** PaperPeriodAttributionView */
+        PaperPeriodAttributionView: {
+            /**
+             * End At
+             * Format: date-time
+             */
+            end_at: string;
+            /** Reason */
+            reason?: string | null;
+            result: components["schemas"]["AttributionResult"] | null;
+            /**
+             * Start At
+             * Format: date-time
+             */
+            start_at: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "complete" | "unavailable";
+        };
+        /** PaperPortfolioCatalogData */
+        PaperPortfolioCatalogData: {
+            /** Accounts */
+            accounts: components["schemas"]["PaperPortfolioItem"][];
+            /**
+             * Availability
+             * @enum {string}
+             */
+            availability: "unavailable" | "empty" | "populated";
+            /** Available At */
+            available_at: string | null;
+        };
+        /** PaperPortfolioCommandData */
+        PaperPortfolioCommandData: {
+            /** Account Id */
+            account_id: string;
+            /**
+             * Command Id
+             * Format: uuid
+             */
+            command_id: string;
+            /** Configuration Fingerprint */
+            configuration_fingerprint?: string | null;
+            /** Configuration Version */
+            configuration_version?: number | null;
+            /** Job Id */
+            job_id?: string | null;
+            /** Message */
+            message: string;
+            /** Sequence */
+            sequence?: number | null;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "rejected" | "pending" | "uncertain" | "waiting_application" | "waiting_publication" | "applied" | "published" | "submitted";
+        };
+        /** PaperPortfolioDetailData */
+        PaperPortfolioDetailData: {
+            account: components["schemas"]["PaperAccountSnapshot"] | null;
+            attribution?: components["schemas"]["PaperPeriodAttributionView"] | null;
+            /**
+             * Backtests
+             * @default []
+             */
+            backtests: components["schemas"]["PaperBacktestChoice"][];
+            band?: components["schemas"]["PaperBacktestBandResult"] | null;
+            /**
+             * Band Position
+             * @default unavailable
+             * @enum {string}
+             */
+            band_position: "inside" | "outside" | "unavailable";
+            /**
+             * Can Band
+             * @default false
+             */
+            can_band: boolean;
+            /**
+             * Can Configure
+             * @default false
+             */
+            can_configure: boolean;
+            /**
+             * Can Pause
+             * @default false
+             */
+            can_pause: boolean;
+            /**
+             * Can Reconcile
+             * @default false
+             */
+            can_reconcile: boolean;
+            configuration: components["schemas"]["PaperConfigurationView"];
+            exposure?: components["schemas"]["ExposureResult"] | null;
+            /** Exposure Reason */
+            exposure_reason?: string | null;
+            /**
+             * History Available
+             * @default false
+             */
+            history_available: boolean;
+            metrics: components["schemas"]["PaperPortfolioMetrics"];
+            /** Nav */
+            nav: components["schemas"]["PaperDailyNavPoint"][];
+            operator: components["schemas"]["PaperOperatorApplication"];
+            /** Reason */
+            reason?: string | null;
+            /** Recent Research */
+            recent_research: components["schemas"]["PaperResearchSummary"][];
+            reduction?: components["schemas"]["PaperReductionStatus"] | null;
+            risk?: components["schemas"]["PaperRiskObservation"] | null;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "complete" | "unavailable";
+        };
+        /** PaperPortfolioHistoryPageView */
+        PaperPortfolioHistoryPageView: {
+            /** Account Id */
+            account_id: string;
+            /**
+             * Coverage
+             * @default complete
+             * @constant
+             */
+            coverage: "complete";
+            /** Generation Id */
+            generation_id: string;
+            /** Ledger Revision */
+            ledger_revision: number;
+            /** Next Cursor */
+            next_cursor?: string | null;
+            /** Records */
+            records: components["schemas"]["PaperPortfolioHistoryRecordView"][];
+            /** Total Orders */
+            total_orders: number;
+        };
+        /** PaperPortfolioHistoryRecordView */
+        PaperPortfolioHistoryRecordView: {
+            /** Fills */
+            fills: components["schemas"]["PaperHistoryFill"][];
+            intent: components["schemas"]["PaperOrderIntent"];
+            order: components["schemas"]["PaperOrder"];
+            /** Reject Message */
+            reject_message: string | null;
+            /** Sequence */
+            sequence: number;
+            /** Side Label */
+            side_label: string;
+            /** Status Label */
+            status_label: string;
+        };
+        /** PaperPortfolioItem */
+        PaperPortfolioItem: {
+            account: components["schemas"]["PaperAccountSnapshot"] | null;
+            /**
+             * Can Band
+             * @default false
+             */
+            can_band: boolean;
+            /**
+             * Can Configure
+             * @default false
+             */
+            can_configure: boolean;
+            /**
+             * Can Pause
+             * @default false
+             */
+            can_pause: boolean;
+            /**
+             * Can Reconcile
+             * @default false
+             */
+            can_reconcile: boolean;
+            configuration: components["schemas"]["PaperConfigurationView"];
+            metrics: components["schemas"]["PaperPortfolioMetrics"];
+            operator: components["schemas"]["PaperOperatorApplication"];
+            /** Reason */
+            reason?: string | null;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "complete" | "unavailable";
+        };
+        /** PaperPortfolioMetrics */
+        PaperPortfolioMetrics: {
+            /** Max Drawdown */
+            max_drawdown?: number | null;
+            /** Reason */
+            reason?: string | null;
+            /** Running Days */
+            running_days: number;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "complete" | "unavailable";
+            /** Total Return */
+            total_return?: number | null;
+            /** Verified Days */
+            verified_days: number;
+        };
+        /** PaperReconcileDifference */
+        PaperReconcileDifference: {
+            /** Actual */
+            actual: string;
+            /** Expected */
+            expected: string;
+            /** Path */
+            path: string;
+        };
+        /** PaperReconcileResult */
+        PaperReconcileResult: {
+            account: components["schemas"]["PaperAccountSnapshot"];
+            /** Actual Fingerprint */
+            actual_fingerprint: string;
+            /** Configuration Fingerprint */
+            configuration_fingerprint: string;
+            /**
+             * Contract
+             * @default paper-reconcile-result/v1
+             * @constant
+             */
+            contract: "paper-reconcile-result/v1";
+            /** Copy Sha256 */
+            copy_sha256: string;
+            /** Difference Count */
+            difference_count: number;
+            /** Differences */
+            differences: components["schemas"]["PaperReconcileDifference"][];
+            /** Expected Fingerprint */
+            expected_fingerprint: string;
+            /** Head Fingerprint */
+            head_fingerprint: string;
+            /** Input Hash */
+            input_hash: string;
+            /** Ledger Revision */
+            ledger_revision: number;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "consistent" | "differences";
+            /** Truncated */
+            truncated: boolean;
+        };
+        /** PaperReductionStatus */
+        PaperReductionStatus: {
+            /**
+             * As Of
+             * Format: date-time
+             */
+            as_of: string;
+            /** Configuration Fingerprint */
+            configuration_fingerprint: string;
+            /** Ledger Frame Fingerprint */
+            ledger_frame_fingerprint: string;
+            /** Plan Fingerprint */
+            plan_fingerprint?: string | null;
+            /** Reason */
+            reason?: string | null;
+            /** Risk Weight */
+            risk_weight: string;
+            /** Signal Ids */
+            signal_ids: string[];
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "not_required" | "waiting" | "complete" | "incomplete";
+            /** Target Risk Weight */
+            target_risk_weight?: string | null;
+        };
         /**
          * PaperRejectReason
          * @enum {string}
          */
         PaperRejectReason: "T_PLUS_ONE" | "SUSPENDED" | "LIMIT_LOCKED" | "INSUFFICIENT_CASH" | "INSUFFICIENT_POSITION" | "INVALID_LOT" | "EXPIRED" | "RISK_REJECTED";
+        /** PaperResearchSealedAnalysis */
+        PaperResearchSealedAnalysis: {
+            /** Account Id */
+            account_id: string;
+            band?: components["schemas"]["PaperBacktestBandResult"] | null;
+            /** Complete Result Hash */
+            complete_result_hash: string;
+            /**
+             * Completed At
+             * Format: date-time
+             */
+            completed_at: string;
+            /** Configuration Fingerprint */
+            configuration_fingerprint: string;
+            /** Configuration Version */
+            configuration_version: number;
+            /**
+             * Job Id
+             * Format: uuid
+             */
+            job_id: string;
+            /** Manifest Hash */
+            manifest_hash: string;
+            reconcile?: components["schemas"]["PaperReconcileResult"] | null;
+            /** Result Hash */
+            result_hash: string;
+            /** Spec Hash */
+            spec_hash: string;
+            /**
+             * Task Name
+             * @enum {string}
+             */
+            task_name: "paper_reconcile" | "paper_backtest_band";
+        };
+        /** PaperResearchSummary */
+        PaperResearchSummary: {
+            /**
+             * Accepted At
+             * Format: date-time
+             */
+            accepted_at: string;
+            /** Account Id */
+            account_id: string;
+            /** Configuration Fingerprint */
+            configuration_fingerprint: string;
+            /** Configuration Version */
+            configuration_version: number;
+            /**
+             * Job Id
+             * Format: uuid
+             */
+            job_id: string;
+            /** Reason */
+            reason?: string | null;
+            sealed?: components["schemas"]["PaperResearchSealedAnalysis"] | null;
+            /** Status */
+            status: components["schemas"]["JobStatus"] | "submitted";
+            /**
+             * Task Name
+             * @enum {string}
+             */
+            task_name: "paper_reconcile" | "paper_backtest_band";
+        };
+        /** PaperRiskObservation */
+        PaperRiskObservation: {
+            /** Account Id */
+            account_id: string;
+            /** Configuration Fingerprint */
+            configuration_fingerprint: string;
+            decision: components["schemas"]["DrawdownDecision"] | null;
+            /** Ledger Revision */
+            ledger_revision: number;
+            /** Nav */
+            nav: string;
+            /**
+             * Observed At
+             * Format: date-time
+             */
+            observed_at: string;
+            /** Source Fingerprint */
+            source_fingerprint: string;
+        };
+        /** PaperSellQuantityAuthority */
+        PaperSellQuantityAuthority: {
+            /** Account Id */
+            account_id: string;
+            /**
+             * Action
+             * @enum {string}
+             */
+            action: "REDUCE" | "S_INTENT";
+            /** Available Quantity */
+            available_quantity: number;
+            /**
+             * Decision Cutoff
+             * Format: date-time
+             */
+            decision_cutoff: string;
+            /** Entry Signal Id */
+            entry_signal_id: string;
+            /** Exit Signal Id */
+            exit_signal_id: string;
+            /** Remaining Quantity */
+            remaining_quantity: number;
+            /** Requested Quantity */
+            requested_quantity: number;
+            /** Snapshot Id */
+            snapshot_id?: string | null;
+            /** Source Lot Fingerprint */
+            source_lot_fingerprint: string;
+            /** Tranche Fraction */
+            tranche_fraction: string;
+            /** Ts Code */
+            ts_code: string;
+        };
         /**
          * PaperSide
          * @enum {string}
@@ -9677,6 +10724,34 @@ export interface components {
             /** Win Rate */
             win_rate: number | null;
         };
+        /** RunPaperPortfolioResearch */
+        RunPaperPortfolioResearch: {
+            /** Account Id */
+            account_id: string;
+            /** Backtest Job Id */
+            backtest_job_id?: string | null;
+            /** Command Id */
+            command_id: string;
+            /** Configuration Fingerprint */
+            configuration_fingerprint: string;
+            /** Generation Id */
+            generation_id: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "run_paper_portfolio_research";
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+            /**
+             * Task Name
+             * @enum {string}
+             */
+            task_name: "paper_reconcile" | "paper_backtest_band";
+        };
         /** RunStrategyTemplate */
         RunStrategyTemplate: {
             /** Command Id */
@@ -9744,6 +10819,29 @@ export interface components {
          * @enum {string}
          */
         SampleState: "available" | "empty" | "missing" | "unsupported" | "unpublished" | "stale" | "error";
+        /** SavePaperPortfolioConfiguration */
+        SavePaperPortfolioConfiguration: {
+            /** Account Id */
+            account_id: string;
+            /** Command Id */
+            command_id: string;
+            drawdown_rule?: components["schemas"]["DrawdownRule-Input"] | null;
+            /** Expected Configuration Fingerprint */
+            expected_configuration_fingerprint: string;
+            /** Generation Id */
+            generation_id: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "save_paper_portfolio_configuration";
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+            weight_rule: components["schemas"]["PortfolioWeightRule-Input"];
+        };
         /** SavePoolCommand */
         SavePoolCommand: {
             /** Base Name */
@@ -10240,6 +11338,33 @@ export interface components {
             today: string;
             /** Trade Date */
             trade_date: string | null;
+        };
+        /** SetPaperAccountPaused */
+        SetPaperAccountPaused: {
+            /** Account Id */
+            account_id: string;
+            /** Command Id */
+            command_id: string;
+            /** Configuration Fingerprint */
+            configuration_fingerprint: string;
+            /** Expected Paused */
+            expected_paused: boolean;
+            /** Expected Sequence */
+            expected_sequence: number;
+            /** Generation Id */
+            generation_id: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "set_paper_account_paused";
+            /** Paused */
+            paused: boolean;
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
         };
         /** SignalItem */
         SignalItem: {
@@ -13089,6 +14214,381 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["Envelope_SurgeSearchData_"];
                 };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    accounts_api_v1_paper_portfolios_get: {
+        parameters: {
+            query?: {
+                generation_id?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_PaperPortfolioCatalogData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    detail_api_v1_paper_portfolios__account_id__get: {
+        parameters: {
+            query?: {
+                generation_id?: string | null;
+            };
+            header?: never;
+            path: {
+                account_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_PaperPortfolioDetailData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    band_api_v1_paper_portfolios__account_id__band_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                account_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RunPaperPortfolioResearch"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_PaperPortfolioCommandData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    configuration_api_v1_paper_portfolios__account_id__configuration_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                account_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SavePaperPortfolioConfiguration"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_PaperPortfolioCommandData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    history_api_v1_paper_portfolios__account_id__history_get: {
+        parameters: {
+            query?: {
+                generation_id?: string | null;
+                cursor?: string | null;
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                account_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_PaperPortfolioHistoryPageView_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    confirm_api_v1_paper_portfolios__account_id__pause_confirm_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                account_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PaperPauseConfirmBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_PaperPortfolioCommandData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    prepare_api_v1_paper_portfolios__account_id__pause_prepare_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                account_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetPaperAccountPaused"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_PaperPausePreparationData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    reconcile_api_v1_paper_portfolios__account_id__reconcile_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                account_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RunPaperPortfolioResearch"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_PaperPortfolioCommandData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    recover_api_v1_paper_portfolios__account_id__recover_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                account_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetPaperAccountPaused"] | components["schemas"]["SavePaperPortfolioConfiguration"] | components["schemas"]["RunPaperPortfolioResearch"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_PaperPortfolioCommandData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    research_api_v1_paper_portfolios__account_id__research__job_id__get: {
+        parameters: {
+            query?: {
+                generation_id?: string | null;
+            };
+            header?: never;
+            path: {
+                account_id: string;
+                job_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_PaperResearchSummary_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    download_api_v1_paper_portfolios__account_id__research__job_id__download_get: {
+        parameters: {
+            query?: {
+                generation_id?: string | null;
+            };
+            header?: never;
+            path: {
+                account_id: string;
+                job_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description Validation Error */
             422: {

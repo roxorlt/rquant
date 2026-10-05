@@ -1,0 +1,58 @@
+{
+  "source": "Independent Fraction calculation; imports no rquant/product modules",
+  "frozen_seed": 20261005,
+  "paths": 2048,
+  "returns": [
+    "-.01",
+    "0",
+    ".02"
+  ],
+  "days": [
+    {
+      "lower_fraction": "99/100",
+      "upper_fraction": "51/50"
+    },
+    {
+      "lower_fraction": "9801/10000",
+      "upper_fraction": "2601/2500"
+    },
+    {
+      "lower_fraction": "9801/10000",
+      "upper_fraction": "2601/2500"
+    },
+    {
+      "lower_fraction": "970299/1000000",
+      "upper_fraction": "132651/125000"
+    },
+    {
+      "lower_fraction": "970299/1000000",
+      "upper_fraction": "132651/125000"
+    },
+    {
+      "lower_fraction": "970299/1000000",
+      "upper_fraction": "669754899/625000000"
+    },
+    {
+      "lower_fraction": "485004925449/500000000000",
+      "upper_fraction": "6765201/6250000"
+    },
+    {
+      "lower_fraction": "485004925449/500000000000",
+      "upper_fraction": "34157499849/31250000000"
+    }
+  ],
+  "zero_returns": [
+    {
+      "lower_fraction": "1",
+      "upper_fraction": "1"
+    },
+    {
+      "lower_fraction": "1",
+      "upper_fraction": "1"
+    },
+    {
+      "lower_fraction": "1",
+      "upper_fraction": "1"
+    }
+  ]
+}

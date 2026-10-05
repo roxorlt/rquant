@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from rquant.paper_research import PaperResearchAdapterCatalog
+
 import re
 import stat
 from collections.abc import Callable
@@ -315,10 +317,14 @@ def _preflight_research_plan(
     spec: ResearchRunSpec,
     *,
     template_catalog: StrategyTemplateAdapterCatalog | None = None,
+    paper_catalog: PaperResearchAdapterCatalog | None = None,
 ) -> None:
     try:
+        from rquant.paper_research_adapter import paper_research_adapter_registry
+        if template_catalog is not None and paper_catalog is not None:
+            raise ValueError("one original plan requires one exact owned catalog")
         registry = (
-            default_strategy_job_adapter_registry()
+            (default_strategy_job_adapter_registry() if paper_catalog is None else paper_research_adapter_registry(paper_catalog))
             if template_catalog is None
             else strategy_template_adapter_registry(template_catalog)
         )
