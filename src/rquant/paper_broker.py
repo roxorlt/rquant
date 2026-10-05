@@ -5,7 +5,10 @@ from __future__ import annotations
 import json
 import secrets
 import sqlite3
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+import os
+import stat
 from datetime import UTC, date, datetime
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
@@ -513,6 +516,12 @@ def paper_ledger_financial_state_digest(connection: sqlite3.Connection) -> str:
     )
 
 
+class _ReadonlyLedgerConnection(sqlite3.Connection):
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> bool:
+        # Original read methods share the outer, fixed snapshot transaction.
+        return False
+
+
 class PaperBrokerStore:
     """Own the only mutable paper ledger and serialize all writes through SQLite."""
 
@@ -527,6 +536,7 @@ class PaperBrokerStore:
         ledger_id: str | None = None,
         ledger_anchor_path: Path | None = None,
         ledger_anchor_verifier: Ed25519PaperLedgerAnchorVerifier | None = None,
+        _read_only: bool = False,
     ) -> None:
         if not account_id.strip():
             raise ValueError("account_id must not be empty")
@@ -549,8 +559,69 @@ class PaperBrokerStore:
         self.ledger_id = None if ledger_id is None else ledger_id.strip()
         self.ledger_anchor_path = None if ledger_anchor_path is None else Path(ledger_anchor_path)
         self.ledger_anchor_verifier = ledger_anchor_verifier
+        if type(_read_only) is not bool:
+            raise TypeError("paper readonly mode must be an internal boolean")
+        self._read_only = _read_only
+        self._readonly_connection: sqlite3.Connection | None = None
+        if _read_only:
+            if not self.path.is_file() or self.path.is_symlink():
+                raise PaperBrokerReconciliationError("readonly paper source must already exist")
+            identity = self.path.lstat()
+            if not stat.S_ISREG(identity.st_mode) or identity.st_uid != os.getuid() or identity.st_nlink != 1:
+                raise PaperBrokerReconciliationError("readonly paper source must be a regular owned file")
+            self._readonly_identity = (identity.st_dev, identity.st_ino)
+            with self.path.open("rb") as source:
+                header = source.read(20)
+            if header[18:20] == b"\x02\x02" and not self.path.with_name(self.path.name + "-wal").exists():
+                raise PaperBrokerReconciliationError("readonly WAL source lacks its existing safe side file")
+            connection = sqlite3.connect(f"{self.path.absolute().as_uri()}?mode=ro", uri=True,
+                                         isolation_level=None, timeout=busy_timeout_ms / 1000,
+                                         factory=_ReadonlyLedgerConnection)
+            connection.row_factory = sqlite3.Row
+            self._readonly_connection = connection
+            try:
+                connection.execute("PRAGMA query_only = ON")
+                connection.execute("BEGIN")
+                self._require_trusted_ledger(connection)
+                row = connection.execute("SELECT initial_cash,cost_policy_fingerprint FROM broker_account WHERE account_id=?", (self.account_id,)).fetchone()
+                if row is None or Decimal(row["initial_cash"]) != initial_cash or row["cost_policy_fingerprint"] != cost_policy.fingerprint:
+                    raise PaperBrokerReconciliationError("readonly paper account/configuration differs")
+                if self.ledger_id is not None:
+                    migration = connection.execute("SELECT migration_attestation_digest FROM paper_ledger_migration_attestation WHERE singleton=1").fetchone()
+                    head = connection.execute("SELECT revision,head_marker_fingerprint,attestation_fingerprint FROM paper_ledger_head_marker ORDER BY revision DESC LIMIT 1").fetchone()
+                    if migration is None or head is None or not self._anchor_matches_current_head({
+                        "migration_attestation_digest": migration[0], "head_revision": int(head["revision"]),
+                        "head_marker_fingerprint": head["head_marker_fingerprint"],
+                        "attestation_fingerprint": head["attestation_fingerprint"],
+                        "financial_state_digest": paper_ledger_financial_state_digest(connection),
+                    }):
+                        raise PaperBrokerReconciliationError("readonly paper source anchor does not match the original v5 head")
+                self._connect()
+            except BaseException:
+                connection.close()
+                self._readonly_connection = None
+                raise
+            return
         self._reject_online_v4_open()
         self._initialize()
+
+    @classmethod
+    @contextmanager
+    def open_readonly(cls, path: Path, *, account_id: str, initial_cash: Decimal,
+                      cost_policy: BrokerCostPolicy, busy_timeout_ms: int = 5_000,
+                      ledger_id: str | None = None, ledger_anchor_path: Path | None = None,
+                      ledger_anchor_verifier: Ed25519PaperLedgerAnchorVerifier | None = None) -> Iterator[PaperBrokerStore]:
+        reader = cls(path, account_id=account_id, initial_cash=initial_cash, cost_policy=cost_policy,
+                     busy_timeout_ms=busy_timeout_ms, ledger_id=ledger_id,
+                     ledger_anchor_path=ledger_anchor_path, ledger_anchor_verifier=ledger_anchor_verifier,
+                     _read_only=True)
+        try:
+            yield reader
+        finally:
+            connection = reader._readonly_connection
+            reader._readonly_connection = None
+            if connection is not None:
+                connection.close()
 
     def _reject_online_v4_open(self) -> None:
         """Inspect an existing ledger read-only before any SQLite write pragma runs."""
@@ -580,6 +651,14 @@ class PaperBrokerStore:
             )
 
     def _connect(self) -> sqlite3.Connection:
+        if self._read_only:
+            identity = self.path.lstat()
+            if (stat.S_ISREG(identity.st_mode) is False or identity.st_uid != os.getuid()
+                    or identity.st_nlink != 1 or (identity.st_dev, identity.st_ino) != self._readonly_identity):
+                raise PaperBrokerReconciliationError("readonly paper source was replaced")
+            if self._readonly_connection is None:
+                raise PaperBrokerReconciliationError("readonly paper session is closed")
+            return self._readonly_connection
         connection = sqlite3.connect(
             self.path,
             timeout=self.busy_timeout_ms / 1_000,

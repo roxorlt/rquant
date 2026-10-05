@@ -11,6 +11,7 @@ from typing import Literal
 from pydantic import Field, StrictBool, StrictInt, field_validator, model_validator
 
 from rquant.paper_broker import BrokerCostPolicy, PaperBrokerStore
+from rquant.paper_portfolio_runtime import PaperPortfolioRuntimeCatalog
 from rquant.paper_ledger_anchor import Ed25519PaperLedgerAnchorVerifier
 from rquant.paper_signal_consumer import (
     PaperSignalConsumerStateStore,
@@ -240,7 +241,10 @@ def paper_broker_builder(
     clock: Callable[[], datetime],
     quote_resolver: QuoteResolver | None = None,
     trade_date_resolver: TradeDateResolver | None = None,
+    portfolio_catalog: PaperPortfolioRuntimeCatalog | None = None,
 ) -> RuntimeServiceBuilder:
+    if portfolio_catalog is not None and type(portfolio_catalog) is not PaperPortfolioRuntimeCatalog:
+        raise TypeError("paper builder requires its finite concrete portfolio catalog")
     if (quote_resolver is None) != (trade_date_resolver is None):
         raise ValueError("paper broker dependencies must be provided together")
 
@@ -248,6 +252,10 @@ def paper_broker_builder(
         settings = _paper_settings(manifest, kind=RuntimeServiceKind.PAPER_BROKER)
         if not isinstance(settings, PaperBrokerSettings):
             raise TypeError("paper broker settings are unavailable")
+        portfolio_runtime = portfolio_catalog.for_manifest(manifest) if portfolio_catalog else None
+        if (portfolio_runtime is not None and portfolio_runtime.risk_publisher is not None
+                and portfolio_runtime.risk_publisher.spool.paths.root != settings.signal_spool_root):
+            raise ValueError("paper risk route differs from the original exact role spool")
         if quote_resolver is None and trade_date_resolver is None:
             if (
                 settings.raw_spool_root is None
@@ -277,6 +285,12 @@ def paper_broker_builder(
             resolved_quote_resolver = pit_resolver
             resolved_trade_date_resolver = pit_resolver.trade_date_at
             constraint_generation_resolver = pit_resolver.constraint_generation_at
+            if portfolio_runtime is not None:
+                from rquant.backtest.contracts import SSECalendar
+
+                dates = pit_resolver._sse_open_dates
+                portfolio_runtime.calendar = SSECalendar(source_identity=settings.trade_calendar_sha256,
+                                                        coverage_start=dates[0], coverage_end=dates[-1], dates=dates)
         else:
             if quote_resolver is None or trade_date_resolver is None:
                 raise RuntimeError("paper broker dependencies are unavailable")
@@ -319,6 +333,8 @@ def paper_broker_builder(
             busy_timeout_ms=settings.busy_timeout_ms,
         )
         authority_publisher = None
+        portfolio_view_source = None
+        portfolio_sequence_floor = None
         if settings.serving_authority_root is not None:
             from rquant.runtime_serving_authority import ServingSourceAuthorityPublisher
 
@@ -329,8 +345,13 @@ def paper_broker_builder(
                 payload_kind="paper_accounts",
                 clock=clock,
             )
+            if portfolio_runtime is not None:
+                from rquant.paper_portfolio_view_source import PaperPortfolioViewSource
+
+                portfolio_view_source = PaperPortfolioViewSource(portfolio_runtime, broker=broker, queue=queue)
 
         def publish_account_authority(observed_at: datetime) -> str | None:
+            nonlocal portfolio_sequence_floor
             if authority_publisher is None:
                 return None
             from rquant.paper_history_serving import paper_history_projections
@@ -350,9 +371,27 @@ def paper_broker_builder(
             account = authority_state.snapshot
             reason = "paper account marks use last execution prices" if account.holdings else None
             projections = paper_history_projections(history)
+            sequence = history.ledger_revision
+            if portfolio_view_source is not None:
+                from rquant.paper_portfolio_projection import PaperPortfolioSnapshot, paper_portfolio_projections
+                from rquant.runtime_serving_authority import ServingSourceAuthorityReader, ServingSourceAuthorityUnavailableError
+
+                portfolio_account = portfolio_view_source.read(as_of=observed_at)
+                portfolio_snapshot = PaperPortfolioSnapshot(available_at=observed_at, accounts=(portfolio_account,))
+                projections += paper_portfolio_projections(portfolio_snapshot)
+                if portfolio_sequence_floor is None:
+                    try:
+                        previous = ServingSourceAuthorityReader(root=settings.serving_authority_root, expected_producer_commit=manifest.producer_commit,
+                                                                expected_dataset_id="paper_accounts", expected_payload_kind="paper_accounts")(observed_at)
+                        portfolio_sequence_floor = previous.sequence
+                    except ServingSourceAuthorityUnavailableError:
+                        portfolio_sequence_floor = 0
+                sequence = portfolio_view_source.publication_sequence(portfolio_snapshot, minimum_sequence=max(sequence, portfolio_sequence_floor))
+                if portfolio_account.reason:
+                    reason = "; ".join(part for part in (reason, portfolio_account.reason) if part)
             values: dict[str, object] = {
                 "dataset_id": "paper_accounts",
-                "sequence": history.ledger_revision,
+                "sequence": sequence,
                 "event_time": observed_at,
                 "published_at": observed_at,
                 "status": (
@@ -371,6 +410,11 @@ def paper_broker_builder(
                 if not isinstance(payload, PaperAccountsPayload):
                     raise ValueError("paper authority payload is inconsistent")
                 tables = {item.table_name: item for item in payload.projections}
+                if "paper_portfolio_state" in tables:
+                    from rquant.paper_portfolio_projection import validate_paper_portfolio_projections
+                    from rquant.paper_portfolio_view_source import paper_portfolio_publication_identity
+
+                    return paper_portfolio_publication_identity(validate_paper_portfolio_projections(tables))
                 if set(tables) != {
                     "paper_order_window",
                     "paper_order_history",
@@ -441,9 +485,29 @@ def paper_broker_builder(
                 trade_date=resolved_trade_date_resolver(observed_at),
                 quote_resolver=resolved_quote_resolver,
                 limit=settings.limit,
+                portfolio_runtime=portfolio_runtime,
             )
+            if portfolio_runtime is not None:
+                try:
+                    with portfolio_runtime.state._connection(write=True):
+                        if portfolio_runtime.risk_publisher is not None:
+                            portfolio_runtime.risk_publisher.publish_pending(observed_at=observed_at)
+                        portfolio_runtime.plan_risk_reductions(broker, decision_at=observed_at,
+                                                               trade_date=resolved_trade_date_resolver(observed_at),
+                                                               quote_resolver=resolved_quote_resolver, queue=queue)
+                    portfolio_runtime.risk_reason = None
+                except ValueError as exc:
+                    portfolio_runtime.risk_reason = str(exc)
             failures = summary.failed_count
             authority_generation = publish_account_authority(observed_at)
+            portfolio_generations = {}
+            if portfolio_runtime is not None:
+                applied = portfolio_runtime.operator.current()
+                portfolio_generations = {
+                    "paper_portfolio_configuration": portfolio_runtime.state.configuration.fingerprint,
+                    "paper_operator_application": canonical_sha256(applied),
+                    **({"paper_operator_control": applied.control_fingerprint} if applied.control_fingerprint else {}),
+                }
             return RuntimeStepResult(
                 input_sequence=descriptor.high_watermark,
                 output_sequence=consumed.ended_at_sequence,
@@ -454,6 +518,7 @@ def paper_broker_builder(
                     "paper_cost_policy": cost_policy.fingerprint,
                     "paper_execution_cost_spec": cost_policy.cost_spec_id,
                     "paper_signal_policy": policy.fingerprint,
+                    **portfolio_generations,
                     **constraint_generation,
                     **(
                         {"paper_accounts": authority_generation}
@@ -461,7 +526,9 @@ def paper_broker_builder(
                         else {}
                     ),
                 },
-                degraded_reasons=("paper_execution_failed",) if failures else (),
+                degraded_reasons=(("paper_execution_failed",) if failures else ())
+                                 + (("paper_portfolio_risk_unavailable",) if portfolio_runtime is not None and portfolio_runtime.risk_reason else ()),
+                observations=({"paper_operator_applied_sequence": applied.sequence} if portfolio_runtime is not None else {}),
                 watermark_advanced=consumed.watermark_advanced,
             )
 

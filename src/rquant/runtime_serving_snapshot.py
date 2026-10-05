@@ -125,6 +125,19 @@ class PaperAccountsPayload(RuntimeContractModel):
     paper_accounts: tuple[PaperAccountSnapshot, ...] = ()
     projections: tuple[ServingProjectionPayload, ...] = ()
 
+    @model_validator(mode="after")
+    def validate_portfolio_graph(self) -> Self:
+        from rquant.paper_portfolio_projection_contract import PAPER_PORTFOLIO_PROJECTION_TABLES
+
+        if any(p.table_name in PAPER_PORTFOLIO_PROJECTION_TABLES for p in self.projections):
+            from rquant.paper_portfolio_projection import validate_paper_portfolio_projections
+
+            graph = validate_paper_portfolio_projections({p.table_name: p for p in self.projections})
+            account_ids = {account.account_id for account in self.paper_accounts}
+            if graph is None or any(item.configuration.binding.account_id not in account_ids for item in graph.accounts):
+                raise ValueError("paper portfolio owner payload contains a different account")
+        return self
+
 
 class RuntimeHealthPayload(RuntimeContractModel):
     payload_kind: Literal["runtime_health"] = "runtime_health"

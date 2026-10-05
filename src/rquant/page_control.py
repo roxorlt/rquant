@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Literal, Protocol
 
 if TYPE_CHECKING:
+    from rquant.paper_portfolio_commands import PaperPortfolioPageControlBackend
     from rquant.research_query.saved import SavedResearchQuery
     from rquant.strategy_authoring import StrategyAuthoringPageControlBackend
     from rquant.strategy_authoring_source import StrategySourceCatalog
@@ -71,6 +72,16 @@ from rquant.manual_watchlist import (
     WatchlistCapacityError,
     WatchlistVersionConflictError,
 )
+from rquant.paper_operator_commands import (
+    OwnedPaperPortfolioCommand,
+    OwnedSavePaperPortfolioConfiguration,
+    OwnedSetPaperAccountPaused,
+    PaperPortfolioCommand,
+    SavePaperPortfolioConfiguration,
+    SetPaperAccountPaused,
+)
+from rquant.paper_portfolio_models import PaperPortfolioStateIdentity
+from rquant.paper_research_commands import RunPaperPortfolioResearch, OwnedRunPaperPortfolioResearch
 from rquant.portfolio_backtest_commands import (
     ExportPortfolioBacktestZip,
     PortfolioPageControlBackend,
@@ -127,6 +138,7 @@ _FACTOR_DEFINITION_KINDS = frozenset({"save_factor_definition", "archive_factor"
 _FACTOR_RUN_KINDS = frozenset({"submit_factor_run"})
 _FACTOR_TRACKING_KINDS = frozenset({"set_factor_tracked"})
 _STRATEGY_AUTHORING_KINDS = frozenset({"save_strategy_template", "archive_strategy_template", "run_strategy_template"})
+_PAPER_PORTFOLIO_KINDS = frozenset({"set_paper_account_paused", "save_paper_portfolio_configuration", "run_paper_portfolio_research"})
 _FACTOR_REGISTRY_EFFECT_IDENTITY = "factor-registry-identity/v1"
 _LOCAL_FILESYSTEM_FENCE_SCHEMA_VERSION = 1
 _CANVAS_HEAD_CONTRACT = "canvas-current-head/v1"
@@ -697,6 +709,9 @@ PageControlCommandValue = Annotated[
     | OwnedSaveStrategyTemplate
     | OwnedArchiveStrategyTemplate
     | OwnedRunStrategyTemplate
+    | OwnedSetPaperAccountPaused
+    | OwnedSavePaperPortfolioConfiguration
+    | OwnedRunPaperPortfolioResearch
     | SaveCanvas
     | CreateCanvas
     | DeleteCanvas
@@ -1163,6 +1178,8 @@ class PageControlOutbox:
         return connection
 
     def enqueue(self, command: PageControlCommandValue) -> PageControlReceipt:
+        if isinstance(command, (SetPaperAccountPaused, SavePaperPortfolioConfiguration, RunPaperPortfolioResearch)):
+            raise ValueError("paper portfolio requires trusted submission")
         if isinstance(command, (SaveStrategyTemplate, ArchiveStrategyTemplate, RunStrategyTemplate)):
             raise ValueError("strategy authoring requires trusted submission")
         if isinstance(command, SaveResearchQuery):
@@ -1228,6 +1245,13 @@ class PageControlOutbox:
             raise TypeError("strategy authoring requires an owned command")
         return self._enqueue(command, require_strategy_authoring_trust=True)
 
+    def enqueue_trusted_paper_portfolio(
+        self, command: OwnedPaperPortfolioCommand
+    ) -> PageControlReceipt:
+        if type(command) not in (OwnedSetPaperAccountPaused, OwnedSavePaperPortfolioConfiguration, OwnedRunPaperPortfolioResearch):
+            raise TypeError("paper portfolio requires an owned command")
+        return self._enqueue(command, require_paper_portfolio_trust=True)
+
     def _enqueue(
         self,
         command: PageControlCommandValue,
@@ -1239,7 +1263,12 @@ class PageControlOutbox:
         require_factor_tracking_trust: bool = False,
         require_research_query_trust: bool = False,
         require_strategy_authoring_trust: bool = False,
+        require_paper_portfolio_trust: bool = False,
     ) -> PageControlReceipt:
+        if isinstance(command, (SetPaperAccountPaused, SavePaperPortfolioConfiguration, RunPaperPortfolioResearch)) != require_paper_portfolio_trust or (
+            require_paper_portfolio_trust and type(command) not in (OwnedSetPaperAccountPaused, OwnedSavePaperPortfolioConfiguration, OwnedRunPaperPortfolioResearch)
+        ):
+            raise ValueError("paper portfolio requires trusted submission")
         if isinstance(command, (SaveStrategyTemplate, ArchiveStrategyTemplate, RunStrategyTemplate)) != require_strategy_authoring_trust or (
             require_strategy_authoring_trust and type(command) not in (OwnedSaveStrategyTemplate, OwnedArchiveStrategyTemplate, OwnedRunStrategyTemplate)
         ):
@@ -1304,7 +1333,7 @@ class PageControlOutbox:
                     raise PageControlCommandConflictError(
                         "command_id already exists with different payload"
                     )
-                if require_price_rule_activation or require_factor_definition_trust or require_strategy_authoring_trust:
+                if require_price_rule_activation or require_factor_definition_trust or require_strategy_authoring_trust or require_paper_portfolio_trust:
                     stored = _COMMAND_ADAPTER.validate_json(existing["payload_json"])
                     if (
                         stored != command
@@ -1607,6 +1636,31 @@ class PageControlOutbox:
             raise PageControlCommandConflictError("stored strategy command is invalid") from exc
         if (
             not isinstance(stored, (OwnedSaveStrategyTemplate, OwnedArchiveStrategyTemplate, OwnedRunStrategyTemplate))
+            or stored.owner_id != authenticated_actor_id
+            or row["command_kind"] != request.kind
+            or stored.original() != request
+            or _command_hash(stored) != row["command_hash"]
+        ):
+            raise PageControlCommandConflictError("command_id already exists with different payload or actor")
+        return stored, self._receipt(row)
+
+    def lookup_paper_portfolio_command(
+        self, request: PaperPortfolioCommand, *, authenticated_actor_id: str
+    ) -> tuple[OwnedPaperPortfolioCommand, PageControlReceipt] | None:
+        if type(request) not in (SetPaperAccountPaused, SavePaperPortfolioConfiguration, RunPaperPortfolioResearch):
+            raise TypeError("paper lookup requires an ownerless original request")
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM page_control_command WHERE command_id = ?", (request.command_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            stored = _COMMAND_ADAPTER.validate_json(row["payload_json"])
+        except ValueError as exc:
+            raise PageControlCommandConflictError("stored paper command is invalid") from exc
+        if (
+            type(stored) not in (OwnedSetPaperAccountPaused, OwnedSavePaperPortfolioConfiguration, OwnedRunPaperPortfolioResearch)
             or stored.owner_id != authenticated_actor_id
             or row["command_kind"] != request.kind
             or stored.original() != request
@@ -2661,6 +2715,7 @@ class PageControlConsumer:
         factor_run_backend: FactorRunPageControlBackend | None = None,
         factor_tracking_backend: FactorTrackingPageControlBackend | None = None,
         strategy_authoring_backend: StrategyAuthoringPageControlBackend | None = None,
+        paper_portfolio_backend: PaperPortfolioPageControlBackend | None = None,
         clock: Callable[[], datetime] | None = None,
         lease_seconds: int = _DEFAULT_LEASE_SECONDS,
         consumer_id: str | None = None,
@@ -2684,6 +2739,7 @@ class PageControlConsumer:
         self.factor_run_backend = factor_run_backend
         self.factor_tracking_backend = factor_tracking_backend
         self.strategy_authoring_backend = strategy_authoring_backend
+        self.paper_portfolio_backend = paper_portfolio_backend
         self.clock = clock or (lambda: datetime.now(UTC))
         self.lease_seconds = lease_seconds
         self.consumer_service_id = consumer_service_id
@@ -2758,6 +2814,22 @@ class PageControlConsumer:
                 return ()
             if claims[0].command != command:
                 raise PageControlCommandConflictError("strategy command changed before claim")
+            return self._complete_claims(claims)
+
+    def drain_paper_portfolio_command(
+        self, command: OwnedPaperPortfolioCommand
+    ) -> tuple[PageControlReceipt, ...]:
+        with _PageControlExecutionMutex(self._consumer_mutex_path()) as acquired:
+            if not acquired:
+                return ()
+            claims = self.outbox.claim_records(
+                limit=1, owner_id=self.consumer_id, lease_seconds=self.lease_seconds,
+                now=self.clock(), target_command_id=command.command_id,
+            )
+            if not claims:
+                return ()
+            if claims[0].command != command:
+                raise PageControlCommandConflictError("paper command changed before claim")
             return self._complete_claims(claims)
 
     def drain_factor_definition_command(
@@ -2891,6 +2963,19 @@ class PageControlConsumer:
                     raise ValueError("strategy original metadata identity differs")
             except Exception as exc:
                 raise _RetryableUncertainEffectError(f"strategy original identity cannot be verified: {exc}") from exc
+        if type(command) in (OwnedSetPaperAccountPaused, OwnedSavePaperPortfolioConfiguration, OwnedRunPaperPortfolioResearch):
+            marker = {"contract": "paper-portfolio-identity/v1", "identity": command.metadata_identity.model_dump(mode="json")}
+            try:
+                self._paper_portfolio_backend().validate(command)
+                if effect.result is None:
+                    effect = self.outbox.record_started_effect_result(
+                        command.command_id, result=marker,
+                        owner_id=claim.owner_id, claim_token=claim.claim_token,
+                    )
+                if effect.result != marker:
+                    raise ValueError("paper original metadata identity differs")
+            except Exception as exc:
+                raise _RetryableUncertainEffectError(f"paper original identity cannot be verified: {exc}") from exc
         if (
             isinstance(command, (SubmitPortfolioBacktest, ExportPortfolioBacktestZip))
             and effect.result is None
@@ -3221,6 +3306,11 @@ class PageControlConsumer:
     def _must_recover_before_failure(
         self, command: PageControlCommandValue, *, created: bool
     ) -> bool:
+        if type(command) in (OwnedSetPaperAccountPaused, OwnedSavePaperPortfolioConfiguration, OwnedRunPaperPortfolioResearch):
+            try:
+                return self._paper_portfolio_backend().has_effect(command)
+            except Exception:
+                return True
         if isinstance(command, (OwnedSaveStrategyTemplate, OwnedArchiveStrategyTemplate, OwnedRunStrategyTemplate)):
             return not created or self.strategy_authoring_backend is not None
         if isinstance(command, (SubmitPortfolioBacktest, ExportPortfolioBacktestZip)):
@@ -3294,6 +3384,8 @@ class PageControlConsumer:
         return _ExecutionOutcome(PageControlStatus.FAILED, effect.result, effect.error)
 
     def _execute(self, command: PageControlCommandValue) -> JsonValue:
+        if type(command) in (OwnedSetPaperAccountPaused, OwnedSavePaperPortfolioConfiguration, OwnedRunPaperPortfolioResearch):
+            return self._paper_portfolio_backend().submit(command)
         if isinstance(command, (OwnedSaveStrategyTemplate, OwnedArchiveStrategyTemplate, OwnedRunStrategyTemplate)):
             return self._strategy_authoring_backend().submit(command)
         if isinstance(command, (SubmitPortfolioBacktest, ExportPortfolioBacktestZip)):
@@ -3430,6 +3522,11 @@ class PageControlConsumer:
         if self.strategy_authoring_backend is None:
             raise RuntimeError("strategy authoring backend is unavailable")
         return self.strategy_authoring_backend
+
+    def _paper_portfolio_backend(self) -> PaperPortfolioPageControlBackend:
+        if self.paper_portfolio_backend is None:
+            raise RuntimeError("paper portfolio backend is unavailable")
+        return self.paper_portfolio_backend
 
     @staticmethod
     def _factor_effect_identity(effect: PageControlEffectRecord) -> FactorRegistryIdentity:
@@ -3656,6 +3753,8 @@ class PageControlConsumer:
         return None
 
     def _recover_started_effect(self, command: PageControlCommandValue) -> JsonValue | None:
+        if type(command) in (OwnedSetPaperAccountPaused, OwnedSavePaperPortfolioConfiguration, OwnedRunPaperPortfolioResearch):
+            return self._paper_portfolio_backend().recover(command)
         if isinstance(command, (OwnedSaveStrategyTemplate, OwnedArchiveStrategyTemplate, OwnedRunStrategyTemplate)):
             return self._strategy_authoring_backend().recover(command)
         if isinstance(command, (SubmitPortfolioBacktest, ExportPortfolioBacktestZip)):
@@ -5091,6 +5190,42 @@ class PageControlService:
         backend.validate(owned)
         return self._settle(owned, self.outbox.enqueue_trusted_strategy_authoring(owned), strategy_authoring_command=owned)
 
+    def _lookup_trusted_paper_portfolio(
+        self, request: PaperPortfolioCommand, *, authenticated_actor_id: str
+    ) -> PageControlReceipt | None:
+        backend = self.consumer._paper_portfolio_backend()
+        backend.authorize(authenticated_actor_id)
+        backend.catalog.for_account(request.account_id, authenticated_actor_id=authenticated_actor_id)
+        matched = self.outbox.lookup_paper_portfolio_command(request, authenticated_actor_id=authenticated_actor_id)
+        return None if matched is None else matched[1]
+
+    def _resume_trusted_paper_portfolio(
+        self, request: PaperPortfolioCommand, *, authenticated_actor_id: str
+    ) -> PageControlReceipt:
+        backend = self.consumer._paper_portfolio_backend()
+        backend.authorize(authenticated_actor_id)
+        backend.catalog.for_account(request.account_id, authenticated_actor_id=authenticated_actor_id)
+        matched = self.outbox.lookup_paper_portfolio_command(request, authenticated_actor_id=authenticated_actor_id)
+        if matched is None:
+            raise KeyError("paper original command not found")
+        owned, receipt = matched
+        return self._settle(owned, receipt, paper_portfolio_command=owned)
+
+    def _submit_trusted_paper_portfolio(
+        self, request: PaperPortfolioCommand, *, authenticated_actor_id: str,
+        verified_metadata_identity: PaperPortfolioStateIdentity, confirmation_id: str | None = None,
+    ) -> PageControlReceipt:
+        backend = self.consumer._paper_portfolio_backend()
+        backend.authorize(authenticated_actor_id)
+        backend.catalog.for_account(request.account_id, authenticated_actor_id=authenticated_actor_id)
+        matched = self.outbox.lookup_paper_portfolio_command(request, authenticated_actor_id=authenticated_actor_id)
+        if matched is not None:
+            return self._settle(matched[0], matched[1], paper_portfolio_command=matched[0])
+        owned = backend.compile(request, authenticated_actor_id=authenticated_actor_id,
+                                expected_identity=verified_metadata_identity, confirmation_id=confirmation_id)
+        backend.validate(owned)
+        return self._settle(owned, self.outbox.enqueue_trusted_paper_portfolio(owned), paper_portfolio_command=owned)
+
     def _resume_trusted_price_rule(
         self, command: PriceAlertRuleRequestValue, *, authenticated_owner_id: str
     ) -> PageControlReceipt:
@@ -5111,15 +5246,22 @@ class PageControlService:
         factor_tracking_command: _OwnedSetFactorTracked | None = None,
         research_query_command: _OwnedSaveResearchQuery | None = None,
         strategy_authoring_command: OwnedStrategyTemplateCommand | None = None,
+        paper_portfolio_command: OwnedPaperPortfolioCommand | None = None,
     ) -> PageControlReceipt:
         for _ in range(100):
             if receipt.status in _PAGE_CONTROL_TERMINAL_STATUSES:
+                if paper_portfolio_command is not None and receipt.status is PageControlStatus.SUCCEEDED:
+                    recovered = self.consumer._paper_portfolio_backend().recover(paper_portfolio_command)
+                    if recovered != receipt.result:
+                        raise RuntimeError("paper original metadata receipt differs from journal")
                 if strategy_authoring_command is not None and receipt.status is PageControlStatus.SUCCEEDED:
                     recovered = self.consumer._strategy_authoring_backend().recover(strategy_authoring_command)
                     if recovered != receipt.result:
                         raise RuntimeError("strategy original metadata receipt differs from journal")
                 return receipt
-            if strategy_authoring_command is not None:
+            if paper_portfolio_command is not None:
+                drained = self.consumer.drain_paper_portfolio_command(paper_portfolio_command)
+            elif strategy_authoring_command is not None:
                 drained = self.consumer.drain_strategy_authoring_command(strategy_authoring_command)
             elif research_query_command is not None:
                 drained = self.consumer.drain_research_query_command(research_query_command)
@@ -5803,6 +5945,10 @@ def _fsync_descriptor(descriptor: int) -> None:
 
 
 def parse_page_control_command(payload: object) -> PageControlCommandValue:
+    if isinstance(payload, (SetPaperAccountPaused, SavePaperPortfolioConfiguration, RunPaperPortfolioResearch)) or (
+        isinstance(payload, Mapping) and payload.get("kind") in _PAPER_PORTFOLIO_KINDS
+    ):
+        raise ValueError("paper portfolio requires trusted submission")
     if isinstance(payload, (SaveStrategyTemplate, ArchiveStrategyTemplate, RunStrategyTemplate)) or (
         isinstance(payload, Mapping) and payload.get("kind") in _STRATEGY_AUTHORING_KINDS
     ):

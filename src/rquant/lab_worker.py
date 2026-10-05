@@ -130,6 +130,8 @@ from rquant.strict_json import (
 )
 
 if TYPE_CHECKING:
+    from rquant.paper_research import PaperResearchAdapterCatalog
+    from rquant.paper_research_runtime import PaperResearchRuntimeDirectory
     from rquant.strategy_template_adapter import StrategyTemplateAdapterCatalog
     from rquant.strategy_template_runtime import StrategyTemplateRuntimeDirectory
 
@@ -497,6 +499,7 @@ def build_builtin_shard_runtime_manifest(
     snapshot_root: Path,
     research_lake_root: Path,
     template_catalog: StrategyTemplateAdapterCatalog | None = None,
+    paper_catalog: PaperResearchAdapterCatalog | None = None,
 ) -> LabShardRuntimeManifest:
     from rquant.lab_worker_registry import builtin_lab_shard_configuration
 
@@ -506,6 +509,7 @@ def build_builtin_shard_runtime_manifest(
         snapshot_root=snapshot_root,
         research_lake_root=research_lake_root,
         template_catalog=template_catalog,
+        paper_catalog=paper_catalog,
     )
     return LabShardRuntimeManifest(
         registry=LabClosedRegistryBinding(
@@ -2755,6 +2759,7 @@ class LabWorker:
         artifact_root: Path,
         adapter_registry: StrategyJobAdapterRegistry | None = None,
         template_directory: StrategyTemplateRuntimeDirectory | None = None,
+        paper_directory: PaperResearchRuntimeDirectory | None = None,
         exploratory_store_factory: StoreFactory | None = None,
         metadata_store_factory: StoreFactory | None = None,
         research_lake_root: Path | None = None,
@@ -2945,6 +2950,8 @@ class LabWorker:
         self.adapter_registry = closed_adapter_registry
         from rquant.strategy_template_runtime import require_template_runtime_directory
         self.template_directory = require_template_runtime_directory(template_directory)
+        from rquant.paper_research_runtime import require_paper_runtime_directory
+        self.paper_directory = require_paper_runtime_directory(paper_directory)
         self.heartbeat_interval_microseconds = heartbeat_interval_microseconds
         self.resource_recheck_interval_microseconds = resource_recheck_interval_microseconds
         self.resource_probe_timeout_microseconds = resource_probe_timeout_microseconds
@@ -5214,9 +5221,12 @@ class LabWorker:
                     shard=payload.shard,
                 )
         registry = self.adapter_registry
-        if self.template_directory is not None:
+        if self.paper_directory is not None or self.template_directory is not None:
             payload = StrategyShardPayload.model_validate_json(claim.definition.payload_json)
-            registry = self.template_directory.registry_for_spec(payload.spec)
+            if self.paper_directory is not None and payload.spec.parameters.strategy_name in {"paper_reconcile", "paper_backtest_band"}:
+                registry = self.paper_directory.registry_for_spec(payload.spec)
+            elif self.template_directory is not None:
+                registry = self.template_directory.registry_for_spec(payload.spec)
         return registry.validate_claim(claim)
 
     def _heartbeat_loop(
@@ -5499,8 +5509,13 @@ class LabWorker:
         ack_live_limit_microseconds = (
             hard_limit_microseconds if initial_session in _LIVE_TRADING_SESSIONS else None
         )
+        manifest = self.shard_runtime_manifest
+        if self.paper_directory is not None and validated.spec.parameters.strategy_name in {"paper_reconcile", "paper_backtest_band"}:
+            manifest = self.paper_directory.manifest_for_spec(validated.spec, manifest)
+        elif self.template_directory is not None:
+            manifest = self.template_directory.manifest_for_spec(validated.spec, manifest)
         request = _ShardWireRequest(
-            manifest=self.shard_runtime_manifest if self.template_directory is None else self.template_directory.manifest_for_spec(validated.spec, self.shard_runtime_manifest),
+            manifest=manifest,
             validated=validated,
             runtime_code_sha=runtime_code_sha,
         )

@@ -75,6 +75,7 @@ from rquant.watchlist_quote_gateway import WatchlistQuoteGateway, WatchlistQuote
 from rquant.watchlist_quote_source_service import capture_watchlist_quote_step
 
 if TYPE_CHECKING:
+    from rquant.paper_portfolio_runtime import PaperPortfolioRuntimeCatalog
     from rquant.paper_signal_worker import QuoteResolver
     from rquant.reference_slow_publisher import ReferenceSlowSourceSnapshot
     from rquant.reference_slow_source import ReferenceSlowAdapter
@@ -1403,6 +1404,7 @@ def build_builtin_registry(
     provider_loader: ProviderLoader | None = None,
     paper_quote_resolver: QuoteResolver | None = None,
     trade_date_resolver: TradeDateResolver | None = None,
+    paper_portfolio_catalog: PaperPortfolioRuntimeCatalog | None = None,
     serving_snapshot_loader: ServingSnapshotLoader | None = None,
     daily_close_fetcher: Callable[[object], object] | None = None,
     shadow_input_loader: object | None = None,
@@ -1417,6 +1419,10 @@ def build_builtin_registry(
     completion_attestation_active_key_id: str | None = None,
     runtime_root: Path | None = None,
 ) -> RuntimeServiceRegistry:
+    from rquant.paper_portfolio_runtime import PaperPortfolioRuntimeCatalog
+
+    if paper_portfolio_catalog is not None and type(paper_portfolio_catalog) is not PaperPortfolioRuntimeCatalog:
+        raise TypeError("paper runtime requires its finite concrete portfolio catalog")
     from rquant.runtime_builder_authority import (
         lab_jobs_publisher_builder,
         paper_execution_constraint_publisher_builder,
@@ -1571,6 +1577,7 @@ def build_builtin_registry(
             clock=resolved_clock,
             quote_resolver=paper_quote_resolver,
             trade_date_resolver=trade_date_resolver,
+            portfolio_catalog=paper_portfolio_catalog,
         ),
     )
     registry.register(

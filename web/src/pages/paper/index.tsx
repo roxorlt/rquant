@@ -5,7 +5,7 @@ import {
   type PaperHoldingItem,
   usePaperAccounts,
 } from "@/api/endpoints";
-import { useMeta } from "@/api/useMeta";
+import { useCurrentMeta, useMeta } from "@/api/useMeta";
 import { toneClass, toneOf } from "@/format/color";
 import {
   formatCount,
@@ -28,6 +28,7 @@ import {
 } from "@/ui";
 import { StockCell } from "../shared/StockCell";
 import { PaperHistory } from "./PaperHistory";
+import { PaperPortfolioWorkspace } from "./PaperPortfolioWorkspace";
 import "./paper.css";
 
 function accountMetrics(account: PaperAccountItem, valuationNote: string | null): Kpi[] {
@@ -140,7 +141,7 @@ function emptyMessage(state: PaperAccountsData["source_state"]) {
   return { title: "暂时读不到页面数据", hint: "请稍后刷新，或查看系统健康。" };
 }
 
-export default function PaperPage() {
+export function LegacyPaperPage() {
   const result = usePaperAccounts();
   const meta = useMeta();
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -241,5 +242,44 @@ export default function PaperPage() {
         </Panel>
       ) : null}
     </>
+  );
+}
+
+export default function PaperPage() {
+  const meta = useCurrentMeta();
+  const viewer = meta.data?.data.viewer;
+  const generation = meta.data?.data.generation?.generation_id;
+  if (meta.error)
+    return (
+      <Panel>
+        <EmptyState
+          title="模拟账户暂时无法加载"
+          hint={<Button onClick={() => void meta.refetch()}>重试</Button>}
+        />
+      </Panel>
+    );
+  if (meta.data === undefined) return <PageSkeleton label="模拟账户加载中" />;
+  if (!viewer)
+    return (
+      <Panel>
+        <EmptyState title="当前账号暂不可用" />
+      </Panel>
+    );
+  if (!generation)
+    return (
+      <Panel>
+        <EmptyState
+          title="账户数据尚未发布"
+          hint={<Button onClick={() => void meta.refetch()}>刷新</Button>}
+        />
+      </Panel>
+    );
+  return (
+    <PaperPortfolioWorkspace
+      key={`${viewer}:${generation}`}
+      viewer={viewer}
+      generation={generation}
+      onLegacy={() => <LegacyPaperPage />}
+    />
   );
 }

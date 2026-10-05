@@ -55,6 +55,7 @@ from rquant.lab_jobs import (
 )
 from rquant.lab_logging import _safe_structured_log
 if TYPE_CHECKING:
+    from rquant.paper_research_runtime import PaperResearchRuntimeDirectory
     from rquant.strategy_template_runtime import StrategyTemplateRuntimeDirectory
 from rquant.lab_result_digest import LabResultDigestPolicy
 from rquant.lab_shard_protocol import LabClaimSpool, LabReportSpool, LabShardClaim, LabShardClaimV2
@@ -340,6 +341,7 @@ class LabScheduler:
         max_reports_per_tick: int = 64,
         adapter_registry: StrategyJobAdapterRegistry | None = None,
         template_directory: StrategyTemplateRuntimeDirectory | None = None,
+        paper_directory: PaperResearchRuntimeDirectory | None = None,
         max_plans_per_tick: int = 64,
         max_claims_per_tick: int = 16,
         max_claim_authority_per_tick: int = 128,
@@ -492,6 +494,8 @@ class LabScheduler:
         self.adapter_registry = adapter_registry
         from rquant.strategy_template_runtime import require_template_runtime_directory
         self.template_directory = require_template_runtime_directory(template_directory)
+        from rquant.paper_research_runtime import require_paper_runtime_directory
+        self.paper_directory = require_paper_runtime_directory(paper_directory)
         self.max_plans_per_tick = max_plans_per_tick
         self.max_claims_per_tick = max_claims_per_tick
         self.max_claim_authority_per_tick = max_claim_authority_per_tick
@@ -2011,11 +2015,17 @@ class LabScheduler:
                 self.artifact_commit_spool.ack(entry, receipt)
         plans_created = 0
         plans_failed = 0
-        if self.adapter_registry is not None or self.template_directory is not None:
+        if self.adapter_registry is not None or self.template_directory is not None or self.paper_directory is not None:
             for job in self.store.list_unplanned_jobs(limit=self.max_plans_per_tick):
                 self._verify_runtime()
                 try:
-                    registry = self.adapter_registry if self.template_directory is None else self.template_directory.registry_for_spec(job.spec)
+                    if self.paper_directory is not None and job.spec.parameters.strategy_name in {"paper_reconcile", "paper_backtest_band"}:
+                        registry = self.paper_directory.registry_for_spec(job.spec)
+                    elif self.template_directory is not None:
+                        registry = self.template_directory.registry_for_spec(job.spec)
+                    else:
+                        from rquant.strategy_job_adapters import default_strategy_job_adapter_registry
+                        registry = self.adapter_registry or default_strategy_job_adapter_registry()
                     definitions = registry.plan(job.spec)
                 except Exception as exc:
                     lease, mutation_now = self._mutation_context()

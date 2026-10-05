@@ -1,6 +1,6 @@
 # Web `current_user` 路由清单
 
-对应 [私有身份边界](2026-09-29-web-private-identity-boundary.md)。以下为当前代码中的全部 100 个 `current_user` 依赖路由；`/api/v1` 前缀已包含。公开类即使收到裸用户头，也只得到 `viewer=None`，不能据此取得身份。私有类统一使用已验证的代理身份；已有 CSRF、角色和业务条件仍单独检查。
+对应 [私有身份边界](2026-09-29-web-private-identity-boundary.md)。以下为当前代码中的全部 111 个 `current_user` 依赖路由；`/api/v1` 前缀已包含。公开类即使收到裸用户头，也只得到 `viewer=None`，不能据此取得身份。私有类统一使用已验证的代理身份；已有 CSRF、角色和业务条件仍单独检查。
 
 ## 公开读取（20）
 
@@ -27,12 +27,17 @@
 | GET | `/api/v1/data/issues` |
 | GET | `/api/v1/data/fundamentals/summary` |
 
-## 私有读取（45）
+## 私有读取（50）
 
 | 方法 | 路径 |
 |---|---|
 | GET | `/api/v1/pools/editor` |
 | GET | `/api/v1/paper/accounts` |
+| GET | `/api/v1/paper-portfolios` |
+| GET | `/api/v1/paper-portfolios/{account_id}` |
+| GET | `/api/v1/paper-portfolios/{account_id}/history` |
+| GET | `/api/v1/paper-portfolios/{account_id}/research/{job_id}` |
+| GET | `/api/v1/paper-portfolios/{account_id}/research/{job_id}/download` |
 | GET | `/api/v1/monitor/channels` |
 | GET | `/api/v1/monitor/timeline` |
 | GET | `/api/v1/monitor/price-rules` |
@@ -79,7 +84,7 @@
 
 名单按认证 owner 过滤。服务日志能力在未登录时只返回空列表，日志正文仍拒绝；普通任务、池子、监控、研究和审计页面则直接返回 401。公开的 `meta` 在没有有效证明时不显示 viewer。
 
-## 受保护操作（35）
+## 受保护操作（41）
 
 | 方法 | 路径 |
 |---|---|
@@ -100,6 +105,12 @@
 | POST | `/api/v1/data/audit-report/commands` |
 | POST | `/api/v1/data/backfill-plans/commands` |
 | POST | `/api/v1/tasks/jobs/commands` |
+| POST | `/api/v1/paper-portfolios/{account_id}/configuration` |
+| POST | `/api/v1/paper-portfolios/{account_id}/pause/prepare` |
+| POST | `/api/v1/paper-portfolios/{account_id}/pause/confirm` |
+| POST | `/api/v1/paper-portfolios/{account_id}/recover` |
+| POST | `/api/v1/paper-portfolios/{account_id}/reconcile` |
+| POST | `/api/v1/paper-portfolios/{account_id}/band` |
 | POST | `/api/v1/factors/definitions/save` |
 | POST | `/api/v1/factors/definitions/save/resume` |
 | POST | `/api/v1/factors/definitions/save/retry` |
@@ -130,6 +141,8 @@
 组合回测读取和下载使用私有身份。运行和 ZIP 准备另核原任务操作名单、CSRF 和完整原请求；结果按原任务与封存摘要读取，未知回执只恢复原操作。没有可用来源时，运行能力明确不可用。
 
 策略模板列表、来源、详情和版本按本人读取。保存、归档及运行另核编辑名单、CSRF 和完整原请求；未知回执只续查原操作。运行须有原任务链及已核验的来源。
+
+模拟组合列表、历史、研究结果和下载按本人读取。仓位设置、暂停及研究另核操作名单、CSRF、账户版本和完整原请求。暂停须先确认；恢复只查原操作。未安装私有服务时，操作保持关闭。
 
 ## 本片与生产边界
 

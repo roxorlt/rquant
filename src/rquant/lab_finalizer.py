@@ -77,6 +77,7 @@ from rquant.strategy_job_adapters import (
 )
 from rquant.strict_json import canonical_json_bytes, strict_model_validate_canonical_json
 if TYPE_CHECKING:
+    from rquant.paper_research_runtime import PaperResearchRuntimeDirectory
     from rquant.strategy_template_runtime import StrategyTemplateRuntimeDirectory
 
 
@@ -1377,6 +1378,7 @@ class LabFinalizer:
         ) = None,
         adapter_registry: StrategyJobAdapterRegistry | None = None,
         template_directory: StrategyTemplateRuntimeDirectory | None = None,
+        paper_directory: PaperResearchRuntimeDirectory | None = None,
         bundle_limits: LabShardBundleLimits | None = None,
         job_limits: LabFinalizerJobLimits | None = None,
         result_digest_policy: LabResultDigestPolicy | None = None,
@@ -1414,6 +1416,8 @@ class LabFinalizer:
         self.adapter_registry = adapter_registry or default_strategy_job_adapter_registry()
         from rquant.strategy_template_runtime import require_template_runtime_directory
         self.template_directory = require_template_runtime_directory(template_directory)
+        from rquant.paper_research_runtime import require_paper_runtime_directory
+        self.paper_directory = require_paper_runtime_directory(paper_directory)
 
     @classmethod
     def for_formal_runtime(
@@ -2257,7 +2261,10 @@ class LabFinalizer:
                 maximum=self.job_limits.max_peak_resident_bytes,
                 label="aggregate preflight peak resident bytes",
             )
-            registry = self.adapter_registry if self.template_directory is None else self.template_directory.registry_for_spec(snapshot.job.spec)
+            if self.paper_directory is not None and snapshot.job.spec.parameters.strategy_name in {"paper_reconcile", "paper_backtest_band"}:
+                registry = self.paper_directory.registry_for_spec(snapshot.job.spec)
+            else:
+                registry = self.adapter_registry if self.template_directory is None else self.template_directory.registry_for_spec(snapshot.job.spec)
             result = registry.aggregate_results(snapshot.job.spec, shard_results)
         except (LabFinalizationIntegrityError, BaseExceptionGroup):
             raise

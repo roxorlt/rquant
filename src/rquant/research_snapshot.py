@@ -787,6 +787,17 @@ def build_dataset_snapshot_binding(
     if selected_dependencies.strategy_id != snapshot.strategy_name:
         raise ValueError("dependency contract does not match snapshot strategy")
 
+    if snapshot.strategy_name in {"paper_reconcile", "paper_backtest_band"}:
+        from rquant.paper_research_source import verify_paper_snapshot_source
+
+        if selected_dependencies != strategy_execution_dependencies(snapshot.strategy_name):
+            raise ValueError("paper requires its exact source contract")
+        if eligibility_resolution is not None or lake_artifacts or ts_codes is not None:
+            raise ValueError("paper source cannot include unrelated artifacts or filters")
+        verify_paper_snapshot_source(source_connection, task_name=snapshot.strategy_name, code_sha=snapshot.code_commit,
+                                     start_date=start_date, end_date=end_date,
+                                     input_hash=snapshot.table_watermarks.get("paper_input_hash", ""), as_of=snapshot.as_of_time)
+
     if selected_dependencies.template_definition is not None:
         from rquant.strategy_template_source import verify_template_snapshot_source
 
@@ -1258,7 +1269,7 @@ class ResearchExecutionSession:
                 )
             )
             session_path = self._session_dir / f"{index:06d}-{artifact.file_hash}.parquet"
-            if published.strategy_name in {"factor_eval", "portfolio_backtest"}:
+            if published.strategy_name in {"factor_eval", "portfolio_backtest", "paper_reconcile", "paper_backtest_band"}:
                 # Factor reads need an independent inode throughout one lease.
                 shutil.copyfile(path, session_path)
             else:

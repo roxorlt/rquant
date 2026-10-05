@@ -7,7 +7,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidatorFunctionWrapHandler, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidatorFunctionWrapHandler, field_validator, model_validator
 
 from rquant.lab_daemon import LabDaemonConfigurationError
 from rquant.research_gate import ResearchGateRequest, open_gated_research_store
@@ -24,6 +24,8 @@ from rquant.strategy_template_adapter import (
     strategy_template_adapter_registry,
 )
 from rquant.strict_json import canonical_json_bytes
+from rquant.paper_research import PaperResearchAdapterCatalog
+from rquant.paper_research_adapter import paper_research_adapter_registry
 
 
 class BuiltinLabShardRuntimeConfig(BaseModel):
@@ -37,6 +39,24 @@ class BuiltinLabShardRuntimeConfig(BaseModel):
     research_lake_root: Path | None = None
     adapter_manifest_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     template_catalog: StrategyTemplateAdapterCatalog | None = None
+    paper_catalog: PaperResearchAdapterCatalog | None = None
+
+    @field_validator("paper_catalog", mode="wrap")
+    @classmethod
+    def parse_paper_catalog(cls, value: object, handler: ValidatorFunctionWrapHandler) -> object:
+        if value is None:
+            return handler(value)
+        if type(value) is PaperResearchAdapterCatalog:
+            return PaperResearchAdapterCatalog.model_validate(value.model_dump(mode="python"))
+        if isinstance(value, Mapping):
+            return PaperResearchAdapterCatalog.model_validate_json(canonical_json_bytes(value))
+        raise ValueError("paper runtime catalog must be the frozen typed object")
+
+    @model_validator(mode="after")
+    def one_owned_catalog(self) -> BuiltinLabShardRuntimeConfig:
+        if self.template_catalog is not None and self.paper_catalog is not None:
+            raise ValueError("one original shard requires one exact owned catalog")
+        return self
 
     @field_validator("template_catalog", mode="wrap")
     @classmethod
@@ -90,9 +110,12 @@ def builtin_lab_shard_configuration(
     snapshot_root: Path,
     research_lake_root: Path,
     template_catalog: StrategyTemplateAdapterCatalog | None = None,
+    paper_catalog: PaperResearchAdapterCatalog | None = None,
 ) -> BuiltinLabShardRuntimeConfig:
+    if template_catalog is not None and paper_catalog is not None:
+        raise ValueError("one original shard requires one exact owned catalog")
     registry = (
-        default_strategy_job_adapter_registry()
+        (default_strategy_job_adapter_registry() if paper_catalog is None else paper_research_adapter_registry(paper_catalog))
         if template_catalog is None
         else strategy_template_adapter_registry(template_catalog)
     )
@@ -104,6 +127,7 @@ def builtin_lab_shard_configuration(
         research_lake_root=Path(research_lake_root).resolve(),
         adapter_manifest_hash=registry.closed_descriptor().manifest_hash,
         template_catalog=template_catalog,
+        paper_catalog=paper_catalog,
     )
 
 
@@ -120,7 +144,7 @@ def resolve_builtin_adapter_registry(
 ) -> StrategyJobAdapterRegistry:
     config = BuiltinLabShardRuntimeConfig.model_validate(configuration, strict=True)
     registry = (
-        default_strategy_job_adapter_registry()
+        (default_strategy_job_adapter_registry() if config.paper_catalog is None else paper_research_adapter_registry(config.paper_catalog))
         if config.template_catalog is None
         else strategy_template_adapter_registry(config.template_catalog)
     )
@@ -154,6 +178,21 @@ def execute_builtin_lab_shard(
     from rquant.strategy_template_adapter import StrategyTemplateAdapter
 
     adapter = registry.for_spec(spec)
+    from rquant.paper_research_adapter import PaperResearchAdapter
+    if type(adapter) is PaperResearchAdapter:
+        from rquant.paper_research_source import open_gated_paper_store
+
+        identity = spec.dataset_snapshot
+        if identity is None or config.research_lake_root is None or spec.research_status != "exploratory":
+            raise PermissionError("paper worker requires its original exploratory immutable source")
+        adapter.parameters(spec)
+        request = ResearchGateRequest(mode="exploratory", strategy_name=adapter.snapshot_strategy_name,
+                                      start_date=spec.parameters.start_date, end_date=spec.parameters.end_date,
+                                      audit_run_id=identity.audit_run_id, dataset_snapshot_id=identity.snapshot_id,
+                                      dataset_binding_hash=identity.binding_hash, code_commit=runtime_code_sha)
+        with open_gated_paper_store(request, metadata_store_factory=store_factory, lake_root=config.research_lake_root,
+                                    catalog=adapter.catalog) as store:
+            return registry.execute_shard(validated, store)
     if type(adapter) is StrategyTemplateAdapter:
         from rquant.strategy_template_source import open_gated_template_store
 
