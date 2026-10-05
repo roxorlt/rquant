@@ -7,29 +7,114 @@ from decimal import Decimal
 
 import pytest
 
+from rquant.portfolio_backtest_models import PortfolioSourceManifest
+from rquant.runtime_contracts import canonical_sha256
 from rquant.strategy_authoring import StrategyAuthoringStore
-from rquant.strategy_authoring_commands import SaveStrategyTemplate
-from rquant.strategy_authoring_source import StrategySourceCatalog, produce_template_entry, template_source_code_identity
+from rquant.strategy_authoring_source import (
+    StrategySourceCatalog,
+    produce_template_entry,
+    template_source_code_identity,
+)
 from rquant.strategy_template import StrategyTemplate
 from rquant.strategy_template_execution import TemplateEntryEvidence
-from rquant.strategy_template_run import FrozenStrategyTemplateInput, TemplateDayEvidence, execute_strategy_template_input
+from rquant.strategy_template_run import (
+    FrozenStrategyTemplateInput,
+    TemplateDayEvidence,
+    execute_strategy_template_input,
+)
 from tests.unit.test_portfolio_backtest import _CODES, _at, _request
-from tests.unit.test_strategy_authoring import NOW, draft
+from tests.unit.test_strategy_authoring import draft
 
 
-def frozen(tmp_path, *, exit_rules: dict[str, object] | None = None, rebalance: dict[str, object] | None = None, prices: tuple[str, ...] = ("10", "8", "8")) -> FrozenStrategyTemplateInput:
+def frozen(
+    tmp_path,
+    *,
+    exit_rules: dict[str, object] | None = None,
+    rebalance: dict[str, object] | None = None,
+    prices: tuple[str, ...] = ("10", "8", "8"),
+    existing_store: StrategyAuthoringStore | None = None,
+) -> FrozenStrategyTemplateInput:
     request = _request((_CODES[0],) * len(prices))
-    rules = StrategyTemplate.model_validate({"entry": {"kind": "conditions", "conditions": [{"key": "not_st"}]}, "exit": exit_rules or {}, "weight_rule": request.weight_rule.model_dump(mode="python"), "rebalance_rule": rebalance or {"kind": "daily"}})
+    rules = StrategyTemplate.model_validate(
+        {
+            "entry": {"kind": "conditions", "conditions": [{"key": "not_st"}]},
+            "exit": exit_rules or {},
+            "weight_rule": request.weight_rule.model_dump(mode="python"),
+            "rebalance_rule": rebalance or {"kind": "daily"},
+        }
+    )
     request = request.model_copy(update={"rebalance_rule": rules.rebalance_rule})
-    days = tuple(day.model_copy(update={"instruments": tuple(instrument.model_copy(update={"decision_price": Decimal(price), "open_price": Decimal(price), "close_price": Decimal(price)}) for instrument in day.instruments)}) for day, price in zip(request.days, prices, strict=True))
-    request = type(request).model_validate(request.model_copy(update={"days": days}).model_dump(mode="python"))
-    target = StrategyAuthoringStore(tmp_path / "metadata.sqlite", definition_root=tmp_path / "definitions", producer_commit=request.producer_commit)
-    target.initialize()
+    days = tuple(
+        day.model_copy(
+            update={
+                "instruments": tuple(
+                    instrument.model_copy(
+                        update={
+                            "decision_price": Decimal(price),
+                            "open_price": Decimal(price),
+                            "close_price": Decimal(price),
+                        }
+                    )
+                    for instrument in day.instruments
+                )
+            }
+        )
+        for day, price in zip(request.days, prices, strict=True)
+    )
+    request = type(request).model_validate(
+        request.model_copy(update={"days": days}).model_dump(mode="python")
+    )
+    target = existing_store or StrategyAuthoringStore(
+        tmp_path / "metadata.sqlite",
+        definition_root=tmp_path / "definitions",
+        producer_commit=request.producer_commit,
+    )
+    if existing_store is None:
+        target.initialize()
     command = draft().model_copy(update={"rules": rules})
-    saved = target.save(command, owner_id="alice", catalog=StrategySourceCatalog(owner_id="alice", generation_id="generation-a", pools=(), signals=()))
-    definition = target.definition_registry(saved.strategy_id).read_strategy_spec(saved.head.registration_fingerprint)
-    evidence = tuple(TemplateDayEvidence(trade_date=day.trade_date, entry=produce_template_entry(rules, TemplateEntryEvidence(observed_at=day.ranking.observed_at, source_hash=day.ranking.source_identity, rows=({"ts_code": _CODES[0], "is_st": False},)), decision_time=_at(day.trade_date, 9, 25))) for day in days)
-    return FrozenStrategyTemplateInput(owner_id="alice", rules=rules, definition=definition, request=request, source_code_identity=template_source_code_identity(), days=evidence)
+    saved = target.save(
+        command,
+        owner_id="alice",
+        catalog=StrategySourceCatalog(
+            owner_id="alice", generation_id="generation-a", pools=(), signals=()
+        ),
+    )
+    definition = target.definition_registry(saved.strategy_id).read_strategy_spec(
+        saved.head.registration_fingerprint
+    )
+    evidence = tuple(
+        TemplateDayEvidence(
+            trade_date=day.trade_date,
+            entry=produce_template_entry(
+                rules,
+                TemplateEntryEvidence(
+                    observed_at=day.ranking.observed_at,
+                    source_hash=day.ranking.source_identity,
+                    rows=({"ts_code": _CODES[0], "is_st": False},),
+                ),
+                decision_time=_at(day.trade_date, 9, 25),
+            ),
+        )
+        for day in days
+    )
+    sources = PortfolioSourceManifest(
+        source_mode="captured_with_retrospective_prices",
+        market_hash=canonical_sha256(request.days),
+        reference_hash=canonical_sha256(request.calendar),
+        opening_hash=canonical_sha256(tuple(day.instruments for day in days)),
+        ranking_hash=canonical_sha256(tuple(day.ranking for day in days)),
+    )
+    return FrozenStrategyTemplateInput(
+        owner_id="alice",
+        rules=rules,
+        definition=definition,
+        request=request,
+        source_code_identity=template_source_code_identity(),
+        sources=sources,
+        source_material_hash=canonical_sha256(request),
+        catalog_generation_id="generation-a",
+        days=evidence,
+    )
 
 
 def test_template_stop_loss_uses_real_broker_costs_and_exits_before_reentry(tmp_path) -> None:
@@ -40,7 +125,9 @@ def test_template_stop_loss_uses_real_broker_costs_and_exits_before_reentry(tmp_
     assert result.status == "complete" and result.strategy_id == value.definition.logical_id
     assert result.definition_record_hash == value.definition.record_hash
     assert result.input_hash == value.input_hash
-    assert [(row.trade_date, row.reason) for row in result.exit_decisions] == [(value.request.days[1].trade_date, "stop_loss")]
+    assert [(row.trade_date, row.reason) for row in result.exit_decisions] == [
+        (value.request.days[1].trade_date, "stop_loss")
+    ]
     assert [order.intent.side.value for order in result.days[1].orders] == ["SELL"]
     assert result.days[0].account.holdings[0].available_quantity == 0
     assert result.days[1].account.cash == Decimal("2789.20")
@@ -48,6 +135,25 @@ def test_template_stop_loss_uses_real_broker_costs_and_exits_before_reentry(tmp_
     assert result.days[0].fees == Decimal("5") and result.days[1].fees == Decimal("5.80")
     assert result.days[2].orders[0].intent.side.value == "BUY"
     assert tuple(research.iterdir()) == ()
+
+
+def test_original_drawdown_blocks_new_positions_and_keeps_exit(tmp_path) -> None:
+    from rquant.portfolio.drawdown import DrawdownRule
+
+    value = frozen(tmp_path, exit_rules={"stop_loss": "0.1"})
+    request = value.request.model_copy(
+        update={
+            "drawdown_rule": DrawdownRule(trigger_drawdown="0.05", action="block_new_positions")
+        }
+    )
+    value = FrozenStrategyTemplateInput.model_validate(
+        {**value.model_dump(mode="python"), "request": request, "input_hash": None}
+    )
+    result = execute_strategy_template_input(value, research_root=tmp_path)
+    assert result.days[1].orders[0].intent.side.value == "SELL"
+    assert result.days[2].orders == ()
+    assert result.days[2].risk.state.active
+    assert result.days[2].skipped[0].reason == "drawdown_blocked"
 
 
 def test_full_exit_parameter_change_changes_actual_decisions(tmp_path) -> None:
@@ -68,12 +174,30 @@ def test_projection_swap_rules_swap_and_future_raw_fact_are_rejected(tmp_path) -
     projection = value.days[0].entry
     forged = projection.model_copy(update={"eligible_codes": (_CODES[1],)})
     with pytest.raises(ValueError, match="projection"):
-        FrozenStrategyTemplateInput.model_validate({**value.model_dump(mode="python"), "input_hash": None, "days": (value.days[0].model_copy(update={"entry": forged}), *value.days[1:])})
+        FrozenStrategyTemplateInput.model_validate(
+            {
+                **value.model_dump(mode="python"),
+                "input_hash": None,
+                "days": (value.days[0].model_copy(update={"entry": forged}), *value.days[1:]),
+            }
+        )
     with pytest.raises(ValueError, match="rules"):
-        FrozenStrategyTemplateInput.model_validate({**value.model_dump(mode="python"), "input_hash": None, "rules": value.rules.model_copy(update={"exit": type(value.rules.exit)(stop_loss=Decimal("0.1"))})})
-    future = projection.evidence.model_copy(update={"observed_at": _at(value.days[0].trade_date, 9, 25) + timedelta(seconds=1)})
+        FrozenStrategyTemplateInput.model_validate(
+            {
+                **value.model_dump(mode="python"),
+                "input_hash": None,
+                "rules": value.rules.model_copy(
+                    update={"exit": type(value.rules.exit)(stop_loss=Decimal("0.1"))}
+                ),
+            }
+        )
+    future = projection.evidence.model_copy(
+        update={"observed_at": _at(value.days[0].trade_date, 9, 25) + timedelta(seconds=1)}
+    )
     with pytest.raises(ValueError, match="future"):
-        produce_template_entry(value.rules, future, decision_time=_at(value.days[0].trade_date, 9, 25))
+        produce_template_entry(
+            value.rules, future, decision_time=_at(value.days[0].trade_date, 9, 25)
+        )
 
 
 def test_timed_exit_without_actual_minute_price_and_status_cannot_run(tmp_path) -> None:
@@ -82,7 +206,12 @@ def test_timed_exit_without_actual_minute_price_and_status_cannot_run(tmp_path) 
 
 
 def test_max_holding_days_follows_trading_calendar_on_non_rebalance_day(tmp_path) -> None:
-    value = frozen(tmp_path, exit_rules={"max_holding_days": 1}, rebalance={"kind": "every_n", "every_n_days": 5}, prices=("10", "10", "10"))
+    value = frozen(
+        tmp_path,
+        exit_rules={"max_holding_days": 1},
+        rebalance={"kind": "every_n", "every_n_days": 5},
+        prices=("10", "10", "10"),
+    )
     result = execute_strategy_template_input(value, research_root=tmp_path)
     assert result.days[1].rebalanced is False
     assert [row.reason for row in result.exit_decisions] == ["max_holding_days"]

@@ -1484,6 +1484,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/strategy-templates/{strategy_id}/runs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 回测指定策略版本 */
+        post: operations["run_command_api_v1_strategy_templates__strategy_id__runs_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/strategy-templates/{strategy_id}/runs/resume": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 续查原策略回测 */
+        post: operations["resume_run_command_api_v1_strategy_templates__strategy_id__runs_resume_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/strategy-templates/{strategy_id}/versions": {
         parameters: {
             query?: never;
@@ -3005,19 +3039,9 @@ export interface components {
             row_count: number;
         };
         /** ConditionTemplateEntry */
-        "ConditionTemplateEntry-Input": {
+        ConditionTemplateEntry: {
             /** Conditions */
-            conditions: components["schemas"]["TemplateCondition-Input"][];
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            kind: "conditions";
-        };
-        /** ConditionTemplateEntry */
-        "ConditionTemplateEntry-Output": {
-            /** Conditions */
-            conditions: components["schemas"]["TemplateCondition-Output"][];
+            conditions: components["schemas"]["TemplateCondition"][];
             /**
              * @description discriminator enum property added by openapi-typescript
              * @enum {string}
@@ -3686,6 +3710,11 @@ export interface components {
         /** Envelope[StrategyTemplateDetailData] */
         Envelope_StrategyTemplateDetailData_: {
             data: components["schemas"]["StrategyTemplateDetailData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[StrategyTemplateRunCommandData] */
+        Envelope_StrategyTemplateRunCommandData_: {
+            data: components["schemas"]["StrategyTemplateRunCommandData"];
             serving: components["schemas"]["ServingMeta"];
         };
         /** Envelope[StrategyTemplateSourcesData] */
@@ -8486,6 +8515,40 @@ export interface components {
             /** Win Rate */
             win_rate: number | null;
         };
+        /** RunStrategyTemplate */
+        RunStrategyTemplate: {
+            /** Command Id */
+            command_id: string;
+            /**
+             * End Date
+             * Format: date
+             */
+            end_date: string;
+            expected_head: components["schemas"]["StrategyTemplateHead"];
+            /** Generation Id */
+            generation_id: string;
+            head: components["schemas"]["StrategyTemplateHead"];
+            /** Initial Cash */
+            initial_cash: number | string;
+            /**
+             * Kind
+             * @default run_strategy_template
+             * @constant
+             */
+            kind: "run_strategy_template";
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+            /**
+             * Start Date
+             * Format: date
+             */
+            start_date: string;
+            /** Strategy Id */
+            strategy_id: string;
+        };
         /** RuntimeServiceItem */
         RuntimeServiceItem: {
             /** Heartbeat At */
@@ -9168,7 +9231,7 @@ export interface components {
         /** StrategyTemplate */
         "StrategyTemplate-Input": {
             /** Entry */
-            entry: components["schemas"]["PoolTemplateEntry"] | components["schemas"]["ConditionTemplateEntry-Input"] | components["schemas"]["SignalTemplateEntry"];
+            entry: components["schemas"]["PoolTemplateEntry"] | components["schemas"]["ConditionTemplateEntry"] | components["schemas"]["SignalTemplateEntry"];
             exit?: components["schemas"]["TemplateExitRules-Input"];
             index_filter?: components["schemas"]["TemplateIndexFilter"] | null;
             rebalance_rule: components["schemas"]["RebalanceRule"];
@@ -9183,7 +9246,7 @@ export interface components {
         /** StrategyTemplate */
         "StrategyTemplate-Output": {
             /** Entry */
-            entry: components["schemas"]["PoolTemplateEntry"] | components["schemas"]["ConditionTemplateEntry-Output"] | components["schemas"]["SignalTemplateEntry"];
+            entry: components["schemas"]["PoolTemplateEntry"] | components["schemas"]["ConditionTemplateEntry"] | components["schemas"]["SignalTemplateEntry"];
             exit?: components["schemas"]["TemplateExitRules-Output"];
             index_filter?: components["schemas"]["TemplateIndexFilter"] | null;
             rebalance_rule: components["schemas"]["RebalanceRule"];
@@ -9237,6 +9300,7 @@ export interface components {
         };
         /** StrategyTemplateConditionChoice */
         StrategyTemplateConditionChoice: {
+            block: components["schemas"]["ScreenBlock"];
             /** Key */
             key: string;
             /** Label */
@@ -9345,6 +9409,23 @@ export interface components {
             spec_hash: string;
             /** Strategy Id */
             strategy_id: string;
+        };
+        /** StrategyTemplateRunCommandData */
+        StrategyTemplateRunCommandData: {
+            /**
+             * Command Id
+             * Format: uuid
+             */
+            command_id: string;
+            /** Job Id */
+            job_id?: string | null;
+            /** Message */
+            message: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "rejected" | "pending" | "submitted" | "uncertain";
         };
         /** StrategyTemplateSourcesData */
         StrategyTemplateSourcesData: {
@@ -9586,18 +9667,11 @@ export interface components {
             source: components["schemas"]["ScreenSourceInfo"] | null;
         };
         /** TemplateCondition */
-        "TemplateCondition-Input": {
+        TemplateCondition: {
             /** Args */
             args?: {
                 [key: string]: components["schemas"]["JsonValue"];
             };
-            /** Key */
-            key: string;
-        };
-        /** TemplateCondition */
-        "TemplateCondition-Output": {
-            /** Args */
-            args?: unknown;
             /** Key */
             key: string;
         };
@@ -12440,6 +12514,76 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_StrategyTemplateDetailData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    run_command_api_v1_strategy_templates__strategy_id__runs_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                strategy_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RunStrategyTemplate"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_StrategyTemplateRunCommandData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    resume_run_command_api_v1_strategy_templates__strategy_id__runs_resume_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                strategy_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RunStrategyTemplate"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_StrategyTemplateRunCommandData_"];
                 };
             };
             /** @description Validation Error */

@@ -13,7 +13,15 @@ from rquant.backtest.contracts import Sha256
 from rquant.experiment_registry import FormalExperimentPlan
 from rquant.research_run_spec import ResearchRunSpec, _decimal_components, _parse_decimal
 from rquant.runtime_contracts import AwareUtcDatetime, RuntimeContractModel
-from rquant.strategy_authoring_commands import StrategyAuthoringIdentity, StrategyTemplateHead, _TemplateCommand
+from rquant.strategy_authoring_commands import (
+    ArchiveStrategyTemplate,
+    OwnedArchiveStrategyTemplate,
+    OwnedSaveStrategyTemplate,
+    SaveStrategyTemplate,
+    StrategyAuthoringIdentity,
+    StrategyTemplateHead,
+    _TemplateCommand,
+)
 from rquant.strategy_template import TEMPLATE_ID_PATTERN
 
 
@@ -40,7 +48,12 @@ class RunStrategyTemplate(_TemplateCommand):
             raise ValueError("template run date range exceeds the research budget")
         if self.head.version > self.expected_head.version:
             raise ValueError("selected template version is ahead of the expected current head")
-        if len(self.model_dump_json(exclude={"owner_id", "metadata_identity", "accepted"}).encode()) > 4096:
+        if (
+            len(
+                self.model_dump_json(exclude={"owner_id", "metadata_identity", "accepted"}).encode()
+            )
+            > 4096
+        ):
             raise ValueError("template run request exceeds byte budget")
         return self
 
@@ -60,11 +73,61 @@ class AcceptedStrategyTemplateRun(RuntimeContractModel):
         execution, experiment = spec.strategy_execution, spec.experiment
         if spec.schema_version != 3 or execution is None or experiment is None:
             raise ValueError("template accepted run requires original v3 ownership")
-        if (spec.parameters.strategy_name, spec.parameters.start_date, spec.parameters.end_date, parameters.get("owner_id"), parameters.get("request_id"), parameters.get("strategy_id"), parameters.get("version"), parameters.get("registration_fingerprint"), parameters.get("record_hash"), parameters.get("spec_fingerprint")) != (request.strategy_id, request.start_date, request.end_date, self.owner_id, request.command_id, request.strategy_id, request.head.version, request.head.registration_fingerprint, request.head.record_hash, request.head.spec_fingerprint):
-            raise ValueError("template accepted run differs from original owner, request or definition")
-        if (execution.strategy_id, execution.strategy_version, execution.strategy_definition_fingerprint, execution.definition_registration_record_hash, execution.strategy_spec_fingerprint) != (request.strategy_id, request.head.version, request.head.registration_fingerprint, request.head.record_hash, request.head.spec_fingerprint):
+        if (
+            spec.parameters.strategy_name,
+            spec.parameters.start_date,
+            spec.parameters.end_date,
+            parameters.get("owner_id"),
+            parameters.get("request_id"),
+            parameters.get("strategy_id"),
+            parameters.get("version"),
+            parameters.get("registration_fingerprint"),
+            parameters.get("record_hash"),
+            parameters.get("spec_fingerprint"),
+        ) != (
+            request.strategy_id,
+            request.start_date,
+            request.end_date,
+            self.owner_id,
+            request.command_id,
+            request.strategy_id,
+            request.head.version,
+            request.head.registration_fingerprint,
+            request.head.record_hash,
+            request.head.spec_fingerprint,
+        ):
+            raise ValueError(
+                "template accepted run differs from original owner, request or definition"
+            )
+        if (
+            execution.strategy_id,
+            execution.strategy_version,
+            execution.strategy_definition_fingerprint,
+            execution.definition_registration_record_hash,
+            execution.strategy_spec_fingerprint,
+        ) != (
+            request.strategy_id,
+            request.head.version,
+            request.head.registration_fingerprint,
+            request.head.record_hash,
+            request.head.spec_fingerprint,
+        ):
             raise ValueError("template original execution identity differs")
-        if self.plan.schema_version != 2 or self.plan.plan_id != experiment.formal_plan_id or self.plan.spec != experiment.spec or (self.plan.strategy_definition_fingerprint, self.plan.definition_registration_record_hash, self.plan.hypothesis_variant) != (request.head.registration_fingerprint, request.head.record_hash, experiment.hypothesis_variant):
+        if (
+            self.plan.schema_version != 2
+            or self.plan.plan_id != experiment.formal_plan_id
+            or self.plan.spec != experiment.spec
+            or (
+                self.plan.strategy_definition_fingerprint,
+                self.plan.definition_registration_record_hash,
+                self.plan.hypothesis_variant,
+            )
+            != (
+                request.head.registration_fingerprint,
+                request.head.record_hash,
+                experiment.hypothesis_variant,
+            )
+        ):
             raise ValueError("template original experiment plan differs")
         if self.accepted_at > spec.deadline or self.accepted_at < execution.definition_available_at:
             raise ValueError("template accepted run is outside its original time bounds")
@@ -80,10 +143,21 @@ class OwnedRunStrategyTemplate(RunStrategyTemplate):
 
     @model_validator(mode="after")
     def owned_original(self) -> Self:
-        original = RunStrategyTemplate.model_validate(self.model_dump(mode="python", exclude={"owner_id", "metadata_identity", "accepted"}))
-        if self.accepted.request != original or self.accepted.owner_id != self.owner_id or self.accepted.metadata_identity != self.metadata_identity:
+        original = RunStrategyTemplate.model_validate(
+            self.model_dump(mode="python", exclude={"owner_id", "metadata_identity", "accepted"})
+        )
+        if (
+            self.accepted.request != original
+            or self.accepted.owner_id != self.owner_id
+            or self.accepted.metadata_identity != self.metadata_identity
+        ):
             raise ValueError("owned template run differs from the original accepted plan")
         return self
+
+    def original(self) -> RunStrategyTemplate:
+        return RunStrategyTemplate.model_validate(
+            self.model_dump(mode="python", exclude={"owner_id", "metadata_identity", "accepted"})
+        )
 
 
 class StrategyTemplateRunReceipt(RuntimeContractModel):
@@ -104,3 +178,9 @@ class StrategyTemplateRunReceipt(RuntimeContractModel):
         if self.job_id != UUID(self.command_id):
             raise ValueError("template run receipt does not reference the original job")
         return self
+
+
+StrategyTemplateCommandValue = SaveStrategyTemplate | ArchiveStrategyTemplate | RunStrategyTemplate
+OwnedStrategyTemplateCommandValue = (
+    OwnedSaveStrategyTemplate | OwnedArchiveStrategyTemplate | OwnedRunStrategyTemplate
+)

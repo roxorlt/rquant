@@ -66,7 +66,9 @@ def test_run_code_budget_includes_unselected_original_facts(tmp_path, source: st
     payload["input_hash"] = None
     codes = tuple(f"{600001 + index}.SH" for index in range(501))
     if source == "ranking":
-        payload["request"]["days"][0]["ranking"]["candidates"] = tuple({"ts_code": code, "rank_score": "0"} for code in codes)
+        payload["request"]["days"][0]["ranking"]["candidates"] = tuple(
+            {"ts_code": code, "rank_score": "0"} for code in codes
+        )
     else:
         raw = payload["days"][0]["entry"]["evidence"]
         if source == "entry_rows":
@@ -74,6 +76,16 @@ def test_run_code_budget_includes_unselected_original_facts(tmp_path, source: st
         elif source == "entry_pool":
             raw["pool_codes"] = codes
         else:
-            raw["signals"] = tuple({"strategy_id": "n_shape", "version": 1, "action": "watch", "ts_code": code, "observed_at": raw["observed_at"], "source_hash": raw["source_hash"]} for code in codes)
+            raw["signals"] = tuple(
+                {
+                    "strategy_id": "n_shape",
+                    "version": 1,
+                    "action": "watch",
+                    "ts_code": code,
+                    "observed_at": raw["observed_at"],
+                    "source_hash": raw["source_hash"],
+                }
+                for code in codes
+            )
     with pytest.raises(ValueError, match="code.*budget"):
         FrozenStrategyTemplateInput.model_validate(payload)

@@ -151,6 +151,20 @@ def execute_builtin_lab_shard(
     registry = resolve_builtin_adapter_registry(config)
     store_factory = _ImmutableLabStoreFactory(config)
     spec = validated.spec
+    from rquant.strategy_template_adapter import StrategyTemplateAdapter
+
+    adapter = registry.for_spec(spec)
+    if type(adapter) is StrategyTemplateAdapter:
+        from rquant.strategy_template_source import open_gated_template_store
+
+        identity = spec.dataset_snapshot
+        if identity is None or config.research_lake_root is None or spec.research_status != "exploratory":
+            raise PermissionError("template worker requires its original exploratory immutable source")
+        parameters = adapter.parameters(spec)
+        version = next(item for item in adapter.catalog.versions if (item.strategy_id, item.head.version) == (parameters.strategy_id, parameters.version))
+        request = ResearchGateRequest(mode="exploratory", strategy_name=adapter.snapshot_strategy_name, start_date=spec.parameters.start_date, end_date=spec.parameters.end_date, audit_run_id=identity.audit_run_id, dataset_snapshot_id=identity.snapshot_id, dataset_binding_hash=identity.binding_hash, code_commit=runtime_code_sha)
+        with open_gated_template_store(request, metadata_store_factory=store_factory, lake_root=config.research_lake_root, version=version) as store:
+            return registry.execute_shard(validated, store)
     if spec.research_status == "exploratory":
         with store_factory() as store:
             return registry.execute_shard(validated, store)

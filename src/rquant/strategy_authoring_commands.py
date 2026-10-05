@@ -9,7 +9,7 @@ from pydantic import Field, field_validator, model_validator
 
 from rquant.backtest.contracts import Sha256
 from rquant.runtime_contracts import AwareUtcDatetime, RuntimeContractModel, canonical_sha256
-from rquant.strategy_template import StrategyTemplate, TEMPLATE_ID_PATTERN
+from rquant.strategy_template import TEMPLATE_ID_PATTERN, StrategyTemplate
 
 
 class StrategyTemplateHead(RuntimeContractModel):
@@ -65,7 +65,12 @@ class SaveStrategyTemplate(_TemplateCommand):
             raise ValueError("existing strategy requires its exact head")
         if self.strategy_id is not None and not self.change_note:
             raise ValueError("new version requires a change note")
-        if len(self.model_dump_json(exclude={"owner_id", "metadata_identity", "accepted"}).encode()) > 32 * 1024:
+        if (
+            len(
+                self.model_dump_json(exclude={"owner_id", "metadata_identity", "accepted"}).encode()
+            )
+            > 32 * 1024
+        ):
             raise ValueError("complete saved strategy exceeds 32 KiB")
         return self
 
@@ -115,13 +120,22 @@ class OwnedSaveStrategyTemplate(SaveStrategyTemplate):
 
     @model_validator(mode="after")
     def bind_original_request(self) -> Self:
-        original = SaveStrategyTemplate.model_validate(self.model_dump(mode="python", exclude={"owner_id", "metadata_identity", "accepted"}))
-        if self.accepted.owner_id != self.owner_id or self.accepted.original_request_hash != original.request_hash or self.accepted.request != original or self.accepted.metadata_identity != self.metadata_identity:
+        original = SaveStrategyTemplate.model_validate(
+            self.model_dump(mode="python", exclude={"owner_id", "metadata_identity", "accepted"})
+        )
+        if (
+            self.accepted.owner_id != self.owner_id
+            or self.accepted.original_request_hash != original.request_hash
+            or self.accepted.request != original
+            or self.accepted.metadata_identity != self.metadata_identity
+        ):
             raise ValueError("owned strategy save differs from original accepted request")
         return self
 
     def original(self) -> SaveStrategyTemplate:
-        return SaveStrategyTemplate.model_validate(self.model_dump(mode="python", exclude={"owner_id", "metadata_identity", "accepted"}))
+        return SaveStrategyTemplate.model_validate(
+            self.model_dump(mode="python", exclude={"owner_id", "metadata_identity", "accepted"})
+        )
 
 
 class OwnedArchiveStrategyTemplate(ArchiveStrategyTemplate):
@@ -132,12 +146,19 @@ class OwnedArchiveStrategyTemplate(ArchiveStrategyTemplate):
     @model_validator(mode="after")
     def bind_original_request(self) -> Self:
         original = self.original()
-        if self.accepted.owner_id != self.owner_id or self.accepted.original_request_hash != original.request_hash or self.accepted.request != original or self.accepted.metadata_identity != self.metadata_identity:
+        if (
+            self.accepted.owner_id != self.owner_id
+            or self.accepted.original_request_hash != original.request_hash
+            or self.accepted.request != original
+            or self.accepted.metadata_identity != self.metadata_identity
+        ):
             raise ValueError("owned strategy archive differs from original accepted request")
         return self
 
     def original(self) -> ArchiveStrategyTemplate:
-        return ArchiveStrategyTemplate.model_validate(self.model_dump(mode="python", exclude={"owner_id", "metadata_identity", "accepted"}))
+        return ArchiveStrategyTemplate.model_validate(
+            self.model_dump(mode="python", exclude={"owner_id", "metadata_identity", "accepted"})
+        )
 
 
 OwnedStrategyTemplateCommand = OwnedSaveStrategyTemplate | OwnedArchiveStrategyTemplate

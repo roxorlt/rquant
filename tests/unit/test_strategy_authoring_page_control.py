@@ -19,9 +19,7 @@ from tests.unit.test_strategy_authoring import NOW, catalog, draft, store
 
 
 def service_for(tmp_path, target, *, enabled: bool = True):
-    backend = StrategyAuthoringPageControlBackend(
-        target, editor_users=("alice",), enabled=enabled
-    )
+    backend = StrategyAuthoringPageControlBackend(target, editor_users=("alice",), enabled=enabled)
     return build_page_control_service(
         outbox_path=tmp_path / "page-control.sqlite",
         data_dir=tmp_path / "private-data",
@@ -81,7 +79,9 @@ def test_original_journal_receipt_binds_exact_original_registry_and_metadata(tmp
     assert service.outbox.audit(request.command_id).command_kind == "save_strategy_template"
 
 
-def test_original_lookup_does_not_consult_new_source_head_or_metadata_identity(tmp_path, monkeypatch) -> None:
+def test_original_lookup_does_not_consult_new_source_head_or_metadata_identity(
+    tmp_path, monkeypatch
+) -> None:
     target = store(tmp_path)
     service = service_for(tmp_path, target)
     request = draft()
@@ -102,14 +102,19 @@ def test_original_lookup_does_not_consult_new_source_head_or_metadata_identity(t
         catalog=catalog(generation="new-generation"),
     )
     assert retried == first
-    for changed in (request.model_copy(update={"name": "换正文"}), request.model_copy(update={"generation_id": "new-generation"})):
+    for changed in (
+        request.model_copy(update={"name": "换正文"}),
+        request.model_copy(update={"generation_id": "new-generation"}),
+    ):
         with pytest.raises(PageControlCommandConflictError):
             service._lookup_trusted_strategy_authoring(changed, authenticated_actor_id="alice")
     with pytest.raises((PermissionError, PageControlCommandConflictError)):
         service._lookup_trusted_strategy_authoring(request, authenticated_actor_id="bob")
 
 
-def test_registry_to_metadata_crash_recovers_original_command_without_a_new_version(tmp_path, monkeypatch) -> None:
+def test_registry_to_metadata_crash_recovers_original_command_without_a_new_version(
+    tmp_path, monkeypatch
+) -> None:
     target = store(tmp_path)
     service = service_for(tmp_path, target)
     request = draft()
@@ -135,7 +140,9 @@ def test_registry_to_metadata_crash_recovers_original_command_without_a_new_vers
     assert len(target.versions(frozen.strategy_id, owner_id="alice")) == 1
 
 
-def test_admission_before_enqueue_crash_preserves_server_id_and_original_body(tmp_path, monkeypatch) -> None:
+def test_admission_before_enqueue_crash_preserves_server_id_and_original_body(
+    tmp_path, monkeypatch
+) -> None:
     target = store(tmp_path)
     service = service_for(tmp_path, target)
     request = draft()
@@ -157,7 +164,9 @@ def test_admission_before_enqueue_crash_preserves_server_id_and_original_body(tm
     assert len(target.list_current(owner_id="alice")) == 1
 
 
-def test_pending_original_effect_cannot_write_a_replaced_metadata_store(tmp_path, monkeypatch) -> None:
+def test_pending_original_effect_cannot_write_a_replaced_metadata_store(
+    tmp_path, monkeypatch
+) -> None:
     target = store(tmp_path)
     service = service_for(tmp_path, target)
     request = draft()
@@ -226,8 +235,11 @@ def test_archive_has_original_journal_effect_and_blocks_new_save(tmp_path) -> No
     saved = submit(service, target, draft()).result
     current = target.get_current(saved["strategy_id"], owner_id="alice")
     archive = ArchiveStrategyTemplate(
-        command_id=str(uuid4()), requested_at=NOW, generation_id="generation-a",
-        strategy_id=current.strategy_id, expected_head=current.head,
+        command_id=str(uuid4()),
+        requested_at=NOW,
+        generation_id="generation-a",
+        strategy_id=current.strategy_id,
+        expected_head=current.head,
     )
     receipt = submit(service, target, archive)
     assert receipt.status is PageControlStatus.SUCCEEDED
@@ -245,8 +257,11 @@ def test_archive_admission_before_enqueue_blocks_new_save_and_run(tmp_path, monk
     saved = submit(service, target, draft()).result
     current = target.get_current(saved["strategy_id"], owner_id="alice")
     archive = ArchiveStrategyTemplate(
-        command_id=str(uuid4()), requested_at=NOW, generation_id="generation-a",
-        strategy_id=current.strategy_id, expected_head=current.head,
+        command_id=str(uuid4()),
+        requested_at=NOW,
+        generation_id="generation-a",
+        strategy_id=current.strategy_id,
+        expected_head=current.head,
     )
     enqueue = service.outbox.enqueue_trusted_strategy_authoring
 
@@ -257,9 +272,19 @@ def test_archive_admission_before_enqueue_blocks_new_save_and_run(tmp_path, monk
     with pytest.raises(RuntimeError, match="archive accepted"):
         submit(service, target, archive)
     with pytest.raises(ValueError, match="awaiting recovery"):
-        target.accept(draft(strategy_id=current.strategy_id, expected_head=current.head), owner_id="alice", catalog=catalog())
+        target.accept(
+            draft(strategy_id=current.strategy_id, expected_head=current.head),
+            owner_id="alice",
+            catalog=catalog(),
+        )
     with pytest.raises(ValueError, match="awaiting recovery"):
-        target.admit_run(current.strategy_id, current.head, owner_id="alice", command_id=str(uuid4()), request_hash="1" * 64)
+        target.admit_run(
+            current.strategy_id,
+            current.head,
+            owner_id="alice",
+            command_id=str(uuid4()),
+            request_hash="1" * 64,
+        )
     monkeypatch.setattr(service.outbox, "enqueue_trusted_strategy_authoring", enqueue)
     receipt = submit(service, target, archive, sources=catalog(generation="changed"))
     assert receipt.status is PageControlStatus.SUCCEEDED

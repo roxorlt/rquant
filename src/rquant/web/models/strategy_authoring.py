@@ -12,6 +12,7 @@ from rquant.strategy_authoring_commands import StrategyTemplateHead
 from rquant.strategy_authoring_projection import StrategyTemplateRecentRun
 from rquant.strategy_authoring_source import TemplatePoolReference, TemplateSignalReference
 from rquant.strategy_template import StrategyTemplate
+from rquant.web.models.screen import ScreenBlock
 
 
 class StrategyTemplateItem(RuntimeContractModel):
@@ -65,6 +66,7 @@ class StrategyTemplateVersionsData(RuntimeContractModel):
 class StrategyTemplateConditionChoice(RuntimeContractModel):
     key: str
     label: str
+    block: ScreenBlock
     parameter_schema: dict[str, JsonValue]
 
 
@@ -79,8 +81,17 @@ class StrategyTemplateSourcesData(RuntimeContractModel):
 
 class StrategyTemplateCommandData(RuntimeContractModel):
     command_id: UUID
-    status: Literal["rejected", "pending", "succeeded_waiting_publication", "published", "uncertain"]
+    status: Literal[
+        "rejected", "pending", "succeeded_waiting_publication", "published", "uncertain"
+    ]
     strategy_id: str | None = None
     head: StrategyTemplateHead | None = None
     current_head_updated: bool = False
+    message: str
+
+
+class StrategyTemplateRunCommandData(RuntimeContractModel):
+    command_id: UUID
+    status: Literal["rejected", "pending", "submitted", "uncertain"]
+    job_id: UUID | None = None
     message: str

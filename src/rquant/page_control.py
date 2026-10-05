@@ -96,11 +96,11 @@ from rquant.strategy_authoring_commands import (
     ArchiveStrategyTemplate,
     OwnedArchiveStrategyTemplate,
     OwnedSaveStrategyTemplate,
-    OwnedStrategyTemplateCommand,
     SaveStrategyTemplate,
     StrategyAuthoringIdentity,
-    StrategyTemplateCommand,
 )
+
+from rquant.strategy_template_run_commands import OwnedRunStrategyTemplate, RunStrategyTemplate, OwnedStrategyTemplateCommandValue as OwnedStrategyTemplateCommand, StrategyTemplateCommandValue as StrategyTemplateCommand
 
 _SAFE_NAME = re.compile(r"^[\w\u4e00-\u9fff-]+$")
 _CANVAS_CATALOG_SCHEMA_VERSION = 1
@@ -126,7 +126,7 @@ _PRICE_RULE_KINDS = frozenset(
 _FACTOR_DEFINITION_KINDS = frozenset({"save_factor_definition", "archive_factor"})
 _FACTOR_RUN_KINDS = frozenset({"submit_factor_run"})
 _FACTOR_TRACKING_KINDS = frozenset({"set_factor_tracked"})
-_STRATEGY_AUTHORING_KINDS = frozenset({"save_strategy_template", "archive_strategy_template"})
+_STRATEGY_AUTHORING_KINDS = frozenset({"save_strategy_template", "archive_strategy_template", "run_strategy_template"})
 _FACTOR_REGISTRY_EFFECT_IDENTITY = "factor-registry-identity/v1"
 _LOCAL_FILESYSTEM_FENCE_SCHEMA_VERSION = 1
 _CANVAS_HEAD_CONTRACT = "canvas-current-head/v1"
@@ -696,6 +696,7 @@ PageControlCommandValue = Annotated[
     | _OwnedSetFactorTracked
     | OwnedSaveStrategyTemplate
     | OwnedArchiveStrategyTemplate
+    | OwnedRunStrategyTemplate
     | SaveCanvas
     | CreateCanvas
     | DeleteCanvas
@@ -1162,7 +1163,7 @@ class PageControlOutbox:
         return connection
 
     def enqueue(self, command: PageControlCommandValue) -> PageControlReceipt:
-        if isinstance(command, (SaveStrategyTemplate, ArchiveStrategyTemplate)):
+        if isinstance(command, (SaveStrategyTemplate, ArchiveStrategyTemplate, RunStrategyTemplate)):
             raise ValueError("strategy authoring requires trusted submission")
         if isinstance(command, SaveResearchQuery):
             raise ValueError("research queries require trusted submission")
@@ -1223,7 +1224,7 @@ class PageControlOutbox:
     def enqueue_trusted_strategy_authoring(
         self, command: OwnedStrategyTemplateCommand
     ) -> PageControlReceipt:
-        if type(command) not in (OwnedSaveStrategyTemplate, OwnedArchiveStrategyTemplate):
+        if type(command) not in (OwnedSaveStrategyTemplate, OwnedArchiveStrategyTemplate, OwnedRunStrategyTemplate):
             raise TypeError("strategy authoring requires an owned command")
         return self._enqueue(command, require_strategy_authoring_trust=True)
 
@@ -1239,8 +1240,8 @@ class PageControlOutbox:
         require_research_query_trust: bool = False,
         require_strategy_authoring_trust: bool = False,
     ) -> PageControlReceipt:
-        if isinstance(command, (SaveStrategyTemplate, ArchiveStrategyTemplate)) != require_strategy_authoring_trust or (
-            require_strategy_authoring_trust and type(command) not in (OwnedSaveStrategyTemplate, OwnedArchiveStrategyTemplate)
+        if isinstance(command, (SaveStrategyTemplate, ArchiveStrategyTemplate, RunStrategyTemplate)) != require_strategy_authoring_trust or (
+            require_strategy_authoring_trust and type(command) not in (OwnedSaveStrategyTemplate, OwnedArchiveStrategyTemplate, OwnedRunStrategyTemplate)
         ):
             raise ValueError("strategy authoring requires trusted submission")
         if isinstance(command, SaveResearchQuery) != require_research_query_trust or (
@@ -1592,7 +1593,7 @@ class PageControlOutbox:
     def lookup_strategy_authoring_command(
         self, request: StrategyTemplateCommand, *, authenticated_actor_id: str
     ) -> tuple[OwnedStrategyTemplateCommand, PageControlReceipt] | None:
-        if type(request) not in (SaveStrategyTemplate, ArchiveStrategyTemplate):
+        if type(request) not in (SaveStrategyTemplate, ArchiveStrategyTemplate, RunStrategyTemplate):
             raise TypeError("strategy lookup requires an ownerless original request")
         with self._connect() as connection:
             row = connection.execute(
@@ -1605,7 +1606,7 @@ class PageControlOutbox:
         except ValueError as exc:
             raise PageControlCommandConflictError("stored strategy command is invalid") from exc
         if (
-            not isinstance(stored, (OwnedSaveStrategyTemplate, OwnedArchiveStrategyTemplate))
+            not isinstance(stored, (OwnedSaveStrategyTemplate, OwnedArchiveStrategyTemplate, OwnedRunStrategyTemplate))
             or stored.owner_id != authenticated_actor_id
             or row["command_kind"] != request.kind
             or stored.original() != request
@@ -2877,7 +2878,7 @@ class PageControlConsumer:
         terminal = self._outcome_from_effect(effect)
         if terminal is not None:
             return terminal
-        if isinstance(command, (OwnedSaveStrategyTemplate, OwnedArchiveStrategyTemplate)):
+        if isinstance(command, (OwnedSaveStrategyTemplate, OwnedArchiveStrategyTemplate, OwnedRunStrategyTemplate)):
             marker = {"contract": "strategy-authoring-identity/v1", "identity": command.metadata_identity.model_dump(mode="json")}
             try:
                 self._strategy_authoring_backend().validate(command)
@@ -3220,7 +3221,7 @@ class PageControlConsumer:
     def _must_recover_before_failure(
         self, command: PageControlCommandValue, *, created: bool
     ) -> bool:
-        if isinstance(command, (OwnedSaveStrategyTemplate, OwnedArchiveStrategyTemplate)):
+        if isinstance(command, (OwnedSaveStrategyTemplate, OwnedArchiveStrategyTemplate, OwnedRunStrategyTemplate)):
             return not created or self.strategy_authoring_backend is not None
         if isinstance(command, (SubmitPortfolioBacktest, ExportPortfolioBacktestZip)):
             effect = self.outbox.effect(command.command_id)
@@ -3293,7 +3294,7 @@ class PageControlConsumer:
         return _ExecutionOutcome(PageControlStatus.FAILED, effect.result, effect.error)
 
     def _execute(self, command: PageControlCommandValue) -> JsonValue:
-        if isinstance(command, (OwnedSaveStrategyTemplate, OwnedArchiveStrategyTemplate)):
+        if isinstance(command, (OwnedSaveStrategyTemplate, OwnedArchiveStrategyTemplate, OwnedRunStrategyTemplate)):
             return self._strategy_authoring_backend().submit(command)
         if isinstance(command, (SubmitPortfolioBacktest, ExportPortfolioBacktestZip)):
             effect = self.outbox.effect(command.command_id)
@@ -3655,7 +3656,7 @@ class PageControlConsumer:
         return None
 
     def _recover_started_effect(self, command: PageControlCommandValue) -> JsonValue | None:
-        if isinstance(command, (OwnedSaveStrategyTemplate, OwnedArchiveStrategyTemplate)):
+        if isinstance(command, (OwnedSaveStrategyTemplate, OwnedArchiveStrategyTemplate, OwnedRunStrategyTemplate)):
             return self._strategy_authoring_backend().recover(command)
         if isinstance(command, (SubmitPortfolioBacktest, ExportPortfolioBacktestZip)):
             effect = self.outbox.effect(command.command_id)
@@ -4728,7 +4729,7 @@ class PageControlService:
         self.consumer = consumer
 
     def submit(self, command: PageControlCommandValue) -> PageControlReceipt:
-        if isinstance(command, (SaveStrategyTemplate, ArchiveStrategyTemplate)):
+        if isinstance(command, (SaveStrategyTemplate, ArchiveStrategyTemplate, RunStrategyTemplate)):
             raise ValueError("strategy authoring requires trusted submission")
         if isinstance(command, SaveResearchQuery):
             raise ValueError("research queries require trusted submission")
@@ -5802,7 +5803,7 @@ def _fsync_descriptor(descriptor: int) -> None:
 
 
 def parse_page_control_command(payload: object) -> PageControlCommandValue:
-    if isinstance(payload, (SaveStrategyTemplate, ArchiveStrategyTemplate)) or (
+    if isinstance(payload, (SaveStrategyTemplate, ArchiveStrategyTemplate, RunStrategyTemplate)) or (
         isinstance(payload, Mapping) and payload.get("kind") in _STRATEGY_AUTHORING_KINDS
     ):
         raise ValueError("strategy authoring requires trusted submission")

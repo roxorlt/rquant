@@ -8,7 +8,7 @@ from collections.abc import Callable
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Annotated, Literal, TypeAlias
+from typing import TYPE_CHECKING, Annotated, Literal, TypeAlias
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
@@ -610,6 +610,10 @@ CommandSubmissionResult: TypeAlias = Annotated[
 ]
 
 
+if TYPE_CHECKING:
+    from rquant.strategy_template_runtime import StrategyTemplateRuntimeDirectory
+
+
 class LabCommandSubmissionFacade:
     """Read scheduler state and publish commands without opening a writable ledger."""
 
@@ -621,12 +625,16 @@ class LabCommandSubmissionFacade:
         experiment_registry: ExperimentRegistry | None = None,
         definition_registry: ImmutableDefinitionRegistry | None = None,
         clock: Callable[[], datetime] | None = None,
+        template_directory: StrategyTemplateRuntimeDirectory | None = None,
     ) -> None:
         self.reader = reader
         self.spool = spool
         self.experiment_registry = experiment_registry
         self.definition_registry = definition_registry
         self.clock = clock or (lambda: datetime.now(UTC))
+        from rquant.strategy_template_runtime import require_template_runtime_directory
+
+        self.template_directory = require_template_runtime_directory(template_directory)
 
     @staticmethod
     def _experiment_submission_intent(
@@ -698,11 +706,15 @@ class LabCommandSubmissionFacade:
             raise FormalSubmissionAuthorityError(
                 "formal plan receipts do not exactly match the research job"
             )
-        if self.definition_registry is None:
+        template_catalog = None if self.template_directory is None else self.template_directory.catalog_for_spec(command.spec)
+        definitions = self.definition_registry
+        if template_catalog is not None:
+            definitions = self.template_directory.store.definition_registry(execution.strategy_id)
+        if definitions is None:
             raise FormalSubmissionAuthorityError(
                 "v3 research submission requires an authoritative Definition Registry"
             )
-        registration = self.definition_registry.read_strategy_spec(
+        registration = definitions.read_strategy_spec(
             execution.strategy_definition_fingerprint,
             as_of=observed_at,
         )

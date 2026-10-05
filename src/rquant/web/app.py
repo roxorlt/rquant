@@ -419,6 +419,8 @@ def create_app(
             body_limit = factor_saves.MAX_SAVE_REQUEST_BYTES
         if body_limit is None and _FACTOR_RUN_WRITE.fullmatch(request.url.path):
             body_limit = factor_runs.MAX_RUN_REQUEST_BYTES
+        if body_limit is None and re.fullmatch(r"/api/v1/strategy-templates/template_[0-9a-f]{32}/runs(?:/resume)?", request.url.path):
+            body_limit = strategy_authoring.MAX_RUN_REQUEST_BYTES
         if request.url.path in (
             "/api/v1/factors/tracking/commands",
             "/api/v1/factors/tracking/commands/resume",
