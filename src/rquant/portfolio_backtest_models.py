@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from datetime import date
 from decimal import Decimal
 from typing import Annotated, Literal, Self
@@ -17,7 +18,7 @@ from rquant.perf import PerformanceSummary, RelativeMetrics, ReturnDistribution,
 from rquant.perf.trades import RoundTrip, RoundTripAnalysis
 from rquant.portfolio.drawdown import DrawdownRule
 from rquant.portfolio.weights import PortfolioWeightRule
-from rquant.research_run_spec import ExecutionCostSpec
+from rquant.research_run_spec import ExecutionCostSpec, _decimal_components, _parse_decimal
 from rquant.runtime_contracts import RuntimeContractModel, canonical_sha256
 
 MAX_CONFIG_BYTES = 32 * 1024
@@ -50,12 +51,44 @@ class PortfolioBacktestConfig(RuntimeContractModel):
     execution_cost_spec: ExecutionCostSpec
     drawdown_rule: DrawdownRule | None = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def validate_numeric_admission(cls, value: object) -> object:
+        data = value.model_dump(mode="python") if isinstance(value, cls) else value
+        if not isinstance(data, Mapping):
+            return value
+        if "initial_cash" in data:
+            cash = _parse_decimal(data["initial_cash"], field_name="initial cash")
+            if not 0 < cash <= Decimal("1000000000000"):
+                raise ValueError("initial cash exceeds the positive money budget")
+            if _decimal_components(cash, field_name="initial cash")[2] < -2:
+                raise ValueError("initial cash must be exact to a cent")
+        weight = data.get("weight_rule")
+        if isinstance(weight, PortfolioWeightRule):
+            weight = weight.model_dump(mode="python")
+        if isinstance(weight, Mapping):
+            for field in (
+                "max_stock_weight",
+                "max_industry_weight",
+                "cash_reserve",
+                "min_target_amount",
+            ):
+                if field not in weight or (
+                    field == "max_industry_weight" and weight[field] is None
+                ):
+                    continue
+                number = _parse_decimal(weight[field], field_name=field)
+                if (
+                    field == "min_target_amount"
+                    and _decimal_components(number, field_name=field)[2] < -2
+                ):
+                    raise ValueError("minimum target amount must be exact to a cent")
+        return value
+
     @model_validator(mode="after")
     def validate_bounds(self) -> Self:
         if not 1 <= (self.end_date - self.start_date).days + 1 <= MAX_DATE_SPAN:
             raise ValueError("date range exceeds portfolio budget")
-        if self.initial_cash * 100 != (self.initial_cash * 100).to_integral_value():
-            raise ValueError("initial cash must be exact to a cent")
         if self.benchmark_code not in SUPPORTED_BENCHMARK_CODES:
             raise ValueError("unsupported benchmark")
         if self.weight_rule.max_positions > MAX_SOURCE_CODES:
@@ -130,6 +163,11 @@ class FrozenPortfolioInput(RuntimeContractModel):
             or len({item.ts_code for item in instruments}) > MAX_SOURCE_CODES
         ):
             raise ValueError("frozen input exceeds source pair/code budget")
+        candidates = {
+            candidate.ts_code for day in self.request.days for candidate in day.ranking.candidates
+        }
+        if len(candidates) > MAX_SOURCE_CODES:
+            raise ValueError("frozen input exceeds candidate code budget")
         if self.sources.opening_hash is None and any(
             item.conditions is not None for item in instruments
         ):

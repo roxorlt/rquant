@@ -5,6 +5,7 @@ import {
   type PortfolioExportRequest,
   type PortfolioJob,
   type PortfolioReceipt,
+  type PortfolioSummary,
   type PortfolioView,
   submitPortfolioExport,
   submitPortfolioRun,
@@ -16,6 +17,7 @@ import {
 } from "@/api/backtests";
 import { ApiError, apiBaseUrl } from "@/api/client";
 import { type LabControlRequest, submitLabControl } from "@/api/endpoints";
+import { useCurrentMeta } from "@/api/useMeta";
 import { type DataColumn, DataTable } from "@/table/DataTable";
 import {
   Button,
@@ -75,6 +77,11 @@ const activeStatus = (job: PortfolioJob | undefined) =>
   job !== undefined && ["queued", "running", "sealing"].includes(job.status);
 
 export default function PortfolioPage() {
+  const meta = useCurrentMeta();
+  const viewer = meta.data?.data.viewer;
+  const [sessionOwner, setSessionOwner] = useState<{ viewer: string | null } | null>(null);
+  const viewerChanged =
+    sessionOwner !== null && viewer !== undefined && sessionOwner.viewer !== viewer;
   const capabilities = usePortfolioCapabilities();
   const [cursor, setCursor] = useState<string | null>(null);
   const [previousCursors, setPreviousCursors] = useState<(string | null)[]>([]);
@@ -85,13 +92,45 @@ export default function PortfolioPage() {
   const selection = useRef({ revision: 0, jobId: null as string | null });
   const summary = usePortfolioSummary(jobId, poll);
   const current = summary.data?.job.job_id === jobId ? summary.data : undefined;
-  const resultHash = current?.result_hash ?? null;
-  const nav = usePortfolioNav(jobId, resultHash);
+  const verifiedResult =
+    !viewerChanged &&
+    current?.available &&
+    current.result_hash !== null &&
+    current.result_hash === current.job.result_hash &&
+    current.result_hash === summary.serving?.generation_id
+      ? current
+      : undefined;
+  const successfulResult =
+    verifiedResult?.job.status === "completed" && verifiedResult.result_status === "complete"
+      ? verifiedResult
+      : undefined;
+  const [lastSuccessful, setLastSuccessful] = useState<{
+    value: PortfolioSummary;
+    generationId: string;
+    viewer: string;
+  } | null>(null);
+  const previousResult =
+    !viewerChanged && lastSuccessful !== null && lastSuccessful.viewer === viewer
+      ? lastSuccessful.value
+      : undefined;
+  const displayedResult = successfulResult ?? previousResult ?? verifiedResult;
+  const showingPrevious =
+    displayedResult !== undefined &&
+    displayedResult === previousResult &&
+    successfulResult === undefined;
+  const resultJobId = displayedResult?.job.job_id ?? null;
+  const resultHash = displayedResult?.result_hash ?? null;
+  const previousDisplayed = useRef<{ jobId: string | null; hash: string | null } | null>(null);
+  const nav = usePortfolioNav(resultJobId, resultHash);
   const [view, setView] = useState<PortfolioView>("trades");
   const [offset, setOffset] = useState(0);
-  const rows = usePortfolioRows(jobId, resultHash, view, offset);
+  const rows = usePortfolioRows(resultJobId, resultHash, view, offset);
   const actualRows =
-    rows.data?.view === view && rows.data.result_hash === resultHash ? rows.data : undefined;
+    rows.data?.view === view &&
+    rows.data.result_hash === resultHash &&
+    rows.serving?.generation_id === resultHash
+      ? rows.data
+      : undefined;
   const [range, setRange] = useState<PortfolioRange>("all");
   const [draft, setDraft] = useState<PortfolioConfig | null>(null);
   const [configOpen, setConfigOpen] = useState(false);
@@ -121,9 +160,36 @@ export default function PortfolioPage() {
     setMetricsOpen(false);
   }, []);
   useEffect(() => {
-    if (jobId === null && pendingRun === null && jobs.data?.jobs[0])
+    if (sessionOwner === null && viewer !== undefined) setSessionOwner({ viewer });
+    if (viewerChanged) setLastSuccessful(null);
+  }, [sessionOwner, viewer, viewerChanged]);
+  useEffect(() => {
+    const generationId = successfulResult?.result_hash;
+    if (successfulResult === undefined || generationId == null || typeof viewer !== "string")
+      return;
+    setLastSuccessful((previous) =>
+      previous?.viewer === viewer &&
+      previous.value.job.job_id === successfulResult.job.job_id &&
+      previous.generationId === generationId
+        ? previous
+        : { value: successfulResult, generationId, viewer },
+    );
+  }, [successfulResult, viewer]);
+  useEffect(() => {
+    if (
+      previousDisplayed.current?.jobId === resultJobId &&
+      previousDisplayed.current.hash === resultHash
+    )
+      return;
+    previousDisplayed.current = { jobId: resultJobId, hash: resultHash };
+    setOffset(0);
+    setDetail(null);
+    setMetricsOpen(false);
+  }, [resultJobId, resultHash]);
+  useEffect(() => {
+    if (!viewerChanged && jobId === null && pendingRun === null && jobs.data?.jobs[0])
       selectJob(jobs.data.jobs[0].job_id);
-  }, [jobId, jobs.data, pendingRun, selectJob]);
+  }, [jobId, jobs.data, pendingRun, selectJob, viewerChanged]);
   useEffect(() => {
     if (current?.job) setPoll(activeStatus(current.job));
   }, [current?.job]);
@@ -170,11 +236,11 @@ export default function PortfolioPage() {
   }
 
   async function exportZip() {
-    if (jobId === null || resultHash === null || busyExport) return;
+    if (resultJobId === null || resultHash === null || busyExport) return;
     const body = exportRequest ?? {
       command_id: crypto.randomUUID(),
       requested_at: new Date().toISOString(),
-      job_id: jobId,
+      job_id: resultJobId,
       result_hash: resultHash,
     };
     setExportRequest(body);
@@ -229,22 +295,35 @@ export default function PortfolioPage() {
     }
   }
 
-  const perf = current?.performance;
+  const perf = displayedResult?.performance;
   const htmlUrl =
-    jobId === null || resultHash === null
+    resultJobId === null || resultHash === null
       ? null
-      : `${apiBaseUrl()}/api/v1/backtests/portfolio/runs/${encodeURIComponent(jobId)}/report.html?result_hash=${resultHash}`;
+      : `${apiBaseUrl()}/api/v1/backtests/portfolio/runs/${encodeURIComponent(resultJobId)}/report.html?result_hash=${resultHash}`;
   const zipUrl =
     exportReceipt?.status === "exported" &&
-    exportReceipt.job_id === jobId &&
+    exportReceipt.job_id === resultJobId &&
     exportReceipt.result_hash === resultHash &&
     exportReceipt.zip_request_id
-      ? `${apiBaseUrl()}/api/v1/backtests/portfolio/runs/${encodeURIComponent(jobId ?? "")}/exports/${exportReceipt.zip_request_id}.zip?result_hash=${resultHash}`
+      ? `${apiBaseUrl()}/api/v1/backtests/portfolio/runs/${encodeURIComponent(resultJobId ?? "")}/exports/${exportReceipt.zip_request_id}.zip?result_hash=${resultHash}`
       : null;
   const source = capabilities.data?.sources.find(
     (item) =>
       item.key === current?.config?.source_key && item.version === current.config.source_version,
   );
+
+  if (viewerChanged)
+    return (
+      <div className="pb-page">
+        <PageHeader eyebrow="RESEARCH / BACKTEST" title="回测" />
+        <Panel>
+          <EmptyState
+            title="访问身份已变，请刷新页面。"
+            hint={<Button onClick={() => window.location.reload()}>刷新页面</Button>}
+          />
+        </Panel>
+      </div>
+    );
 
   return (
     <div className="pb-page">
@@ -371,83 +450,93 @@ export default function PortfolioPage() {
               />
             </Panel>
           ) : current ? (
-            <>
-              <Panel
-                title={`${current.job.start_date} — ${current.job.end_date}`}
-                sub={current.job.label}
-                actions={
-                  <>
-                    <Tip content="候选与历史参考价按已确认的回顾假设使用；不声称候选在当时已经发布，也不把未知开盘条件当成可成交。">
-                      <span className="pb-assumption">回顾假设</span>
-                    </Tip>
-                    <Button size="sm" onClick={configure}>
-                      查看配置
+            <Panel
+              title={`${current.job.start_date} — ${current.job.end_date}`}
+              sub={current.job.label}
+              actions={
+                <>
+                  <Tip content="候选与历史参考价按已确认的回顾假设使用；不声称候选在当时已经发布，也不把未知开盘条件当成可成交。">
+                    <span className="pb-assumption">回顾假设</span>
+                  </Tip>
+                  <Button size="sm" onClick={configure}>
+                    查看配置
+                  </Button>
+                  {current.job.can_pause ? (
+                    <Button
+                      size="sm"
+                      disabled={busyControl || controlRequest !== null}
+                      onClick={() => void control("pause")}
+                    >
+                      暂停
                     </Button>
-                    {current.job.can_pause ? (
-                      <Button
-                        size="sm"
-                        disabled={busyControl || controlRequest !== null}
-                        onClick={() => void control("pause")}
-                      >
-                        暂停
-                      </Button>
-                    ) : null}
-                    {current.job.can_resume ? (
-                      <Button
-                        size="sm"
-                        disabled={busyControl || controlRequest !== null}
-                        onClick={() => void control("resume")}
-                      >
-                        继续
-                      </Button>
-                    ) : null}
-                    {current.job.can_retry ? (
-                      <Button
-                        size="sm"
-                        disabled={busyControl || controlRequest !== null}
-                        onClick={() => void control("retry")}
-                      >
-                        重跑失败任务
-                      </Button>
-                    ) : null}
-                    {current.job.can_cancel ? (
-                      <Button
-                        size="sm"
-                        disabled={busyControl || controlRequest !== null}
-                        onClick={() => setCancelOpen(true)}
-                      >
-                        取消
-                      </Button>
-                    ) : null}
-                  </>
-                }
-              >
-                <div className="pb-context">
-                  <span>{source?.label ?? "来源待确认"}</span>
+                  ) : null}
+                  {current.job.can_resume ? (
+                    <Button
+                      size="sm"
+                      disabled={busyControl || controlRequest !== null}
+                      onClick={() => void control("resume")}
+                    >
+                      继续
+                    </Button>
+                  ) : null}
+                  {current.job.can_retry ? (
+                    <Button
+                      size="sm"
+                      disabled={busyControl || controlRequest !== null}
+                      onClick={() => void control("retry")}
+                    >
+                      重跑失败任务
+                    </Button>
+                  ) : null}
+                  {current.job.can_cancel ? (
+                    <Button
+                      size="sm"
+                      disabled={busyControl || controlRequest !== null}
+                      onClick={() => setCancelOpen(true)}
+                    >
+                      取消
+                    </Button>
+                  ) : null}
+                </>
+              }
+            >
+              <div className="pb-context">
+                <span>{source?.label ?? "来源待确认"}</span>
+                <span>
+                  已完成 <b className="num">{current.completed_days}</b> 个交易日
+                </span>
+                {current.source_updated_at ? (
                   <span>
-                    已完成 <b className="num">{current.completed_days}</b> 个交易日
+                    数据 <RelativeTime at={current.source_updated_at} />
                   </span>
-                  {current.source_updated_at ? (
-                    <span>
-                      数据 <RelativeTime at={current.source_updated_at} />
-                    </span>
+                ) : null}
+              </div>
+              {current.job.progress !== null && activeStatus(current.job) ? (
+                <progress aria-label="回测进度" value={current.job.progress} max={1} />
+              ) : null}
+              {current.message ? <p className="pb-notice">{current.message}</p> : null}
+              {controlMessage ? (
+                <div className="pb-command" role="status">
+                  <span>{controlMessage}</span>
+                  {controlRequest ? (
+                    <Button size="sm" disabled={busyControl} onClick={() => void control(null)}>
+                      重试原操作
+                    </Button>
                   ) : null}
                 </div>
-                {current.job.progress !== null && activeStatus(current.job) ? (
-                  <progress aria-label="回测进度" value={current.job.progress} max={1} />
-                ) : null}
-                {current.message ? <p className="pb-notice">{current.message}</p> : null}
-                {controlMessage ? (
-                  <div className="pb-command" role="status">
-                    <span>{controlMessage}</span>
-                    {controlRequest ? (
-                      <Button size="sm" disabled={busyControl} onClick={() => void control(null)}>
-                        重试原操作
-                      </Button>
-                    ) : null}
-                  </div>
-                ) : null}
-              </Panel>
+              ) : null}
+            </Panel>
+          ) : null}
+          {showingPrevious && displayedResult ? (
+            <section className="pb-context" aria-label="上一份结果区间">
+              <strong>上一份结果</strong>
+              <span>
+                {displayedResult.job.start_date} — {displayedResult.job.end_date}
+              </span>
+            </section>
+          ) : null}
+          {displayedResult ? (
+            <>
               {perf ? (
                 <>
                   <div className="pb-kpis">
@@ -518,7 +607,7 @@ export default function PortfolioPage() {
                     <Button size="sm" onClick={() => setMetricsOpen(true)}>
                       绩效详情
                     </Button>
-                    {current.can_report && htmlUrl ? (
+                    {displayedResult.can_report && htmlUrl ? (
                       <a className="btn sm" href={htmlUrl} download>
                         HTML 报告
                       </a>
@@ -527,7 +616,7 @@ export default function PortfolioPage() {
                       size="sm"
                       disabled={busyExport}
                       disabledReason={
-                        !current.can_report
+                        !displayedResult.can_report
                           ? "完整结果生成后才能导出报告。"
                           : !capabilities.data?.can_export
                             ? "报告导出暂不可用。"
@@ -550,8 +639,8 @@ export default function PortfolioPage() {
                   {exportMessage}
                 </p>
               ) : null}
-              {current.benchmark_message && current.available ? (
-                <p className="pb-notice">{current.benchmark_message}</p>
+              {displayedResult.benchmark_message && displayedResult.available ? (
+                <p className="pb-notice">{displayedResult.benchmark_message}</p>
               ) : null}
               {resultHash !== null ? (
                 <>
@@ -566,7 +655,12 @@ export default function PortfolioPage() {
                     <PageSkeleton />
                   ) : (
                     <PortfolioCharts
-                      rows={nav.data?.result_hash === resultHash ? nav.data.rows : []}
+                      rows={
+                        nav.data?.result_hash === resultHash &&
+                        nav.serving?.generation_id === resultHash
+                          ? nav.data.rows
+                          : []
+                      }
                       range={range}
                       onRange={setRange}
                     />

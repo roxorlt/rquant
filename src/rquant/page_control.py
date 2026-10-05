@@ -3031,11 +3031,7 @@ class PageControlConsumer:
     ) -> bool:
         if isinstance(command, (SubmitPortfolioBacktest, ExportPortfolioBacktestZip)):
             effect = self.outbox.effect(command.command_id)
-            return (
-                self.portfolio_backend is not None
-                and effect is not None
-                and effect.result is not None
-            )
+            return effect is not None and effect.result is not None
         if isinstance(command, _OwnedSetFactorTracked):
             return not created or self.factor_tracking_backend is not None
         if isinstance(command, _OwnedSubmitFactorRun):

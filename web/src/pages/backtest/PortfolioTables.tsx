@@ -102,7 +102,9 @@ const holdingColumns: DataColumn<Holding>[] = [
     id: "cost",
     header: "成本价",
     value: (row) => row.average_cost,
-    cell: (row) => portfolioMoney(row.average_cost),
+    cell: (row) => (
+      <Tip content={`完整成本价：${row.average_cost}`}>{portfolioPrice(row.average_cost)}</Tip>
+    ),
     numeric: true,
     secondary: true,
   },
@@ -110,7 +112,9 @@ const holdingColumns: DataColumn<Holding>[] = [
     id: "price",
     header: "市价",
     value: (row) => row.market_price,
-    cell: (row) => portfolioMoney(row.market_price),
+    cell: (row) => (
+      <Tip content={`完整市价：${row.market_price ?? "—"}`}>{portfolioPrice(row.market_price)}</Tip>
+    ),
     numeric: true,
     secondary: true,
   },
