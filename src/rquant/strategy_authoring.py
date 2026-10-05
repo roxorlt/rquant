@@ -35,6 +35,7 @@ from rquant.strategy_authoring_commands import (
 from rquant.strategy_authoring_projection_contract import (
     MAX_TEMPLATE_COUNT,
     MAX_TEMPLATE_PROJECTION_BYTES,
+    MAX_TEMPLATE_RUN_ADMISSIONS,
     MAX_TEMPLATE_VERSIONS,
 )
 from rquant.strategy_authoring_source import StrategySourceCatalog
@@ -743,6 +744,7 @@ class StrategyAuthoringStore:
             if row["archived"]:
                 raise StrategyAuthoringConflict("strategy is archived")
             version = self._version(connection, strategy_id, head.version, owner_id)
+            self._require_run_capacity(connection)
             connection.execute(
                 "INSERT INTO run_admissions(command_id,owner_id,request_hash,strategy_id,head,spec_hash) VALUES(?,?,?,?,?,?)",
                 (
@@ -755,6 +757,14 @@ class StrategyAuthoringStore:
                 ),
             )
         return version
+
+    @staticmethod
+    def _require_run_capacity(connection: sqlite3.Connection) -> None:
+        if (
+            connection.execute("SELECT COUNT(*) FROM run_admissions").fetchone()[0]
+            >= MAX_TEMPLATE_RUN_ADMISSIONS
+        ):
+            raise StrategyAuthoringConflict("strategy run admission budget reached")
 
     def accepted_run(
         self,
@@ -801,6 +811,7 @@ class StrategyAuthoringStore:
                 != request.head
             ):
                 raise StrategyAuthoringConflict("selected strategy version differs")
+            self._require_run_capacity(connection)
 
     def commit_run_admission(
         self, accepted: AcceptedStrategyTemplateRun
@@ -823,6 +834,7 @@ class StrategyAuthoringStore:
             )
             if version.head != request.head:
                 raise StrategyAuthoringConflict("selected strategy version differs")
+            self._require_run_capacity(connection)
             connection.execute(
                 "INSERT INTO run_admissions VALUES(?,?,?,?,?,?,?,NULL)",
                 (

@@ -21,7 +21,9 @@ function requireData<T>(data: T | undefined, response: Response): T {
       ? "数据已更新，请重新查看策略。"
       : response.status === 401 || response.status === 403
         ? "当前账号无法查看策略。"
-        : "策略暂时无法加载，请稍后重试。",
+        : response.status === 422
+          ? "策略内容有误，请检查后重试。"
+          : "策略暂时无法加载，请稍后重试。",
   );
 }
 

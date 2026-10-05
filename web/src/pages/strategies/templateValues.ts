@@ -33,3 +33,12 @@ export function positiveRate(value: string | number | null | undefined): boolean
     /[1-9]/.test(String(value).split(/[eE]/)[0] ?? "")
   );
 }
+
+export function belowOneRate(value: string | number | null | undefined): boolean {
+  if (!positiveRate(value)) return false;
+  const match = /^\+?(\d*)(?:\.(\d*))?(?:[eE]([+-]?\d+))?$/.exec(String(value));
+  if (!match) return false;
+  const digits = `${match[1] ?? ""}${match[2] ?? ""}`.replace(/^0+/, "");
+  const exponent = Number(match[3] ?? 0);
+  return Number.isFinite(exponent) && digits.length + exponent - (match[2]?.length ?? 0) <= 0;
+}

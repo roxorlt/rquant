@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { ApiError } from "@/api/client";
 import { postTemplateOperation, type TemplateOperation, type TemplateResult } from "./templateApi";
 
 function storageKey(viewer: string): string {
@@ -49,6 +50,16 @@ export function useTemplateCommands(viewer: string) {
     };
   }, []);
 
+  function clearOriginal(): void {
+    original.current = null;
+    setPending(null);
+    try {
+      sessionStorage.removeItem(storageKey(viewer));
+    } catch {
+      /* A definite server result stays final when browser storage is blocked. */
+    }
+  }
+
   async function send(body: TemplateOperation, resume: boolean): Promise<void> {
     if (inFlight.current || (!resume && original.current !== null)) return;
     inFlight.current = true;
@@ -65,21 +76,20 @@ export function useTemplateCommands(viewer: string) {
       if (!active.current) return;
       setResult(receipt);
       if (["published", "submitted", "rejected"].includes(receipt.status)) {
-        original.current = null;
-        setPending(null);
-        try {
-          sessionStorage.removeItem(storageKey(viewer));
-        } catch {
-          /* A confirmed server receipt remains final when browser storage is blocked. */
-        }
+        clearOriginal();
       }
-    } catch {
-      if (active.current)
+    } catch (error) {
+      if (!active.current) return;
+      if (error instanceof ApiError && error.status === 422) {
+        clearOriginal();
+        setResult({ command_id: body.command_id, status: "rejected", message: error.message });
+      } else {
         setResult({
           command_id: body.command_id,
           status: "uncertain",
           message: "结果待确认，请继续查看。",
         });
+      }
     } finally {
       inFlight.current = false;
       if (active.current) setBusy(false);

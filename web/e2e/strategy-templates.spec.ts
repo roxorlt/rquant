@@ -43,7 +43,9 @@ const builtin: Schemas["StrategyCatalogItem"][] = [
   },
 ];
 
-async function fixture(page: Page, uncertain = false) {
+async function fixture(page: Page, baseURL: string | undefined, uncertain = false) {
+  if (baseURL === undefined) throw new Error("Strategy template browser fixture requires baseURL");
+  const allowedOrigin = new URL(baseURL).origin;
   const problems: string[] = [];
   const operations: Operation[] = [];
   const retries: Operation[] = [];
@@ -58,7 +60,7 @@ async function fixture(page: Page, uncertain = false) {
   });
   page.on("requestfailed", (request) => problems.push(`failed request: ${request.url()}`));
   page.on("request", (request) => {
-    if (!request.url().startsWith("http://127.0.0.1:14883/") && !request.url().startsWith("data:"))
+    if (new URL(request.url()).origin !== allowedOrigin && !request.url().startsWith("data:"))
       problems.push(`external request: ${request.url()}`);
   });
   await page.clock.setFixedTime(new Date("2026-09-24T07:32:00Z"));
@@ -241,8 +243,8 @@ async function fixture(page: Page, uncertain = false) {
   };
 }
 
-test("新建完整规则、编辑不可变版本、历史版回测和归档", async ({ page }, info) => {
-  const state = await fixture(page);
+test("新建完整规则、编辑不可变版本、历史版回测和归档", async ({ page, baseURL }, info) => {
+  const state = await fixture(page, baseURL);
   await page.goto("./#/strategies");
   await expect(page.getByRole("table", { name: "策略列表" }).getByRole("row")).toHaveCount(4);
   const create = page.getByRole("button", { name: "新建策略", exact: true });
@@ -253,6 +255,9 @@ test("新建完整规则、编辑不可变版本、历史版回测和归档", as
   await drawer.getByLabel("入场方式").selectOption("pool");
   await drawer.getByRole("button", { name: "下一步", exact: true }).click();
   await drawer.getByRole("checkbox", { name: "止损", exact: true }).check();
+  await drawer.getByLabel("止损幅度（%）").fill("100");
+  await drawer.getByRole("button", { name: "下一步", exact: true }).click();
+  await expect(drawer.getByRole("alert")).toContainText("止损和移动止盈须小于 100%。");
   await drawer.getByLabel("止损幅度（%）").fill("8.5");
   for (const label of ["止盈", "移动止盈", "持有上限"])
     await drawer.getByRole("checkbox", { name: label, exact: true }).check();
@@ -342,8 +347,11 @@ test("新建完整规则、编辑不可变版本、历史版回测和归档", as
   expect(state.problems).toEqual([]);
 });
 
-test("未知回执刷新后按原请求恢复，换代保持原身份，换用户隐藏旧详情", async ({ page }, info) => {
-  const state = await fixture(page, true);
+test("未知回执刷新后按原请求恢复，换代保持原身份，换用户隐藏旧详情", async ({
+  page,
+  baseURL,
+}, info) => {
+  const state = await fixture(page, baseURL, true);
   await page.goto("./#/strategies");
   await page.getByRole("button", { name: "新建策略", exact: true }).click();
   const drawer = page.getByRole("dialog", { name: "新建策略", exact: true });

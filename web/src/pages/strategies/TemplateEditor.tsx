@@ -4,7 +4,7 @@ import type { ParameterValue } from "@/ui/ParamControl";
 import { TemplateParamControl } from "./TemplateParamControl";
 import { ACTION_COPY, REBALANCE_COPY, TemplateRulesSummary } from "./TemplateRules";
 import type { SaveTemplate, TemplateDetail, TemplateRules, TemplateSources } from "./templateApi";
-import { decimalRate, positiveRate, rateValue } from "./templateValues";
+import { belowOneRate, decimalRate, positiveRate, rateValue } from "./templateValues";
 
 const STEPS = ["入场", "退出", "仓位与调仓", "确认"];
 type Condition = Extract<TemplateRules["entry"], { kind: "conditions" }>["conditions"][number];
@@ -150,6 +150,14 @@ export function TemplateEditor({
       (weight.max_industry_weight != null && !positiveRate(weight.max_industry_weight))
     ) {
       setError("启用的比例须大于零。");
+      return false;
+    }
+    if (
+      (["stop_loss", "trailing_profit"] as const).some(
+        (key) => exit[key] != null && !belowOneRate(exit[key]),
+      )
+    ) {
+      setError("止损和移动止盈须小于 100%。");
       return false;
     }
     setError(null);

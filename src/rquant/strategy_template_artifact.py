@@ -14,6 +14,7 @@ from rquant.lab_jobs import LabJobReader
 from rquant.runtime_contracts import RuntimeContractModel
 from rquant.strategy_authoring import StrategyAuthoringStore
 from rquant.strategy_authoring_commands import StrategyAuthoringIdentity, StrategyTemplateHead
+from rquant.strategy_authoring_projection_contract import MAX_TEMPLATE_RUN_ADMISSIONS
 from rquant.strategy_authoring_source import template_source_code_identity
 from rquant.strategy_template import TEMPLATE_ID_PATTERN
 from rquant.strategy_template_adapter import (
@@ -91,9 +92,10 @@ class StrategyTemplateSealedResultReader:
         runs: list[StrategyTemplateRecentRun] = []
         with store._connection(expected_identity=expected_identity) as connection:
             rows = connection.execute(
-                "SELECT * FROM run_admissions ORDER BY command_id LIMIT 4097"
+                "SELECT * FROM run_admissions ORDER BY command_id LIMIT ?",
+                (MAX_TEMPLATE_RUN_ADMISSIONS + 1,),
             ).fetchall()
-            if len(rows) > 4096:
+            if len(rows) > MAX_TEMPLATE_RUN_ADMISSIONS:
                 raise ValueError("template result references exceed the original command budget")
             for row in rows:
                 job_id = UUID(row["command_id"])
