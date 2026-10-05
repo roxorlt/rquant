@@ -337,6 +337,178 @@ describe("日线组合回测", () => {
     );
   });
 
+  it.each([false, true])(
+    "PB-FINAL-04 手选可信不完整原件显示完成前缀，有旧成功缓存 %s；不缓存为成功",
+    async (hasPreviousSuccess) => {
+      results();
+      const partialId = "22222222-2222-4222-8222-222222222222";
+      const partialHash = "2".repeat(64);
+      const runningId = "33333333-3333-4333-8333-333333333333";
+      const message = "部分持仓收盘价缺失；保留已完成结果，不生成完整绩效或报告。";
+      const partial: Schemas["Envelope_PortfolioSummaryData_"] = {
+        ...portfolioSummary,
+        data: {
+          ...portfolioSummary.data,
+          job: {
+            ...portfolioSummary.data.job,
+            job_id: partialId,
+            start_date: "2026-07-01",
+            end_date: "2026-07-31",
+            result_hash: partialHash,
+          },
+          available: true,
+          result_hash: partialHash,
+          result_status: "incomplete",
+          performance: null,
+          can_report: false,
+          completed_days: 1,
+          message,
+        },
+        serving: { ...portfolioSummary.serving, generation_id: partialHash },
+      };
+      const running: Schemas["Envelope_PortfolioSummaryData_"] = {
+        ...portfolioSummary,
+        data: {
+          ...portfolioSummary.data,
+          job: {
+            ...portfolioSummary.data.job,
+            job_id: runningId,
+            start_date: "2026-09-01",
+            end_date: "2026-09-30",
+            status: "running",
+            label: "运行中",
+            result_hash: null,
+            can_pause: true,
+            can_cancel: true,
+          },
+          available: false,
+          result_hash: null,
+          result_status: null,
+          performance: null,
+          can_report: false,
+          completed_days: 0,
+          message: "回测正在运行，完成后可查看结果。",
+        },
+        serving: { ...portfolioSummary.serving, generation_id: null, state: "unavailable" },
+      };
+      const requests: { kind: string; job: string; hash: string | null }[] = [];
+      server.use(
+        http.get(`${base}/runs`, () =>
+          HttpResponse.json({
+            ...portfolioJobs,
+            data: {
+              ...portfolioJobs.data,
+              jobs: hasPreviousSuccess
+                ? [...portfolioJobs.data.jobs, partial.data.job, running.data.job]
+                : [partial.data.job, running.data.job],
+            },
+          }),
+        ),
+        http.get(`${base}/runs/:job`, ({ params }) =>
+          HttpResponse.json(
+            params.job === partialId
+              ? partial
+              : params.job === runningId
+                ? running
+                : portfolioSummary,
+          ),
+        ),
+        http.get(`${base}/runs/:job/nav`, ({ params, request }) => {
+          requests.push({
+            kind: "nav",
+            job: String(params.job),
+            hash: new URL(request.url).searchParams.get("result_hash"),
+          });
+          return HttpResponse.json(
+            params.job === partialId
+              ? {
+                  ...portfolioNav,
+                  data: {
+                    result_hash: partialHash,
+                    rows: portfolioNav.data.rows
+                      .slice(0, 1)
+                      .map((row) => ({ ...row, trade_date: "2026-07-01" })),
+                  },
+                  serving: { ...portfolioNav.serving, generation_id: partialHash },
+                }
+              : portfolioNav,
+          );
+        }),
+        http.get(`${base}/runs/:job/rows`, ({ params, request }) => {
+          requests.push({
+            kind: "rows",
+            job: String(params.job),
+            hash: new URL(request.url).searchParams.get("result_hash"),
+          });
+          return HttpResponse.json(
+            params.job === partialId
+              ? {
+                  ...portfolioTrades,
+                  data: {
+                    ...portfolioTrades.data,
+                    result_hash: partialHash,
+                    total: 1,
+                    trades: portfolioTrades.data.trades.slice(0, 1).map((row) => ({
+                      ...row,
+                      trade_date: "2026-07-01",
+                      ts_code: "600123.SH",
+                      price: "12.3456",
+                    })),
+                  },
+                  serving: { ...portfolioTrades.serving, generation_id: partialHash },
+                }
+              : portfolioTrades,
+          );
+        }),
+      );
+      const user = userEvent.setup();
+      renderApp("/backtest");
+      if (hasPreviousSuccess) {
+        await screen.findByRole("link", { name: "HTML 报告" });
+        await screen.findByRole("table", { name: "成交" });
+        await user.click(screen.getByText("2026-07-01"));
+      }
+      await screen.findByRole("heading", { name: "2026-07-01 — 2026-07-31" });
+      expect(await screen.findByText(message)).toBeVisible();
+      await waitFor(() => {
+        for (const kind of ["nav", "rows"]) {
+          expect(requests).toContainEqual({ kind, job: partialId, hash: partialHash });
+        }
+      });
+      const table = await screen.findByRole("table", { name: "成交" });
+      const code = await within(table).findByText("600123.SH");
+      expect(within(table).getAllByRole("row")).toHaveLength(2);
+      expect(within(table).queryByText("600000.SH")).not.toBeInTheDocument();
+      expect(screen.queryByText("上一份结果")).not.toBeInTheDocument();
+      expect(screen.queryByRole("link", { name: "HTML 报告" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "导出 ZIP" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "绩效详情" })).not.toBeInTheDocument();
+      await user.click(code);
+      const detail = await screen.findByRole("dialog");
+      expect(within(detail).getByText("600123.SH · 成交详情", { exact: true })).toBeVisible();
+      expect(within(detail).getByText("12.3456", { exact: true })).toBeVisible();
+      await user.keyboard("{Escape}");
+      await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+      await user.click(screen.getByText("2026-09-01"));
+      await screen.findByRole("heading", { name: "2026-09-01 — 2026-09-30" });
+      expect(screen.getByRole("button", { name: "暂停" })).toBeVisible();
+      expect(screen.queryByText("600123.SH")).not.toBeInTheDocument();
+      if (hasPreviousSuccess) {
+        expect(screen.getByText("上一份结果")).toBeVisible();
+        expect(screen.getByRole("link", { name: "HTML 报告" })).toHaveAttribute(
+          "href",
+          expect.stringContaining(`/runs/${jobId}/report.html?result_hash=${resultHash}`),
+        );
+        expect(screen.getByRole("table", { name: "成交" })).toBeInTheDocument();
+      } else {
+        expect(screen.queryByText("上一份结果")).not.toBeInTheDocument();
+        expect(screen.queryByRole("table", { name: "成交" })).not.toBeInTheDocument();
+        expect(screen.queryByRole("link", { name: "HTML 报告" })).not.toBeInTheDocument();
+      }
+      expect(requests.some((request) => request.job === runningId)).toBe(false);
+    },
+  );
+
   it("PB-FINAL-04 已认证访问身份改变后不继续显示或导出原身份结果", async () => {
     results();
     const { queryClient } = renderApp("/backtest");

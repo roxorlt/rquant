@@ -113,7 +113,7 @@ export default function PortfolioPage() {
     !viewerChanged && lastSuccessful !== null && lastSuccessful.viewer === viewer
       ? lastSuccessful.value
       : undefined;
-  const displayedResult = successfulResult ?? previousResult ?? verifiedResult;
+  const displayedResult = verifiedResult ?? previousResult;
   const showingPrevious =
     displayedResult !== undefined &&
     displayedResult === previousResult &&
