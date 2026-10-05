@@ -57,6 +57,10 @@ ProjectionColumnKind = Literal["string", "int", "float", "bool", "date", "timest
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 _MAX_PROJECTION_CELL_BYTES = 64 * 1024
 _MAX_OWNER_PROJECTION_BYTES = 7 * 1024 * 1024
+_PRIVATE_EXPERIMENT_TABLES = frozenset(
+    {"experiment_private_attempt", "experiment_private_family", "experiment_private_window"}
+)
+_MAX_PRIVATE_EXPERIMENT_BYTES = 8 * 1024 * 1024
 _NL_SCREEN_CURSOR_TYPE = "nl_screen_page"
 _NL_SCREEN_ORDER_VERSION = "trade_date_ts_code_v1"
 _RANKED_NL_SCREEN_ORDER_VERSION = "rank_ts_code_v1"
@@ -163,6 +167,41 @@ def _contract(
 
 PAGE_PROJECTION_CONTRACTS: Mapping[str, ServingProjectionContract] = MappingProxyType(
     {
+        "experiment_private_attempt": _contract(
+            "promotions",
+            (
+                ("owner", "string"),
+                ("experiment_id", "string"),
+                ("family_id", "string"),
+                ("registered_at", "timestamp"),
+                ("payload_json", "string"),
+            ),
+            ("owner", "experiment_id"),
+            max_rows=32_000,
+            max_bytes=6 * 1024 * 1024,
+            event_time_columns=("registered_at",),
+        ),
+        "experiment_private_family": _contract(
+            "promotions",
+            (("owner", "string"), ("family_id", "string"), ("payload_json", "string")),
+            ("owner", "family_id"),
+            max_rows=32_000,
+            max_bytes=3 * 1024 * 1024,
+        ),
+        "experiment_private_window": _contract(
+            "promotions",
+            (
+                ("owner", "string"),
+                ("retained_count", "int"),
+                ("truncated", "bool"),
+                ("oldest_registered_at", "timestamp"),
+                ("policy_json", "string"),
+            ),
+            ("owner",),
+            max_rows=64,
+            max_bytes=64 * 1024,
+            event_time_columns=("oldest_registered_at",),
+        ),
         "experiment_attempt": _contract(
             "promotions",
             (
@@ -1896,6 +1935,16 @@ class ServingReadModelInput(RuntimeContractModel):
                 projection.owner_dataset_id,
                 0,
             ) + _projection_json_bytes(projection)
+        private_projections=tuple(p for p in self.projections if p.table_name in _PRIVATE_EXPERIMENT_TABLES)
+        private_bytes=sum(_projection_json_bytes(p) for p in private_projections)
+        if private_projections and {p.table_name for p in private_projections}!=_PRIVATE_EXPERIMENT_TABLES:
+            raise ValueError("private experiment projection is partial")
+        if private_bytes>_MAX_PRIVATE_EXPERIMENT_BYTES:
+            raise ValueError("private experiment projections exceed their authority byte budget")
+        if private_projections:
+            # The explicit private collection has its own accepted 8 MiB budget.
+            # The original shared projections retain their original 7 MiB budget.
+            owner_sizes["promotions"]-=private_bytes
         oversized_owners = tuple(
             sorted(
                 owner for owner, size in owner_sizes.items() if size > _MAX_OWNER_PROJECTION_BYTES

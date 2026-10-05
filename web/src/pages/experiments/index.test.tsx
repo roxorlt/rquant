@@ -33,6 +33,13 @@ const second: Schemas["ExperimentItem"] = {
 };
 
 describe("实验记录", () => {
+  beforeEach(() =>
+    server.use(
+      http.get("*/api/v1/experiments/capabilities", () =>
+        HttpResponse.json({ data: { available: false }, serving }),
+      ),
+    ),
+  );
   it("元数据未返回前不请求或展示实验，核验后只请求当前数据代", async () => {
     const generation = "f".repeat(64);
     let releaseMeta = () => {};
@@ -41,6 +48,12 @@ describe("实验记录", () => {
     });
     const requests: (string | null)[] = [];
     server.use(
+      http.get("*/api/v1/experiments/capabilities", () =>
+        HttpResponse.json({
+          data: { available: false },
+          serving: metaEnvelope({ generationId: generation }).serving,
+        }),
+      ),
       http.get("*/api/v1/meta", async () => {
         await metaGate;
         return HttpResponse.json(metaEnvelope({ generationId: generation }));
@@ -299,7 +312,12 @@ describe("实验记录", () => {
     expect(screen.getByRole("region", { name: "实验对比" })).toBeVisible();
 
     const changed = metaEnvelope({ generationId: nextGeneration });
-    server.use(metaHandler(changed));
+    server.use(
+      metaHandler(changed),
+      http.get("*/api/v1/experiments/capabilities", () =>
+        HttpResponse.json({ data: { available: false }, serving: changed.serving }),
+      ),
+    );
     act(() => queryClient.setQueryData(META_QUERY_KEY, changed));
     expect(await screen.findByRole("status", { name: "正在加载实验记录" })).toBeVisible();
     expect(screen.queryByRole("table", { name: "实验记录" })).not.toBeInTheDocument();

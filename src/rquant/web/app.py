@@ -28,7 +28,7 @@ from rquant.screen.dynamic_rsi import VerifiedDynamicRsiProjection
 from rquant.screen.formula_history_projection import VerifiedFormulaHistoryProjection
 from rquant.screen.replica_source import VerifiedReplicaScreenSource
 from rquant.unit_log_service import UnitLogClient
-from rquant.web import portfolio_backtest_routes
+from rquant.web import portfolio_backtest_routes, experiment_platform_routes
 from rquant.web.alert_ack_gateway import AckLookupGateway, AckLookupTransport
 from rquant.web.backfill_plan_command_gateway import (
     BackfillPlanCommandGateway,
@@ -100,6 +100,7 @@ if TYPE_CHECKING:
     from rquant.research_query.service import QueryPrivateClient
     from rquant.watchlist_admission import WatchlistAdmissionClient
     from rquant.web.portfolio_backtest_service import PortfolioWebService
+    from rquant.web.experiment_platform_service import ExperimentWebService
 
 API_TITLE = "rQuant Web API"
 #: Version of the HTTP contract, bumped by hand; not the package version, so that a
@@ -123,6 +124,7 @@ _WRITE_BODY_LIMITS = {
     "/api/v1/research/queries/resume": research_query.MAX_REQUEST_BYTES,
     "/api/v1/backtests/portfolio/runs": portfolio_backtest_routes.MAX_RUN_REQUEST_BYTES,
     "/api/v1/backtests/portfolio/exports": portfolio_backtest_routes.MAX_EXPORT_REQUEST_BYTES,
+    "/api/v1/experiments/commands": experiment_platform_routes.MAX_REQUEST_BYTES,
 }
 _FACTOR_ARCHIVE_WRITE = re.compile(
     r"^/api/v1/factors/definitions/[a-z][a-z0-9_]{0,63}/archive(?:/resume)?$"
@@ -165,6 +167,7 @@ class WebContext:
     research_query_client: QueryPrivateClient | None
     research_query_save_client: QueryPrivateClient | None
     portfolio_backtests: PortfolioWebService | None
+    experiment_platform: ExperimentWebService | None
 
 
 def create_app(
@@ -191,6 +194,7 @@ def create_app(
     research_query_client: QueryPrivateClient | None = None,
     research_query_save_client: QueryPrivateClient | None = None,
     portfolio_backtests: PortfolioWebService | None = None,
+    experiment_platform: ExperimentWebService | None = None,
 ) -> FastAPI:
     """Build the app. Nothing is opened until the first request or startup."""
 
@@ -387,6 +391,7 @@ def create_app(
             transport=formula_market_command_transport,
         ),
         portfolio_backtests=portfolio_backtests,
+        experiment_platform=experiment_platform,
         lab_controls=LabControlGateway(
             endpoint=settings.page_control_url,
             transport=lab_control_command_transport,
@@ -515,6 +520,7 @@ def create_app(
     app.include_router(
         experiments.router, prefix="/api/v1", tags=["experiments"], dependencies=private
     )
+    app.include_router(experiment_platform_routes.router, prefix="/api/v1", tags=["experiments"])
     app.include_router(
         strategies.router, prefix="/api/v1", tags=["strategies"], dependencies=private
     )

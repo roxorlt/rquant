@@ -56,6 +56,7 @@ from rquant.strict_json import canonical_json_bytes
 
 if TYPE_CHECKING:
     from rquant.config import Settings
+    from rquant.experiment_platform_commands import ExperimentPageControlBackend
 
 PRODUCTION_CANVAS_SIGNER_COMMAND = (
     "/usr/bin/sudo",
@@ -139,6 +140,7 @@ def build_page_control_service(
     log_dir: Path | None = None,
     allowed_lab_export_roots: tuple[Path, ...] | None = None,
     lab_backend: LabPageControlBackend | None = None,
+    experiment_backend: ExperimentPageControlBackend | None = None,
     backfill_plan_backend: BackfillPlanPageControlBackend | None = None,
     data_audit_report_backend: DataAuditReportPageControlBackend | None = None,
     formula_market_backend: FormulaMarketPageControlBackend | None = None,
@@ -158,6 +160,7 @@ def build_page_control_service(
         log_dir=log_dir,
         allowed_lab_export_roots=allowed_lab_export_roots,
         lab_backend=lab_backend,
+        experiment_backend=experiment_backend,
         backfill_plan_backend=backfill_plan_backend,
         data_audit_report_backend=data_audit_report_backend,
         formula_market_backend=formula_market_backend,
@@ -180,6 +183,7 @@ def build_page_control_service_with_dependencies(
     log_dir: Path | None = None,
     allowed_lab_export_roots: tuple[Path, ...] | None = None,
     lab_backend: LabPageControlBackend | None = None,
+    experiment_backend: ExperimentPageControlBackend | None = None,
     backfill_plan_backend: BackfillPlanPageControlBackend | None = None,
     data_audit_report_backend: DataAuditReportPageControlBackend | None = None,
     formula_market_backend: FormulaMarketPageControlBackend | None = None,
@@ -226,6 +230,7 @@ def build_page_control_service_with_dependencies(
                 else _build_lab_backend()
             ),
             backfill_plan_backend=backfill_plan_backend,
+            experiment_backend=experiment_backend,
             data_audit_report_backend=data_audit_report_backend,
             formula_market_backend=formula_market_backend,
             formula_pool_backend=formula_pool_backend,

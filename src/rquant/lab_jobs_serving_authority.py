@@ -829,7 +829,9 @@ class LabJobsServingSourceReader:
 
     def __call__(self, observed_at: datetime, /) -> SourceReadResult:
         observed = normalize_aware_utc(observed_at)
-        first = self.reader.list_published_jobs_with_events(limit=self.max_jobs)
+        from rquant.experiment_platform_projection import legacy_job_snapshot
+
+        first = legacy_job_snapshot(self.reader, limit=self.max_jobs)
         first_page = first.page
         self._validate_summaries(first_page, observed_at=observed)
 
@@ -865,7 +867,7 @@ class LabJobsServingSourceReader:
         )
         projections = (*base_projections, *factor_result_projections)
 
-        second = self.reader.list_published_jobs_with_events(limit=self.max_jobs)
+        second = legacy_job_snapshot(self.reader, limit=self.max_jobs)
         second_page = second.page
         if second.page != first.page:
             raise LabJobsServingAuthorityIntegrityError(

@@ -406,6 +406,8 @@ def promotions_publisher_builder(
     open_artifact_terminal_lifecycle: (
         Callable[[], ProductionArtifactTerminalLifecycle] | None
     ) = None,
+    private_experiment_reader: Callable[[datetime], tuple[ServingProjectionPayload, ...]]
+    | None = None,
 ) -> RuntimeServiceBuilder:
     def build(manifest: RuntimeServiceManifest) -> RuntimeServiceStep:
         if manifest.service_kind is not RuntimeServiceKind.PROMOTIONS_PUBLISHER:
@@ -429,6 +431,7 @@ def promotions_publisher_builder(
                 registry=experiment_registry_reader,
                 limit=settings.max_decisions,
                 include_experiments=True,
+                private_experiment_reader=private_experiment_reader,
             )
             publisher = ServingSourceAuthorityPublisher(
                 root=settings.authority_root,

@@ -21,6 +21,7 @@ from rquant.portfolio_backtest_artifact import (
     PortfolioResultReader,
     PortfolioViewReadResult,
     PortfolioZipExportFacade,
+    is_private_portfolio_job,
 )
 from rquant.portfolio_backtest_models import PortfolioBacktestConfig
 from rquant.runtime_contracts import RuntimeContractModel
@@ -186,6 +187,8 @@ class PortfolioWebService:
         context = self.reader.get_command_context(job_id)
         if context is None or context.job.spec.parameters.strategy_name != "portfolio_backtest":
             raise LookupError("找不到这次组合回测。")
+        if is_private_portfolio_job(context.job):
+            raise LookupError("找不到这次组合回测。")
         job, availability = context.job, context.availability
         authority = self.reader.get_artifact_preview_authority(job_id)
         status: Literal[
@@ -228,8 +231,13 @@ class PortfolioWebService:
         )
 
     def jobs(self, *, limit: int, cursor: str | None) -> PortfolioJobsData:
-        page = self.reader.list_jobs(
-            filters=LabJobListFilters(keyword="portfolio_backtest"), limit=limit, cursor=cursor
+        from rquant.experiment_platform_projection import legacy_job_page
+
+        page = legacy_job_page(
+            self.reader,
+            filters=LabJobListFilters(keyword="portfolio_backtest"),
+            limit=limit,
+            cursor=cursor,
         )
         jobs = tuple(
             self.job(item.job_id, progress=item.progress.fraction)
@@ -295,6 +303,7 @@ class PortfolioWebService:
     def _view(
         self, job_id: UUID, name: str, result_hash: str, offset: int, limit: int
     ) -> PortfolioViewReadResult:
+        self.job(job_id)
         self.results.read(job_id, expected_result_hash=result_hash)
         return self.results.read_view(
             job_id,
