@@ -1,0 +1,71 @@
+.price-rule-actions,
+.price-rule-footer,
+.price-rule-intent {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.price-rule-footer {
+  justify-content: flex-end;
+}
+.price-rule-form {
+  display: grid;
+  gap: 18px;
+}
+.price-rule-pair {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 12px;
+}
+.price-rule-form .inp {
+  width: 100%;
+  min-width: 0;
+}
+.price-rule-intent {
+  flex-wrap: wrap;
+  color: var(--muted);
+}
+.price-rule-intent > :first-child {
+  margin-right: auto;
+}
+.price-rule-note {
+  margin: 12px 0 0;
+}
+.price-rule-operations {
+  display: grid;
+  gap: 8px;
+  list-style: none;
+  padding: 12px 0 0;
+  margin: 0;
+}
+.price-rule-operations li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+}
+.price-rule-operations li > :first-child {
+  overflow-wrap: anywhere;
+}
+.price-rule-operations [role="status"] {
+  color: var(--muted);
+  font-size: 12px;
+}
+@media (max-width: 760px) {
+  .price-rule-table .tbl {
+    min-width: 0;
+  }
+  .price-rule-table .tbl th,
+  .price-rule-table .tbl td {
+    padding: 8px 5px;
+  }
+  .price-rule-table .price-rule-actions {
+    gap: 0;
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .price-rule-table .price-rule-actions .btn {
+    min-height: 32px;
+    padding: 2px 6px;
+  }
+}

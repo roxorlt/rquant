@@ -75,6 +75,7 @@ from rquant.web.routes import (
     paper,
     pool_editor,
     pools,
+    price_alert_rules,
     research_query,
     screen,
     service_logs,
@@ -94,6 +95,7 @@ if TYPE_CHECKING:
     from rquant.factor_definition_admission import FactorDefinitionAdmissionClient
     from rquant.factor_run_admission import FactorRunAdmissionClient
     from rquant.factor_tracking_admission import FactorTrackingAdmissionClient
+    from rquant.price_alert_admission import PriceAlertAdmissionClient
     from rquant.research_query.service import QueryPrivateClient
     from rquant.watchlist_admission import WatchlistAdmissionClient
 
@@ -107,6 +109,8 @@ _WRITE_BODY_LIMITS = {
     "/api/v1/pools/editor/nl-preview": pool_editor.MAX_NL_REQUEST_BYTES,
     "/api/v1/monitor/ack": monitor.MAX_ACK_REQUEST_BYTES,
     "/api/v1/watchlist/commands": manual_watchlist.MAX_COMMAND_REQUEST_BYTES,
+    "/api/v1/monitor/price-rules/commands": price_alert_rules.MAX_COMMAND_REQUEST_BYTES,
+    "/api/v1/monitor/price-rules/commands/resume": price_alert_rules.MAX_COMMAND_REQUEST_BYTES,
     "/api/v1/data/backfill-plans/commands": backfill_plan_commands.MAX_REQUEST_BYTES,
     "/api/v1/data/audit-report/commands": data_audit_report_commands.MAX_REQUEST_BYTES,
     "/api/v1/screen/tdx/market/commands": formula_market_commands.MAX_REQUEST_BYTES,
@@ -143,6 +147,7 @@ class WebContext:
     ack_lookup: AckLookupGateway
     ack_admission: AckAdmissionClient | None
     watchlist_admission: WatchlistAdmissionClient | None
+    price_alert_admission: PriceAlertAdmissionClient | None
     factor_admission: FactorDefinitionAdmissionClient | None
     factor_run_admission: FactorRunAdmissionClient | None
     factor_tracking_admission: FactorTrackingAdmissionClient | None
@@ -168,6 +173,7 @@ def create_app(
     ack_lookup_transport: AckLookupTransport | None = None,
     ack_admission_client: AckAdmissionClient | None = None,
     watchlist_admission_client: WatchlistAdmissionClient | None = None,
+    price_alert_admission_client: PriceAlertAdmissionClient | None = None,
     factor_admission_client: FactorDefinitionAdmissionClient | None = None,
     factor_run_admission_client: FactorRunAdmissionClient | None = None,
     factor_tracking_admission_client: FactorTrackingAdmissionClient | None = None,
@@ -259,6 +265,18 @@ def create_app(
             if watchlist_admission_client is not None
             else WatchlistAdmissionClient(settings.watchlist_admission_socket_path)
         )
+    configured_price_alert_admission = None
+    if settings.price_alert_admission_socket_path is not None:
+        from rquant.price_alert_admission import PriceAlertAdmissionClient
+
+        configured_price_alert_admission = (
+            price_alert_admission_client
+            or PriceAlertAdmissionClient(
+                settings.price_alert_admission_socket_path,
+                expected_service_uid=settings.price_alert_admission_service_uid,
+                shared_gid=settings.price_alert_admission_shared_gid,
+            )
+        )
     configured_factor_admission = None
     if settings.factor_admission_socket_path is not None:
         from rquant.factor_definition_admission import FactorDefinitionAdmissionClient
@@ -343,6 +361,7 @@ def create_app(
         ),
         ack_admission=configured_ack_admission,
         watchlist_admission=configured_watchlist_admission,
+        price_alert_admission=configured_price_alert_admission,
         factor_admission=configured_factor_admission,
         factor_run_admission=configured_factor_run,
         factor_tracking_admission=configured_factor_tracking,
@@ -472,6 +491,7 @@ def create_app(
     app.include_router(paper.router, prefix="/api/v1", tags=["paper"], dependencies=private)
     app.include_router(monitor.router, prefix="/api/v1", tags=["monitor"], dependencies=private)
     app.include_router(manual_watchlist.router, prefix="/api/v1", tags=["watchlist"])
+    app.include_router(price_alert_rules.router, prefix="/api/v1", tags=["monitor"])
     app.include_router(tasks.router, prefix="/api/v1", tags=["tasks"], dependencies=private)
     app.include_router(
         tasks_controls.router, prefix="/api/v1", tags=["tasks"], dependencies=private
