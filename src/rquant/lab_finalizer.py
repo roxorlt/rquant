@@ -10,7 +10,7 @@ import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO, Literal, TypeVar
+from typing import TYPE_CHECKING, BinaryIO, Literal, TypeVar
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 import pandas as pd
@@ -76,6 +76,8 @@ from rquant.strategy_job_adapters import (
     default_strategy_job_adapter_registry,
 )
 from rquant.strict_json import canonical_json_bytes, strict_model_validate_canonical_json
+if TYPE_CHECKING:
+    from rquant.strategy_template_runtime import StrategyTemplateRuntimeDirectory
 
 
 class LabFinalizationError(RuntimeError):
@@ -1374,6 +1376,7 @@ class LabFinalizer:
             LabFinalizerAuthorityVerificationKeyProvider | None
         ) = None,
         adapter_registry: StrategyJobAdapterRegistry | None = None,
+        template_directory: StrategyTemplateRuntimeDirectory | None = None,
         bundle_limits: LabShardBundleLimits | None = None,
         job_limits: LabFinalizerJobLimits | None = None,
         result_digest_policy: LabResultDigestPolicy | None = None,
@@ -1409,6 +1412,8 @@ class LabFinalizer:
                 finalizer_authority_verification_key_provider
             )
         self.adapter_registry = adapter_registry or default_strategy_job_adapter_registry()
+        from rquant.strategy_template_runtime import require_template_runtime_directory
+        self.template_directory = require_template_runtime_directory(template_directory)
 
     @classmethod
     def for_formal_runtime(
@@ -2252,7 +2257,8 @@ class LabFinalizer:
                 maximum=self.job_limits.max_peak_resident_bytes,
                 label="aggregate preflight peak resident bytes",
             )
-            result = self.adapter_registry.aggregate_results(snapshot.job.spec, shard_results)
+            registry = self.adapter_registry if self.template_directory is None else self.template_directory.registry_for_spec(snapshot.job.spec)
+            result = registry.aggregate_results(snapshot.job.spec, shard_results)
         except (LabFinalizationIntegrityError, BaseExceptionGroup):
             raise
         except Exception as exc:

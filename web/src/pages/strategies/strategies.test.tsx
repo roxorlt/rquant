@@ -9,6 +9,29 @@ import { metaHandler, server } from "@/test/server";
 
 const firstGeneration = metaEnvelope().serving.generation_id ?? "a".repeat(64);
 const nextGeneration = "b".repeat(64);
+beforeEach(() => {
+  server.use(
+    http.get("*/api/v1/strategy-templates", () =>
+      HttpResponse.json({
+        data: { availability: "unavailable", available_at: null, templates: [], can_create: false },
+        serving: metaEnvelope().serving,
+      }),
+    ),
+    http.get("*/api/v1/strategy-templates/sources", () =>
+      HttpResponse.json({
+        data: {
+          availability: "unavailable",
+          pools: [],
+          signals: [],
+          conditions: [],
+          comparison_fields: [],
+          can_create: false,
+        },
+        serving: metaEnvelope().serving,
+      }),
+    ),
+  );
+});
 const strategies: Schemas["StrategyCatalogItem"][] = [
   {
     strategy_id: "auction_gap",

@@ -199,6 +199,49 @@
         "title": "AlertAcknowledgmentView",
         "type": "object"
       },
+      "ArchiveStrategyTemplate": {
+        "additionalProperties": false,
+        "properties": {
+          "command_id": {
+            "title": "Command Id",
+            "type": "string"
+          },
+          "expected_head": {
+            "$ref": "#/components/schemas/StrategyTemplateHead"
+          },
+          "generation_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Generation Id",
+            "type": "string"
+          },
+          "kind": {
+            "const": "archive_strategy_template",
+            "default": "archive_strategy_template",
+            "title": "Kind",
+            "type": "string"
+          },
+          "requested_at": {
+            "format": "date-time",
+            "title": "Requested At",
+            "type": "string"
+          },
+          "strategy_id": {
+            "pattern": "^template_[0-9a-f]{32}$",
+            "title": "Strategy Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "command_id",
+          "requested_at",
+          "generation_id",
+          "strategy_id",
+          "expected_head"
+        ],
+        "title": "ArchiveStrategyTemplate",
+        "type": "object"
+      },
       "Assignment": {
         "additionalProperties": false,
         "properties": {
@@ -3915,6 +3958,31 @@
         "title": "ClosedDayRows",
         "type": "object"
       },
+      "ConditionTemplateEntry": {
+        "additionalProperties": false,
+        "properties": {
+          "conditions": {
+            "items": {
+              "$ref": "#/components/schemas/TemplateCondition"
+            },
+            "maxItems": 26,
+            "minItems": 1,
+            "title": "Conditions",
+            "type": "array"
+          },
+          "kind": {
+            "const": "conditions",
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "conditions"
+        ],
+        "title": "ConditionTemplateEntry",
+        "type": "object"
+      },
       "CorrelationResult": {
         "additionalProperties": false,
         "description": "One cross-sectional correlation, including an explicit unavailable state.",
@@ -5957,6 +6025,102 @@
           "serving"
         ],
         "title": "Envelope[StrategyCatalogData]",
+        "type": "object"
+      },
+      "Envelope_StrategyTemplateCatalogData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/StrategyTemplateCatalogData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[StrategyTemplateCatalogData]",
+        "type": "object"
+      },
+      "Envelope_StrategyTemplateCommandData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/StrategyTemplateCommandData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[StrategyTemplateCommandData]",
+        "type": "object"
+      },
+      "Envelope_StrategyTemplateDetailData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/StrategyTemplateDetailData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[StrategyTemplateDetailData]",
+        "type": "object"
+      },
+      "Envelope_StrategyTemplateRunCommandData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/StrategyTemplateRunCommandData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[StrategyTemplateRunCommandData]",
+        "type": "object"
+      },
+      "Envelope_StrategyTemplateSourcesData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/StrategyTemplateSourcesData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[StrategyTemplateSourcesData]",
+        "type": "object"
+      },
+      "Envelope_StrategyTemplateVersionsData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/StrategyTemplateVersionsData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[StrategyTemplateVersionsData]",
         "type": "object"
       },
       "Envelope_SurgeData_": {
@@ -16398,6 +16562,39 @@
         "title": "PoolStep",
         "type": "object"
       },
+      "PoolTemplateEntry": {
+        "additionalProperties": false,
+        "properties": {
+          "body_hash": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Body Hash",
+            "type": "string"
+          },
+          "kind": {
+            "const": "pool",
+            "title": "Kind",
+            "type": "string"
+          },
+          "pool_key": {
+            "pattern": "^[a-zA-Z0-9_./:-]{1,128}$",
+            "title": "Pool Key",
+            "type": "string"
+          },
+          "version": {
+            "minimum": 1.0,
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "kind",
+          "pool_key",
+          "version",
+          "body_hash"
+        ],
+        "title": "PoolTemplateEntry",
+        "type": "object"
+      },
       "PoolsData": {
         "properties": {
           "canvases": {
@@ -20277,6 +20474,80 @@
         "title": "RoundTripStats",
         "type": "object"
       },
+      "RunStrategyTemplate": {
+        "additionalProperties": false,
+        "properties": {
+          "command_id": {
+            "title": "Command Id",
+            "type": "string"
+          },
+          "end_date": {
+            "format": "date",
+            "title": "End Date",
+            "type": "string"
+          },
+          "expected_head": {
+            "$ref": "#/components/schemas/StrategyTemplateHead"
+          },
+          "generation_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Generation Id",
+            "type": "string"
+          },
+          "head": {
+            "$ref": "#/components/schemas/StrategyTemplateHead"
+          },
+          "initial_cash": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "maximum": 1000000000000.0,
+                "type": "number"
+              },
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              }
+            ],
+            "title": "Initial Cash"
+          },
+          "kind": {
+            "const": "run_strategy_template",
+            "default": "run_strategy_template",
+            "title": "Kind",
+            "type": "string"
+          },
+          "requested_at": {
+            "format": "date-time",
+            "title": "Requested At",
+            "type": "string"
+          },
+          "start_date": {
+            "format": "date",
+            "title": "Start Date",
+            "type": "string"
+          },
+          "strategy_id": {
+            "pattern": "^template_[0-9a-f]{32}$",
+            "title": "Strategy Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "command_id",
+          "requested_at",
+          "generation_id",
+          "strategy_id",
+          "head",
+          "expected_head",
+          "start_date",
+          "end_date",
+          "initial_cash"
+        ],
+        "title": "RunStrategyTemplate",
+        "type": "object"
+      },
       "RuntimeServiceItem": {
         "properties": {
           "heartbeat_at": {
@@ -20650,6 +20921,78 @@
           "sql"
         ],
         "title": "SaveResearchQuery",
+        "type": "object"
+      },
+      "SaveStrategyTemplate": {
+        "additionalProperties": false,
+        "properties": {
+          "change_note": {
+            "default": "",
+            "maxLength": 1024,
+            "title": "Change Note",
+            "type": "string"
+          },
+          "command_id": {
+            "title": "Command Id",
+            "type": "string"
+          },
+          "expected_head": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StrategyTemplateHead"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "generation_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Generation Id",
+            "type": "string"
+          },
+          "kind": {
+            "const": "save_strategy_template",
+            "default": "save_strategy_template",
+            "title": "Kind",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "requested_at": {
+            "format": "date-time",
+            "title": "Requested At",
+            "type": "string"
+          },
+          "rules": {
+            "$ref": "#/components/schemas/StrategyTemplate-Input"
+          },
+          "strategy_id": {
+            "anyOf": [
+              {
+                "pattern": "^template_[0-9a-f]{32}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Strategy Id"
+          }
+        },
+        "required": [
+          "command_id",
+          "requested_at",
+          "generation_id",
+          "name",
+          "rules"
+        ],
+        "title": "SaveStrategyTemplate",
         "type": "object"
       },
       "SavedCanvas": {
@@ -21847,6 +22190,52 @@
         "title": "SignalItem",
         "type": "object"
       },
+      "SignalTemplateEntry": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "enum": [
+              "watch",
+              "b_intent",
+              "b_confirm",
+              "reduce",
+              "s_intent",
+              "s_confirm"
+            ],
+            "title": "Action",
+            "type": "string"
+          },
+          "kind": {
+            "const": "signal",
+            "title": "Kind",
+            "type": "string"
+          },
+          "source_hash": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Source Hash",
+            "type": "string"
+          },
+          "strategy_id": {
+            "pattern": "^[a-z][a-z0-9_]{0,63}$",
+            "title": "Strategy Id",
+            "type": "string"
+          },
+          "version": {
+            "minimum": 1.0,
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "kind",
+          "strategy_id",
+          "version",
+          "action",
+          "source_hash"
+        ],
+        "title": "SignalTemplateEntry",
+        "type": "object"
+      },
       "SignalsSummary": {
         "properties": {
           "by_action": {
@@ -22147,6 +22536,668 @@
           "display_value"
         ],
         "title": "StrategyParameter",
+        "type": "object"
+      },
+      "StrategyTemplate-Input": {
+        "additionalProperties": false,
+        "properties": {
+          "entry": {
+            "discriminator": {
+              "mapping": {
+                "conditions": "#/components/schemas/ConditionTemplateEntry",
+                "pool": "#/components/schemas/PoolTemplateEntry",
+                "signal": "#/components/schemas/SignalTemplateEntry"
+              },
+              "propertyName": "kind"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/PoolTemplateEntry"
+              },
+              {
+                "$ref": "#/components/schemas/ConditionTemplateEntry"
+              },
+              {
+                "$ref": "#/components/schemas/SignalTemplateEntry"
+              }
+            ],
+            "title": "Entry"
+          },
+          "exit": {
+            "$ref": "#/components/schemas/TemplateExitRules-Input"
+          },
+          "index_filter": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TemplateIndexFilter"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "rebalance_rule": {
+            "$ref": "#/components/schemas/RebalanceRule"
+          },
+          "template_contract": {
+            "const": "strategy-template/v1",
+            "default": "strategy-template/v1",
+            "title": "Template Contract",
+            "type": "string"
+          },
+          "weight_rule": {
+            "$ref": "#/components/schemas/PortfolioWeightRule-Input"
+          }
+        },
+        "required": [
+          "entry",
+          "weight_rule",
+          "rebalance_rule"
+        ],
+        "title": "StrategyTemplate",
+        "type": "object"
+      },
+      "StrategyTemplate-Output": {
+        "additionalProperties": false,
+        "properties": {
+          "entry": {
+            "discriminator": {
+              "mapping": {
+                "conditions": "#/components/schemas/ConditionTemplateEntry",
+                "pool": "#/components/schemas/PoolTemplateEntry",
+                "signal": "#/components/schemas/SignalTemplateEntry"
+              },
+              "propertyName": "kind"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/PoolTemplateEntry"
+              },
+              {
+                "$ref": "#/components/schemas/ConditionTemplateEntry"
+              },
+              {
+                "$ref": "#/components/schemas/SignalTemplateEntry"
+              }
+            ],
+            "title": "Entry"
+          },
+          "exit": {
+            "$ref": "#/components/schemas/TemplateExitRules-Output"
+          },
+          "index_filter": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TemplateIndexFilter"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "rebalance_rule": {
+            "$ref": "#/components/schemas/RebalanceRule"
+          },
+          "template_contract": {
+            "const": "strategy-template/v1",
+            "default": "strategy-template/v1",
+            "title": "Template Contract",
+            "type": "string"
+          },
+          "weight_rule": {
+            "$ref": "#/components/schemas/PortfolioWeightRule-Output"
+          }
+        },
+        "required": [
+          "entry",
+          "weight_rule",
+          "rebalance_rule"
+        ],
+        "title": "StrategyTemplate",
+        "type": "object"
+      },
+      "StrategyTemplateCatalogData": {
+        "additionalProperties": false,
+        "properties": {
+          "availability": {
+            "enum": [
+              "unavailable",
+              "empty",
+              "populated"
+            ],
+            "title": "Availability",
+            "type": "string"
+          },
+          "available_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Available At"
+          },
+          "can_create": {
+            "default": false,
+            "title": "Can Create",
+            "type": "boolean"
+          },
+          "templates": {
+            "items": {
+              "$ref": "#/components/schemas/StrategyTemplateItem"
+            },
+            "maxItems": 500,
+            "title": "Templates",
+            "type": "array"
+          }
+        },
+        "required": [
+          "availability",
+          "available_at",
+          "templates"
+        ],
+        "title": "StrategyTemplateCatalogData",
+        "type": "object"
+      },
+      "StrategyTemplateCommandData": {
+        "additionalProperties": false,
+        "properties": {
+          "command_id": {
+            "format": "uuid",
+            "title": "Command Id",
+            "type": "string"
+          },
+          "current_head_updated": {
+            "default": false,
+            "title": "Current Head Updated",
+            "type": "boolean"
+          },
+          "head": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StrategyTemplateHead"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "rejected",
+              "pending",
+              "succeeded_waiting_publication",
+              "published",
+              "uncertain"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "strategy_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Strategy Id"
+          }
+        },
+        "required": [
+          "command_id",
+          "status",
+          "message"
+        ],
+        "title": "StrategyTemplateCommandData",
+        "type": "object"
+      },
+      "StrategyTemplateConditionChoice": {
+        "additionalProperties": false,
+        "properties": {
+          "block": {
+            "$ref": "#/components/schemas/ScreenBlock"
+          },
+          "key": {
+            "title": "Key",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "parameter_schema": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/JsonValue"
+            },
+            "title": "Parameter Schema",
+            "type": "object"
+          }
+        },
+        "required": [
+          "key",
+          "label",
+          "block",
+          "parameter_schema"
+        ],
+        "title": "StrategyTemplateConditionChoice",
+        "type": "object"
+      },
+      "StrategyTemplateDetailData": {
+        "additionalProperties": false,
+        "properties": {
+          "archived": {
+            "title": "Archived",
+            "type": "boolean"
+          },
+          "can_archive": {
+            "default": false,
+            "title": "Can Archive",
+            "type": "boolean"
+          },
+          "can_run": {
+            "default": false,
+            "title": "Can Run",
+            "type": "boolean"
+          },
+          "can_save": {
+            "default": false,
+            "title": "Can Save",
+            "type": "boolean"
+          },
+          "change_note": {
+            "title": "Change Note",
+            "type": "string"
+          },
+          "current_head": {
+            "$ref": "#/components/schemas/StrategyTemplateHead"
+          },
+          "head": {
+            "$ref": "#/components/schemas/StrategyTemplateHead"
+          },
+          "latest_run": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StrategyTemplateRecentRun"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "rules": {
+            "$ref": "#/components/schemas/StrategyTemplate-Output"
+          },
+          "saved_at": {
+            "format": "date-time",
+            "title": "Saved At",
+            "type": "string"
+          },
+          "strategy_id": {
+            "title": "Strategy Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "strategy_id",
+          "name",
+          "head",
+          "current_head",
+          "rules",
+          "saved_at",
+          "change_note",
+          "archived"
+        ],
+        "title": "StrategyTemplateDetailData",
+        "type": "object"
+      },
+      "StrategyTemplateHead": {
+        "additionalProperties": false,
+        "properties": {
+          "record_hash": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Record Hash",
+            "type": "string"
+          },
+          "registration_fingerprint": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Registration Fingerprint",
+            "type": "string"
+          },
+          "spec_fingerprint": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Spec Fingerprint",
+            "type": "string"
+          },
+          "version": {
+            "minimum": 1.0,
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "version",
+          "registration_fingerprint",
+          "record_hash",
+          "spec_fingerprint"
+        ],
+        "title": "StrategyTemplateHead",
+        "type": "object"
+      },
+      "StrategyTemplateItem": {
+        "additionalProperties": false,
+        "properties": {
+          "archived": {
+            "title": "Archived",
+            "type": "boolean"
+          },
+          "entry_kind": {
+            "enum": [
+              "pool",
+              "conditions",
+              "signal"
+            ],
+            "title": "Entry Kind",
+            "type": "string"
+          },
+          "head": {
+            "$ref": "#/components/schemas/StrategyTemplateHead"
+          },
+          "latest_run": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StrategyTemplateRecentRun"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "phase": {
+            "enum": [
+              "未评估",
+              "已有回测"
+            ],
+            "title": "Phase",
+            "type": "string"
+          },
+          "saved_at": {
+            "format": "date-time",
+            "title": "Saved At",
+            "type": "string"
+          },
+          "strategy_id": {
+            "title": "Strategy Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "strategy_id",
+          "name",
+          "head",
+          "saved_at",
+          "entry_kind",
+          "archived",
+          "phase"
+        ],
+        "title": "StrategyTemplateItem",
+        "type": "object"
+      },
+      "StrategyTemplateRecentRun": {
+        "additionalProperties": false,
+        "properties": {
+          "complete_result_hash": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Complete Result Hash",
+            "type": "string"
+          },
+          "completed_at": {
+            "format": "date-time",
+            "title": "Completed At",
+            "type": "string"
+          },
+          "head": {
+            "$ref": "#/components/schemas/StrategyTemplateHead"
+          },
+          "input_hash": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Input Hash",
+            "type": "string"
+          },
+          "job_id": {
+            "format": "uuid",
+            "title": "Job Id",
+            "type": "string"
+          },
+          "manifest_hash": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Manifest Hash",
+            "type": "string"
+          },
+          "owner_id": {
+            "title": "Owner Id",
+            "type": "string"
+          },
+          "result_hash": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Result Hash",
+            "type": "string"
+          },
+          "spec_hash": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Spec Hash",
+            "type": "string"
+          },
+          "strategy_id": {
+            "title": "Strategy Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "job_id",
+          "owner_id",
+          "strategy_id",
+          "head",
+          "input_hash",
+          "result_hash",
+          "spec_hash",
+          "manifest_hash",
+          "complete_result_hash",
+          "completed_at"
+        ],
+        "title": "StrategyTemplateRecentRun",
+        "type": "object"
+      },
+      "StrategyTemplateRunCommandData": {
+        "additionalProperties": false,
+        "properties": {
+          "command_id": {
+            "format": "uuid",
+            "title": "Command Id",
+            "type": "string"
+          },
+          "job_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Job Id"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "rejected",
+              "pending",
+              "submitted",
+              "uncertain"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "command_id",
+          "status",
+          "message"
+        ],
+        "title": "StrategyTemplateRunCommandData",
+        "type": "object"
+      },
+      "StrategyTemplateSourcesData": {
+        "additionalProperties": false,
+        "properties": {
+          "availability": {
+            "enum": [
+              "unavailable",
+              "empty",
+              "populated"
+            ],
+            "title": "Availability",
+            "type": "string"
+          },
+          "can_create": {
+            "default": false,
+            "title": "Can Create",
+            "type": "boolean"
+          },
+          "comparison_fields": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Comparison Fields",
+            "type": "array"
+          },
+          "conditions": {
+            "items": {
+              "$ref": "#/components/schemas/StrategyTemplateConditionChoice"
+            },
+            "title": "Conditions",
+            "type": "array"
+          },
+          "pools": {
+            "items": {
+              "$ref": "#/components/schemas/TemplatePoolReference"
+            },
+            "title": "Pools",
+            "type": "array"
+          },
+          "signals": {
+            "items": {
+              "$ref": "#/components/schemas/TemplateSignalReference"
+            },
+            "title": "Signals",
+            "type": "array"
+          }
+        },
+        "required": [
+          "availability",
+          "pools",
+          "signals",
+          "conditions",
+          "comparison_fields"
+        ],
+        "title": "StrategyTemplateSourcesData",
+        "type": "object"
+      },
+      "StrategyTemplateVersionItem": {
+        "additionalProperties": false,
+        "properties": {
+          "change_note": {
+            "title": "Change Note",
+            "type": "string"
+          },
+          "head": {
+            "$ref": "#/components/schemas/StrategyTemplateHead"
+          },
+          "is_head": {
+            "title": "Is Head",
+            "type": "boolean"
+          },
+          "latest_run": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StrategyTemplateRecentRun"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "saved_at": {
+            "format": "date-time",
+            "title": "Saved At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "head",
+          "saved_at",
+          "change_note",
+          "is_head"
+        ],
+        "title": "StrategyTemplateVersionItem",
+        "type": "object"
+      },
+      "StrategyTemplateVersionsData": {
+        "additionalProperties": false,
+        "properties": {
+          "current_head": {
+            "$ref": "#/components/schemas/StrategyTemplateHead"
+          },
+          "next_before_version": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Before Version"
+          },
+          "strategy_id": {
+            "title": "Strategy Id",
+            "type": "string"
+          },
+          "versions": {
+            "items": {
+              "$ref": "#/components/schemas/StrategyTemplateVersionItem"
+            },
+            "maxItems": 100,
+            "title": "Versions",
+            "type": "array"
+          }
+        },
+        "required": [
+          "strategy_id",
+          "current_head",
+          "versions"
+        ],
+        "title": "StrategyTemplateVersionsData",
         "type": "object"
       },
       "StreakSummary": {
@@ -22689,6 +23740,306 @@
           "source"
         ],
         "title": "TdxPreviewSourceData",
+        "type": "object"
+      },
+      "TemplateCondition": {
+        "additionalProperties": false,
+        "properties": {
+          "args": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/JsonValue"
+            },
+            "title": "Args",
+            "type": "object"
+          },
+          "key": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "key"
+        ],
+        "title": "TemplateCondition",
+        "type": "object"
+      },
+      "TemplateExitRules-Input": {
+        "additionalProperties": false,
+        "properties": {
+          "exit_time": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Exit Time"
+          },
+          "max_holding_days": {
+            "anyOf": [
+              {
+                "maximum": 2520.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Holding Days"
+          },
+          "stop_loss": {
+            "anyOf": [
+              {
+                "exclusiveMaximum": 1.0,
+                "exclusiveMinimum": 0.0,
+                "type": "number"
+              },
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stop Loss"
+          },
+          "take_profit": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "maximum": 10.0,
+                "type": "number"
+              },
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Take Profit"
+          },
+          "trailing_profit": {
+            "anyOf": [
+              {
+                "exclusiveMaximum": 1.0,
+                "exclusiveMinimum": 0.0,
+                "type": "number"
+              },
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trailing Profit"
+          }
+        },
+        "title": "TemplateExitRules",
+        "type": "object"
+      },
+      "TemplateExitRules-Output": {
+        "additionalProperties": false,
+        "properties": {
+          "exit_time": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Exit Time"
+          },
+          "max_holding_days": {
+            "anyOf": [
+              {
+                "maximum": 2520.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Holding Days"
+          },
+          "stop_loss": {
+            "anyOf": [
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stop Loss"
+          },
+          "take_profit": {
+            "anyOf": [
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Take Profit"
+          },
+          "trailing_profit": {
+            "anyOf": [
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trailing Profit"
+          }
+        },
+        "title": "TemplateExitRules",
+        "type": "object"
+      },
+      "TemplateIndexFilter": {
+        "additionalProperties": false,
+        "properties": {
+          "benchmark_code": {
+            "title": "Benchmark Code",
+            "type": "string"
+          },
+          "direction": {
+            "enum": [
+              "above",
+              "below"
+            ],
+            "title": "Direction",
+            "type": "string"
+          },
+          "ma_days": {
+            "maximum": 250.0,
+            "minimum": 1.0,
+            "title": "Ma Days",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "benchmark_code",
+          "ma_days",
+          "direction"
+        ],
+        "title": "TemplateIndexFilter",
+        "type": "object"
+      },
+      "TemplatePoolReference": {
+        "additionalProperties": false,
+        "properties": {
+          "body_hash": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Body Hash",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "owner_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Owner Id"
+          },
+          "pool_key": {
+            "title": "Pool Key",
+            "type": "string"
+          },
+          "version": {
+            "minimum": 1.0,
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "pool_key",
+          "version",
+          "body_hash",
+          "owner_id",
+          "name"
+        ],
+        "title": "TemplatePoolReference",
+        "type": "object"
+      },
+      "TemplateSignalReference": {
+        "additionalProperties": false,
+        "properties": {
+          "actions": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Actions",
+            "type": "array"
+          },
+          "name": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "owner_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Owner Id"
+          },
+          "source_hash": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Source Hash",
+            "type": "string"
+          },
+          "strategy_id": {
+            "title": "Strategy Id",
+            "type": "string"
+          },
+          "version": {
+            "minimum": 1.0,
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "strategy_id",
+          "version",
+          "source_hash",
+          "actions",
+          "owner_id",
+          "name"
+        ],
+        "title": "TemplateSignalReference",
         "type": "object"
       },
       "TradingDayGap": {
@@ -26692,6 +28043,492 @@
           }
         },
         "summary": "已核验策略定义",
+        "tags": [
+          "strategies"
+        ]
+      }
+    },
+    "/api/v1/strategy-templates": {
+      "get": {
+        "operationId": "templates_api_v1_strategy_templates_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "generation_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "pattern": "^[0-9a-f]{64}$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Generation Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_StrategyTemplateCatalogData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "我的策略模板",
+        "tags": [
+          "strategies"
+        ]
+      }
+    },
+    "/api/v1/strategy-templates/commands": {
+      "post": {
+        "operationId": "command_api_v1_strategy_templates_commands_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "discriminator": {
+                  "mapping": {
+                    "archive_strategy_template": "#/components/schemas/ArchiveStrategyTemplate",
+                    "save_strategy_template": "#/components/schemas/SaveStrategyTemplate"
+                  },
+                  "propertyName": "kind"
+                },
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/SaveStrategyTemplate"
+                  },
+                  {
+                    "$ref": "#/components/schemas/ArchiveStrategyTemplate"
+                  }
+                ],
+                "title": "Body"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_StrategyTemplateCommandData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "保存版本或归档策略",
+        "tags": [
+          "strategies"
+        ]
+      }
+    },
+    "/api/v1/strategy-templates/commands/resume": {
+      "post": {
+        "operationId": "resume_command_api_v1_strategy_templates_commands_resume_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "discriminator": {
+                  "mapping": {
+                    "archive_strategy_template": "#/components/schemas/ArchiveStrategyTemplate",
+                    "save_strategy_template": "#/components/schemas/SaveStrategyTemplate"
+                  },
+                  "propertyName": "kind"
+                },
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/SaveStrategyTemplate"
+                  },
+                  {
+                    "$ref": "#/components/schemas/ArchiveStrategyTemplate"
+                  }
+                ],
+                "title": "Body"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_StrategyTemplateCommandData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "续查原策略操作",
+        "tags": [
+          "strategies"
+        ]
+      }
+    },
+    "/api/v1/strategy-templates/sources": {
+      "get": {
+        "operationId": "sources_api_v1_strategy_templates_sources_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "generation_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "pattern": "^[0-9a-f]{64}$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Generation Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_StrategyTemplateSourcesData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "策略入场来源",
+        "tags": [
+          "strategies"
+        ]
+      }
+    },
+    "/api/v1/strategy-templates/{strategy_id}": {
+      "get": {
+        "operationId": "detail_api_v1_strategy_templates__strategy_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "strategy_id",
+            "required": true,
+            "schema": {
+              "pattern": "^template_[0-9a-f]{32}$",
+              "title": "Strategy Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "generation_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "pattern": "^[0-9a-f]{64}$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Generation Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "version",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 4096,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Version"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_StrategyTemplateDetailData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "策略规则与版本",
+        "tags": [
+          "strategies"
+        ]
+      }
+    },
+    "/api/v1/strategy-templates/{strategy_id}/runs": {
+      "post": {
+        "operationId": "run_command_api_v1_strategy_templates__strategy_id__runs_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "strategy_id",
+            "required": true,
+            "schema": {
+              "pattern": "^template_[0-9a-f]{32}$",
+              "title": "Strategy Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RunStrategyTemplate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_StrategyTemplateRunCommandData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "回测指定策略版本",
+        "tags": [
+          "strategies"
+        ]
+      }
+    },
+    "/api/v1/strategy-templates/{strategy_id}/runs/resume": {
+      "post": {
+        "operationId": "resume_run_command_api_v1_strategy_templates__strategy_id__runs_resume_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "strategy_id",
+            "required": true,
+            "schema": {
+              "pattern": "^template_[0-9a-f]{32}$",
+              "title": "Strategy Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RunStrategyTemplate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_StrategyTemplateRunCommandData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "续查原策略回测",
+        "tags": [
+          "strategies"
+        ]
+      }
+    },
+    "/api/v1/strategy-templates/{strategy_id}/versions": {
+      "get": {
+        "operationId": "versions_api_v1_strategy_templates__strategy_id__versions_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "strategy_id",
+            "required": true,
+            "schema": {
+              "pattern": "^template_[0-9a-f]{32}$",
+              "title": "Strategy Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "generation_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "pattern": "^[0-9a-f]{64}$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Generation Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "before_version",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 4097,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Before Version"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_StrategyTemplateVersionsData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "策略版本历史",
         "tags": [
           "strategies"
         ]

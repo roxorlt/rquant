@@ -8,7 +8,7 @@ from collections.abc import Callable
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Annotated, Literal, TypeAlias
+from typing import TYPE_CHECKING, Annotated, Literal, TypeAlias
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
@@ -63,6 +63,12 @@ from rquant.strategy_job_adapters import (
     NShapeOptimizeParameters,
     build_adapter_execution_contract,
     default_strategy_job_adapter_registry,
+)
+from rquant.strategy_template_adapter import (
+    StrategyTemplateAdapterCatalog,
+    StrategyTemplateRunInput,
+    strategy_template_adapter_registry,
+    template_adapter_id,
 )
 from rquant.strict_json import canonical_json_bytes
 
@@ -132,6 +138,7 @@ ResearchRunInput: TypeAlias = Annotated[
     | NShapeOptimizationRunInput
     | AuctionGapRunInput
     | GrowthBoardSurgeRunInput
+    | StrategyTemplateRunInput
     | PortfolioBacktestRunInput,
     Field(discriminator="kind"),
 ]
@@ -222,6 +229,13 @@ def _run_identity(
             "growth-board-surge",
             run_input.parameters,
         )
+    if isinstance(run_input, StrategyTemplateRunInput):
+        return (
+            run_input.parameters.strategy_id,
+            ResearchJobType.STRATEGY_REPLAY,
+            template_adapter_id(run_input.parameters.strategy_id),
+            run_input.parameters,
+        )
     if isinstance(run_input, PortfolioBacktestRunInput):
         return (
             "portfolio_backtest",
@@ -294,9 +308,18 @@ def _validate_run_input_bounds(run_input: ResearchRunInput) -> None:
             )
 
 
-def _preflight_research_plan(spec: ResearchRunSpec) -> None:
+def _preflight_research_plan(
+    spec: ResearchRunSpec,
+    *,
+    template_catalog: StrategyTemplateAdapterCatalog | None = None,
+) -> None:
     try:
-        definitions = default_strategy_job_adapter_registry().plan(spec)
+        registry = (
+            default_strategy_job_adapter_registry()
+            if template_catalog is None
+            else strategy_template_adapter_registry(template_catalog)
+        )
+        definitions = registry.plan(spec)
     except (OverflowError, TypeError, ValueError, ValidationError) as exc:
         raise ResearchJobSubmissionError("adapter_plan", str(exc)) from exc
     if len(definitions) > MAX_JOB_SHARDS:
@@ -343,6 +366,7 @@ def build_research_job_submission(
     max_attempts: int = 1,
     trusted_strategy_registration: StrategySpecRegistration | None = None,
     formal_experiment_plan: FormalExperimentPlan | None = None,
+    template_catalog: StrategyTemplateAdapterCatalog | None = None,
 ) -> ResearchJobSubmission:
     decision = ResearchGateDecision.model_validate(gate_decision)
     if not decision.allowed:
@@ -399,7 +423,7 @@ def build_research_job_submission(
         )
     except (TypeError, ValueError, ValidationError) as exc:
         raise ResearchJobSubmissionError("input_bounds", str(exc)) from exc
-    _preflight_research_plan(spec)
+    _preflight_research_plan(spec, template_catalog=template_catalog)
     command = SubmitJobCommand(
         job_id=job_id,
         spec=spec,
@@ -586,6 +610,10 @@ CommandSubmissionResult: TypeAlias = Annotated[
 ]
 
 
+if TYPE_CHECKING:
+    from rquant.strategy_template_runtime import StrategyTemplateRuntimeDirectory
+
+
 class LabCommandSubmissionFacade:
     """Read scheduler state and publish commands without opening a writable ledger."""
 
@@ -597,12 +625,16 @@ class LabCommandSubmissionFacade:
         experiment_registry: ExperimentRegistry | None = None,
         definition_registry: ImmutableDefinitionRegistry | None = None,
         clock: Callable[[], datetime] | None = None,
+        template_directory: StrategyTemplateRuntimeDirectory | None = None,
     ) -> None:
         self.reader = reader
         self.spool = spool
         self.experiment_registry = experiment_registry
         self.definition_registry = definition_registry
         self.clock = clock or (lambda: datetime.now(UTC))
+        from rquant.strategy_template_runtime import require_template_runtime_directory
+
+        self.template_directory = require_template_runtime_directory(template_directory)
 
     @staticmethod
     def _experiment_submission_intent(
@@ -674,11 +706,15 @@ class LabCommandSubmissionFacade:
             raise FormalSubmissionAuthorityError(
                 "formal plan receipts do not exactly match the research job"
             )
-        if self.definition_registry is None:
+        template_catalog = None if self.template_directory is None else self.template_directory.catalog_for_spec(command.spec)
+        definitions = self.definition_registry
+        if template_catalog is not None:
+            definitions = self.template_directory.store.definition_registry(execution.strategy_id)
+        if definitions is None:
             raise FormalSubmissionAuthorityError(
                 "v3 research submission requires an authoritative Definition Registry"
             )
-        registration = self.definition_registry.read_strategy_spec(
+        registration = definitions.read_strategy_spec(
             execution.strategy_definition_fingerprint,
             as_of=observed_at,
         )

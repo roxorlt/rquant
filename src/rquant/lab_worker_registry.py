@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from contextlib import ExitStack
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidatorFunctionWrapHandler, field_validator
 
 from rquant.lab_daemon import LabDaemonConfigurationError
 from rquant.research_gate import ResearchGateRequest, open_gated_research_store
@@ -16,6 +17,11 @@ from rquant.strategy_job_adapters import (
     LabShardExecutionResult,
     ValidatedStrategyShard,
     default_strategy_job_adapter_registry,
+    StrategyJobAdapterRegistry,
+)
+from rquant.strategy_template_adapter import (
+    StrategyTemplateAdapterCatalog,
+    strategy_template_adapter_registry,
 )
 from rquant.strict_json import canonical_json_bytes
 
@@ -30,6 +36,18 @@ class BuiltinLabShardRuntimeConfig(BaseModel):
     snapshot_root: Path | None = None
     research_lake_root: Path | None = None
     adapter_manifest_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    template_catalog: StrategyTemplateAdapterCatalog | None = None
+
+    @field_validator("template_catalog", mode="wrap")
+    @classmethod
+    def parse_template_catalog(cls, value: object, handler: ValidatorFunctionWrapHandler) -> object:
+        if value is None:
+            return handler(value)
+        if isinstance(value, StrategyTemplateAdapterCatalog):
+            return StrategyTemplateAdapterCatalog.model_validate(value.model_dump(mode="python"))
+        if isinstance(value, Mapping):
+            return StrategyTemplateAdapterCatalog.model_validate_json(canonical_json_bytes(value))
+        raise ValueError("template runtime catalog must be the frozen typed object")
 
 
 class _ImmutableLabStoreContext:
@@ -71,8 +89,13 @@ def builtin_lab_shard_configuration(
     forbidden_paths: tuple[Path, ...],
     snapshot_root: Path,
     research_lake_root: Path,
+    template_catalog: StrategyTemplateAdapterCatalog | None = None,
 ) -> BuiltinLabShardRuntimeConfig:
-    registry = default_strategy_job_adapter_registry()
+    registry = (
+        default_strategy_job_adapter_registry()
+        if template_catalog is None
+        else strategy_template_adapter_registry(template_catalog)
+    )
     return BuiltinLabShardRuntimeConfig(
         configured=True,
         catalog_path=Path(catalog_path).resolve(),
@@ -80,6 +103,7 @@ def builtin_lab_shard_configuration(
         snapshot_root=Path(snapshot_root).resolve(),
         research_lake_root=Path(research_lake_root).resolve(),
         adapter_manifest_hash=registry.closed_descriptor().manifest_hash,
+        template_catalog=template_catalog,
     )
 
 
@@ -89,6 +113,20 @@ def unconfigured_builtin_lab_shard_configuration() -> BuiltinLabShardRuntimeConf
         configured=False,
         adapter_manifest_hash=registry.closed_descriptor().manifest_hash,
     )
+
+
+def resolve_builtin_adapter_registry(
+    configuration: BuiltinLabShardRuntimeConfig,
+) -> StrategyJobAdapterRegistry:
+    config = BuiltinLabShardRuntimeConfig.model_validate(configuration, strict=True)
+    registry = (
+        default_strategy_job_adapter_registry()
+        if config.template_catalog is None
+        else strategy_template_adapter_registry(config.template_catalog)
+    )
+    if registry.closed_descriptor().manifest_hash != config.adapter_manifest_hash:
+        raise LabDaemonConfigurationError("strategy adapter registry hash mismatch")
+    return registry
 
 
 def _read_builtin_runtime_configuration(configuration: object) -> BuiltinLabShardRuntimeConfig:
@@ -110,11 +148,23 @@ def execute_builtin_lab_shard(
     config = _read_builtin_runtime_configuration(configuration)
     if not config.configured:
         raise LabDaemonConfigurationError("built-in shard runtime is not configured")
-    registry = default_strategy_job_adapter_registry()
-    if registry.closed_descriptor().manifest_hash != config.adapter_manifest_hash:
-        raise LabDaemonConfigurationError("strategy adapter registry hash mismatch")
+    registry = resolve_builtin_adapter_registry(config)
     store_factory = _ImmutableLabStoreFactory(config)
     spec = validated.spec
+    from rquant.strategy_template_adapter import StrategyTemplateAdapter
+
+    adapter = registry.for_spec(spec)
+    if type(adapter) is StrategyTemplateAdapter:
+        from rquant.strategy_template_source import open_gated_template_store
+
+        identity = spec.dataset_snapshot
+        if identity is None or config.research_lake_root is None or spec.research_status != "exploratory":
+            raise PermissionError("template worker requires its original exploratory immutable source")
+        parameters = adapter.parameters(spec)
+        version = next(item for item in adapter.catalog.versions if (item.strategy_id, item.head.version) == (parameters.strategy_id, parameters.version))
+        request = ResearchGateRequest(mode="exploratory", strategy_name=adapter.snapshot_strategy_name, start_date=spec.parameters.start_date, end_date=spec.parameters.end_date, audit_run_id=identity.audit_run_id, dataset_snapshot_id=identity.snapshot_id, dataset_binding_hash=identity.binding_hash, code_commit=runtime_code_sha)
+        with open_gated_template_store(request, metadata_store_factory=store_factory, lake_root=config.research_lake_root, version=version) as store:
+            return registry.execute_shard(validated, store)
     if spec.research_status == "exploratory":
         with store_factory() as store:
             return registry.execute_shard(validated, store)

@@ -1,0 +1,219 @@
+.template-workspace {
+  display: grid;
+  gap: 16px;
+  margin-bottom: 24px;
+  min-width: 0;
+}
+.template-name {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+.template-archived {
+  color: var(--faint);
+  font-size: 11px;
+}
+.template-editor,
+.template-detail {
+  display: grid;
+  gap: 20px;
+  min-width: 0;
+}
+.template-editor h3,
+.template-detail h3,
+.template-rules h3 {
+  font-size: 14px;
+  margin: 0 0 12px;
+}
+.template-steps {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  padding: 0;
+  margin: 0;
+  list-style: none;
+  gap: 6px;
+}
+.template-steps li {
+  display: grid;
+  gap: 7px;
+  font-size: 12px;
+  color: var(--faint);
+  border-bottom: 2px solid var(--rule);
+  padding-bottom: 12px;
+}
+.template-steps li[aria-current="step"] {
+  color: var(--ink);
+  border-color: var(--accent);
+}
+.template-steps li span {
+  font-family: var(--font-mono);
+}
+.template-fields {
+  display: grid;
+  gap: 16px;
+  border: 0;
+  padding: 0;
+  margin: 0;
+  min-width: 0;
+}
+.template-condition {
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  padding: 12px;
+  min-width: 0;
+}
+.template-condition-head {
+  display: flex;
+  align-items: end;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.template-condition-head .field {
+  flex: 1;
+  min-width: 130px;
+}
+.template-param-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  min-width: 0;
+}
+.template-param-grid .field,
+.template-param-grid input,
+.template-param-grid select,
+.template-condition input,
+.template-condition select {
+  min-width: 0;
+  width: 100%;
+}
+.template-condition .template-param-grid {
+  margin-top: 12px;
+}
+.template-exit {
+  display: grid;
+  grid-template-columns: minmax(115px, 1fr) minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+}
+.template-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  min-height: 32px;
+}
+.template-check input {
+  width: 16px;
+  height: 16px;
+}
+.template-form-actions {
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+  border-top: 1px solid var(--rule);
+  padding-top: 16px;
+}
+.template-rules {
+  display: grid;
+  gap: 20px;
+  min-width: 0;
+}
+.template-rule-list {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 13px;
+}
+.template-rule-list li {
+  margin: 8px 0;
+}
+.template-rule-list li > span {
+  margin-left: 10px;
+  color: var(--muted);
+}
+.template-values {
+  display: grid;
+  grid-template-columns: minmax(105px, 1fr) minmax(0, 1.6fr);
+  gap: 10px 16px;
+  font-size: 13px;
+  margin: 0;
+}
+.template-values dt {
+  color: var(--muted);
+}
+.template-values dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.template-detail-heading {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 13px;
+}
+.template-detail-heading p,
+.template-change-note,
+.template-receipt p {
+  margin: 0;
+}
+.template-actions,
+.template-receipt {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+.template-history {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 16px;
+}
+.template-history li {
+  border-top: 1px solid var(--rule);
+  padding-top: 12px;
+  font-size: 13px;
+}
+.template-history li > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+.template-history p {
+  margin: 8px 0;
+  overflow-wrap: anywhere;
+}
+.template-message {
+  display: grid;
+  gap: 12px;
+}
+.template-small-help {
+  color: var(--faint);
+  font-size: 12px;
+  text-decoration: underline dotted;
+}
+@media (max-width: 440px) {
+  .template-workspace {
+    gap: 12px;
+    margin-bottom: 16px;
+  }
+  .template-param-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .template-exit {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .template-condition-head .field {
+    flex-basis: 100%;
+  }
+  .template-workspace .panel-h {
+    flex-wrap: wrap;
+  }
+  .template-steps li {
+    font-size: 11px;
+  }
+}
