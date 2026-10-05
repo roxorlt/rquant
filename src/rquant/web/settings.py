@@ -122,6 +122,9 @@ class WebSettings(BaseModel):
     nl_openai_model: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
     ack_admission_socket_path: Path | None = None
     watchlist_admission_socket_path: Path | None = None
+    price_alert_admission_socket_path: Path | None = None
+    price_alert_admission_service_uid: StrictInt | None = Field(default=None, ge=0)
+    price_alert_admission_shared_gid: StrictInt | None = Field(default=None, ge=0)
     factor_admission_socket_path: Path | None = None
     factor_admission_service_uid: StrictInt | None = None
     factor_admission_shared_gid: StrictInt | None = None
@@ -158,6 +161,38 @@ class WebSettings(BaseModel):
 
     @model_validator(mode="after")
     def validate_sources_and_ingress(self) -> Self:
+        price_fields = (
+            self.price_alert_admission_socket_path,
+            self.price_alert_admission_service_uid,
+            self.price_alert_admission_shared_gid,
+        )
+        if any(value is not None for value in price_fields):
+            if (
+                not all(value is not None for value in price_fields)
+                or self.ingress_socket_path is None
+                or self.proxy_proof_file is None
+            ):
+                raise ValueError(
+                    "price rules require private Web ingress, proxy proof, socket and IDs"
+                )
+            path = self.price_alert_admission_socket_path
+            if not path.is_absolute() or ".." in path.parts or len(os.fsencode(path)) >= 100:
+                raise ValueError("price rule socket must be short and absolute")
+            if self.price_alert_admission_service_uid == os.geteuid():
+                raise ValueError("price rule service UID must differ from Web UID")
+            other_paths = (
+                self.ingress_socket_path,
+                self.ack_admission_socket_path,
+                self.watchlist_admission_socket_path,
+                self.factor_admission_socket_path,
+                self.factor_run_admission_socket_path,
+                self.factor_tracking_admission_socket_path,
+                self.research_query_socket_path,
+                self.research_query_save_socket_path,
+                self.unit_log_socket_path,
+            )
+            if any(other is not None and other.parent == path.parent for other in other_paths):
+                raise ValueError("price rule socket needs a separate private directory")
         query_fields = (
             self.research_query_socket_path,
             self.research_query_service_uid,
@@ -559,6 +594,16 @@ class WebSettings(BaseModel):
         watchlist_socket = source.get(WATCHLIST_ADMISSION_SOCKET_ENV_VAR, "").strip()
         if watchlist_socket:
             values["watchlist_admission_socket_path"] = Path(watchlist_socket)
+        price_socket = source.get("RQUANT_WEB_PRICE_ALERT_ADMISSION_SOCKET", "").strip()
+        if price_socket:
+            values["price_alert_admission_socket_path"] = Path(price_socket)
+        for env_name, field in (
+            ("RQUANT_WEB_PRICE_ALERT_ADMISSION_SERVICE_UID", "price_alert_admission_service_uid"),
+            ("RQUANT_WEB_PRICE_ALERT_ADMISSION_SHARED_GID", "price_alert_admission_shared_gid"),
+        ):
+            raw = source.get(env_name, "").strip()
+            if raw:
+                values[field] = int(raw)
         factor_socket = source.get(FACTOR_ADMISSION_SOCKET_ENV_VAR, "").strip()
         if factor_socket:
             values["factor_admission_socket_path"] = Path(factor_socket)

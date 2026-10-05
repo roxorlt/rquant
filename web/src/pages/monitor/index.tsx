@@ -30,6 +30,7 @@ import { AlertAcknowledgment, unacknowledgedKpi } from "../shared/AlertAcknowled
 import { StockCell } from "../shared/StockCell";
 import { type AckCommandSnapshot, AlertAckCommandSession } from "./alertAckCommandSession";
 import { ChannelStatus } from "./ChannelStatus";
+import { PriceAlertRules } from "./PriceAlertRules";
 import "./monitor.css";
 
 const ALERT_ID = /^[0-9a-f]{64}$/;
@@ -611,6 +612,7 @@ export default function MonitorPage() {
       />
       <ChannelStatus data={channelData} loading={channelLoading} retry={channelResult.refetch} />
       <ManualWatchlistPanel onStock={setSelectedStock} />
+      <PriceAlertRules />
       {result.isLoading || (oldGeneration && !result.error) ? (
         <PageSkeleton label="告警时间线加载中" />
       ) : result.error ? (
