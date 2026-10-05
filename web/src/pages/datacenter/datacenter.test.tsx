@@ -377,6 +377,7 @@ describe("数据中心目录", () => {
 
 const report: Schemas["DataAuditReportData"] = {
   source_state: "ready",
+  dataset_state: "not_published",
   overview: {
     report_hash: "f".repeat(64),
     schema_version: 1,
@@ -541,7 +542,7 @@ describe("运行日线审计", () => {
     const panel = screen.getByRole("region", { name: "日线质量报告" });
     await waitFor(() => expect(within(panel).getByLabelText("结束日期")).toHaveValue("2026-09-23"));
     await user.click(within(panel).getByRole("button", { name: "运行数据审计" }));
-    expect(screen.getByText(/不会执行回补或写入日线/)).toBeInTheDocument();
+    expect(screen.getByText(/只读核对.*全部目录数据/)).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "确认排队" }));
     expect(await within(panel).findByText("本次请求已排队")).toBeInTheDocument();
     expect(requests).toHaveLength(1);
@@ -658,6 +659,7 @@ describe("运行日线审计", () => {
     calendarHandler();
     reportHandler({
       source_state: "not_published",
+      dataset_state: "not_published",
       overview: null,
       months: [],
       rules: [],
@@ -886,7 +888,14 @@ describe("日线质量报告", () => {
     ["unavailable", "日线质量报告暂时不可用"],
   ] as const)("shows %s without a fabricated zero", async (state, title) => {
     catalogHandlers();
-    reportHandler({ source_state: state, overview: null, months: [], rules: [], issues: [] });
+    reportHandler({
+      source_state: state,
+      dataset_state: state,
+      overview: null,
+      months: [],
+      rules: [],
+      issues: [],
+    });
     renderApp("/datacenter");
     expect(await screen.findByText(title)).toBeInTheDocument();
     expect(screen.queryByRole("table", { name: "月度覆盖" })).not.toBeInTheDocument();
@@ -924,7 +933,7 @@ describe("日线质量报告", () => {
     expect(screen.queryByRole("img", { name: /按月覆盖率/ })).not.toBeInTheDocument();
   });
 
-  it("only requests the report on daily_bar and clears the old report after a generation swap", async () => {
+  it("shows other catalog report states and clears the old report after a generation swap", async () => {
     const user = userEvent.setup();
     catalogHandlers();
     reportHandler();
@@ -932,6 +941,8 @@ describe("日线质量报告", () => {
     expect(await screen.findByRole("img", { name: /按月覆盖率/ })).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: /复权因子/ }));
     expect(screen.queryByRole("region", { name: "日线质量报告" })).not.toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "数据质量报告" })).toBeInTheDocument();
+    expect(await screen.findByText("这份数据尚未审计")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: /股票日线/ }));
     expect(await screen.findByRole("img", { name: /按月覆盖率/ })).toBeInTheDocument();
     server.use(

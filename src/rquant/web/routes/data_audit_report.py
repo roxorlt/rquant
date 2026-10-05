@@ -1,4 +1,4 @@
-"""One-generation read of the bounded offline daily-bar audit report."""
+"""One-generation read of bounded daily-bar and catalog audit results."""
 
 from __future__ import annotations
 
@@ -17,9 +17,14 @@ from rquant.data_audit_report_job_projection import (
     validate_data_audit_report_job_progress,
 )
 from rquant.data_audit_report_jobs import DataAuditReportJobEvent
+from rquant.data_audit_report_projection import read_catalog_audit_projection_rows
+from rquant.data_catalog.descriptions import DATASETS, FIELDS
 from rquant.serving_read_models import PAGE_PROJECTION_CONTRACTS
 from rquant.web.envelope import Envelope
 from rquant.web.models.data_audit_report import (
+    AuditReportDataset,
+    AuditReportDatasetField,
+    AuditReportDatasetRule,
     AuditReportIssue,
     AuditReportMonth,
     AuditReportOverview,
@@ -29,6 +34,7 @@ from rquant.web.models.data_audit_report import (
     AuditReportUnassessedReason,
     DataAuditReportData,
     IssueRuleId,
+    ReportDatasetRow,
     ReportIssueRow,
     ReportMonthRow,
     ReportOverviewRow,
@@ -99,6 +105,118 @@ _ERROR_HINTS = {
     "internal_error": "审计未完成，请稍后重试。",
 }
 _RowT = TypeVar("_RowT", bound=BaseModel)
+_DATASET_STATES = {
+    "measured": "已统计",
+    "delayed": "更新较晚",
+    "not_applicable": "不适用",
+    "missing_expected_scope": "缺少应有范围",
+    "missing_source": "缺少来源",
+    "not_evaluated": "未评估",
+}
+_DATASET_RULES = {
+    "date_presence": "交易日记录",
+    "freshness": "更新延迟",
+    "required_keys": "主键空值",
+    "field_nulls": "字段空值",
+    "known_sources": "记录来源",
+    "known_frequency": "分钟频率",
+    "closed_day_rows": "休市日记录",
+    "row_count_change": "行数变化",
+    "observation_cutoff": "观察时刻",
+}
+_DATASET_REASONS = {
+    "date_presence_only": "只统计每日是否有记录，完整证券范围未确认。",
+    "population_unknown": "未提供权威证券范围。",
+    "minute_grid_unknown": "未提供权威分钟网格。",
+    "named_partitions_only": "只核对具名分区，整个湖的覆盖未确认。",
+    "current_snapshot": "仅保留当前快照，不检查历史逐日覆盖。",
+    "event_driven": "按事件更新，不要求每日有记录。",
+    "not_required_daily": "合同不要求每个交易日均有记录。",
+    "visibility_unknown": "可见时刻尚未确认。",
+    "source_missing": "没有这份来源。",
+    "contract_columns_missing": "来源列与合同不符。",
+    "no_observations": "所选范围没有可检查记录。",
+    "no_visible_observations": "尚无已确认可见记录。",
+    "no_completed_sessions": "范围内尚无已结束的交易日。",
+    "outside_contract_history": "超出合同历史范围。",
+    "session_grid_unknown": "缺少权威交易时段和频率网格，不能用自然时间判断盘中延迟。",
+    "null_counts_only": "显示实际空值，未声明阈值的可选字段不会算作异常。",
+    "declared_keys": "按合同主键检查空值。",
+    "declared_sources": "按合同核对实际记录来源。",
+    "declared_frequencies": "核对受支持的分钟频率；完整分钟范围未确认。",
+    "not_minute": "这份数据不是分钟线。",
+    "no_ingestion_clock": "合同未提供写入时间，无法检查迟到。",
+    "observations_only": "只解释已有记录，不确认采集完成或完整证券范围。",
+    "no_source_column": "来源没有逐行来源列，无法核对来源值。",
+}
+
+
+def _dataset_data(
+    borrowed: BorrowedGeneration,
+    data: DataAuditReportData,
+    available_at: datetime | None,
+) -> DataAuditReportData:
+    if data.overview is None or data.overview.schema_version == 1:
+        return data
+    state, at = _projection_state(borrowed, ("audit_report_dataset",), absent_state="not_published")
+    if state != "ready" or at != available_at:
+        raise ValueError("catalog audit and daily report projection times disagree")
+    rows = _rows(
+        borrowed,
+        "audit_report_dataset",
+        ReportDatasetRow,
+        borrowed.manifest.row_counts["audit_report_dataset"],
+    )
+    results = read_catalog_audit_projection_rows(
+        tuple(r.model_dump() for r in rows), report_hash=data.overview.report_hash
+    )
+    if any(
+        r.audit_start != data.overview.audit_start
+        or r.observed_through != data.overview.observed_through
+        or r.source_kind != "fixed_replica"
+        or not r.source_id.startswith("sha256:")
+        or len(r.source_id) != 71
+        for r in results
+    ):
+        raise ValueError("catalog audit source or range differs from overview")
+    datasets = [
+        AuditReportDataset(
+            **result.model_dump(exclude={"fields", "rules"}),
+            name=DATASETS[result.dataset_id].name,
+            coverage_label=_DATASET_STATES[result.coverage_state],
+            freshness_label=_DATASET_STATES[result.freshness_state],
+            completeness_label={
+                "missing_expected_scope": "完整范围未确认",
+                "not_applicable": "不适用",
+                "not_evaluated": "未评估",
+            }[result.completeness_state],
+            conclusion_label={
+                "not_fully_assessed": "尚未完整检查",
+                "issues_observed": "发现问题",
+                "no_issues_observed": "已检查范围无问题",
+            }[result.conclusion],
+            fields=tuple(
+                AuditReportDatasetField(
+                    **field.model_dump(),
+                    name=FIELDS[field.field_name].name
+                    if field.field_name in FIELDS
+                    else "检查字段",
+                )
+                for field in result.fields
+            ),
+            rules=tuple(
+                AuditReportDatasetRule(
+                    **rule.model_dump(),
+                    name=_DATASET_RULES[rule.rule_id],
+                    state_label=_DATASET_STATES[rule.state],
+                    reason_label=_DATASET_REASONS[rule.reason],
+                )
+                for rule in result.rules
+            ),
+        )
+        for result in results
+    ]
+    return data.model_copy(update={"dataset_state": "ready", "datasets": datasets})
 
 
 def _projection_state(
@@ -450,6 +568,7 @@ def _snapshot(borrowed: BorrowedGeneration | None) -> DataAuditReportData:
             )
         else:
             data = _read_report(borrowed)
+            data = _dataset_data(borrowed, data, report_available_at)
         if borrowed is None:
             return data
         progress = _read_progress(

@@ -74,7 +74,11 @@ from rquant.data_audit_projection import (
     DataAuditIssueProjectionRow,
     DataAuditStatusProjectionRow,
 )
-from rquant.data_audit_report import MAX_REPORT_BYTES, parse_data_audit_report_bytes
+from rquant.data_audit_report import (
+    MAX_REPORT_BYTES,
+    data_audit_report_path,
+    parse_data_audit_report_bytes,
+)
 from rquant.data_audit_report_job_projection import (
     DataAuditReportJobProgress,
     DataAuditReportSuccessfulTask,
@@ -83,7 +87,10 @@ from rquant.data_audit_report_job_projection import (
     validate_data_audit_report_job_progress,
 )
 from rquant.data_audit_report_jobs import DataAuditReportJobEvent
-from rquant.data_audit_report_projection import project_data_audit_report
+from rquant.data_audit_report_projection import (
+    project_data_audit_report,
+    read_catalog_audit_projection_rows,
+)
 from rquant.factor.definition_serving import project_factor_definition_serving_snapshot
 from rquant.factor.registry import (
     FactorDefinitionRegistry,
@@ -3752,8 +3759,8 @@ class DuckDBLabPageProjectionSource:
             if success is None:
                 return ()
             assert self.audit_report_job_directory is not None
-            path = self.audit_report_job_directory / (
-                f"data-audit-v1-{success.receipt.report_hash}.json"
+            path = data_audit_report_path(
+                self.audit_report_job_directory, success.receipt.report_hash
             )
         if path is None:
             return ()
@@ -5281,6 +5288,7 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
         required = {"data_audit_issue", "data_audit_status", "research_gate_metadata"}
         optional_groups = (
             REPORT_PROJECTION_TABLES,
+            {"audit_report_dataset"},
             REPORT_JOB_PROJECTION_TABLES,
             BACKFILL_PLAN_PROJECTION_TABLES,
             FORMULA_MARKET_PROJECTION_TABLES,
@@ -5294,6 +5302,7 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
             or names - required - set().union(*optional_groups)
             or len(names) != len(self.projections)
             or tuple(item.table_name for item in self.projections) != tuple(sorted(names))
+            or ("audit_report_dataset" in names and not names >= REPORT_PROJECTION_TABLES)
         ):
             raise ValueError("lab page projection snapshot is incomplete")
         projections = {item.table_name: item for item in self.projections}
@@ -5357,6 +5366,25 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
             ):
                 raise ValueError("audit report source and completion remain unconfirmed")
             report_hash = summary["report_hash"]
+            if summary["schema_version"] not in (1, 2) or (
+                ("audit_report_dataset" in names) != (summary["schema_version"] == 2)
+            ):
+                raise ValueError("catalog audit schema and projection set disagree")
+            if "audit_report_dataset" in names:
+                dataset_projection = projections["audit_report_dataset"]
+                if dataset_projection.available_at != projections["audit_report_overview"].available_at:
+                    raise ValueError("catalog audit and daily report projection times disagree")
+                results = read_catalog_audit_projection_rows(
+                    tuple(dict(row) for row in dataset_projection.rows), report_hash=str(report_hash)
+                )
+                if any(
+                    result.audit_start.isoformat() != summary["audit_start"]
+                    or result.observed_through.isoformat() != summary["observed_through"]
+                    or result.source_kind != "fixed_replica"
+                    or re.fullmatch(r"sha256:[0-9a-f]{64}", result.source_id) is None
+                    for result in results
+                ):
+                    raise ValueError("catalog audit source or range differs from overview")
             for name in REPORT_PROJECTION_TABLES - {"audit_report_overview"}:
                 if any(row["report_hash"] != report_hash for row in projections[name].rows):
                     raise ValueError("audit report projection mixes reports")
@@ -5504,7 +5532,8 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
         )
         if (
             audit_report_projections
-            and {item.table_name for item in audit_report_projections} != REPORT_PROJECTION_TABLES
+            and {item.table_name for item in audit_report_projections}
+            not in (REPORT_PROJECTION_TABLES, REPORT_PROJECTION_TABLES | {"audit_report_dataset"})
         ):
             raise ValueError("audit report projections must be complete")
         if (

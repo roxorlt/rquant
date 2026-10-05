@@ -25,6 +25,7 @@ from rquant.data_audit_report import (
     DataAuditReplicaChangedError,
     capture_data_audit_replica_identity,
     create_and_publish_data_audit_report,
+    data_audit_report_path,
     load_data_audit_report,
 )
 
@@ -369,7 +370,7 @@ class DataAuditReportJobStore:
             or _SHA256.fullmatch(source_sha256) is None
         ):
             raise DataAuditReportArtifactUnavailableError("stored audit report identity is invalid")
-        path = self.report_directory / f"data-audit-v1-{report_hash}.json"
+        path = data_audit_report_path(self.report_directory, report_hash)
         try:
             report = load_data_audit_report(path)
             if (
@@ -672,6 +673,7 @@ class DataAuditReportJobWorker:
                 expected_file_identity=request.replica_file_identity,
                 expected_file_sha256=claim.replica_sha256,
                 on_replica_sha256=lambda digest: self.store._record_replica_sha256(claim, digest),
+                include_catalog=True,
             )
             report = load_data_audit_report(report_path)
             if lost.is_set():

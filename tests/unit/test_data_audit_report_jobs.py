@@ -14,7 +14,9 @@ import pytest
 
 from rquant.data_audit_evidence import DailyBarNullFieldSpec
 from rquant.data_audit_report import (
+    CatalogDataAuditReport,
     capture_data_audit_replica_identity,
+    data_audit_report_path,
     load_data_audit_report,
 )
 from rquant.data_audit_report_jobs import (
@@ -126,8 +128,9 @@ def test_worker_publishes_verified_hash_and_bounded_safe_events(tmp_path: Path) 
     assert finished.status == "succeeded" and finished.attempts == 1
     assert finished.report_hash is not None
     report = load_data_audit_report(
-        tmp_path / "reports" / f"data-audit-v1-{finished.report_hash}.json"
+        data_audit_report_path(tmp_path / "reports", finished.report_hash)
     )
+    assert isinstance(report, CatalogDataAuditReport) and len(report.datasets) == 24
     assert report.content_hash == finished.report_hash
     assert report.source.mode == "production_unverified"
     assert report.collection_status == "collection_unconfirmed"
@@ -149,7 +152,7 @@ def test_rotated_replica_fails_and_does_not_replace_previous_success(tmp_path: P
     store.submit(_request(primary, replica))
     success = DataAuditReportJobWorker(store).run_one()
     assert success is not None and success.report_hash is not None
-    previous = tmp_path / "reports" / f"data-audit-v1-{success.report_hash}.json"
+    previous = data_audit_report_path(tmp_path / "reports", success.report_hash)
     before = previous.read_bytes()
     clock.advance(600)
     second_request = _request(primary, replica, key="audit-command-0002")
@@ -281,7 +284,7 @@ def test_report_failure_preserves_previous_artifact_and_stores_only_safe_code(
     store.submit(_request(primary, replica))
     previous = DataAuditReportJobWorker(store).run_one()
     assert previous is not None and previous.report_hash is not None
-    artifact = tmp_path / "reports" / f"data-audit-v1-{previous.report_hash}.json"
+    artifact = data_audit_report_path(tmp_path / "reports", previous.report_hash)
     before = artifact.read_bytes()
     clock.advance(600)
     next_task = store.submit(_request(primary, replica, key="audit-command-0002"))

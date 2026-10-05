@@ -182,7 +182,7 @@ function DatasetDetail({ dataset }: { dataset: CatalogDataset }) {
           </div>
         </dl>
       </Panel>
-      {dataset.dataset_id === "daily_bar" ? <DailyReportPanel /> : null}
+      <DailyReportPanel datasetId={dataset.dataset_id} />
       <Panel
         title="字段字典"
         sub={dataset.schema_available ? `${dataset.fields.length} 个字段` : undefined}
