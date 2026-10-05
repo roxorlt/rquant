@@ -11,6 +11,7 @@ from pydantic import Field, model_validator
 from rquant.backtest.contracts import Sha256
 from rquant.lab_artifact_preview import ArtifactPreviewReader
 from rquant.lab_jobs import LabJobReader
+from rquant.portfolio_backtest_models import MAX_BUNDLE_BYTES
 from rquant.runtime_contracts import RuntimeContractModel
 from rquant.strategy_authoring import StrategyAuthoringStore
 from rquant.strategy_authoring_commands import StrategyAuthoringIdentity, StrategyTemplateHead
@@ -23,8 +24,11 @@ from rquant.strategy_template_adapter import (
     StrategyTemplateExecutionVersion,
     StrategyTemplateRunParameters,
 )
+from rquant.strategy_template_run import StrategyTemplateResult
 
 if TYPE_CHECKING:
+    from rquant.experiment_platform_projection import ExperimentPrivateResultAuthority
+    from rquant.experiment_platform_template_models import PreparedExperimentTemplate
     from rquant.strategy_authoring_projection import StrategyTemplateRecentRun
 
 REFERENCE_COLUMNS = (
@@ -41,6 +45,54 @@ REFERENCE_COLUMNS = (
     "result_hash",
     "complete",
 )
+
+
+class TemplateReadResult(RuntimeContractModel):
+    job_id: UUID
+    spec_hash: Sha256
+    manifest_hash: Sha256
+    result_hash: Sha256
+    result: StrategyTemplateResult
+
+
+def bind_complete_template_result(
+    prepared: PreparedExperimentTemplate, result: StrategyTemplateResult
+) -> None:
+    """Bind the complete original payload; no account or result is computed here."""
+    from rquant.experiment_platform_template_models import PreparedExperimentTemplate
+
+    if type(prepared) is not PreparedExperimentTemplate:
+        raise TypeError("template result needs its actual typed private preparation")
+    result = StrategyTemplateResult.model_validate(result.model_dump(mode="python"))
+    frozen = prepared.frozen
+    if (
+        result.owner_id,
+        result.strategy_id,
+        result.version,
+        result.definition_fingerprint,
+        result.definition_record_hash,
+        result.input_hash,
+        result.calendar_source_identity,
+        result.cost_spec_id,
+        result.status,
+    ) != (
+        frozen.owner_id,
+        prepared.catalog.versions[0].strategy_id,
+        prepared.catalog.versions[0].head.version,
+        frozen.definition.fingerprint,
+        frozen.definition.record_hash,
+        frozen.input_hash,
+        frozen.request.calendar.source_identity,
+        frozen.request.execution_cost_spec.cost_spec_id,
+        "complete",
+    ):
+        raise ValueError("full template result differs from its original preparation")
+    if (
+        tuple(d.trade_date for d in result.days) != tuple(d.trade_date for d in frozen.days)
+        or any(d.account is None or d.daily_return is None for d in result.days)
+        or len(result.model_dump_json().encode()) > MAX_BUNDLE_BYTES
+    ):
+        raise ValueError("full template result has incomplete days or exceeds its byte budget")
 
 
 class TemplateSealedResultReference(RuntimeContractModel):
@@ -79,6 +131,77 @@ class StrategyTemplateSealedResultReader:
             raise TypeError("template results require the same concrete original Lab authority")
         self.reader = reader
         self.artifact_reader = artifact_reader
+        self.full_previews = ArtifactPreviewReader(
+            reader=reader,
+            artifact_root=artifact_reader.artifact_root,
+            max_preview_rows=1,
+            max_preview_columns=len(REFERENCE_COLUMNS),
+            max_preview_cell_bytes=MAX_BUNDLE_BYTES,
+            max_preview_arrow_bytes=MAX_BUNDLE_BYTES + 1024,
+            max_preview_serialized_bytes=2 * MAX_BUNDLE_BYTES + 1024 * 1024,
+        )
+
+    def read_private(
+        self,
+        job_id: UUID,
+        *,
+        private_owner: str,
+        private_authority: ExperimentPrivateResultAuthority,
+        expected_result_hash: str,
+    ) -> TemplateReadResult:
+        from rquant.experiment_platform_projection import ExperimentPrivateResultAuthority
+        from rquant.experiment_platform_template_models import PreparedExperimentTemplate
+
+        if type(private_authority) is not ExperimentPrivateResultAuthority:
+            raise TypeError("private template results require installed owner authority")
+        authority = self.reader.get_artifact_preview_authority(job_id)
+        if authority is None or authority.evidence.complete_result_hash != expected_result_hash:
+            raise ValueError("exact private template sealed result is unavailable or changed")
+        receipt = private_authority.authorize(authority.job, private_owner)
+        prepared = receipt.prepared
+        if type(prepared) is not PreparedExperimentTemplate:
+            raise ValueError("private template result has another original source kind")
+        preview = self.full_previews.preview(
+            job_id, table_name="template_result", row_limit=1, column_limit=2
+        )
+        table = preview.table
+        if (
+            set(preview.available_tables)
+            != {"template_reference", "template_result", "equity", "orders", "exits", "summary"}
+            or table is None
+            or table.columns != ("result_hash", "payload")
+            or table.total_rows != 1
+            or table.total_columns != 2
+            or table.rows_truncated
+            or table.columns_truncated
+            or len(table.rows) != 1
+            or any(not isinstance(v, str) for v in table.rows[0])
+            or len(table.rows[0][1].encode()) > MAX_BUNDLE_BYTES
+        ):
+            raise ValueError("full template result schema, inventory or byte budget differs")
+        result = StrategyTemplateResult.model_validate_json(table.rows[0][1])
+        bind_complete_template_result(prepared, result)
+        if result.content_hash != table.rows[0][0]:
+            raise ValueError("template sealed payload hash differs from its table reference")
+        after = self.reader.get_artifact_preview_authority(job_id)
+        if (
+            after is None
+            or private_authority.authorize(after.job, private_owner) != receipt
+            or (
+                after != authority
+                or preview.spec_hash != authority.job.spec_hash
+                or preview.complete_result_hash != expected_result_hash
+                or preview.manifest_hash != authority.evidence.manifest_hash
+            )
+        ):
+            raise ValueError("private template authority changed during full sealed read")
+        return TemplateReadResult(
+            job_id=job_id,
+            spec_hash=preview.spec_hash,
+            manifest_hash=preview.manifest_hash,
+            result_hash=preview.complete_result_hash,
+            result=result,
+        )
 
     def recent_runs(
         self,

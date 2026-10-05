@@ -137,6 +137,42 @@
   min-width: 0;
 }
 
+.exp-form .template-rules,
+.exp-template-rules .template-rules {
+  display: grid;
+  gap: 12px;
+  margin: 12px 0;
+}
+.exp-form .template-rules section,
+.exp-template-rules .template-rules section {
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+}
+.exp-form .template-values,
+.exp-template-rules .template-values {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 10px;
+  font-size: 13px;
+}
+.exp-form :where(.template-values) dt,
+.exp-template-rules :where(.template-values) dt {
+  color: var(--muted);
+}
+.exp-form :where(.template-values) dd,
+.exp-template-rules :where(.template-values) dd {
+  margin: 0;
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+.exp-form .template-rule-list,
+.exp-template-rules .template-rule-list {
+  padding-left: 20px;
+  overflow-wrap: anywhere;
+}
+
 .exp-window {
   margin: 0;
   padding: 12px 16px;

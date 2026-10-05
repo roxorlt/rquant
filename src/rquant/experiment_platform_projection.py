@@ -21,6 +21,10 @@ from rquant.experiment_platform import (
     SearchDimension,
     Sha256,
 )
+from rquant.experiment_platform_template_models import (
+    ExperimentTemplateSelection,
+    ExperimentTemplateSlot,
+)
 from rquant.experiment_registry import (
     ExperimentAttempt,
     ExperimentRegistryReadonlyReader,
@@ -37,6 +41,7 @@ from rquant.portfolio_backtest_models import PortfolioBacktestConfig
 from rquant.portfolio_backtest_source import PortfolioExperimentProtocol
 from rquant.runtime_contracts import AwareUtcDatetime, RuntimeContractModel, canonical_sha256
 from rquant.serving_read_models import ServingProjectionPayload, _projection_json_bytes
+from rquant.strategy_template import StrategyTemplate
 
 if TYPE_CHECKING:
     from rquant.experiment_platform_evidence import ExperimentOverfitEvidence
@@ -123,6 +128,7 @@ class ExperimentAttemptFact(RuntimeContractModel):
 
 
 class ExperimentSearchContext(RuntimeContractModel):
+    template: ExperimentTemplateSelection | None = None
     request_fingerprint: Sha256
     protocol: PortfolioExperimentProtocol
     dimensions: tuple[SearchDimension, ...]
@@ -144,6 +150,14 @@ class ExperimentSearchContext(RuntimeContractModel):
         )
 
 
+class ExperimentPlannedSlotFact(RuntimeContractModel):
+    index: int = Field(ge=0, le=63)
+    configuration: PortfolioBacktestConfig
+    definition_state: Literal["pending", "saved", "failed", "cancelled"]
+    input_prepared: bool
+    failure: Literal["capacity", "source_changed", "invalid_definition"] | None = None
+
+
 class ExperimentFamilyFact(RuntimeContractModel):
     owner: Owner
     family_id: str
@@ -161,6 +175,11 @@ class ExperimentFamilyFact(RuntimeContractModel):
     outer_admitted: bool = False
     evidence_id: Sha256 | None = None
     selected_search_experiment_id: Sha256 | None = None
+    preparation_state: Literal["preparing", "ready", "cancelled"] = "ready"
+    preparations: tuple[ExperimentPlannedSlotFact, ...] = Field(default=(), max_length=64)
+    preparation_window_truncated: bool = False
+    template_name: str | None = None
+    template_rules: StrategyTemplate | None = None
 
 
 class ExperimentPrivateSnapshot(RuntimeContractModel):
@@ -259,7 +278,7 @@ class ExperimentPrivateResultAuthority:
                 expected != job.spec
                 or job.spec_hash != expected.spec_hash
                 or prepared.owner != owner
-                or prepared.prepared.frozen.config != family.actual_configurations[index]
+                or prepared.configuration != family.actual_configurations[index]
             ):
                 raise PermissionError("private result differs from its exact admitted definition")
             if family.phase == "outer":
@@ -276,7 +295,7 @@ class ExperimentPrivateResultAuthority:
                 if (
                     family.family_id != "experiment-outer:" + grant.grant_id
                     or family.parent_family_id != grant.family_id
-                    or prepared.prepared.frozen.config != family.actual_configurations[0]
+                    or prepared.configuration != family.actual_configurations[0]
                 ):
                     raise PermissionError("private outer result grant differs")
             return prepared
@@ -310,12 +329,116 @@ class ExperimentPrivateProjectionReader:
                 ).fetchone()[0]
             )
             stored_owners = connection.execute(
-                "SELECT DISTINCT owner FROM experiment_private_family ORDER BY owner LIMIT 65"
+                "SELECT owner FROM experiment_private_family UNION "
+                "SELECT owner FROM experiment_family_request ORDER BY owner LIMIT 65"
             ).fetchall()
             owners = tuple(sorted(self.owners | {row[0] for row in stored_owners}))
             if len(owners) > 64:
                 raise ValueError("private experiment source exceeds 64 owners")
             for owner in owners:
+                pending_rows = connection.execute(
+                    "SELECT payload_json FROM experiment_family_request WHERE owner=? "
+                    "AND state!='ready' ORDER BY json_extract(payload_json,'$.registered_at') DESC,"
+                    "family_id DESC LIMIT 501",
+                    (owner,),
+                ).fetchall()
+                retained_pending = []
+                pending_count = 0
+                for pending_row in pending_rows:
+                    if pending_count >= 500:
+                        break
+                    record = ExperimentFamilyRecord.model_validate_json(pending_row[0])
+                    if record.owner != owner or record.state == "ready":
+                        raise ValueError("private preparing owner or state differs")
+                    retained_pending.append(record)
+                    pending_count += len(record.actual_configurations)
+                for record in retained_pending:
+                    slot_rows = connection.execute(
+                        "SELECT payload_json FROM experiment_template_slot WHERE family_id=? "
+                        "ORDER BY child_index LIMIT 65",
+                        (record.family_id,),
+                    ).fetchall()
+                    slots = tuple(
+                        ExperimentTemplateSlot.model_validate_json(r[0]) for r in slot_rows
+                    )
+                    if record.template_baseline is not None and (
+                        len(slots) != len(record.actual_configurations)
+                        or tuple(s.index for s in slots) != tuple(range(len(slots)))
+                        or any(
+                            (s.owner, s.family_id, s.baseline_hash)
+                            != (owner, record.family_id, canonical_sha256(record.template_baseline))
+                            for s in slots
+                        )
+                    ):
+                        raise ValueError(
+                            "private planned slots differ from their complete admitted array"
+                        )
+                    indices = {
+                        r[0]
+                        for r in connection.execute(
+                            "SELECT child_index FROM experiment_prepared_child WHERE family_id=?",
+                            (record.family_id,),
+                        ).fetchall()
+                    }
+                    if not indices <= set(range(len(record.actual_configurations))):
+                        raise ValueError("private preparation contains an unplanned index")
+                    preparations = tuple(
+                        ExperimentPlannedSlotFact(
+                            index=i,
+                            configuration=cfg,
+                            definition_state=slots[i].state
+                            if slots
+                            else ("cancelled" if record.state == "cancelled" else "pending"),
+                            input_prepared=i in indices,
+                            failure=slots[i].failure if slots else None,
+                        )
+                        for i, cfg in enumerate(record.actual_configurations)
+                    )
+                    parent = record
+                    if record.parent_family_id is not None:
+                        parent_row = connection.execute(
+                            "SELECT payload_json FROM experiment_family_request "
+                            "WHERE owner=? AND family_id=?",
+                            (owner, record.parent_family_id),
+                        ).fetchone()
+                        if parent_row is None:
+                            raise ValueError("preparing outer family lost its exact owner parent")
+                        parent = ExperimentFamilyRecord.model_validate_json(parent_row[0])
+                    potential = 1
+                    for dimension in record.request.dimensions:
+                        potential *= len(dimension.values)
+                    note_row = connection.execute(
+                        "SELECT payload_json FROM experiment_note WHERE owner=? AND family_id=?",
+                        (owner, record.family_id),
+                    ).fetchone()
+                    families.append(
+                        ExperimentFamilyFact(
+                            owner=owner,
+                            family_id=record.family_id,
+                            request_id=record.request_id,
+                            name=record.request.name,
+                            template_name=None
+                            if record.template_baseline is None
+                            else record.template_baseline.name,
+                            template_rules=None
+                            if record.template_baseline is None
+                            else record.template_baseline.version.rules,
+                            request=ExperimentSearchContext.from_request(record.request),
+                            registered_at=record.registered_at,
+                            policy=record.policy,
+                            phase=record.phase,
+                            parent_family_id=record.parent_family_id,
+                            planned_count=len(preparations),
+                            potential_count=potential,
+                            search_count=len(parent.actual_configurations),
+                            preparation_state=record.state,
+                            preparations=preparations,
+                            preparation_window_truncated=len(retained_pending) < len(pending_rows),
+                            note=None
+                            if note_row is None
+                            else ExperimentNote.model_validate_json(note_row[0]),
+                        )
+                    )
                 rows = connection.execute(
                     "SELECT a.* FROM experiment_attempt a JOIN experiment_private_family f "
                     "ON a.hypothesis_family=f.hypothesis_family WHERE f.owner=? "
@@ -391,6 +514,12 @@ class ExperimentPrivateProjectionReader:
                             family_id=family_id,
                             request_id=record.request_id,
                             name=record.request.name,
+                            template_name=None
+                            if record.template_baseline is None
+                            else record.template_baseline.name,
+                            template_rules=None
+                            if record.template_baseline is None
+                            else record.template_baseline.version.rules,
                             request=ExperimentSearchContext.from_request(record.request),
                             registered_at=record.registered_at,
                             policy=record.policy,
@@ -474,7 +603,7 @@ class ExperimentPrivateProjectionReader:
                             child.family_id,
                             prepared.owner,
                             prepared.index,
-                            prepared.prepared.frozen.config,
+                            prepared.configuration,
                         ) != (owner, family_id, owner, index, record.actual_configurations[index]):
                             raise ValueError("private exact configuration differs")
                         attempts.append(

@@ -11,6 +11,8 @@ from statistics import mean, stdev
 import pandas as pd
 from pydantic import Field
 
+from rquant.backtest.benchmark import BenchmarkSeries
+from rquant.backtest.contracts import BacktestDayResult, BacktestRequest
 from rquant.experiment_platform import ExperimentPlatformStore
 from rquant.experiment_platform_projection import (
     ExperimentAttemptFact,
@@ -30,7 +32,13 @@ from rquant.overfit_pbo import CSCVInput, CSCVPBOResult, calculate_cscv_pbo
 from rquant.perf import annualized_turnover, performance_summary, relative_metrics
 from rquant.perf.trades import summarize_round_trips
 from rquant.portfolio_backtest_artifact import PortfolioReadResult, PortfolioResultReader
+from rquant.portfolio_backtest_models import (
+    PortfolioBacktestConfig,
+    PortfolioPerformance,
+    PortfolioSourceManifest,
+)
 from rquant.runtime_contracts import RuntimeContractModel, canonical_sha256
+from rquant.strategy_template_artifact import StrategyTemplateSealedResultReader, TemplateReadResult
 from rquant.web.experiment_platform_models import (
     ExperimentComparisonData,
     ExperimentCurvePoint,
@@ -41,6 +49,7 @@ from rquant.web.experiment_platform_models import (
     ExperimentPhasePerformance,
     ExperimentResultData,
     ExperimentStatisticsData,
+    ExperimentTemplateResultIdentity,
 )
 from rquant.web.models.backtests import PortfolioEditableConfig
 
@@ -56,6 +65,25 @@ _SUMMARY = (
     ("win_rate", "胜率", "percent"),
     ("payoff_ratio", "盈亏比", "number"),
 )
+
+
+def unavailable_experiment_metrics() -> tuple[ExperimentMetric, ...]:
+    """Keep the public metric columns even when a planned result has no values."""
+    fields = tuple(f for f in _SUMMARY if f[0] not in ("win_rate", "payoff_ratio")) + (
+        ("trade_count", "闭合交易", "count"),
+        ("win_rate", "胜率", "percent"),
+        ("payoff_ratio", "盈亏比", "number"),
+        ("annualized_turnover", "年化换手", "percent"),
+        ("excess_total_return", "超额收益", "percent"),
+        ("excess_annualized_return", "年化超额", "percent"),
+        ("alpha", "阿尔法", "number"),
+        ("beta", "贝塔", "number"),
+        ("tracking_error", "跟踪误差", "percent"),
+        ("information_ratio", "信息比率", "number"),
+    )
+    return tuple(
+        ExperimentMetric(key=k, label=label, unit=unit, value=None) for k, label, unit in fields
+    )
 
 
 def _metrics(
@@ -112,7 +140,34 @@ def result_from_sealed(
         or bundle.performance is None
     ):
         raise ValueError("full sealed result differs from its registered binding")
-    config = bundle.frozen.config
+    return _project_complete_result(
+        fact,
+        family,
+        config=bundle.frozen.config,
+        request=bundle.frozen.request,
+        days=bundle.result.days,
+        performance=bundle.performance,
+        benchmark_series=bundle.benchmark,
+        sources=bundle.frozen.sources,
+        sealed=sealed,
+        execution="portfolio-backtest@1",
+    )
+
+
+def _project_complete_result(
+    fact: ExperimentAttemptFact,
+    family: ExperimentFamilyFact,
+    *,
+    config: PortfolioBacktestConfig,
+    request: BacktestRequest,
+    days: tuple[BacktestDayResult, ...],
+    performance: PortfolioPerformance,
+    benchmark_series: BenchmarkSeries | None,
+    sources: PortfolioSourceManifest,
+    sealed: PortfolioReadResult | TemplateReadResult,
+    execution: str,
+    template: ExperimentTemplateResultIdentity | None = None,
+) -> ExperimentResultData:
     if (
         fact.owner,
         fact.family_id,
@@ -134,17 +189,19 @@ def result_from_sealed(
         raise ValueError("search result includes a forbidden phase")
     benchmark = (
         {}
-        if bundle.benchmark is None
-        else {d.trade_date: d.normalized_nav for d in bundle.benchmark.days}
+        if benchmark_series is None
+        else {d.trade_date: d.normalized_nav for d in benchmark_series.days}
     )
+    if any(d.normalized_nav is None or not d.normalized_nav.is_finite() for d in days):
+        raise ValueError("original normalized NAV is unavailable")
     points = tuple(
         ExperimentCurvePoint(
             trade_date=d.trade_date,
-            nav=float(d.account.nav),
+            nav=float(d.normalized_nav),
             daily_return=float(d.daily_return),
             benchmark_nav=benchmark.get(d.trade_date),
         )
-        for d in bundle.result.days
+        for d in days
     )
     phases = (
         (("outer", window),)
@@ -157,12 +214,12 @@ def result_from_sealed(
     summaries = []
     benchmark_returns = (
         {}
-        if bundle.benchmark is None
-        else {d.trade_date: d.daily_return for d in bundle.benchmark.days}
+        if benchmark_series is None
+        else {d.trade_date: d.daily_return for d in benchmark_series.days}
     )
-    previous_equity = float(bundle.frozen.request.initial_cash)
+    previous_equity = float(request.initial_cash)
     turnover_rows = {}
-    for day in bundle.result.days:
+    for day in days:
         buy = sum(
             float(order.receipt.fill.notional)
             for order in day.orders
@@ -180,9 +237,7 @@ def result_from_sealed(
             p for p in points if interval.start_date <= p.trade_date <= interval.end_date
         )
         expected = tuple(
-            d
-            for d in bundle.frozen.request.calendar.dates
-            if interval.start_date <= d <= interval.end_date
+            d for d in request.calendar.dates if interval.start_date <= d <= interval.end_date
         )
         if tuple(p.trade_date for p in selected) != expected:
             raise ValueError("phase result does not cover its complete SSE interval")
@@ -190,7 +245,7 @@ def result_from_sealed(
         # Only actually closed trips wholly inside the phase count as phase trades.
         trips = tuple(
             t
-            for t in bundle.performance.round_trips
+            for t in performance.round_trips
             if interval.start_date <= t.entry_date <= t.exit_date <= interval.end_date
         )
         analysis = summarize_round_trips(trips).overall
@@ -228,7 +283,7 @@ def result_from_sealed(
                 message="验证承接训练末账户。" if phase == "validation" else None,
             )
         )
-    whole = bundle.performance
+    whole = performance
     metrics = list(
         _metrics(
             whole.summary,
@@ -246,10 +301,10 @@ def result_from_sealed(
         "frequency": "daily",
         "initial_cash": config.initial_cash,
         "benchmark": config.benchmark_code,
-        "code": bundle.frozen.request.producer_commit,
-        "execution": "portfolio-backtest@1",
+        "code": request.producer_commit,
+        "execution": execution,
         "cost": config.execution_cost_spec,
-        "sources": bundle.frozen.sources,
+        "sources": sources,
     }
     return ExperimentResultData(
         experiment_id=fact.attempt.spec.experiment_id,
@@ -266,6 +321,7 @@ def result_from_sealed(
         phases=tuple(summaries),
         metrics=tuple(metrics),
         curves=points,
+        template=template,
     )
 
 
@@ -289,9 +345,24 @@ def read_experiment_result(
     *,
     results: PortfolioResultReader,
     authority: ExperimentPrivateResultAuthority,
+    template_results: StrategyTemplateSealedResultReader | None = None,
 ) -> ExperimentResultData:
     if fact.result_hash is None or fact.attempt.status.value not in ("executed", "succeeded"):
         raise ValueError("selected experiment has no completed sealed result")
+    if family.request.template is not None:
+        if template_results is None:
+            raise ValueError("original private template result reader is unavailable")
+        from rquant.experiment_platform_template_evidence import result_from_template
+
+        sealed_template = template_results.read_private(
+            fact.child.job_id,
+            expected_result_hash=fact.result_hash,
+            private_owner=fact.owner,
+            private_authority=authority,
+        )
+        job = template_results.reader.get_job(fact.child.job_id)
+        prepared = authority.authorize(job, fact.owner).prepared
+        return result_from_template(fact, family, sealed_template, prepared)
     sealed = results.read(
         fact.child.job_id,
         expected_result_hash=fact.result_hash,
@@ -324,6 +395,16 @@ def compare_experiment_results(
         _flatten(a.configuration.model_dump(mode="json")),
         _flatten(b.configuration.model_dump(mode="json")),
     )
+    for result, parameters in ((a, left), (b, right)):
+        if result.template is not None:
+            parameters.update(
+                _flatten(
+                    result.template.rules.model_dump(
+                        mode="json", include={"entry", "exit", "index_filter"}
+                    ),
+                    "template",
+                )
+            )
     differences = tuple(
         ExperimentParameterDifference(path=key, a=left.get(key), b=right.get(key))
         for key in sorted(left.keys() | right.keys())
@@ -733,6 +814,7 @@ class ExperimentEvidencePublisher:
         store: ExperimentPlatformStore,
         projection: ExperimentPrivateProjectionReader,
         results: PortfolioResultReader,
+        template_results: StrategyTemplateSealedResultReader | None = None,
         independence_resolver: Callable[
             [ExperimentFamilyFact, tuple[ExperimentAttemptFact, ...]],
             ExperimentIndependenceEvidence | None,
@@ -741,6 +823,7 @@ class ExperimentEvidencePublisher:
     ) -> None:
         self.store, self.projection, self.results = store, projection, results
         self.independence_resolver = independence_resolver
+        self.template_results = template_results
 
     def __call__(self, observed_at: datetime) -> tuple[str, ...]:
         snapshot = self.projection.snapshot(observed_at)
@@ -775,7 +858,11 @@ class ExperimentEvidencePublisher:
                 fact: ExperimentAttemptFact, bound_family: ExperimentFamilyFact = family
             ) -> ExperimentResultData:
                 return read_experiment_result(
-                    fact, bound_family, results=self.results, authority=self.projection.authority
+                    fact,
+                    bound_family,
+                    results=self.results,
+                    authority=self.projection.authority,
+                    template_results=self.template_results,
                 )
 
             evidence = build_overfit_evidence(

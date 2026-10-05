@@ -6847,6 +6847,14 @@
             ],
             "title": "Message"
           },
+          "metrics": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ExperimentMetric"
+            },
+            "title": "Metrics",
+            "type": "array"
+          },
           "phase": {
             "enum": [
               "search",
@@ -6871,6 +6879,16 @@
             ],
             "title": "Result Hash"
           },
+          "rules": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StrategyTemplate-Output"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "status": {
             "enum": [
               "registered",
@@ -6882,6 +6900,17 @@
             ],
             "title": "Status",
             "type": "string"
+          },
+          "strategy_name": {
+            "default": "组合回测",
+            "title": "Strategy Name",
+            "type": "string"
+          },
+          "strategy_version": {
+            "default": 1,
+            "minimum": 1.0,
+            "title": "Strategy Version",
+            "type": "integer"
           }
         },
         "required": [
@@ -6945,6 +6974,11 @@
           },
           "can_search": {
             "title": "Can Search",
+            "type": "boolean"
+          },
+          "can_search_templates": {
+            "default": false,
+            "title": "Can Search Templates",
             "type": "boolean"
           },
           "can_unseal": {
@@ -7172,6 +7206,16 @@
             ],
             "default": "0",
             "title": "Target Period Sharpe"
+          },
+          "template": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ExperimentTemplateSelection"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
@@ -7261,6 +7305,24 @@
           "potential_count": {
             "title": "Potential Count",
             "type": "integer"
+          },
+          "preparation_state": {
+            "default": "ready",
+            "enum": [
+              "preparing",
+              "ready",
+              "cancelled"
+            ],
+            "title": "Preparation State",
+            "type": "string"
+          },
+          "preparations": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ExperimentPreparationRow"
+            },
+            "title": "Preparations",
+            "type": "array"
           },
           "protocol": {
             "$ref": "#/components/schemas/PortfolioExperimentProtocol"
@@ -7696,6 +7758,19 @@
             ],
             "title": "Oldest Registered At"
           },
+          "preparing_families": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ExperimentPreparationFamily"
+            },
+            "title": "Preparing Families",
+            "type": "array"
+          },
+          "preparing_window_truncated": {
+            "default": false,
+            "title": "Preparing Window Truncated",
+            "type": "boolean"
+          },
           "retained_count": {
             "maximum": 500.0,
             "minimum": 0.0,
@@ -7899,6 +7974,146 @@
         "title": "ExperimentPolicyWrite",
         "type": "object"
       },
+      "ExperimentPreparationFamily": {
+        "additionalProperties": false,
+        "properties": {
+          "cancelled_count": {
+            "title": "Cancelled Count",
+            "type": "integer"
+          },
+          "definition_saved_count": {
+            "title": "Definition Saved Count",
+            "type": "integer"
+          },
+          "failed_count": {
+            "title": "Failed Count",
+            "type": "integer"
+          },
+          "family_id": {
+            "title": "Family Id",
+            "type": "string"
+          },
+          "input_prepared_count": {
+            "title": "Input Prepared Count",
+            "type": "integer"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "planned_count": {
+            "title": "Planned Count",
+            "type": "integer"
+          },
+          "registered_at": {
+            "format": "date-time",
+            "title": "Registered At",
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "preparing",
+              "cancelled"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "family_id",
+          "name",
+          "registered_at",
+          "state",
+          "planned_count",
+          "definition_saved_count",
+          "input_prepared_count",
+          "failed_count",
+          "cancelled_count"
+        ],
+        "title": "ExperimentPreparationFamily",
+        "type": "object"
+      },
+      "ExperimentPreparationRow": {
+        "additionalProperties": false,
+        "properties": {
+          "configuration": {
+            "$ref": "#/components/schemas/PortfolioEditableConfig-Output"
+          },
+          "definition_state": {
+            "enum": [
+              "pending",
+              "saved",
+              "failed",
+              "cancelled"
+            ],
+            "title": "Definition State",
+            "type": "string"
+          },
+          "failure": {
+            "anyOf": [
+              {
+                "enum": [
+                  "capacity",
+                  "source_changed",
+                  "invalid_definition"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failure"
+          },
+          "index": {
+            "maximum": 63.0,
+            "minimum": 0.0,
+            "title": "Index",
+            "type": "integer"
+          },
+          "input_prepared": {
+            "title": "Input Prepared",
+            "type": "boolean"
+          },
+          "metrics": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ExperimentMetric"
+            },
+            "title": "Metrics",
+            "type": "array"
+          },
+          "rules": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StrategyTemplate-Output"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "strategy_name": {
+            "default": "组合回测",
+            "title": "Strategy Name",
+            "type": "string"
+          },
+          "strategy_version": {
+            "default": 1,
+            "minimum": 1.0,
+            "title": "Strategy Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "index",
+          "configuration",
+          "definition_state",
+          "input_prepared"
+        ],
+        "title": "ExperimentPreparationRow",
+        "type": "object"
+      },
       "ExperimentResultData": {
         "additionalProperties": false,
         "properties": {
@@ -7969,6 +8184,16 @@
           "spec_hash": {
             "title": "Spec Hash",
             "type": "string"
+          },
+          "template": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ExperimentTemplateResultIdentity"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
@@ -8180,6 +8405,52 @@
         "title": "ExperimentStatisticsData",
         "type": "object"
       },
+      "ExperimentTemplateResultIdentity": {
+        "additionalProperties": false,
+        "properties": {
+          "content_hash": {
+            "title": "Content Hash",
+            "type": "string"
+          },
+          "head": {
+            "$ref": "#/components/schemas/StrategyTemplateHead"
+          },
+          "rules": {
+            "$ref": "#/components/schemas/StrategyTemplate-Output"
+          },
+          "strategy_id": {
+            "title": "Strategy Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "strategy_id",
+          "head",
+          "rules",
+          "content_hash"
+        ],
+        "title": "ExperimentTemplateResultIdentity",
+        "type": "object"
+      },
+      "ExperimentTemplateSelection": {
+        "additionalProperties": false,
+        "properties": {
+          "head": {
+            "$ref": "#/components/schemas/StrategyTemplateHead"
+          },
+          "strategy_id": {
+            "pattern": "^template_[0-9a-f]{32}$",
+            "title": "Strategy Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "strategy_id",
+          "head"
+        ],
+        "title": "ExperimentTemplateSelection",
+        "type": "object"
+      },
       "ExperimentUnsealWrite": {
         "additionalProperties": false,
         "properties": {
@@ -8283,6 +8554,8 @@
               "registered",
               "cancellation_pending",
               "cancelled",
+              "already_completed",
+              "already_finished",
               "note_saved",
               "policy_saved",
               "outer_admitted"

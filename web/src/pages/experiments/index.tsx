@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { ApiError } from "@/api/client";
 import {
   type ExperimentCapabilities,
+  type ExperimentComparison,
   type ExperimentFamily,
   type ExperimentItem,
   type ExperimentMetric,
@@ -23,8 +24,10 @@ import { useCurrentMeta } from "@/api/useMeta";
 import { EChart } from "@/charts/EChart";
 import type { EChartOption } from "@/charts/echarts";
 import type { ChartColors } from "@/charts/tokens";
-import { formatCount, formatPercent } from "@/format/number";
+import { formatCount, formatNumber, formatPercent } from "@/format/number";
 import { formatShanghaiDateTime } from "@/format/time";
+import { ACTION_COPY, TemplateRulesSummary } from "@/pages/strategies/TemplateRules";
+import type { TemplateDetail } from "@/pages/strategies/templateApi";
 import { type DataColumn, DataTable } from "@/table/DataTable";
 import {
   Button,
@@ -40,6 +43,7 @@ import {
   Tip,
 } from "@/ui";
 import "./experiments.css";
+import { ExperimentTemplatePicker } from "./TemplatePicker";
 
 const statusLabel: Record<
   ExperimentItem["status"],
@@ -72,6 +76,59 @@ const parameters = {
 type Parameter = keyof typeof parameters;
 const phaseNames = { training: "训练", validation: "验证", outer: "样本外" } as const;
 
+const comparisonParameters: Record<string, string> = {
+  ...parameters,
+  "template.entry.kind": "入场方式",
+  "template.entry.pool_key": "股票池",
+  "template.entry.strategy_id": "策略信号",
+  "template.entry.version": "来源版本",
+  "template.entry.body_hash": "股票池来源",
+  "template.entry.source_hash": "信号来源",
+  "template.entry.action": "信号动作",
+  "template.exit.stop_loss": "止损",
+  "template.exit.take_profit": "止盈",
+  "template.exit.trailing_profit": "移动止盈",
+  "template.exit.max_holding_days": "持有上限",
+  "template.exit.exit_time": "定时退出",
+  "template.index_filter.benchmark_code": "过滤指数",
+  "template.index_filter.ma_days": "指数均线",
+  "template.index_filter.direction": "指数条件",
+};
+
+function comparisonParameter(path: string): string {
+  const known = comparisonParameters[path];
+  if (known) return known;
+  const condition = /^template\.entry\.conditions\[(\d+)\]\.(key|args\..+)$/.exec(path);
+  if (condition)
+    return `入场条件 ${Number(condition[1]) + 1}${condition[2] === "key" ? "" : " · 参数"}`;
+  return "其他设置";
+}
+
+function comparisonValue(path: string, value: string | null): string | null {
+  if (!path.startsWith("template.")) return value;
+  if (value === null) return "未启用";
+  if (/^template\.exit\.(stop_loss|take_profit|trailing_profit)$/.test(path))
+    return formatPercent(Number(value) * 100);
+  if (path === "template.exit.max_holding_days") return `${value} 个交易日`;
+  if (path === "template.index_filter.ma_days") return `${value} 日`;
+  if (path === "template.exit.exit_time" || path === "template.index_filter.benchmark_code")
+    return value;
+  if (path === "template.entry.kind")
+    return (
+      ({ pool: "股票池", conditions: "条件筛选", signal: "策略信号" } as Record<string, string>)[
+        value
+      ] ?? "查看设置"
+    );
+  if (path === "template.index_filter.direction")
+    return value === "above" ? "高于均线" : "低于均线";
+  if (path === "template.entry.action")
+    return ACTION_COPY[value as keyof typeof ACTION_COPY] ?? "查看设置";
+  if (/(_hash|pool_key|strategy_id)$/.test(path)) return "已绑定";
+  if (/^template\.entry\.conditions\[\d+\]\.key$/.test(path))
+    return value === "not_st" ? "非 ST" : "原筛选条件";
+  return Number.isFinite(Number(value)) ? value : "查看设置";
+}
+
 function metricText(metric: ExperimentMetric): string {
   if (metric.value === null) return "—";
   if (metric.unit === "percent") return formatPercent(metric.value * 100);
@@ -94,6 +151,50 @@ function Metrics({ values }: { values: ExperimentMetric[] }) {
       ))}
     </dl>
   );
+}
+
+function RowParameters({ item }: { item: Pick<FormalExperiment, "configuration" | "rules"> }) {
+  return (
+    <div>
+      <span>{parameterSummary(item.configuration)}</span>
+      <details>
+        <summary>全部参数</summary>
+        <Configuration value={item.configuration} />
+        {item.rules ? <TemplateRulesSummary rules={item.rules} sources={undefined} /> : null}
+      </details>
+    </div>
+  );
+}
+
+type MetricRow = Pick<FormalExperiment, "metrics">;
+
+function rowMetric(item: MetricRow, key: string): ExperimentMetric | undefined {
+  return item.metrics?.find((metric) => metric.key === key);
+}
+
+function metricsForRows(rows: MetricRow[]): ExperimentMetric[] {
+  return Array.from(
+    new Map(
+      rows.flatMap((item) => item.metrics ?? []).map((metric) => [metric.key, metric]),
+    ).values(),
+  );
+}
+
+function metricColumn<T extends MetricRow>(
+  metric: ExperimentMetric,
+  secondary: boolean,
+): DataColumn<T> {
+  return {
+    id: `metric-${metric.key}`,
+    header: metric.label,
+    value: (item) => rowMetric(item, metric.key)?.value ?? null,
+    cell: (item) => {
+      const value = rowMetric(item, metric.key);
+      return value ? metricText(value) : "—";
+    },
+    numeric: true,
+    secondary,
+  };
 }
 
 function Configuration({ value }: { value: ExperimentResult["configuration"] }) {
@@ -191,6 +292,20 @@ function Configuration({ value }: { value: ExperimentResult["configuration"] }) 
   );
 }
 
+function ResultRules({ result }: { result: ExperimentResult }) {
+  if (!result.template) return null;
+  return (
+    <div className="exp-template-rules">
+      <Tip
+        content={`策略 ${result.template.strategy_id}；定义 ${result.template.head.registration_fingerprint}；正文 ${result.template.content_hash}`}
+      >
+        <span className="exp-help">策略 · 第 {result.template.head.version} 版</span>
+      </Tip>
+      <TemplateRulesSummary rules={result.template.rules} sources={undefined} />
+    </div>
+  );
+}
+
 function Curves({ results }: { results: ExperimentResult[] }) {
   const build = useCallback(
     (colors: ChartColors): EChartOption => {
@@ -205,6 +320,7 @@ function Curves({ results }: { results: ExperimentResult[] }) {
         xAxis: { type: "category", data: dates, axisLabel: { color: colors.muted } },
         yAxis: {
           type: "value",
+          name: "归一净值",
           scale: true,
           axisLabel: { color: colors.muted },
           splitLine: { lineStyle: { color: colors.grid } },
@@ -251,7 +367,17 @@ function Curves({ results }: { results: ExperimentResult[] }) {
             rowKey={(point) => point.trade_date}
             columns={[
               { id: "date", header: "日期", value: (point) => point.trade_date },
-              { id: "nav", header: "净值", value: (point) => point.nav, numeric: true },
+              {
+                id: "nav",
+                header: "净值",
+                value: (point) => point.nav,
+                numeric: true,
+                cell: (point) => (
+                  <Tip content={`完整净值：${point.nav}`}>
+                    <span>{formatNumber(point.nav, 4)}</span>
+                  </Tip>
+                ),
+              },
               {
                 id: "return",
                 header: "日收益",
@@ -263,6 +389,14 @@ function Curves({ results }: { results: ExperimentResult[] }) {
                 id: "benchmark",
                 header: "基准",
                 value: (point) => point.benchmark_nav ?? null,
+                cell: (point) =>
+                  point.benchmark_nav == null ? (
+                    "—"
+                  ) : (
+                    <Tip content={`完整基准净值：${point.benchmark_nav}`}>
+                      <span>{formatNumber(point.benchmark_nav, 4)}</span>
+                    </Tip>
+                  ),
                 numeric: true,
                 secondary: true,
               },
@@ -313,17 +447,31 @@ function originalRequest(owner: string): ExperimentWrite | null {
 }
 
 function SearchForm({
+  owner,
+  generation,
   capabilities,
   busy,
   blocked,
   onSubmit,
 }: {
+  owner: string;
+  generation: string;
   capabilities: ExperimentCapabilities;
   busy: boolean;
   blocked: boolean;
   onSubmit: (request: ExperimentSearch) => void;
 }) {
   const defaults = capabilities.default_config;
+  const [execution, setExecution] = useState<"portfolio" | "template">("portfolio");
+  const [template, setTemplate] = useState<TemplateDetail | null>(null);
+  const base =
+    execution === "template" && template && defaults
+      ? {
+          ...defaults,
+          weight_rule: template.rules.weight_rule,
+          rebalance_rule: template.rules.rebalance_rule,
+        }
+      : defaults;
   const available = capabilities.sources.filter((source) => source.available);
   const [sourceId, setSourceId] = useState(`${defaults?.source_key}@${defaults?.source_version}`);
   const source =
@@ -357,7 +505,11 @@ function SearchForm({
   });
   const [error, setError] = useState("");
   const dimensions = Object.entries(values)
-    .filter(([, value]) => value.trim() !== "")
+    .filter(
+      ([key, value]) =>
+        value.trim() !== "" &&
+        (key !== "rebalance_rule.every_n_days" || base?.rebalance_rule.kind === "every_n"),
+    )
     .map(([parameter, value]) => ({
       parameter,
       values: value.split(/[,，]/).map((v) => v.trim()),
@@ -387,8 +539,12 @@ function SearchForm({
     });
   };
   const submit = () => {
+    if (execution === "template" && (!capabilities.can_search_templates || !template)) {
+      setError("请先核对策略及版本。");
+      return;
+    }
     if (
-      !defaults ||
+      !base ||
       !source ||
       !name.trim() ||
       ranges.length !== 6 ||
@@ -420,7 +576,12 @@ function SearchForm({
     }
     onSubmit({
       name: name.trim(),
-      base_config: { ...defaults, source_key: source.key, source_version: source.version },
+      base_config: { ...base, source_key: source.key, source_version: source.version },
+      ...(execution === "template" && template
+        ? {
+            template: { strategy_id: template.strategy_id, head: template.head },
+          }
+        : {}),
       protocol: {
         train_range: { start_date: ranges[0] ?? "", end_date: ranges[1] ?? "" },
         validation_range: { start_date: ranges[2] ?? "", end_date: ranges[3] ?? "" },
@@ -453,6 +614,33 @@ function SearchForm({
           onChange={(event) => setName(event.target.value)}
         />
       </label>
+      {capabilities.can_search_templates ? (
+        <>
+          <label className="field">
+            策略类型
+            <select
+              className="inp"
+              aria-label="实验执行方式"
+              value={execution}
+              onChange={(event) => {
+                setTemplate(null);
+                setExecution(event.target.value as "portfolio" | "template");
+              }}
+            >
+              <option value="portfolio">组合策略</option>
+              <option value="template">已保存策略</option>
+            </select>
+          </label>
+          {execution === "template" ? (
+            <ExperimentTemplatePicker
+              key={`${owner}:${generation}`}
+              owner={owner}
+              generation={generation}
+              onChange={setTemplate}
+            />
+          ) : null}
+        </>
+      ) : null}
       <label className="field">
         来源
         <select
@@ -474,8 +662,16 @@ function SearchForm({
           ))}
         </select>
       </label>
-      <Tip content="组合策略沿用已登记版本、撮合和费用。搜索只改变下列参数。验证承接训练末账户，样本外另开账户。">
-        <span className="exp-help">组合策略 · 第 1 版</span>
+      <Tip
+        content={
+          execution === "template"
+            ? "沿用所选版本的完整规则、撮合和费用。搜索只改变下列参数；入场与退出规则保持原值。"
+            : "组合策略沿用已登记版本、撮合和费用。搜索只改变下列参数。验证承接训练末账户，样本外另开账户。"
+        }
+      >
+        <span className="exp-help">
+          {execution === "template" ? "参数搜索说明" : "组合策略 · 第 1 版"}
+        </span>
       </Tip>
       <div className="exp-range-grid">
         {["训练开始", "训练结束", "验证开始", "验证结束", "样本外开始", "样本外结束"].map(
@@ -523,7 +719,7 @@ function SearchForm({
         {(Object.keys(parameters) as Parameter[])
           .filter(
             (key) =>
-              key !== "rebalance_rule.every_n_days" || defaults?.rebalance_rule.kind === "every_n",
+              key !== "rebalance_rule.every_n_days" || base?.rebalance_rule.kind === "every_n",
           )
           .map((key) => (
             <label className="field" key={key}>
@@ -610,7 +806,12 @@ function SearchForm({
         </Tip>
       </div>
       {error ? <p role="alert">{error}</p> : null}
-      <Button type="submit" disabled={busy || blocked || !capabilities.can_search}>
+      <Button
+        type="submit"
+        disabled={
+          busy || blocked || !capabilities.can_search || (execution === "template" && !template)
+        }
+      >
         开始搜索
       </Button>
     </form>
@@ -622,6 +823,8 @@ export default function ExperimentsPage() {
   const owner = meta.isError ? null : (meta.data?.data.viewer ?? null);
   const generation = meta.isError ? null : (meta.data?.data.generation?.generation_id ?? null);
   const caps = useExperimentCapabilities(owner, generation);
+  const [legacyView, setLegacyView] = useState<{ owner: string; generation: string } | null>(null);
+  const legacy = legacyView?.owner === owner && legacyView?.generation === generation;
   if (owner && generation && caps.isLoading)
     return (
       <>
@@ -629,35 +832,55 @@ export default function ExperimentsPage() {
         <PageSkeleton label="正在加载实验记录" />
       </>
     );
-  if (caps.error instanceof ApiError && caps.error.status === 409)
+  if (owner && generation && caps.error)
     return (
       <>
         <PageHeader eyebrow="策略与验证" title="我的实验" />
         <Panel>
-          <p role="alert">数据已更新，请重新查看实验。</p>
+          <p role="alert">
+            {caps.error instanceof ApiError && caps.error.status === 409
+              ? "数据已更新，请重新查看实验。"
+              : caps.error instanceof ApiError && [401, 403].includes(caps.error.status)
+                ? "当前账号无法查看本人实验，请核对登录与权限。"
+                : "实验权限暂时无法核对，请稍后重试。"}
+          </p>
         </Panel>
       </>
     );
-  if (owner && generation && caps.data?.available)
+  if (owner && generation && caps.data?.available && !legacy)
     return (
       <FormalExperimentsPage
         key={`${owner}:${generation}`}
         owner={owner}
         generation={generation}
         caps={caps.data}
+        onLegacy={() => setLegacyView({ owner, generation })}
       />
     );
-  return <LegacyExperimentsPage />;
+  return (
+    <>
+      {owner && generation && caps.data?.available ? (
+        <div className="exp-toolbar">
+          <Button variant="ghost" onClick={() => setLegacyView(null)}>
+            我的实验
+          </Button>
+        </div>
+      ) : null}
+      <LegacyExperimentsPage />
+    </>
+  );
 }
 
 function FormalExperimentsPage({
   owner,
   generation,
   caps,
+  onLegacy,
 }: {
   owner: string;
   generation: string;
   caps: ExperimentCapabilities;
+  onLegacy: () => void;
 }) {
   const [refresh, setRefresh] = useState(0);
   const [cursors, setCursors] = useState<(string | null)[]>([null]);
@@ -671,6 +894,7 @@ function FormalExperimentsPage({
   const [pending, setPending] = useState<ExperimentWrite | null>(() => originalRequest(owner));
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
+  const [accessFailure, setAccessFailure] = useState<ApiError | null>(null);
   const [unseal, setUnseal] = useState<{
     family: ExperimentFamily;
     item: FormalExperiment;
@@ -723,9 +947,22 @@ function FormalExperimentsPage({
     phase,
     metric,
   );
-  const conflict = [mine, family, result, stats, comparison, heat].some(
-    (query) => query.error instanceof ApiError && query.error.status === 409,
-  );
+  const boundaryError = [mine, family, result, stats, comparison, heat].find(
+    (query) => query.error instanceof ApiError && [401, 403, 409].includes(query.error.status),
+  )?.error;
+  const accessError = accessFailure ?? (boundaryError instanceof ApiError ? boundaryError : null);
+  useEffect(() => {
+    if (!(boundaryError instanceof ApiError)) return;
+    setAccessFailure(boundaryError);
+    setChosen([]);
+    setCompareOpen(false);
+    setFamilyId(null);
+    setSelected(null);
+    setUnseal(null);
+    setNewOpen(false);
+    setPolicyOpen(false);
+    focusReturn.current = null;
+  }, [boundaryError]);
   const close = () => {
     focusReturn.current = {
       owner,
@@ -918,9 +1155,17 @@ function FormalExperimentsPage({
       ),
     },
     {
+      id: "strategy",
+      header: "策略 / 版本",
+      value: (item) => item.strategy_name ?? "组合回测",
+      cell: (item) => `${item.strategy_name ?? "组合回测"} · 第 ${item.strategy_version ?? 1} 版`,
+      wrap: true,
+    },
+    {
       id: "parameters",
       header: "参数",
       value: (item) => parameterSummary(item.configuration),
+      cell: (item) => <RowParameters item={item} />,
       wrap: true,
     },
     {
@@ -943,6 +1188,9 @@ function FormalExperimentsPage({
       value: (item) => (item.phase === "outer" ? "样本外" : "训练与验证"),
       secondary: true,
     },
+    ...metricsForRows(mine.data?.items ?? [])
+      .filter((metric) => ["total_return", "max_drawdown", "sharpe"].includes(metric.key))
+      .map((metric) => metricColumn<FormalExperiment>(metric, metric.key !== "total_return")),
     {
       id: "time",
       header: "登记",
@@ -951,12 +1199,16 @@ function FormalExperimentsPage({
       secondary: true,
     },
   ];
-  if (conflict)
+  if (accessError)
     return (
       <>
         <PageHeader eyebrow="策略与验证" title="我的实验" />
         <Panel>
-          <div role="alert">数据已更新，请重新查看实验。</div>
+          <div role="alert">
+            {accessError.status === 409
+              ? "数据已更新，请重新查看实验。"
+              : "当前账号无法查看本人实验，请核对登录与权限。"}
+          </div>
           <Button onClick={() => window.location.reload()}>重新加载</Button>
         </Panel>
       </>
@@ -968,6 +1220,9 @@ function FormalExperimentsPage({
     <>
       <PageHeader eyebrow="策略与验证" title="我的实验" note="搜索参数，比较结果，验证样本外表现" />
       <div className="exp-toolbar">
+        <Button variant="ghost" onClick={onLegacy}>
+          旧共享记录
+        </Button>
         <Button
           disabled={!caps.can_search || !!pending}
           onClick={(event) => open(event.currentTarget, () => setNewOpen(true))}
@@ -1014,6 +1269,67 @@ function FormalExperimentsPage({
               </Button>
             ) : null}
           </div>
+        </Panel>
+      ) : null}
+      {!mine.error && (mine.data?.preparing_families?.length ?? 0) > 0 ? (
+        <Panel title="准备记录" flush>
+          {mine.data?.preparing_window_truncated ? (
+            <Tip content="仅展示最近的准备记录；每份实验保留全部计划项。">
+              <span className="exp-window">显示最近的准备记录</span>
+            </Tip>
+          ) : null}
+          <DataTable
+            label="准备中的实验"
+            rows={mine.data?.preparing_families ?? []}
+            rowKey={(record) => record.family_id}
+            columns={[
+              {
+                id: "name",
+                header: "实验",
+                value: (record) => record.name,
+                wrap: true,
+                cell: (record) => (
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    id={`experiment-preparation-${record.family_id}`}
+                    onClick={(event) =>
+                      open(event.currentTarget, () => {
+                        setFamilyId(record.family_id);
+                        setSelected(null);
+                      })
+                    }
+                  >
+                    {record.name}
+                  </Button>
+                ),
+              },
+              {
+                id: "total",
+                header: "计划",
+                value: (record) => record.planned_count,
+                cell: (record) => `计划 ${record.planned_count} 次`,
+                numeric: true,
+              },
+              {
+                id: "progress",
+                header: "进度",
+                value: (record) =>
+                  `已保存 ${record.definition_saved_count} · 已准备 ${record.input_prepared_count}`,
+                wrap: true,
+              },
+              {
+                id: "state",
+                header: "状态",
+                value: (record) =>
+                  record.state === "cancelled"
+                    ? "已取消"
+                    : record.failed_count
+                      ? `未完成 ${record.failed_count} 项`
+                      : "准备中",
+              },
+            ]}
+          />
         </Panel>
       ) : null}
       <Panel title="全部尝试" flush>
@@ -1100,6 +1416,7 @@ function FormalExperimentsPage({
                     <h3>实验 {index === 0 ? "A" : "B"}</h3>
                     <Metrics values={entry.metrics} />
                     <Configuration value={entry.configuration} />
+                    <ResultRules result={entry} />
                   </article>
                 ))}
               </div>
@@ -1121,15 +1438,27 @@ function FormalExperimentsPage({
                   {
                     id: "name",
                     header: "参数",
-                    value: (row) => parameters[row.path as Parameter] ?? "其他设置",
+                    value: (row) => comparisonParameter(row.path),
                     cell: (row) => (
                       <Tip content={row.path}>
-                        <span>{parameters[row.path as Parameter] ?? "其他设置"}</span>
+                        <span>{comparisonParameter(row.path)}</span>
                       </Tip>
                     ),
                   },
-                  { id: "a", header: "A", value: (row) => row.a },
-                  { id: "b", header: "B", value: (row) => row.b },
+                  ...(["a", "b"] as const).map((side) => ({
+                    id: side,
+                    header: side.toUpperCase(),
+                    value: (row: ExperimentComparison["differences"][number]) =>
+                      comparisonValue(row.path, row[side]),
+                    cell: (row: ExperimentComparison["differences"][number]) =>
+                      row.path.startsWith("template.") ? (
+                        <Tip content={row[side] ?? undefined}>
+                          <span>{comparisonValue(row.path, row[side])}</span>
+                        </Tip>
+                      ) : (
+                        row[side]
+                      ),
+                  })),
                 ]}
               />
             </>
@@ -1144,6 +1473,8 @@ function FormalExperimentsPage({
         title="新建实验"
       >
         <SearchForm
+          owner={owner}
+          generation={generation}
           capabilities={caps}
           busy={busy}
           blocked={!!pending}
@@ -1217,9 +1548,10 @@ function FormalExperimentsPage({
                 disabled={
                   busy ||
                   !!pending ||
-                  currentFamily.items.every(
-                    (item) => !["registered", "running"].includes(item.status),
-                  )
+                  (currentFamily.preparation_state !== "preparing" &&
+                    currentFamily.items.every(
+                      (item) => !["registered", "running"].includes(item.status),
+                    ))
                 }
                 onClick={() =>
                   void write({
@@ -1257,28 +1589,134 @@ function FormalExperimentsPage({
                 {currentFamily.outer_admitted ? "已解封" : "解封样本外"}
               </Button>
             </div>
-            <DataTable
-              label="完整参数与状态"
-              rows={currentFamily.items}
-              columns={[
-                {
-                  id: "configuration",
-                  header: "组合",
-                  value: (item) => parameterSummary(item.configuration),
-                  cell: (item) => (
-                    <Button variant="ghost" size="sm" onClick={() => setSelected(item)}>
-                      第 {item.index + 1} 项 · {parameterSummary(item.configuration)}
-                    </Button>
+            {(currentFamily.preparations?.length ?? 0) > 0 ? (
+              <>
+                <h3>
+                  {currentFamily.preparation_state === "cancelled" ? "准备已取消" : "准备进度"}
+                </h3>
+                <Tip content="每个计划项均保留。规则保存或输入准备失败的项不会计作已运行，也不会生成回测统计。">
+                  <span className="exp-help">准备进度说明</span>
+                </Tip>
+                <DataTable
+                  label="完整准备清单"
+                  rows={currentFamily.preparations ?? []}
+                  rowKey={(slot) => String(slot.index)}
+                  columns={[
+                    {
+                      id: "index",
+                      header: "计划项",
+                      value: (slot) => slot.index + 1,
+                      numeric: true,
+                    },
+                    {
+                      id: "strategy",
+                      header: "策略 / 版本",
+                      value: (slot) => slot.strategy_name ?? "组合回测",
+                      cell: (slot) =>
+                        `${slot.strategy_name ?? "组合回测"} · 第 ${slot.strategy_version ?? 1} 版`,
+                      wrap: true,
+                    },
+                    {
+                      id: "config",
+                      header: "参数",
+                      value: (slot) => parameterSummary(slot.configuration),
+                      wrap: true,
+                      cell: (slot) => (
+                        <>
+                          <RowParameters item={slot} />
+                          <details>
+                            <summary>全部指标</summary>
+                            <Metrics values={slot.metrics ?? []} />
+                          </details>
+                        </>
+                      ),
+                    },
+                    {
+                      id: "state",
+                      header: "状态",
+                      value: (slot) =>
+                        slot.definition_state === "cancelled"
+                          ? "已取消"
+                          : slot.definition_state === "failed"
+                            ? "未完成"
+                            : slot.input_prepared
+                              ? "已准备"
+                              : slot.definition_state === "saved"
+                                ? "规则已保存"
+                                : "待准备",
+                    },
+                    {
+                      id: "reason",
+                      header: "原因",
+                      value: (slot) =>
+                        slot.failure === "capacity"
+                          ? "容量不足"
+                          : slot.failure === "source_changed"
+                            ? "来源已更新"
+                            : slot.failure === "invalid_definition"
+                              ? "规则无法保存"
+                              : "—",
+                      wrap: true,
+                    },
+                    ...metricsForRows(currentFamily.preparations ?? []).map((metric) =>
+                      metricColumn<NonNullable<ExperimentFamily["preparations"]>[number]>(
+                        metric,
+                        metric.key !== "total_return",
+                      ),
+                    ),
+                  ]}
+                />
+              </>
+            ) : null}
+            {currentFamily.items.length > 0 ? (
+              <DataTable
+                label="完整参数与指标"
+                rows={currentFamily.items}
+                columns={[
+                  {
+                    id: "configuration",
+                    header: "组合",
+                    value: (item) => parameterSummary(item.configuration),
+                    cell: (item) => (
+                      <>
+                        <Button variant="ghost" size="sm" onClick={() => setSelected(item)}>
+                          第 {item.index + 1} 项
+                        </Button>
+                        <RowParameters item={item} />
+                        <details>
+                          <summary>全部指标</summary>
+                          <Metrics values={item.metrics ?? []} />
+                        </details>
+                      </>
+                    ),
+                    wrap: true,
+                  },
+                  {
+                    id: "strategy",
+                    header: "策略 / 版本",
+                    value: (item) => item.strategy_name ?? "组合回测",
+                    cell: (item) =>
+                      `${item.strategy_name ?? "组合回测"} · 第 ${item.strategy_version ?? 1} 版`,
+                    wrap: true,
+                  },
+                  {
+                    id: "state",
+                    header: "状态",
+                    value: (item) => (item.cancellation_pending ? "取消待确认" : item.label),
+                  },
+                  {
+                    id: "reason",
+                    header: "原因",
+                    value: (item) => item.message ?? null,
+                    wrap: true,
+                  },
+                  ...metricsForRows(currentFamily.items).map((metric) =>
+                    metricColumn<FormalExperiment>(metric, metric.key !== "total_return"),
                   ),
-                },
-                {
-                  id: "state",
-                  header: "状态",
-                  value: (item) => (item.cancellation_pending ? "取消待确认" : item.label),
-                },
-              ]}
-              rowKey={(item) => item.experiment_id}
-            />
+                ]}
+                rowKey={(item) => item.experiment_id}
+              />
+            ) : null}
             <label className="field">
               研究备注
               <textarea
@@ -1328,6 +1766,7 @@ function FormalExperimentsPage({
                 </Tip>
                 <Curves results={[result.data]} />
                 <Configuration value={result.data.configuration} />
+                <ResultRules result={result.data} />
                 <h3>全区间指标</h3>
                 <Metrics values={result.data.metrics} />
                 <label className="field">

@@ -4128,6 +4128,11 @@ export interface components {
             /** Message */
             message?: string | null;
             /**
+             * Metrics
+             * @default []
+             */
+            metrics: components["schemas"]["ExperimentMetric"][];
+            /**
              * Phase
              * @enum {string}
              */
@@ -4139,11 +4144,22 @@ export interface components {
             registered_at: string;
             /** Result Hash */
             result_hash?: string | null;
+            rules?: components["schemas"]["StrategyTemplate-Output"] | null;
             /**
              * Status
              * @enum {string}
              */
             status: "registered" | "running" | "executed" | "succeeded" | "failed" | "cancelled";
+            /**
+             * Strategy Name
+             * @default 组合回测
+             */
+            strategy_name: string;
+            /**
+             * Strategy Version
+             * @default 1
+             */
+            strategy_version: number;
         };
         /** ExperimentCancelWrite */
         ExperimentCancelWrite: {
@@ -4173,6 +4189,11 @@ export interface components {
             can_edit_policy: boolean;
             /** Can Search */
             can_search: boolean;
+            /**
+             * Can Search Templates
+             * @default false
+             */
+            can_search_templates: boolean;
             /** Can Unseal */
             can_unseal: boolean;
             default_config?: components["schemas"]["PortfolioEditableConfig-Output"] | null;
@@ -4252,6 +4273,7 @@ export interface components {
              * @default 0
              */
             target_period_sharpe: number | string;
+            template?: components["schemas"]["ExperimentTemplateSelection"] | null;
         };
         /** ExperimentFamilyData */
         ExperimentFamilyData: {
@@ -4284,6 +4306,17 @@ export interface components {
             planned_count: number;
             /** Potential Count */
             potential_count: number;
+            /**
+             * Preparation State
+             * @default ready
+             * @enum {string}
+             */
+            preparation_state: "preparing" | "ready" | "cancelled";
+            /**
+             * Preparations
+             * @default []
+             */
+            preparations: components["schemas"]["ExperimentPreparationRow"][];
             protocol: components["schemas"]["PortfolioExperimentProtocol"];
             /**
              * Registered At
@@ -4409,6 +4442,16 @@ export interface components {
             next_cursor?: string | null;
             /** Oldest Registered At */
             oldest_registered_at?: string | null;
+            /**
+             * Preparing Families
+             * @default []
+             */
+            preparing_families: components["schemas"]["ExperimentPreparationFamily"][];
+            /**
+             * Preparing Window Truncated
+             * @default false
+             */
+            preparing_window_truncated: boolean;
             /** Retained Count */
             retained_count: number;
             /** Truncated */
@@ -4485,6 +4528,64 @@ export interface components {
              */
             requested_at: string;
         };
+        /** ExperimentPreparationFamily */
+        ExperimentPreparationFamily: {
+            /** Cancelled Count */
+            cancelled_count: number;
+            /** Definition Saved Count */
+            definition_saved_count: number;
+            /** Failed Count */
+            failed_count: number;
+            /** Family Id */
+            family_id: string;
+            /** Input Prepared Count */
+            input_prepared_count: number;
+            /** Name */
+            name: string;
+            /** Planned Count */
+            planned_count: number;
+            /**
+             * Registered At
+             * Format: date-time
+             */
+            registered_at: string;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "preparing" | "cancelled";
+        };
+        /** ExperimentPreparationRow */
+        ExperimentPreparationRow: {
+            configuration: components["schemas"]["PortfolioEditableConfig-Output"];
+            /**
+             * Definition State
+             * @enum {string}
+             */
+            definition_state: "pending" | "saved" | "failed" | "cancelled";
+            /** Failure */
+            failure?: ("capacity" | "source_changed" | "invalid_definition") | null;
+            /** Index */
+            index: number;
+            /** Input Prepared */
+            input_prepared: boolean;
+            /**
+             * Metrics
+             * @default []
+             */
+            metrics: components["schemas"]["ExperimentMetric"][];
+            rules?: components["schemas"]["StrategyTemplate-Output"] | null;
+            /**
+             * Strategy Name
+             * @default 组合回测
+             */
+            strategy_name: string;
+            /**
+             * Strategy Version
+             * @default 1
+             */
+            strategy_version: number;
+        };
         /** ExperimentResultData */
         ExperimentResultData: {
             /** Basis Hash */
@@ -4519,6 +4620,7 @@ export interface components {
             result_hash: string;
             /** Spec Hash */
             spec_hash: string;
+            template?: components["schemas"]["ExperimentTemplateResultIdentity"] | null;
         };
         /** ExperimentSearchWrite */
         ExperimentSearchWrite: {
@@ -4590,6 +4692,21 @@ export interface components {
             /** Search Count */
             search_count: number;
         };
+        /** ExperimentTemplateResultIdentity */
+        ExperimentTemplateResultIdentity: {
+            /** Content Hash */
+            content_hash: string;
+            head: components["schemas"]["StrategyTemplateHead"];
+            rules: components["schemas"]["StrategyTemplate-Output"];
+            /** Strategy Id */
+            strategy_id: string;
+        };
+        /** ExperimentTemplateSelection */
+        ExperimentTemplateSelection: {
+            head: components["schemas"]["StrategyTemplateHead"];
+            /** Strategy Id */
+            strategy_id: string;
+        };
         /** ExperimentUnsealWrite */
         ExperimentUnsealWrite: {
             /**
@@ -4641,7 +4758,7 @@ export interface components {
              * Status
              * @enum {string}
              */
-            status: "pending" | "processing" | "unknown" | "failed" | "registered" | "cancellation_pending" | "cancelled" | "note_saved" | "policy_saved" | "outer_admitted";
+            status: "pending" | "processing" | "unknown" | "failed" | "registered" | "cancellation_pending" | "cancelled" | "already_completed" | "already_finished" | "note_saved" | "policy_saved" | "outer_admitted";
             /** Version */
             version?: number | null;
         };

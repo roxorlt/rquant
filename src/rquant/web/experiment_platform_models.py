@@ -20,6 +20,8 @@ from rquant.perf import PerformanceSummary
 from rquant.portfolio_backtest_models import PortfolioPerformance
 from rquant.portfolio_backtest_source import PortfolioExperimentProtocol
 from rquant.runtime_contracts import RuntimeContractModel
+from rquant.strategy_authoring_commands import StrategyTemplateHead
+from rquant.strategy_template import StrategyTemplate
 from rquant.web.models.backtests import PortfolioEditableConfig
 
 
@@ -47,6 +49,7 @@ class ExperimentCapabilities(RuntimeContractModel):
     sources: tuple[ExperimentSourceOption, ...] = ()
     default_config: PortfolioEditableConfig | None = None
     policy: HoldoutPolicy | None = None
+    can_search_templates: bool = False
 
 
 class ExperimentMetric(RuntimeContractModel):
@@ -70,6 +73,22 @@ class ExperimentAttemptRow(RuntimeContractModel):
     result_hash: str | None = None
     message: str | None = None
     cancellation_pending: bool = False
+    strategy_name: str = "组合回测"
+    strategy_version: int = Field(default=1, ge=1)
+    rules: StrategyTemplate | None = None
+    metrics: tuple[ExperimentMetric, ...] = ()
+
+
+class ExperimentPreparationFamily(RuntimeContractModel):
+    family_id: str
+    name: str
+    registered_at: datetime
+    state: Literal["preparing", "cancelled"]
+    planned_count: int
+    definition_saved_count: int
+    input_prepared_count: int
+    failed_count: int
+    cancelled_count: int
 
 
 class ExperimentMineData(RuntimeContractModel):
@@ -79,6 +98,20 @@ class ExperimentMineData(RuntimeContractModel):
     truncated: bool
     oldest_registered_at: datetime | None = None
     next_cursor: str | None = None
+    preparing_families: tuple[ExperimentPreparationFamily, ...] = ()
+    preparing_window_truncated: bool = False
+
+
+class ExperimentPreparationRow(RuntimeContractModel):
+    index: int = Field(ge=0, le=63)
+    configuration: PortfolioEditableConfig
+    definition_state: Literal["pending", "saved", "failed", "cancelled"]
+    input_prepared: bool
+    failure: Literal["capacity", "source_changed", "invalid_definition"] | None = None
+    strategy_name: str = "组合回测"
+    strategy_version: int = Field(default=1, ge=1)
+    rules: StrategyTemplate | None = None
+    metrics: tuple[ExperimentMetric, ...] = ()
 
 
 class ExperimentFamilyData(RuntimeContractModel):
@@ -98,6 +131,8 @@ class ExperimentFamilyData(RuntimeContractModel):
     note: str
     note_version: int
     outer_admitted: bool
+    preparation_state: Literal["preparing", "ready", "cancelled"] = "ready"
+    preparations: tuple[ExperimentPreparationRow, ...] = ()
 
 
 class ExperimentCurvePoint(RuntimeContractModel):
@@ -116,6 +151,13 @@ class ExperimentPhasePerformance(RuntimeContractModel):
     message: str | None = None
 
 
+class ExperimentTemplateResultIdentity(RuntimeContractModel):
+    strategy_id: str
+    head: StrategyTemplateHead
+    rules: StrategyTemplate
+    content_hash: str
+
+
 class ExperimentResultData(RuntimeContractModel):
     experiment_id: str
     family_id: str
@@ -131,6 +173,7 @@ class ExperimentResultData(RuntimeContractModel):
     phases: tuple[ExperimentPhasePerformance, ...]
     metrics: tuple[ExperimentMetric, ...]
     curves: tuple[ExperimentCurvePoint, ...]
+    template: ExperimentTemplateResultIdentity | None = None
 
 
 class ExperimentParameterDifference(RuntimeContractModel):
@@ -244,6 +287,8 @@ class ExperimentWriteReceipt(RuntimeContractModel):
         "registered",
         "cancellation_pending",
         "cancelled",
+        "already_completed",
+        "already_finished",
         "note_saved",
         "policy_saved",
         "outer_admitted",

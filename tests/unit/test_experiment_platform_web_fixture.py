@@ -142,6 +142,14 @@ def test_exp23_typed_web_fixture_from_original_synthetic_sealed_results(
             a=facts[0].attempt.spec.experiment_id,
             b=facts[1].attempt.spec.experiment_id,
         )
+        for row in fixture["mine"]["data"]["items"]:
+            full = fixture["results"][row["experiment_id"]]["data"]
+            assert row["metrics"] == full["metrics"]
+            assert row["result_hash"] == full["result_hash"]
+            assert row["configuration"] == full["configuration"]
+        assert fixture["family"]["data"]["items"] == sorted(
+            fixture["mine"]["data"]["items"], key=lambda row: row["index"]
+        )
         assert (
             client.get(
                 prefix + "/results/" + facts[0].attempt.spec.experiment_id,
@@ -150,6 +158,7 @@ def test_exp23_typed_web_fixture_from_original_synthetic_sealed_results(
             == 409
         )
     output = Path(__file__).resolve().parents[2] / (
-        "data/verification/experiment-platform-20261005/implementation/typed-web-fixture.json"
+        "data/verification/experiment-platform-20261005/implementation/final-repair-01/typed-web-fixture-04.json"
     )
+    assert not output.exists(), "retain the preceding actual fixture"
     output.write_text(json.dumps(fixture, ensure_ascii=False, indent=2) + "\n")

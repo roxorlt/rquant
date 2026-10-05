@@ -19,11 +19,14 @@ from rquant.experiment_platform_projection import (
     PRIVATE_TABLES,
     ExperimentAttemptFact,
     ExperimentFamilyFact,
+    ExperimentPlannedSlotFact,
     ExperimentPrivateResultAuthority,
 )
 from rquant.portfolio_backtest_artifact import PortfolioResultReader
 from rquant.portfolio_backtest_models import PortfolioBacktestConfig
 from rquant.runtime_contracts import RuntimeContractModel, canonical_sha256
+from rquant.strategy_template import StrategyTemplate
+from rquant.strategy_template_artifact import StrategyTemplateSealedResultReader
 from rquant.web import readers
 from rquant.web.experiment_platform_models import (
     ExperimentAttemptRow,
@@ -32,6 +35,8 @@ from rquant.web.experiment_platform_models import (
     ExperimentFamilyData,
     ExperimentHeatmapData,
     ExperimentMineData,
+    ExperimentPreparationFamily,
+    ExperimentPreparationRow,
     ExperimentResultData,
     ExperimentSourceOption,
     ExperimentStatisticsData,
@@ -80,6 +85,7 @@ class ExperimentWebService:
         self,
         *,
         results: PortfolioResultReader | None = None,
+        template_results: StrategyTemplateSealedResultReader | None = None,
         private_authority: ExperimentPrivateResultAuthority | None = None,
         gateway: LabControlGateway | None = None,
         profiles: tuple[ExperimentSourceProfile, ...] = (),
@@ -87,6 +93,7 @@ class ExperimentWebService:
         owners: frozenset[str] = frozenset(),
         administrators: frozenset[str] = frozenset(),
         enabled: bool = False,
+        template_available: bool = False,
     ) -> None:
         if not administrators <= owners:
             raise ValueError("experiment administrators need owner permission")
@@ -100,9 +107,11 @@ class ExperimentWebService:
         ) not in {(p.source_key, p.source_version) for p in profiles}:
             raise ValueError("default experiment config has no trusted source")
         self.results, self.private_authority = results, private_authority
+        self.template_results = template_results
         self.gateway = gateway or LabControlGateway()
         self.profiles, self.default_config = profiles, default_config
         self.owners, self.administrators, self.enabled = owners, administrators, enabled
+        self.template_available = template_available
 
     def can_submit(self, owner: str, *, policy: bool = False) -> bool:
         # The writer performs original-request lookup before applying its current switch.
@@ -171,6 +180,9 @@ class ExperimentWebService:
             if self.default_config is None
             else PortfolioEditableConfig.from_domain(self.default_config),
             policy=policy,
+            can_search_templates=ready
+            and self.template_available
+            and self.template_results is not None,
         )
 
     def _family(
@@ -231,15 +243,61 @@ class ExperimentWebService:
             (owner, family.family_id),
         ).fetchall()
         facts = tuple(self._fact(borrowed, owner, row[0]) for row in rows)
+        if family.preparation_state != "ready":
+            if facts or len(family.preparations) != family.planned_count:
+                raise ValueError("preparing family has unexpected jobs or missing planned slots")
+            return ()
         if len(facts) != family.planned_count or sorted(f.index for f in facts) != list(
             range(family.planned_count)
         ):
             raise ValueError("private full family rows differ")
         return tuple(sorted(facts, key=lambda f: f.index))
 
+    @staticmethod
+    def _strategy(
+        family: ExperimentFamilyFact, configuration: PortfolioBacktestConfig
+    ) -> tuple[str, int, StrategyTemplate | None]:
+        if family.request.template is None:
+            return "组合回测", 1, None
+        if family.template_name is None or family.template_rules is None:
+            raise ValueError("private row lost its registered template baseline")
+        rules = StrategyTemplate.model_validate(
+            family.template_rules.model_dump(mode="python")
+            | {
+                "weight_rule": configuration.weight_rule,
+                "rebalance_rule": configuration.rebalance_rule,
+            }
+        )
+        return family.template_name, family.request.template.head.version, rules
+
+    def _preparation(
+        self, slot: ExperimentPlannedSlotFact, family: ExperimentFamilyFact
+    ) -> ExperimentPreparationRow:
+        from rquant.experiment_platform_evidence import unavailable_experiment_metrics
+
+        strategy_name, strategy_version, rules = self._strategy(family, slot.configuration)
+        return ExperimentPreparationRow(
+            index=slot.index,
+            configuration=PortfolioEditableConfig.from_domain(slot.configuration),
+            definition_state=slot.definition_state,
+            input_prepared=slot.input_prepared,
+            failure=slot.failure,
+            strategy_name=strategy_name,
+            strategy_version=strategy_version,
+            rules=rules,
+            metrics=unavailable_experiment_metrics(),
+        )
+
     def _row(
         self, fact: ExperimentAttemptFact, family: ExperimentFamilyFact
     ) -> ExperimentAttemptRow:
+        from rquant.experiment_platform_evidence import (
+            read_experiment_result,
+            unavailable_experiment_metrics,
+        )
+
+        if (fact.owner, fact.family_id) != (family.owner, family.family_id):
+            raise PermissionError("private row belongs to another owner or family")
         status = fact.attempt.status.value
         labels = {
             "registered": "等待运行",
@@ -256,6 +314,28 @@ class ExperimentWebService:
         )
         if status == "failed":
             message = "本次未完成，原尝试仍计入搜索总数。"
+        elif status == "cancelled":
+            message = "已取消，原尝试仍计入搜索总数。"
+        metrics = unavailable_experiment_metrics()
+        strategy_name, strategy_version, rules = self._strategy(family, fact.configuration)
+        if status in ("executed", "succeeded") and fact.result_hash is not None:
+            if self.results is None or self.private_authority is None:
+                message = "完整指标暂时无法读取，请稍后重试。"
+            else:
+                result = read_experiment_result(
+                    fact,
+                    family,
+                    results=self.results,
+                    authority=self.private_authority,
+                    template_results=self.template_results,
+                )
+                if rules is not None and (
+                    result.template is None or result.template.rules != rules
+                ):
+                    raise ValueError("private row rules differ from its sealed result")
+                metrics = result.metrics
+                if any(metric.value is None for metric in metrics):
+                    message = "部分指标暂不可计算。"
         return ExperimentAttemptRow(
             experiment_id=fact.attempt.spec.experiment_id,
             family_id=fact.family_id,
@@ -270,6 +350,10 @@ class ExperimentWebService:
             result_hash=fact.result_hash,
             message=message,
             cancellation_pending=fact.child.cancel_state == "pending",
+            strategy_name=strategy_name,
+            strategy_version=strategy_version,
+            rules=rules,
+            metrics=metrics,
         )
 
     def mine(
@@ -283,6 +367,35 @@ class ExperimentWebService:
     ) -> ExperimentMineData:
         if not self._published(borrowed):
             return ExperimentMineData(available=False, retained_count=0, truncated=False)
+        preparation_rows = borrowed.cursor.execute(
+            "SELECT payload_json FROM experiment_private_family WHERE owner=? AND "
+            "json_extract_string(payload_json,'$.preparation_state')!='ready' "
+            "ORDER BY json_extract_string(payload_json,'$.registered_at') "
+            "DESC,family_id DESC LIMIT 501",
+            (owner,),
+        ).fetchall()
+        preparing = tuple(ExperimentFamilyFact.model_validate_json(r[0]) for r in preparation_rows)
+        if any(
+            f.owner != owner
+            or f.preparation_state == "ready"
+            or len(f.preparations) != f.planned_count
+            for f in preparing
+        ):
+            raise ValueError("private planned owner window conflicts")
+        preparing_rows = tuple(
+            ExperimentPreparationFamily(
+                family_id=f.family_id,
+                name=f.name,
+                registered_at=f.registered_at,
+                state=f.preparation_state,
+                planned_count=f.planned_count,
+                definition_saved_count=sum(p.definition_state == "saved" for p in f.preparations),
+                input_prepared_count=sum(p.input_prepared for p in f.preparations),
+                failed_count=sum(p.definition_state == "failed" for p in f.preparations),
+                cancelled_count=sum(p.definition_state == "cancelled" for p in f.preparations),
+            )
+            for f in preparing
+        )
         window = borrowed.cursor.execute(
             (
                 "SELECT retained_count,truncated,oldest_registered_at FROM "
@@ -300,7 +413,13 @@ class ExperimentWebService:
             (owner,),
         ).fetchall()
         if not window and not rows:
-            return ExperimentMineData(available=True, retained_count=0, truncated=False)
+            return ExperimentMineData(
+                available=True,
+                retained_count=0,
+                truncated=False,
+                preparing_families=preparing_rows,
+                preparing_window_truncated=any(f.preparation_window_truncated for f in preparing),
+            )
         if (
             len(window) != 1
             or window[0][0] != min(len(rows), 500)
@@ -347,6 +466,8 @@ class ExperimentWebService:
             truncated=window[0][1],
             oldest_registered_at=window[0][2],
             next_cursor=next_cursor,
+            preparing_families=preparing_rows,
+            preparing_window_truncated=any(f.preparation_window_truncated for f in preparing),
         )
 
     def family(
@@ -365,12 +486,16 @@ class ExperimentWebService:
             potential_count=family.potential_count,
             search_count=family.search_count,
             parameters=tuple(d.parameter for d in family.request.dimensions),
-            failed_count=sum(f.attempt.status.value == "failed" for f in facts),
-            cancelled_count=sum(f.attempt.status.value == "cancelled" for f in facts),
+            failed_count=sum(f.attempt.status.value == "failed" for f in facts)
+            + sum(p.definition_state == "failed" for p in family.preparations),
+            cancelled_count=sum(f.attempt.status.value == "cancelled" for f in facts)
+            + sum(p.definition_state == "cancelled" for p in family.preparations),
             items=tuple(self._row(f, family) for f in facts),
             note="" if family.note is None else family.note.text,
             note_version=0 if family.note is None else family.note.version,
             outer_admitted=family.outer_admitted,
+            preparation_state=family.preparation_state,
+            preparations=tuple(self._preparation(p, family) for p in family.preparations),
         )
 
     def result(
@@ -387,7 +512,11 @@ class ExperimentWebService:
         ):
             raise ValueError("private exact sealed result is unavailable or changed")
         return read_experiment_result(
-            fact, family, results=self.results, authority=self.private_authority
+            fact,
+            family,
+            results=self.results,
+            authority=self.private_authority,
+            template_results=self.template_results,
         )
 
     def compare(
@@ -445,8 +574,10 @@ class ExperimentWebService:
                 family_id=family.family_id,
                 experiment_id=target,
                 search_count=family.search_count,
-                failed_count=sum(f.attempt.status.value == "failed" for f in facts),
-                cancelled_count=sum(f.attempt.status.value == "cancelled" for f in facts),
+                failed_count=sum(f.attempt.status.value == "failed" for f in facts)
+                + sum(p.definition_state == "failed" for p in family.preparations),
+                cancelled_count=sum(f.attempt.status.value == "cancelled" for f in facts)
+                + sum(p.definition_state == "cancelled" for p in family.preparations),
                 evidence_id=canonical_sha256(facts),
                 reasons=("完整搜索证据尚未保存，请稍后重试。",),
             )
@@ -502,7 +633,12 @@ class ExperimentWebService:
                 raise ValueError("outer receipt has another job")
         else:
             actions = {
-                "cancel_experiment_family": {"cancellation_pending", "cancelled"},
+                "cancel_experiment_family": {
+                    "cancellation_pending",
+                    "cancelled",
+                    "already_completed",
+                    "already_finished",
+                },
                 "set_experiment_note": {"note_saved"},
                 "set_experiment_holdout_policy": {"policy_saved"},
             }

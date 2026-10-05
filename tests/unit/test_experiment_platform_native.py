@@ -34,9 +34,30 @@ from tests.unit.test_experiment_platform_flow import preparation as preparation
 def test_exp01_exp08d_exp14_original_host_native_worker_and_private_binding(
     preparation, tmp_path: Path
 ) -> None:
+    _host_original_chain(preparation, tmp_path, template=False)
+
+
+def test_c5t06_c5t07_original_template_host_native_worker_and_full_sealed_result(
+    preparation, tmp_path: Path
+) -> None:
+    _host_original_chain(preparation, tmp_path, template=True)
+
+
+def _host_original_chain(preparation, tmp_path: Path, *, template: bool) -> None:
     if os.environ.get("RQUANT_M8_HOST_NATIVE_PROOF") != "1":
         pytest.skip("host native/socket proof is executed by the root task")
     platform, prepare, data, profile, reads, _ = preparation
+    request, template_runtime = search(), None
+    if template:
+        from rquant.experiment_platform_templates import ExperimentTemplateRuntimeBinding
+        from tests.unit.test_experiment_platform_templates import configure_template
+
+        platform, prepare, profile, selected_binding, request = configure_template(
+            preparation, tmp_path
+        )
+        template_runtime = ExperimentTemplateRuntimeBinding(
+            store=platform, binding=selected_binding
+        )
     platform.install_policy(months=0, now=NOW)
     jobs = LabJobStore(tmp_path / "jobs.sqlite3")
     jobs.initialize()
@@ -53,6 +74,7 @@ def test_exp01_exp08d_exp14_original_host_native_worker_and_private_binding(
         experiment_registry=platform.registry,
         definition_registry=prepare.definitions,
         clock=lambda: NOW,
+        experiment_template_binding=template_runtime,
     )
     binding = bind_experiment_platform(
         store=platform,
@@ -76,7 +98,7 @@ def test_exp01_exp08d_exp14_original_host_native_worker_and_private_binding(
         ),
     )
     command = RegisterExperimentFamily(
-        command_id=str(UUID(int=950)), requested_at=NOW, actor_id="alice", request=search()
+        command_id=str(UUID(int=950)), requested_at=NOW, actor_id="alice", request=request
     )
     receipt = service.submit(command)
     assert receipt.status.value == "succeeded" and receipt.result["planned_count"] == 4, receipt
@@ -120,6 +142,7 @@ def test_exp01_exp08d_exp14_original_host_native_worker_and_private_binding(
             key if identifier == key.key_id else None
         ),
         lifecycle_synchronizer=PausedLifecycle(),
+        experiment_template_binding=template_runtime,
         clock=lambda: NOW,
     )
     socket_root = Path(tempfile.mkdtemp(prefix="m8-native-", dir="/private/tmp"))
@@ -143,6 +166,7 @@ def test_exp01_exp08d_exp14_original_host_native_worker_and_private_binding(
                 snapshot_root=tmp_path / "worker-copies",
                 research_lake_root=prepare.lake_root,
             ),
+            experiment_template_binding=template_runtime,
             heartbeat_interval_seconds=1,
             receipt_timeout_seconds=10,
             clock=lambda: NOW,
@@ -161,6 +185,7 @@ def test_exp01_exp08d_exp14_original_host_native_worker_and_private_binding(
             commit_spool=commits,
             verified_code_sha_provider=lambda: profile.producer_commit,
             finalizer_authority_key_provider=lambda: key,
+            experiment_template_binding=template_runtime,
         )
         finalizations = []
         scheduler.run_once()
@@ -209,21 +234,52 @@ def test_exp01_exp08d_exp14_original_host_native_worker_and_private_binding(
         assert len(snapshot.attempts) == 4 and all(
             f.attempt.status.value == "executed" and f.result_hash for f in snapshot.attempts
         )
-        for fact in snapshot.attempts:
-            with pytest.raises(PermissionError):
-                results.read(fact.child.job_id)
-            with pytest.raises(PermissionError):
-                results.read(
+        if template:
+            from rquant.experiment_platform_evidence import read_experiment_result
+
+            template_reader = binding.command_backend.template_results
+            for fact in snapshot.attempts:
+                with pytest.raises(PermissionError):
+                    template_reader.read_private(
+                        fact.child.job_id,
+                        expected_result_hash=fact.result_hash,
+                        private_owner="bob",
+                        private_authority=binding.private_projection.authority,
+                    )
+                full = template_reader.read_private(
                     fact.child.job_id,
-                    private_owner="bob",
+                    expected_result_hash=fact.result_hash,
+                    private_owner="alice",
                     private_authority=binding.private_projection.authority,
                 )
-            read = results.read(
-                fact.child.job_id,
-                private_owner="alice",
-                private_authority=binding.private_projection.authority,
-            )
-            assert read.bundle.result.status == "complete" and len(read.bundle.result.days) == 4
+                assert full.result.status == "complete" and len(full.result.days) == 4
+                projected = read_experiment_result(
+                    fact,
+                    family,
+                    results=results,
+                    authority=binding.private_projection.authority,
+                    template_results=template_reader,
+                )
+                assert projected.template is not None and len(projected.curves) == 4
+                assert tuple(p.phase for p in projected.phases) == ("training", "validation")
+                assert all(len(p.curves) == 2 for p in projected.phases)
+                assert projected.configuration.to_domain() == fact.configuration
+        else:
+            for fact in snapshot.attempts:
+                with pytest.raises(PermissionError):
+                    results.read(fact.child.job_id)
+                with pytest.raises(PermissionError):
+                    results.read(
+                        fact.child.job_id,
+                        private_owner="bob",
+                        private_authority=binding.private_projection.authority,
+                    )
+                read = results.read(
+                    fact.child.job_id,
+                    private_owner="alice",
+                    private_authority=binding.private_projection.authority,
+                )
+                assert read.bundle.result.status == "complete" and len(read.bundle.result.days) == 4
         evidence = binding.private_projection.authority.evidence(
             "alice", family_id, family.evidence_id
         )
@@ -240,7 +296,10 @@ def test_exp01_exp08d_exp14_original_host_native_worker_and_private_binding(
         print(
             json.dumps(
                 {
-                    "kind": "m8-synthetic-host-native/v1",
+                    "kind": "m8-synthetic-template-host-native/v1"
+                    if template
+                    else "m8-synthetic-host-native/v1",
+                    "original_template_typed_execution": template,
                     "actual_original_workers": len(outcomes),
                     "actual_finalizations": len(finalizations),
                     "original_jobs": len(reader.list_jobs().items),

@@ -53,6 +53,7 @@ if (!config) throw new Error("fixture config missing");
 const caps: Schemas["ExperimentCapabilities"] = {
   available: true,
   can_search: true,
+  can_search_templates: false,
   can_unseal: true,
   can_edit_policy: true,
   message: null,
@@ -93,6 +94,10 @@ const item = (index: number): Schemas["ExperimentAttemptRow"] => ({
   result_hash: null,
   message: null,
   cancellation_pending: false,
+  strategy_name: "组合回测",
+  strategy_version: 1,
+  metrics:
+    fixture.family.data.items[0]?.metrics?.map((metric) => ({ ...metric, value: null })) ?? [],
 });
 
 function ready(items = [item(1)]) {
@@ -118,6 +123,201 @@ function ready(items = [item(1)]) {
 }
 
 describe("正式实验", () => {
+  it("逐日净值正文显示四位小数，提示保留原值", async () => {
+    sealed();
+    renderApp("/experiments");
+    const mine = await screen.findByRole("table", { name: "我的实验" });
+    await userEvent.click(within(mine).getByRole("button", { name: "仓位实验 · 1" }));
+    expect(await screen.findByRole("img", { name: "实验与基准净值" })).toBeVisible();
+    await userEvent.click(screen.getByText("逐日净值"));
+    const table = await screen.findByRole("table", { name: "实验1逐日净值" });
+    const result = fixture.results[fixture.family.data.items[0]?.experiment_id ?? ""];
+    const point = result?.data.curves[0];
+    if (!point) throw new Error("original normalized daily value is missing");
+    const row = within(table).getAllByRole("row")[1];
+    if (!row) throw new Error("original daily row is missing");
+    const cells = within(row).getAllByRole("cell");
+    expect(cells[1]).toHaveTextContent("0.9983");
+    expect(table.textContent).not.toContain(String(point.nav));
+    for (const cell of cells) expect(findJargon(cell.textContent ?? "")).toEqual([]);
+    if (point.benchmark_nav != null)
+      expect(cells[3]).toHaveTextContent(
+        point.benchmark_nav.toLocaleString("zh-CN", {
+          minimumFractionDigits: 4,
+          maximumFractionDigits: 4,
+        }),
+      );
+    const anchor = cells[1]?.querySelector<HTMLElement>(".tip-anchor");
+    if (!anchor) throw new Error("original precision tip is missing");
+    await userEvent.hover(anchor);
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(`完整净值：${point.nav}`);
+    await userEvent.unhover(anchor);
+    await waitFor(() => expect(screen.queryByRole("tooltip")).not.toBeInTheDocument());
+    await act(async () => anchor.focus());
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(`完整净值：${point.nav}`);
+  });
+
+  it("本人列表与完整参数指标表保留四项、原指标、策略版本和缺值原因", async () => {
+    sealed();
+    const items = fixture.mine.data.items.map((item, index) => {
+      const result = fixture.results[item.experiment_id];
+      if (!result) throw new Error("actual typed result is missing");
+      const blank = index === 1 || index === 2;
+      return {
+        ...item,
+        strategy_name: "原入场策略",
+        strategy_version: 3,
+        rules: null,
+        status:
+          index === 1 ? ("failed" as const) : index === 2 ? ("cancelled" as const) : item.status,
+        label: index === 1 ? "运行失败" : index === 2 ? "已取消" : item.label,
+        result_hash: blank ? null : item.result_hash,
+        message:
+          index === 1 ? "运行失败，历史尝试保留。" : index === 2 ? "已取消，历史尝试保留。" : null,
+        metrics: result.data.metrics.map((metric, metricIndex) => ({
+          ...metric,
+          value: blank || (index === 3 && metricIndex === 0) ? null : metric.value,
+        })),
+      };
+    });
+    server.use(
+      http.get("*/api/v1/experiments/mine", () =>
+        HttpResponse.json({
+          ...fixture.mine,
+          data: { ...fixture.mine.data, items },
+        }),
+      ),
+      http.get("*/api/v1/experiments/families/:family", () =>
+        HttpResponse.json({
+          ...fixture.family,
+          data: { ...fixture.family.data, items, failed_count: 1, cancelled_count: 1 },
+        }),
+      ),
+    );
+    renderApp("/experiments");
+    const mine = await screen.findByRole("table", { name: "我的实验" });
+    expect(within(mine).getByRole("columnheader", { name: "策略 / 版本" })).toBeVisible();
+    expect(within(mine).getByRole("columnheader", { name: "净收益" })).toBeVisible();
+    expect(within(mine).getAllByText("原入场策略 · 第 3 版")).toHaveLength(4);
+    expect(within(mine).getAllByRole("row")).toHaveLength(5);
+    await userEvent.click(within(mine).getByRole("button", { name: "仓位实验 · 1" }));
+    const matrix = await screen.findByRole("table", { name: "完整参数与指标" });
+    expect(within(matrix).getAllByRole("row")).toHaveLength(5);
+    for (const metric of items[0]?.metrics ?? []) {
+      expect(within(matrix).getByRole("columnheader", { name: metric.label })).toBeVisible();
+    }
+    expect(within(matrix).getByText("运行失败，历史尝试保留。")).toBeVisible();
+    expect(within(matrix).getByText("已取消，历史尝试保留。")).toBeVisible();
+    expect(within(matrix).getAllByRole("row")[2]?.textContent).toContain("—");
+    expect(within(matrix).getAllByRole("row")[3]?.textContent).toContain("—");
+    const row = within(matrix).getAllByRole("row")[1];
+    if (!row) throw new Error("first original planned row is missing");
+    await userEvent.click(within(row).getByText("全部参数"));
+    expect(within(row).getByText("单股上限")).toBeVisible();
+    await userEvent.click(within(row).getByText("全部指标"));
+    expect(within(row).getByText("波动率")).toBeVisible();
+  });
+  it.each([
+    [401, "capabilities"],
+    [403, "capabilities"],
+    [409, "capabilities"],
+    [403, "mine"],
+  ] as const)("缓存能力后重查 %s %s 撤下私有视图和写入，保留原请求", async (status, query) => {
+    sealed();
+    const original: Schemas["ExperimentCancelWrite"] = {
+      kind: "cancel_experiment_family",
+      command_id: "00000000-0000-0000-0000-000000780041",
+      requested_at: "2026-10-05T08:00:00Z",
+      family_id: fixture.family.data.family_id,
+    };
+    const key = "rquant:experiment-request:v1:alice";
+    sessionStorage.setItem(key, JSON.stringify({ owner: "alice", body: original }));
+    const app = renderApp("/experiments");
+    const table = await screen.findByRole("table", { name: "我的实验" });
+    await userEvent.click(within(table).getByRole("checkbox", { name: "选择仓位实验第1项" }));
+    await userEvent.click(screen.getByRole("button", { name: "仓位实验 · 1" }));
+    expect(await screen.findByRole("img", { name: "实验与基准净值" })).toBeVisible();
+    server.use(http.get(`*/api/v1/experiments/${query}`, () => HttpResponse.json({}, { status })));
+    await act(async () => {
+      await app.queryClient.invalidateQueries({
+        queryKey: ["formal-experiments", "alice", fixture.generation_id, query],
+      });
+    });
+    await waitFor(() => {
+      expect(screen.queryByRole("table", { name: "我的实验" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("img", { name: "实验与基准净值" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "新建实验" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "核对原请求" })).not.toBeInTheDocument();
+    });
+    expect(screen.getByRole("alert")).toBeVisible();
+    expect(JSON.parse(sessionStorage.getItem(key) ?? "{}")).toEqual({
+      owner: "alice",
+      body: original,
+    });
+  });
+
+  it.each([
+    [true, true],
+    [true, false],
+    [false, false],
+  ])("私有可用 %s 写入 %s 仍能单独查看旧共享记录", async (available, canSearch) => {
+    ready();
+    let legacyReads = 0;
+    server.use(
+      http.get("*/api/v1/experiments/capabilities", () =>
+        HttpResponse.json({
+          data: { ...caps, available, can_search: canSearch },
+          serving: meta.serving,
+        }),
+      ),
+      http.get("*/api/v1/experiments", () => {
+        legacyReads += 1;
+        return HttpResponse.json({
+          data: {
+            available: true,
+            items: [
+              {
+                experiment_id: "e".repeat(64),
+                hypothesis_family: "旧均线记录",
+                registered_at: "2026-09-24T07:20:00Z",
+                status: "succeeded",
+                completed_at: "2026-09-24T07:25:00Z",
+                trade_count: 12,
+                net_return_pct: 7.5,
+                max_drawdown_pct: 3.25,
+                win_rate_pct: 60,
+              },
+            ],
+            retained_count: 1,
+            truncated: false,
+            oldest_registered_at: "2026-09-24T07:20:00Z",
+            next_cursor: null,
+          },
+          serving: meta.serving,
+        });
+      }),
+    );
+    renderApp("/experiments");
+    if (available) {
+      const mine = await screen.findByRole("table", { name: "我的实验" });
+      expect(within(mine).getByRole("button", { name: "仓位研究 · 2" })).toBeVisible();
+      expect(screen.getByRole("button", { name: "新建实验" }).hasAttribute("disabled")).toBe(
+        !canSearch,
+      );
+      expect(legacyReads).toBe(0);
+      await userEvent.click(screen.getByRole("button", { name: "旧共享记录" }));
+    }
+    const shared = await screen.findByRole("table", { name: "实验记录" });
+    expect(within(shared).getByText("旧均线记录")).toBeVisible();
+    expect(screen.queryByRole("table", { name: "我的实验" })).not.toBeInTheDocument();
+    expect(shared.textContent).not.toContain("仓位研究");
+    expect(legacyReads).toBe(1);
+    if (available) {
+      await userEvent.click(screen.getByRole("button", { name: "我的实验" }));
+      expect(await screen.findByRole("table", { name: "我的实验" })).toBeVisible();
+    }
+  });
+
   it("显示本人完整尝试；新建包含真实三个区间与参数范围，不显示内部编号", async () => {
     ready();
     renderApp("/experiments");
@@ -212,6 +412,37 @@ describe("正式实验", () => {
     await userEvent.click(screen.getByRole("button", { name: "对比所选" }));
     expect(await screen.findByRole("img", { name: "两份实验净值" })).toBeVisible();
     expect(screen.getByRole("table", { name: "参数差异" })).toBeVisible();
+  });
+
+  it("模板规则差异显示短中文与百分比，来源标识只在提示中", async () => {
+    sealed();
+    server.use(
+      http.get("*/api/v1/experiments/compare", () =>
+        HttpResponse.json({
+          ...fixture.comparison,
+          data: {
+            ...fixture.comparison.data,
+            differences: [
+              { path: "template.exit.stop_loss", a: null, b: "0.05" },
+              { path: "template.exit.max_holding_days", a: "5", b: "10" },
+              { path: "template.entry.body_hash", a: "a".repeat(64), b: "b".repeat(64) },
+            ],
+          },
+        } satisfies Schemas["Envelope_ExperimentComparisonData_"]),
+      ),
+    );
+    renderApp("/experiments");
+    const table = await screen.findByRole("table", { name: "我的实验" });
+    await userEvent.click(within(table).getByRole("checkbox", { name: "选择仓位实验第1项" }));
+    await userEvent.click(within(table).getByRole("checkbox", { name: "选择仓位实验第2项" }));
+    await userEvent.click(screen.getByRole("button", { name: "对比所选" }));
+    const changes = await screen.findByRole("table", { name: "参数差异" });
+    expect(within(changes).getByRole("row", { name: "止损 未启用 5.00%" })).toBeVisible();
+    expect(
+      within(changes).getByRole("row", { name: "持有上限 5 个交易日 10 个交易日" }),
+    ).toBeVisible();
+    expect(changes.textContent).not.toContain("a".repeat(64));
+    expect(changes.textContent).not.toContain("b".repeat(64));
   });
 
   it("请求处理中关闭抽屉，未知回执后恢复核对按钮焦点", async () => {

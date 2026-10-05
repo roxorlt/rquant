@@ -615,6 +615,7 @@ CommandSubmissionResult: TypeAlias = Annotated[
 
 if TYPE_CHECKING:
     from rquant.strategy_template_runtime import StrategyTemplateRuntimeDirectory
+    from rquant.experiment_platform_templates import ExperimentTemplateRuntimeBinding
 
 
 class LabCommandSubmissionFacade:
@@ -629,6 +630,7 @@ class LabCommandSubmissionFacade:
         definition_registry: ImmutableDefinitionRegistry | None = None,
         clock: Callable[[], datetime] | None = None,
         template_directory: StrategyTemplateRuntimeDirectory | None = None,
+        experiment_template_binding: ExperimentTemplateRuntimeBinding | None = None,
     ) -> None:
         self.reader = reader
         self.spool = spool
@@ -638,6 +640,10 @@ class LabCommandSubmissionFacade:
         from rquant.strategy_template_runtime import require_template_runtime_directory
 
         self.template_directory = require_template_runtime_directory(template_directory)
+        from rquant.experiment_platform_templates import require_experiment_template_runtime_binding
+        self.experiment_template_binding = require_experiment_template_runtime_binding(experiment_template_binding)
+        if self.experiment_template_binding is not None and self.experiment_template_binding.store.registry is not experiment_registry:
+            raise ValueError("private template directory needs the same original experiment registry")
 
     @staticmethod
     def _experiment_submission_intent(
@@ -709,10 +715,13 @@ class LabCommandSubmissionFacade:
             raise FormalSubmissionAuthorityError(
                 "formal plan receipts do not exactly match the research job"
             )
-        template_catalog = None if self.template_directory is None else self.template_directory.catalog_for_spec(command.spec)
+        directory = self.template_directory
+        if self.experiment_template_binding is not None:
+            directory = self.experiment_template_binding.directory_for_job(command.job_id, command.spec) or directory
+        template_catalog = None if directory is None else directory.catalog_for_spec(command.spec)
         definitions = self.definition_registry
         if template_catalog is not None:
-            definitions = self.template_directory.store.definition_registry(execution.strategy_id)
+            definitions = directory.store.definition_registry(execution.strategy_id)
         if definitions is None:
             raise FormalSubmissionAuthorityError(
                 "v3 research submission requires an authoritative Definition Registry"

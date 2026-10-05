@@ -143,8 +143,10 @@ def test_exp15_actual_evidence_seal_has_no_invented_pvalue_or_approval(complete_
     snapshot = projection.snapshot(NOW + timedelta(seconds=3))
     family = snapshot.families[0]
     facts = tuple(sorted(snapshot.attempts, key=lambda f: f.index))
+
     def read(fact: ExperimentAttemptFact) -> ExperimentResultData:
         return read_experiment_result(fact, family, results=results, authority=projection.authority)
+
     evidence = build_overfit_evidence(family, facts, read=read)
     assert evidence.search_count == 4
     assert all(
@@ -174,8 +176,10 @@ def test_exp20_and21_complete_heatmap_and_two_full_curves(complete_family) -> No
     snapshot = projection.snapshot(NOW + timedelta(seconds=3))
     family = snapshot.families[0]
     facts = tuple(sorted(snapshot.attempts, key=lambda f: f.index))
+
     def read(fact: ExperimentAttemptFact) -> ExperimentResultData:
         return read_experiment_result(fact, family, results=results, authority=projection.authority)
+
     a, b = read(facts[0]), read(facts[1])
     comparison = compare_experiment_results(a, b)
     assert comparison.comparable and comparison.differences
@@ -211,6 +215,73 @@ def test_exp20_and21_complete_heatmap_and_two_full_curves(complete_family) -> No
             metric="total_return",
             read=read,
         )
+
+
+def test_c5t08_comparison_includes_full_rules_and_excludes_internal_template_identity(
+    complete_family, tmp_path: Path
+) -> None:
+    from rquant.strategy_template import StrategyTemplate
+    from rquant.web.experiment_platform_models import ExperimentTemplateResultIdentity
+    from tests.unit.test_experiment_platform_templates import binding_for
+
+    _, projection, results, _ = complete_family
+    snapshot = projection.snapshot(NOW + timedelta(seconds=3))
+    facts = tuple(sorted(snapshot.attempts, key=lambda f: f.index))
+    a, b = tuple(
+        read_experiment_result(
+            fact, snapshot.families[0], results=results, authority=projection.authority
+        )
+        for fact in facts[:2]
+    )
+    ordinary = compare_experiment_results(a, b)
+    binding, _, _, saved, _ = binding_for(tmp_path)
+    original = binding.original.get_version(saved.strategy_id, 1, owner_id="alice")
+    # Comparison DTO inputs are synthetic; this is not a template execution proof.
+    left = ExperimentTemplateResultIdentity(
+        strategy_id=saved.strategy_id, head=saved.head, rules=original.rules, content_hash="a" * 64
+    )
+    right = left.model_copy(
+        update={
+            "strategy_id": "template_" + "f" * 32,
+            "content_hash": "b" * 64,
+            "rules": StrategyTemplate.model_validate(
+                original.rules.model_dump(mode="python")
+                | {
+                    "entry": {
+                        "kind": "pool",
+                        "pool_key": "actual-pool",
+                        "version": 1,
+                        "body_hash": "e" * 64,
+                    },
+                    "exit": {"stop_loss": "0.05", "max_holding_days": 5},
+                    "index_filter": {
+                        "benchmark_code": "000300.SH",
+                        "ma_days": 20,
+                        "direction": "above",
+                    },
+                }
+            ),
+        }
+    )
+    comparison = compare_experiment_results(
+        a.model_copy(update={"template": left}), b.model_copy(update={"template": right})
+    )
+    changes = {row.path: (row.a, row.b) for row in comparison.differences}
+    assert changes["template.exit.stop_loss"] == (None, "0.05")
+    assert changes["template.exit.max_holding_days"] == (None, "5")
+    assert changes["template.index_filter.ma_days"] == (None, "20")
+    assert changes["template.entry.pool_key"] == (None, "actual-pool")
+    assert not any("head" in p or "content_hash" in p or "strategy_id" in p for p in changes)
+    assert (
+        tuple(d for d in comparison.differences if not d.path.startswith("template."))
+        == ordinary.differences
+    )
+    assert comparison.metric_differences == ordinary.metric_differences
+    same_rules = compare_experiment_results(
+        a.model_copy(update={"template": left}),
+        b.model_copy(update={"template": right.model_copy(update={"rules": left.rules})}),
+    )
+    assert same_rules.differences == ordinary.differences
 
 
 def test_exp12_and13_outer_commits_once_before_failed_read_and_exact_replay(

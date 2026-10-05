@@ -262,7 +262,9 @@ async def command(
     messages = {
         "registered": "已登记搜索，完成后显示结果。",
         "cancellation_pending": "正在核对取消结果。",
-        "cancelled": "已取消，历史实验仍保留。",
+        "cancelled": "未完成项已取消，已有结果仍保留。",
+        "already_completed": "实验已完成，结果仍保留。",
+        "already_finished": "实验已结束，历史记录仍保留。",
         "note_saved": "备注已保存。",
         "policy_saved": "封存设置已保存。",
         "outer_admitted": "已解封，结果未完成。",

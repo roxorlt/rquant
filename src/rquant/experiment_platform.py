@@ -18,6 +18,13 @@ from zoneinfo import ZoneInfo
 from pydantic import Field, field_validator, model_validator
 
 from rquant.backtest.contracts import SSECalendar
+from rquant.experiment_platform_template_models import (
+    ExperimentTemplateBaseline,
+    ExperimentTemplatePublication,
+    ExperimentTemplateSelection,
+    ExperimentTemplateSlot,
+    PreparedExperimentTemplate,
+)
 from rquant.experiment_registry import (
     DateRange,
     ExperimentRegistry,
@@ -35,6 +42,8 @@ from rquant.portfolio_backtest_source import (
     PublishedPortfolioInput,
 )
 from rquant.runtime_contracts import AwareUtcDatetime, RuntimeContractModel, canonical_sha256
+from rquant.strategy_authoring_commands import SaveStrategyTemplate, StrategyTemplateReceipt
+from rquant.strategy_template import StrategyTemplate
 
 Sha256 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 Owner = Annotated[str, Field(pattern=r"^[A-Za-z0-9._@-]{1,64}$")]
@@ -90,6 +99,7 @@ class SearchDimension(RuntimeContractModel):
 
 class ExperimentSearchRequest(RuntimeContractModel):
     name: str = Field(min_length=1, max_length=60)
+    template: ExperimentTemplateSelection | None = None
     base_config: PortfolioBacktestConfig
     protocol: PortfolioExperimentProtocol
     dimensions: tuple[SearchDimension, ...] = Field(min_length=1, max_length=5)
@@ -216,16 +226,30 @@ class ExperimentFamilyRecord(RuntimeContractModel):
     )
     registered_at: AwareUtcDatetime
     policy: HoldoutPolicy
-    state: Literal["preparing", "ready"] = "preparing"
+    state: Literal["preparing", "ready", "cancelled"] = "preparing"
     phase: Literal["search", "outer"] = "search"
     parent_family_id: str | None = None
+    template_baseline: ExperimentTemplateBaseline | None = None
+
+    @model_validator(mode="after")
+    def bind_template_baseline(self) -> Self:
+        selection, baseline = self.request.template, self.template_baseline
+        if (selection is None) != (baseline is None):
+            raise ValueError("template selection needs its original server baseline")
+        if baseline is not None and (
+            baseline.version.owner_id != self.owner
+            or (baseline.version.strategy_id, baseline.version.head)
+            != (selection.strategy_id, selection.head)
+        ):
+            raise PermissionError("template original baseline differs from its owner or head")
+        return self
 
 
 class ExperimentChildRegistration(RuntimeContractModel):
     config: PortfolioBacktestConfig
     plan: FormalExperimentPlan
     intent: ExperimentSubmissionIntent
-    published: PublishedPortfolioInput
+    published: PublishedPortfolioInput | ExperimentTemplatePublication
 
 
 class ExperimentSourceProfile(RuntimeContractModel):
@@ -279,7 +303,15 @@ class ExperimentPreparationReceipt(RuntimeContractModel):
     source_path: str = Field(max_length=1024)
     file_identity: tuple[int, int, int, int]
     file_sha256: Sha256
-    prepared: PreparedPortfolioRequest
+    prepared: PreparedPortfolioRequest | PreparedExperimentTemplate
+
+    @property
+    def configuration(self) -> PortfolioBacktestConfig:
+        return (
+            self.prepared.configuration
+            if isinstance(self.prepared, PreparedExperimentTemplate)
+            else self.prepared.frozen.config
+        )
 
 
 class ExperimentPreparationReservation(RuntimeContractModel):
@@ -290,6 +322,7 @@ class ExperimentPreparationReservation(RuntimeContractModel):
     source_path: str = Field(max_length=4096)
     input_hash: Sha256
     created_at: AwareUtcDatetime
+    template_benchmark_closes: tuple[tuple[date, float], ...] | None = None
 
 
 class ExperimentChildAdmission(RuntimeContractModel):
@@ -341,6 +374,9 @@ class ExperimentOuterGrant(RuntimeContractModel):
 
 
 _SCHEMA = (
+    "CREATE TABLE IF NOT EXISTS experiment_template_slot(family_id TEXT NOT "
+    "NULL,child_index INTEGER NOT NULL,payload_json TEXT NOT NULL,PRIMARY "
+    "KEY(family_id,child_index));"
     "\nCREATE TABLE IF NOT EXISTS experiment_platform_metadata(key TEXT PRIMARY KEY,value "
     "TEXT NOT NULL);\nCREATE TABLE IF NOT EXISTS experiment_family_request(\n request_id "
     "TEXT PRIMARY KEY,owner TEXT NOT NULL,body_hash TEXT NOT NULL,\n family_id TEXT NOT "
@@ -477,6 +513,7 @@ class ExperimentPlatformStore:
         body_hash: str,
         request: ExperimentSearchRequest,
         registered_at: datetime,
+        template_baseline: ExperimentTemplateBaseline | None = None,
     ) -> ExperimentFamilyRecord:
         with self.transaction() as connection:
             row = connection.execute(
@@ -507,6 +544,39 @@ class ExperimentPlatformStore:
                 actual_configurations=enumerate_search(request),
                 registered_at=registered_at,
                 policy=policy,
+                template_baseline=template_baseline,
+            )
+            slots = (
+                ()
+                if template_baseline is None
+                else tuple(
+                    ExperimentTemplateSlot(
+                        owner=owner,
+                        family_id=record.family_id,
+                        index=index,
+                        baseline_hash=canonical_sha256(template_baseline),
+                        request=SaveStrategyTemplate(
+                            command_id=str(
+                                uuid5(
+                                    NAMESPACE_URL,
+                                    f"template-save:{owner}:{record.family_id}:{index}",
+                                )
+                            ),
+                            requested_at=registered_at,
+                            generation_id=template_baseline.generation_id,
+                            name=request.name,
+                            change_note="实验参数",
+                            rules=StrategyTemplate.model_validate(
+                                template_baseline.version.rules.model_dump(mode="python")
+                                | {
+                                    "weight_rule": cfg.weight_rule,
+                                    "rebalance_rule": cfg.rebalance_rule,
+                                }
+                            ),
+                        ),
+                    )
+                    for index, cfg in enumerate(record.actual_configurations)
+                )
             )
             connection.execute(
                 "INSERT INTO experiment_family_request VALUES(?,?,?,?,?,?)",
@@ -519,7 +589,88 @@ class ExperimentPlatformStore:
                     _json_payload(record),
                 ),
             )
+            for slot in slots:
+                connection.execute(
+                    "INSERT INTO experiment_template_slot VALUES(?,?,?)",
+                    (record.family_id, slot.index, _json_payload(slot)),
+                )
         return record
+
+    def template_slots(self, owner: str, family_id: str) -> tuple[ExperimentTemplateSlot, ...]:
+        with self.registry._connect() as connection:
+            record = self._record(connection, owner, family_id)
+            rows = connection.execute(
+                "SELECT payload_json FROM experiment_template_slot WHERE "
+                "family_id=? ORDER BY child_index",
+                (family_id,),
+            ).fetchall()
+        slots = tuple(ExperimentTemplateSlot.model_validate_json(row[0]) for row in rows)
+        if record.template_baseline is None:
+            if slots:
+                raise ValueError("ordinary experiment cannot have template slots")
+            return ()
+        if len(slots) != len(record.actual_configurations) or any(
+            (s.owner, s.family_id, s.index, s.baseline_hash)
+            != (owner, family_id, i, canonical_sha256(record.template_baseline))
+            for i, s in enumerate(slots)
+        ):
+            raise ValueError("complete original template slots differ")
+        return slots
+
+    def save_template_slot(
+        self,
+        original: ExperimentTemplateSlot,
+        *,
+        receipt: StrategyTemplateReceipt | None = None,
+        failure: Literal["capacity", "source_changed", "invalid_definition"] | None = None,
+    ) -> ExperimentTemplateSlot:
+        with self.transaction() as connection:
+            record = self._record(connection, original.owner, original.family_id)
+            row = connection.execute(
+                "SELECT payload_json FROM experiment_template_slot WHERE "
+                "family_id=? AND child_index=?",
+                (original.family_id, original.index),
+            ).fetchone()
+            current = None if row is None else ExperimentTemplateSlot.model_validate_json(row[0])
+            if current is None or current.model_dump(
+                exclude={"state", "receipt", "failure"}
+            ) != original.model_dump(exclude={"state", "receipt", "failure"}):
+                raise ValueError("original derived slot changed")
+            if receipt is not None and (
+                receipt.owner_id,
+                receipt.command_id,
+                receipt.original_request_hash,
+                receipt.action,
+                receipt.head.version,
+            ) != (
+                current.owner,
+                current.request.command_id,
+                current.request.request_hash,
+                "save",
+                1,
+            ):
+                raise ValueError("derived receipt differs from original save command")
+            if current.state != "pending":
+                if receipt == current.receipt and failure == current.failure:
+                    return current
+                raise ValueError("derived slot is immutable after completion")
+            if record.state != "preparing":
+                raise ValueError("template family no longer accepts preparation")
+            updated = current.model_copy(
+                update={
+                    "state": "saved" if receipt is not None else "failed",
+                    "receipt": receipt,
+                    "failure": failure,
+                }
+            )
+            if receipt is None and failure is None:
+                raise ValueError("derived completion needs an original receipt or failure")
+            connection.execute(
+                "UPDATE experiment_template_slot SET payload_json=? WHERE "
+                "family_id=? AND child_index=?",
+                (_json_payload(updated), original.family_id, original.index),
+            )
+            return updated
 
     def get_request(self, owner: str, request_id: UUID) -> ExperimentFamilyRecord | None:
         with self.registry._connect() as connection:
@@ -604,7 +755,7 @@ class ExperimentPlatformStore:
             record = self._record(connection, checked.owner, checked.family_id)
             if (
                 checked.index >= len(record.actual_configurations)
-                or checked.prepared.frozen.config != record.actual_configurations[checked.index]
+                or checked.configuration != record.actual_configurations[checked.index]
             ):
                 raise ValueError("prepared child differs from fixed array")
             previous = connection.execute(
@@ -700,6 +851,7 @@ class ExperimentPlatformStore:
                 policy=grant.policy,
                 phase="outer",
                 parent_family_id=grant.family_id,
+                template_baseline=parent.template_baseline,
             )
             old = connection.execute(
                 "SELECT payload_json FROM experiment_family_request WHERE request_id=?",
@@ -721,6 +873,24 @@ class ExperimentPlatformStore:
                     _json_payload(record),
                 ),
             )
+            if parent.template_baseline is not None:
+                selected = connection.execute(
+                    "SELECT s.payload_json FROM experiment_template_slot s JOIN "
+                    "experiment_prepared_child p ON p.family_id=s.family_id AND "
+                    "p.child_index=s.child_index WHERE s.family_id=? AND "
+                    "json_extract(p.payload_json,'$.prepared.formal_plan.spec.experiment_id')=?",
+                    (parent.family_id, grant.experiment_id),
+                ).fetchall()
+                if len(selected) != 1:
+                    raise ValueError("outer grant has no exact saved parent template slot")
+                slot = ExperimentTemplateSlot.model_validate_json(selected[0][0])
+                if slot.state != "saved" or slot.receipt is None:
+                    raise ValueError("outer grant requires an originally saved template version")
+                inherited = slot.model_copy(update={"family_id": record.family_id, "index": 0})
+                connection.execute(
+                    "INSERT INTO experiment_template_slot VALUES(?,?,?)",
+                    (record.family_id, 0, _json_payload(inherited)),
+                )
         return record
 
     def register_family_submission(
@@ -739,6 +909,8 @@ class ExperimentPlatformStore:
             if row is None:
                 raise ValueError("family request is not prepared")
             record = self._record(connection, owner, row[0])
+            if record.state == "cancelled":
+                raise ValueError("original preparing family was cancelled")
             if tuple(child.config for child in children) != record.actual_configurations:
                 raise ValueError("complete fixed configuration array differs")
             if not children or len({c.plan.spec.experiment_id for c in children}) != len(children):
@@ -960,8 +1132,6 @@ class ExperimentPlatformStore:
         body_hash = canonical_sha256({"kind": "cancel", "family": family_id})
         with self.transaction() as connection:
             record = self._record(connection, owner, family_id)
-            if record.state != "ready":
-                raise ValueError("family is not ready for cancellation")
             previous = connection.execute(
                 "SELECT * FROM experiment_platform_receipt WHERE request_id=?", (str(request_id),)
             ).fetchone()
@@ -972,6 +1142,38 @@ class ExperimentPlatformStore:
                     ExperimentChildAdmission.model_validate(v)
                     for v in json.loads(previous["payload_json"])
                 )
+            if record.state in ("preparing", "cancelled"):
+                if record.state == "preparing":
+                    connection.execute(
+                        "UPDATE experiment_family_request SET "
+                        "state='cancelled',payload_json=? WHERE family_id=?",
+                        (
+                            _json_payload(record.model_copy(update={"state": "cancelled"})),
+                            family_id,
+                        ),
+                    )
+                    slots = connection.execute(
+                        "SELECT child_index,payload_json FROM "
+                        "experiment_template_slot WHERE family_id=?",
+                        (family_id,),
+                    ).fetchall()
+                    for slot_row in slots:
+                        slot = ExperimentTemplateSlot.model_validate_json(slot_row[1])
+                        if slot.state in ("pending", "saved"):
+                            connection.execute(
+                                "UPDATE experiment_template_slot SET "
+                                "payload_json=? WHERE family_id=? AND child_index=?",
+                                (
+                                    _json_payload(slot.model_copy(update={"state": "cancelled"})),
+                                    family_id,
+                                    slot_row[0],
+                                ),
+                            )
+                connection.execute(
+                    "INSERT INTO experiment_platform_receipt VALUES(?,?,?,?)",
+                    (str(request_id), owner, body_hash, "[]"),
+                )
+                return ()
             rows = connection.execute(
                 (
                     "SELECT payload_json FROM experiment_child_admission WHERE "

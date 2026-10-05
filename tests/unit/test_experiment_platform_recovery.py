@@ -2,10 +2,18 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
+from typing import cast
 from uuid import UUID
 
 import pytest
 
+from rquant.experiment_platform_commands import (
+    CancelExperimentFamily,
+    ExperimentCommandResult,
+    ExperimentCommandWriter,
+    ExperimentFamilyPreparer,
+)
 from rquant.lab_job_center import (
     CommandSubmissionConflict,
     ExperimentLifecycleCoordinator,
@@ -62,6 +70,24 @@ def test_exp08_c_lost_publish_receipt_then_cancel_replays_exact_original_child(
     assert pending.cancel_state == "pending" and pending.publish_grant_seq < pending.cancel_seq
     assert store.registry.get_attempt(intent.experiment_id).status.value == "registered"
     assert store.registry.list_pending_submissions() == (intent,)
+    writer = ExperimentCommandWriter(
+        store=store,
+        commands=facade,
+        prepare=cast(ExperimentFamilyPreparer, SimpleNamespace(clock=lambda: NOW)),
+        enabled=True,
+        owners=frozenset({"alice"}),
+    )
+    command = CancelExperimentFamily(
+        command_id=str(UUID(int=901)),
+        requested_at=NOW,
+        actor_id="alice",
+        family_id=record.family_id,
+    )
+    marker = writer.freeze(command)
+    assert (
+        ExperimentCommandResult.model_validate(writer.recover(command, marker)).status
+        == "cancellation_pending"
+    )
     monkeypatch.setattr(facade, "_mark_experiment_submission_published", mark)
     recovered = facade.recover_pending_experiment_submissions()
     assert len(recovered) == 1 and calls == [envelope, envelope] and len(spool.pending()) == 1
@@ -100,6 +126,9 @@ def test_exp08_c_lost_publish_receipt_then_cancel_replays_exact_original_child(
     assert reader.get_job(intent.job_id).status.value == "cancelled"
     lifecycle.recover(observed_at=NOW)
     assert store.child(intent.job_id).cancel_state == "confirmed"
+    terminal = ExperimentCommandResult.model_validate(writer.recover(command, marker))
+    assert terminal.status == "cancelled" and terminal.planned_count == 4
+    assert ExperimentCommandResult.model_validate(writer.recover(command, marker)) == terminal
     assert len(store.registry.list_family_attempts(record.family_id)) == 4
     assert all(
         a.status.value == "cancelled" for a in store.registry.list_family_attempts(record.family_id)

@@ -20,6 +20,7 @@ from rquant.data_metadata import DataAuditRun, DatasetSnapshot
 from rquant.definition_registry import ImmutableDefinitionRegistry
 from rquant.experiment_platform import (
     MAX_FAMILY_INPUT_BYTES,
+    ExperimentChildAdmission,
     ExperimentChildRegistration,
     ExperimentFamilyRecord,
     ExperimentOuterGrant,
@@ -37,6 +38,10 @@ from rquant.experiment_platform import (
     validate_experiment_dates,
 )
 from rquant.experiment_platform_projection import ExperimentPrivateResultAuthority
+from rquant.experiment_platform_template_models import (
+    ExperimentTemplateBaseline,
+    PreparedExperimentTemplate,
+)
 from rquant.experiment_registry import DateRange
 from rquant.lab_job_center import CommandSubmissionReceipt, LabCommandSubmissionFacade
 from rquant.lab_job_protocol import LabCommandEnvelope
@@ -57,6 +62,7 @@ from rquant.research_run_spec import DatasetSnapshotIdentity
 from rquant.research_snapshot import ResearchExecutionSession
 from rquant.runtime_contracts import AwareUtcDatetime, RuntimeContractModel, canonical_sha256
 from rquant.storage.duckdb import DuckDBStore
+from rquant.strategy_template_artifact import StrategyTemplateSealedResultReader
 
 if TYPE_CHECKING:
     from rquant.experiment_platform_evidence import ExperimentIndependenceEvidence
@@ -65,6 +71,7 @@ if TYPE_CHECKING:
         ExperimentFamilyFact,
         ExperimentPrivateProjectionReader,
     )
+    from rquant.experiment_platform_templates import ExperimentTemplateBinding
     from rquant.lab_job_center import ExperimentLifecycleCoordinator
     from rquant.portfolio_backtest_models import FrozenPortfolioInput, PortfolioBacktestConfig
     from rquant.promotions_serving_authority import PromotionsSourceReader
@@ -153,6 +160,8 @@ class ExperimentCommandResult(RuntimeContractModel):
         "registered",
         "cancellation_pending",
         "cancelled",
+        "already_completed",
+        "already_finished",
         "note_saved",
         "policy_saved",
         "outer_admitted",
@@ -218,6 +227,7 @@ class ExperimentFamilyPreparer:
         input_root: Path,
         clock: Callable[[], datetime],
         max_task_seconds: int = 3600,
+        template_binding: ExperimentTemplateBinding | None = None,
     ) -> None:
         self.store, self.definitions = store, definitions
         self.profiles = tuple(
@@ -240,6 +250,16 @@ class ExperimentFamilyPreparer:
         self.catalog, self.lake_root, self.input_root = catalog, lake_root, input_root
         self._input_root_identity = (identity.st_dev, identity.st_ino)
         self.clock, self.max_task_seconds = clock, max_task_seconds
+        self.template_binding = template_binding
+
+    def template_baseline(
+        self, owner: str, request: ExperimentSearchRequest
+    ) -> ExperimentTemplateBaseline | None:
+        if request.template is None:
+            return None
+        if self.template_binding is None:
+            raise ValueError("original template source is not installed")
+        return self.template_binding.baseline(owner=owner, request=request)
 
     def profile(self, record: ExperimentFamilyRecord) -> ExperimentSourceProfile:
         matches = tuple(
@@ -343,6 +363,8 @@ class ExperimentFamilyPreparer:
             raise ValueError("formal family preparation changed")
         if record.state == "ready":
             return record
+        if record.state == "cancelled":
+            raise ValueError("original preparing family was cancelled")
         profile = self.profile(record)
         now = self.clock()
         if record.phase == "search":
@@ -385,6 +407,10 @@ class ExperimentFamilyPreparer:
             window=window,
             outer_grant_id=None if grant is None else grant.grant_id,
         )
+        if record.template_baseline is not None:
+            if self.template_binding is None:
+                raise ValueError("original template preparation is unavailable")
+            return self.template_binding.prepare_family(self, record, read=read, profile=profile)
         children = []
         input_bytes = 0
         source = None
@@ -562,6 +588,7 @@ class ExperimentCommandWriter:
         commands: LabCommandSubmissionFacade,
         prepare: ExperimentFamilyPreparer,
         results: PortfolioResultReader | None = None,
+        template_results: StrategyTemplateSealedResultReader | None = None,
         enabled: bool = False,
         owners: frozenset[str] = frozenset(),
         administrators: frozenset[str] = frozenset(),
@@ -572,6 +599,7 @@ class ExperimentCommandWriter:
         self.store, self.commands, self.prepare, self.results = store, commands, prepare, results
         self.enabled, self.owners, self.administrators = enabled, owners, administrators
         self.private_authority = private_authority
+        self.template_results = template_results
 
     def _owner(self, command: ExperimentCommand) -> None:
         if command.actor_id not in self.owners:
@@ -627,8 +655,12 @@ class ExperimentCommandWriter:
                 body_hash=canonical_sha256(command),
                 request=command.request,
                 registered_at=self.prepare.clock(),
+                template_baseline=None
+                if original is not None
+                else self.prepare.template_baseline(command.actor_id, command.request),
             )
-            record = self._prepare_admitted(command, record)
+            if record.state != "cancelled":
+                record = self._prepare_admitted(command, record)
             effect = ExperimentEffect(
                 command_hash=canonical_sha256(command),
                 owner=command.actor_id,
@@ -664,17 +696,33 @@ class ExperimentCommandWriter:
                 from rquant.experiment_platform import ExperimentChildAdmission
 
                 child = ExperimentChildAdmission.model_validate_json(row[0])
-                result = self.results.read(
-                    child.job_id,
-                    expected_result_hash=command.result_hash,
-                    private_owner=command.actor_id,
-                    private_authority=self.private_authority,
-                )
-                if (
-                    result.bundle.result.status != "complete"
-                    or result.bundle.frozen.config not in parent.actual_configurations
-                ):
-                    raise ValueError("selected candidate has no full exact sealed result")
+                if parent.template_baseline is not None:
+                    if self.template_results is None:
+                        raise ValueError("original template result reader is unavailable")
+                    result = self.template_results.read_private(
+                        child.job_id,
+                        expected_result_hash=command.result_hash,
+                        private_owner=command.actor_id,
+                        private_authority=self.private_authority,
+                    )
+                    job = self.commands.reader.get_job(child.job_id)
+                    preparation = self.private_authority.authorize(job, command.actor_id)
+                    if not isinstance(preparation.prepared, PreparedExperimentTemplate) or (
+                        preparation.configuration not in parent.actual_configurations
+                    ):
+                        raise ValueError("selected template lacks its full exact sealed result")
+                else:
+                    result = self.results.read(
+                        child.job_id,
+                        expected_result_hash=command.result_hash,
+                        private_owner=command.actor_id,
+                        private_authority=self.private_authority,
+                    )
+                    if (
+                        result.bundle.result.status != "complete"
+                        or result.bundle.frozen.config not in parent.actual_configurations
+                    ):
+                        raise ValueError("selected candidate has no full exact sealed result")
                 profile = self.prepare.profile(parent)
                 policy = self.store.policy()
                 cutoff = min(
@@ -783,43 +831,61 @@ class ExperimentCommandWriter:
             if effect.family_id is None:
                 raise ValueError("original formal family is missing")
             record = self.store.get_family(command.actor_id, effect.family_id)
-            if record.state != "ready":
-                raise ValueError("complete formal family is not ready")
-            ids = []
-            for index in range(len(record.actual_configurations)):
-                job_id = stable_experiment_job(record.owner, record.request_id, index)
-                intent = self.store.registry.get_submission_intent_for_job(job_id)
-                if intent is None:
-                    raise ValueError("complete formal child intent is missing")
-                child = self.store.child(job_id)
-                # Keep planned identities even when cancellation preceded publication.
-                ids.append(job_id)
-                if child is not None and child.cancel_state == "before_publication":
-                    continue
-                envelope = LabCommandEnvelope.model_validate_json(intent.envelope_json)
-                result = self.commands.submit_create(
-                    envelope.command,
-                    interaction_key=stable_experiment_interaction(
-                        record.owner, record.request_id, index
-                    ),
-                )
-                if not isinstance(result, CommandSubmissionReceipt):
-                    raise ValueError("original child publication needs recovery")
-            jobs, count = tuple(ids), len(record.actual_configurations)
-            status = "outer_admitted" if record.phase == "outer" else "registered"
+            if record.state == "cancelled":
+                count, status = len(record.actual_configurations), "cancelled"
+            else:
+                if record.state != "ready":
+                    raise ValueError("complete formal family is not ready")
+                ids = []
+                for index in range(len(record.actual_configurations)):
+                    job_id = stable_experiment_job(record.owner, record.request_id, index)
+                    intent = self.store.registry.get_submission_intent_for_job(job_id)
+                    if intent is None:
+                        raise ValueError("complete formal child intent is missing")
+                    child = self.store.child(job_id)
+                    # Keep planned identities even when cancellation preceded publication.
+                    ids.append(job_id)
+                    if child is not None and child.cancel_state == "before_publication":
+                        continue
+                    envelope = LabCommandEnvelope.model_validate_json(intent.envelope_json)
+                    result = self.commands.submit_create(
+                        envelope.command,
+                        interaction_key=stable_experiment_interaction(
+                            record.owner, record.request_id, index
+                        ),
+                    )
+                    if not isinstance(result, CommandSubmissionReceipt):
+                        raise ValueError("original child publication needs recovery")
+                jobs, count = tuple(ids), len(record.actual_configurations)
+                status = "outer_admitted" if record.phase == "outer" else "registered"
         elif isinstance(command, CancelExperimentFamily):
             self.commands.recover_private_experiment_cancellations(observed_at=self.prepare.clock())
+            record = self.store.get_family(command.actor_id, command.family_id)
+            count = len(record.actual_configurations)
             with self.store.registry._connect() as connection:
-                pending = connection.execute(
-                    (
-                        "SELECT 1 FROM experiment_child_admission WHERE "
-                        "hypothesis_family=? AND json_extract(payload_json,'$.cancel_stat"
-                        "e')='pending' LIMIT "
-                        "1"
-                    ),
-                    (command.family_id,),
-                ).fetchone()
-            status = "cancellation_pending" if pending else "cancelled"
+                rows = connection.execute(
+                    "SELECT payload_json FROM experiment_child_admission "
+                    "WHERE owner=? AND hypothesis_family=?",
+                    (command.actor_id, command.family_id),
+                ).fetchall()
+            children = tuple(ExperimentChildAdmission.model_validate_json(row[0]) for row in rows)
+            if not children and record.state == "cancelled":
+                status = "cancelled"
+            elif len(children) != count or any(
+                (child.owner, child.family_id) != (command.actor_id, command.family_id)
+                for child in children
+            ):
+                raise ValueError("complete cancellation receipt lost its original children")
+            elif any(child.cancel_state in ("none", "pending") for child in children):
+                status = "cancellation_pending"
+            elif all(child.cancel_state == "already_completed" for child in children):
+                status = "already_completed"
+            elif any(
+                child.cancel_state in ("before_publication", "confirmed") for child in children
+            ):
+                status = "cancelled"
+            else:
+                status = "already_finished"
         elif isinstance(command, SetExperimentNote):
             status = "note_saved"
         else:
@@ -888,11 +954,22 @@ def bind_experiment_platform(
     projection = ExperimentPrivateProjectionReader(
         registry=readonly, jobs=commands.reader, owners=owners
     )
+    template_results = None
+    if prepare.template_binding is not None:
+        from rquant.lab_artifact_preview import ArtifactPreviewReader
+
+        template_results = StrategyTemplateSealedResultReader(
+            reader=commands.reader,
+            artifact_reader=ArtifactPreviewReader(
+                reader=commands.reader, artifact_root=results.previews.artifact_root
+            ),
+        )
     writer = ExperimentCommandWriter(
         store=store,
         commands=commands,
         prepare=prepare,
         results=results,
+        template_results=template_results,
         enabled=enabled,
         owners=owners,
         administrators=administrators,
@@ -902,6 +979,7 @@ def bind_experiment_platform(
         store=store,
         projection=projection,
         results=results,
+        template_results=template_results,
         independence_resolver=independence_resolver,
     )
     return ExperimentRuntimeBinding(
@@ -914,6 +992,7 @@ def bind_experiment_platform(
         ),
         web_service=ExperimentWebService(
             results=results,
+            template_results=template_results,
             private_authority=projection.authority,
             gateway=gateway,
             profiles=prepare.profiles,
@@ -921,5 +1000,7 @@ def bind_experiment_platform(
             owners=owners,
             administrators=administrators,
             enabled=enabled,
+            template_available=prepare.template_binding is not None
+            and prepare.template_binding.phase_provider is not None,
         ),
     )
