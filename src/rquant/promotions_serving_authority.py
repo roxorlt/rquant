@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from typing import Protocol
+from collections.abc import Callable
 
 from rquant.experiment_registry import (
+    ExperimentRegistryReadonlyReader,
     ExperimentServingReadSnapshot,
     PromotionDecisionReadSnapshot,
 )
@@ -53,19 +55,29 @@ class PromotionsSourceReader:
         registry: PromotionDecisionAuthority,
         limit: int = 1_000,
         include_experiments: bool = False,
+        private_experiment_reader: Callable[[datetime], tuple[ServingProjectionPayload, ...]]
+        | None = None,
     ) -> None:
         if not callable(getattr(registry, "read_promotion_decisions", None)):
             raise TypeError("registry must provide promotion decision reads")
         if limit < 1:
             raise ValueError("limit must be positive")
+        if private_experiment_reader is not None and not isinstance(
+            registry, ExperimentRegistryReadonlyReader
+        ):
+            raise TypeError("private experiments require the original readonly registry")
         self.registry = registry
         self.limit = limit
         self.include_experiments = include_experiments
+        self.private_experiment_reader = private_experiment_reader
 
     def __call__(self, observed_at: datetime, /) -> SourceReadResult:
         observed = normalize_aware_utc(observed_at)
+        if self.private_experiment_reader is not None:
+            self.registry._path_authority.rebind_and_assert_current_after_trusted_sqlite_change()
         if self.include_experiments:
-            combined = self.registry.read_serving_snapshot(
+            read = getattr(self.registry, "read_legacy_shared_serving_snapshot", None)
+            combined = (read or self.registry.read_serving_snapshot)(
                 observed_at=observed,
                 decision_limit=self.limit,
             )
@@ -128,13 +140,26 @@ class PromotionsSourceReader:
             )
             sequence = combined.sequence
         else:
-            snapshot = self.registry.read_promotion_decisions(
+            read = getattr(self.registry, "read_legacy_shared_promotion_decisions", None)
+            snapshot = (read or self.registry.read_promotion_decisions)(
                 observed_at=observed,
                 limit=self.limit,
             )
             source_time = snapshot.event_time or _EMPTY_EVENT_TIME
             projections = ()
             sequence = snapshot.sequence
+        if self.private_experiment_reader is not None:
+            private = self.private_experiment_reader(observed)
+            repeated = self.private_experiment_reader(observed)
+            if private != repeated:
+                raise ValueError("private experiment source changed while publishing")
+            from rquant.experiment_platform_projection import PRIVATE_TABLES
+
+            if private and {p.table_name for p in private} != set(PRIVATE_TABLES):
+                raise ValueError("private experiment source is partial")
+            projections = (*projections, *private)
+            if private:
+                source_time = observed
         values: dict[str, object] = {
             "dataset_id": PROMOTIONS_DATASET_ID,
             "sequence": sequence,

@@ -379,6 +379,142 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/experiments/capabilities": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 正式实验能力 */
+        get: operations["capabilities_api_v1_experiments_capabilities_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/experiments/commands": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 登记、取消、备注与样本外解封 */
+        post: operations["command_api_v1_experiments_commands_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/experiments/compare": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 比较两份封存实验 */
+        get: operations["compare_api_v1_experiments_compare_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/experiments/families/{family_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 完整搜索族 */
+        get: operations["family_api_v1_experiments_families__family_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/experiments/families/{family_id}/heatmap": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 参数热力图与邻域 */
+        get: operations["heatmap_api_v1_experiments_families__family_id__heatmap_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/experiments/mine": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 我的正式实验 */
+        get: operations["mine_api_v1_experiments_mine_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/experiments/results/{experiment_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 封存实验结果 */
+        get: operations["result_api_v1_experiments_results__experiment_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/experiments/results/{experiment_id}/statistics": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 实验过拟合证据 */
+        get: operations["statistics_api_v1_experiments_results__experiment_id__statistics_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/factors/capabilities": {
         parameters: {
             query?: never;
@@ -2930,6 +3066,57 @@ export interface components {
             /** Version */
             version: string;
         };
+        /**
+         * CSCVInput
+         * @description Aligned single-period returns for a complete candidate family.
+         */
+        CSCVInput: {
+            /** Candidate Ids */
+            candidate_ids: string[];
+            /** Period End Dates */
+            period_end_dates: string[];
+            /** Returns By Observation */
+            returns_by_observation: number[][];
+            /** Slice Count */
+            slice_count: number;
+        };
+        /**
+         * CSCVPBOResult
+         * @description Exact split count and fraction of selected candidates below OOS median.
+         */
+        CSCVPBOResult: {
+            /** Below Median Count */
+            below_median_count: number;
+            inputs: components["schemas"]["CSCVInput"];
+            /** Probability Of Backtest Overfitting */
+            probability_of_backtest_overfitting: number;
+            /** Split Count */
+            split_count: number;
+            /** Splits */
+            splits: components["schemas"]["CSCVSplitResult"][];
+        };
+        /**
+         * CSCVSplitResult
+         * @description One IS/OOS split, with Sharpe arrays ordered like the input candidates.
+         */
+        CSCVSplitResult: {
+            /** In Sample Sharpe By Candidate */
+            in_sample_sharpe_by_candidate: number[];
+            /** In Sample Slices */
+            in_sample_slices: number[];
+            /** Logit */
+            logit: number;
+            /** Out Of Sample Rank */
+            out_of_sample_rank: number;
+            /** Out Of Sample Relative Rank */
+            out_of_sample_relative_rank: number;
+            /** Out Of Sample Sharpe By Candidate */
+            out_of_sample_sharpe_by_candidate: number[];
+            /** Out Of Sample Slices */
+            out_of_sample_slices: number[];
+            /** Selected Candidate Id */
+            selected_candidate_id: string;
+        };
         /** CallExpr */
         CallExpr: {
             /** Args */
@@ -3335,6 +3522,44 @@ export interface components {
             status: "fresh" | "stale" | "degraded" | "unavailable";
             user_status: components["schemas"]["StatusInfo"];
         };
+        /** DateRange */
+        DateRange: {
+            /**
+             * End Date
+             * Format: date
+             */
+            end_date: string;
+            /**
+             * Start Date
+             * Format: date
+             */
+            start_date: string;
+        };
+        /**
+         * DeflatedSharpeInput
+         * @description Single-period selected Sharpe and complete independent-trial family evidence.
+         *
+         *     Convert annualized Sharpe before calling. The caller must verify the trial
+         *     family's completeness and independence; a raw run count is not a substitute.
+         */
+        DeflatedSharpeInput: {
+            /** Family Sharpe Std Per Period */
+            family_sharpe_std_per_period: number;
+            /** Independent Trial Count */
+            independent_trial_count: number;
+            selected_strategy: components["schemas"]["SinglePeriodSharpeInput"];
+        };
+        /**
+         * DeflatedSharpeResult
+         * @description Probability above the expected maximum noise Sharpe for an independent family.
+         */
+        DeflatedSharpeResult: {
+            /** Expected Max Noise Sharpe Per Period */
+            expected_max_noise_sharpe_per_period: number;
+            inputs: components["schemas"]["DeflatedSharpeInput"];
+            /** Probability */
+            probability: number;
+        };
         /** DeliveriesSummary */
         DeliveriesSummary: {
             /** Delivered */
@@ -3501,9 +3726,44 @@ export interface components {
             data: components["schemas"]["DataAuditReportData"];
             serving: components["schemas"]["ServingMeta"];
         };
+        /** Envelope[ExperimentCapabilities] */
+        Envelope_ExperimentCapabilities_: {
+            data: components["schemas"]["ExperimentCapabilities"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[ExperimentComparisonData] */
+        Envelope_ExperimentComparisonData_: {
+            data: components["schemas"]["ExperimentComparisonData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[ExperimentFamilyData] */
+        Envelope_ExperimentFamilyData_: {
+            data: components["schemas"]["ExperimentFamilyData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[ExperimentHeatmapData] */
+        Envelope_ExperimentHeatmapData_: {
+            data: components["schemas"]["ExperimentHeatmapData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
         /** Envelope[ExperimentListData] */
         Envelope_ExperimentListData_: {
             data: components["schemas"]["ExperimentListData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[ExperimentMineData] */
+        Envelope_ExperimentMineData_: {
+            data: components["schemas"]["ExperimentMineData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[ExperimentResultData] */
+        Envelope_ExperimentResultData_: {
+            data: components["schemas"]["ExperimentResultData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[ExperimentStatisticsData] */
+        Envelope_ExperimentStatisticsData_: {
+            data: components["schemas"]["ExperimentStatisticsData"];
             serving: components["schemas"]["ServingMeta"];
         };
         /** Envelope[FactorArchiveCommandData] */
@@ -3886,6 +4146,277 @@ export interface components {
             /** Sell Bps */
             sell_bps: string;
         };
+        /** ExperimentAttemptRow */
+        ExperimentAttemptRow: {
+            /**
+             * Cancellation Pending
+             * @default false
+             */
+            cancellation_pending: boolean;
+            configuration: components["schemas"]["PortfolioEditableConfig-Output"];
+            /** Experiment Id */
+            experiment_id: string;
+            /** Family Id */
+            family_id: string;
+            /** Family Name */
+            family_name: string;
+            /** Index */
+            index: number;
+            /**
+             * Job Id
+             * Format: uuid
+             */
+            job_id: string;
+            /** Label */
+            label: string;
+            /** Message */
+            message?: string | null;
+            /**
+             * Metrics
+             * @default []
+             */
+            metrics: components["schemas"]["ExperimentMetric"][];
+            /**
+             * Phase
+             * @enum {string}
+             */
+            phase: "search" | "outer";
+            /**
+             * Registered At
+             * Format: date-time
+             */
+            registered_at: string;
+            /** Result Hash */
+            result_hash?: string | null;
+            rules?: components["schemas"]["StrategyTemplate-Output"] | null;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "registered" | "running" | "executed" | "succeeded" | "failed" | "cancelled";
+            /**
+             * Strategy Name
+             * @default 组合回测
+             */
+            strategy_name: string;
+            /**
+             * Strategy Version
+             * @default 1
+             */
+            strategy_version: number;
+        };
+        /** ExperimentCancelWrite */
+        ExperimentCancelWrite: {
+            /**
+             * Command Id
+             * Format: uuid
+             */
+            command_id: string;
+            /** Family Id */
+            family_id: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "cancel_experiment_family";
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+        };
+        /** ExperimentCapabilities */
+        ExperimentCapabilities: {
+            /** Available */
+            available: boolean;
+            /** Can Edit Policy */
+            can_edit_policy: boolean;
+            /** Can Search */
+            can_search: boolean;
+            /**
+             * Can Search Templates
+             * @default false
+             */
+            can_search_templates: boolean;
+            /** Can Unseal */
+            can_unseal: boolean;
+            default_config?: components["schemas"]["PortfolioEditableConfig-Output"] | null;
+            /** Message */
+            message: string | null;
+            policy?: components["schemas"]["HoldoutPolicy"] | null;
+            /**
+             * Sources
+             * @default []
+             */
+            sources: components["schemas"]["ExperimentSourceOption"][];
+        };
+        /** ExperimentComparisonData */
+        ExperimentComparisonData: {
+            a: components["schemas"]["ExperimentResultData"];
+            b: components["schemas"]["ExperimentResultData"];
+            /** Comparable */
+            comparable: boolean;
+            /** Differences */
+            differences: components["schemas"]["ExperimentParameterDifference"][];
+            /** Message */
+            message: string | null;
+            /** Metric Differences */
+            metric_differences: components["schemas"]["ExperimentMetric"][];
+        };
+        /** ExperimentCurvePoint */
+        ExperimentCurvePoint: {
+            /** Benchmark Nav */
+            benchmark_nav?: number | null;
+            /** Daily Return */
+            daily_return: number;
+            /** Nav */
+            nav: number;
+            /**
+             * Trade Date
+             * Format: date
+             */
+            trade_date: string;
+        };
+        /** ExperimentEditableRequest */
+        ExperimentEditableRequest: {
+            base_config: components["schemas"]["PortfolioEditableConfig-Input"];
+            /**
+             * Confidence
+             * @default 0.95
+             */
+            confidence: number | string;
+            /** Dimensions */
+            dimensions: components["schemas"]["SearchDimension"][];
+            /**
+             * Method
+             * @default grid
+             * @enum {string}
+             */
+            method: "grid" | "random";
+            /** Name */
+            name: string;
+            /**
+             * Pbo Slices
+             * @default 4
+             * @enum {integer}
+             */
+            pbo_slices: 4 | 6 | 8 | 10;
+            protocol: components["schemas"]["PortfolioExperimentProtocol"];
+            /**
+             * Random Count
+             * @default 1
+             */
+            random_count: number;
+            /**
+             * Seed
+             * @default 0
+             */
+            seed: number;
+            /**
+             * Target Period Sharpe
+             * @default 0
+             */
+            target_period_sharpe: number | string;
+            template?: components["schemas"]["ExperimentTemplateSelection"] | null;
+        };
+        /** ExperimentFamilyData */
+        ExperimentFamilyData: {
+            /** Cancelled Count */
+            cancelled_count: number;
+            /** Failed Count */
+            failed_count: number;
+            /** Family Id */
+            family_id: string;
+            /** Items */
+            items: components["schemas"]["ExperimentAttemptRow"][];
+            /** Name */
+            name: string;
+            /** Note */
+            note: string;
+            /** Note Version */
+            note_version: number;
+            /** Outer Admitted */
+            outer_admitted: boolean;
+            /** Parameters */
+            parameters: ("weight_rule.max_positions" | "weight_rule.max_stock_weight" | "weight_rule.cash_reserve" | "weight_rule.min_target_amount" | "rebalance_rule.every_n_days")[];
+            /** Parent Family Id */
+            parent_family_id?: string | null;
+            /**
+             * Phase
+             * @enum {string}
+             */
+            phase: "search" | "outer";
+            /** Planned Count */
+            planned_count: number;
+            /** Potential Count */
+            potential_count: number;
+            /**
+             * Preparation State
+             * @default ready
+             * @enum {string}
+             */
+            preparation_state: "preparing" | "ready" | "cancelled";
+            /**
+             * Preparations
+             * @default []
+             */
+            preparations: components["schemas"]["ExperimentPreparationRow"][];
+            protocol: components["schemas"]["PortfolioExperimentProtocol"];
+            /**
+             * Registered At
+             * Format: date-time
+             */
+            registered_at: string;
+            /** Search Count */
+            search_count: number;
+        };
+        /** ExperimentHeatmapCell */
+        ExperimentHeatmapCell: {
+            /** Experiment Id */
+            experiment_id: string | null;
+            /** Status */
+            status: string;
+            /** Value */
+            value: number | null;
+            /** X */
+            x: string;
+            /** Y */
+            y: string;
+        };
+        /** ExperimentHeatmapData */
+        ExperimentHeatmapData: {
+            /** Available Neighbors */
+            available_neighbors: number;
+            /** Cells */
+            cells: components["schemas"]["ExperimentHeatmapCell"][];
+            /** Complete Neighborhood */
+            complete_neighborhood: boolean;
+            /** Family Id */
+            family_id: string;
+            /** Fixed Parameters */
+            fixed_parameters: components["schemas"]["ExperimentParameterDifference"][];
+            /** Metric */
+            metric: string;
+            /** Neighbor Count */
+            neighbor_count: number;
+            /** Neighbor Minimum */
+            neighbor_minimum: number | null;
+            /**
+             * Phase
+             * @enum {string}
+             */
+            phase: "training" | "validation" | "outer";
+            /** Selected Experiment Id */
+            selected_experiment_id: string;
+            /** X Parameter */
+            x_parameter: string;
+            /** X Values */
+            x_values: string[];
+            /** Y Parameter */
+            y_parameter: string;
+            /** Y Values */
+            y_values: string[];
+        };
         /** ExperimentItem */
         ExperimentItem: {
             /** Completed At */
@@ -3927,6 +4458,353 @@ export interface components {
             retained_count: number;
             /** Truncated */
             truncated: boolean;
+        };
+        /** ExperimentMetric */
+        ExperimentMetric: {
+            /** Key */
+            key: string;
+            /** Label */
+            label: string;
+            /**
+             * Unit
+             * @enum {string}
+             */
+            unit: "percent" | "number" | "days" | "count";
+            /** Value */
+            value: number | null;
+        };
+        /** ExperimentMineData */
+        ExperimentMineData: {
+            /** Available */
+            available: boolean;
+            /**
+             * Items
+             * @default []
+             */
+            items: components["schemas"]["ExperimentAttemptRow"][];
+            /** Next Cursor */
+            next_cursor?: string | null;
+            /** Oldest Registered At */
+            oldest_registered_at?: string | null;
+            /**
+             * Preparing Families
+             * @default []
+             */
+            preparing_families: components["schemas"]["ExperimentPreparationFamily"][];
+            /**
+             * Preparing Window Truncated
+             * @default false
+             */
+            preparing_window_truncated: boolean;
+            /** Retained Count */
+            retained_count: number;
+            /** Truncated */
+            truncated: boolean;
+        };
+        /** ExperimentNoteWrite */
+        ExperimentNoteWrite: {
+            /**
+             * Command Id
+             * Format: uuid
+             */
+            command_id: string;
+            /** Expected Version */
+            expected_version: number;
+            /** Family Id */
+            family_id: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "set_experiment_note";
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+            /** Text */
+            text: string;
+        };
+        /** ExperimentParameterDifference */
+        ExperimentParameterDifference: {
+            /** A */
+            a: string | null;
+            /** B */
+            b: string | null;
+            /** Path */
+            path: string;
+        };
+        /** ExperimentPhasePerformance */
+        ExperimentPhasePerformance: {
+            /** Curves */
+            curves: components["schemas"]["ExperimentCurvePoint"][];
+            /** Message */
+            message?: string | null;
+            /** Metrics */
+            metrics: components["schemas"]["ExperimentMetric"][];
+            /**
+             * Phase
+             * @enum {string}
+             */
+            phase: "training" | "validation" | "outer";
+            summary: components["schemas"]["PerformanceSummary"] | null;
+            window: components["schemas"]["DateRange"];
+        };
+        /** ExperimentPolicyWrite */
+        ExperimentPolicyWrite: {
+            /**
+             * Command Id
+             * Format: uuid
+             */
+            command_id: string;
+            /** Expected Version */
+            expected_version: number;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "set_experiment_holdout_policy";
+            /** Months */
+            months: number;
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+        };
+        /** ExperimentPreparationFamily */
+        ExperimentPreparationFamily: {
+            /** Cancelled Count */
+            cancelled_count: number;
+            /** Definition Saved Count */
+            definition_saved_count: number;
+            /** Failed Count */
+            failed_count: number;
+            /** Family Id */
+            family_id: string;
+            /** Input Prepared Count */
+            input_prepared_count: number;
+            /** Name */
+            name: string;
+            /** Planned Count */
+            planned_count: number;
+            /**
+             * Registered At
+             * Format: date-time
+             */
+            registered_at: string;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "preparing" | "cancelled";
+        };
+        /** ExperimentPreparationRow */
+        ExperimentPreparationRow: {
+            configuration: components["schemas"]["PortfolioEditableConfig-Output"];
+            /**
+             * Definition State
+             * @enum {string}
+             */
+            definition_state: "pending" | "saved" | "failed" | "cancelled";
+            /** Failure */
+            failure?: ("capacity" | "source_changed" | "invalid_definition") | null;
+            /** Index */
+            index: number;
+            /** Input Prepared */
+            input_prepared: boolean;
+            /**
+             * Metrics
+             * @default []
+             */
+            metrics: components["schemas"]["ExperimentMetric"][];
+            rules?: components["schemas"]["StrategyTemplate-Output"] | null;
+            /**
+             * Strategy Name
+             * @default 组合回测
+             */
+            strategy_name: string;
+            /**
+             * Strategy Version
+             * @default 1
+             */
+            strategy_version: number;
+        };
+        /** ExperimentResultData */
+        ExperimentResultData: {
+            /** Basis Hash */
+            basis_hash: string;
+            configuration: components["schemas"]["PortfolioEditableConfig-Output"];
+            /** Curves */
+            curves: components["schemas"]["ExperimentCurvePoint"][];
+            /** Experiment Id */
+            experiment_id: string;
+            /** Family Id */
+            family_id: string;
+            /** Input Hash */
+            input_hash: string;
+            /**
+             * Job Id
+             * Format: uuid
+             */
+            job_id: string;
+            /** Manifest Hash */
+            manifest_hash: string;
+            /** Metrics */
+            metrics: components["schemas"]["ExperimentMetric"][];
+            performance: components["schemas"]["PortfolioPerformance"];
+            /**
+             * Phase
+             * @enum {string}
+             */
+            phase: "search" | "outer";
+            /** Phases */
+            phases: components["schemas"]["ExperimentPhasePerformance"][];
+            /** Result Hash */
+            result_hash: string;
+            /** Spec Hash */
+            spec_hash: string;
+            template?: components["schemas"]["ExperimentTemplateResultIdentity"] | null;
+        };
+        /** ExperimentSearchWrite */
+        ExperimentSearchWrite: {
+            /**
+             * Command Id
+             * Format: uuid
+             */
+            command_id: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "register_experiment_family";
+            request: components["schemas"]["ExperimentEditableRequest"];
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+        };
+        /** ExperimentSourceOption */
+        ExperimentSourceOption: {
+            /** Available */
+            available: boolean;
+            /**
+             * End Date
+             * Format: date
+             */
+            end_date: string;
+            /** Key */
+            key: string;
+            /** Label */
+            label: string;
+            /** Message */
+            message?: string | null;
+            /**
+             * Start Date
+             * Format: date
+             */
+            start_date: string;
+            /** Trading Dates */
+            trading_dates: string[];
+            /** Version */
+            version: number;
+        };
+        /** ExperimentStatisticsData */
+        ExperimentStatisticsData: {
+            /** Bh Adjusted P */
+            bh_adjusted_p?: number | null;
+            /** Cancelled Count */
+            cancelled_count: number;
+            dsr?: components["schemas"]["DeflatedSharpeResult"] | null;
+            /** Evidence Id */
+            evidence_id: string;
+            /** Experiment Id */
+            experiment_id: string;
+            /** Failed Count */
+            failed_count: number;
+            /** Family Id */
+            family_id: string;
+            mintrl?: components["schemas"]["MinimumTrackRecordLengthResult"] | null;
+            pbo?: components["schemas"]["CSCVPBOResult"] | null;
+            psr?: components["schemas"]["ProbabilisticSharpeResult"] | null;
+            /**
+             * Reasons
+             * @default []
+             */
+            reasons: string[];
+            /** Search Count */
+            search_count: number;
+        };
+        /** ExperimentTemplateResultIdentity */
+        ExperimentTemplateResultIdentity: {
+            /** Content Hash */
+            content_hash: string;
+            head: components["schemas"]["StrategyTemplateHead"];
+            rules: components["schemas"]["StrategyTemplate-Output"];
+            /** Strategy Id */
+            strategy_id: string;
+        };
+        /** ExperimentTemplateSelection */
+        ExperimentTemplateSelection: {
+            head: components["schemas"]["StrategyTemplateHead"];
+            /** Strategy Id */
+            strategy_id: string;
+        };
+        /** ExperimentUnsealWrite */
+        ExperimentUnsealWrite: {
+            /**
+             * Command Id
+             * Format: uuid
+             */
+            command_id: string;
+            /**
+             * Confirmed
+             * @constant
+             */
+            confirmed: true;
+            /** Experiment Id */
+            experiment_id: string;
+            /** Family Id */
+            family_id: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "unseal_experiment_outer_test";
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+            /** Result Hash */
+            result_hash: string;
+        };
+        /** ExperimentWriteReceipt */
+        ExperimentWriteReceipt: {
+            /**
+             * Command Id
+             * Format: uuid
+             */
+            command_id: string;
+            /** Family Id */
+            family_id?: string | null;
+            /**
+             * Job Ids
+             * @default []
+             */
+            job_ids: string[];
+            /** Message */
+            message: string;
+            /** Planned Count */
+            planned_count?: number | null;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "pending" | "processing" | "unknown" | "failed" | "registered" | "cancellation_pending" | "cancelled" | "already_completed" | "already_finished" | "note_saved" | "policy_saved" | "outer_admitted";
+            /** Version */
+            version?: number | null;
         };
         /** FactorArchiveCommandData */
         FactorArchiveCommandData: {
@@ -6095,6 +6973,21 @@ export interface components {
             /** Unrealized Pnl */
             unrealized_pnl: number;
         };
+        /** HoldoutPolicy */
+        HoldoutPolicy: {
+            /**
+             * Months
+             * @default 0
+             */
+            months: number;
+            /**
+             * Updated At
+             * Format: date-time
+             */
+            updated_at: string;
+            /** Version */
+            version: number;
+        };
         /**
          * ICSeriesSummary
          * @description Statistics for one IC definition across an ordered set of decision dates.
@@ -6447,6 +7340,24 @@ export interface components {
             server_time: string;
             /** Viewer */
             viewer: string | null;
+        };
+        /**
+         * MinimumTrackRecordLengthResult
+         * @description Formula estimate and conservative reportable count, or an explicit unavailable state.
+         */
+        MinimumTrackRecordLengthResult: {
+            /** Confidence */
+            confidence: number;
+            /** Estimated Observations */
+            estimated_observations: number | null;
+            inputs: components["schemas"]["SinglePeriodSharpeInput"];
+            /** Minimum Observations */
+            minimum_observations: number | null;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "reachable" | "unreachable";
         };
         /** MinuteBar */
         MinuteBar: {
@@ -7509,6 +8420,15 @@ export interface components {
             start_date: string;
             weight_rule: components["schemas"]["PortfolioWeightRule-Output"];
         };
+        /**
+         * PortfolioExperimentProtocol
+         * @description Producer-injected preregistration ranges; no claim that outer tests ran.
+         */
+        PortfolioExperimentProtocol: {
+            frozen_outer_test_range: components["schemas"]["DateRange"];
+            train_range: components["schemas"]["DateRange"];
+            validation_range: components["schemas"]["DateRange"];
+        };
         /** PortfolioExportRequest */
         PortfolioExportRequest: {
             /**
@@ -7720,6 +8640,27 @@ export interface components {
              * Format: date
              */
             trade_date: string;
+        };
+        /** PortfolioPerformance */
+        PortfolioPerformance: {
+            /** Annualized Turnover */
+            annualized_turnover: number | null;
+            benchmark_summary: components["schemas"]["PerformanceSummary"] | null;
+            distribution: components["schemas"]["ReturnDistribution"];
+            /**
+             * Overfit State
+             * @default not_evaluated
+             * @constant
+             */
+            overfit_state: "not_evaluated";
+            relative: components["schemas"]["RelativeMetrics"] | null;
+            /** Rolling */
+            rolling: components["schemas"]["PortfolioRollingMetric"][];
+            round_trip_analysis: components["schemas"]["RoundTripAnalysis"];
+            /** Round Trips */
+            round_trips: components["schemas"]["RoundTrip"][];
+            streaks: components["schemas"]["StreakSummary"];
+            summary: components["schemas"]["PerformanceSummary"];
         };
         /** PortfolioPerformanceData */
         PortfolioPerformanceData: {
@@ -8247,6 +9188,17 @@ export interface components {
             /** Version */
             version: number;
         };
+        /**
+         * ProbabilisticSharpeResult
+         * @description Probability that the estimated Sharpe exceeds its specified benchmark.
+         */
+        ProbabilisticSharpeResult: {
+            /** Estimation Variance Factor */
+            estimation_variance_factor: number;
+            inputs: components["schemas"]["SinglePeriodSharpeInput"];
+            /** Probability */
+            probability: number;
+        };
         /** ProjectionInfo */
         ProjectionInfo: {
             /** Available */
@@ -8662,6 +9614,39 @@ export interface components {
              * @enum {string}
              */
             reason: "window_unfinished" | "visibility_pending" | "missing_price" | "suspended" | "source_unavailable";
+        };
+        /** RoundTrip */
+        RoundTrip: {
+            /**
+             * Entry Date
+             * Format: date
+             */
+            entry_date: string;
+            /** Entry Fee */
+            entry_fee: number;
+            /** Entry Notional */
+            entry_notional: number;
+            /**
+             * Exit Date
+             * Format: date
+             */
+            exit_date: string;
+            /** Exit Fee */
+            exit_fee: number;
+            /** Exit Notional */
+            exit_notional: number;
+            /** Holding Days */
+            holding_days: number;
+            /** Industry */
+            industry: string;
+            /** Net Pnl */
+            net_pnl: number;
+            /** Quantity */
+            quantity: number;
+            /** Return Rate */
+            return_rate: number;
+            /** Ts Code */
+            ts_code: string;
         };
         /** RoundTripAnalysis */
         RoundTripAnalysis: {
@@ -9176,6 +10161,16 @@ export interface components {
              */
             unknown_count: number;
         };
+        /** SearchDimension */
+        SearchDimension: {
+            /**
+             * Parameter
+             * @enum {string}
+             */
+            parameter: "weight_rule.max_positions" | "weight_rule.max_stock_weight" | "weight_rule.cash_reserve" | "weight_rule.min_target_amount" | "rebalance_rule.every_n_days";
+            /** Values */
+            values: (number | string)[];
+        };
         /** ServiceItem */
         ServiceItem: {
             /** Backlog Count */
@@ -9306,6 +10301,26 @@ export interface components {
             items: components["schemas"]["SignalItem"][];
             /** Total */
             total: number;
+        };
+        /**
+         * SinglePeriodSharpeInput
+         * @description Sharpe and moments at one frequency; convert annualized Sharpe before calling.
+         *
+         *     The caller verifies that observations are independent, returns and costs share
+         *     one basis, and no future information enters the estimate. These facts cannot
+         *     be inferred from the summary statistics supplied here.
+         */
+        SinglePeriodSharpeInput: {
+            /** Benchmark Sharpe Per Period */
+            benchmark_sharpe_per_period: number;
+            /** Independent Observations */
+            independent_observations: number;
+            /** Observed Sharpe Per Period */
+            observed_sharpe_per_period: number;
+            /** Pearson Kurtosis */
+            pearson_kurtosis: number;
+            /** Skewness */
+            skewness: number;
         };
         /** SourcePosition */
         SourcePosition: {
@@ -10759,6 +11774,263 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_ExperimentListData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    capabilities_api_v1_experiments_capabilities_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_ExperimentCapabilities_"];
+                };
+            };
+        };
+    };
+    command_api_v1_experiments_commands_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ExperimentSearchWrite"] | components["schemas"]["ExperimentCancelWrite"] | components["schemas"]["ExperimentNoteWrite"] | components["schemas"]["ExperimentUnsealWrite"] | components["schemas"]["ExperimentPolicyWrite"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExperimentWriteReceipt"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    compare_api_v1_experiments_compare_get: {
+        parameters: {
+            query: {
+                a: string;
+                b: string;
+                generation_id: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_ExperimentComparisonData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    family_api_v1_experiments_families__family_id__get: {
+        parameters: {
+            query: {
+                generation_id: string;
+            };
+            header?: never;
+            path: {
+                family_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_ExperimentFamilyData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    heatmap_api_v1_experiments_families__family_id__heatmap_get: {
+        parameters: {
+            query: {
+                selected: string;
+                x: string;
+                y: string;
+                metric: string;
+                phase: string;
+                generation_id: string;
+            };
+            header?: never;
+            path: {
+                family_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_ExperimentHeatmapData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    mine_api_v1_experiments_mine_get: {
+        parameters: {
+            query?: {
+                limit?: number;
+                cursor?: string | null;
+                generation_id?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_ExperimentMineData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    result_api_v1_experiments_results__experiment_id__get: {
+        parameters: {
+            query: {
+                generation_id: string;
+                result_hash: string;
+            };
+            header?: never;
+            path: {
+                experiment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_ExperimentResultData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    statistics_api_v1_experiments_results__experiment_id__statistics_get: {
+        parameters: {
+            query: {
+                generation_id: string;
+            };
+            header?: never;
+            path: {
+                experiment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_ExperimentStatisticsData_"];
                 };
             };
             /** @description Validation Error */

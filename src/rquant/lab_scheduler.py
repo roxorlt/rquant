@@ -56,6 +56,7 @@ from rquant.lab_jobs import (
 from rquant.lab_logging import _safe_structured_log
 if TYPE_CHECKING:
     from rquant.strategy_template_runtime import StrategyTemplateRuntimeDirectory
+    from rquant.experiment_platform_templates import ExperimentTemplateRuntimeBinding
 from rquant.lab_result_digest import LabResultDigestPolicy
 from rquant.lab_shard_protocol import LabClaimSpool, LabReportSpool, LabShardClaim, LabShardClaimV2
 from rquant.lab_source_stage import (
@@ -340,6 +341,7 @@ class LabScheduler:
         max_reports_per_tick: int = 64,
         adapter_registry: StrategyJobAdapterRegistry | None = None,
         template_directory: StrategyTemplateRuntimeDirectory | None = None,
+        experiment_template_binding: ExperimentTemplateRuntimeBinding | None = None,
         max_plans_per_tick: int = 64,
         max_claims_per_tick: int = 16,
         max_claim_authority_per_tick: int = 128,
@@ -492,6 +494,8 @@ class LabScheduler:
         self.adapter_registry = adapter_registry
         from rquant.strategy_template_runtime import require_template_runtime_directory
         self.template_directory = require_template_runtime_directory(template_directory)
+        from rquant.experiment_platform_templates import require_experiment_template_runtime_binding
+        self.experiment_template_binding = require_experiment_template_runtime_binding(experiment_template_binding)
         self.max_plans_per_tick = max_plans_per_tick
         self.max_claims_per_tick = max_claims_per_tick
         self.max_claim_authority_per_tick = max_claim_authority_per_tick
@@ -2011,11 +2015,14 @@ class LabScheduler:
                 self.artifact_commit_spool.ack(entry, receipt)
         plans_created = 0
         plans_failed = 0
-        if self.adapter_registry is not None or self.template_directory is not None:
+        if self.adapter_registry is not None or self.template_directory is not None or self.experiment_template_binding is not None:
             for job in self.store.list_unplanned_jobs(limit=self.max_plans_per_tick):
                 self._verify_runtime()
                 try:
-                    registry = self.adapter_registry if self.template_directory is None else self.template_directory.registry_for_spec(job.spec)
+                    directory = self.template_directory
+                    if self.experiment_template_binding is not None:
+                        directory = self.experiment_template_binding.directory_for_job(job.job_id, job.spec) or directory
+                    registry = self.adapter_registry if directory is None else directory.registry_for_spec(job.spec)
                     definitions = registry.plan(job.spec)
                 except Exception as exc:
                     lease, mutation_now = self._mutation_context()

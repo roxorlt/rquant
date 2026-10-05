@@ -3492,6 +3492,154 @@
         "title": "BuiltinPoolCopySource",
         "type": "object"
       },
+      "CSCVInput": {
+        "additionalProperties": false,
+        "description": "Aligned single-period returns for a complete candidate family.",
+        "properties": {
+          "candidate_ids": {
+            "items": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 64,
+            "minItems": 2,
+            "title": "Candidate Ids",
+            "type": "array"
+          },
+          "period_end_dates": {
+            "items": {
+              "format": "date",
+              "type": "string"
+            },
+            "maxItems": 4096,
+            "title": "Period End Dates",
+            "type": "array"
+          },
+          "returns_by_observation": {
+            "items": {
+              "items": {
+                "type": "number"
+              },
+              "type": "array"
+            },
+            "maxItems": 4096,
+            "title": "Returns By Observation",
+            "type": "array"
+          },
+          "slice_count": {
+            "title": "Slice Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "candidate_ids",
+          "period_end_dates",
+          "returns_by_observation",
+          "slice_count"
+        ],
+        "title": "CSCVInput",
+        "type": "object"
+      },
+      "CSCVPBOResult": {
+        "additionalProperties": false,
+        "description": "Exact split count and fraction of selected candidates below OOS median.",
+        "properties": {
+          "below_median_count": {
+            "title": "Below Median Count",
+            "type": "integer"
+          },
+          "inputs": {
+            "$ref": "#/components/schemas/CSCVInput"
+          },
+          "probability_of_backtest_overfitting": {
+            "title": "Probability Of Backtest Overfitting",
+            "type": "number"
+          },
+          "split_count": {
+            "title": "Split Count",
+            "type": "integer"
+          },
+          "splits": {
+            "items": {
+              "$ref": "#/components/schemas/CSCVSplitResult"
+            },
+            "title": "Splits",
+            "type": "array"
+          }
+        },
+        "required": [
+          "inputs",
+          "split_count",
+          "below_median_count",
+          "probability_of_backtest_overfitting",
+          "splits"
+        ],
+        "title": "CSCVPBOResult",
+        "type": "object"
+      },
+      "CSCVSplitResult": {
+        "additionalProperties": false,
+        "description": "One IS/OOS split, with Sharpe arrays ordered like the input candidates.",
+        "properties": {
+          "in_sample_sharpe_by_candidate": {
+            "items": {
+              "type": "number"
+            },
+            "title": "In Sample Sharpe By Candidate",
+            "type": "array"
+          },
+          "in_sample_slices": {
+            "items": {
+              "type": "integer"
+            },
+            "title": "In Sample Slices",
+            "type": "array"
+          },
+          "logit": {
+            "title": "Logit",
+            "type": "number"
+          },
+          "out_of_sample_rank": {
+            "title": "Out Of Sample Rank",
+            "type": "integer"
+          },
+          "out_of_sample_relative_rank": {
+            "title": "Out Of Sample Relative Rank",
+            "type": "number"
+          },
+          "out_of_sample_sharpe_by_candidate": {
+            "items": {
+              "type": "number"
+            },
+            "title": "Out Of Sample Sharpe By Candidate",
+            "type": "array"
+          },
+          "out_of_sample_slices": {
+            "items": {
+              "type": "integer"
+            },
+            "title": "Out Of Sample Slices",
+            "type": "array"
+          },
+          "selected_candidate_id": {
+            "title": "Selected Candidate Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "in_sample_slices",
+          "out_of_sample_slices",
+          "selected_candidate_id",
+          "in_sample_sharpe_by_candidate",
+          "out_of_sample_sharpe_by_candidate",
+          "out_of_sample_rank",
+          "out_of_sample_relative_rank",
+          "logit"
+        ],
+        "title": "CSCVSplitResult",
+        "type": "object"
+      },
       "CallExpr": {
         "additionalProperties": false,
         "properties": {
@@ -4787,6 +4935,80 @@
         "title": "DatasetWatermarkInfo",
         "type": "object"
       },
+      "DateRange": {
+        "additionalProperties": false,
+        "properties": {
+          "end_date": {
+            "format": "date",
+            "title": "End Date",
+            "type": "string"
+          },
+          "start_date": {
+            "format": "date",
+            "title": "Start Date",
+            "type": "string"
+          }
+        },
+        "required": [
+          "start_date",
+          "end_date"
+        ],
+        "title": "DateRange",
+        "type": "object"
+      },
+      "DeflatedSharpeInput": {
+        "additionalProperties": false,
+        "description": "Single-period selected Sharpe and complete independent-trial family evidence.\n\nConvert annualized Sharpe before calling. The caller must verify the trial\nfamily's completeness and independence; a raw run count is not a substitute.",
+        "properties": {
+          "family_sharpe_std_per_period": {
+            "minimum": 0.0,
+            "title": "Family Sharpe Std Per Period",
+            "type": "number"
+          },
+          "independent_trial_count": {
+            "minimum": 1.0,
+            "title": "Independent Trial Count",
+            "type": "integer"
+          },
+          "selected_strategy": {
+            "$ref": "#/components/schemas/SinglePeriodSharpeInput"
+          }
+        },
+        "required": [
+          "selected_strategy",
+          "independent_trial_count",
+          "family_sharpe_std_per_period"
+        ],
+        "title": "DeflatedSharpeInput",
+        "type": "object"
+      },
+      "DeflatedSharpeResult": {
+        "additionalProperties": false,
+        "description": "Probability above the expected maximum noise Sharpe for an independent family.",
+        "properties": {
+          "expected_max_noise_sharpe_per_period": {
+            "minimum": 0.0,
+            "title": "Expected Max Noise Sharpe Per Period",
+            "type": "number"
+          },
+          "inputs": {
+            "$ref": "#/components/schemas/DeflatedSharpeInput"
+          },
+          "probability": {
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Probability",
+            "type": "number"
+          }
+        },
+        "required": [
+          "inputs",
+          "expected_max_noise_sharpe_per_period",
+          "probability"
+        ],
+        "title": "DeflatedSharpeResult",
+        "type": "object"
+      },
       "DeliveriesSummary": {
         "properties": {
           "delivered": {
@@ -5291,6 +5513,70 @@
         "title": "Envelope[DataAuditReportData]",
         "type": "object"
       },
+      "Envelope_ExperimentCapabilities_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/ExperimentCapabilities"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[ExperimentCapabilities]",
+        "type": "object"
+      },
+      "Envelope_ExperimentComparisonData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/ExperimentComparisonData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[ExperimentComparisonData]",
+        "type": "object"
+      },
+      "Envelope_ExperimentFamilyData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/ExperimentFamilyData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[ExperimentFamilyData]",
+        "type": "object"
+      },
+      "Envelope_ExperimentHeatmapData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/ExperimentHeatmapData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[ExperimentHeatmapData]",
+        "type": "object"
+      },
       "Envelope_ExperimentListData_": {
         "properties": {
           "data": {
@@ -5305,6 +5591,54 @@
           "serving"
         ],
         "title": "Envelope[ExperimentListData]",
+        "type": "object"
+      },
+      "Envelope_ExperimentMineData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/ExperimentMineData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[ExperimentMineData]",
+        "type": "object"
+      },
+      "Envelope_ExperimentResultData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/ExperimentResultData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[ExperimentResultData]",
+        "type": "object"
+      },
+      "Envelope_ExperimentStatisticsData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/ExperimentStatisticsData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[ExperimentStatisticsData]",
         "type": "object"
       },
       "Envelope_FactorArchiveCommandData_": {
@@ -6498,6 +6832,718 @@
         "title": "ExecutionCostSlippage",
         "type": "object"
       },
+      "ExperimentAttemptRow": {
+        "additionalProperties": false,
+        "properties": {
+          "cancellation_pending": {
+            "default": false,
+            "title": "Cancellation Pending",
+            "type": "boolean"
+          },
+          "configuration": {
+            "$ref": "#/components/schemas/PortfolioEditableConfig-Output"
+          },
+          "experiment_id": {
+            "title": "Experiment Id",
+            "type": "string"
+          },
+          "family_id": {
+            "title": "Family Id",
+            "type": "string"
+          },
+          "family_name": {
+            "title": "Family Name",
+            "type": "string"
+          },
+          "index": {
+            "title": "Index",
+            "type": "integer"
+          },
+          "job_id": {
+            "format": "uuid",
+            "title": "Job Id",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Message"
+          },
+          "metrics": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ExperimentMetric"
+            },
+            "title": "Metrics",
+            "type": "array"
+          },
+          "phase": {
+            "enum": [
+              "search",
+              "outer"
+            ],
+            "title": "Phase",
+            "type": "string"
+          },
+          "registered_at": {
+            "format": "date-time",
+            "title": "Registered At",
+            "type": "string"
+          },
+          "result_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Result Hash"
+          },
+          "rules": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StrategyTemplate-Output"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "status": {
+            "enum": [
+              "registered",
+              "running",
+              "executed",
+              "succeeded",
+              "failed",
+              "cancelled"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "strategy_name": {
+            "default": "组合回测",
+            "title": "Strategy Name",
+            "type": "string"
+          },
+          "strategy_version": {
+            "default": 1,
+            "minimum": 1.0,
+            "title": "Strategy Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "experiment_id",
+          "family_id",
+          "family_name",
+          "phase",
+          "registered_at",
+          "status",
+          "label",
+          "index",
+          "configuration",
+          "job_id"
+        ],
+        "title": "ExperimentAttemptRow",
+        "type": "object"
+      },
+      "ExperimentCancelWrite": {
+        "additionalProperties": false,
+        "properties": {
+          "command_id": {
+            "format": "uuid",
+            "title": "Command Id",
+            "type": "string"
+          },
+          "family_id": {
+            "maxLength": 100,
+            "title": "Family Id",
+            "type": "string"
+          },
+          "kind": {
+            "const": "cancel_experiment_family",
+            "default": "cancel_experiment_family",
+            "title": "Kind",
+            "type": "string"
+          },
+          "requested_at": {
+            "format": "date-time",
+            "title": "Requested At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "command_id",
+          "requested_at",
+          "family_id"
+        ],
+        "title": "ExperimentCancelWrite",
+        "type": "object"
+      },
+      "ExperimentCapabilities": {
+        "additionalProperties": false,
+        "properties": {
+          "available": {
+            "title": "Available",
+            "type": "boolean"
+          },
+          "can_edit_policy": {
+            "title": "Can Edit Policy",
+            "type": "boolean"
+          },
+          "can_search": {
+            "title": "Can Search",
+            "type": "boolean"
+          },
+          "can_search_templates": {
+            "default": false,
+            "title": "Can Search Templates",
+            "type": "boolean"
+          },
+          "can_unseal": {
+            "title": "Can Unseal",
+            "type": "boolean"
+          },
+          "default_config": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PortfolioEditableConfig-Output"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Message"
+          },
+          "policy": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/HoldoutPolicy"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "sources": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ExperimentSourceOption"
+            },
+            "title": "Sources",
+            "type": "array"
+          }
+        },
+        "required": [
+          "available",
+          "can_search",
+          "can_unseal",
+          "can_edit_policy",
+          "message"
+        ],
+        "title": "ExperimentCapabilities",
+        "type": "object"
+      },
+      "ExperimentComparisonData": {
+        "additionalProperties": false,
+        "properties": {
+          "a": {
+            "$ref": "#/components/schemas/ExperimentResultData"
+          },
+          "b": {
+            "$ref": "#/components/schemas/ExperimentResultData"
+          },
+          "comparable": {
+            "title": "Comparable",
+            "type": "boolean"
+          },
+          "differences": {
+            "items": {
+              "$ref": "#/components/schemas/ExperimentParameterDifference"
+            },
+            "title": "Differences",
+            "type": "array"
+          },
+          "message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Message"
+          },
+          "metric_differences": {
+            "items": {
+              "$ref": "#/components/schemas/ExperimentMetric"
+            },
+            "title": "Metric Differences",
+            "type": "array"
+          }
+        },
+        "required": [
+          "a",
+          "b",
+          "differences",
+          "comparable",
+          "message",
+          "metric_differences"
+        ],
+        "title": "ExperimentComparisonData",
+        "type": "object"
+      },
+      "ExperimentCurvePoint": {
+        "additionalProperties": false,
+        "properties": {
+          "benchmark_nav": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Benchmark Nav"
+          },
+          "daily_return": {
+            "title": "Daily Return",
+            "type": "number"
+          },
+          "nav": {
+            "title": "Nav",
+            "type": "number"
+          },
+          "trade_date": {
+            "format": "date",
+            "title": "Trade Date",
+            "type": "string"
+          }
+        },
+        "required": [
+          "trade_date",
+          "nav",
+          "daily_return"
+        ],
+        "title": "ExperimentCurvePoint",
+        "type": "object"
+      },
+      "ExperimentEditableRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "base_config": {
+            "$ref": "#/components/schemas/PortfolioEditableConfig-Input"
+          },
+          "confidence": {
+            "anyOf": [
+              {
+                "exclusiveMaximum": 1.0,
+                "exclusiveMinimum": 0.5,
+                "type": "number"
+              },
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              }
+            ],
+            "default": "0.95",
+            "title": "Confidence"
+          },
+          "dimensions": {
+            "items": {
+              "$ref": "#/components/schemas/SearchDimension"
+            },
+            "maxItems": 5,
+            "minItems": 1,
+            "title": "Dimensions",
+            "type": "array"
+          },
+          "method": {
+            "default": "grid",
+            "enum": [
+              "grid",
+              "random"
+            ],
+            "title": "Method",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 60,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "pbo_slices": {
+            "default": 4,
+            "enum": [
+              4,
+              6,
+              8,
+              10
+            ],
+            "title": "Pbo Slices",
+            "type": "integer"
+          },
+          "protocol": {
+            "$ref": "#/components/schemas/PortfolioExperimentProtocol"
+          },
+          "random_count": {
+            "default": 1,
+            "maximum": 64.0,
+            "minimum": 1.0,
+            "title": "Random Count",
+            "type": "integer"
+          },
+          "seed": {
+            "default": 0,
+            "maximum": 4294967295.0,
+            "minimum": 0.0,
+            "title": "Seed",
+            "type": "integer"
+          },
+          "target_period_sharpe": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              }
+            ],
+            "default": "0",
+            "title": "Target Period Sharpe"
+          },
+          "template": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ExperimentTemplateSelection"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "name",
+          "base_config",
+          "protocol",
+          "dimensions"
+        ],
+        "title": "ExperimentEditableRequest",
+        "type": "object"
+      },
+      "ExperimentFamilyData": {
+        "additionalProperties": false,
+        "properties": {
+          "cancelled_count": {
+            "title": "Cancelled Count",
+            "type": "integer"
+          },
+          "failed_count": {
+            "title": "Failed Count",
+            "type": "integer"
+          },
+          "family_id": {
+            "title": "Family Id",
+            "type": "string"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/ExperimentAttemptRow"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "note": {
+            "title": "Note",
+            "type": "string"
+          },
+          "note_version": {
+            "title": "Note Version",
+            "type": "integer"
+          },
+          "outer_admitted": {
+            "title": "Outer Admitted",
+            "type": "boolean"
+          },
+          "parameters": {
+            "items": {
+              "enum": [
+                "weight_rule.max_positions",
+                "weight_rule.max_stock_weight",
+                "weight_rule.cash_reserve",
+                "weight_rule.min_target_amount",
+                "rebalance_rule.every_n_days"
+              ],
+              "type": "string"
+            },
+            "title": "Parameters",
+            "type": "array"
+          },
+          "parent_family_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parent Family Id"
+          },
+          "phase": {
+            "enum": [
+              "search",
+              "outer"
+            ],
+            "title": "Phase",
+            "type": "string"
+          },
+          "planned_count": {
+            "title": "Planned Count",
+            "type": "integer"
+          },
+          "potential_count": {
+            "title": "Potential Count",
+            "type": "integer"
+          },
+          "preparation_state": {
+            "default": "ready",
+            "enum": [
+              "preparing",
+              "ready",
+              "cancelled"
+            ],
+            "title": "Preparation State",
+            "type": "string"
+          },
+          "preparations": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ExperimentPreparationRow"
+            },
+            "title": "Preparations",
+            "type": "array"
+          },
+          "protocol": {
+            "$ref": "#/components/schemas/PortfolioExperimentProtocol"
+          },
+          "registered_at": {
+            "format": "date-time",
+            "title": "Registered At",
+            "type": "string"
+          },
+          "search_count": {
+            "title": "Search Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "family_id",
+          "name",
+          "phase",
+          "registered_at",
+          "protocol",
+          "planned_count",
+          "potential_count",
+          "failed_count",
+          "cancelled_count",
+          "search_count",
+          "parameters",
+          "items",
+          "note",
+          "note_version",
+          "outer_admitted"
+        ],
+        "title": "ExperimentFamilyData",
+        "type": "object"
+      },
+      "ExperimentHeatmapCell": {
+        "additionalProperties": false,
+        "properties": {
+          "experiment_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Experiment Id"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "value": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Value"
+          },
+          "x": {
+            "title": "X",
+            "type": "string"
+          },
+          "y": {
+            "title": "Y",
+            "type": "string"
+          }
+        },
+        "required": [
+          "x",
+          "y",
+          "experiment_id",
+          "status",
+          "value"
+        ],
+        "title": "ExperimentHeatmapCell",
+        "type": "object"
+      },
+      "ExperimentHeatmapData": {
+        "additionalProperties": false,
+        "properties": {
+          "available_neighbors": {
+            "maximum": 8.0,
+            "minimum": 0.0,
+            "title": "Available Neighbors",
+            "type": "integer"
+          },
+          "cells": {
+            "items": {
+              "$ref": "#/components/schemas/ExperimentHeatmapCell"
+            },
+            "title": "Cells",
+            "type": "array"
+          },
+          "complete_neighborhood": {
+            "title": "Complete Neighborhood",
+            "type": "boolean"
+          },
+          "family_id": {
+            "title": "Family Id",
+            "type": "string"
+          },
+          "fixed_parameters": {
+            "items": {
+              "$ref": "#/components/schemas/ExperimentParameterDifference"
+            },
+            "title": "Fixed Parameters",
+            "type": "array"
+          },
+          "metric": {
+            "title": "Metric",
+            "type": "string"
+          },
+          "neighbor_count": {
+            "maximum": 8.0,
+            "minimum": 0.0,
+            "title": "Neighbor Count",
+            "type": "integer"
+          },
+          "neighbor_minimum": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Neighbor Minimum"
+          },
+          "phase": {
+            "enum": [
+              "training",
+              "validation",
+              "outer"
+            ],
+            "title": "Phase",
+            "type": "string"
+          },
+          "selected_experiment_id": {
+            "title": "Selected Experiment Id",
+            "type": "string"
+          },
+          "x_parameter": {
+            "title": "X Parameter",
+            "type": "string"
+          },
+          "x_values": {
+            "items": {
+              "type": "string"
+            },
+            "title": "X Values",
+            "type": "array"
+          },
+          "y_parameter": {
+            "title": "Y Parameter",
+            "type": "string"
+          },
+          "y_values": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Y Values",
+            "type": "array"
+          }
+        },
+        "required": [
+          "family_id",
+          "selected_experiment_id",
+          "x_parameter",
+          "y_parameter",
+          "x_values",
+          "y_values",
+          "phase",
+          "metric",
+          "fixed_parameters",
+          "cells",
+          "neighbor_count",
+          "available_neighbors",
+          "neighbor_minimum",
+          "complete_neighborhood"
+        ],
+        "title": "ExperimentHeatmapData",
+        "type": "object"
+      },
       "ExperimentItem": {
         "additionalProperties": false,
         "properties": {
@@ -6662,6 +7708,911 @@
           "next_cursor"
         ],
         "title": "ExperimentListData",
+        "type": "object"
+      },
+      "ExperimentMetric": {
+        "additionalProperties": false,
+        "properties": {
+          "key": {
+            "title": "Key",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "unit": {
+            "enum": [
+              "percent",
+              "number",
+              "days",
+              "count"
+            ],
+            "title": "Unit",
+            "type": "string"
+          },
+          "value": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Value"
+          }
+        },
+        "required": [
+          "key",
+          "label",
+          "value",
+          "unit"
+        ],
+        "title": "ExperimentMetric",
+        "type": "object"
+      },
+      "ExperimentMineData": {
+        "additionalProperties": false,
+        "properties": {
+          "available": {
+            "title": "Available",
+            "type": "boolean"
+          },
+          "items": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ExperimentAttemptRow"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          },
+          "oldest_registered_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Oldest Registered At"
+          },
+          "preparing_families": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ExperimentPreparationFamily"
+            },
+            "title": "Preparing Families",
+            "type": "array"
+          },
+          "preparing_window_truncated": {
+            "default": false,
+            "title": "Preparing Window Truncated",
+            "type": "boolean"
+          },
+          "retained_count": {
+            "maximum": 500.0,
+            "minimum": 0.0,
+            "title": "Retained Count",
+            "type": "integer"
+          },
+          "truncated": {
+            "title": "Truncated",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "available",
+          "retained_count",
+          "truncated"
+        ],
+        "title": "ExperimentMineData",
+        "type": "object"
+      },
+      "ExperimentNoteWrite": {
+        "additionalProperties": false,
+        "properties": {
+          "command_id": {
+            "format": "uuid",
+            "title": "Command Id",
+            "type": "string"
+          },
+          "expected_version": {
+            "minimum": 0.0,
+            "title": "Expected Version",
+            "type": "integer"
+          },
+          "family_id": {
+            "maxLength": 100,
+            "title": "Family Id",
+            "type": "string"
+          },
+          "kind": {
+            "const": "set_experiment_note",
+            "default": "set_experiment_note",
+            "title": "Kind",
+            "type": "string"
+          },
+          "requested_at": {
+            "format": "date-time",
+            "title": "Requested At",
+            "type": "string"
+          },
+          "text": {
+            "maxLength": 1024,
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "command_id",
+          "requested_at",
+          "family_id",
+          "expected_version",
+          "text"
+        ],
+        "title": "ExperimentNoteWrite",
+        "type": "object"
+      },
+      "ExperimentParameterDifference": {
+        "additionalProperties": false,
+        "properties": {
+          "a": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "A"
+          },
+          "b": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "B"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "a",
+          "b"
+        ],
+        "title": "ExperimentParameterDifference",
+        "type": "object"
+      },
+      "ExperimentPhasePerformance": {
+        "additionalProperties": false,
+        "properties": {
+          "curves": {
+            "items": {
+              "$ref": "#/components/schemas/ExperimentCurvePoint"
+            },
+            "title": "Curves",
+            "type": "array"
+          },
+          "message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Message"
+          },
+          "metrics": {
+            "items": {
+              "$ref": "#/components/schemas/ExperimentMetric"
+            },
+            "title": "Metrics",
+            "type": "array"
+          },
+          "phase": {
+            "enum": [
+              "training",
+              "validation",
+              "outer"
+            ],
+            "title": "Phase",
+            "type": "string"
+          },
+          "summary": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PerformanceSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "window": {
+            "$ref": "#/components/schemas/DateRange"
+          }
+        },
+        "required": [
+          "phase",
+          "window",
+          "summary",
+          "metrics",
+          "curves"
+        ],
+        "title": "ExperimentPhasePerformance",
+        "type": "object"
+      },
+      "ExperimentPolicyWrite": {
+        "additionalProperties": false,
+        "properties": {
+          "command_id": {
+            "format": "uuid",
+            "title": "Command Id",
+            "type": "string"
+          },
+          "expected_version": {
+            "minimum": 0.0,
+            "title": "Expected Version",
+            "type": "integer"
+          },
+          "kind": {
+            "const": "set_experiment_holdout_policy",
+            "default": "set_experiment_holdout_policy",
+            "title": "Kind",
+            "type": "string"
+          },
+          "months": {
+            "maximum": 36.0,
+            "minimum": 0.0,
+            "title": "Months",
+            "type": "integer"
+          },
+          "requested_at": {
+            "format": "date-time",
+            "title": "Requested At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "command_id",
+          "requested_at",
+          "months",
+          "expected_version"
+        ],
+        "title": "ExperimentPolicyWrite",
+        "type": "object"
+      },
+      "ExperimentPreparationFamily": {
+        "additionalProperties": false,
+        "properties": {
+          "cancelled_count": {
+            "title": "Cancelled Count",
+            "type": "integer"
+          },
+          "definition_saved_count": {
+            "title": "Definition Saved Count",
+            "type": "integer"
+          },
+          "failed_count": {
+            "title": "Failed Count",
+            "type": "integer"
+          },
+          "family_id": {
+            "title": "Family Id",
+            "type": "string"
+          },
+          "input_prepared_count": {
+            "title": "Input Prepared Count",
+            "type": "integer"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "planned_count": {
+            "title": "Planned Count",
+            "type": "integer"
+          },
+          "registered_at": {
+            "format": "date-time",
+            "title": "Registered At",
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "preparing",
+              "cancelled"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "family_id",
+          "name",
+          "registered_at",
+          "state",
+          "planned_count",
+          "definition_saved_count",
+          "input_prepared_count",
+          "failed_count",
+          "cancelled_count"
+        ],
+        "title": "ExperimentPreparationFamily",
+        "type": "object"
+      },
+      "ExperimentPreparationRow": {
+        "additionalProperties": false,
+        "properties": {
+          "configuration": {
+            "$ref": "#/components/schemas/PortfolioEditableConfig-Output"
+          },
+          "definition_state": {
+            "enum": [
+              "pending",
+              "saved",
+              "failed",
+              "cancelled"
+            ],
+            "title": "Definition State",
+            "type": "string"
+          },
+          "failure": {
+            "anyOf": [
+              {
+                "enum": [
+                  "capacity",
+                  "source_changed",
+                  "invalid_definition"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failure"
+          },
+          "index": {
+            "maximum": 63.0,
+            "minimum": 0.0,
+            "title": "Index",
+            "type": "integer"
+          },
+          "input_prepared": {
+            "title": "Input Prepared",
+            "type": "boolean"
+          },
+          "metrics": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ExperimentMetric"
+            },
+            "title": "Metrics",
+            "type": "array"
+          },
+          "rules": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StrategyTemplate-Output"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "strategy_name": {
+            "default": "组合回测",
+            "title": "Strategy Name",
+            "type": "string"
+          },
+          "strategy_version": {
+            "default": 1,
+            "minimum": 1.0,
+            "title": "Strategy Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "index",
+          "configuration",
+          "definition_state",
+          "input_prepared"
+        ],
+        "title": "ExperimentPreparationRow",
+        "type": "object"
+      },
+      "ExperimentResultData": {
+        "additionalProperties": false,
+        "properties": {
+          "basis_hash": {
+            "title": "Basis Hash",
+            "type": "string"
+          },
+          "configuration": {
+            "$ref": "#/components/schemas/PortfolioEditableConfig-Output"
+          },
+          "curves": {
+            "items": {
+              "$ref": "#/components/schemas/ExperimentCurvePoint"
+            },
+            "title": "Curves",
+            "type": "array"
+          },
+          "experiment_id": {
+            "title": "Experiment Id",
+            "type": "string"
+          },
+          "family_id": {
+            "title": "Family Id",
+            "type": "string"
+          },
+          "input_hash": {
+            "title": "Input Hash",
+            "type": "string"
+          },
+          "job_id": {
+            "format": "uuid",
+            "title": "Job Id",
+            "type": "string"
+          },
+          "manifest_hash": {
+            "title": "Manifest Hash",
+            "type": "string"
+          },
+          "metrics": {
+            "items": {
+              "$ref": "#/components/schemas/ExperimentMetric"
+            },
+            "title": "Metrics",
+            "type": "array"
+          },
+          "performance": {
+            "$ref": "#/components/schemas/PortfolioPerformance"
+          },
+          "phase": {
+            "enum": [
+              "search",
+              "outer"
+            ],
+            "title": "Phase",
+            "type": "string"
+          },
+          "phases": {
+            "items": {
+              "$ref": "#/components/schemas/ExperimentPhasePerformance"
+            },
+            "title": "Phases",
+            "type": "array"
+          },
+          "result_hash": {
+            "title": "Result Hash",
+            "type": "string"
+          },
+          "spec_hash": {
+            "title": "Spec Hash",
+            "type": "string"
+          },
+          "template": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ExperimentTemplateResultIdentity"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "experiment_id",
+          "family_id",
+          "job_id",
+          "phase",
+          "configuration",
+          "result_hash",
+          "input_hash",
+          "spec_hash",
+          "manifest_hash",
+          "basis_hash",
+          "performance",
+          "phases",
+          "metrics",
+          "curves"
+        ],
+        "title": "ExperimentResultData",
+        "type": "object"
+      },
+      "ExperimentSearchWrite": {
+        "additionalProperties": false,
+        "properties": {
+          "command_id": {
+            "format": "uuid",
+            "title": "Command Id",
+            "type": "string"
+          },
+          "kind": {
+            "const": "register_experiment_family",
+            "default": "register_experiment_family",
+            "title": "Kind",
+            "type": "string"
+          },
+          "request": {
+            "$ref": "#/components/schemas/ExperimentEditableRequest"
+          },
+          "requested_at": {
+            "format": "date-time",
+            "title": "Requested At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "command_id",
+          "requested_at",
+          "request"
+        ],
+        "title": "ExperimentSearchWrite",
+        "type": "object"
+      },
+      "ExperimentSourceOption": {
+        "additionalProperties": false,
+        "properties": {
+          "available": {
+            "title": "Available",
+            "type": "boolean"
+          },
+          "end_date": {
+            "format": "date",
+            "title": "End Date",
+            "type": "string"
+          },
+          "key": {
+            "title": "Key",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Message"
+          },
+          "start_date": {
+            "format": "date",
+            "title": "Start Date",
+            "type": "string"
+          },
+          "trading_dates": {
+            "items": {
+              "format": "date",
+              "type": "string"
+            },
+            "title": "Trading Dates",
+            "type": "array"
+          },
+          "version": {
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "key",
+          "version",
+          "label",
+          "start_date",
+          "end_date",
+          "trading_dates",
+          "available"
+        ],
+        "title": "ExperimentSourceOption",
+        "type": "object"
+      },
+      "ExperimentStatisticsData": {
+        "additionalProperties": false,
+        "properties": {
+          "bh_adjusted_p": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bh Adjusted P"
+          },
+          "cancelled_count": {
+            "title": "Cancelled Count",
+            "type": "integer"
+          },
+          "dsr": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DeflatedSharpeResult"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "evidence_id": {
+            "title": "Evidence Id",
+            "type": "string"
+          },
+          "experiment_id": {
+            "title": "Experiment Id",
+            "type": "string"
+          },
+          "failed_count": {
+            "title": "Failed Count",
+            "type": "integer"
+          },
+          "family_id": {
+            "title": "Family Id",
+            "type": "string"
+          },
+          "mintrl": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MinimumTrackRecordLengthResult"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "pbo": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CSCVPBOResult"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "psr": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProbabilisticSharpeResult"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "reasons": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Reasons",
+            "type": "array"
+          },
+          "search_count": {
+            "title": "Search Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "family_id",
+          "experiment_id",
+          "search_count",
+          "failed_count",
+          "cancelled_count",
+          "evidence_id"
+        ],
+        "title": "ExperimentStatisticsData",
+        "type": "object"
+      },
+      "ExperimentTemplateResultIdentity": {
+        "additionalProperties": false,
+        "properties": {
+          "content_hash": {
+            "title": "Content Hash",
+            "type": "string"
+          },
+          "head": {
+            "$ref": "#/components/schemas/StrategyTemplateHead"
+          },
+          "rules": {
+            "$ref": "#/components/schemas/StrategyTemplate-Output"
+          },
+          "strategy_id": {
+            "title": "Strategy Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "strategy_id",
+          "head",
+          "rules",
+          "content_hash"
+        ],
+        "title": "ExperimentTemplateResultIdentity",
+        "type": "object"
+      },
+      "ExperimentTemplateSelection": {
+        "additionalProperties": false,
+        "properties": {
+          "head": {
+            "$ref": "#/components/schemas/StrategyTemplateHead"
+          },
+          "strategy_id": {
+            "pattern": "^template_[0-9a-f]{32}$",
+            "title": "Strategy Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "strategy_id",
+          "head"
+        ],
+        "title": "ExperimentTemplateSelection",
+        "type": "object"
+      },
+      "ExperimentUnsealWrite": {
+        "additionalProperties": false,
+        "properties": {
+          "command_id": {
+            "format": "uuid",
+            "title": "Command Id",
+            "type": "string"
+          },
+          "confirmed": {
+            "const": true,
+            "title": "Confirmed",
+            "type": "boolean"
+          },
+          "experiment_id": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Experiment Id",
+            "type": "string"
+          },
+          "family_id": {
+            "maxLength": 100,
+            "title": "Family Id",
+            "type": "string"
+          },
+          "kind": {
+            "const": "unseal_experiment_outer_test",
+            "default": "unseal_experiment_outer_test",
+            "title": "Kind",
+            "type": "string"
+          },
+          "requested_at": {
+            "format": "date-time",
+            "title": "Requested At",
+            "type": "string"
+          },
+          "result_hash": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Result Hash",
+            "type": "string"
+          }
+        },
+        "required": [
+          "command_id",
+          "requested_at",
+          "family_id",
+          "experiment_id",
+          "result_hash",
+          "confirmed"
+        ],
+        "title": "ExperimentUnsealWrite",
+        "type": "object"
+      },
+      "ExperimentWriteReceipt": {
+        "additionalProperties": false,
+        "properties": {
+          "command_id": {
+            "format": "uuid",
+            "title": "Command Id",
+            "type": "string"
+          },
+          "family_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Family Id"
+          },
+          "job_ids": {
+            "default": [],
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "title": "Job Ids",
+            "type": "array"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "planned_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Planned Count"
+          },
+          "status": {
+            "enum": [
+              "pending",
+              "processing",
+              "unknown",
+              "failed",
+              "registered",
+              "cancellation_pending",
+              "cancelled",
+              "already_completed",
+              "already_finished",
+              "note_saved",
+              "policy_saved",
+              "outer_admitted"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "version": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Version"
+          }
+        },
+        "required": [
+          "command_id",
+          "status",
+          "message"
+        ],
+        "title": "ExperimentWriteReceipt",
         "type": "object"
       },
       "FactorArchiveCommandData": {
@@ -12841,6 +14792,34 @@
         "title": "HoldingItem",
         "type": "object"
       },
+      "HoldoutPolicy": {
+        "additionalProperties": false,
+        "properties": {
+          "months": {
+            "default": 0,
+            "maximum": 36.0,
+            "minimum": 0.0,
+            "title": "Months",
+            "type": "integer"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
+            "type": "string"
+          },
+          "version": {
+            "minimum": 1.0,
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "version",
+          "updated_at"
+        ],
+        "title": "HoldoutPolicy",
+        "type": "object"
+      },
       "ICSeriesSummary": {
         "additionalProperties": false,
         "description": "Statistics for one IC definition across an ordered set of decision dates.",
@@ -13995,6 +15974,60 @@
           "market"
         ],
         "title": "MetaData",
+        "type": "object"
+      },
+      "MinimumTrackRecordLengthResult": {
+        "additionalProperties": false,
+        "description": "Formula estimate and conservative reportable count, or an explicit unavailable state.",
+        "properties": {
+          "confidence": {
+            "exclusiveMaximum": 1.0,
+            "exclusiveMinimum": 0.5,
+            "title": "Confidence",
+            "type": "number"
+          },
+          "estimated_observations": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Estimated Observations"
+          },
+          "inputs": {
+            "$ref": "#/components/schemas/SinglePeriodSharpeInput"
+          },
+          "minimum_observations": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Minimum Observations"
+          },
+          "status": {
+            "enum": [
+              "reachable",
+              "unreachable"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "inputs",
+          "confidence",
+          "status",
+          "estimated_observations",
+          "minimum_observations"
+        ],
+        "title": "MinimumTrackRecordLengthResult",
         "type": "object"
       },
       "MinuteBar": {
@@ -17210,6 +19243,28 @@
         "title": "PortfolioEditableConfig",
         "type": "object"
       },
+      "PortfolioExperimentProtocol": {
+        "additionalProperties": false,
+        "description": "Producer-injected preregistration ranges; no claim that outer tests ran.",
+        "properties": {
+          "frozen_outer_test_range": {
+            "$ref": "#/components/schemas/DateRange"
+          },
+          "train_range": {
+            "$ref": "#/components/schemas/DateRange"
+          },
+          "validation_range": {
+            "$ref": "#/components/schemas/DateRange"
+          }
+        },
+        "required": [
+          "train_range",
+          "validation_range",
+          "frozen_outer_test_range"
+        ],
+        "title": "PortfolioExperimentProtocol",
+        "type": "object"
+      },
       "PortfolioExportRequest": {
         "additionalProperties": false,
         "properties": {
@@ -17772,6 +19827,87 @@
           "incomplete_reason"
         ],
         "title": "PortfolioNavRow",
+        "type": "object"
+      },
+      "PortfolioPerformance": {
+        "additionalProperties": false,
+        "properties": {
+          "annualized_turnover": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Annualized Turnover"
+          },
+          "benchmark_summary": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PerformanceSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "distribution": {
+            "$ref": "#/components/schemas/ReturnDistribution"
+          },
+          "overfit_state": {
+            "const": "not_evaluated",
+            "default": "not_evaluated",
+            "title": "Overfit State",
+            "type": "string"
+          },
+          "relative": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RelativeMetrics"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "rolling": {
+            "items": {
+              "$ref": "#/components/schemas/PortfolioRollingMetric"
+            },
+            "title": "Rolling",
+            "type": "array"
+          },
+          "round_trip_analysis": {
+            "$ref": "#/components/schemas/RoundTripAnalysis"
+          },
+          "round_trips": {
+            "items": {
+              "$ref": "#/components/schemas/RoundTrip"
+            },
+            "title": "Round Trips",
+            "type": "array"
+          },
+          "streaks": {
+            "$ref": "#/components/schemas/StreakSummary"
+          },
+          "summary": {
+            "$ref": "#/components/schemas/PerformanceSummary"
+          }
+        },
+        "required": [
+          "summary",
+          "benchmark_summary",
+          "relative",
+          "annualized_turnover",
+          "rolling",
+          "round_trips",
+          "round_trip_analysis",
+          "distribution",
+          "streaks"
+        ],
+        "title": "PortfolioPerformance",
         "type": "object"
       },
       "PortfolioPerformanceData": {
@@ -19316,6 +21452,33 @@
         "title": "PriceAlertRuntimeItem",
         "type": "object"
       },
+      "ProbabilisticSharpeResult": {
+        "additionalProperties": false,
+        "description": "Probability that the estimated Sharpe exceeds its specified benchmark.",
+        "properties": {
+          "estimation_variance_factor": {
+            "exclusiveMinimum": 0.0,
+            "title": "Estimation Variance Factor",
+            "type": "number"
+          },
+          "inputs": {
+            "$ref": "#/components/schemas/SinglePeriodSharpeInput"
+          },
+          "probability": {
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Probability",
+            "type": "number"
+          }
+        },
+        "required": [
+          "inputs",
+          "estimation_variance_factor",
+          "probability"
+        ],
+        "title": "ProbabilisticSharpeResult",
+        "type": "object"
+      },
       "ProjectionInfo": {
         "properties": {
           "available": {
@@ -20813,6 +22976,76 @@
           "count"
         ],
         "title": "ReturnMissingCount",
+        "type": "object"
+      },
+      "RoundTrip": {
+        "properties": {
+          "entry_date": {
+            "format": "date",
+            "title": "Entry Date",
+            "type": "string"
+          },
+          "entry_fee": {
+            "title": "Entry Fee",
+            "type": "number"
+          },
+          "entry_notional": {
+            "title": "Entry Notional",
+            "type": "number"
+          },
+          "exit_date": {
+            "format": "date",
+            "title": "Exit Date",
+            "type": "string"
+          },
+          "exit_fee": {
+            "title": "Exit Fee",
+            "type": "number"
+          },
+          "exit_notional": {
+            "title": "Exit Notional",
+            "type": "number"
+          },
+          "holding_days": {
+            "title": "Holding Days",
+            "type": "integer"
+          },
+          "industry": {
+            "title": "Industry",
+            "type": "string"
+          },
+          "net_pnl": {
+            "title": "Net Pnl",
+            "type": "number"
+          },
+          "quantity": {
+            "title": "Quantity",
+            "type": "integer"
+          },
+          "return_rate": {
+            "title": "Return Rate",
+            "type": "number"
+          },
+          "ts_code": {
+            "title": "Ts Code",
+            "type": "string"
+          }
+        },
+        "required": [
+          "ts_code",
+          "industry",
+          "entry_date",
+          "exit_date",
+          "quantity",
+          "entry_notional",
+          "exit_notional",
+          "entry_fee",
+          "exit_fee",
+          "net_pnl",
+          "return_rate",
+          "holding_days"
+        ],
+        "title": "RoundTrip",
         "type": "object"
       },
       "RoundTripAnalysis": {
@@ -22314,6 +24547,45 @@
         "title": "ScreenStep",
         "type": "object"
       },
+      "SearchDimension": {
+        "additionalProperties": false,
+        "properties": {
+          "parameter": {
+            "enum": [
+              "weight_rule.max_positions",
+              "weight_rule.max_stock_weight",
+              "weight_rule.cash_reserve",
+              "weight_rule.min_target_amount",
+              "rebalance_rule.every_n_days"
+            ],
+            "title": "Parameter",
+            "type": "string"
+          },
+          "values": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                  "type": "string"
+                }
+              ]
+            },
+            "maxItems": 16,
+            "minItems": 1,
+            "title": "Values",
+            "type": "array"
+          }
+        },
+        "required": [
+          "parameter",
+          "values"
+        ],
+        "title": "SearchDimension",
+        "type": "object"
+      },
       "ServiceItem": {
         "properties": {
           "backlog_count": {
@@ -22694,6 +24966,42 @@
           "items"
         ],
         "title": "SignalsSummary",
+        "type": "object"
+      },
+      "SinglePeriodSharpeInput": {
+        "additionalProperties": false,
+        "description": "Sharpe and moments at one frequency; convert annualized Sharpe before calling.\n\nThe caller verifies that observations are independent, returns and costs share\none basis, and no future information enters the estimate. These facts cannot\nbe inferred from the summary statistics supplied here.",
+        "properties": {
+          "benchmark_sharpe_per_period": {
+            "title": "Benchmark Sharpe Per Period",
+            "type": "number"
+          },
+          "independent_observations": {
+            "minimum": 30.0,
+            "title": "Independent Observations",
+            "type": "integer"
+          },
+          "observed_sharpe_per_period": {
+            "title": "Observed Sharpe Per Period",
+            "type": "number"
+          },
+          "pearson_kurtosis": {
+            "title": "Pearson Kurtosis",
+            "type": "number"
+          },
+          "skewness": {
+            "title": "Skewness",
+            "type": "number"
+          }
+        },
+        "required": [
+          "observed_sharpe_per_period",
+          "benchmark_sharpe_per_period",
+          "skewness",
+          "pearson_kurtosis",
+          "independent_observations"
+        ],
+        "title": "SinglePeriodSharpeInput",
         "type": "object"
       },
       "SourcePosition": {
@@ -26052,6 +28360,499 @@
           }
         },
         "summary": "实验记录",
+        "tags": [
+          "experiments"
+        ]
+      }
+    },
+    "/api/v1/experiments/capabilities": {
+      "get": {
+        "operationId": "capabilities_api_v1_experiments_capabilities_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_ExperimentCapabilities_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "正式实验能力",
+        "tags": [
+          "experiments"
+        ]
+      }
+    },
+    "/api/v1/experiments/commands": {
+      "post": {
+        "operationId": "command_api_v1_experiments_commands_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "discriminator": {
+                  "mapping": {
+                    "cancel_experiment_family": "#/components/schemas/ExperimentCancelWrite",
+                    "register_experiment_family": "#/components/schemas/ExperimentSearchWrite",
+                    "set_experiment_holdout_policy": "#/components/schemas/ExperimentPolicyWrite",
+                    "set_experiment_note": "#/components/schemas/ExperimentNoteWrite",
+                    "unseal_experiment_outer_test": "#/components/schemas/ExperimentUnsealWrite"
+                  },
+                  "propertyName": "kind"
+                },
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/ExperimentSearchWrite"
+                  },
+                  {
+                    "$ref": "#/components/schemas/ExperimentCancelWrite"
+                  },
+                  {
+                    "$ref": "#/components/schemas/ExperimentNoteWrite"
+                  },
+                  {
+                    "$ref": "#/components/schemas/ExperimentUnsealWrite"
+                  },
+                  {
+                    "$ref": "#/components/schemas/ExperimentPolicyWrite"
+                  }
+                ],
+                "title": "Body"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExperimentWriteReceipt"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "登记、取消、备注与样本外解封",
+        "tags": [
+          "experiments"
+        ]
+      }
+    },
+    "/api/v1/experiments/compare": {
+      "get": {
+        "operationId": "compare_api_v1_experiments_compare_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "a",
+            "required": true,
+            "schema": {
+              "title": "A",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "b",
+            "required": true,
+            "schema": {
+              "title": "B",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "generation_id",
+            "required": true,
+            "schema": {
+              "pattern": "^[0-9a-f]{64}$",
+              "title": "Generation Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_ExperimentComparisonData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "比较两份封存实验",
+        "tags": [
+          "experiments"
+        ]
+      }
+    },
+    "/api/v1/experiments/families/{family_id}": {
+      "get": {
+        "operationId": "family_api_v1_experiments_families__family_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "family_id",
+            "required": true,
+            "schema": {
+              "title": "Family Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "generation_id",
+            "required": true,
+            "schema": {
+              "pattern": "^[0-9a-f]{64}$",
+              "title": "Generation Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_ExperimentFamilyData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "完整搜索族",
+        "tags": [
+          "experiments"
+        ]
+      }
+    },
+    "/api/v1/experiments/families/{family_id}/heatmap": {
+      "get": {
+        "operationId": "heatmap_api_v1_experiments_families__family_id__heatmap_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "family_id",
+            "required": true,
+            "schema": {
+              "title": "Family Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "selected",
+            "required": true,
+            "schema": {
+              "title": "Selected",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "x",
+            "required": true,
+            "schema": {
+              "title": "X",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "y",
+            "required": true,
+            "schema": {
+              "title": "Y",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "metric",
+            "required": true,
+            "schema": {
+              "title": "Metric",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "phase",
+            "required": true,
+            "schema": {
+              "pattern": "^(training|validation|outer)$",
+              "title": "Phase",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "generation_id",
+            "required": true,
+            "schema": {
+              "pattern": "^[0-9a-f]{64}$",
+              "title": "Generation Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_ExperimentHeatmapData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "参数热力图与邻域",
+        "tags": [
+          "experiments"
+        ]
+      }
+    },
+    "/api/v1/experiments/mine": {
+      "get": {
+        "operationId": "mine_api_v1_experiments_mine_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "maximum": 50,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 1024,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "generation_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "pattern": "^[0-9a-f]{64}$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Generation Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_ExperimentMineData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "我的正式实验",
+        "tags": [
+          "experiments"
+        ]
+      }
+    },
+    "/api/v1/experiments/results/{experiment_id}": {
+      "get": {
+        "operationId": "result_api_v1_experiments_results__experiment_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "experiment_id",
+            "required": true,
+            "schema": {
+              "title": "Experiment Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "generation_id",
+            "required": true,
+            "schema": {
+              "pattern": "^[0-9a-f]{64}$",
+              "title": "Generation Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "result_hash",
+            "required": true,
+            "schema": {
+              "pattern": "^[0-9a-f]{64}$",
+              "title": "Result Hash",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_ExperimentResultData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "封存实验结果",
+        "tags": [
+          "experiments"
+        ]
+      }
+    },
+    "/api/v1/experiments/results/{experiment_id}/statistics": {
+      "get": {
+        "operationId": "statistics_api_v1_experiments_results__experiment_id__statistics_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "experiment_id",
+            "required": true,
+            "schema": {
+              "title": "Experiment Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "generation_id",
+            "required": true,
+            "schema": {
+              "pattern": "^[0-9a-f]{64}$",
+              "title": "Generation Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_ExperimentStatisticsData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "实验过拟合证据",
         "tags": [
           "experiments"
         ]

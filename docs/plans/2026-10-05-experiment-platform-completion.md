@@ -200,3 +200,52 @@ root 串行共享接线仅限：
 6. 冻结最终候选，做一次集中独立终审。原作者修范围内 finding，原 reviewer 定向复核；有效证据继续复用。清理自有临时输入和进程，保留失败原件。
 
 本文件只完成方案。尚未实现 C8 产品，不宣称统计真实通过、用户晋级、全市场容量或生产运行。实现验收后再更新差距表和来源状态；本片的新按钮不得把未完成依赖隐藏为成功。
+
+
+## 13. 已接受 C5 的受限接线补充
+
+本节由根任务授权。它补上第 2 节的真实模板接口依赖。C5 产品为 `cdfd7b4ff33a2712b0aa694b90e17646080a2f0a`，已接受；当前 M8 组合链、原统计和浏览器证明继续复用。本节只冻结接线合同，模板搜索尚未实现或验收。新增失败矩阵和源 SHA 见 `spec-proposal/c5-typed-supplement-01/`，原 26 项矩阵保留。
+
+### 13.1 原版本与派生版本
+
+服务端从原 `StrategyAuthoringStore` 读取本人的精确 ID、版本、完整 head、完整 rules 和 metadata identity。浏览器不能提供 owner、路径、函数或登记回执来授予执行权。原版本被冻结为基线，归档或缺失版本拒绝新搜索；原请求恢复仍先查原记录。
+
+五个搜索轴沿第 3 节。每个实际配置只改原 rules 的仓位和调仓字段；入场、退出、指数过滤、成本及其他规则不变。先用原完整 `StrategyTemplate` 模型校验全部选中配置。不能在旧定义指纹下覆盖字段：原 `FrozenStrategyTemplateInput` 会重编译完整 rules，并核对输入仓位和调仓。
+
+派生版本走原 `StrategyAuthoringStore.accept/complete_save`、Compiler、FeatureContract、Registry 和真实回执。使用服务端安装的专用私有原 store，原 schema 和保存协议不改。每个配置用一个新 server-generated `template_<uuidhex>` ID、版本 1；不更新用户原 C5 head，也不向 S4 原目录注入搜索派生项。这是原保存组件的私有实例，不是第二个登记器、任务框架或队列。
+
+### 13.2 先固定全部 N，再保存与准备
+
+原 M8 同库准入先提交完整已选数组、原基线定义、稳定 family/index/child 身份，以及 N 个派生保存 slot。每个 slot 固定原保存命令 ID、完整 rules、父定义、来源和参数摘要，状态先为待准备。恢复读取已保存数组，不重新抽样。每项始终占一行；`planned N` 不因保存未完成、失败或取消而减少。
+
+slot 在调用原 accept 前已存在。accept 已保存 server-generated ID 后回执丢失，恢复同命令，沿原 command_refs 取回同 ID/版本。complete_save 后、M8 slot 回写前中断也查原回执，不再保存一版。保存失败保留该 slot、原命令和原因。已保存 slot 不改正文；内容冲突直接拒绝。
+
+planned 和正式已登记数量分开显示。准备未齐时是 N 个计划、零已发布 job，不能称 N 个原 attempt 已执行。所有派生定义、phase 输入和 child manifest 均通过后，仍由原 M8 `register_family_submission` 同事务提交全部 formal plans、attempts 和 intents，再进入原发布准入。任何项永久失败都保留完整 N，整族不发布；暂时中断恢复同 slot。统计在正式族或结果不齐时明确不可用，不删失败项来降低分母。
+
+取消先成立后，尚未完成的保存和准备不允许变成发布准入。已保存的定义和命令事实保留。若必须做恢复才能核原结果，只核原命令，不创建另一个配置；原发布/取消两排序和 unknown 处理不变。
+
+### 13.3 容量与运行合同
+
+一个安装的私有派生 store 总计最多 500 个逻辑 ID、4,096 个版本；本片每 ID 只保存版本 1，因此 500 个 ID 先形成有效边界。新族先核已有真实数量和完整 N，容量不足时仍保留原准入/拒绝事实，不局部缩减数组。原每项保存事务继续检查实际容量；竞争或中途容量失败也不得超限，失败族不发布。没有自动回收或生产迁移授权。
+
+每个 child 只构建其精确已提交 ID/版本的原 adapter catalog，不把全库定义塞进 manifest。调用原 `StrategyTemplateRuntimeDirectory.manifest_for_spec`，在形成 ready 族和发布 intent 前实算单 child configuration JSON 字节，超过原 512 KiB 就拒绝。原 C5 500 代码、20,000 工作单元和 16 MiB 完整输入，以及 M8 完整族输入 512 MiB，均保持；不裁历史、代码或规则来凑容量。
+
+phase 来源继续在取数前核实际 family/source/window。用原模板 freeze/publish、`StrategyTemplateRunParameters.from_input` 和 `build_research_job_submission` 构建输入和原 v3 任务。不能直接调用会登记单项 `template:<hash>` 族的 `StrategyTemplateRunPreparer.prepare`；本片统一登记完整 M8 族。原训练和验证连续运行；样本外另开原始资金账户。时间退出必须具原实际分钟价格、状态和时刻；缺材料显示不可用，不用日线代替。
+
+原 Lab 以实际持久 family/child/job/spec 选择服务端安装的私有目录，再用原精确 catalog 和 runtime directory。基线和派生定义回执、完整 rules、source、input、job/spec 必须全部相符。不能用前缀、别名、浏览器布尔许可或任意文件路径选择 adapter。普通 C5 原目录默认只读原 store；旧入口读不到内部派生版本。原 C6/default adapter 路径、原队列、撮合、费用、数学和 ZIP 保持。
+
+### 13.4 模板结果与统计同口径
+
+使用原模板 worker 和原封存 reader，读取完整 `StrategyTemplateResult`。核实际 owner、ID/版本、definition fingerprint/record hash、input hash、calendar identity、cost_spec_id、status 和 content_hash，再核原 job/spec/manifest、原完整输入和阶段日期。`incomplete`、预览或摘要不能补成完整曲线。
+
+模板的实际 `BacktestDayResult` 日值沿原绩效入口投影，与组合链使用相同的日频净收益、零无风险利率、费用和资金约定。训练/验证分段仍沿固定日期和原实际账户；不能重置验证资金或把未闭合持仓算成闭合交易。完整原参数与模板规则一并保留。日值缺失或不有限时对应指标为空，并有具体原因。
+
+PSR、DSR、MinTRL、CSCV/PBO 和 BH 仍调用原函数。收益向量来自完整原封存日值；独立性解析器默认无证据，模板版本或条数不算独立性。失败、取消和未完成保存项保留在原完整 planned N；正式登记不齐时统计不可用。outer 单项不得把搜索 N 改成 1。PromotionDecision 仍是计算 gate，不写人工批准。
+
+### 13.5 实际写集与直接证明
+
+owned 改点限 `experiment_platform*` 的精确模板绑定、派生 slot/回执、受限准备、严格结果分支，以及现有 Web DTO/API/页面和直接测试。模板选择和版本摘要由真实本人目录提供；内部 hash 只在 Tip，原组合默认路径保持。
+
+根任务先把已接受 C5 基础串行合入本树。额外 shared 接线须在合入后记录精确 before SHA：只扩原 Lab 的精确定义读取和 runtime 目录选择、原模板完整结果 reader 的 typed 私有投影。没有实际 before SHA 的路径暂不写。Compiler/adapter 数学、原 registry 协议、普通 C5 目录和旧 DTO 不改。
+
+本补充的直接矩阵沿 EXP-04/05/06/07/10/11/13/14/15/17/21/22/26，细项为 C5T-01–08。只补新派生定义和原模板运行的失败/执行证据，复用已有效的原 native、501 分页、纯统计和未受影响浏览器证明；不新增逐阶段审查。完整 M8 最终候选仍只做一次集中独立终审。

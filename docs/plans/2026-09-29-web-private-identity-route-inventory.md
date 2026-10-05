@@ -1,6 +1,6 @@
 # Web `current_user` 路由清单
 
-对应 [私有身份边界](2026-09-29-web-private-identity-boundary.md)。以下为当前代码中的全部 102 个 `current_user` 依赖路由；`/api/v1` 前缀已包含。公开类即使收到裸用户头，也只得到 `viewer=None`，不能据此取得身份。私有类统一使用已验证的代理身份；已有 CSRF、角色和业务条件仍单独检查。
+对应 [私有身份边界](2026-09-29-web-private-identity-boundary.md)。以下为当前代码中的全部 110 个 `current_user` 依赖路由；`/api/v1` 前缀已包含。公开类即使收到裸用户头，也只得到 `viewer=None`，不能据此取得身份。私有类统一使用已验证的代理身份；已有 CSRF、角色和业务条件仍单独检查。
 
 ## 公开读取（20）
 
@@ -27,7 +27,7 @@
 | GET | `/api/v1/data/issues` |
 | GET | `/api/v1/data/fundamentals/summary` |
 
-## 私有读取（47）
+## 私有读取（54）
 
 | 方法 | 路径 |
 |---|---|
@@ -78,10 +78,17 @@
 | GET | `/api/v1/data/backfill-plans/{plan_hash}` |
 | GET | `/api/v1/research/catalog` |
 | GET | `/api/v1/research/queries` |
+| GET | `/api/v1/experiments/capabilities` |
+| GET | `/api/v1/experiments/mine` |
+| GET | `/api/v1/experiments/families/{family_id}` |
+| GET | `/api/v1/experiments/results/{experiment_id}` |
+| GET | `/api/v1/experiments/compare` |
+| GET | `/api/v1/experiments/families/{family_id}/heatmap` |
+| GET | `/api/v1/experiments/results/{experiment_id}/statistics` |
 
 名单按认证 owner 过滤。服务日志能力在未登录时只返回空列表，日志正文仍拒绝；普通任务、池子、监控、研究和审计页面则直接返回 401。公开的 `meta` 在没有有效证明时不显示 viewer。
 
-## 受保护操作（35）
+## 受保护操作（36）
 
 | 方法 | 路径 |
 |---|---|
@@ -93,6 +100,7 @@
 | POST | `/api/v1/monitor/ack` |
 | POST | `/api/v1/monitor/price-rules/commands` |
 | POST | `/api/v1/monitor/price-rules/commands/resume` |
+| POST | `/api/v1/experiments/commands` |
 | POST | `/api/v1/backtests/portfolio/runs` |
 | POST | `/api/v1/backtests/portfolio/exports` |
 | POST | `/api/v1/watchlist/commands` |

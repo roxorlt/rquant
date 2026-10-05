@@ -6,6 +6,173 @@
   overflow-wrap: anywhere;
 }
 
+.exp-toolbar,
+.exp-request,
+.exp-facts {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+.exp-request {
+  margin: 0;
+  justify-content: space-between;
+}
+.exp-facts {
+  font-size: 12px;
+  color: var(--muted);
+}
+.exp-form {
+  display: grid;
+  gap: 16px;
+}
+.exp-form fieldset {
+  min-width: 0;
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  padding: 12px;
+  display: grid;
+  gap: 12px;
+}
+.exp-form legend {
+  color: var(--muted);
+  font-size: 12px;
+  padding: 0 6px;
+}
+.exp-range-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+.exp-metrics {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0 16px;
+}
+.exp-metrics > div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--rule);
+  padding: 10px 0;
+  min-width: 0;
+}
+.exp-metrics dt {
+  color: var(--muted);
+  font-size: 12px;
+}
+.exp-metrics dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+  text-align: right;
+}
+.exp-help {
+  display: inline-block;
+  color: var(--muted);
+  font-size: 12px;
+  border-bottom: 1px dotted var(--muted);
+  margin: 6px 0;
+  cursor: help;
+}
+.exp-search-total {
+  display: flex;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 12px;
+  background: var(--accent-weak);
+  border-radius: 6px;
+}
+.exp-table-details {
+  margin: 10px 0 18px;
+}
+.exp-heat-scroll {
+  max-width: 100%;
+  overflow-x: auto;
+  margin: 12px 0;
+}
+.exp-heat {
+  width: 100%;
+  border-collapse: collapse;
+  text-align: center;
+  font-size: 12px;
+}
+.exp-heat th {
+  padding: 8px;
+  font-weight: 500;
+  color: var(--muted);
+}
+.exp-heat td {
+  border: 1px solid var(--rule);
+  padding: 2px;
+}
+.exp-heat-cell {
+  padding: 10px 8px;
+  min-width: 58px;
+  min-height: 44px;
+  width: 100%;
+  border: none;
+  background: var(--surface);
+  color: var(--muted);
+  font: inherit;
+  cursor: pointer;
+}
+.exp-heat-cell.measured {
+  background: var(--accent-weak);
+  color: var(--ink);
+}
+.exp-heat-cell:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.exp-form .field,
+.exp-range-grid .field {
+  min-width: 0;
+}
+.exp-form .inp,
+.exp-range-grid .inp {
+  width: 100%;
+  min-width: 0;
+}
+
+.exp-form .template-rules,
+.exp-template-rules .template-rules {
+  display: grid;
+  gap: 12px;
+  margin: 12px 0;
+}
+.exp-form .template-rules section,
+.exp-template-rules .template-rules section {
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+}
+.exp-form .template-values,
+.exp-template-rules .template-values {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 10px;
+  font-size: 13px;
+}
+.exp-form :where(.template-values) dt,
+.exp-template-rules :where(.template-values) dt {
+  color: var(--muted);
+}
+.exp-form :where(.template-values) dd,
+.exp-template-rules :where(.template-values) dd {
+  margin: 0;
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+.exp-form .template-rule-list,
+.exp-template-rules .template-rule-list {
+  padding-left: 20px;
+  overflow-wrap: anywhere;
+}
+
 .exp-window {
   margin: 0;
   padding: 12px 16px;
@@ -121,6 +288,9 @@
 }
 
 @media (max-width: 760px) {
+  .exp-metrics {
+    grid-template-columns: 1fr;
+  }
   .exp-select-bar {
     flex-wrap: wrap;
   }

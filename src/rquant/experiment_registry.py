@@ -516,6 +516,47 @@ def _bind_readonly_registry_authority(
     raise transient_error
 
 
+def _private_platform_schema(connection: sqlite3.Connection) -> bool:
+    installed = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='experiment_platform_metadata'"
+    ).fetchone()
+    reserved = "(hypothesis_family LIKE 'experiment-search:%' OR hypothesis_family LIKE 'experiment-outer:%')"
+    if installed is None:
+        if connection.execute(
+            f"SELECT 1 FROM hypothesis_family_manifest WHERE {reserved} LIMIT 1"
+        ).fetchone():
+            raise ExperimentRegistryError("private experiment facts are missing")
+        return False
+    version = connection.execute(
+        "SELECT value FROM experiment_platform_metadata WHERE key='version'"
+    ).fetchone()
+    if version is None or version[0] != "1":
+        raise ExperimentRegistryError("unknown private experiment schema")
+    required = {
+        "experiment_platform_metadata",
+        "experiment_private_family",
+        "experiment_family_request",
+        "experiment_platform_operation",
+        "experiment_child_admission",
+        "experiment_outer_grant",
+        "experiment_note",
+        "experiment_platform_receipt",
+        "experiment_evidence",
+        "experiment_evidence_head",
+        "experiment_prepared_child",
+        "experiment_preparation_reservation",
+    }
+    tables = {r[0] for r in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if not required <= tables:
+        raise ExperimentRegistryError("private experiment facts are incomplete")
+    missing = connection.execute(
+        f"SELECT 1 FROM hypothesis_family_manifest WHERE {reserved} AND hypothesis_family NOT IN (SELECT hypothesis_family FROM experiment_private_family) LIMIT 1"
+    ).fetchone()
+    if missing is not None:
+        raise ExperimentRegistryError("private experiment owner facts are incomplete")
+    return True
+
+
 class ExperimentRegistryReadonlyReader:
     """Read promotion governance without initializing or mutating its SQLite ledger."""
 
@@ -629,22 +670,30 @@ class ExperimentRegistryReadonlyReader:
         *,
         observed: datetime,
         limit: int,
+        legacy_shared: bool = False,
     ) -> PromotionDecisionReadSnapshot:
         cutoff = _utc_iso(observed)
+        predicate = "1"
+        if legacy_shared and _private_platform_schema(connection):
+            predicate = """NOT EXISTS (
+                SELECT 1 FROM json_each(promotion_decision.payload_json,'$.experiment_ids') ids
+                JOIN experiment_attempt a ON a.experiment_id=ids.value
+                JOIN experiment_private_family p ON p.hypothesis_family=a.hypothesis_family
+            )"""
         metadata = connection.execute(
-            """
+            f"""
             SELECT COALESCE(MAX(rowid), 0) AS sequence,
                    MAX(decided_at) AS event_time
             FROM promotion_decision
-            WHERE decided_at <= ?
+            WHERE decided_at <= ? AND {predicate}
             """,
             (cutoff,),
         ).fetchone()
         rows = connection.execute(
-            """
+            f"""
             SELECT rowid, decision_id, stage, approved, decided_at, payload_json
             FROM promotion_decision
-            WHERE decided_at <= ?
+            WHERE decided_at <= ? AND {predicate}
             ORDER BY decided_at DESC, decision_id DESC
             LIMIT ?
             """,
@@ -688,6 +737,52 @@ class ExperimentRegistryReadonlyReader:
         decision_limit: int = 1_000,
         attempt_limit: int = EXPERIMENT_SERVING_ATTEMPT_LIMIT,
     ) -> ExperimentServingReadSnapshot:
+        return self._serving_snapshot(
+            observed_at=observed_at,
+            decision_limit=decision_limit,
+            attempt_limit=attempt_limit,
+            legacy_shared=False,
+        )
+
+    def read_legacy_shared_promotion_decisions(
+        self,
+        *,
+        observed_at: datetime,
+        limit: int = 1_000,
+    ) -> PromotionDecisionReadSnapshot:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 10_000:
+            raise ValueError("decision limit is outside its budget")
+        with self._read_snapshot() as connection:
+            _private_platform_schema(connection)
+            return self._promotion_decisions_in_snapshot(
+                connection,
+                observed=normalize_aware_utc(observed_at),
+                limit=limit,
+                legacy_shared=True,
+            )
+
+    def read_legacy_shared_serving_snapshot(
+        self,
+        *,
+        observed_at: datetime,
+        decision_limit: int = 1_000,
+        attempt_limit: int = EXPERIMENT_SERVING_ATTEMPT_LIMIT,
+    ) -> ExperimentServingReadSnapshot:
+        return self._serving_snapshot(
+            observed_at=observed_at,
+            decision_limit=decision_limit,
+            attempt_limit=attempt_limit,
+            legacy_shared=True,
+        )
+
+    def _serving_snapshot(
+        self,
+        *,
+        observed_at: datetime,
+        decision_limit: int,
+        attempt_limit: int,
+        legacy_shared: bool,
+    ) -> ExperimentServingReadSnapshot:
         """Read a recent attempt window and its current evidence in one verified transaction."""
 
         observed = normalize_aware_utc(observed_at)
@@ -704,13 +799,19 @@ class ExperimentRegistryReadonlyReader:
         ):
             raise ValueError("attempt_limit must be from 1 through 500")
         with self._read_snapshot() as connection:
+            private = _private_platform_schema(connection) if legacy_shared else False
+            predicate = (
+                "hypothesis_family NOT IN (SELECT hypothesis_family FROM experiment_private_family)"
+                if private
+                else "1"
+            )
             promotions = self._promotion_decisions_in_snapshot(
-                connection, observed=observed, limit=decision_limit
+                connection, observed=observed, limit=decision_limit, legacy_shared=legacy_shared
             )
             rows = connection.execute(
                 "SELECT rowid, * FROM experiment_attempt "
                 "INDEXED BY experiment_attempt_registered_keyset_idx "
-                "WHERE registered_at <= ? "
+                f"WHERE registered_at <= ? AND {predicate} "
                 "ORDER BY registered_at DESC, experiment_id DESC LIMIT ?",
                 (_utc_iso(observed), attempt_limit + 1),
             ).fetchall()
@@ -1335,9 +1436,11 @@ class ExperimentRegistry:
                     "promotion policy fingerprint conflicts with the registry"
                 )
 
-    def register_hypothesis_family(
-        self, manifest: HypothesisFamilyManifest
-    ) -> HypothesisFamilyManifest:
+    def _insert_hypothesis_family(
+        self,
+        connection: sqlite3.Connection,
+        manifest: HypothesisFamilyManifest,
+    ) -> None:
         expected = canonical_sha256(manifest.model_dump(mode="python", exclude={"manifest_id"}))
         if manifest.manifest_id != expected:
             raise ExperimentIdentityConflictError(
@@ -1345,44 +1448,47 @@ class ExperimentRegistry:
             )
         manifest = HypothesisFamilyManifest.model_validate(manifest.model_dump(mode="python"))
         payload = _json_payload(manifest)
+        existing = connection.execute(
+            """
+            SELECT payload_json FROM hypothesis_family_manifest
+            WHERE hypothesis_family = ?
+            """,
+            (manifest.hypothesis_family,),
+        ).fetchone()
+        if existing is not None:
+            if existing["payload_json"] != payload:
+                raise ExperimentIdentityConflictError("hypothesis family manifest is immutable")
+            return
+        attempts = connection.execute(
+            "SELECT COUNT(*) FROM experiment_attempt WHERE hypothesis_family = ?",
+            (manifest.hypothesis_family,),
+        ).fetchone()[0]
+        if attempts:
+            raise IncompleteHypothesisFamilyError(
+                "hypothesis family must be preregistered before attempts"
+            )
+        connection.execute(
+            """
+            INSERT INTO hypothesis_family_manifest(
+                hypothesis_family, manifest_id, preregistered_at, payload_json
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (
+                manifest.hypothesis_family,
+                manifest.manifest_id,
+                _utc_iso(manifest.preregistered_at),
+                payload,
+            ),
+        )
+
+    def register_hypothesis_family(
+        self,
+        manifest: HypothesisFamilyManifest,
+    ) -> HypothesisFamilyManifest:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
-                existing = connection.execute(
-                    """
-                    SELECT payload_json FROM hypothesis_family_manifest
-                    WHERE hypothesis_family = ?
-                    """,
-                    (manifest.hypothesis_family,),
-                ).fetchone()
-                if existing is not None:
-                    if existing["payload_json"] != payload:
-                        raise ExperimentIdentityConflictError(
-                            "hypothesis family manifest is immutable"
-                        )
-                    connection.rollback()
-                    return manifest
-                attempts = connection.execute(
-                    "SELECT COUNT(*) FROM experiment_attempt WHERE hypothesis_family = ?",
-                    (manifest.hypothesis_family,),
-                ).fetchone()[0]
-                if attempts:
-                    raise IncompleteHypothesisFamilyError(
-                        "hypothesis family must be preregistered before attempts"
-                    )
-                connection.execute(
-                    """
-                    INSERT INTO hypothesis_family_manifest(
-                        hypothesis_family, manifest_id, preregistered_at, payload_json
-                    ) VALUES (?, ?, ?, ?)
-                    """,
-                    (
-                        manifest.hypothesis_family,
-                        manifest.manifest_id,
-                        _utc_iso(manifest.preregistered_at),
-                        payload,
-                    ),
-                )
+                self._insert_hypothesis_family(connection, manifest)
                 connection.commit()
             except BaseException:
                 connection.rollback()
@@ -1429,14 +1535,16 @@ class ExperimentRegistry:
             }
         )
 
-    def register_formal_plan(
+    def _insert_formal_plan(
         self,
+        connection: sqlite3.Connection,
         plan: FormalExperimentPlan,
-        *,
         family_manifest: HypothesisFamilyManifest,
-    ) -> FormalExperimentPlan:
+    ) -> None:
         selected = FormalExperimentPlan.model_validate(plan.model_dump(mode="python"))
-        manifest = self.register_hypothesis_family(family_manifest)
+        manifest = HypothesisFamilyManifest.model_validate(
+            family_manifest.model_dump(mode="python")
+        )
         spec = selected.spec
         if spec.experiment_id not in manifest.experiment_ids:
             raise IncompleteHypothesisFamilyError(
@@ -1464,38 +1572,47 @@ class ExperimentRegistry:
             seed=spec.seed,
         )
         payload = _json_payload(selected)
+        rows = connection.execute(
+            """
+            SELECT plan_json FROM formal_experiment_plan
+            WHERE plan_id = ? OR experiment_id = ? OR resolution_key = ?
+            """,
+            (selected.plan_id, spec.experiment_id, resolution_key),
+        ).fetchall()
+        if rows:
+            if len(rows) != 1 or rows[0]["plan_json"] != payload:
+                raise ExperimentIdentityConflictError(
+                    "formal experiment plan identity has conflicting content"
+                )
+            return
+        connection.execute(
+            """
+            INSERT INTO formal_experiment_plan(
+                plan_id, experiment_id, resolution_key,
+                preregistered_at, plan_json
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                selected.plan_id,
+                spec.experiment_id,
+                resolution_key,
+                _utc_iso(selected.preregistered_at),
+                payload,
+            ),
+        )
+
+    def register_formal_plan(
+        self,
+        plan: FormalExperimentPlan,
+        *,
+        family_manifest: HypothesisFamilyManifest,
+    ) -> FormalExperimentPlan:
+        selected = FormalExperimentPlan.model_validate(plan.model_dump(mode="python"))
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
-                rows = connection.execute(
-                    """
-                    SELECT plan_json FROM formal_experiment_plan
-                    WHERE plan_id = ? OR experiment_id = ? OR resolution_key = ?
-                    """,
-                    (selected.plan_id, spec.experiment_id, resolution_key),
-                ).fetchall()
-                if rows:
-                    if len(rows) != 1 or rows[0]["plan_json"] != payload:
-                        raise ExperimentIdentityConflictError(
-                            "formal experiment plan identity has conflicting content"
-                        )
-                    connection.rollback()
-                    return selected
-                connection.execute(
-                    """
-                    INSERT INTO formal_experiment_plan(
-                        plan_id, experiment_id, resolution_key,
-                        preregistered_at, plan_json
-                    ) VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (
-                        selected.plan_id,
-                        spec.experiment_id,
-                        resolution_key,
-                        _utc_iso(selected.preregistered_at),
-                        payload,
-                    ),
-                )
+                self._insert_hypothesis_family(connection, family_manifest)
+                self._insert_formal_plan(connection, selected, family_manifest)
                 connection.commit()
             except BaseException:
                 connection.rollback()
@@ -1575,13 +1692,14 @@ class ExperimentRegistry:
             )
         return ExperimentSpec.model_validate(spec.model_dump(mode="python"))
 
-    def register_attempt(
+    def _insert_attempt(
         self,
+        connection: sqlite3.Connection,
         spec: ExperimentSpec,
         *,
         registered_at: datetime,
         submission: ExperimentSubmissionIntent | None = None,
-    ) -> ExperimentAttempt:
+    ) -> None:
         spec = self._validated_spec(spec)
         registered_at = normalize_aware_utc(registered_at)
         payload = _json_payload(spec)
@@ -1608,118 +1726,130 @@ class ExperimentRegistry:
                 raise ExperimentIdentityConflictError(
                     "formal job submission requires current formal plan receipts"
                 )
+        manifest = self._required_manifest(connection, spec.hypothesis_family)
+        if spec.experiment_id not in manifest.experiment_ids:
+            raise IncompleteHypothesisFamilyError(
+                "experiment id was not preregistered in the family manifest"
+            )
+        if spec.metric_definition_fingerprint != manifest.metric_definition_fingerprint:
+            raise IncompleteHypothesisFamilyError(
+                "experiment metric does not match the preregistered manifest"
+            )
+        if registered_at < manifest.preregistered_at:
+            raise ValueError("registered_at cannot precede family preregistration")
+        if submission is not None:
+            plan_row = connection.execute(
+                """
+                SELECT plan_json FROM formal_experiment_plan
+                WHERE plan_id = ? AND preregistered_at <= ?
+                """,
+                (submission.formal_plan_id, _utc_iso(registered_at)),
+            ).fetchone()
+            if plan_row is None:
+                raise IncompleteHypothesisFamilyError(
+                    "exact visible preregistered formal plan is required"
+                )
+            plan = FormalExperimentPlan.model_validate_json(plan_row["plan_json"])
+            if plan.schema_version != 2:
+                raise ExperimentIdentityConflictError(
+                    "legacy formal plan cannot own a current job submission"
+                )
+            exact_plan_receipts = (
+                plan.plan_id,
+                plan.spec,
+                plan.hypothesis_variant,
+                plan.strategy_definition_fingerprint,
+                plan.definition_registration_record_hash,
+            )
+            submitted_plan_receipts = (
+                submission.formal_plan_id,
+                spec,
+                submission.hypothesis_variant,
+                submission.strategy_definition_fingerprint,
+                submission.definition_registration_record_hash,
+            )
+            if exact_plan_receipts != submitted_plan_receipts:
+                raise ExperimentIdentityConflictError(
+                    "submission intent conflicts with authoritative formal plan receipts"
+                )
+        existing = connection.execute(
+            "SELECT spec_json FROM experiment_attempt WHERE experiment_id = ?",
+            (spec.experiment_id,),
+        ).fetchone()
+        if existing is not None:
+            if existing["spec_json"] != payload:
+                raise ExperimentIdentityConflictError(
+                    f"experiment_id {spec.experiment_id} has conflicting content"
+                )
+        else:
+            connection.execute(
+                """
+                INSERT INTO experiment_attempt(
+                    experiment_id, hypothesis_family, spec_json, status, registered_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    spec.experiment_id,
+                    spec.hypothesis_family,
+                    payload,
+                    ExperimentStatus.REGISTERED.value,
+                    _utc_iso(registered_at),
+                ),
+            )
+        if submission is not None:
+            intent_json = _json_payload(submission)
+            existing_submission = connection.execute(
+                """
+                SELECT intent_json FROM experiment_submission_outbox
+                WHERE request_id = ? OR job_id = ?
+                """,
+                (str(submission.request_id), str(submission.job_id)),
+            ).fetchall()
+            if existing_submission:
+                if (
+                    len(existing_submission) != 1
+                    or existing_submission[0]["intent_json"] != intent_json
+                ):
+                    raise ExperimentIdentityConflictError(
+                        "job submission identity has conflicting immutable content"
+                    )
+            else:
+                connection.execute(
+                    """
+                    INSERT INTO experiment_submission_outbox(
+                        request_id, job_id, experiment_id, attempt_identity,
+                        intent_json, command_content_hash, state, prepared_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'prepared', ?)
+                    """,
+                    (
+                        str(submission.request_id),
+                        str(submission.job_id),
+                        submission.experiment_id,
+                        submission.attempt_identity,
+                        intent_json,
+                        submission.command_content_hash,
+                        _utc_iso(registered_at),
+                    ),
+                )
+
+    def register_attempt(
+        self,
+        spec: ExperimentSpec,
+        *,
+        registered_at: datetime,
+        submission: ExperimentSubmissionIntent | None = None,
+    ) -> ExperimentAttempt:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
-                manifest = self._required_manifest(connection, spec.hypothesis_family)
-                if spec.experiment_id not in manifest.experiment_ids:
-                    raise IncompleteHypothesisFamilyError(
-                        "experiment id was not preregistered in the family manifest"
-                    )
-                if spec.metric_definition_fingerprint != manifest.metric_definition_fingerprint:
-                    raise IncompleteHypothesisFamilyError(
-                        "experiment metric does not match the preregistered manifest"
-                    )
-                if registered_at < manifest.preregistered_at:
-                    raise ValueError("registered_at cannot precede family preregistration")
-                if submission is not None:
-                    plan_row = connection.execute(
-                        """
-                        SELECT plan_json FROM formal_experiment_plan
-                        WHERE plan_id = ? AND preregistered_at <= ?
-                        """,
-                        (submission.formal_plan_id, _utc_iso(registered_at)),
-                    ).fetchone()
-                    if plan_row is None:
-                        raise IncompleteHypothesisFamilyError(
-                            "exact visible preregistered formal plan is required"
-                        )
-                    plan = FormalExperimentPlan.model_validate_json(plan_row["plan_json"])
-                    if plan.schema_version != 2:
-                        raise ExperimentIdentityConflictError(
-                            "legacy formal plan cannot own a current job submission"
-                        )
-                    exact_plan_receipts = (
-                        plan.plan_id,
-                        plan.spec,
-                        plan.hypothesis_variant,
-                        plan.strategy_definition_fingerprint,
-                        plan.definition_registration_record_hash,
-                    )
-                    submitted_plan_receipts = (
-                        submission.formal_plan_id,
-                        spec,
-                        submission.hypothesis_variant,
-                        submission.strategy_definition_fingerprint,
-                        submission.definition_registration_record_hash,
-                    )
-                    if exact_plan_receipts != submitted_plan_receipts:
-                        raise ExperimentIdentityConflictError(
-                            "submission intent conflicts with authoritative formal plan receipts"
-                        )
-                existing = connection.execute(
-                    "SELECT spec_json FROM experiment_attempt WHERE experiment_id = ?",
-                    (spec.experiment_id,),
-                ).fetchone()
-                if existing is not None:
-                    if existing["spec_json"] != payload:
-                        raise ExperimentIdentityConflictError(
-                            f"experiment_id {spec.experiment_id} has conflicting content"
-                        )
-                else:
-                    connection.execute(
-                        """
-                        INSERT INTO experiment_attempt(
-                            experiment_id, hypothesis_family, spec_json, status, registered_at
-                        ) VALUES (?, ?, ?, ?, ?)
-                        """,
-                        (
-                            spec.experiment_id,
-                            spec.hypothesis_family,
-                            payload,
-                            ExperimentStatus.REGISTERED.value,
-                            _utc_iso(registered_at),
-                        ),
-                    )
-                if submission is not None:
-                    intent_json = _json_payload(submission)
-                    existing_submission = connection.execute(
-                        """
-                        SELECT intent_json FROM experiment_submission_outbox
-                        WHERE request_id = ? OR job_id = ?
-                        """,
-                        (str(submission.request_id), str(submission.job_id)),
-                    ).fetchall()
-                    if existing_submission:
-                        if (
-                            len(existing_submission) != 1
-                            or existing_submission[0]["intent_json"] != intent_json
-                        ):
-                            raise ExperimentIdentityConflictError(
-                                "job submission identity has conflicting immutable content"
-                            )
-                    else:
-                        connection.execute(
-                            """
-                            INSERT INTO experiment_submission_outbox(
-                                request_id, job_id, experiment_id, attempt_identity,
-                                intent_json, command_content_hash, state, prepared_at
-                            ) VALUES (?, ?, ?, ?, ?, ?, 'prepared', ?)
-                            """,
-                            (
-                                str(submission.request_id),
-                                str(submission.job_id),
-                                submission.experiment_id,
-                                submission.attempt_identity,
-                                intent_json,
-                                submission.command_content_hash,
-                                _utc_iso(registered_at),
-                            ),
-                        )
+                self._insert_attempt(
+                    connection, spec, registered_at=registered_at, submission=submission
+                )
                 connection.commit()
             except BaseException:
                 connection.rollback()
                 raise
+        assert spec.experiment_id is not None
         return self.get_attempt(spec.experiment_id)
 
     def list_pending_submissions(
@@ -1730,10 +1860,18 @@ class ExperimentRegistry:
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1_000:
             raise ValueError("submission outbox limit must be from 1 through 1000")
         with self._connect() as connection:
+            private = _private_platform_schema(connection)
+            predicate = (
+                "NOT EXISTS (SELECT 1 FROM experiment_child_admission c "
+                "WHERE c.job_id=experiment_submission_outbox.job_id "
+                "AND json_extract(c.payload_json,'$.cancel_state')='before_publication')"
+                if private
+                else "1"
+            )
             rows = connection.execute(
-                """
+                f"""
                 SELECT intent_json FROM experiment_submission_outbox
-                WHERE state = 'prepared'
+                WHERE state = 'prepared' AND {predicate}
                 ORDER BY prepared_at, request_id
                 LIMIT ?
                 """,
@@ -1771,14 +1909,20 @@ class ExperimentRegistry:
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1_000:
             raise ValueError("recoverable submission limit must be from 1 through 1000")
         with self._connect() as connection:
+            private = _private_platform_schema(connection)
+            predicate = (
+                "NOT EXISTS (SELECT 1 FROM experiment_child_admission c "
+                "WHERE c.job_id=outbox.job_id AND json_extract(c.payload_json,'$.cancel_state')='before_publication')"
+                if private
+                else "1"
+            )
             rows = connection.execute(
-                """
+                f"""
                 SELECT outbox.intent_json
                 FROM experiment_submission_outbox AS outbox
                 JOIN experiment_attempt AS attempt
                   ON attempt.experiment_id = outbox.experiment_id
-                WHERE outbox.state = 'prepared'
-                   OR attempt.status IN (?, ?)
+                WHERE (outbox.state = 'prepared' OR attempt.status IN (?, ?)) AND {predicate}
                 ORDER BY outbox.prepared_at, outbox.request_id
                 LIMIT ?
                 """,

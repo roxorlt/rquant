@@ -201,17 +201,19 @@ class PreparedPortfolioRequest(RuntimeContractModel):
         )
 
 
-def register_portfolio_plan(
+def build_portfolio_plan(
     value: FrozenPortfolioInput,
     published: PublishedPortfolioInput,
     *,
     definitions: ImmutableDefinitionRegistry,
-    experiments: ExperimentRegistry,
     protocol: PortfolioExperimentProtocol,
     now: datetime,
     deadline: datetime,
     random_seed: int = 0,
+    family_id: str | None = None,
+    hypothesis_variant: str = "daily-portfolio",
 ) -> PreparedPortfolioRequest:
+    """Build the original immutable receipts; do not register a partial family."""
     checked = FrozenPortfolioInput.model_validate(value.model_dump(mode="python"))
     publication = PublishedPortfolioInput.model_validate(published.model_dump(mode="python"))
     if (checked.config.config_hash, checked.input_hash) != (
@@ -235,7 +237,9 @@ def register_portfolio_plan(
     contract = build_adapter_execution_contract(
         "portfolio-backtest", "1", checked.request.producer_commit
     )
-    family = "portfolio:" + canonical_sha256({"input": checked.input_hash, "protocol": protocol})
+    family = family_id or "portfolio:" + canonical_sha256(
+        {"input": checked.input_hash, "protocol": protocol}
+    )
     spec = ExperimentSpec(
         strategy_spec_fingerprint=registration.spec.spec_fingerprint,
         strategy_executable_fingerprint=registration.executable_fingerprint,
@@ -261,6 +265,49 @@ def register_portfolio_plan(
         ),
         seed=random_seed,
     )
+    plan = FormalExperimentPlan(
+        schema_version=2,
+        spec=spec,
+        hypothesis_variant=hypothesis_variant,
+        strategy_definition_fingerprint=registration.fingerprint,
+        definition_registration_record_hash=registration.record_hash,
+        preregistered_at=now,
+    )
+    prepared = PreparedPortfolioRequest(
+        frozen=checked,
+        published=publication,
+        registration=registration,
+        formal_plan=plan,
+        deadline=deadline,
+        random_seed=random_seed,
+    )
+    prepared.submission(job_id=UUID(int=0))
+    return prepared
+
+
+def register_portfolio_plan(
+    value: FrozenPortfolioInput,
+    published: PublishedPortfolioInput,
+    *,
+    definitions: ImmutableDefinitionRegistry,
+    experiments: ExperimentRegistry,
+    protocol: PortfolioExperimentProtocol,
+    now: datetime,
+    deadline: datetime,
+    random_seed: int = 0,
+) -> PreparedPortfolioRequest:
+    prepared = build_portfolio_plan(
+        value,
+        published,
+        definitions=definitions,
+        protocol=protocol,
+        now=now,
+        deadline=deadline,
+        random_seed=random_seed,
+    )
+    checked, publication = prepared.frozen, prepared.published
+    registration, spec = prepared.registration, prepared.formal_plan.spec
+    family = spec.hypothesis_family
     try:
         existing = experiments.resolve_formal_plan(
             strategy_spec_fingerprint=spec.strategy_spec_fingerprint,
@@ -303,16 +350,9 @@ def register_portfolio_plan(
                 preregistered_at=now,
             ),
         )
-    prepared = PreparedPortfolioRequest(
-        frozen=checked,
-        published=publication,
-        registration=registration,
-        formal_plan=plan,
-        deadline=deadline,
-        random_seed=random_seed,
-    )
-    prepared.submission(job_id=UUID(int=0))
-    return prepared
+    restored = prepared.model_copy(update={"formal_plan": plan})
+    restored.submission(job_id=UUID(int=0))
+    return restored
 
 
 def publish_portfolio_input(
@@ -650,6 +690,7 @@ class PortfolioRequestPreparer:
         code_commit: str,
         clock: Callable[[], datetime],
         max_task_seconds: int = 3600,
+        protected_sources: frozenset[tuple[str, int]] = frozenset(),
     ) -> None:
         observed = input_root.lstat()
         if (
@@ -668,9 +709,12 @@ class PortfolioRequestPreparer:
         self.catalog, self.lake_root, self.input_root = catalog, lake_root, input_root
         self.definitions, self.experiments, self.protocol = definitions, experiments, protocol
         self.code_commit, self.clock, self.max_task_seconds = code_commit, clock, max_task_seconds
+        self.protected_sources = frozenset(protected_sources)
 
     def __call__(self, config: PortfolioBacktestConfig) -> PreparedPortfolioRequest:
         checked = PortfolioBacktestConfig.model_validate(config.model_dump(mode="python"))
+        if (checked.source_key, checked.source_version) in self.protected_sources:
+            raise PermissionError("protected source requires formal experiment phase admission")
         source = self.source_provider(checked.source_key, checked.source_version)
         value = freeze_portfolio_config(source, checked)
         if value.request.producer_commit != self.code_commit:

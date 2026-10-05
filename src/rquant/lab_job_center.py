@@ -55,7 +55,7 @@ from rquant.research_run_spec import (
     ResourceClass,
     StrategyExecutionIdentity,
 )
-from rquant.runtime_contracts import canonical_sha256
+from rquant.runtime_contracts import canonical_sha256, normalize_aware_utc
 from rquant.strategy_job_adapters import (
     AuctionGapParameters,
     GrowthBoardSurgeParameters,
@@ -75,6 +75,9 @@ from rquant.strict_json import canonical_json_bytes
 _CLEAN_CODE_SHA = re.compile(r"^[0-9a-f]{40}$")
 _MAX_RESEARCH_DATE_SPAN_DAYS = 5 * 366
 _MAX_WALK_FORWARD_FOLDS = 64
+
+if TYPE_CHECKING:
+    from rquant.experiment_platform import ExperimentChildAdmission, ExperimentPlatformStore
 
 ResearchJobSubmissionErrorCode: TypeAlias = Literal[
     "input_bounds",
@@ -612,6 +615,7 @@ CommandSubmissionResult: TypeAlias = Annotated[
 
 if TYPE_CHECKING:
     from rquant.strategy_template_runtime import StrategyTemplateRuntimeDirectory
+    from rquant.experiment_platform_templates import ExperimentTemplateRuntimeBinding
 
 
 class LabCommandSubmissionFacade:
@@ -626,6 +630,7 @@ class LabCommandSubmissionFacade:
         definition_registry: ImmutableDefinitionRegistry | None = None,
         clock: Callable[[], datetime] | None = None,
         template_directory: StrategyTemplateRuntimeDirectory | None = None,
+        experiment_template_binding: ExperimentTemplateRuntimeBinding | None = None,
     ) -> None:
         self.reader = reader
         self.spool = spool
@@ -635,6 +640,10 @@ class LabCommandSubmissionFacade:
         from rquant.strategy_template_runtime import require_template_runtime_directory
 
         self.template_directory = require_template_runtime_directory(template_directory)
+        from rquant.experiment_platform_templates import require_experiment_template_runtime_binding
+        self.experiment_template_binding = require_experiment_template_runtime_binding(experiment_template_binding)
+        if self.experiment_template_binding is not None and self.experiment_template_binding.store.registry is not experiment_registry:
+            raise ValueError("private template directory needs the same original experiment registry")
 
     @staticmethod
     def _experiment_submission_intent(
@@ -706,10 +715,13 @@ class LabCommandSubmissionFacade:
             raise FormalSubmissionAuthorityError(
                 "formal plan receipts do not exactly match the research job"
             )
-        template_catalog = None if self.template_directory is None else self.template_directory.catalog_for_spec(command.spec)
+        directory = self.template_directory
+        if self.experiment_template_binding is not None:
+            directory = self.experiment_template_binding.directory_for_job(command.job_id, command.spec) or directory
+        template_catalog = None if directory is None else directory.catalog_for_spec(command.spec)
         definitions = self.definition_registry
         if template_catalog is not None:
-            definitions = self.template_directory.store.definition_registry(execution.strategy_id)
+            definitions = directory.store.definition_registry(execution.strategy_id)
         if definitions is None:
             raise FormalSubmissionAuthorityError(
                 "v3 research submission requires an authoritative Definition Registry"
@@ -759,11 +771,38 @@ class LabCommandSubmissionFacade:
             observed_at=observed_at,
         )
         assert self.experiment_registry is not None
+        platform = self._private_experiment_platform(envelope)
+        if platform is not None:
+            stored = self.experiment_registry.get_submission_intent_for_job(intent.job_id)
+            if stored != intent or platform.child(intent.job_id) is None:
+                raise FormalSubmissionAuthorityError("private formal family is not fully ready")
+            return
         self.experiment_registry.register_attempt(
             experiment.spec,
             registered_at=observed_at,
             submission=intent,
         )
+
+    def _private_experiment_platform(
+        self, envelope: LabCommandEnvelope
+    ) -> ExperimentPlatformStore | None:
+        command = envelope.command
+        if not isinstance(command, SubmitJobCommand) or command.spec.experiment is None:
+            return None
+        from rquant.experiment_platform import ExperimentPlatformStore, PRIVATE_FAMILY_PREFIXES
+
+        if not command.spec.experiment.hypothesis_family.startswith(PRIVATE_FAMILY_PREFIXES):
+            return None
+        if self.experiment_registry is None:
+            raise FormalSubmissionAuthorityError("private experiment registry is unavailable")
+        return ExperimentPlatformStore(self.experiment_registry)
+
+    def _admit_private_publication(self, envelope: LabCommandEnvelope) -> None:
+        platform = self._private_experiment_platform(envelope)
+        if platform is not None:
+            intent = self._experiment_submission_intent(envelope)
+            assert intent is not None
+            platform.admit_publication(intent, now=self.clock())
 
     def validate_prepared_experiment_submission(
         self,
@@ -795,6 +834,9 @@ class LabCommandSubmissionFacade:
             raise FormalSubmissionAuthorityError(
                 "formal submission Experiment attempt identity conflicts with its plan"
             )
+        platform = self._private_experiment_platform(envelope)
+        if platform is not None:
+            platform.validate_publication(intent)
 
     def _mark_experiment_submission_published(self, envelope: LabCommandEnvelope) -> None:
         intent = self._experiment_submission_intent(envelope)
@@ -824,12 +866,151 @@ class LabCommandSubmissionFacade:
                 or envelope.content_hash != intent.command_content_hash
             ):
                 raise RuntimeError("experiment submission outbox conflicts with command envelope")
+            self._admit_private_publication(envelope)
             published = self._publish(envelope)
             if isinstance(published, CommandSubmissionConflict):
                 raise RuntimeError("experiment submission recovery hit a command conflict")
             self._mark_experiment_submission_published(envelope)
             recovered.append(published)
         return tuple(recovered)
+
+    def recover_private_experiment_cancellations(
+        self,
+        *,
+        observed_at: datetime,
+    ) -> tuple[ExperimentChildAdmission, ...]:
+        """Resume original cancel requests; a transport receipt is not cancellation."""
+        if self.experiment_registry is None:
+            return ()
+        from rquant.experiment_platform import ExperimentPlatformStore
+        from rquant.experiment_registry import _private_platform_schema
+
+        with self.experiment_registry._connect() as connection:
+            if not _private_platform_schema(connection):
+                return ()
+        platform = ExperimentPlatformStore(self.experiment_registry)
+        observed = normalize_aware_utc(observed_at)
+        progress = []
+        for child in platform.pending_cancellations():
+            job = self.reader.get_job(child.job_id)
+            if job is None:
+                progress.append(child)
+                continue
+            if job.updated_at > observed:
+                raise ValueError("cancellation job fact is from the future")
+            self._validate_private_cancel_binding(child, observed_at=observed)
+            terminal = {
+                JobStatus.SUCCEEDED: "already_completed",
+                JobStatus.CANCELLED: "confirmed",
+            }.get(job.status)
+            if job.status is JobStatus.FAILED and not job.recoverable:
+                terminal = "failed"
+            if terminal is not None:
+                self.synchronize_experiment_lifecycle(child.job_id, observed_at=observed)
+                child = child.model_copy(update={"cancel_state": terminal})
+                platform.record_cancel_progress(child)
+                progress.append(child)
+                continue
+            if not child.cancel_request_chain:
+                key = f"experiment.cancel:{child.job_id}:{job.version}:0"
+                child = child.model_copy(
+                    update={
+                        "cancel_job_version": job.version,
+                        "cancel_request_chain": (self._request_id(key),),
+                    }
+                )
+                platform.record_cancel_progress(child)
+            index = len(child.cancel_request_chain) - 1
+            key = f"experiment.cancel:{child.job_id}:{child.cancel_job_version}:{index}"
+            if self._request_id(key) != child.cancel_request_chain[-1]:
+                raise ValueError("original cancel request binding changed")
+            result = self._submit_control(
+                CancelJobCommand(
+                    job_id=child.job_id,
+                    expected_version=child.cancel_job_version,
+                    reason="experiment family cancellation",
+                ),
+                interaction_key=key,
+                private_cancellation=child,
+            )
+            stale = isinstance(result, CommandSubmissionStale) or (
+                isinstance(result, CommandSubmissionConflict)
+                and result.reason == "scheduler_rejected"
+                and (result.scheduler_reason or "").startswith("stale_version:")
+            )
+            if stale:
+                # Both branches prove the old request did not apply. Re-read the
+                # actual version and persist its successor before any transport.
+                context = self.reader.get_command_context(child.job_id)
+                if context is not None and context.job.version != child.cancel_job_version:
+                    version = context.job.version
+                    key = f"experiment.cancel:{child.job_id}:{version}:{index + 1}"
+                    child = child.model_copy(
+                        update={
+                            "cancel_job_version": version,
+                            "cancel_request_chain": (
+                                *child.cancel_request_chain,
+                                self._request_id(key),
+                            ),
+                        }
+                    )
+                    platform.record_cancel_progress(child)
+            progress.append(child)
+        return tuple(progress)
+
+    def _validate_private_cancel_binding(
+        self, child: ExperimentChildAdmission, *, observed_at: datetime
+    ) -> None:
+        from rquant.experiment_platform import ExperimentPlatformStore
+
+        if self.experiment_registry is None:
+            raise FormalSubmissionAuthorityError("private cancellation registry is unavailable")
+        platform = ExperimentPlatformStore(self.experiment_registry)
+        persisted = platform.child(child.job_id)
+        if (
+            persisted != child
+            or child.cancel_state != "pending"
+            or child.publish_grant_seq is None
+            or child.cancel_seq is None
+            or child.cancel_seq <= child.publish_grant_seq
+        ):
+            raise FormalSubmissionAuthorityError("private cancellation has no persisted admission")
+        family = platform.get_family(child.owner, child.family_id)
+        intent = self.experiment_registry.get_submission_intent_for_job(child.job_id)
+        if (
+            family.state != "ready"
+            or intent is None
+            or (
+                intent.job_id,
+                intent.request_id,
+                intent.experiment_id,
+                intent.command_content_hash,
+            )
+            != (child.job_id, child.request_id, child.experiment_id, child.command_content_hash)
+        ):
+            raise FormalSubmissionAuthorityError("private cancellation ownership changed")
+        original = LabCommandEnvelope.model_validate_json(intent.envelope_json)
+        self.validate_prepared_experiment_submission(original, observed_at=observed_at)
+        job = self.reader.get_job(child.job_id)
+        if (
+            not isinstance(original.command, SubmitJobCommand)
+            or job is None
+            or job.spec != original.command.spec
+            or job.spec.experiment is None
+            or job.spec.experiment.hypothesis_family != child.family_id
+            or job.spec.experiment.experiment_id != child.experiment_id
+        ):
+            raise FormalSubmissionAuthorityError(
+                "private cancellation job or immutable spec changed"
+            )
+
+    @staticmethod
+    def _private_control_spec(spec: ResearchRunSpec) -> bool:
+        from rquant.experiment_platform import PRIVATE_FAMILY_PREFIXES
+
+        return spec.experiment is not None and spec.experiment.hypothesis_family.startswith(
+            PRIVATE_FAMILY_PREFIXES
+        )
 
     def synchronize_experiment_lifecycle(
         self,
@@ -1019,7 +1200,13 @@ class LabCommandSubmissionFacade:
         existing = self._existing(envelope)
         if existing is not None:
             if isinstance(existing, CommandSubmissionReceipt):
-                self._prepare_experiment_submission(envelope)
+                platform = self._private_experiment_platform(envelope)
+                if platform is None:
+                    self._prepare_experiment_submission(envelope)
+                else:
+                    intent = self._experiment_submission_intent(envelope)
+                    assert intent is not None
+                    platform.validate_publication(intent)
                 self._mark_experiment_submission_published(envelope)
             return existing
         if self.reader.get_job(validated.job_id) is not None:
@@ -1029,6 +1216,7 @@ class LabCommandSubmissionFacade:
                 reason="job_id_exists",
             )
         self._prepare_experiment_submission(envelope)
+        self._admit_private_publication(envelope)
         published = self._publish(envelope)
         if isinstance(published, CommandSubmissionReceipt):
             self._mark_experiment_submission_published(envelope)
@@ -1043,7 +1231,7 @@ class LabCommandSubmissionFacade:
         interaction_key: str | None = None,
     ) -> CommandSubmissionResult:
         source = self.reader.get_job(source_job_id)
-        if source is None:
+        if source is None or self._private_control_spec(source.spec):
             return CommandSubmissionConflict(
                 request_id=self._request_id(interaction_key),
                 job_id=new_job_id,
@@ -1063,6 +1251,7 @@ class LabCommandSubmissionFacade:
         command: LabCommand,
         *,
         interaction_key: str | None,
+        private_cancellation: ExperimentChildAdmission | None = None,
     ) -> CommandSubmissionResult:
         if isinstance(command, SubmitJobCommand):
             raise TypeError("control submission cannot contain a create command")
@@ -1071,6 +1260,26 @@ class LabCommandSubmissionFacade:
             command=command,
         )
         existing = self._existing(envelope)
+        job = self.reader.get_job(command.job_id)
+        if job is not None and self._private_control_spec(job.spec):
+            if private_cancellation is None:
+                return CommandSubmissionConflict(
+                    request_id=envelope.request_id,
+                    job_id=command.job_id,
+                    reason="job_not_found",
+                )
+            self._validate_private_cancel_binding(private_cancellation, observed_at=self.clock())
+            if (
+                not isinstance(command, CancelJobCommand)
+                or command.job_id != private_cancellation.job_id
+                or command.expected_version != private_cancellation.cancel_job_version
+                or not private_cancellation.cancel_request_chain
+                or envelope.request_id != private_cancellation.cancel_request_chain[-1]
+                or command.reason != "experiment family cancellation"
+            ):
+                raise FormalSubmissionAuthorityError("original private cancel request changed")
+        elif private_cancellation is not None:
+            raise FormalSubmissionAuthorityError("private cancellation has no matching private job")
         if existing is not None:
             return existing
         context = self.reader.get_command_context(command.job_id)
@@ -1223,11 +1432,17 @@ class ExperimentLifecycleCoordinator:
 
     _MAX_RECOVERY_JOBS = 999
 
-    def __init__(self, facade: LabCommandSubmissionFacade) -> None:
+    def __init__(
+        self,
+        facade: LabCommandSubmissionFacade,
+        *,
+        evidence_sink: Callable[[datetime], object] | None = None,
+    ) -> None:
         if facade.experiment_registry is None:
             raise RuntimeError("experiment lifecycle coordinator requires ExperimentRegistry")
         self.facade = facade
         self.registry = facade.experiment_registry
+        self.evidence_sink = evidence_sink
 
     def validate_submission(
         self,
@@ -1295,6 +1510,9 @@ class ExperimentLifecycleCoordinator:
                 continue
             self.synchronize(intent.job_id, observed_at=observed_at)
             synchronized.append(intent.job_id)
+        self.facade.recover_private_experiment_cancellations(observed_at=observed_at)
+        if self.evidence_sink is not None:
+            self.evidence_sink(observed_at)
         return ExperimentLifecycleRecoveryResult(
             recovered_submission_count=len(recovered),
             synchronized_job_ids=tuple(synchronized),

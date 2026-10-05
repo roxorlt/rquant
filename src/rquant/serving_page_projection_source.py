@@ -5387,10 +5387,14 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
                 raise ValueError("catalog audit schema and projection set disagree")
             if "audit_report_dataset" in names:
                 dataset_projection = projections["audit_report_dataset"]
-                if dataset_projection.available_at != projections["audit_report_overview"].available_at:
+                if (
+                    dataset_projection.available_at
+                    != projections["audit_report_overview"].available_at
+                ):
                     raise ValueError("catalog audit and daily report projection times disagree")
                 results = read_catalog_audit_projection_rows(
-                    tuple(dict(row) for row in dataset_projection.rows), report_hash=str(report_hash)
+                    tuple(dict(row) for row in dataset_projection.rows),
+                    report_hash=str(report_hash),
                 )
                 if any(
                     result.audit_start.isoformat() != summary["audit_start"]
@@ -5546,11 +5550,9 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
                 rows=tuple(_research_gate_row(row) for row in rows),
             ),
         )
-        if (
-            audit_report_projections
-            and {item.table_name for item in audit_report_projections}
-            not in (REPORT_PROJECTION_TABLES, REPORT_PROJECTION_TABLES | {"audit_report_dataset"})
-        ):
+        if audit_report_projections and {
+            item.table_name for item in audit_report_projections
+        } not in (REPORT_PROJECTION_TABLES, REPORT_PROJECTION_TABLES | {"audit_report_dataset"}):
             raise ValueError("audit report projections must be complete")
         if (
             audit_job_projections

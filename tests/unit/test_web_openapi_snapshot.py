@@ -62,6 +62,7 @@ def test_every_api_path_is_versioned_and_only_defined_mutations_use_post() -> No
                 "/api/v1/research/query",
                 "/api/v1/research/queries/save",
                 "/api/v1/research/queries/resume",
+                "/api/v1/experiments/commands",
                 "/api/v1/strategy-templates/commands",
                 "/api/v1/strategy-templates/commands/resume",
                 "/api/v1/strategy-templates/{strategy_id}/runs",

@@ -4,6 +4,7 @@ import type { ReactNode } from "react";
 export interface SideDrawerProps {
   open: boolean;
   onClose: () => void;
+  afterOpenChange?: (open: boolean) => void;
   title: ReactNode;
   /** 520 px instead of 440 px (log viewer, backtest config). */
   wide?: boolean;
@@ -16,6 +17,7 @@ export interface SideDrawerProps {
 export function SideDrawer({
   open,
   onClose,
+  afterOpenChange,
   title,
   wide,
   extra,
@@ -26,6 +28,7 @@ export function SideDrawer({
     <AntDrawer
       open={open}
       onClose={onClose}
+      afterOpenChange={afterOpenChange}
       title={title}
       extra={extra}
       footer={footer}

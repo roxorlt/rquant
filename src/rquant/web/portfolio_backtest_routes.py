@@ -203,7 +203,9 @@ def report(
     _viewer: Annotated[str | None, Depends(current_user)],
     result_hash: Annotated[str, Query(pattern=r"^[0-9a-f]{64}$")],
 ) -> Response:
-    read = _read(lambda: _service(request).results.read(job_id, expected_result_hash=result_hash))
+    service = _service(request)
+    _read(lambda: service.job(job_id))
+    read = _read(lambda: service.results.read(job_id, expected_result_hash=result_hash))
     try:
         html = read.html_bytes()
     except ArtifactPreviewUnavailableError as error:
@@ -235,7 +237,9 @@ def download_zip(
     _viewer: Annotated[str | None, Depends(current_user)],
     result_hash: Annotated[str, Query(pattern=r"^[0-9a-f]{64}$")],
 ) -> Response:
-    exports = _service(request).exports
+    service = _service(request)
+    _read(lambda: service.job(job_id))
+    exports = service.exports
     if exports is None:
         raise HTTPException(503, "报告下载暂不可用，请稍后重试。")
     try:

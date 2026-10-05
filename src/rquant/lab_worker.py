@@ -132,6 +132,7 @@ from rquant.strict_json import (
 if TYPE_CHECKING:
     from rquant.strategy_template_adapter import StrategyTemplateAdapterCatalog
     from rquant.strategy_template_runtime import StrategyTemplateRuntimeDirectory
+    from rquant.experiment_platform_templates import ExperimentTemplateRuntimeBinding
 
 LAB_WORKER_MAX_SHARDS_PER_TICK = 1
 _HASH_PATTERN = r"^[0-9a-f]{64}$"
@@ -2755,6 +2756,7 @@ class LabWorker:
         artifact_root: Path,
         adapter_registry: StrategyJobAdapterRegistry | None = None,
         template_directory: StrategyTemplateRuntimeDirectory | None = None,
+        experiment_template_binding: ExperimentTemplateRuntimeBinding | None = None,
         exploratory_store_factory: StoreFactory | None = None,
         metadata_store_factory: StoreFactory | None = None,
         research_lake_root: Path | None = None,
@@ -2945,6 +2947,8 @@ class LabWorker:
         self.adapter_registry = closed_adapter_registry
         from rquant.strategy_template_runtime import require_template_runtime_directory
         self.template_directory = require_template_runtime_directory(template_directory)
+        from rquant.experiment_platform_templates import require_experiment_template_runtime_binding
+        self.experiment_template_binding = require_experiment_template_runtime_binding(experiment_template_binding)
         self.heartbeat_interval_microseconds = heartbeat_interval_microseconds
         self.resource_recheck_interval_microseconds = resource_recheck_interval_microseconds
         self.resource_probe_timeout_microseconds = resource_probe_timeout_microseconds
@@ -5214,9 +5218,13 @@ class LabWorker:
                     shard=payload.shard,
                 )
         registry = self.adapter_registry
-        if self.template_directory is not None:
+        if self.template_directory is not None or self.experiment_template_binding is not None:
             payload = StrategyShardPayload.model_validate_json(claim.definition.payload_json)
-            registry = self.template_directory.registry_for_spec(payload.spec)
+            directory = self.template_directory
+            if self.experiment_template_binding is not None:
+                directory = self.experiment_template_binding.directory_for_job(claim.job_id, payload.spec) or directory
+            if directory is not None:
+                registry = directory.registry_for_spec(payload.spec)
         return registry.validate_claim(claim)
 
     def _heartbeat_loop(
@@ -5499,8 +5507,11 @@ class LabWorker:
         ack_live_limit_microseconds = (
             hard_limit_microseconds if initial_session in _LIVE_TRADING_SESSIONS else None
         )
+        directory = self.template_directory
+        if self.experiment_template_binding is not None:
+            directory = self.experiment_template_binding.directory_for_job(claim.job_id, validated.spec) or directory
         request = _ShardWireRequest(
-            manifest=self.shard_runtime_manifest if self.template_directory is None else self.template_directory.manifest_for_spec(validated.spec, self.shard_runtime_manifest),
+            manifest=self.shard_runtime_manifest if directory is None else directory.manifest_for_spec(validated.spec, self.shard_runtime_manifest),
             validated=validated,
             runtime_code_sha=runtime_code_sha,
         )

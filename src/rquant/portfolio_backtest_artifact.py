@@ -10,6 +10,7 @@ import zipfile
 from contextlib import suppress
 from pathlib import Path
 from uuid import UUID, uuid4
+from typing import TYPE_CHECKING
 
 from pydantic import Field
 
@@ -29,6 +30,18 @@ from rquant.portfolio_backtest_models import (
     PortfolioBundle,
 )
 from rquant.runtime_contracts import RuntimeContractModel
+
+if TYPE_CHECKING:
+    from rquant.experiment_platform_projection import ExperimentPrivateResultAuthority
+
+
+def is_private_portfolio_job(job: object) -> bool:
+    spec = getattr(job, "spec", None)
+    experiment = getattr(spec, "experiment", None)
+    identity = getattr(experiment, "spec", None)
+    return isinstance(
+        getattr(identity, "hypothesis_family", None), str
+    ) and identity.hypothesis_family.startswith(("experiment-search:", "experiment-outer:"))
 
 
 class PortfolioReadResult(RuntimeContractModel):
@@ -66,10 +79,30 @@ class PortfolioResultReader:
             max_preview_serialized_bytes=2 * MAX_BUNDLE_BYTES + 1024 * 1024,
         )
 
-    def read(self, job_id: UUID, *, expected_result_hash: str | None = None) -> PortfolioReadResult:
+    @staticmethod
+    def _private_guard(
+        job: object, *, owner: str | None, authority: ExperimentPrivateResultAuthority | None
+    ) -> None:
+        if not is_private_portfolio_job(job):
+            return
+        from rquant.experiment_platform_projection import ExperimentPrivateResultAuthority
+
+        if owner is None or not isinstance(authority, ExperimentPrivateResultAuthority):
+            raise PermissionError("private portfolio result requires exact owner authority")
+        authority.authorize(job, owner)
+
+    def read(
+        self,
+        job_id: UUID,
+        *,
+        expected_result_hash: str | None = None,
+        private_owner: str | None = None,
+        private_authority: ExperimentPrivateResultAuthority | None = None,
+    ) -> PortfolioReadResult:
         authority = self.reader.get_artifact_preview_authority(job_id)
         if authority is None or authority.job.spec.parameters.strategy_name != "portfolio_backtest":
             raise ArtifactPreviewUnavailableError("portfolio sealed result is unavailable")
+        self._private_guard(authority.job, owner=private_owner, authority=private_authority)
         if (
             expected_result_hash is not None
             and authority.evidence.complete_result_hash != expected_result_hash
@@ -114,6 +147,8 @@ class PortfolioResultReader:
         ):
             raise ArtifactPreviewIntegrityError("portfolio bundle conflicts with the admitted task")
         after = self.reader.get_artifact_preview_authority(job_id)
+        if after is not None:
+            self._private_guard(after.job, owner=private_owner, authority=private_authority)
         if (
             after != authority
             or preview.complete_result_hash != authority.evidence.complete_result_hash
@@ -138,6 +173,10 @@ class PortfolioResultReader:
             or offset + limit > 80_000
         ):
             raise ValueError("portfolio view bounds are invalid")
+        authority = self.reader.get_artifact_preview_authority(job_id)
+        if authority is None:
+            raise ArtifactPreviewUnavailableError("portfolio sealed result is unavailable")
+        self._private_guard(authority.job, owner=None, authority=None)
         preview = self.views.preview(
             job_id, table_name=table_name, row_limit=offset + limit, column_limit=1
         )
