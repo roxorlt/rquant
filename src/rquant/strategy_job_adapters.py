@@ -1409,11 +1409,14 @@ def _rerank_optimizer_table(table: LabShardTable) -> pd.DataFrame:
 
 @lru_cache(maxsize=1)
 def default_strategy_job_adapter_registry() -> StrategyJobAdapterRegistry:
+    from rquant.portfolio_backtest_adapter import PortfolioBacktestAdapter
+
     return StrategyJobAdapterRegistry(
         (
             NShapeCompareAdapter(),
             NShapeOptimizeAdapter(),
             AuctionGapAdapter(),
             GrowthBoardSurgeAdapter(),
+            PortfolioBacktestAdapter(),
         )
     )

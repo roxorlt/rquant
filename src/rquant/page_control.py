@@ -66,6 +66,11 @@ from rquant.manual_watchlist import (
     WatchlistCapacityError,
     WatchlistVersionConflictError,
 )
+from rquant.portfolio_backtest_commands import (
+    ExportPortfolioBacktestZip,
+    PortfolioPageControlBackend,
+    SubmitPortfolioBacktest,
+)
 from rquant.price_alert_rule_store import (
     PriceAlertRuleCapacityError,
     PriceAlertRuleDelete,
@@ -87,6 +92,7 @@ _SAFE_NAME = re.compile(r"^[\w\u4e00-\u9fff-]+$")
 _CANVAS_CATALOG_SCHEMA_VERSION = 1
 _PRIVATE_DIRECTORY_MODE = 0o700
 _PRIVATE_FILE_MODE = 0o600
+
 _MAX_MANAGED_JSON_BYTES = 1024 * 1024
 _MAX_MANAGED_LOG_BYTES = 8 * 1024 * 1024
 _DEFAULT_LEASE_SECONDS = 30
@@ -672,6 +678,8 @@ PageControlCommandValue = Annotated[
     | SubmitDataAuditReport
     | SubmitFormulaMarketRun
     | ExportLabArtifactZip
+    | SubmitPortfolioBacktest
+    | ExportPortfolioBacktestZip
     | DiscardLabArtifactZip,
     Field(discriminator="kind"),
 ]
@@ -2505,6 +2513,7 @@ class PageControlConsumer:
         log_dir: Path,
         allowed_lab_export_roots: tuple[Path, ...] = (),
         lab_backend: LabPageControlBackend | None = None,
+        portfolio_backend: PortfolioPageControlBackend | None = None,
         backfill_plan_backend: BackfillPlanPageControlBackend | None = None,
         data_audit_report_backend: DataAuditReportPageControlBackend | None = None,
         formula_market_backend: FormulaMarketPageControlBackend | None = None,
@@ -2526,6 +2535,7 @@ class PageControlConsumer:
             Path(os.path.abspath(path)) for path in allowed_lab_export_roots
         )
         self.lab_backend = lab_backend
+        self.portfolio_backend = portfolio_backend
         self.backfill_plan_backend = backfill_plan_backend
         self.data_audit_report_backend = data_audit_report_backend
         self.formula_market_backend = formula_market_backend
@@ -2689,6 +2699,31 @@ class PageControlConsumer:
         terminal = self._outcome_from_effect(effect)
         if terminal is not None:
             return terminal
+        if (
+            isinstance(command, (SubmitPortfolioBacktest, ExportPortfolioBacktestZip))
+            and effect.result is None
+        ):
+            try:
+                if self.portfolio_backend is None:
+                    raise RuntimeError("portfolio writer is unavailable")
+                marker = self.portfolio_backend.freeze(command)
+                effect = self.outbox.record_started_effect_result(
+                    command.command_id,
+                    result=marker,
+                    owner_id=claim.owner_id,
+                    claim_token=claim.claim_token,
+                )
+            except Exception as exc:
+                effect = self.outbox.finish_effect(
+                    command.command_id,
+                    status=PageControlEffectStatus.FAILED,
+                    error=f"{type(exc).__name__}: {exc}",
+                    owner_id=claim.owner_id,
+                    claim_token=claim.claim_token,
+                )
+                outcome = self._outcome_from_effect(effect)
+                assert outcome is not None
+                return outcome
         if isinstance(command, _OwnedSetFactorTracked):
             marker = {
                 "contract": "factor-tracking-identities/v1",
@@ -2994,6 +3029,13 @@ class PageControlConsumer:
     def _must_recover_before_failure(
         self, command: PageControlCommandValue, *, created: bool
     ) -> bool:
+        if isinstance(command, (SubmitPortfolioBacktest, ExportPortfolioBacktestZip)):
+            effect = self.outbox.effect(command.command_id)
+            return (
+                self.portfolio_backend is not None
+                and effect is not None
+                and effect.result is not None
+            )
         if isinstance(command, _OwnedSetFactorTracked):
             return not created or self.factor_tracking_backend is not None
         if isinstance(command, _OwnedSubmitFactorRun):
@@ -3062,6 +3104,11 @@ class PageControlConsumer:
         return _ExecutionOutcome(PageControlStatus.FAILED, effect.result, effect.error)
 
     def _execute(self, command: PageControlCommandValue) -> JsonValue:
+        if isinstance(command, (SubmitPortfolioBacktest, ExportPortfolioBacktestZip)):
+            effect = self.outbox.effect(command.command_id)
+            if self.portfolio_backend is None or effect is None or effect.result is None:
+                raise RuntimeError("portfolio frozen admission is unavailable")
+            return self.portfolio_backend.submit(command, effect.result)
         if isinstance(command, _OwnedSetFactorTracked):
             return self._factor_tracking_backend().submit(command)
         if isinstance(command, _OwnedSubmitFactorRun):
@@ -3412,6 +3459,11 @@ class PageControlConsumer:
         return None
 
     def _recover_started_effect(self, command: PageControlCommandValue) -> JsonValue | None:
+        if isinstance(command, (SubmitPortfolioBacktest, ExportPortfolioBacktestZip)):
+            effect = self.outbox.effect(command.command_id)
+            if self.portfolio_backend is None or effect is None or effect.result is None:
+                raise RuntimeError("portfolio original admission is unavailable")
+            return self.portfolio_backend.recover(command, effect.result)
         if isinstance(command, _OwnedSetFactorTracked):
             return self._factor_tracking_backend().recover(command)
         if isinstance(command, _OwnedSubmitFactorRun):

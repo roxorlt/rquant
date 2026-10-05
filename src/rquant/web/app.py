@@ -28,6 +28,7 @@ from rquant.screen.dynamic_rsi import VerifiedDynamicRsiProjection
 from rquant.screen.formula_history_projection import VerifiedFormulaHistoryProjection
 from rquant.screen.replica_source import VerifiedReplicaScreenSource
 from rquant.unit_log_service import UnitLogClient
+from rquant.web import portfolio_backtest_routes
 from rquant.web.alert_ack_gateway import AckLookupGateway, AckLookupTransport
 from rquant.web.backfill_plan_command_gateway import (
     BackfillPlanCommandGateway,
@@ -94,6 +95,7 @@ if TYPE_CHECKING:
     from rquant.factor_run_admission import FactorRunAdmissionClient
     from rquant.factor_tracking_admission import FactorTrackingAdmissionClient
     from rquant.watchlist_admission import WatchlistAdmissionClient
+    from rquant.web.portfolio_backtest_service import PortfolioWebService
 
 API_TITLE = "rQuant Web API"
 #: Version of the HTTP contract, bumped by hand; not the package version, so that a
@@ -110,6 +112,8 @@ _WRITE_BODY_LIMITS = {
     "/api/v1/screen/tdx/market/commands": formula_market_commands.MAX_REQUEST_BYTES,
     "/api/v1/pools/formula/commands": formula_pool_save_commands.MAX_REQUEST_BYTES,
     "/api/v1/tasks/jobs/commands": tasks_controls.MAX_REQUEST_BYTES,
+    "/api/v1/backtests/portfolio/runs": portfolio_backtest_routes.MAX_RUN_REQUEST_BYTES,
+    "/api/v1/backtests/portfolio/exports": portfolio_backtest_routes.MAX_EXPORT_REQUEST_BYTES,
 }
 _FACTOR_ARCHIVE_WRITE = re.compile(
     r"^/api/v1/factors/definitions/[a-z][a-z0-9_]{0,63}/archive(?:/resume)?$"
@@ -148,6 +152,7 @@ class WebContext:
     audit_report_commands: AuditReportCommandGateway
     formula_market_commands: FormulaMarketCommandGateway
     lab_controls: LabControlGateway
+    portfolio_backtests: PortfolioWebService | None
 
 
 def create_app(
@@ -170,6 +175,7 @@ def create_app(
     audit_report_command_transport: AuditReportCommandTransport | None = None,
     formula_market_command_transport: FormulaMarketCommandTransport | None = None,
     lab_control_command_transport: LabControlTransport | None = None,
+    portfolio_backtests: PortfolioWebService | None = None,
 ) -> FastAPI:
     """Build the app. Nothing is opened until the first request or startup."""
 
@@ -336,6 +342,7 @@ def create_app(
             endpoint=settings.page_control_url,
             transport=formula_market_command_transport,
         ),
+        portfolio_backtests=portfolio_backtests,
         lab_controls=LabControlGateway(
             endpoint=settings.page_control_url,
             transport=lab_control_command_transport,
@@ -424,6 +431,10 @@ def create_app(
             return JSONResponse(
                 status_code=422, content={"detail": "保存信息有误，请检查名称和任务。"}
             )
+        if request.url.path.startswith("/api/v1/backtests/portfolio/"):
+            return JSONResponse(
+                status_code=422, content={"detail": "回测请求有误，请检查来源、日期和配置。"}
+            )
         if request.url.path == "/api/v1/tasks/jobs/commands":
             return JSONResponse(
                 status_code=422, content={"detail": "任务操作请求有误，请刷新后重试。"}
@@ -445,6 +456,9 @@ def create_app(
         tasks_controls.router, prefix="/api/v1", tags=["tasks"], dependencies=private
     )
     app.include_router(service_logs.router, prefix="/api/v1", tags=["tasks"])
+    app.include_router(
+        portfolio_backtest_routes.router, prefix="/api/v1", tags=["backtests"], dependencies=private
+    )
     app.include_router(backtests.router, prefix="/api/v1", tags=["backtests"], dependencies=private)
     app.include_router(
         experiments.router, prefix="/api/v1", tags=["experiments"], dependencies=private

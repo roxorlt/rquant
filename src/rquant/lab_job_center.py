@@ -40,6 +40,7 @@ from rquant.lab_jobs import (
     JobStatus,
     LabJobReader,
 )
+from rquant.portfolio_backtest_adapter import PortfolioBacktestRunInput
 from rquant.research_gate import ResearchGateDecision
 from rquant.research_run_spec import (
     DatasetSnapshotIdentity,
@@ -130,7 +131,8 @@ ResearchRunInput: TypeAlias = Annotated[
     NShapeComparisonRunInput
     | NShapeOptimizationRunInput
     | AuctionGapRunInput
-    | GrowthBoardSurgeRunInput,
+    | GrowthBoardSurgeRunInput
+    | PortfolioBacktestRunInput,
     Field(discriminator="kind"),
 ]
 
@@ -218,6 +220,13 @@ def _run_identity(
             "growth_board_surge",
             ResearchJobType.STRATEGY_REPLAY,
             "growth-board-surge",
+            run_input.parameters,
+        )
+    if isinstance(run_input, PortfolioBacktestRunInput):
+        return (
+            "portfolio_backtest",
+            ResearchJobType.STRATEGY_REPLAY,
+            "portfolio-backtest",
             run_input.parameters,
         )
     raise TypeError(f"unsupported research run input: {type(run_input).__name__}")

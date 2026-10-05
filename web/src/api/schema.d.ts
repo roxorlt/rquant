@@ -21,6 +21,143 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/backtests/portfolio/capabilities": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 组合回测来源与操作权限 */
+        get: operations["capabilities_api_v1_backtests_portfolio_capabilities_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/backtests/portfolio/exports": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 准备组合回测 ZIP */
+        post: operations["submit_export_api_v1_backtests_portfolio_exports_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/backtests/portfolio/runs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 组合回测记录 */
+        get: operations["list_runs_api_v1_backtests_portfolio_runs_get"];
+        put?: never;
+        /** 运行组合回测 */
+        post: operations["submit_run_api_v1_backtests_portfolio_runs_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/backtests/portfolio/runs/{job_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 组合回测绩效 */
+        get: operations["summary_api_v1_backtests_portfolio_runs__job_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/backtests/portfolio/runs/{job_id}/exports/{request_id}.zip": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 下载组合回测完整 ZIP */
+        get: operations["download_zip_api_v1_backtests_portfolio_runs__job_id__exports__request_id__zip_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/backtests/portfolio/runs/{job_id}/nav": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 组合净值与回撤 */
+        get: operations["nav_api_v1_backtests_portfolio_runs__job_id__nav_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/backtests/portfolio/runs/{job_id}/report.html": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 下载组合回测 HTML 报告 */
+        get: operations["report_api_v1_backtests_portfolio_runs__job_id__report_html_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/backtests/portfolio/runs/{job_id}/rows": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 组合回测明细 */
+        get: operations["rows_api_v1_backtests_portfolio_runs__job_id__rows_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/backtests/{run_id}": {
         parameters: {
             query?: never;
@@ -2635,6 +2772,40 @@ export interface components {
             /** Total */
             total: number;
         };
+        /** DrawdownRule */
+        "DrawdownRule-Input": {
+            /**
+             * Action
+             * @enum {string}
+             */
+            action: "block_new_positions" | "cap_total_risk_weight";
+            /**
+             * Release Drawdown
+             * @default 0
+             */
+            release_drawdown: number | string;
+            /** Total Risk Weight Cap */
+            total_risk_weight_cap?: number | string | null;
+            /** Trigger Drawdown */
+            trigger_drawdown: number | string;
+        };
+        /** DrawdownRule */
+        "DrawdownRule-Output": {
+            /**
+             * Action
+             * @enum {string}
+             */
+            action: "block_new_positions" | "cap_total_risk_weight";
+            /**
+             * Release Drawdown
+             * @default 0
+             */
+            release_drawdown: string;
+            /** Total Risk Weight Cap */
+            total_risk_weight_cap?: string | null;
+            /** Trigger Drawdown */
+            trigger_drawdown: string;
+        };
         /** EditableCanvas */
         EditableCanvas: {
             /** Command Id */
@@ -2885,6 +3056,31 @@ export interface components {
             data: components["schemas"]["PoolsData"];
             serving: components["schemas"]["ServingMeta"];
         };
+        /** Envelope[PortfolioCapabilities] */
+        Envelope_PortfolioCapabilities_: {
+            data: components["schemas"]["PortfolioCapabilities"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[PortfolioJobsData] */
+        Envelope_PortfolioJobsData_: {
+            data: components["schemas"]["PortfolioJobsData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[PortfolioNavData] */
+        Envelope_PortfolioNavData_: {
+            data: components["schemas"]["PortfolioNavData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[PortfolioRowsData] */
+        Envelope_PortfolioRowsData_: {
+            data: components["schemas"]["PortfolioRowsData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[PortfolioSummaryData] */
+        Envelope_PortfolioSummaryData_: {
+            data: components["schemas"]["PortfolioSummaryData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
         /** Envelope[PulseData] */
         Envelope_PulseData_: {
             data: components["schemas"]["PulseData"];
@@ -2947,6 +3143,93 @@ export interface components {
             service_id: string;
             /** Summary */
             summary: string;
+        };
+        /**
+         * ExecutionCostApplicability
+         * @enum {string}
+         */
+        ExecutionCostApplicability: "BUY" | "SELL" | "BOTH";
+        /** ExecutionCostFeeRule */
+        "ExecutionCostFeeRule-Input": {
+            applies_to: components["schemas"]["ExecutionCostApplicability"];
+            /** Minimum Amount */
+            minimum_amount: number | string;
+            /** Rate Bps */
+            rate_bps: number | string;
+            /** Rule Id */
+            rule_id: string;
+            /** Selector Id */
+            selector_id: string;
+        };
+        /** ExecutionCostFeeRule */
+        "ExecutionCostFeeRule-Output": {
+            applies_to: components["schemas"]["ExecutionCostApplicability"];
+            /** Minimum Amount */
+            minimum_amount: string;
+            /** Rate Bps */
+            rate_bps: string;
+            /** Rule Id */
+            rule_id: string;
+            /** Selector Id */
+            selector_id: string;
+        };
+        /** ExecutionCostMoney */
+        "ExecutionCostMoney-Input": {
+            /** Quantum */
+            quantum: number | string;
+            /**
+             * Rounding
+             * @constant
+             */
+            rounding: "HALF_UP";
+        };
+        /** ExecutionCostMoney */
+        "ExecutionCostMoney-Output": {
+            /** Quantum */
+            quantum: string;
+            /**
+             * Rounding
+             * @constant
+             */
+            rounding: "HALF_UP";
+        };
+        /** ExecutionCostSlippage */
+        "ExecutionCostSlippage-Input": {
+            /** Buy Bps */
+            buy_bps: number | string;
+            /**
+             * Owner
+             * @constant
+             */
+            owner: "shared_cost_engine";
+            /**
+             * Price Rounding
+             * @constant
+             */
+            price_rounding: "HALF_UP";
+            /** Price Tick */
+            price_tick: number | string;
+            /** Sell Bps */
+            sell_bps: number | string;
+        };
+        /** ExecutionCostSlippage */
+        "ExecutionCostSlippage-Output": {
+            /** Buy Bps */
+            buy_bps: string;
+            /**
+             * Owner
+             * @constant
+             */
+            owner: "shared_cost_engine";
+            /**
+             * Price Rounding
+             * @constant
+             */
+            price_rounding: "HALF_UP";
+            /** Price Tick */
+            price_tick: string;
+            /** Sell Bps */
+            sell_bps: string;
         };
         /** ExperimentItem */
         ExperimentItem: {
@@ -4969,6 +5252,15 @@ export interface components {
             /** Services */
             services: components["schemas"]["ServiceItem"][];
         };
+        /** HistogramBin */
+        HistogramBin: {
+            /** Count */
+            count: number;
+            /** Lower */
+            lower: number;
+            /** Upper */
+            upper: number;
+        };
         /** HoldingItem */
         HoldingItem: {
             /** Available Quantity */
@@ -5026,6 +5318,22 @@ export interface components {
             valid_day_count: number;
             /** Zero Variance Day Count */
             zero_variance_day_count: number;
+        };
+        /**
+         * InstrumentSelector
+         * @description One exact, ordered instrument-scope selector for a v3 cost contract.
+         */
+        InstrumentSelector: {
+            /** Exchange */
+            exchange: string;
+            /** Instrument Class */
+            instrument_class: string;
+            /** Market */
+            market: string;
+            /** Security Class */
+            security_class: string;
+            /** Selector Id */
+            selector_id: string;
         };
         /** IntradayData */
         IntradayData: {
@@ -5810,6 +6118,31 @@ export interface components {
             message: string;
             position: components["schemas"]["SourcePosition"];
         };
+        /** PerformanceSummary */
+        PerformanceSummary: {
+            /** Annualized Return */
+            annualized_return: number | null;
+            /** Annualized Volatility */
+            annualized_volatility: number | null;
+            /** Calmar */
+            calmar: number | null;
+            /** Max Drawdown */
+            max_drawdown: number | null;
+            /** Max Drawdown Duration */
+            max_drawdown_duration: number | null;
+            /** Observations */
+            observations: number;
+            /** Payoff Ratio */
+            payoff_ratio: number | null;
+            /** Sharpe */
+            sharpe: number | null;
+            /** Sortino */
+            sortino: number | null;
+            /** Total Return */
+            total_return: number | null;
+            /** Win Rate */
+            win_rate: number | null;
+        };
         /** PipelineStage */
         PipelineStage: {
             /** Hint */
@@ -6052,6 +6385,231 @@ export interface components {
              */
             state: "ready" | "no_data" | "unavailable";
         };
+        /** PortfolioCapabilities */
+        PortfolioCapabilities: {
+            /** Available */
+            available: boolean;
+            /**
+             * Benchmarks
+             * @default []
+             */
+            benchmarks: string[];
+            /** Can Export */
+            can_export: boolean;
+            /** Can Run */
+            can_run: boolean;
+            default_config?: components["schemas"]["PortfolioEditableConfig-Output"] | null;
+            /** Message */
+            message: string | null;
+            /**
+             * Sources
+             * @default []
+             */
+            sources: components["schemas"]["PortfolioSourceOption"][];
+        };
+        /** PortfolioCommandReceipt */
+        PortfolioCommandReceipt: {
+            /** Byte Size */
+            byte_size?: number | null;
+            /**
+             * Command Id
+             * Format: uuid
+             */
+            command_id: string;
+            /** Job Id */
+            job_id?: string | null;
+            /** Message */
+            message: string;
+            /** Result Hash */
+            result_hash?: string | null;
+            /** Sha256 */
+            sha256?: string | null;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "submitted" | "pending" | "processing" | "unknown" | "failed" | "conflict" | "exported";
+            /** Zip Request Id */
+            zip_request_id?: string | null;
+        };
+        /**
+         * PortfolioCostConfig
+         * @description Exact v3 JSON; validation remains owned by the shared cost contract.
+         */
+        "PortfolioCostConfig-Input": {
+            /**
+             * Assessment Unit
+             * @constant
+             */
+            assessment_unit: "FILL";
+            /** Commission Rules */
+            commission_rules: components["schemas"]["ExecutionCostFeeRule-Input"][];
+            /** Cost Engine Version */
+            cost_engine_version: string;
+            /** Cost Spec Id */
+            cost_spec_id?: string | null;
+            /**
+             * Fee Notional Basis
+             * @constant
+             */
+            fee_notional_basis: "EXECUTED_NOTIONAL";
+            /** Instrument Selectors */
+            instrument_selectors: components["schemas"]["InstrumentSelector"][];
+            money: components["schemas"]["ExecutionCostMoney-Input"];
+            /** Research Notional Per Trade */
+            research_notional_per_trade?: number | string | null;
+            /**
+             * Schema Version
+             * @default 3
+             * @constant
+             */
+            schema_version: 3;
+            slippage: components["schemas"]["ExecutionCostSlippage-Input"];
+            /** Stamp Duty Rules */
+            stamp_duty_rules: components["schemas"]["ExecutionCostFeeRule-Input"][];
+            /** Transfer Fee Rules */
+            transfer_fee_rules: components["schemas"]["ExecutionCostFeeRule-Input"][];
+        };
+        /**
+         * PortfolioCostConfig
+         * @description Exact v3 JSON; validation remains owned by the shared cost contract.
+         */
+        "PortfolioCostConfig-Output": {
+            /**
+             * Assessment Unit
+             * @constant
+             */
+            assessment_unit: "FILL";
+            /** Commission Rules */
+            commission_rules: components["schemas"]["ExecutionCostFeeRule-Output"][];
+            /** Cost Engine Version */
+            cost_engine_version: string;
+            /** Cost Spec Id */
+            cost_spec_id?: string | null;
+            /**
+             * Fee Notional Basis
+             * @constant
+             */
+            fee_notional_basis: "EXECUTED_NOTIONAL";
+            /** Instrument Selectors */
+            instrument_selectors: components["schemas"]["InstrumentSelector"][];
+            money: components["schemas"]["ExecutionCostMoney-Output"];
+            /** Research Notional Per Trade */
+            research_notional_per_trade?: string | null;
+            /**
+             * Schema Version
+             * @default 3
+             * @constant
+             */
+            schema_version: 3;
+            slippage: components["schemas"]["ExecutionCostSlippage-Output"];
+            /** Stamp Duty Rules */
+            stamp_duty_rules: components["schemas"]["ExecutionCostFeeRule-Output"][];
+            /** Transfer Fee Rules */
+            transfer_fee_rules: components["schemas"]["ExecutionCostFeeRule-Output"][];
+        };
+        /** PortfolioCreateRequest */
+        PortfolioCreateRequest: {
+            /**
+             * Command Id
+             * Format: uuid
+             */
+            command_id: string;
+            config: components["schemas"]["PortfolioEditableConfig-Input"];
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+        };
+        /** PortfolioEditableConfig */
+        "PortfolioEditableConfig-Input": {
+            /**
+             * Benchmark Code
+             * @default 000300.SH
+             */
+            benchmark_code: string;
+            drawdown_rule?: components["schemas"]["DrawdownRule-Input"] | null;
+            /**
+             * End Date
+             * Format: date
+             */
+            end_date: string;
+            execution_cost_spec: components["schemas"]["PortfolioCostConfig-Input"];
+            /** Initial Cash */
+            initial_cash: number | string;
+            rebalance_rule: components["schemas"]["RebalanceRule"];
+            /**
+             * Source Key
+             * @default verified-screen
+             */
+            source_key: string;
+            /**
+             * Source Version
+             * @default 1
+             */
+            source_version: number;
+            /**
+             * Start Date
+             * Format: date
+             */
+            start_date: string;
+            weight_rule: components["schemas"]["PortfolioWeightRule-Input"];
+        };
+        /** PortfolioEditableConfig */
+        "PortfolioEditableConfig-Output": {
+            /**
+             * Benchmark Code
+             * @default 000300.SH
+             */
+            benchmark_code: string;
+            drawdown_rule?: components["schemas"]["DrawdownRule-Output"] | null;
+            /**
+             * End Date
+             * Format: date
+             */
+            end_date: string;
+            execution_cost_spec: components["schemas"]["PortfolioCostConfig-Output"];
+            /** Initial Cash */
+            initial_cash: string;
+            rebalance_rule: components["schemas"]["RebalanceRule"];
+            /**
+             * Source Key
+             * @default verified-screen
+             */
+            source_key: string;
+            /**
+             * Source Version
+             * @default 1
+             */
+            source_version: number;
+            /**
+             * Start Date
+             * Format: date
+             */
+            start_date: string;
+            weight_rule: components["schemas"]["PortfolioWeightRule-Output"];
+        };
+        /** PortfolioExportRequest */
+        PortfolioExportRequest: {
+            /**
+             * Command Id
+             * Format: uuid
+             */
+            command_id: string;
+            /**
+             * Job Id
+             * Format: uuid
+             */
+            job_id: string;
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+            /** Result Hash */
+            result_hash: string;
+        };
         /**
          * PortfolioGroupPoint
          * @description One group's completed return, compounded return and target-weight change.
@@ -6090,6 +6648,365 @@ export interface components {
              * @enum {string}
              */
             status: "ok" | "insufficient_samples";
+        };
+        /** PortfolioHoldingRow */
+        PortfolioHoldingRow: {
+            /** Available Quantity */
+            available_quantity: number;
+            /** Average Cost */
+            average_cost: string;
+            /** Code */
+            code: string;
+            /** Frozen Quantity */
+            frozen_quantity: number;
+            /** Market Price */
+            market_price: string;
+            /** Quantity */
+            quantity: number;
+            /**
+             * Trade Date
+             * Format: date
+             */
+            trade_date: string;
+        };
+        /** PortfolioJob */
+        PortfolioJob: {
+            /**
+             * Can Cancel
+             * @default false
+             */
+            can_cancel: boolean;
+            /**
+             * Can Pause
+             * @default false
+             */
+            can_pause: boolean;
+            /**
+             * Can Resume
+             * @default false
+             */
+            can_resume: boolean;
+            /**
+             * Can Retry
+             * @default false
+             */
+            can_retry: boolean;
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /**
+             * End Date
+             * Format: date
+             */
+            end_date: string;
+            /**
+             * Job Id
+             * Format: uuid
+             */
+            job_id: string;
+            /** Label */
+            label: string;
+            /** Progress */
+            progress: number | null;
+            /** Result Hash */
+            result_hash: string | null;
+            /**
+             * Start Date
+             * Format: date
+             */
+            start_date: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "queued" | "running" | "paused" | "cancelled" | "failed" | "completed" | "sealing";
+            /**
+             * Updated At
+             * Format: date-time
+             */
+            updated_at: string;
+            /** Version */
+            version: number;
+        };
+        /** PortfolioJobsData */
+        PortfolioJobsData: {
+            /** Available */
+            available: boolean;
+            /** Jobs */
+            jobs: components["schemas"]["PortfolioJob"][];
+            /** Next Cursor */
+            next_cursor: string | null;
+        };
+        /** PortfolioLogRow */
+        PortfolioLogRow: {
+            /**
+             * Level
+             * @enum {string}
+             */
+            level: "normal" | "note" | "error";
+            /** Message */
+            message: string;
+            /**
+             * Trade Date
+             * Format: date
+             */
+            trade_date: string;
+            /** Ts Code */
+            ts_code: string | null;
+        };
+        /** PortfolioMonthRow */
+        PortfolioMonthRow: {
+            /** Month */
+            month: number;
+            /** Return Rate */
+            return_rate: number | null;
+            /** Year */
+            year: number;
+        };
+        /** PortfolioNavData */
+        PortfolioNavData: {
+            /** Result Hash */
+            result_hash: string;
+            /** Rows */
+            rows: components["schemas"]["PortfolioNavRow"][];
+        };
+        /** PortfolioNavRow */
+        PortfolioNavRow: {
+            /** Benchmark Nav */
+            benchmark_nav: number | null;
+            /** Benchmark Return */
+            benchmark_return: number | null;
+            /** Cash */
+            cash: string | null;
+            /** Daily Return */
+            daily_return: string | null;
+            /** Drawdown */
+            drawdown: number | null;
+            /** Fees */
+            fees: string;
+            /** Incomplete Reason */
+            incomplete_reason: "missing_held_close" | null;
+            /** Market Value */
+            market_value: string | null;
+            /** Nav */
+            nav: string | null;
+            /** Normalized Nav */
+            normalized_nav: string | null;
+            /** Rebalanced */
+            rebalanced: boolean;
+            /**
+             * Trade Date
+             * Format: date
+             */
+            trade_date: string;
+        };
+        /** PortfolioPerformanceData */
+        PortfolioPerformanceData: {
+            /** Annualized Turnover */
+            annualized_turnover: number | null;
+            benchmark_summary: components["schemas"]["PerformanceSummary"] | null;
+            distribution: components["schemas"]["ReturnDistribution"];
+            /**
+             * Overfit State
+             * @constant
+             */
+            overfit_state: "not_evaluated";
+            relative: components["schemas"]["RelativeMetrics"] | null;
+            /** Rolling */
+            rolling: components["schemas"]["PortfolioRollingMetric"][];
+            round_trip_analysis: components["schemas"]["RoundTripAnalysis"];
+            streaks: components["schemas"]["StreakSummary"];
+            summary: components["schemas"]["PerformanceSummary"];
+        };
+        /** PortfolioRollingMetric */
+        PortfolioRollingMetric: {
+            /** Sharpe */
+            sharpe: number | null;
+            /**
+             * Trade Date
+             * Format: date
+             */
+            trade_date: string;
+            /** Volatility */
+            volatility: number | null;
+        };
+        /** PortfolioRowsData */
+        PortfolioRowsData: {
+            /**
+             * Daily
+             * @default []
+             */
+            daily: components["schemas"]["PortfolioNavRow"][];
+            /**
+             * Holdings
+             * @default []
+             */
+            holdings: components["schemas"]["PortfolioHoldingRow"][];
+            /**
+             * Log
+             * @default []
+             */
+            log: components["schemas"]["PortfolioLogRow"][];
+            /**
+             * Monthly
+             * @default []
+             */
+            monthly: components["schemas"]["PortfolioMonthRow"][];
+            /** Next Offset */
+            next_offset: number | null;
+            /** Result Hash */
+            result_hash: string;
+            /** Total */
+            total: number;
+            /**
+             * Trades
+             * @default []
+             */
+            trades: components["schemas"]["PortfolioTradeRow"][];
+            /**
+             * View
+             * @enum {string}
+             */
+            view: "trades" | "holdings" | "daily" | "monthly" | "log";
+        };
+        /** PortfolioSourceOption */
+        PortfolioSourceOption: {
+            /**
+             * End Date
+             * Format: date
+             */
+            end_date: string;
+            /** Industry Available */
+            industry_available: boolean;
+            /** Key */
+            key: string;
+            /** Label */
+            label: string;
+            /** Opening Verified */
+            opening_verified: boolean;
+            /** Ranking Available */
+            ranking_available: boolean;
+            /**
+             * Start Date
+             * Format: date
+             */
+            start_date: string;
+            /**
+             * Updated At
+             * Format: date-time
+             */
+            updated_at: string;
+            /** Version */
+            version: number;
+        };
+        /** PortfolioSummaryData */
+        PortfolioSummaryData: {
+            /** Available */
+            available: boolean;
+            /** Benchmark Available */
+            benchmark_available: boolean;
+            /** Benchmark Message */
+            benchmark_message: string | null;
+            /** Can Report */
+            can_report: boolean;
+            /** Completed Days */
+            completed_days: number;
+            config: components["schemas"]["PortfolioEditableConfig-Output"] | null;
+            job: components["schemas"]["PortfolioJob"];
+            /** Message */
+            message: string | null;
+            performance: components["schemas"]["PortfolioPerformanceData"] | null;
+            /** Result Hash */
+            result_hash: string | null;
+            /** Result Status */
+            result_status: ("complete" | "incomplete") | null;
+            /** Source Updated At */
+            source_updated_at: string | null;
+        };
+        /** PortfolioTradeRow */
+        PortfolioTradeRow: {
+            /** Amount */
+            amount: string | null;
+            /** Fees */
+            fees: string | null;
+            /** Price */
+            price: string | null;
+            /** Quantity */
+            quantity: number;
+            /** Reason */
+            reason: string | null;
+            /**
+             * Side
+             * @enum {string}
+             */
+            side: "BUY" | "SELL";
+            /** Status */
+            status: string;
+            /**
+             * Trade Date
+             * Format: date
+             */
+            trade_date: string;
+            /** Ts Code */
+            ts_code: string;
+        };
+        /** PortfolioWeightRule */
+        "PortfolioWeightRule-Input": {
+            /**
+             * Cash Reserve
+             * @default 0
+             */
+            cash_reserve: number | string;
+            /** Max Industry Weight */
+            max_industry_weight?: number | string | null;
+            /** Max Positions */
+            max_positions: number;
+            /**
+             * Max Stock Weight
+             * @default 1
+             */
+            max_stock_weight: number | string;
+            /**
+             * Method
+             * @default equal
+             * @enum {string}
+             */
+            method: "equal" | "rank_score";
+            /**
+             * Min Target Amount
+             * @default 0
+             */
+            min_target_amount: number | string;
+        };
+        /** PortfolioWeightRule */
+        "PortfolioWeightRule-Output": {
+            /**
+             * Cash Reserve
+             * @default 0
+             */
+            cash_reserve: string;
+            /** Max Industry Weight */
+            max_industry_weight?: string | null;
+            /** Max Positions */
+            max_positions: number;
+            /**
+             * Max Stock Weight
+             * @default 1
+             */
+            max_stock_weight: string;
+            /**
+             * Method
+             * @default equal
+             * @enum {string}
+             */
+            method: "equal" | "rank_score";
+            /**
+             * Min Target Amount
+             * @default 0
+             */
+            min_target_amount: string;
         };
         /** ProjectionInfo */
         ProjectionInfo: {
@@ -6194,6 +7111,33 @@ export interface components {
             t: string;
             /** Up Ratio Pct */
             up_ratio_pct: number | null;
+        };
+        /** RebalanceRule */
+        RebalanceRule: {
+            /** Every N Days */
+            every_n_days?: number | null;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "daily" | "weekly" | "monthly" | "every_n";
+        };
+        /** RelativeMetrics */
+        RelativeMetrics: {
+            /** Aligned Observations */
+            aligned_observations: number;
+            /** Alpha */
+            alpha: number | null;
+            /** Beta */
+            beta: number | null;
+            /** Excess Annualized Return */
+            excess_annualized_return: number | null;
+            /** Excess Total Return */
+            excess_total_return: number | null;
+            /** Information Ratio */
+            information_ratio: number | null;
+            /** Tracking Error */
+            tracking_error: number | null;
         };
         /** ResearchJobItem */
         ResearchJobItem: {
@@ -6328,6 +7272,21 @@ export interface components {
             /** Source Updated At */
             source_updated_at: string | null;
         };
+        /** ReturnDistribution */
+        ReturnDistribution: {
+            /** Bins */
+            bins: components["schemas"]["HistogramBin"][];
+            /** Count */
+            count: number;
+            /** Mean */
+            mean: number | null;
+            /** Median */
+            median: number | null;
+            /** P05 */
+            p05: number | null;
+            /** P95 */
+            p95: number | null;
+        };
         /** ReturnMissingCount */
         ReturnMissingCount: {
             /** Count */
@@ -6337,6 +7296,35 @@ export interface components {
              * @enum {string}
              */
             reason: "window_unfinished" | "visibility_pending" | "missing_price" | "suspended" | "source_unavailable";
+        };
+        /** RoundTripAnalysis */
+        RoundTripAnalysis: {
+            /** By Holding Days */
+            by_holding_days: {
+                [key: string]: components["schemas"]["RoundTripStats"];
+            };
+            /** By Industry */
+            by_industry: {
+                [key: string]: components["schemas"]["RoundTripStats"];
+            };
+            /** By Symbol */
+            by_symbol: {
+                [key: string]: components["schemas"]["RoundTripStats"];
+            };
+            overall: components["schemas"]["RoundTripStats"];
+        };
+        /** RoundTripStats */
+        RoundTripStats: {
+            /** Average Holding Days */
+            average_holding_days: number | null;
+            /** Count */
+            count: number;
+            /** Net Pnl */
+            net_pnl: number;
+            /** Payoff Ratio */
+            payoff_ratio: number | null;
+            /** Win Rate */
+            win_rate: number | null;
         };
         /** RuntimeServiceItem */
         RuntimeServiceItem: {
@@ -6930,6 +7918,17 @@ export interface components {
             /** Label */
             label: string;
         };
+        /** StreakSummary */
+        StreakSummary: {
+            /** Current Loss */
+            current_loss: number;
+            /** Current Win */
+            current_win: number;
+            /** Longest Loss */
+            longest_loss: number;
+            /** Longest Win */
+            longest_win: number;
+        };
         /** SurgeConfig */
         SurgeConfig: {
             /** Boards */
@@ -7236,6 +8235,305 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_BacktestListData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    capabilities_api_v1_backtests_portfolio_capabilities_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_PortfolioCapabilities_"];
+                };
+            };
+        };
+    };
+    submit_export_api_v1_backtests_portfolio_exports_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PortfolioExportRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PortfolioCommandReceipt"];
+                };
+            };
+            /** @description Conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PortfolioCommandReceipt"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_runs_api_v1_backtests_portfolio_runs_get: {
+        parameters: {
+            query?: {
+                limit?: number;
+                cursor?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_PortfolioJobsData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    submit_run_api_v1_backtests_portfolio_runs_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PortfolioCreateRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PortfolioCommandReceipt"];
+                };
+            };
+            /** @description Conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PortfolioCommandReceipt"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    summary_api_v1_backtests_portfolio_runs__job_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                job_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_PortfolioSummaryData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    download_zip_api_v1_backtests_portfolio_runs__job_id__exports__request_id__zip_get: {
+        parameters: {
+            query: {
+                result_hash: string;
+            };
+            header?: never;
+            path: {
+                job_id: string;
+                request_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    nav_api_v1_backtests_portfolio_runs__job_id__nav_get: {
+        parameters: {
+            query: {
+                result_hash: string;
+            };
+            header?: never;
+            path: {
+                job_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_PortfolioNavData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    report_api_v1_backtests_portfolio_runs__job_id__report_html_get: {
+        parameters: {
+            query: {
+                result_hash: string;
+            };
+            header?: never;
+            path: {
+                job_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    rows_api_v1_backtests_portfolio_runs__job_id__rows_get: {
+        parameters: {
+            query: {
+                result_hash: string;
+                view: "trades" | "holdings" | "daily" | "monthly" | "log";
+                offset?: number;
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                job_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_PortfolioRowsData_"];
                 };
             };
             /** @description Validation Error */
