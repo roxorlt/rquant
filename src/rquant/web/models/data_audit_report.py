@@ -1,4 +1,4 @@
-"""Bounded public shapes for the offline daily-bar audit report."""
+"""Bounded public audit shapes, including compatible daily-bar and catalog results."""
 
 from __future__ import annotations
 
@@ -8,6 +8,12 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
 from rquant.data_audit_contracts import MAX_AUDIT_DAYS, MAX_INDEXED_ISSUES, MAX_REPORT_ISSUES
+from rquant.data_audit_datasets import (
+    MAX_DATASET_RESULT_BYTES,
+    DatasetAuditResult,
+    DatasetAuditRule,
+    DatasetFieldNulls,
+)
 
 ReportHash = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 RuleId = Literal["daily_bar.close_limit", "daily_bar.zero_volume", "daily_bar.field_null_ratio"]
@@ -33,7 +39,7 @@ class _ReportModel(BaseModel):
 
 class ReportOverviewRow(_ReportModel):
     report_hash: ReportHash
-    schema_version: Literal[1]
+    schema_version: Literal[1, 2]
     rule_version: Literal["daily-bar-quality-v1"]
     run_status: Literal["completed"]
     collection_status: Literal["collection_unconfirmed"]
@@ -212,6 +218,45 @@ class AuditReportTaskProgress(_ReportModel):
     events: list[AuditReportTaskEvent] = Field(default_factory=list, max_length=20)
 
 
+class ReportDatasetRow(_ReportModel):
+    report_hash: ReportHash
+    dataset_id: str = Field(min_length=1, max_length=64)
+    result_json: str = Field(min_length=1, max_length=MAX_DATASET_RESULT_BYTES)
+
+
+class AuditReportDatasetField(DatasetFieldNulls):
+    name: str
+
+
+class AuditReportDatasetRule(DatasetAuditRule):
+    name: str
+    state_label: str
+    reason_label: str
+
+
+class AuditReportDataset(DatasetAuditResult):
+    name: str
+    coverage_label: str
+    freshness_label: str
+    completeness_label: str
+    conclusion_label: str
+    fields: tuple[AuditReportDatasetField, ...]
+    rules: tuple[AuditReportDatasetRule, ...]
+
+    @model_validator(mode="after")
+    def _counts(self) -> AuditReportDataset:
+        # Chinese presentation labels are outside the sealed summary byte budget.
+        core = self.model_dump(include=set(DatasetAuditResult.model_fields))
+        core["fields"] = [
+            f.model_dump(include=set(DatasetFieldNulls.model_fields)) for f in self.fields
+        ]
+        core["rules"] = [
+            r.model_dump(include=set(DatasetAuditRule.model_fields)) for r in self.rules
+        ]
+        DatasetAuditResult.model_validate(core)
+        return self
+
+
 class DataAuditReportData(_ReportModel):
     source_state: Literal["ready", "not_published", "unavailable"]
     overview: AuditReportOverview | None
@@ -221,3 +266,5 @@ class DataAuditReportData(_ReportModel):
     progress: AuditReportTaskProgress = Field(
         default_factory=lambda: AuditReportTaskProgress(availability="unavailable")
     )
+    dataset_state: Literal["ready", "not_published", "unavailable"] = "not_published"
+    datasets: list[AuditReportDataset] = Field(default_factory=list, max_length=24)

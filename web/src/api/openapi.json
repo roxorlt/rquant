@@ -510,6 +510,593 @@
         "title": "AuditReportCommandRequest",
         "type": "object"
       },
+      "AuditReportDataset": {
+        "additionalProperties": false,
+        "properties": {
+          "as_of": {
+            "format": "date-time",
+            "title": "As Of",
+            "type": "string"
+          },
+          "audit_start": {
+            "format": "date",
+            "title": "Audit Start",
+            "type": "string"
+          },
+          "closed_day_rows": {
+            "items": {
+              "$ref": "#/components/schemas/ClosedDayRows"
+            },
+            "maxItems": 128,
+            "title": "Closed Day Rows",
+            "type": "array"
+          },
+          "completeness_label": {
+            "title": "Completeness Label",
+            "type": "string"
+          },
+          "completeness_state": {
+            "enum": [
+              "missing_expected_scope",
+              "not_applicable",
+              "not_evaluated"
+            ],
+            "title": "Completeness State",
+            "type": "string"
+          },
+          "conclusion": {
+            "enum": [
+              "not_fully_assessed",
+              "issues_observed",
+              "no_issues_observed"
+            ],
+            "title": "Conclusion",
+            "type": "string"
+          },
+          "conclusion_label": {
+            "title": "Conclusion Label",
+            "type": "string"
+          },
+          "contract_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Contract Sha256",
+            "type": "string"
+          },
+          "coverage_label": {
+            "title": "Coverage Label",
+            "type": "string"
+          },
+          "coverage_reason": {
+            "enum": [
+              "date_presence_only",
+              "population_unknown",
+              "minute_grid_unknown",
+              "named_partitions_only",
+              "current_snapshot",
+              "event_driven",
+              "not_required_daily",
+              "visibility_unknown",
+              "source_missing",
+              "contract_columns_missing",
+              "no_observations",
+              "no_visible_observations",
+              "no_completed_sessions",
+              "outside_contract_history",
+              "session_grid_unknown",
+              "null_counts_only",
+              "declared_keys",
+              "declared_sources",
+              "declared_frequencies",
+              "not_minute",
+              "no_ingestion_clock",
+              "observations_only",
+              "no_source_column"
+            ],
+            "title": "Coverage Reason",
+            "type": "string"
+          },
+          "coverage_state": {
+            "enum": [
+              "measured",
+              "delayed",
+              "not_applicable",
+              "missing_expected_scope",
+              "missing_source",
+              "not_evaluated"
+            ],
+            "title": "Coverage State",
+            "type": "string"
+          },
+          "covered_open_days": {
+            "anyOf": [
+              {
+                "maximum": 3660.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Covered Open Days"
+          },
+          "dataset_id": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Dataset Id",
+            "type": "string"
+          },
+          "expected_open_days": {
+            "anyOf": [
+              {
+                "maximum": 3660.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Open Days"
+          },
+          "fields": {
+            "items": {
+              "$ref": "#/components/schemas/AuditReportDatasetField"
+            },
+            "title": "Fields",
+            "type": "array"
+          },
+          "frequencies": {
+            "items": {
+              "$ref": "#/components/schemas/DatasetFrequencyCount"
+            },
+            "maxItems": 64,
+            "title": "Frequencies",
+            "type": "array"
+          },
+          "freshness_label": {
+            "title": "Freshness Label",
+            "type": "string"
+          },
+          "freshness_lag_sessions": {
+            "anyOf": [
+              {
+                "maximum": 3660.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Freshness Lag Sessions"
+          },
+          "freshness_reason": {
+            "enum": [
+              "date_presence_only",
+              "population_unknown",
+              "minute_grid_unknown",
+              "named_partitions_only",
+              "current_snapshot",
+              "event_driven",
+              "not_required_daily",
+              "visibility_unknown",
+              "source_missing",
+              "contract_columns_missing",
+              "no_observations",
+              "no_visible_observations",
+              "no_completed_sessions",
+              "outside_contract_history",
+              "session_grid_unknown",
+              "null_counts_only",
+              "declared_keys",
+              "declared_sources",
+              "declared_frequencies",
+              "not_minute",
+              "no_ingestion_clock",
+              "observations_only",
+              "no_source_column"
+            ],
+            "title": "Freshness Reason",
+            "type": "string"
+          },
+          "freshness_state": {
+            "enum": [
+              "measured",
+              "delayed",
+              "not_applicable",
+              "missing_expected_scope",
+              "missing_source",
+              "not_evaluated"
+            ],
+            "title": "Freshness State",
+            "type": "string"
+          },
+          "gaps": {
+            "items": {
+              "$ref": "#/components/schemas/TradingDayGap"
+            },
+            "maxItems": 128,
+            "title": "Gaps",
+            "type": "array"
+          },
+          "latest_ingested_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Latest Ingested At"
+          },
+          "latest_visible_date": {
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Latest Visible Date"
+          },
+          "latest_visible_time": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Latest Visible Time"
+          },
+          "monthly": {
+            "items": {
+              "$ref": "#/components/schemas/MonthlyCoverage"
+            },
+            "maxItems": 122,
+            "title": "Monthly",
+            "type": "array"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "observed_age_seconds": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Observed Age Seconds"
+          },
+          "observed_rows": {
+            "maximum": 1000000000000.0,
+            "minimum": 0.0,
+            "title": "Observed Rows",
+            "type": "integer"
+          },
+          "observed_through": {
+            "format": "date",
+            "title": "Observed Through",
+            "type": "string"
+          },
+          "omitted_closed_day_count": {
+            "default": 0,
+            "maximum": 3660.0,
+            "minimum": 0.0,
+            "title": "Omitted Closed Day Count",
+            "type": "integer"
+          },
+          "omitted_closed_day_rows": {
+            "default": 0,
+            "maximum": 1000000000000.0,
+            "minimum": 0.0,
+            "title": "Omitted Closed Day Rows",
+            "type": "integer"
+          },
+          "omitted_gap_count": {
+            "default": 0,
+            "maximum": 3660.0,
+            "minimum": 0.0,
+            "title": "Omitted Gap Count",
+            "type": "integer"
+          },
+          "omitted_gap_open_days": {
+            "default": 0,
+            "maximum": 3660.0,
+            "minimum": 0.0,
+            "title": "Omitted Gap Open Days",
+            "type": "integer"
+          },
+          "omitted_row_changes": {
+            "maximum": 3660.0,
+            "minimum": 0.0,
+            "title": "Omitted Row Changes",
+            "type": "integer"
+          },
+          "pending_rows": {
+            "maximum": 1000000000000.0,
+            "minimum": 0.0,
+            "title": "Pending Rows",
+            "type": "integer"
+          },
+          "recorded_after_as_of_rows": {
+            "maximum": 1000000000000.0,
+            "minimum": 0.0,
+            "title": "Recorded After As Of Rows",
+            "type": "integer"
+          },
+          "row_changes": {
+            "items": {
+              "$ref": "#/components/schemas/DatasetRowChange"
+            },
+            "maxItems": 128,
+            "title": "Row Changes",
+            "type": "array"
+          },
+          "rule_version": {
+            "const": "catalog-dataset-audit-v1",
+            "default": "catalog-dataset-audit-v1",
+            "title": "Rule Version",
+            "type": "string"
+          },
+          "rules": {
+            "items": {
+              "$ref": "#/components/schemas/AuditReportDatasetRule"
+            },
+            "title": "Rules",
+            "type": "array"
+          },
+          "scope": {
+            "enum": [
+              "audit_range",
+              "current_snapshot",
+              "named_partitions"
+            ],
+            "title": "Scope",
+            "type": "string"
+          },
+          "source_column_present": {
+            "title": "Source Column Present",
+            "type": "boolean"
+          },
+          "source_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Source Id",
+            "type": "string"
+          },
+          "source_kind": {
+            "enum": [
+              "fixed_replica",
+              "named_lake"
+            ],
+            "title": "Source Kind",
+            "type": "string"
+          },
+          "source_state": {
+            "enum": [
+              "ready",
+              "missing_source",
+              "schema_mismatch"
+            ],
+            "title": "Source State",
+            "type": "string"
+          },
+          "unknown_frequency_rows": {
+            "maximum": 1000000000000.0,
+            "minimum": 0.0,
+            "title": "Unknown Frequency Rows",
+            "type": "integer"
+          },
+          "unknown_source_rows": {
+            "maximum": 1000000000000.0,
+            "minimum": 0.0,
+            "title": "Unknown Source Rows",
+            "type": "integer"
+          },
+          "visibility": {
+            "$ref": "#/components/schemas/VisibilityRule"
+          },
+          "visible_rows": {
+            "maximum": 1000000000000.0,
+            "minimum": 0.0,
+            "title": "Visible Rows",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "dataset_id",
+          "source_id",
+          "source_kind",
+          "source_state",
+          "source_column_present",
+          "scope",
+          "audit_start",
+          "observed_through",
+          "as_of",
+          "contract_sha256",
+          "visibility",
+          "coverage_state",
+          "coverage_reason",
+          "completeness_state",
+          "freshness_state",
+          "freshness_reason",
+          "latest_visible_date",
+          "latest_visible_time",
+          "latest_ingested_at",
+          "observed_rows",
+          "visible_rows",
+          "pending_rows",
+          "recorded_after_as_of_rows",
+          "unknown_source_rows",
+          "unknown_frequency_rows",
+          "monthly",
+          "gaps",
+          "closed_day_rows",
+          "fields",
+          "frequencies",
+          "row_changes",
+          "omitted_row_changes",
+          "rules",
+          "conclusion",
+          "name",
+          "coverage_label",
+          "freshness_label",
+          "completeness_label",
+          "conclusion_label"
+        ],
+        "title": "AuditReportDataset",
+        "type": "object"
+      },
+      "AuditReportDatasetField": {
+        "additionalProperties": false,
+        "properties": {
+          "field_name": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Field Name",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "null_rows": {
+            "maximum": 1000000000000.0,
+            "minimum": 0.0,
+            "title": "Null Rows",
+            "type": "integer"
+          },
+          "observed_rows": {
+            "maximum": 1000000000000.0,
+            "minimum": 0.0,
+            "title": "Observed Rows",
+            "type": "integer"
+          },
+          "required_key": {
+            "title": "Required Key",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "field_name",
+          "observed_rows",
+          "null_rows",
+          "required_key",
+          "name"
+        ],
+        "title": "AuditReportDatasetField",
+        "type": "object"
+      },
+      "AuditReportDatasetRule": {
+        "additionalProperties": false,
+        "properties": {
+          "checked_rows": {
+            "maximum": 1000000000000.0,
+            "minimum": 0.0,
+            "title": "Checked Rows",
+            "type": "integer"
+          },
+          "issue_count": {
+            "maximum": 1000000000000.0,
+            "minimum": 0.0,
+            "title": "Issue Count",
+            "type": "integer"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "reason": {
+            "enum": [
+              "date_presence_only",
+              "population_unknown",
+              "minute_grid_unknown",
+              "named_partitions_only",
+              "current_snapshot",
+              "event_driven",
+              "not_required_daily",
+              "visibility_unknown",
+              "source_missing",
+              "contract_columns_missing",
+              "no_observations",
+              "no_visible_observations",
+              "no_completed_sessions",
+              "outside_contract_history",
+              "session_grid_unknown",
+              "null_counts_only",
+              "declared_keys",
+              "declared_sources",
+              "declared_frequencies",
+              "not_minute",
+              "no_ingestion_clock",
+              "observations_only",
+              "no_source_column"
+            ],
+            "title": "Reason",
+            "type": "string"
+          },
+          "reason_label": {
+            "title": "Reason Label",
+            "type": "string"
+          },
+          "rule_id": {
+            "enum": [
+              "date_presence",
+              "freshness",
+              "required_keys",
+              "field_nulls",
+              "known_sources",
+              "known_frequency",
+              "closed_day_rows",
+              "row_count_change",
+              "observation_cutoff"
+            ],
+            "title": "Rule Id",
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "measured",
+              "delayed",
+              "not_applicable",
+              "missing_expected_scope",
+              "missing_source",
+              "not_evaluated"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "state_label": {
+            "title": "State Label",
+            "type": "string"
+          }
+        },
+        "required": [
+          "rule_id",
+          "state",
+          "reason",
+          "checked_rows",
+          "issue_count",
+          "name",
+          "state_label",
+          "reason_label"
+        ],
+        "title": "AuditReportDatasetRule",
+        "type": "object"
+      },
       "AuditReportIssue": {
         "additionalProperties": false,
         "properties": {
@@ -824,7 +1411,10 @@
             "type": "string"
           },
           "schema_version": {
-            "const": 1,
+            "enum": [
+              1,
+              2
+            ],
             "title": "Schema Version",
             "type": "integer"
           },
@@ -3304,6 +3894,27 @@
         "title": "CatalogSummary",
         "type": "object"
       },
+      "ClosedDayRows": {
+        "additionalProperties": false,
+        "properties": {
+          "day": {
+            "format": "date",
+            "title": "Day",
+            "type": "string"
+          },
+          "row_count": {
+            "exclusiveMinimum": 0.0,
+            "title": "Row Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "day",
+          "row_count"
+        ],
+        "title": "ClosedDayRows",
+        "type": "object"
+      },
       "CorrelationResult": {
         "additionalProperties": false,
         "description": "One cross-sectional correlation, including an explicit unavailable state.",
@@ -3733,6 +4344,24 @@
       "DataAuditReportData": {
         "additionalProperties": false,
         "properties": {
+          "dataset_state": {
+            "default": "not_published",
+            "enum": [
+              "ready",
+              "not_published",
+              "unavailable"
+            ],
+            "title": "Dataset State",
+            "type": "string"
+          },
+          "datasets": {
+            "items": {
+              "$ref": "#/components/schemas/AuditReportDataset"
+            },
+            "maxItems": 24,
+            "title": "Datasets",
+            "type": "array"
+          },
           "issues": {
             "items": {
               "$ref": "#/components/schemas/AuditReportIssue"
@@ -3785,6 +4414,82 @@
           "issues"
         ],
         "title": "DataAuditReportData",
+        "type": "object"
+      },
+      "DatasetFrequencyCount": {
+        "additionalProperties": false,
+        "properties": {
+          "frequency": {
+            "maxLength": 32,
+            "minLength": 1,
+            "title": "Frequency",
+            "type": "string"
+          },
+          "row_count": {
+            "maximum": 1000000000000.0,
+            "minimum": 0.0,
+            "title": "Row Count",
+            "type": "integer"
+          },
+          "visible_rows": {
+            "maximum": 1000000000000.0,
+            "minimum": 0.0,
+            "title": "Visible Rows",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "frequency",
+          "row_count",
+          "visible_rows"
+        ],
+        "title": "DatasetFrequencyCount",
+        "type": "object"
+      },
+      "DatasetRowChange": {
+        "additionalProperties": false,
+        "properties": {
+          "change_rows": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Change Rows"
+          },
+          "day": {
+            "format": "date",
+            "title": "Day",
+            "type": "string"
+          },
+          "previous_rows": {
+            "anyOf": [
+              {
+                "maximum": 1000000000000.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Previous Rows"
+          },
+          "row_count": {
+            "maximum": 1000000000000.0,
+            "minimum": 0.0,
+            "title": "Row Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "day",
+          "row_count"
+        ],
+        "title": "DatasetRowChange",
         "type": "object"
       },
       "DatasetSnapshotArtifact": {
@@ -13242,6 +13947,55 @@
         "title": "MonitorTrigger",
         "type": "object"
       },
+      "MonthlyCoverage": {
+        "additionalProperties": false,
+        "properties": {
+          "coverage_ratio": {
+            "anyOf": [
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Coverage Ratio"
+          },
+          "covered_open_days": {
+            "minimum": 0.0,
+            "title": "Covered Open Days",
+            "type": "integer"
+          },
+          "expected_open_days": {
+            "minimum": 0.0,
+            "title": "Expected Open Days",
+            "type": "integer"
+          },
+          "month": {
+            "format": "date",
+            "title": "Month",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "measured",
+              "no_expected_sessions"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "month",
+          "expected_open_days",
+          "covered_open_days",
+          "coverage_ratio",
+          "status"
+        ],
+        "title": "MonthlyCoverage",
+        "type": "object"
+      },
       "NamedLakeFrozenFile": {
         "additionalProperties": false,
         "properties": {
@@ -18849,6 +19603,33 @@
         "title": "TdxPreviewSourceData",
         "type": "object"
       },
+      "TradingDayGap": {
+        "additionalProperties": false,
+        "properties": {
+          "end": {
+            "format": "date",
+            "title": "End",
+            "type": "string"
+          },
+          "missing_open_days": {
+            "minimum": 1.0,
+            "title": "Missing Open Days",
+            "type": "integer"
+          },
+          "start": {
+            "format": "date",
+            "title": "Start",
+            "type": "string"
+          }
+        },
+        "required": [
+          "start",
+          "end",
+          "missing_open_days"
+        ],
+        "title": "TradingDayGap",
+        "type": "object"
+      },
       "TranslationPlan": {
         "additionalProperties": false,
         "properties": {
@@ -19114,6 +19895,19 @@
         ],
         "title": "ValidationError",
         "type": "object"
+      },
+      "VisibilityRule": {
+        "description": "Earliest point at which an event may be used by a PIT query.",
+        "enum": [
+          "minute_as_of",
+          "auction_0925",
+          "panel_close_next_session",
+          "financial_pit",
+          "daily_valuation_pit",
+          "unknown"
+        ],
+        "title": "VisibilityRule",
+        "type": "string"
       },
       "WatchlistSource": {
         "enum": [

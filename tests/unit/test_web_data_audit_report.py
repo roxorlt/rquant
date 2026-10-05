@@ -255,6 +255,8 @@ def test_unpublished_report_and_generation_change_have_distinct_states(tmp_path:
         assert unpublished.status_code == 200
         assert unpublished.json()["data"] == {
             "source_state": "not_published",
+            "dataset_state": "not_published",
+            "datasets": [],
             "overview": None,
             "months": [],
             "rules": [],

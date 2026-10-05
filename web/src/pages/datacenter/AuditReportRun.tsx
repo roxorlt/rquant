@@ -136,7 +136,7 @@ export function AuditReportRun({
             <span className="dc-report-eyebrow">数据核对</span>
             <h3>运行数据审计</h3>
           </div>
-          <Tip content="只读检查交易日覆盖和日线质量；报告发布后在下方查看。">
+          <Tip content="只读核对全部目录数据的覆盖、延迟与质量；原日线规则仍保留，发布后可逐份查看。">
             <span className="dc-audit-help">说明</span>
           </Tip>
         </div>
@@ -197,7 +197,8 @@ export function AuditReportRun({
           busy={command.busy}
           description={
             <p>
-              将只读核对 {start} 至 {end} 的交易日和日线质量，可能耗时较长；不会执行回补或写入日线。
+              将只读核对 {start} 至 {end}{" "}
+              的全部目录数据，可能耗时较长。报告保留缺少依据和未评估的说明。
             </p>
           }
           onCancel={() => setConfirmOpen(false)}

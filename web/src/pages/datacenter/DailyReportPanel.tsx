@@ -28,6 +28,7 @@ import {
 } from "@/ui";
 import { AuditReportRun } from "./AuditReportRun";
 import { AuditReportCommandSession } from "./auditReportCommandSession";
+import { DatasetReportContent } from "./DatasetReportPanel";
 
 type Overview = NonNullable<DataAuditReportData["overview"]>;
 
@@ -363,7 +364,8 @@ function ReportContent({ data, overview }: { data: DataAuditReportData; overview
   );
 }
 
-export function DailyReportPanel() {
+export function DailyReportPanel({ datasetId = "daily_bar" }: { datasetId?: string }) {
+  const reportTitle = datasetId === "daily_bar" ? "日线质量报告" : "数据质量报告";
   const meta = useMeta();
   const expectedGeneration = meta.data?.serving.generation_id;
   const report = useDataAuditReport(expectedGeneration);
@@ -444,7 +446,7 @@ export function DailyReportPanel() {
 
   let result: ReactNode;
   if (meta.isLoading || report.isLoading) {
-    result = <PageSkeleton label="日线质量报告加载中" />;
+    result = <PageSkeleton label={`${reportTitle}加载中`} />;
   } else if (meta.error) {
     result = <EmptyState title="暂时无法确认当前数据" hint="稍后刷新页面再试" />;
   } else if (report.error) {
@@ -452,23 +454,40 @@ export function DailyReportPanel() {
       <EmptyState
         title={
           report.error instanceof ApiError && report.error.status === 409
-            ? "日线质量报告已更新，请刷新"
-            : "日线质量报告暂时不可用"
+            ? `${reportTitle}已更新，请刷新`
+            : `${reportTitle}暂时不可用`
         }
         hint="稍后刷新页面再试"
       />
     );
   } else if (!sameReport) {
-    result = <EmptyState title="日线质量报告已更新，请刷新" hint="稍后刷新页面再试" />;
+    result = <EmptyState title={`${reportTitle}已更新，请刷新`} hint="稍后刷新页面再试" />;
   } else if (report.data?.source_state === "not_published") {
-    result = <EmptyState title="日线质量报告尚未发布" hint="发布后会显示覆盖与质量记录" />;
+    result = <EmptyState title={`${reportTitle}尚未发布`} hint="发布后会显示覆盖与质量记录" />;
   } else if (report.data?.source_state !== "ready" || report.data.overview === null) {
-    result = <EmptyState title="日线质量报告暂时不可用" hint="稍后刷新页面再试" />;
+    result = <EmptyState title={`${reportTitle}暂时不可用`} hint="稍后刷新页面再试" />;
   } else {
-    result = <ReportContent data={report.data} overview={report.data.overview} />;
+    const dataset = report.data.datasets?.find((item) => item.dataset_id === datasetId);
+    if (report.data.dataset_state === "ready" && dataset) {
+      result = (
+        <>
+          <DatasetReportContent dataset={dataset} />
+          {datasetId === "daily_bar" ? (
+            <details className="dc-dataset-details">
+              <summary>日线规则明细</summary>
+              <ReportContent data={report.data} overview={report.data.overview} />
+            </details>
+          ) : null}
+        </>
+      );
+    } else if (datasetId === "daily_bar") {
+      result = <ReportContent data={report.data} overview={report.data.overview} />;
+    } else {
+      result = <EmptyState title="这份数据尚未审计" hint="运行全目录审计后会显示覆盖与质量记录" />;
+    }
   }
   return (
-    <Panel title="日线质量报告" label="日线质量报告" flush>
+    <Panel title={reportTitle} label={reportTitle} flush>
       <AuditReportRun
         calendar={calendar.data}
         calendarReady={sameCalendar && !calendar.error}

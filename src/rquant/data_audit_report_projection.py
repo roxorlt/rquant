@@ -1,4 +1,4 @@
-"""Small Serving read model derived from one verified daily-bar audit artifact."""
+"""Bounded catalog and daily Serving rows derived from one verified audit artifact."""
 
 from __future__ import annotations
 
@@ -7,7 +7,12 @@ from collections import Counter
 from datetime import datetime
 
 from rquant.data_audit_contracts import MAX_INDEXED_ISSUES
-from rquant.data_audit_report import DataAuditReport
+from rquant.data_audit_datasets import DatasetAuditResult
+from rquant.data_audit_report import (
+    CatalogDataAuditReport,
+    DataAuditReport,
+    validate_data_audit_report,
+)
 from rquant.serving_read_models import ServingProjectionPayload
 
 
@@ -15,7 +20,7 @@ def project_data_audit_report(
     report: DataAuditReport, *, available_at: datetime
 ) -> tuple[ServingProjectionPayload, ...]:
     """Retain exact totals while limiting the first-page issue index."""
-    report = DataAuditReport.model_validate(report)
+    report = validate_data_audit_report(report)
     monthly = report.coverage.monthly
     indexed = report.issues[:MAX_INDEXED_ISSUES]
     expected_days = sum(item.expected_open_days for item in monthly)
@@ -112,7 +117,47 @@ def project_data_audit_report(
         "audit_report_rule": tuple(rule_rows),
         "audit_report_issue": issue_rows,
     }
+    if isinstance(report, CatalogDataAuditReport):
+        rows["audit_report_dataset"] = tuple(
+            {
+                "report_hash": report.content_hash,
+                "dataset_id": result.dataset_id,
+                "result_json": result.model_dump_json(),
+            }
+            for result in report.datasets
+        )
     return tuple(
         ServingProjectionPayload(table_name=name, available_at=available_at, rows=rows[name])
         for name in sorted(rows)
     )
+
+
+def read_catalog_audit_projection_rows(
+    rows: tuple[dict[str, object], ...],
+    *,
+    report_hash: str,
+) -> tuple[DatasetAuditResult, ...]:
+    """Validate typed, canonical summaries and one source/range/observation binding."""
+    from rquant.data_catalog.build import CATALOG_CONTRACTS
+
+    if len(rows) != len(CATALOG_CONTRACTS):
+        raise ValueError("catalog audit projection lacks datasets")
+    results = []
+    for row in rows:
+        raw = row.get("result_json")
+        if row.get("report_hash") != report_hash or not isinstance(raw, str):
+            raise ValueError("catalog audit projection mixes reports")
+        result = DatasetAuditResult.model_validate_json(raw)
+        if row.get("dataset_id") != result.dataset_id or raw != result.model_dump_json():
+            raise ValueError("catalog audit projection is noncanonical or mislabelled")
+        results.append(result)
+    ids = tuple(r.dataset_id for r in results)
+    if ids != tuple(sorted(c.dataset_id for c in CATALOG_CONTRACTS)):
+        raise ValueError("catalog audit projection is missing or duplicating datasets")
+    bindings = {
+        (r.source_id, r.source_kind, r.audit_start, r.observed_through, r.as_of, r.rule_version)
+        for r in results
+    }
+    if len(bindings) != 1:
+        raise ValueError("catalog audit projection mixes sources or observation times")
+    return tuple(results)

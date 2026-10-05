@@ -14,7 +14,12 @@ from types import SimpleNamespace
 import pytest
 
 from rquant.data_audit_evidence import DailyBarNullFieldSpec
-from rquant.data_audit_report import capture_data_audit_replica_identity
+from rquant.data_audit_report import (
+    CatalogDataAuditReport,
+    capture_data_audit_replica_identity,
+    data_audit_report_path,
+    load_data_audit_report,
+)
 from rquant.data_audit_report_job_projection import read_data_audit_report_job_snapshot
 from rquant.data_audit_report_jobs import (
     DataAuditReportJobRequest,
@@ -34,7 +39,8 @@ from rquant.serving_read_models import (
 from rquant.storage.duckdb import DuckDBStore
 from tests.unit.test_data_audit_report import END, START, _database
 
-OBSERVED = datetime(2026, 10, 2, tzinfo=UTC)
+# Real state/artifact inode ctime must precede the fixture observation.
+OBSERVED = datetime.now(UTC) + timedelta(minutes=5)
 
 
 class _Clock:
@@ -90,7 +96,7 @@ def _rows(source: DuckDBLabPageProjectionSource) -> dict[str, tuple[object, ...]
 
 
 def _date_artifact_for_fixture(store: DataAuditReportJobStore, report_hash: str) -> None:
-    artifact = store.report_directory / f"data-audit-v1-{report_hash}.json"
+    artifact = data_audit_report_path(store.report_directory, report_hash)
     date = datetime(2026, 10, 1, tzinfo=UTC).timestamp()
     os.utime(artifact, (date, date))
 
@@ -144,6 +150,84 @@ def test_running_task_has_progress_without_a_report(tmp_path: Path) -> None:
         "started",
     ]
     assert "audit_report_overview" not in rows
+
+
+def test_v2_success_receipt_artifact_serving_and_api_share_identity(tmp_path: Path) -> None:
+    from rquant.web.settings import WebSettings
+    from tests.support.web_proxy_identity import ResearcherTestClient, create_private_test_app
+    from tests.support.web_serving_fixture import FIXTURE_BUILT_AT, build_web_fixture
+
+    store, primary, replica, research, _ = _fixture(tmp_path)
+    original_source = replica.read_bytes()
+    request = _request(primary, replica, key="audit-command-0001")
+    queued = store.submit(request)
+    finished = DataAuditReportJobWorker(store).run_one()
+    assert finished is not None and finished.status == "succeeded"
+    assert finished.task_id == queued.task_id and finished.report_hash is not None
+    assert store.lookup_by_key(request.idempotency_key) == (request, finished)
+
+    path = data_audit_report_path(store.report_directory, finished.report_hash)
+    report = load_data_audit_report(path)
+    assert isinstance(report, CatalogDataAuditReport) and len(report.datasets) == 24
+    assert path.name == f"data-audit-v2-{finished.report_hash}.json"
+    job = read_data_audit_report_job_snapshot(store.state_path, observed_at=OBSERVED)
+    assert job.successful is not None and job.successful.receipt == finished
+    assert report.source.snapshot_label == f"sha256:{job.successful.replica_sha256}"
+
+    snapshot = _source(research, store.state_path, store.report_directory)(OBSERVED)
+    projections = tuple(
+        item for item in snapshot.projections if item.table_name.startswith("audit_report_")
+    )
+    assert len(projections) == 7
+    assert len({item.available_at for item in projections}) == 1
+    dataset_rows = next(p.rows for p in projections if p.table_name == "audit_report_dataset")
+    assert len(dataset_rows) == 24
+    assert {r["report_hash"] for r in dataset_rows} == {finished.report_hash}
+
+    # The existing publisher fixture uses minute sequence offsets. Keep its build
+    # later than the real inode times instead of backdating source identities.
+    sequence = int((OBSERVED - FIXTURE_BUILT_AT).total_seconds() // 60) + 1
+    root = tmp_path / "serving"
+    manifest = build_web_fixture(
+        root, "baseline", sequence=sequence, audit_report_projections=projections
+    )
+    app = create_private_test_app(
+        WebSettings(serving_root=root),
+        clock=lambda: manifest.built_at + timedelta(seconds=20),
+        background=False,
+    )
+    with ResearcherTestClient(app) as client:
+        response = client.get("/api/v1/data/report", params={"generation": manifest.generation_id})
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["serving"]["generation_id"] == manifest.generation_id
+    assert response.headers["X-Rquant-Generation"] == manifest.generation_id
+    data = payload["data"]
+    assert data["source_state"] == data["dataset_state"] == "ready"
+    assert data["overview"]["schema_version"] == 2
+    assert data["overview"]["report_hash"] == finished.report_hash
+    assert data["overview"]["current"] is False
+    assert data["overview"]["collection_status"] == "collection_unconfirmed"
+    assert (
+        data["progress"]["successful_task_id"]
+        == data["progress"]["latest_task_id"]
+        == finished.task_id
+    )
+    assert data["progress"]["successful_report_hash"] == finished.report_hash
+    assert data["progress"]["latest_status"] == "succeeded"
+    assert [event["event_type"] for event in data["progress"]["events"]] == [
+        "queued",
+        "started",
+        "source_check",
+        "succeeded",
+    ]
+    assert len(data["datasets"]) == 24
+    assert {d["source_id"] for d in data["datasets"]} == {report.source.snapshot_label}
+    daily = next(d for d in data["datasets"] if d["dataset_id"] == "daily_bar")
+    assert daily["observed_rows"] == 2
+    assert isinstance(daily["monthly"][0]["coverage_ratio"], str)
+    assert len(data["rules"]) == 3
+    assert replica.read_bytes() == original_source
 
 
 @pytest.mark.parametrize("status", ["queued", "running", "failed"])
@@ -241,7 +325,7 @@ def test_damaged_success_artifact_rejects_entire_generation(tmp_path: Path) -> N
     success = DataAuditReportJobWorker(store).run_one()
     assert success is not None and success.report_hash is not None
     _date_artifact_for_fixture(store, success.report_hash)
-    artifact = store.report_directory / f"data-audit-v1-{success.report_hash}.json"
+    artifact = data_audit_report_path(store.report_directory, success.report_hash)
     artifact.chmod(0o600)
     artifact.write_bytes(artifact.read_bytes().replace(b"collection_unconfirmed", b"completed", 1))
 

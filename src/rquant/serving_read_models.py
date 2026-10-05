@@ -1210,6 +1210,13 @@ PAGE_PROJECTION_CONTRACTS: Mapping[str, ServingProjectionContract] = MappingProx
             max_bytes=256 * 1024,
             event_date_columns=("trade_date",),
         ),
+        "audit_report_dataset": _contract(
+            "lab_jobs",
+            (("report_hash", "string"), ("dataset_id", "string"), ("result_json", "string")),
+            ("report_hash", "dataset_id"),
+            max_rows=24,
+            max_bytes=2 * 1024 * 1024,
+        ),
         "audit_report_job": _contract(
             "lab_jobs",
             (

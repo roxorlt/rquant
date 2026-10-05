@@ -8,7 +8,7 @@ import os
 import stat
 import tempfile
 from collections.abc import Callable
-from datetime import date
+from datetime import date, datetime, time, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 from typing import Annotated, BinaryIO, Literal, Self
@@ -23,6 +23,7 @@ from rquant.data_audit_coverage import (
     MonthlyCoverage,
     TradingDayGap,
 )
+from rquant.data_audit_datasets import DatasetAuditResult
 from rquant.data_audit_evidence import (
     MAX_AUDIT_DAYS,
     DailyBarNullFieldSpec,
@@ -347,6 +348,54 @@ class DataAuditReport(_ReportBody):
         return self
 
 
+class CatalogDataAuditReport(DataAuditReport):
+    """V2 adds catalog facts while retaining the daily V1 result unchanged."""
+
+    schema_version: Literal[2] = 2
+    dataset_rule_version: Literal["catalog-dataset-audit-v1"] = "catalog-dataset-audit-v1"
+    dataset_contract_sha256: Sha256
+    audit_as_of: datetime
+    datasets: tuple[DatasetAuditResult, ...] = Field(min_length=24, max_length=24)
+
+    @model_validator(mode="after")
+    def validate_dataset_binding(self) -> Self:
+        from rquant.data_catalog.build import CATALOG_CONTRACTS
+
+        ids = tuple(item.dataset_id for item in self.datasets)
+        if ids != tuple(sorted(c.dataset_id for c in CATALOG_CONTRACTS)):
+            raise ValueError("catalog audit must include every dataset exactly once")
+        if self.audit_as_of.tzinfo is None or self.audit_as_of.utcoffset() is None:
+            raise ValueError("catalog audit requires an aware observation time")
+        if any(
+            item.source_id != self.source.snapshot_label
+            or item.source_kind != "fixed_replica"
+            or item.audit_start != self.audit_start
+            or item.observed_through != self.observed_through
+            or item.as_of != self.audit_as_of
+            or item.rule_version != self.dataset_rule_version
+            for item in self.datasets
+        ):
+            raise ValueError("catalog audit source, range or rule version differs")
+        if self.dataset_contract_sha256 != _payload_hash(
+            {item.dataset_id: item.contract_sha256 for item in self.datasets}
+        ):
+            raise ValueError("catalog audit contract summary differs")
+        return self
+
+
+def validate_data_audit_report(report: DataAuditReport) -> DataAuditReport:
+    model = CatalogDataAuditReport if report.schema_version == 2 else DataAuditReport
+    return model.model_validate(report.model_dump(mode="python"))
+
+
+def data_audit_report_path(directory: Path, report_hash: str) -> Path:
+    """Resolve two explicit artifact versions without directory scans or fallback on corruption."""
+    if len(report_hash) != 64 or any(c not in "0123456789abcdef" for c in report_hash):
+        raise ValueError("invalid audit report digest")
+    current = directory / f"data-audit-v2-{report_hash}.json"
+    return current if current.exists() else directory / f"data-audit-v1-{report_hash}.json"
+
+
 def _canonical_bytes(value: dict[str, object]) -> bytes:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
 
@@ -514,11 +563,55 @@ def build_data_audit_report(
     return report
 
 
+def build_catalog_data_audit_report(
+    connection: duckdb.DuckDBPyConnection,
+    *,
+    source: AuditReportSource,
+    audit_start: date,
+    observed_through: date,
+    null_fields: tuple[DailyBarNullFieldSpec, ...],
+    as_of: datetime,
+) -> CatalogDataAuditReport:
+    from rquant.data_audit_dataset_evidence import read_catalog_audit_from_connection
+    from rquant.data_audit_datasets import catalog_contract_sha256
+
+    daily = build_data_audit_report(
+        connection,
+        source=source,
+        audit_start=audit_start,
+        observed_through=observed_through,
+        null_fields=null_fields,
+    )
+    datasets = read_catalog_audit_from_connection(
+        connection,
+        source_id=source.snapshot_label,
+        audit_start=audit_start,
+        observed_through=observed_through,
+        as_of=as_of,
+    )
+    data = {
+        **daily.model_dump(mode="json", exclude={"content_hash"}),
+        "schema_version": 2,
+        "dataset_rule_version": "catalog-dataset-audit-v1",
+        "dataset_contract_sha256": catalog_contract_sha256(),
+        "audit_as_of": datasets[0].model_dump(mode="json")["as_of"],
+        "datasets": [r.model_dump(mode="json") for r in datasets],
+    }
+    report = CatalogDataAuditReport.model_validate({**data, "content_hash": _payload_hash(data)})
+    if len(_canonical_bytes(report.model_dump(mode="json"))) > MAX_REPORT_BYTES:
+        raise ValueError("audit report exceeds byte limit")
+    return report
+
+
 def _decode_report(data: bytes) -> DataAuditReport:
     if not data or len(data) > MAX_REPORT_BYTES:
         raise ValueError("audit report exceeds byte limit or is empty")
     try:
-        report = DataAuditReport.model_validate_json(data)
+        header = json.loads(data)
+        if not isinstance(header, dict):
+            raise ValueError("audit report must be an object")
+        model = CatalogDataAuditReport if header.get("schema_version") == 2 else DataAuditReport
+        report = model.model_validate_json(data)
     except ValueError as exc:
         raise ValueError("audit report is invalid or its digest mismatches") from exc
     if data != _canonical_bytes(report.model_dump(mode="json")):
@@ -552,7 +645,7 @@ def load_data_audit_report(path: Path) -> DataAuditReport:
 
 def publish_data_audit_report(report: DataAuditReport, directory: Path) -> Path:
     """Validate, fsync, then atomically add one immutable content-addressed file."""
-    report = DataAuditReport.model_validate(report)
+    report = validate_data_audit_report(report)
     data = _canonical_bytes(report.model_dump(mode="json"))
     _decode_report(data)
     directory.mkdir(parents=True, exist_ok=True)
@@ -665,6 +758,7 @@ def create_and_publish_data_audit_report(
     expected_file_identity: AuditReplicaFileIdentity | None = None,
     expected_file_sha256: str | None = None,
     on_replica_sha256: Callable[[str], None] | None = None,
+    include_catalog: bool = False,
 ) -> Path:
     """Seal one trusted local replica read into an unverified production report.
 
@@ -738,7 +832,18 @@ def create_and_publish_data_audit_report(
             _require_fixed_replica(primary_path, replica_path, pinned_source)
             with duckdb.connect(str(pinned), read_only=True) as connection:
                 _require_fixed_replica(primary_path, replica_path, pinned_source)
-                report = build_data_audit_report(
+                builder = (
+                    build_catalog_data_audit_report if include_catalog else build_data_audit_report
+                )
+                observation = {}
+                if include_catalog:
+                    from rquant.data_contracts import EXCHANGE_TIMEZONE
+
+                    # Keep retry digests stable; this cutoff is not the actual execution clock.
+                    observation["as_of"] = datetime.combine(
+                        observed_through + timedelta(days=1), time.min, EXCHANGE_TIMEZONE
+                    )
+                report = builder(
                     connection,
                     source=AuditReportSource(
                         mode="production_unverified",
@@ -748,6 +853,7 @@ def create_and_publish_data_audit_report(
                     audit_start=audit_start,
                     observed_through=observed_through,
                     null_fields=null_fields,
+                    **observation,
                 )
                 _require_fixed_replica(primary_path, replica_path, pinned_source)
             if _file_sha256(handle) != digest:

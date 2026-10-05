@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import duckdb
@@ -31,7 +31,8 @@ from rquant.storage.duckdb import DuckDBStore
 from rquant.storage.schema import DAILY_BAR_DDL, TRADE_CALENDAR_DDL
 from tests.unit.test_data_audit_report import END, START, _database, _report
 
-OBSERVED = datetime(2026, 10, 1, 12, tzinfo=UTC)
+# Real inode/directory ctime cannot be backdated with os.utime.
+OBSERVED = datetime.now(UTC) + timedelta(minutes=5)
 REPORT_TABLES = {
     "audit_report_overview",
     "audit_report_month",

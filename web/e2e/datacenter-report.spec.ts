@@ -1,132 +1,7 @@
 import { expect, type Page, test } from "@playwright/test";
 import type { Schemas } from "../src/api/client";
+import { dailyReport as report } from "./datacenter-report.fixture.ts";
 import { expectNoHorizontalOverflow, watch } from "./watch.ts";
-
-const report: Schemas["DataAuditReportData"] = {
-  source_state: "ready",
-  overview: {
-    report_hash: "f".repeat(64),
-    schema_version: 1,
-    rule_version: "daily-bar-quality-v1",
-    run_status: "completed",
-    collection_status: "collection_unconfirmed",
-    collection_completed_through: null,
-    collection_label: "采集未确认",
-    coverage_conclusion: "unconfirmed",
-    coverage_label: "覆盖情况待确认",
-    quality_conclusion: "issues_observed",
-    quality_label: "发现问题",
-    current: false,
-    source_mode: "production_unverified",
-    source_namespace: "production",
-    replica_generation_id: null,
-    audit_start: "2026-07-01",
-    observed_through: "2026-09-30",
-    expected_open_days: 66,
-    covered_open_days: 64,
-    missing_open_days: 2,
-    gap_count: 1,
-    longest_gap_open_days: 2,
-    closed_day_count: 26,
-    monthly_count: 3,
-    rule_count: 3,
-    quality_issue_count: 1,
-    indexed_issue_count: 1,
-    omitted_issue_count: 0,
-    unassessed_rule_days: 70,
-  },
-  months: [
-    {
-      month: "2026-07-01",
-      expected_open_days: 22,
-      covered_open_days: 22,
-      coverage_ratio: 1,
-      status: "measured",
-      status_label: "已统计",
-    },
-    {
-      month: "2026-08-01",
-      expected_open_days: 22,
-      covered_open_days: 22,
-      coverage_ratio: 1,
-      status: "measured",
-      status_label: "已统计",
-    },
-    {
-      month: "2026-09-01",
-      expected_open_days: 22,
-      covered_open_days: 20,
-      coverage_ratio: 20 / 22,
-      status: "measured",
-      status_label: "已统计",
-    },
-  ],
-  rules: [
-    {
-      rule_id: "daily_bar.close_limit",
-      name: "收盘价上下限",
-      field_name: null,
-      field_label: null,
-      expected_days: 66,
-      checked_days: 64,
-      assessed_days: 0,
-      unassessed_days: 66,
-      first_assessed_date: null,
-      last_assessed_date: null,
-      assessment_complete: false,
-      unassessed_reasons: [
-        { reason: "no_daily_bar", name: "缺少日线", days: 2 },
-        { reason: "limits_unavailable", name: "涨跌停价未确认", days: 64 },
-      ],
-      issue_count: 0,
-    },
-    {
-      rule_id: "daily_bar.zero_volume",
-      name: "零成交量",
-      field_name: null,
-      field_label: null,
-      expected_days: 66,
-      checked_days: 64,
-      assessed_days: 64,
-      unassessed_days: 2,
-      first_assessed_date: "2026-07-01",
-      last_assessed_date: "2026-09-30",
-      assessment_complete: false,
-      unassessed_reasons: [{ reason: "no_daily_bar", name: "缺少日线", days: 2 }],
-      issue_count: 1,
-    },
-    {
-      rule_id: "daily_bar.field_null_ratio",
-      name: "字段空值比例",
-      field_name: "close",
-      field_label: "收盘价",
-      expected_days: 66,
-      checked_days: 64,
-      assessed_days: 64,
-      unassessed_days: 2,
-      first_assessed_date: "2026-07-01",
-      last_assessed_date: "2026-09-30",
-      assessment_complete: false,
-      unassessed_reasons: [{ reason: "no_daily_bar", name: "缺少日线", days: 2 }],
-      issue_count: 0,
-    },
-  ],
-  issues: [
-    {
-      number: 1,
-      trade_date: "2026-09-03",
-      rule_id: "daily_bar.zero_volume_unsuspended",
-      name: "未停牌但零成交量",
-      ts_code: "000001.SZ",
-      field_name: null,
-      field_label: null,
-      observed_value: "0",
-      reference_value: null,
-      null_rows: null,
-      observed_rows: null,
-    },
-  ],
-};
 
 async function installAuditRun(page: Page) {
   const metaResponse = await page.request.get("./api/v1/meta");
@@ -153,6 +28,8 @@ async function installAuditRun(page: Page) {
       json: {
         data: {
           source_state: "not_published",
+          dataset_state: "not_published",
+          datasets: [],
           overview: null,
           months: [],
           rules: [],
@@ -309,7 +186,8 @@ for (const width of [1440, 390]) {
     await run.focus();
     await page.keyboard.press("Enter");
     const dialog = page.getByRole("dialog", { name: "运行数据审计" });
-    await expect(dialog).toContainText("不会执行回补或写入日线");
+    await expect(dialog).toContainText("只读核对");
+    await expect(dialog).toContainText("全部目录数据");
     await dialog.getByRole("button", { name: "确认排队" }).focus();
     await page.keyboard.press("Enter");
     await expect(panel.getByText("本次请求已排队")).toBeVisible();

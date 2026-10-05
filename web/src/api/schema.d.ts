@@ -1541,6 +1541,197 @@ export interface components {
              */
             requested_at: string;
         };
+        /** AuditReportDataset */
+        AuditReportDataset: {
+            /**
+             * As Of
+             * Format: date-time
+             */
+            as_of: string;
+            /**
+             * Audit Start
+             * Format: date
+             */
+            audit_start: string;
+            /** Closed Day Rows */
+            closed_day_rows: components["schemas"]["ClosedDayRows"][];
+            /** Completeness Label */
+            completeness_label: string;
+            /**
+             * Completeness State
+             * @enum {string}
+             */
+            completeness_state: "missing_expected_scope" | "not_applicable" | "not_evaluated";
+            /**
+             * Conclusion
+             * @enum {string}
+             */
+            conclusion: "not_fully_assessed" | "issues_observed" | "no_issues_observed";
+            /** Conclusion Label */
+            conclusion_label: string;
+            /** Contract Sha256 */
+            contract_sha256: string;
+            /** Coverage Label */
+            coverage_label: string;
+            /**
+             * Coverage Reason
+             * @enum {string}
+             */
+            coverage_reason: "date_presence_only" | "population_unknown" | "minute_grid_unknown" | "named_partitions_only" | "current_snapshot" | "event_driven" | "not_required_daily" | "visibility_unknown" | "source_missing" | "contract_columns_missing" | "no_observations" | "no_visible_observations" | "no_completed_sessions" | "outside_contract_history" | "session_grid_unknown" | "null_counts_only" | "declared_keys" | "declared_sources" | "declared_frequencies" | "not_minute" | "no_ingestion_clock" | "observations_only" | "no_source_column";
+            /**
+             * Coverage State
+             * @enum {string}
+             */
+            coverage_state: "measured" | "delayed" | "not_applicable" | "missing_expected_scope" | "missing_source" | "not_evaluated";
+            /** Covered Open Days */
+            covered_open_days?: number | null;
+            /** Dataset Id */
+            dataset_id: string;
+            /** Expected Open Days */
+            expected_open_days?: number | null;
+            /** Fields */
+            fields: components["schemas"]["AuditReportDatasetField"][];
+            /** Frequencies */
+            frequencies: components["schemas"]["DatasetFrequencyCount"][];
+            /** Freshness Label */
+            freshness_label: string;
+            /** Freshness Lag Sessions */
+            freshness_lag_sessions?: number | null;
+            /**
+             * Freshness Reason
+             * @enum {string}
+             */
+            freshness_reason: "date_presence_only" | "population_unknown" | "minute_grid_unknown" | "named_partitions_only" | "current_snapshot" | "event_driven" | "not_required_daily" | "visibility_unknown" | "source_missing" | "contract_columns_missing" | "no_observations" | "no_visible_observations" | "no_completed_sessions" | "outside_contract_history" | "session_grid_unknown" | "null_counts_only" | "declared_keys" | "declared_sources" | "declared_frequencies" | "not_minute" | "no_ingestion_clock" | "observations_only" | "no_source_column";
+            /**
+             * Freshness State
+             * @enum {string}
+             */
+            freshness_state: "measured" | "delayed" | "not_applicable" | "missing_expected_scope" | "missing_source" | "not_evaluated";
+            /** Gaps */
+            gaps: components["schemas"]["TradingDayGap"][];
+            /** Latest Ingested At */
+            latest_ingested_at: string | null;
+            /** Latest Visible Date */
+            latest_visible_date: string | null;
+            /** Latest Visible Time */
+            latest_visible_time: string | null;
+            /** Monthly */
+            monthly: components["schemas"]["MonthlyCoverage"][];
+            /** Name */
+            name: string;
+            /** Observed Age Seconds */
+            observed_age_seconds?: number | null;
+            /** Observed Rows */
+            observed_rows: number;
+            /**
+             * Observed Through
+             * Format: date
+             */
+            observed_through: string;
+            /**
+             * Omitted Closed Day Count
+             * @default 0
+             */
+            omitted_closed_day_count: number;
+            /**
+             * Omitted Closed Day Rows
+             * @default 0
+             */
+            omitted_closed_day_rows: number;
+            /**
+             * Omitted Gap Count
+             * @default 0
+             */
+            omitted_gap_count: number;
+            /**
+             * Omitted Gap Open Days
+             * @default 0
+             */
+            omitted_gap_open_days: number;
+            /** Omitted Row Changes */
+            omitted_row_changes: number;
+            /** Pending Rows */
+            pending_rows: number;
+            /** Recorded After As Of Rows */
+            recorded_after_as_of_rows: number;
+            /** Row Changes */
+            row_changes: components["schemas"]["DatasetRowChange"][];
+            /**
+             * Rule Version
+             * @default catalog-dataset-audit-v1
+             * @constant
+             */
+            rule_version: "catalog-dataset-audit-v1";
+            /** Rules */
+            rules: components["schemas"]["AuditReportDatasetRule"][];
+            /**
+             * Scope
+             * @enum {string}
+             */
+            scope: "audit_range" | "current_snapshot" | "named_partitions";
+            /** Source Column Present */
+            source_column_present: boolean;
+            /** Source Id */
+            source_id: string;
+            /**
+             * Source Kind
+             * @enum {string}
+             */
+            source_kind: "fixed_replica" | "named_lake";
+            /**
+             * Source State
+             * @enum {string}
+             */
+            source_state: "ready" | "missing_source" | "schema_mismatch";
+            /** Unknown Frequency Rows */
+            unknown_frequency_rows: number;
+            /** Unknown Source Rows */
+            unknown_source_rows: number;
+            visibility: components["schemas"]["VisibilityRule"];
+            /** Visible Rows */
+            visible_rows: number;
+        };
+        /** AuditReportDatasetField */
+        AuditReportDatasetField: {
+            /** Field Name */
+            field_name: string;
+            /** Name */
+            name: string;
+            /** Null Rows */
+            null_rows: number;
+            /** Observed Rows */
+            observed_rows: number;
+            /** Required Key */
+            required_key: boolean;
+        };
+        /** AuditReportDatasetRule */
+        AuditReportDatasetRule: {
+            /** Checked Rows */
+            checked_rows: number;
+            /** Issue Count */
+            issue_count: number;
+            /** Name */
+            name: string;
+            /**
+             * Reason
+             * @enum {string}
+             */
+            reason: "date_presence_only" | "population_unknown" | "minute_grid_unknown" | "named_partitions_only" | "current_snapshot" | "event_driven" | "not_required_daily" | "visibility_unknown" | "source_missing" | "contract_columns_missing" | "no_observations" | "no_visible_observations" | "no_completed_sessions" | "outside_contract_history" | "session_grid_unknown" | "null_counts_only" | "declared_keys" | "declared_sources" | "declared_frequencies" | "not_minute" | "no_ingestion_clock" | "observations_only" | "no_source_column";
+            /** Reason Label */
+            reason_label: string;
+            /**
+             * Rule Id
+             * @enum {string}
+             */
+            rule_id: "date_presence" | "freshness" | "required_keys" | "field_nulls" | "known_sources" | "known_frequency" | "closed_day_rows" | "row_count_change" | "observation_cutoff";
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "measured" | "delayed" | "not_applicable" | "missing_expected_scope" | "missing_source" | "not_evaluated";
+            /** State Label */
+            state_label: string;
+        };
         /** AuditReportIssue */
         AuditReportIssue: {
             /** Field Label */
@@ -1671,9 +1862,9 @@ export interface components {
             run_status: "completed";
             /**
              * Schema Version
-             * @constant
+             * @enum {integer}
              */
-            schema_version: 1;
+            schema_version: 1 | 2;
             /**
              * Source Mode
              * @constant
@@ -2476,6 +2667,16 @@ export interface components {
             /** Sources */
             sources: string[];
         };
+        /** ClosedDayRows */
+        ClosedDayRows: {
+            /**
+             * Day
+             * Format: date
+             */
+            day: string;
+            /** Row Count */
+            row_count: number;
+        };
         /**
          * CorrelationResult
          * @description One cross-sectional correlation, including an explicit unavailable state.
@@ -2612,6 +2813,14 @@ export interface components {
         };
         /** DataAuditReportData */
         DataAuditReportData: {
+            /**
+             * Dataset State
+             * @default not_published
+             * @enum {string}
+             */
+            dataset_state: "ready" | "not_published" | "unavailable";
+            /** Datasets */
+            datasets?: components["schemas"]["AuditReportDataset"][];
             /** Issues */
             issues: components["schemas"]["AuditReportIssue"][];
             /** Months */
@@ -2625,6 +2834,29 @@ export interface components {
              * @enum {string}
              */
             source_state: "ready" | "not_published" | "unavailable";
+        };
+        /** DatasetFrequencyCount */
+        DatasetFrequencyCount: {
+            /** Frequency */
+            frequency: string;
+            /** Row Count */
+            row_count: number;
+            /** Visible Rows */
+            visible_rows: number;
+        };
+        /** DatasetRowChange */
+        DatasetRowChange: {
+            /** Change Rows */
+            change_rows?: number | null;
+            /**
+             * Day
+             * Format: date
+             */
+            day: string;
+            /** Previous Rows */
+            previous_rows?: number | null;
+            /** Row Count */
+            row_count: number;
         };
         /** DatasetSnapshotArtifact */
         DatasetSnapshotArtifact: {
@@ -5828,6 +6060,25 @@ export interface components {
             /** Status Label */
             status_label: string;
         };
+        /** MonthlyCoverage */
+        MonthlyCoverage: {
+            /** Coverage Ratio */
+            coverage_ratio: string | null;
+            /** Covered Open Days */
+            covered_open_days: number;
+            /** Expected Open Days */
+            expected_open_days: number;
+            /**
+             * Month
+             * Format: date
+             */
+            month: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "measured" | "no_expected_sessions";
+        };
         /** NamedLakeFrozenFile */
         NamedLakeFrozenFile: {
             /** Byte Count */
@@ -7616,6 +7867,21 @@ export interface components {
             dates: string[];
             source: components["schemas"]["ScreenSourceInfo"] | null;
         };
+        /** TradingDayGap */
+        TradingDayGap: {
+            /**
+             * End
+             * Format: date
+             */
+            end: string;
+            /** Missing Open Days */
+            missing_open_days: number;
+            /**
+             * Start
+             * Format: date
+             */
+            start: string;
+        };
         /** TranslationPlan */
         TranslationPlan: {
             /** Assignments */
@@ -7705,6 +7971,12 @@ export interface components {
             /** Error Type */
             type: string;
         };
+        /**
+         * VisibilityRule
+         * @description Earliest point at which an event may be used by a PIT query.
+         * @enum {string}
+         */
+        VisibilityRule: "minute_as_of" | "auction_0925" | "panel_close_next_session" | "financial_pit" | "daily_valuation_pit" | "unknown";
         /**
          * WatchlistSource
          * @enum {string}
