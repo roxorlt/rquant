@@ -88,6 +88,9 @@ from rquant.web.routes import (
     tasks,
     tasks_controls,
 )
+from rquant.web.routes import condition_alert_rules as condition_alert_rules_routes
+from rquant.web.routes import screen_history as screen_history_routes
+from rquant.web.routes import screen_alert_draft as screen_alert_draft_routes
 from rquant.web.screen_service import ScreenApplicationService
 from rquant.web.security import require_current_user
 from rquant.web.service_log_access_audit import ServiceLogAccessAudit
@@ -102,6 +105,7 @@ if TYPE_CHECKING:
     from rquant.factor_run_admission import FactorRunAdmissionClient
     from rquant.factor_tracking_admission import FactorTrackingAdmissionClient
     from rquant.price_alert_admission import PriceAlertAdmissionClient
+    from rquant.screen.query_admission import ScreenQueryPrivateClient
     from rquant.research_query.service import QueryPrivateClient
     from rquant.watchlist_admission import WatchlistAdmissionClient
     from rquant.web.portfolio_backtest_service import PortfolioWebService
@@ -112,6 +116,13 @@ API_TITLE = "rQuant Web API"
 #: release that does not touch the API leaves the OpenAPI snapshot unchanged.
 API_VERSION = "1"
 _WRITE_BODY_LIMITS = {
+    "/api/v1/monitor/condition-rules/commands": condition_alert_rules_routes.MAX_COMMAND_REQUEST_BYTES,
+    "/api/v1/monitor/condition-rules/commands/resume": condition_alert_rules_routes.MAX_COMMAND_REQUEST_BYTES,
+    "/api/v1/screen/query/execute": screen_history_routes.MAX_REQUEST_BYTES,
+    "/api/v1/screen/query/lookup": screen_history_routes.MAX_REQUEST_BYTES,
+    "/api/v1/screen/query/resume": screen_history_routes.MAX_REQUEST_BYTES,
+    "/api/v1/screen/query/presets/save": screen_history_routes.MAX_REQUEST_BYTES,
+    "/api/v1/screen/query/alert-draft": screen_alert_draft_routes.MAX_REQUEST_BYTES,
     "/api/v1/screen/nl-preview": screen.MAX_NL_REQUEST_BYTES,
     "/api/v1/pools/editor/commands": pool_editor.MAX_REQUEST_BYTES,
     "/api/v1/pools/editor/nl-preview": pool_editor.MAX_NL_REQUEST_BYTES,
@@ -173,6 +184,7 @@ class WebContext:
     audit_report_commands: AuditReportCommandGateway
     formula_market_commands: FormulaMarketCommandGateway
     lab_controls: LabControlGateway
+    screen_query_client: ScreenQueryPrivateClient | None
     research_query_client: QueryPrivateClient | None
     research_query_save_client: QueryPrivateClient | None
     portfolio_backtests: PortfolioWebService | None
@@ -202,6 +214,7 @@ def create_app(
     audit_report_command_transport: AuditReportCommandTransport | None = None,
     formula_market_command_transport: FormulaMarketCommandTransport | None = None,
     lab_control_command_transport: LabControlTransport | None = None,
+    screen_query_client: ScreenQueryPrivateClient | None = None,
     research_query_client: QueryPrivateClient | None = None,
     research_query_save_client: QueryPrivateClient | None = None,
     portfolio_backtests: PortfolioWebService | None = None,
@@ -234,6 +247,15 @@ def create_app(
         lifespan=lifespan,
     )
     cursor_key = secrets.token_bytes(32)
+    configured_screen_query = screen_query_client
+    if settings.screen_query_socket_path is not None:
+        from rquant.screen.query_admission import ScreenQueryPrivateClient
+
+        configured_screen_query = configured_screen_query or ScreenQueryPrivateClient(
+            settings.screen_query_socket_path,
+            expected_service_uid=settings.screen_query_service_uid,
+            shared_gid=settings.screen_query_shared_gid,
+        )
     configured_research_query = research_query_client
     configured_research_query_save = research_query_save_client
     if settings.research_query_socket_path is not None:
@@ -354,12 +376,22 @@ def create_app(
 
         configured_paper_portfolio = PaperPortfolioAdmissionClient(settings.paper_portfolio_socket_path, expected_service_uid=settings.paper_portfolio_service_uid, shared_gid=settings.paper_portfolio_shared_gid)
     configured_strategy_authoring = strategy_authoring_gateway
-    if configured_strategy_authoring is not None and not isinstance(configured_strategy_authoring, StrategyAuthoringGateway):
+    if configured_strategy_authoring is not None and not isinstance(
+        configured_strategy_authoring, StrategyAuthoringGateway
+    ):
         raise TypeError("strategy templates require a typed private gateway")
-    if configured_strategy_authoring is None and settings.strategy_authoring_enabled and settings.strategy_authoring_socket_path is not None:
+    if (
+        configured_strategy_authoring is None
+        and settings.strategy_authoring_enabled
+        and settings.strategy_authoring_socket_path is not None
+    ):
         from rquant.strategy_authoring_admission import StrategyAuthoringAdmissionClient
 
-        configured_strategy_authoring = StrategyAuthoringAdmissionClient(settings.strategy_authoring_socket_path, expected_service_uid=settings.strategy_authoring_service_uid, shared_gid=settings.strategy_authoring_shared_gid)
+        configured_strategy_authoring = StrategyAuthoringAdmissionClient(
+            settings.strategy_authoring_socket_path,
+            expected_service_uid=settings.strategy_authoring_service_uid,
+            shared_gid=settings.strategy_authoring_shared_gid,
+        )
     if configured_nl_parser is None and settings.nl_openai_api_key is not None:
         assert settings.nl_openai_model is not None
         configured_nl_parser = OpenAiScreenPlanParser(
@@ -382,6 +414,7 @@ def create_app(
             replica=screen_replica,
             history=screen_history,
             rsi=screen_rsi,
+            clock=clock,
         ),
         pool_commands=PoolCommandGateway(
             endpoint=settings.page_control_url,
@@ -423,6 +456,7 @@ def create_app(
             endpoint=settings.page_control_url,
             transport=lab_control_command_transport,
         ),
+        screen_query_client=configured_screen_query,
         research_query_client=configured_research_query,
         research_query_save_client=configured_research_query_save,
     )
@@ -440,7 +474,9 @@ def create_app(
             body_limit = factor_saves.MAX_SAVE_REQUEST_BYTES
         if body_limit is None and _FACTOR_RUN_WRITE.fullmatch(request.url.path):
             body_limit = factor_runs.MAX_RUN_REQUEST_BYTES
-        if body_limit is None and re.fullmatch(r"/api/v1/strategy-templates/template_[0-9a-f]{32}/runs(?:/resume)?", request.url.path):
+        if body_limit is None and re.fullmatch(
+            r"/api/v1/strategy-templates/template_[0-9a-f]{32}/runs(?:/resume)?", request.url.path
+        ):
             body_limit = strategy_authoring.MAX_RUN_REQUEST_BYTES
         if request.url.path in (
             "/api/v1/factors/tracking/commands",
@@ -482,6 +518,12 @@ def create_app(
         request: Request,
         error: RequestValidationError,
     ) -> Response:
+        if request.url.path.startswith("/api/v1/screen/query/"):
+            return JSONResponse(
+                status_code=422,
+                content={"detail": "选股请求有误，请检查后重试。"},
+                headers={"Cache-Control": "no-store"},
+            )
         if request.url.path.startswith("/api/v1/strategy-templates"):
             return JSONResponse(status_code=422, content={"detail": "策略内容有误，请检查后重试。"})
         if request.url.path.startswith("/api/v1/research/"):
@@ -542,6 +584,7 @@ def create_app(
     app.include_router(paper_portfolio.router, prefix="/api/v1", tags=["paper"], dependencies=private)
     app.include_router(monitor.router, prefix="/api/v1", tags=["monitor"], dependencies=private)
     app.include_router(manual_watchlist.router, prefix="/api/v1", tags=["watchlist"])
+    app.include_router(condition_alert_rules_routes.router, prefix="/api/v1", tags=["monitor"])
     app.include_router(price_alert_rules.router, prefix="/api/v1", tags=["monitor"])
     app.include_router(price_alert_runtime.router, prefix="/api/v1", tags=["monitor"])
     app.include_router(tasks.router, prefix="/api/v1", tags=["tasks"], dependencies=private)
@@ -561,7 +604,9 @@ def create_app(
         strategies.router, prefix="/api/v1", tags=["strategies"], dependencies=private
     )
     app.include_router(factors.router, prefix="/api/v1", tags=["factors"], dependencies=private)
-    app.include_router(strategy_authoring.router, prefix="/api/v1", tags=["strategies"], dependencies=private)
+    app.include_router(
+        strategy_authoring.router, prefix="/api/v1", tags=["strategies"], dependencies=private
+    )
     app.include_router(factor_runs.router, prefix="/api/v1", tags=["factors"], dependencies=private)
     app.include_router(
         factor_tracking.router, prefix="/api/v1", tags=["factors"], dependencies=private
@@ -575,6 +620,8 @@ def create_app(
     app.include_router(health.router, prefix="/api/v1", tags=["health"])
     app.include_router(panorama.router, prefix="/api/v1", tags=["panorama"])
     app.include_router(screen.router, prefix="/api/v1", tags=["screen"])
+    app.include_router(screen_history_routes.router, prefix="/api/v1", tags=["screen"])
+    app.include_router(screen_alert_draft_routes.router, prefix="/api/v1", tags=["screen"])
     app.include_router(
         formula_market_commands.router, prefix="/api/v1", tags=["screen"], dependencies=private
     )

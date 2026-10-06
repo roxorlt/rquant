@@ -1,4 +1,4 @@
-"""Fixed original source-byte compatibility for the first price runtime slice."""
+"""Original price bytes and explicit shared extensions remain frozen."""
 
 from hashlib import sha256
 from pathlib import Path
@@ -63,10 +63,44 @@ _FROZEN_SOURCES = {
     ),
 }
 
+# These three owned seams gained additive condition paths. Keep the original lock.
+_AUTHORIZED_CONDITION_EXTENSIONS = {
+    "src/rquant/price_alert_rule_store.py": (
+        "ed562820f524262337c2ed1382d076e6aa430b427ee530dff6a93af630382f9a",
+        "b2deaf089353c9df47a4f26e76ceef1d351b9854cefb0ccb9d376c44f846622b",
+    ),
+    "src/rquant/page_control.py": (
+        "03f3ffb55de69a116cbb5f78a2d1f22132ad11748d5488c5c074bf7fff3f8522",
+        "9ed5e7d15d33a13c57095c95c91939a96d6f1213e3938bf9c349e42652477ccb",
+    ),
+    "src/rquant/price_alert_admission.py": (
+        "cd72a6fbc2d90528ccf987ac6389d6800495e373e3325283c9f393b88bb3ed25",
+        "ce482684ed9fd841286c0be81061cab16cdf023c6adc28ab40199d5cc038f8d7",
+    ),
+}
+
+# Preserve the accepted extension lock before recording the exact repair of submit replay.
+_AUTHORIZED_M4_REPAIRS = {
+    "src/rquant/page_control.py": (
+        "9ed5e7d15d33a13c57095c95c91939a96d6f1213e3938bf9c349e42652477ccb",
+        "b0fbc62a7723efaecdca42d0d0fdf9956ddd7c65d29f8c87953234d38c5c2b4d",
+    ),
+}
+
 
 @pytest.mark.parametrize(("relative", "expected"), tuple(_FROZEN_SOURCES.items()))
-def test_original_configuration_and_strategy_contract_bytes_remain_frozen(
+def test_original_contracts_and_authorized_shared_extensions_remain_frozen(
     relative: str, expected: str
 ) -> None:
+    extension = _AUTHORIZED_CONDITION_EXTENSIONS.get(relative)
+    if extension is not None:
+        before, after = extension
+        assert before == expected
+        expected = after
+    repair = _AUTHORIZED_M4_REPAIRS.get(relative)
+    if repair is not None:
+        before, after = repair
+        assert before == expected
+        expected = after
     root = Path(__file__).resolve().parents[2]
     assert sha256((root / relative).read_bytes()).hexdigest() == expected

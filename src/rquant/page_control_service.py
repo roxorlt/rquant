@@ -50,9 +50,14 @@ from rquant.page_control import (
     PageControlService,
     parse_page_control_command,
 )
+from rquant.pool_result_receipt import DailyWriterCapability, PublishedDailyScreenEvidence
 from rquant.research_manifest import detect_verified_code_commit
 from rquant.runtime_shadow_validation import _ed25519_signing_payload
+from rquant.screen.query_contracts import ScreenQueryDefinition
+from rquant.screen.query_history import ScreenQueryHistory, prepare_private_screen_outbox
 from rquant.strict_json import canonical_json_bytes
+from rquant.web.condition_alert_commands import ConditionRuleScopeResolver, condition_scope_resolver
+from rquant.web.models.screen import ScreenRunData
 
 if TYPE_CHECKING:
     from rquant.config import Settings
@@ -150,6 +155,11 @@ def build_page_control_service(
     factor_definition_backend: FactorDefinitionPageControlBackend | None = None,
     strategy_authoring_backend: StrategyAuthoringPageControlBackend | None = None,
     paper_portfolio_backend: PaperPortfolioPageControlBackend | None = None,
+    screen_query_executor: Callable[[ScreenQueryDefinition], ScreenRunData] | None = None,
+    screen_query_cursor_key: bytes | None = None,
+    condition_rule_scope: ConditionRuleScopeResolver | None = None,
+    daily_writer_capability: Callable[[], DailyWriterCapability | None] | None = None,
+    daily_run_evidence: Callable[[], tuple[PublishedDailyScreenEvidence, ...]] | None = None,
     load_default_lab_backend: bool = True,
     clock: Callable[[], datetime] | None = None,
     lease_seconds: int = 30,
@@ -172,6 +182,11 @@ def build_page_control_service(
         factor_definition_backend=factor_definition_backend,
         strategy_authoring_backend=strategy_authoring_backend,
         paper_portfolio_backend=paper_portfolio_backend,
+        screen_query_executor=screen_query_executor,
+        screen_query_cursor_key=screen_query_cursor_key,
+        condition_rule_scope=condition_rule_scope,
+        daily_writer_capability=daily_writer_capability,
+        daily_run_evidence=daily_run_evidence,
         load_default_lab_backend=load_default_lab_backend,
         clock=clock,
         lease_seconds=lease_seconds,
@@ -197,6 +212,11 @@ def build_page_control_service_with_dependencies(
     factor_definition_backend: FactorDefinitionPageControlBackend | None = None,
     strategy_authoring_backend: StrategyAuthoringPageControlBackend | None = None,
     paper_portfolio_backend: PaperPortfolioPageControlBackend | None = None,
+    screen_query_executor: Callable[[ScreenQueryDefinition], ScreenRunData] | None = None,
+    screen_query_cursor_key: bytes | None = None,
+    condition_rule_scope: ConditionRuleScopeResolver | None = None,
+    daily_writer_capability: Callable[[], DailyWriterCapability | None] | None = None,
+    daily_run_evidence: Callable[[], tuple[PublishedDailyScreenEvidence, ...]] | None = None,
     load_default_lab_backend: bool = True,
     clock: Callable[[], datetime] | None = None,
     lease_seconds: int = 30,
@@ -216,14 +236,21 @@ def build_page_control_service_with_dependencies(
         ) or (_settings().lab_runtime_dir_resolved / "exports",)
     else:
         allowed_roots = allowed_lab_export_roots
-    outbox = PageControlOutbox(
-        Path(
-            outbox_path
-            or os.environ.get(
-                "RQUANT_PAGE_CONTROL_OUTBOX",
-                _settings().data_dir / "page-control.sqlite3",
-            )
+    if (screen_query_executor is None) != (screen_query_cursor_key is None):
+        raise ValueError("private screening requires explicit executor and shared cursor material")
+    path = Path(
+        outbox_path
+        or os.environ.get(
+            "RQUANT_PAGE_CONTROL_OUTBOX", _settings().data_dir / "page-control.sqlite3"
         )
+    )
+    if screen_query_cursor_key is not None:
+        prepare_private_screen_outbox(path)
+    outbox = PageControlOutbox(path)
+    screen_history = (
+        None
+        if screen_query_cursor_key is None
+        else ScreenQueryHistory(outbox, cursor_key=screen_query_cursor_key)
     )
     return PageControlService(
         outbox=outbox,
@@ -245,6 +272,11 @@ def build_page_control_service_with_dependencies(
             factor_definition_backend=factor_definition_backend,
             strategy_authoring_backend=strategy_authoring_backend,
             paper_portfolio_backend=paper_portfolio_backend,
+            screen_query_history=screen_history,
+            screen_query_executor=screen_query_executor,
+            condition_rule_scope=condition_rule_scope,
+            daily_writer_capability=daily_writer_capability,
+            daily_run_evidence=daily_run_evidence,
             clock=clock,
             lease_seconds=lease_seconds,
             consumer_id=consumer_instance_id,
@@ -356,6 +388,21 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="shared private socket GID for price rule admission",
     )
+    parser.add_argument(
+        "--condition-rule-serving-root",
+        type=Path,
+        help="explicit original Serving source for full-condition scope; absent disables enable",
+    )
+    parser.add_argument(
+        "--condition-rule-activate",
+        action="store_true",
+        help="explicitly install the additive owned condition rule schema",
+    )
+    parser.add_argument(
+        "--screen-query-config",
+        type=Path,
+        help="explicit owner-private screening config; absent means disabled",
+    )
     parser.add_argument("--factor-archive-socket", type=Path)
     parser.add_argument("--factor-archive-registry", type=Path)
     parser.add_argument("--factor-archive-web-uid", type=int)
@@ -383,11 +430,21 @@ def main(
     factor_archive_editors: str | None = None,
     factor_save_enabled: bool = False,
     formula_market_config_path: Path | None = None,
+    condition_rule_serving_root: Path | None = None,
+    condition_rule_activate: bool = False,
+    screen_query_config_path: Path | None = None,
 ) -> None:
     """Entry point. `argv` is what the runtime wrapper derived; keywords are for tests."""
 
     if argv is not None:
         arguments = build_parser().parse_args(list(argv))
+        if screen_query_config_path is not None and arguments.screen_query_config is not None:
+            raise ValueError("screen private config was supplied twice")
+        screen_query_config_path = screen_query_config_path or arguments.screen_query_config
+        condition_rule_serving_root = (
+            condition_rule_serving_root or arguments.condition_rule_serving_root
+        )
+        condition_rule_activate = condition_rule_activate or arguments.condition_rule_activate
         expected_commit = expected_commit or arguments.expected_commit
         if formula_market_config_path is not None and arguments.formula_market_config is not None:
             raise ValueError("formula market config was supplied twice")
@@ -442,6 +499,9 @@ def main(
         factor_archive_editors=factor_archive_editors,
         factor_save_enabled=factor_save_enabled,
         formula_market_config_path=formula_market_config_path,
+        condition_rule_serving_root=condition_rule_serving_root,
+        condition_rule_activate=condition_rule_activate,
+        screen_query_config_path=screen_query_config_path,
     )
 
 
@@ -462,6 +522,9 @@ def _serve(
     factor_archive_editors: str | None = None,
     factor_save_enabled: bool = False,
     formula_market_config_path: Path | None = None,
+    condition_rule_serving_root: Path | None = None,
+    condition_rule_activate: bool = False,
+    screen_query_config_path: Path | None = None,
 ) -> None:
     from rquant.runtime_deployment_profile import (
         LINUX_PRODUCTION_RUNTIME_ROOT,
@@ -583,6 +646,27 @@ def _serve(
             FactorDefinitionRegistry(factor_archive_registry_path)
         )
         factor_backend.identity()
+    screen_config = None
+    screen_executor = None
+    if screen_query_config_path is not None:
+        from rquant.screen.query_admission import (
+            ScreenQueryExecutor,
+            load_screen_query_private_config,
+        )
+
+        screen_config = load_screen_query_private_config(screen_query_config_path)
+        others = (
+            ack_socket_path,
+            watchlist_socket_path,
+            price_rule_socket_path,
+            factor_archive_socket_path,
+        )
+        if any(
+            other is not None and screen_config.socket_path.parent == other.parent
+            for other in others
+        ):
+            raise ValueError("screen private endpoint requires a separate directory")
+        screen_executor = ScreenQueryExecutor(screen_config)
     service = build_page_control_service(
         outbox_path=page_profile.outbox_path,
         data_dir=page_profile.data_dir,
@@ -590,6 +674,15 @@ def _serve(
         allowed_lab_export_roots=(page_profile.data_dir / "exports",),
         formula_market_backend=formula_market_backend,
         formula_pool_backend=formula_pool_backend,
+        condition_rule_scope=None
+        if condition_rule_serving_root is None
+        else condition_scope_resolver(condition_rule_serving_root),
+        screen_query_executor=screen_executor,
+        daily_writer_capability=None
+        if screen_executor is None
+        else screen_executor.daily_writer_capability,
+        daily_run_evidence=None if screen_executor is None else screen_executor.daily_run_evidence,
+        screen_query_cursor_key=None if screen_executor is None else screen_executor.cursor_key,
         factor_definition_backend=factor_backend,
         load_default_lab_backend=False,
         consumer_service_id=canvas_profile.consumer_service_id,
@@ -600,6 +693,14 @@ def _serve(
         ),
         canvas_publication_keyring=keyring,
     )
+    if condition_rule_activate:
+        if condition_rule_serving_root is None or price_rule_socket_path is None:
+            raise ValueError(
+                "condition installation requires the existing private peer and Serving source"
+            )
+        from datetime import UTC
+
+        service.outbox.activate_condition_alert_rules(datetime.now(UTC))
     if (ack_socket_path is None) != (ack_serving_root is None):
         raise ValueError("ack socket and Serving root must be configured together")
     ack_server = None
@@ -663,10 +764,23 @@ def _serve(
             )
         except Exception:
             logger.exception("Factor archive admission listener disabled during startup")
+    screen_server = None
     server_class = _server_class_for_host(host)
     try:
+        if screen_config is not None:
+            from rquant.screen.query_admission import ScreenQueryPrivateServer
+
+            screen_server = ScreenQueryPrivateServer(
+                screen_config.socket_path,
+                allowed_users=screen_config.allowed_users,
+                trusted_web_uid=screen_config.trusted_web_uid,
+                shared_gid=screen_config.shared_gid,
+                control=service,
+            )
         server = server_class((host, port), handler_for(service))
     except Exception:
+        if screen_server is not None:
+            screen_server.server_close()
         if ack_server is not None:
             ack_server.server_close()
         if watchlist_server is not None:
@@ -676,6 +790,8 @@ def _serve(
         if factor_archive_server is not None:
             factor_archive_server.server_close()
         raise
+    screen_thread = None
+    screen_started = False
     ack_thread = None
     ack_started = False
     watchlist_thread = None
@@ -685,6 +801,10 @@ def _serve(
     factor_archive_thread = None
     factor_archive_started = False
     try:
+        if screen_server is not None:
+            screen_thread = threading.Thread(target=screen_server.serve_forever, daemon=False)
+            screen_thread.start()
+            screen_started = True
         if ack_server is not None:
             ack_thread = threading.Thread(target=ack_server.serve_forever, daemon=True)
             ack_thread.start()
@@ -708,6 +828,11 @@ def _serve(
         server.serve_forever()
     finally:
         server.server_close()
+        if screen_server is not None:
+            if screen_started and screen_thread is not None:
+                screen_server.shutdown()
+                screen_thread.join()
+            screen_server.server_close()
         if ack_server is not None:
             if ack_started and ack_thread is not None:
                 ack_server.shutdown()

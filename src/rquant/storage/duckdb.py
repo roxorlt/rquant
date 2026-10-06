@@ -33,6 +33,9 @@ from rquant.data_metadata import (
 from rquant.pool_result_receipt import (
     ScreenRunReceipt,
     ScreenRunReceiptDraft,
+    ScreenRunEvidence,
+    ScreenRunEvidenceDraft,
+    persisted_result_digests,
     member_price_digest,
     member_set_digest,
 )
@@ -2578,6 +2581,7 @@ class DuckDBStore:
         receipt: ScreenRunReceipt | ScreenRunReceiptDraft,
         *,
         manage_transaction: bool = True,
+        evidence: ScreenRunEvidenceDraft | None = None,
     ) -> int:
         """Commit the exact member set and its proof together, including zero rows."""
         if isinstance(receipt, ScreenRunReceiptDraft):
@@ -2626,6 +2630,24 @@ class DuckDBStore:
             else:
                 sealed = receipt
             self._upsert_screen_run_receipt(sealed)
+            self._conn.execute("DELETE FROM screen_run_evidence WHERE trade_date=? AND preset_name=?", [trade_date, preset_name])
+            if evidence is not None:
+                if (evidence.input.trade_date != sealed.trade_date
+                        or evidence.definition_version != sealed.definition_version
+                        or (evidence.input.unknown_count and sealed.lineage_complete)):
+                    raise ValueError("daily input evidence differs from result receipt")
+                persisted_extra = self._conn.execute(
+                    "SELECT ts_code,extra FROM screen_result WHERE trade_date=? AND preset_name=? ORDER BY ts_code",
+                    [trade_date, preset_name],
+                ).fetchall()
+                extra_digest, rank_digest = persisted_result_digests(persisted_extra, ranked=evidence.ranking_plan_digest is not None)
+                proof = ScreenRunEvidence(
+                    **evidence.model_dump(mode="python"), preset_name=preset_name,
+                    result_version=sealed.result_version, hit_count=sealed.hit_count,
+                    persisted_extra_digest=extra_digest, member_rank_digest=rank_digest,
+                    completed_at=sealed.completed_at,
+                )
+                self._upsert_screen_run_evidence(proof)
             if started:
                 self._conn.execute("COMMIT")
                 started = False
@@ -2634,6 +2656,27 @@ class DuckDBStore:
                 self._conn.execute("ROLLBACK")
             raise
         return len(codes)
+
+    def _upsert_screen_run_evidence(self, proof: ScreenRunEvidence) -> None:
+        self._conn.execute("INSERT INTO screen_run_evidence VALUES (?,?,?,?,?)", [proof.input.trade_date,proof.preset_name,proof.result_version,proof.evidence_version,proof.model_dump_json()])
+
+    def query_screen_run_evidence(self, trade_date: str, preset_name: str) -> ScreenRunEvidence | None:
+        row = self._conn.execute("SELECT result_version,evidence_version,payload_json FROM screen_run_evidence WHERE trade_date=? AND preset_name=?", [trade_date,preset_name]).fetchone()
+        if row is None:
+            return None
+        proof = ScreenRunEvidence.model_validate_json(row[2])
+        receipt = self.query_screen_run_receipt(trade_date, preset_name)
+        actual = self._conn.execute("SELECT ts_code,extra FROM screen_result WHERE trade_date=? AND preset_name=? ORDER BY ts_code", [trade_date,preset_name]).fetchall()
+        digests = persisted_result_digests(actual, ranked=proof.ranking_plan_digest is not None)
+        if (receipt is None or (row[0],row[1]) != (proof.result_version,proof.evidence_version)
+                or proof.input.trade_date.isoformat() != trade_date or proof.preset_name != preset_name
+                or receipt.result_version != proof.result_version or receipt.hit_count != proof.hit_count
+                or receipt.definition_version != proof.definition_version
+                or receipt.completed_at != proof.completed_at
+                or len(actual) != proof.hit_count
+                or digests != (proof.persisted_extra_digest,proof.member_rank_digest)):
+            raise ValueError("persisted screen evidence differs from actual result")
+        return proof
 
     def _upsert_screen_run_receipt(self, receipt: ScreenRunReceipt) -> None:
         self._conn.execute(

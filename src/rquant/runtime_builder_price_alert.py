@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 
 from pydantic import Field, ValidationError, field_validator
 
+from rquant.condition_alert_runtime_contracts import ConditionAlertActivationSettings
 from rquant.live_contracts import CurrentPointer, LiveChannel
 from rquant.live_spool import LiveBatchSpool, _secure_read_regular_file
 from rquant.price_alert_runtime import evaluate_price_alert_round
@@ -29,6 +30,10 @@ from rquant.price_alert_runtime_source import (
     read_price_alert_scope,
 )
 from rquant.price_alert_runtime_store import PriceAlertRuntimeStore
+from rquant.runtime_builder_condition_alert import (
+    ConditionEvaluationSettings,
+    build_borrowed_condition_step,
+)
 from rquant.runtime_contracts import RuntimeContractModel, normalize_aware_utc
 from rquant.runtime_market_session import load_market_calendar_authority
 from rquant.runtime_service_control import RuntimeServicePlane, RuntimeStepResult
@@ -107,6 +112,9 @@ def verify_price_role_manifest(
 
 
 class PriceAlertRuntimeSettings(RuntimeContractModel):
+    condition_alert_runtime: ConditionAlertActivationSettings | None = None
+    condition_alert_runtime_manifest_path: Path | None = None
+    condition_alert: ConditionEvaluationSettings | None = None
     price_alert_runtime: PriceAlertActivationSettings
     price_alert_runtime_manifest_path: Path
     ledger_path: Path
@@ -296,6 +304,55 @@ def price_alert_runtime_builder(
                     degraded_reasons=degraded,
                 )
 
+        if settings.condition_alert is not None:
+            if (
+                settings.condition_alert_runtime is None
+                or settings.condition_alert_runtime_manifest_path is None
+            ):
+                store.close()
+                raise ValueError("condition composition requires its full actual manifest")
+            try:
+                condition_step = build_borrowed_condition_step(
+                    manifest,
+                    settings.condition_alert,
+                    store,
+                    runtime_root=runtime_root,
+                    clock=clock,
+                )
+            except BaseException:
+                store.close()
+                raise
+            original_step = step
+
+            def combined_step() -> RuntimeStepResult:
+                result = original_step()
+                if "price_alert:waiting_cadence" in result.degraded_reasons:
+                    return result
+                try:
+                    condition_step()
+                except Exception:
+                    return result.model_copy(
+                        update={
+                            "degraded_reasons": tuple(
+                                sorted(
+                                    set(
+                                        result.degraded_reasons
+                                        + ("condition_alert:evaluation_unavailable",)
+                                    )
+                                )
+                            )
+                        }
+                    )
+                return result
+
+            combined_step.condition_store = condition_step.condition_store
+            step = combined_step
+        elif (
+            settings.condition_alert_runtime is not None
+            or settings.condition_alert_runtime_manifest_path is not None
+        ):
+            store.close()
+            raise ValueError("partial condition composition is unavailable")
         step.store = store
         step.close = store.close
         return step

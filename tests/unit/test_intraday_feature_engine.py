@@ -115,6 +115,46 @@ def _compute(
     )
 
 
+def test_v4_price_speed_and_volume_ratio_use_original_visible_minutes() -> None:
+    legacy = _compute()
+    assert legacy.envelope.content_hash == "9cbbce2d773ac482a3295d6e0d8e6d47e13771e02f326b35fa77bfdccfc4e202"
+    config = IntradayFeatureConfig(producer_commit=PRODUCER_COMMIT,lookback_sessions=2,
+        contract_version=4,schema_version=3)
+    result = _compute(config=config)
+    row = result.frame.iloc[0]
+    assert row["speed_5m_pct"] == pytest.approx(100 * (14 / 11 - 1))
+    historical = _historical_minutes()
+    baseline = historical.groupby(historical.trade_time.dt.date).vol.sum().median()
+    assert row["cumulative_volume_ratio"] == pytest.approx(1100 / baseline)
+    assert "speed_5m_pct" not in legacy.frame.columns
+    replay = replay_compute(_current_minutes(),historical,
+        decision_time=datetime(2026,7,31,9,40,2,tzinfo=SHANGHAI),
+        input_available_at=datetime(2026,7,31,9,40,2,tzinfo=SHANGHAI),
+        input_batch_ids=("history-0002","current-0007"),sequence=7,config=config)
+    assert replay.payload_bytes == result.payload_bytes and replay.envelope == result.envelope
+
+
+@pytest.mark.parametrize("kind", ["missing_minute","opening","lunch"])
+def test_v4_price_speed_rejects_incomplete_or_cross_session_minutes(kind: str) -> None:
+    current = _current_minutes()
+    if kind == "missing_minute":
+        current = current.drop(index=7)
+    elif kind == "opening":
+        current = current.iloc[:5]
+    else:
+        current = current.iloc[-6:].copy()
+        current["trade_time"] = [datetime(2026,7,31,11,28),datetime(2026,7,31,11,29),
+            datetime(2026,7,31,11,30),datetime(2026,7,31,13,0),datetime(2026,7,31,13,1),datetime(2026,7,31,13,2)]
+        current["available_at"] = [value.replace(tzinfo=SHANGHAI)+timedelta(seconds=2) for value in current.trade_time]
+    decision = current.iloc[-1].trade_time.replace(tzinfo=SHANGHAI)+timedelta(seconds=2)
+    result = _compute(current=current,decision_time=decision,
+        config=IntradayFeatureConfig(producer_commit=PRODUCER_COMMIT,contract_version=4,schema_version=3))
+    assert pd.isna(result.frame.iloc[0]["speed_5m_pct"])
+    status = result.envelope.field_status("speed_5m_pct",candidate_id="600000.SH")
+    assert status.status is FeatureAvailability.UNAVAILABLE
+    assert status.reason in {"non_contiguous_minutes","insufficient_prior_minutes","session_break"}
+
+
 def test_computes_only_closed_pit_bars_and_explicit_tick_rule_proxies() -> None:
     result = _compute()
     row = result.frame.iloc[0]

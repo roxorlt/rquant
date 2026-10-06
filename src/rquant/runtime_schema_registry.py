@@ -711,7 +711,7 @@ _CHANNEL_SPECS = (
         "runtime.intraday_feature.batch-envelope",
         FeatureBatchEnvelope,
         (RuntimeServiceKind.FEATURE_LIVE,),
-        (RuntimeServiceKind.STRATEGY_LIVE,),
+        (RuntimeServiceKind.STRATEGY_LIVE, RuntimeServiceKind.NOTIFIER),
     ),
     _ChannelSpec(
         "runtime.strategy_candidate.snapshot",

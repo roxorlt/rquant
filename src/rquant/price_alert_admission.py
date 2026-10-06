@@ -20,23 +20,35 @@ from pydantic import TypeAdapter
 
 from rquant.manual_watchlist import OwnerId
 from rquant.page_control import (
+    DeleteAlertRule,
     DeletePriceAlertRule,
     PageControlCommandConflictError,
     PageControlReceipt,
     PageControlService,
     PageControlStatus,
+    SaveAlertRule,
     SavePriceAlertRule,
+    SetAlertRuleEnabled,
     SetPriceAlertRuleEnabled,
 )
 from rquant.strict_json import strict_json_loads
 
 _MAX_COMMAND_BYTES = 8 * 1024
+_MAX_CONDITION_COMMAND_BYTES = 80 * 1024
 _MAX_RESPONSE_BYTES = 16 * 1024
 _ROUTE = "/v1/price-alert-admission"
 _LOOKUP_ROUTE = f"{_ROUTE}/lookup"
 _RESUME_ROUTE = f"{_ROUTE}/resume"
 _OWNER_ADAPTER = TypeAdapter(OwnerId)
-PriceRuleCommand = SavePriceAlertRule | SetPriceAlertRuleEnabled | DeletePriceAlertRule
+PriceRuleCommand = (
+    SavePriceAlertRule
+    | SetPriceAlertRuleEnabled
+    | DeletePriceAlertRule
+    | SaveAlertRule
+    | SetAlertRuleEnabled
+    | DeleteAlertRule
+)
+_CONDITION_TYPES = (SaveAlertRule, SetAlertRuleEnabled, DeleteAlertRule)
 
 
 class PriceAlertAdmissionUnavailableError(RuntimeError):
@@ -58,6 +70,10 @@ class PriceAlertAdmission:
         self, command: PriceRuleCommand, *, authenticated_owner_id: str
     ) -> PageControlReceipt:
         with self._lock:
+            if type(command) in _CONDITION_TYPES:
+                return self.service._submit_trusted_condition_rule(
+                    command, authenticated_owner_id=authenticated_owner_id
+                )
             return self.service._submit_trusted_price_rule(
                 command, authenticated_owner_id=authenticated_owner_id
             )
@@ -66,6 +82,10 @@ class PriceAlertAdmission:
         self, command: PriceRuleCommand, *, authenticated_owner_id: str
     ) -> PageControlReceipt | None:
         with self._lock:
+            if type(command) in _CONDITION_TYPES:
+                return self.service._lookup_trusted_condition_rule(
+                    command, authenticated_owner_id=authenticated_owner_id
+                )
             return self.service._lookup_trusted_price_rule(
                 command, authenticated_owner_id=authenticated_owner_id
             )
@@ -74,6 +94,10 @@ class PriceAlertAdmission:
         self, command: PriceRuleCommand, *, authenticated_owner_id: str
     ) -> PageControlReceipt:
         with self._lock:
+            if type(command) in _CONDITION_TYPES:
+                return self.service._resume_trusted_condition_rule(
+                    command, authenticated_owner_id=authenticated_owner_id
+                )
             return self.service._resume_trusted_price_rule(
                 command, authenticated_owner_id=authenticated_owner_id
             )
@@ -225,8 +249,18 @@ def _decode_request(body: bytes) -> tuple[PriceRuleCommand, str]:
         command = SetPriceAlertRuleEnabled.model_validate(raw)
     elif kind == "delete_price_alert_rule":
         command = DeletePriceAlertRule.model_validate(raw)
+    elif kind == "save_alert_rule":
+        command = SaveAlertRule.model_validate(raw)
+    elif kind == "set_alert_rule_enabled":
+        command = SetAlertRuleEnabled.model_validate(raw)
+    elif kind == "delete_alert_rule":
+        command = DeleteAlertRule.model_validate(raw)
     else:
         raise ValueError("unsupported price rule command")
+    if len(body) > (
+        _MAX_CONDITION_COMMAND_BYTES if type(command) in _CONDITION_TYPES else _MAX_COMMAND_BYTES
+    ):
+        raise ValueError("private rule request exceeds its kind budget")
     return command, owner
 
 
@@ -252,7 +286,7 @@ def _handler_for_admission() -> type[BaseHTTPRequestHandler]:
                 ):
                     raise ValueError("invalid price admission framing")
                 size = int(lengths[0])
-                if not 1 <= size <= _MAX_COMMAND_BYTES:
+                if not 1 <= size <= _MAX_CONDITION_COMMAND_BYTES:
                     raise ValueError("invalid price admission body size")
                 body = self.rfile.read(size)
                 if len(body) != size:
@@ -459,6 +493,9 @@ class PriceAlertAdmissionClient:
             SavePriceAlertRule,
             SetPriceAlertRuleEnabled,
             DeletePriceAlertRule,
+            SaveAlertRule,
+            SetAlertRuleEnabled,
+            DeleteAlertRule,
         ):
             raise TypeError("price admission requires an ownerless price rule command")
         if not isinstance(authenticated_owner_id, str):
@@ -470,7 +507,11 @@ class PriceAlertAdmissionClient:
             allow_nan=False,
             separators=(",", ":"),
         ).encode("utf-8")
-        if len(body) > _MAX_COMMAND_BYTES:
+        if len(body) > (
+            _MAX_CONDITION_COMMAND_BYTES
+            if type(command) in _CONDITION_TYPES
+            else _MAX_COMMAND_BYTES
+        ):
             raise ValueError("price admission request exceeds bound")
         connection = _UnixHTTPConnection(
             self.socket_path,

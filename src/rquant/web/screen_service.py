@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import date, datetime, time
+from datetime import UTC, date, datetime, time
+from typing import Literal
 from zoneinfo import ZoneInfo
 
+import duckdb
 import pandas as pd
 from pydantic import ValidationError
 
 from rquant.llm.compile import compile_screen_plan
 from rquant.llm.schemas import RuleCall, ScreenPlan, Stage
-from rquant.screen.core import _collect_aggregates
+from rquant.screen.core import _collect_aggregates, rule_state
 from rquant.screen.dynamic_rsi import (
     DynamicRsiProjectionUnavailableError,
     VerifiedDynamicRsiProjection,
@@ -25,7 +28,8 @@ from rquant.screen.formula_history_projection import (
     VerifiedFormulaHistoryProjection,
 )
 from rquant.screen.loader import FUNDAMENTAL_COLS_MAP
-from rquant.screen.ranking import RETURN_20D_COLUMN, RankingCondition
+from rquant.screen.query_contracts import ScreenQueryDefinition
+from rquant.screen.ranking import RETURN_20D_COLUMN, RankingCondition, rank_screen_results
 from rquant.screen.replica_source import (
     ScreenReplicaBudgetError,
     ScreenReplicaChangedError,
@@ -42,14 +46,18 @@ from rquant.screen.tdx.evaluate import (
 )
 from rquant.serving_read_models import (
     PAGE_PROJECTION_CONTRACTS,
+    NlScreenPage,
     NlScreenPageError,
     NlScreenProjectionFeatureError,
+    nl_screen_query_digest,
     paginate_nl_screen_projection,
     paginate_ranked_nl_screen_projection,
+    screen_nl_projection,
 )
 from rquant.web import readers
 from rquant.web.models.screen import (
     ScreenCatalogData,
+    ScreenCondition,
     ScreenRow,
     ScreenRunData,
     ScreenRunRequest,
@@ -67,9 +75,9 @@ from rquant.web.screen_catalog import (
 )
 from rquant.web.serving import BorrowedGeneration
 
-_REPLICA_RANK_COLUMNS = frozenset({
-    "TURNOVER_RATE[0]", "CIRC_MV[0]", "PCT_CHG[0]", RETURN_20D_COLUMN
-})
+_REPLICA_RANK_COLUMNS = frozenset(
+    {"TURNOVER_RATE[0]", "CIRC_MV[0]", "PCT_CHG[0]", RETURN_20D_COLUMN}
+)
 _FUNDAMENTAL_COLUMNS = frozenset(f"{name}[0]" for name in FUNDAMENTAL_COLS_MAP.values())
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 _PREVIEW_UNKNOWN = {
@@ -111,36 +119,7 @@ def _number(value: object) -> float | None:
     return None if value is None or bool(pd.isna(value)) else float(value)
 
 
-def _known_rule(rule: Rule, dependencies: tuple[str, ...]) -> Rule:
-    def apply(frame: pd.DataFrame) -> pd.Series:
-        present = frame.loc[:, dependencies].notna().all(axis=1)
-        return rule(frame).astype("boolean").fillna(False) & present
-
-    return apply
-
-
-def _replica_rule_state(
-    universe: pd.DataFrame,
-    rules: list[Rule],
-) -> tuple[list[Rule], list[int]]:
-    confirmed = pd.Series(True, index=universe.index, dtype="boolean")
-    possible = confirmed.copy()
-    safe_rules: list[Rule] = []
-    unknown_counts: list[int] = []
-    for rule in rules:
-        dependencies = tuple(
-            sorted(
-                required_rule_columns([rule])
-                | {request.name for request in _collect_aggregates([rule])}
-            )
-        )
-        present = universe.loc[:, dependencies].notna().all(axis=1)
-        passed = rule(universe).astype("boolean").fillna(False) & present
-        confirmed &= passed
-        possible &= passed | ~present
-        unknown_counts.append(int((possible & ~confirmed).sum()))
-        safe_rules.append(_known_rule(rule, dependencies))
-    return safe_rules, unknown_counts
+_replica_rule_state = rule_state
 
 
 class ScreenApplicationService:
@@ -151,11 +130,13 @@ class ScreenApplicationService:
         replica: VerifiedReplicaScreenSource | None = None,
         history: VerifiedFormulaHistoryProjection | None = None,
         rsi: VerifiedDynamicRsiProjection | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.cursor_key = cursor_key
         self.replica = replica
         self.history = history
         self.rsi = rsi
+        self.clock = clock or (lambda: datetime.now(UTC))
 
     def _rsi_ready(self, source_identity: str, dates: list[date]) -> bool:
         if self.rsi is None:
@@ -247,7 +228,42 @@ class ScreenApplicationService:
             source_updated_at=snapshot.updated_at,
         )
 
-    def catalog(self, borrowed: BorrowedGeneration | None) -> ScreenCatalogData:
+    def catalog(
+        self, borrowed: BorrowedGeneration | None, *, mode: Literal["daily", "intraday"] = "daily"
+    ) -> ScreenCatalogData:
+        if mode == "intraday":
+            from rquant.web.screen_intraday import intraday_screen_context
+
+            try:
+                context = intraday_screen_context(
+                    borrowed, now=self.clock(), replica=self.replica, rsi=self.rsi
+                )
+            except (ValueError, RuntimeError, duckdb.Error):
+                return ScreenCatalogData(
+                    source_kind="intraday",
+                    blocks=screen_blocks(daily_anchor=True),
+                    dates=[],
+                    available=False,
+                    ranking_metrics=[],
+                    source=None,
+                )
+            return ScreenCatalogData(
+                source_kind="intraday",
+                blocks=screen_blocks(
+                    dynamic_ma=context.dynamic_ma,
+                    dynamic_rsi=context.dynamic_rsi,
+                    fundamental_fields=context.fundamental_fields,
+                    extra_fields=context.extra_fields,
+                    daily_anchor=True,
+                ),
+                dates=[context.snapshot.source.trade_date],
+                available=bool(context.extra_fields),
+                ranking_metrics=available_ranking_metrics(
+                    tuple(name for name, _ in context.extra_fields)
+                    + (tuple(_REPLICA_RANK_COLUMNS) if context.daily_source_identity else ())
+                ),
+                source=context.source,
+            )
         if self.replica is not None:
             try:
                 snapshot = self.replica.available_dates()
@@ -330,6 +346,50 @@ class ScreenApplicationService:
             source=source,
         )
 
+    def run_complete(
+        self,
+        definition: ScreenQueryDefinition,
+        *,
+        borrowed: BorrowedGeneration | None,
+        serving_unavailable: bool,
+    ) -> ScreenRunData:
+        if definition.mode == "intraday":
+            # The source descriptor is read again; the request never supplies source facts.
+            from rquant.web.screen_intraday import intraday_screen_context
+
+            try:
+                context = intraday_screen_context(
+                    borrowed, now=self.clock(), replica=self.replica, rsi=self.rsi
+                )
+            except (ValueError, RuntimeError, duckdb.Error) as error:
+                raise ScreenApplicationError(503, "盘中数据暂不可用，请稍后重试。") from error
+            body = ScreenRunRequest(
+                trade_date=definition.trade_date,
+                conditions=[
+                    ScreenCondition(key=c.name, args=c.args) for c in definition.conditions
+                ],
+                source_identity=definition.source_identity,
+                ranking=definition.ranking,
+                mode="intraday",
+                decision_cutoff=definition.cutoff,
+                intraday_source_identity=context.snapshot.source.source_identity,
+            )
+            return self._evaluate(
+                body, borrowed=borrowed, serving_unavailable=serving_unavailable, complete=True
+            )
+        actual_kind = "replica" if self.replica is not None else "serving"
+        if definition.source_kind != actual_kind:
+            raise ScreenApplicationError(409, "选股数据已更新，请重新运行。")
+        body = ScreenRunRequest(
+            trade_date=definition.trade_date,
+            conditions=[ScreenCondition(key=c.name, args=c.args) for c in definition.conditions],
+            source_identity=definition.source_identity,
+            ranking=definition.ranking,
+        )
+        return self._evaluate(
+            body, borrowed=borrowed, serving_unavailable=serving_unavailable, complete=True
+        )
+
     def run(
         self,
         body: ScreenRunRequest,
@@ -337,6 +397,22 @@ class ScreenApplicationService:
         borrowed: BorrowedGeneration | None,
         serving_unavailable: bool,
     ) -> ScreenRunData:
+        return self._evaluate(
+            body, borrowed=borrowed, serving_unavailable=serving_unavailable, complete=False
+        )
+
+    def _evaluate(
+        self,
+        body: ScreenRunRequest,
+        *,
+        borrowed: BorrowedGeneration | None,
+        serving_unavailable: bool,
+        complete: bool,
+    ) -> ScreenRunData:
+        if body.mode == "intraday":
+            return self._evaluate_intraday(
+                body, borrowed=borrowed, serving_unavailable=serving_unavailable, complete=complete
+            )
         if (
             self.replica is None
             and body.source_identity is not None
@@ -515,6 +591,131 @@ class ScreenApplicationService:
                 updated_at=borrowed.manifest.built_at,
             )
 
+        return self._page_result(
+            body,
+            universe=universe,
+            page_rules=page_rules,
+            unknown_counts=unknown_counts,
+            source=source,
+            rule_labels=rule_labels,
+            normalized_plan=compiled.normalized_plan,
+            complete=complete,
+        )
+
+    def _evaluate_intraday(
+        self,
+        body: ScreenRunRequest,
+        *,
+        borrowed: BorrowedGeneration | None,
+        serving_unavailable: bool,
+        complete: bool,
+    ) -> ScreenRunData:
+        from rquant.web.screen_intraday import (
+            intraday_screen_context,
+            prepare_intraday_screen_frame,
+        )
+
+        if serving_unavailable or borrowed is None:
+            raise ScreenApplicationError(503, "盘中数据暂不可用，请稍后重试。")
+        try:
+            context = intraday_screen_context(
+                borrowed, now=self.clock(), replica=self.replica, rsi=self.rsi
+            )
+        except (ValueError, RuntimeError, duckdb.Error) as error:
+            raise ScreenApplicationError(503, "盘中数据暂不可用，请稍后重试。") from error
+        actual = context.snapshot.source
+        if (
+            body.trade_date != actual.trade_date
+            or body.source_identity != context.source.identity
+            or body.decision_cutoff != actual.cutoff
+            or body.intraday_source_identity != actual.source_identity
+        ):
+            raise ScreenApplicationError(409, "盘中数据已更新，请保留条件重新运行。")
+        if not context.extra_fields:
+            raise ScreenApplicationError(503, "盘中来源已过期，请稍后重试。")
+        try:
+            args = validate_screen_choices(
+                body.conditions,
+                dynamic_ma=context.dynamic_ma,
+                dynamic_rsi=context.dynamic_rsi,
+                fundamental_fields=context.fundamental_fields,
+                extra_fields=context.extra_fields,
+            )
+            plan = ScreenPlan(
+                trade_date=body.trade_date.isoformat(),
+                stages=[
+                    Stage(
+                        label="条件",
+                        rules=[
+                            RuleCall(name=c.key, args=a)
+                            for c, a in zip(body.conditions, args, strict=True)
+                        ],
+                    )
+                ],
+            )
+            compiled = compile_screen_plan(plan)
+            labels = {block.key: block.label for block in screen_blocks()}
+            rule_labels = [labels[c.key] for c in body.conditions]
+            rank_columns = [c.metric for c in body.ranking.conditions] if body.ranking else []
+            offered = {
+                option.value for option in self.catalog(borrowed, mode="intraday").ranking_metrics
+            }
+            if set(rank_columns) - offered:
+                raise ValueError("intraday ranking metric is unavailable")
+            inputs = prepare_intraday_screen_frame(
+                context,
+                borrowed=borrowed,
+                rules=compiled.rules,
+                rank_columns=rank_columns,
+                replica=self.replica,
+                rsi=self.rsi,
+            )
+            universe = inputs.frame
+            page_rules, unknown_counts = rule_state(universe, compiled.rules)
+        except ScreenReplicaChangedError as error:
+            raise ScreenApplicationError(409, "日线数据已更新，请保留条件重新运行。") from error
+        except (
+            ScreenReplicaUnavailableError,
+            ScreenReplicaDataError,
+            ScreenReplicaBudgetError,
+        ) as error:
+            raise ScreenApplicationError(503, "上个交易日的数据暂不可用，请稍后重试。") from error
+        except duckdb.Error as error:
+            raise ScreenApplicationError(503, "盘中数据暂不可用，请稍后重试。") from error
+        except (ValueError, KeyError) as error:
+            raise ScreenApplicationError(422, "所选盘中条件暂不可用，请刷新目录。") from error
+        normalized = {
+            **compiled.normalized_plan,
+            "mode": "intraday",
+            "cutoff": actual.cutoff.isoformat(),
+            "source_identity": actual.source_identity,
+            "daily_anchor_date": actual.daily_anchor_date.isoformat(),
+        }
+        return self._page_result(
+            body,
+            universe=universe,
+            page_rules=page_rules,
+            unknown_counts=unknown_counts,
+            source=context.source,
+            rule_labels=rule_labels,
+            normalized_plan=normalized,
+            complete=complete,
+        )
+
+    def _page_result(
+        self,
+        body: ScreenRunRequest,
+        *,
+        universe: pd.DataFrame,
+        page_rules: list[Rule],
+        unknown_counts: list[int],
+        source: ScreenSourceInfo,
+        rule_labels: list[str],
+        normalized_plan: Mapping[str, object],
+        complete: bool,
+    ) -> ScreenRunData:
+        ranking = body.ranking
+        rank_columns = [condition.metric for condition in ranking.conditions] if ranking else []
         missing_metrics = [metric for metric in rank_columns if metric not in universe.columns]
         if missing_metrics:
             label = RANKING_METRIC_LABELS[missing_metrics[0]]
@@ -527,18 +728,67 @@ class ScreenApplicationService:
         ):
             raise ScreenApplicationError(503, "当前排名数据不完整，请换一个指标或稍后重试。")
 
+        ranking_unknown_count = 0
         try:
+            ranked_input = None
+            if ranking is not None:
+                ranked_input, _ = screen_nl_projection(
+                    universe,
+                    trade_date=body.trade_date.isoformat(),
+                    rules=page_rules,
+                    rule_labels=rule_labels,
+                    include_columns=rank_columns,
+                )
+                positive_metrics = [
+                    condition.metric for condition in ranking.conditions if condition.weight > 0
+                ]
+                ranking_unknown_count = int(
+                    ranked_input[positive_metrics]
+                    .apply(lambda values: values.map(_number))
+                    .isna()
+                    .any(axis=1)
+                    .sum()
+                )
             page_args = dict(
                 generation_id=source.identity,
                 trade_date=body.trade_date.isoformat(),
                 rules=page_rules,
                 rule_labels=rule_labels,
-                normalized_plan=compiled.normalized_plan,
+                normalized_plan=normalized_plan,
                 page_size=body.page_size,
                 signing_key=self.cursor_key,
                 cursor=body.cursor,
             )
-            if ranking is None:
+            if complete:
+                if len(universe) > 8000:
+                    raise ScreenApplicationError(503, "本次结果超出保存范围，请收窄条件。")
+                rank_args = (
+                    [
+                        RankingCondition(column=c.metric, ascending=c.ascending, weight=c.weight)
+                        for c in ranking.conditions
+                    ]
+                    if ranking
+                    else []
+                )
+                selected, diagnostics = screen_nl_projection(
+                    universe,
+                    trade_date=body.trade_date.isoformat(),
+                    rules=page_rules,
+                    rule_labels=rule_labels,
+                    include_columns=rank_columns,
+                )
+                if ranking is not None:
+                    selected = rank_screen_results(selected, rank_args, top_n=ranking.top_n)
+                    selected["rank_position"] = range(1, len(selected) + 1)
+                page = NlScreenPage(
+                    rows=selected,
+                    diagnostics=diagnostics,
+                    start_cursor="",
+                    next_cursor=None,
+                    generation_id=source.identity,
+                    query_digest=nl_screen_query_digest(normalized_plan),
+                )
+            elif ranking is None:
                 page = paginate_nl_screen_projection(universe, **page_args)
             else:
                 page = paginate_ranked_nl_screen_projection(
@@ -572,12 +822,17 @@ class ScreenApplicationService:
                 else "当前数据还不支持这项排名，请换一个指标。",
             ) from error
 
+        display = universe.set_index("ts_code")
         rows = [
             ScreenRow(
                 ts_code=str(row["ts_code"]),
                 name=str(row["name"]) if pd.notna(row["name"]) else None,
-                close=_number(row["CLOSE[0]"]),
-                pct_chg=_number(row["PCT_CHG[0]"]),
+                close=_number(display.loc[row["ts_code"], "INTRADAY_PRICE[0]"])
+                if body.mode == "intraday"
+                else _number(row["CLOSE[0]"]),
+                pct_chg=_number(display.loc[row["ts_code"], "INTRADAY_PCT_CHG[0]"])
+                if body.mode == "intraday"
+                else _number(row["PCT_CHG[0]"]),
                 ranking_score=_number(row.get("ranking_score")),
                 rank_position=int(row["rank_position"]) if "rank_position" in row else None,
             )
@@ -593,7 +848,7 @@ class ScreenApplicationService:
             status="ready",
             base_count=len(universe),
             total=total,
-            unknown_count=steps[-1].unknown_count if steps else 0,
+            unknown_count=(steps[-1].unknown_count if steps else 0) + ranking_unknown_count,
             ranked_count=min(total, ranking.top_n) if ranking is not None else None,
             steps=steps,
             rows=rows,

@@ -1,16 +1,306 @@
-import { screen, waitFor, within } from "@testing-library/react";
+import { act, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { HttpResponse, http } from "msw";
 import { vi } from "vitest";
 import type { Schemas } from "@/api/client";
+import type {
+  ExecuteScreenQuery,
+  ScreenExecutionView,
+  ScreenRunData,
+  ScreenRunRequest,
+} from "@/api/screen";
 import { metaEnvelope } from "@/test/fixtures";
 import { findJargon } from "@/test/jargon";
 import { renderApp } from "@/test/render";
 import { server } from "@/test/server";
 
 const serving = metaEnvelope().serving;
-const source = { identity: "a".repeat(64), updated_at: "2026-09-24T07:30:00Z" };
-const RECENT_DESCRIPTIONS_KEY = "rquant.screen.recent-descriptions.v1";
+const source: ScreenRunData["source"] = {
+  mode: "daily",
+  identity: "a".repeat(64),
+  updated_at: "2026-09-24T07:30:00Z",
+};
+const PRIVATE_SCOPE = "1".repeat(64);
+const RECENT_DESCRIPTIONS_KEY = `rquant.screen.recent-descriptions.v1:${PRIVATE_SCOPE}`;
+type RunResolver = Parameters<typeof http.post>[1];
+let recorded = new Map<
+  string,
+  {
+    entry: ScreenExecutionView;
+    data: ScreenRunData;
+    page: (cursor: string) => Promise<Response | undefined>;
+  }
+>();
+const drawerLifecycle = vi.hoisted(() => new Map<string, ((open: boolean) => void) | undefined>());
+vi.mock("@/ui", async (original) => {
+  const actual = await original<typeof import("@/ui")>();
+  return {
+    ...actual,
+    SideDrawer: (props: Parameters<typeof actual.SideDrawer>[0]) => {
+      if (typeof props.title === "string") drawerLifecycle.set(props.title, props.afterOpenChange);
+      return <actual.SideDrawer {...props} />;
+    },
+  };
+});
+
+it.each([
+  ["历史", "选股历史"],
+  ["常用条件", "常用条件"],
+])("%s 关闭后回到当前同页面入口", async (label, title) => {
+  catalog();
+  const user = userEvent.setup();
+  renderApp("/screener");
+  const trigger = await screen.findByRole("button", { name: label });
+  await user.click(trigger);
+  const dialog = await screen.findByRole("dialog", { name: title });
+  const close = within(dialog).getByRole("button", { name: /close|关闭/i });
+  close.focus();
+  expect(screen.getByRole("button", { name: label })).not.toHaveFocus();
+  await user.click(close);
+  await waitFor(() => expect(screen.queryByRole("dialog", { name: title })).toBeNull());
+  // Interrupted opening removes the real dialog without a false motion callback.
+  await waitFor(() => expect(screen.getByRole("button", { name: label })).toHaveFocus());
+  await act(async () => drawerLifecycle.get(title)?.(false));
+  expect(screen.getByRole("button", { name: label })).toHaveFocus();
+});
+
+it("模式首次加载时保留同一盘中入口和页标题", async () => {
+  catalog();
+  let release: () => void = () => {};
+  const pending = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let requested = false;
+  server.use(
+    http.get("*/api/v1/screen/blocks", async ({ request }) => {
+      const intraday = new URL(request.url).searchParams.get("mode") === "intraday";
+      if (intraday) {
+        requested = true;
+        await pending;
+      }
+      return HttpResponse.json({
+        data: {
+          blocks,
+          dates: intraday ? [] : ["2026-09-24"],
+          available: !intraday,
+          ranking_metrics: [],
+          source: intraday ? null : source,
+          source_kind: intraday ? "intraday" : "replica",
+          nl_generate_available: false,
+        },
+        serving,
+      });
+    }),
+  );
+  const user = userEvent.setup();
+  renderApp("/screener");
+  await screen.findByRole("button", { name: "运行筛选" });
+  const title = screen.getByRole("heading", { name: "选股器" });
+  const trigger = screen.getByRole("button", { name: "盘中" });
+  try {
+    await user.click(trigger);
+    await waitFor(() => expect(requested).toBe(true));
+    expect(trigger.isConnected).toBe(true);
+    expect(screen.getByRole("button", { name: "盘中" })).toBe(trigger);
+    expect(trigger).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("heading", { name: "选股器" })).toBe(title);
+    expect(screen.queryByRole("button", { name: "运行筛选" })).toBeNull();
+  } finally {
+    await act(async () => release());
+  }
+  await screen.findByText("选股数据暂不可用");
+  expect(screen.getByRole("button", { name: "盘中" })).toBe(trigger);
+  expect(screen.getByRole("button", { name: "运行筛选" })).toBeDisabled();
+});
+
+it("重开待确认原请求显示查询和恢复入口，并保留同一 UUID 和完整正文", async () => {
+  const command: ExecuteScreenQuery = {
+    kind: "execute_screen_query",
+    command_id: "reload-original-command",
+    requested_at: "2026-10-05T07:00:00Z",
+    page_size: 37,
+    definition: {
+      schema_version: 1,
+      description: "原请求",
+      mode: "daily",
+      trade_date: "2026-09-24",
+      source_kind: "replica",
+      source_identity: "a".repeat(64),
+      conditions: [{ name: "not_st", args: {} }],
+      ranking: null,
+    },
+  };
+  const original = { action: "execute" as const, command };
+  sessionStorage.setItem(
+    `rquant.screen-command.v1:${PRIVATE_SCOPE}`,
+    JSON.stringify({ schema: 1, scope: PRIVATE_SCOPE, original }),
+  );
+  const seen: unknown[] = [];
+  const execute = vi.fn();
+  function recover(action: "lookup" | "resume") {
+    return http.post(`*/api/v1/screen/query/${action}`, async ({ request }) => {
+      seen.push(await request.json());
+      return HttpResponse.json({
+        available: true,
+        owner_scope_tag: PRIVATE_SCOPE,
+        presets: [],
+        receipt: {
+          command_id: command.command_id,
+          status: "pending",
+          enqueued_at: command.requested_at,
+          completed_at: null,
+          result: null,
+          error: null,
+        },
+      });
+    });
+  }
+  server.use(
+    recover("lookup"),
+    recover("resume"),
+    http.post("*/api/v1/screen/query/execute", execute),
+  );
+  const user = userEvent.setup();
+  renderApp("/screener");
+  expect(await screen.findByRole("button", { name: "恢复原请求" })).toBeVisible();
+  expect(screen.getByText("结果待确认，请核对原请求。")).toBeVisible();
+  await user.click(screen.getByRole("button", { name: "查询原请求" }));
+  await waitFor(() => expect(screen.getByRole("button", { name: "恢复原请求" })).toBeEnabled());
+  await user.click(screen.getByRole("button", { name: "恢复原请求" }));
+  await waitFor(() =>
+    expect(seen).toEqual([
+      { action: "lookup", original },
+      { action: "resume", original },
+    ]),
+  );
+  expect(execute).not.toHaveBeenCalled();
+  expect(
+    JSON.parse(sessionStorage.getItem(`rquant.screen-command.v1:${PRIVATE_SCOPE}`) ?? "null")
+      .original,
+  ).toEqual(original);
+});
+
+function screenRunHandler(resolver: RunResolver) {
+  return http.post("*/api/v1/screen/query/execute", async (info) => {
+    const command = (await info.request.json()) as ExecuteScreenQuery;
+    const body: ScreenRunRequest = {
+      mode: command.definition.mode,
+      trade_date: command.definition.trade_date,
+      conditions: command.definition.conditions.map((call) => ({
+        key: call.name,
+        args: call.args,
+      })),
+      page_size: command.page_size ?? 20,
+      cursor: null,
+      source_identity: command.definition.source_identity,
+      ranking: command.definition.ranking ?? null,
+    };
+    const evaluate = async (cursor: string | null) => {
+      const answer = await resolver({
+        ...info,
+        request: new Request(info.request.url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ...body, cursor }),
+        }),
+      });
+      return answer instanceof Response ? answer : undefined;
+    };
+    const response = await evaluate(null);
+    if (!response || !response.ok) return response;
+    const envelope = (await response.json()) as Schemas["Envelope_ScreenRunData_"];
+    const data = envelope.data;
+    const entry: ScreenExecutionView = {
+      execution_id: command.command_id,
+      sequence: recorded.size + 1,
+      command_hash: "c".repeat(64),
+      plan_hash: "d".repeat(64),
+      definition: { ...command.definition, trade_date: data.trade_date },
+      original_command: command,
+      source: data.source,
+      started_at: command.requested_at,
+      completed_at: command.requested_at,
+      status: data.status === "ready" ? "succeeded" : "failed",
+      base_count: data.base_count,
+      total: data.total,
+      unknown_count: data.unknown_count ?? 0,
+      ranked_count: data.ranked_count ?? null,
+      steps: data.steps,
+      artifact_sha256: "e".repeat(64),
+      member_rank_sha256: "f".repeat(64),
+      failure_code: null,
+    };
+    recorded.set(command.command_id, { entry, data, page: (cursor) => evaluate(cursor) });
+    return HttpResponse.json({
+      available: true,
+      owner_scope_tag: PRIVATE_SCOPE,
+      receipt: {
+        command_id: command.command_id,
+        enqueued_at: command.requested_at,
+        completed_at: command.requested_at,
+        status: "succeeded",
+        error: null,
+        result: {},
+      },
+      presets: [],
+    });
+  });
+}
+
+beforeEach(() => {
+  drawerLifecycle.clear();
+  recorded = new Map();
+  server.use(
+    http.get("*/api/v1/screen/query/history", () =>
+      HttpResponse.json({
+        available: true,
+        owner_scope_tag: PRIVATE_SCOPE,
+        history: {
+          owner_scope_tag: PRIVATE_SCOPE,
+          items: [...recorded.values()].map((item) => item.entry).reverse(),
+          next_cursor: null,
+        },
+        presets: [],
+      }),
+    ),
+    http.get("*/api/v1/screen/query/presets", () =>
+      HttpResponse.json({ available: true, owner_scope_tag: PRIVATE_SCOPE, presets: [] }),
+    ),
+    http.get("*/api/v1/screen/query/executions/:executionId", ({ params }) =>
+      HttpResponse.json({
+        available: true,
+        owner_scope_tag: PRIVATE_SCOPE,
+        execution: recorded.get(String(params.executionId))?.entry ?? null,
+        presets: [],
+      }),
+    ),
+    http.get(
+      "*/api/v1/screen/query/executions/:executionId/results",
+      async ({ params, request }) => {
+        const current = recorded.get(String(params.executionId));
+        if (!current) return HttpResponse.json({ detail: "未找到原请求。" }, { status: 404 });
+        const cursor = new URL(request.url).searchParams.get("cursor");
+        let data = current.data;
+        if (cursor) {
+          const response = await current.page(cursor);
+          if (!response || !response.ok) return response;
+          data = ((await response.json()) as Schemas["Envelope_ScreenRunData_"]).data;
+        }
+        return HttpResponse.json({
+          available: true,
+          owner_scope_tag: PRIVATE_SCOPE,
+          results: {
+            execution_id: current.entry.execution_id,
+            artifact_sha256: current.entry.artifact_sha256,
+            rows: data.rows,
+            next_cursor: data.next_cursor,
+          },
+          presets: [],
+        });
+      },
+    ),
+  );
+});
 const blocks: Schemas["ScreenBlock"][] = [
   {
     key: "not_st",
@@ -88,6 +378,46 @@ function stockDrawer() {
 }
 
 describe("选股器", () => {
+  it("运行保留完整原命令，私有回包失联后只恢复原请求", async () => {
+    catalog();
+    const seen: ExecuteScreenQuery[] = [];
+    server.use(
+      http.get("*/api/v1/screen/query/history", () =>
+        HttpResponse.json({
+          available: true,
+          owner_scope_tag: "1".repeat(64),
+          history: { owner_scope_tag: "1".repeat(64), items: [], next_cursor: null },
+          presets: [],
+        }),
+      ),
+      http.post("*/api/v1/screen/query/execute", async ({ request }) => {
+        seen.push((await request.json()) as ExecuteScreenQuery);
+        return HttpResponse.error();
+      }),
+      http.post("*/api/v1/screen/query/lookup", async ({ request }) => {
+        const body = (await request.json()) as { original: { command: ExecuteScreenQuery } };
+        seen.push(body.original.command);
+        return HttpResponse.json({ detail: "未找到原请求。" }, { status: 404 });
+      }),
+    );
+    renderApp("/screener");
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "运行筛选" }));
+    await screen.findByText("结果待确认，请核对原请求。");
+    await user.click(screen.getByRole("button", { name: "查询原请求" }));
+    await waitFor(() => expect(seen).toHaveLength(2));
+    expect(seen[1]).toEqual(seen[0]);
+    expect(seen[0]).toMatchObject({
+      kind: "execute_screen_query",
+      definition: {
+        source_identity: source.identity,
+        trade_date: "2026-09-24",
+        conditions: [{ name: "not_st", args: {} }],
+      },
+    });
+    expect(screen.getByRole("button", { name: "历史" })).toBeVisible();
+    expect(screen.queryByText("命中 0 只")).toBeNull();
+  });
   it("批量操作只称本页两只，不把总命中数当成本页范围", async () => {
     Object.defineProperty(navigator, "locks", {
       configurable: true,
@@ -97,7 +427,7 @@ describe("选股器", () => {
     });
     catalog();
     server.use(
-      http.post("*/api/v1/screen/run", () =>
+      screenRunHandler(() =>
         HttpResponse.json({
           data: {
             trade_date: "2026-09-24",
@@ -213,7 +543,7 @@ describe("选股器", () => {
           conditions: [{ key: "not_st", args: {} }],
         });
       }),
-      http.post("*/api/v1/screen/run", () => {
+      screenRunHandler(() => {
         runs += 1;
         return HttpResponse.json({
           data: {
@@ -303,7 +633,7 @@ describe("选股器", () => {
           ],
         });
       }),
-      http.post("*/api/v1/screen/run", async ({ request }) => {
+      screenRunHandler(async ({ request }) => {
         const body = (await request.json()) as Schemas["ScreenRunRequest"];
         runs.push(body);
         return HttpResponse.json({
@@ -381,7 +711,7 @@ describe("选股器", () => {
           conditions: [{ key: "circ_mv_lt", args: { threshold_yi: 80 } }],
         }),
       ),
-      http.post("*/api/v1/screen/run", () =>
+      screenRunHandler(() =>
         HttpResponse.json({
           data: {
             trade_date: "2026-09-24",
@@ -427,7 +757,7 @@ describe("选股器", () => {
           conditions: [{ key: "not_st", args: {} }],
         }),
       ),
-      http.post("*/api/v1/screen/run", async () => {
+      screenRunHandler(async () => {
         await pending;
         return HttpResponse.json({
           data: {
@@ -469,7 +799,7 @@ describe("选股器", () => {
           conditions: [{ key: "circ_mv_lt", args: { threshold_yi: previews === 1 ? 80 : 60 } }],
         });
       }),
-      http.post("*/api/v1/screen/run", () => {
+      screenRunHandler(() => {
         runs += 1;
         return HttpResponse.json({
           data: {
@@ -570,7 +900,7 @@ describe("选股器", () => {
     expect(screen.getAllByRole("button", { name: /删除第/ })).toHaveLength(1);
   });
 
-  it("Serving 筛选传目录身份，响应身份或日期不符便清旧结果并刷新目录", async () => {
+  it("筛选传目录身份，执行事实日期不符便保持待确认，不显示伪结果", async () => {
     let catalogReads = 0;
     server.use(
       http.get("*/api/v1/screen/blocks", () => {
@@ -588,7 +918,7 @@ describe("选股器", () => {
           serving,
         });
       }),
-      http.post("*/api/v1/screen/run", async ({ request }) => {
+      screenRunHandler(async ({ request }) => {
         const body = (await request.json()) as Schemas["ScreenRunRequest"];
         expect(body.source_identity).toBe(source.identity);
         return HttpResponse.json({
@@ -609,9 +939,9 @@ describe("选股器", () => {
     const user = userEvent.setup();
     renderApp("/screener");
     await user.click(await screen.findByRole("button", { name: "运行筛选" }));
-    expect(await screen.findByRole("status")).toHaveTextContent("选股数据已更新，请重新筛选。");
+    expect(await screen.findByRole("status")).toHaveTextContent("结果待确认，请核对原请求。");
     expect(screen.queryByText("命中 27 只")).toBeNull();
-    await waitFor(() => expect(catalogReads).toBeGreaterThanOrEqual(2));
+    expect(catalogReads).toBeGreaterThanOrEqual(1);
   });
 
   it("建议在日期或来源变化后失效", async () => {
@@ -896,7 +1226,7 @@ describe("选股器", () => {
   it("局部条件未知时在结果和逐条计数中明示未判定数量", async () => {
     catalog();
     server.use(
-      http.post("*/api/v1/screen/run", () =>
+      screenRunHandler(() =>
         HttpResponse.json({
           data: {
             trade_date: "2026-09-24",
@@ -926,7 +1256,7 @@ describe("选股器", () => {
     stockDrawer();
     const requests: Schemas["ScreenRunRequest"][] = [];
     server.use(
-      http.post("*/api/v1/screen/run", async ({ request }) => {
+      screenRunHandler(async ({ request }) => {
         const body = (await request.json()) as Schemas["ScreenRunRequest"];
         requests.push(body);
         return HttpResponse.json({
@@ -1070,7 +1400,7 @@ describe("选股器", () => {
           serving,
         }),
       ),
-      http.post("*/api/v1/screen/run", async ({ request }) => {
+      screenRunHandler(async ({ request }) => {
         const body = (await request.json()) as Schemas["ScreenRunRequest"];
         requests.push(body);
         return HttpResponse.json({
@@ -1194,7 +1524,7 @@ describe("选股器", () => {
           serving,
         }),
       ),
-      http.post("*/api/v1/screen/run", async ({ request }) => {
+      screenRunHandler(async ({ request }) => {
         const body = (await request.json()) as Schemas["ScreenRunRequest"];
         requests.push(body);
         return HttpResponse.json({
@@ -1341,7 +1671,7 @@ describe("选股器", () => {
           serving,
         }),
       ),
-      http.post("*/api/v1/screen/run", async ({ request }) => {
+      screenRunHandler(async ({ request }) => {
         const body = (await request.json()) as Schemas["ScreenRunRequest"];
         requests.push(body);
         return HttpResponse.json({
@@ -1390,7 +1720,7 @@ describe("选股器", () => {
     ]);
   });
 
-  it("自定义 RSI 不可用后将旧周期恢复为目录选项", async () => {
+  it("自定义 RSI 不可用后保留旧周期并阻止静默换条件", async () => {
     let ready = true;
     const base = {
       key: "period",
@@ -1476,14 +1806,18 @@ describe("选股器", () => {
     ready = false;
     await user.click(screen.getByRole("button", { name: "刷新选股数据" }));
     expect(await screen.findByText("自定义 RSI 暂不可用")).toBeInTheDocument();
-    expect(screen.getByRole("combobox", { name: "指标周期" })).toHaveValue("14");
+    expect(screen.getByRole("button", { name: "运行筛选" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "运行筛选" })).toHaveAttribute(
+      "aria-description",
+      "原条件暂不可用，请核对后再运行。",
+    );
   });
 
   it("条件修改后标明旧结果；无数据或不支持的条件不显示伪结果", async () => {
     catalog();
     let unsupported = false;
     server.use(
-      http.post("*/api/v1/screen/run", () =>
+      screenRunHandler(() =>
         unsupported
           ? HttpResponse.json(
               { detail: "当前数据还不支持这个条件，请换一条或稍后重试。" },
@@ -1515,8 +1849,8 @@ describe("选股器", () => {
     expect(screen.getByRole("status")).toHaveTextContent("条件已改，请重新运行");
     unsupported = true;
     await user.click(screen.getByRole("button", { name: "运行筛选" }));
-    expect(await screen.findByRole("alert")).toHaveTextContent("当前数据还不支持这个条件");
-    expect(screen.getByRole("status")).toHaveTextContent("条件已改，请重新运行");
+    expect(await screen.findByText("结果待确认，请核对原请求。")).toBeVisible();
+    expect(screen.getByText("条件已改，请重新运行。旧结果仅供参考。")).toBeVisible();
   });
 
   it("没有已发布选股数据时解释原因并禁用运行", async () => {
@@ -1543,7 +1877,7 @@ describe("选股器", () => {
           serving,
         }),
       ),
-      http.post("*/api/v1/screen/run", () =>
+      screenRunHandler(() =>
         HttpResponse.json({
           data: {
             trade_date: "2026-09-24",
@@ -1644,7 +1978,7 @@ describe("选股器", () => {
           serving,
         }),
       ),
-      http.post("*/api/v1/screen/run", async ({ request }) => {
+      screenRunHandler(async ({ request }) => {
         const body = (await request.json()) as Schemas["ScreenRunRequest"];
         requests.push(body);
         return HttpResponse.json({
@@ -1696,7 +2030,7 @@ describe("选股器", () => {
     catalog();
     const requests: Schemas["ScreenRunRequest"][] = [];
     server.use(
-      http.post("*/api/v1/screen/run", async ({ request }) => {
+      screenRunHandler(async ({ request }) => {
         const body = (await request.json()) as Schemas["ScreenRunRequest"];
         requests.push(body);
         return HttpResponse.json({
@@ -1787,7 +2121,7 @@ describe("选股器", () => {
     );
     const commands: Record<string, unknown>[] = [];
     server.use(
-      http.post("*/api/v1/screen/run", async ({ request }) => {
+      screenRunHandler(async ({ request }) => {
         const body = (await request.json()) as Schemas["ScreenRunRequest"];
         return HttpResponse.json({
           data: {
@@ -1864,7 +2198,7 @@ describe("选股器", () => {
     );
     const commands: Record<string, unknown>[] = [];
     server.use(
-      http.post("*/api/v1/screen/run", async ({ request }) => {
+      screenRunHandler(async ({ request }) => {
         const body = (await request.json()) as Schemas["ScreenRunRequest"];
         return HttpResponse.json({
           data: {
@@ -1931,7 +2265,7 @@ describe("选股器", () => {
           serving,
         }),
       ),
-      http.post("*/api/v1/screen/run", () =>
+      screenRunHandler(() =>
         HttpResponse.json({
           data: {
             trade_date: "2026-09-24",
@@ -1987,7 +2321,7 @@ describe("选股器", () => {
     let editorGeneration: string | null = "c".repeat(64);
     let resultState = "not_run";
     server.use(
-      http.post("*/api/v1/screen/run", () =>
+      screenRunHandler(() =>
         HttpResponse.json({
           data: {
             trade_date: "2026-09-24",
@@ -2075,13 +2409,48 @@ describe("选股器", () => {
                 result: {
                   state: resultState,
                   status_label: "等待选股",
-                  trade_date: null,
-                  hit_count: null,
+                  trade_date: resultState === "current_rules" ? "2026-09-24" : null,
+                  hit_count: resultState === "current_rules" ? 27 : null,
                 },
               },
             ],
           },
           serving,
+        }),
+      ),
+    );
+    server.use(
+      http.get("*/api/v1/screen/query/history", () =>
+        HttpResponse.json({
+          available: true,
+          owner_scope_tag: "1".repeat(64),
+          history: { owner_scope_tag: "1".repeat(64), items: [], next_cursor: null },
+          presets: [],
+          daily_writer_capability: null,
+          daily_run_evidence:
+            resultState === "current_rules"
+              ? [
+                  {
+                    trade_date: "2026-09-24",
+                    preset_name: "user/发布观察",
+                    definition_version: version,
+                    result_version: "b".repeat(64),
+                    source_kind: "daily_writer",
+                    source_identity: "c".repeat(64),
+                    content_digest: "d".repeat(64),
+                    decision_at: "2026-09-24T09:00:00Z",
+                    universe_count: 30,
+                    hit_count: 27,
+                    unknown_count: 0,
+                    ranking_plan_digest: null,
+                    member_rank_digest: "e".repeat(64),
+                    persisted_extra_digest: "f".repeat(64),
+                    writer_contract_fingerprint: "a".repeat(64),
+                    evidence_version: "a".repeat(64),
+                    completed_at: "2026-09-24T10:00:00Z",
+                  },
+                ]
+              : [],
         }),
       ),
     );
@@ -2097,77 +2466,110 @@ describe("选股器", () => {
     editorGeneration = serving.generation_id;
     await user.click(within(dialog).getByRole("button", { name: "检查更新" }));
     expect(await within(dialog).findByText("规则已发布")).toBeInTheDocument();
-    expect(within(dialog).getByText("等待下次选股结果")).toBeInTheDocument();
+    expect(within(dialog).getByText("等待日终结果确认")).toBeInTheDocument();
     resultState = "current_rules";
     await user.click(within(dialog).getByRole("button", { name: "检查更新" }));
     expect(await within(dialog).findByText("结果已按新规则更新")).toBeInTheDocument();
   });
 
-  it("自定义指标虽能预览，也不允许保存成无法每日重算的池子", async () => {
-    catalog();
-    server.use(
-      http.get("*/api/v1/screen/blocks", () =>
-        HttpResponse.json({
-          data: {
-            blocks: [
-              ...blocks,
-              {
-                key: "rsi_oversold",
-                label: "RSI 超卖",
-                hint: "RSI 低于指定值",
-                category: "indicator",
-                category_label: "指标",
-                parameters: [
-                  {
-                    key: "period",
-                    label: "周期",
-                    input: "integer",
-                    initial: 7,
-                    required: true,
-                    minimum: 2,
-                    maximum: 60,
-                    scale: 1,
-                    custom_ma: false,
-                  },
-                ],
-              },
-            ],
-            dates: ["2026-09-24"],
+  it.each(["未安装", "同代已安装", "旧代回证"])(
+    "自定义指标保存核验日终能力：%s",
+    async (writerState) => {
+      catalog();
+      server.use(
+        http.get("*/api/v1/screen/blocks", () =>
+          HttpResponse.json({
+            data: {
+              blocks: [
+                ...blocks,
+                {
+                  key: "rsi_oversold",
+                  label: "RSI 超卖",
+                  hint: "RSI 低于指定值",
+                  category: "indicator",
+                  category_label: "指标",
+                  parameters: [
+                    {
+                      key: "period",
+                      label: "周期",
+                      input: "integer",
+                      initial: 7,
+                      required: true,
+                      minimum: 2,
+                      maximum: 60,
+                      scale: 1,
+                      custom_ma: false,
+                    },
+                  ],
+                },
+              ],
+              dates: ["2026-09-24"],
+              available: true,
+              ranking_metrics: [],
+              source,
+              source_kind: "replica",
+              nl_generate_available: false,
+            },
+            serving,
+          }),
+        ),
+        screenRunHandler(() =>
+          HttpResponse.json({
+            data: {
+              trade_date: "2026-09-24",
+              status: "ready",
+              base_count: 30,
+              total: 4,
+              steps: [],
+              rows: [],
+              next_cursor: null,
+              source,
+            },
+            serving,
+          }),
+        ),
+      );
+      server.use(
+        http.get("*/api/v1/screen/query/history", () =>
+          HttpResponse.json({
             available: true,
-            ranking_metrics: [],
-            source,
-            source_kind: "replica",
-            nl_generate_available: false,
-          },
-          serving,
-        }),
-      ),
-      http.post("*/api/v1/screen/run", () =>
-        HttpResponse.json({
-          data: {
-            trade_date: "2026-09-24",
-            status: "ready",
-            base_count: 30,
-            total: 4,
-            steps: [],
-            rows: [],
-            next_cursor: null,
-            source,
-          },
-          serving,
-        }),
-      ),
-    );
-    const user = userEvent.setup();
-    renderApp("/screener");
-    await user.selectOptions(
-      await screen.findByRole("combobox", { name: "条件目录" }),
-      "rsi_oversold",
-    );
-    await user.click(screen.getByRole("button", { name: "添加条件" }));
-    await user.click(screen.getByRole("button", { name: "运行筛选" }));
-    await screen.findByText("命中 4 只");
-    expect(screen.getByRole("button", { name: "保存为池子" })).toBeDisabled();
-    expect(screen.getByText("自定义 RSI 暂不能保存为每日池子。")).toBeInTheDocument();
-  });
+            owner_scope_tag: "1".repeat(64),
+            history: { owner_scope_tag: "1".repeat(64), items: [], next_cursor: null },
+            presets: [],
+            daily_writer_capability:
+              writerState === "未安装"
+                ? null
+                : {
+                    contract: "daily-screen-writer/v1",
+                    serving_generation_id:
+                      writerState === "同代已安装" ? serving.generation_id : "f".repeat(64),
+                    writer_contract_fingerprint: "a".repeat(64),
+                    verified_result_version: "b".repeat(64),
+                    verified_evidence_version: "c".repeat(64),
+                    completed_at: "2026-09-24T10:00:00Z",
+                    canonical_receipt_id: "1".repeat(64),
+                    canonical_generation_id: "2".repeat(64),
+                    source_generation_id: "3".repeat(64),
+                  },
+            daily_run_evidence: [],
+          }),
+        ),
+      );
+      const user = userEvent.setup();
+      renderApp("/screener");
+      await user.selectOptions(
+        await screen.findByRole("combobox", { name: "条件目录" }),
+        "rsi_oversold",
+      );
+      await user.click(screen.getByRole("button", { name: "添加条件" }));
+      await user.click(screen.getByRole("button", { name: "运行筛选" }));
+      await screen.findByText("命中 4 只");
+      if (writerState === "同代已安装")
+        expect(screen.getByRole("button", { name: "保存为池子" })).toBeEnabled();
+      else {
+        expect(screen.getByRole("button", { name: "保存为池子" })).toBeDisabled();
+        expect(screen.getByText("自定义 RSI 暂不能保存为每日池子。")).toBeInTheDocument();
+      }
+    },
+  );
 });

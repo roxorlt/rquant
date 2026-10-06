@@ -375,7 +375,7 @@ class BuiltinStrategyEvaluatorRegistry:
                     *definition.spec.required_features,
                     *definition.spec.optional_features,
                 )
-            }
+            } | {"speed_5m_pct", "hist_cumulative_volume_median", "cumulative_volume_ratio"}
         )
         return TrustedExecutableRegistry(
             features=tuple(

@@ -70,7 +70,10 @@ def bootstrap_portfolio_definition(
         if existing.producer_commit != producer_commit:
             raise PermissionError("portfolio definition code differs")
         return existing
-    feature = registry.latest_feature_contract("intraday-pit", as_of=now)
+    from rquant.runtime_definition_bootstrap import plan_builtin_definitions
+
+    plan = plan_builtin_definitions(producer_commit=producer_commit)
+    feature = registry.read_feature_contract(plan.feature_contract_fingerprints[2], as_of=now)
     if feature is None or feature.version != 3 or feature.producer_commit != producer_commit:
         raise PermissionError("portfolio definition requires the original trusted feature contract")
     definition = builtins.load_definition("portfolio_backtest", 1)

@@ -164,6 +164,11 @@ class PriceAlertRuleRepository:
         except sqlite3.Error as exc:
             raise PriceAlertRuleUnavailableError("price rule rows cannot be read") from exc
 
+    def install_condition_schema(self) -> None:
+        from rquant.condition_alert_rule_store import ConditionAlertRuleRepository
+
+        ConditionAlertRuleRepository(self._connection).install_schema()
+
     @staticmethod
     def _entry(row: sqlite3.Row | tuple) -> PriceAlertRuleEntry:
         try:

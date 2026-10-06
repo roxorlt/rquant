@@ -5,6 +5,7 @@ import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
+from itertools import permutations
 from pathlib import Path
 
 import pytest
@@ -33,6 +34,265 @@ NOW = datetime(2026, 7, 31, 2, 30, tzinfo=UTC)
 POLICY = "a" * 64
 GENERATION = "b" * 64
 SPEC = "c" * 64
+
+
+def _condition_mixed_world(tmp_path: Path):
+    from tests.unit.test_condition_alert_route import condition_route_fixture
+    from tests.unit.test_price_alert_event_contracts import AT
+    from tests.unit.test_price_alert_route import route_fixture
+    from tests.unit.test_price_alert_route_spool import legacy_route
+
+    producer, bus, activation, policy, source, price = route_fixture(tmp_path)
+    legacy_route(bus, "a", 1)
+    bus.commit_price_alert_route(
+        activation=activation,
+        policy=policy,
+        source=source,
+        record=price,
+        source_inspected_at=AT,
+        routed_at=AT,
+    )
+    spool = SignalRouteSpool(tmp_path / "condition-mixed-spool")
+    signal_route_spool_module.publish_mixed_notification_bus_prefix(
+        bus=bus, spool=spool, limit=2, observed_at=AT
+    )
+    originals = tuple(
+        (spool.paths.records / spool.paths.record_name(n)).read_bytes() for n in (1, 2)
+    )
+    actual, condition_activation, condition_policy, condition_source, condition = (
+        condition_route_fixture(tmp_path, bus)
+    )
+    bus.commit_condition_alert_route(
+        activation=condition_activation,
+        policy=condition_policy,
+        source=condition_source,
+        record=condition,
+        source_inspected_at=AT,
+        routed_at=AT,
+    )
+    legacy_route(bus, "d", 2)
+    return producer, bus, spool, originals
+
+
+def test_condition_three_families_reopen_and_preserve_original_v2_v4_bytes(tmp_path: Path) -> None:
+    from tests.unit.test_price_alert_event_contracts import AT
+
+    producer, bus, spool, originals = _condition_mixed_world(tmp_path)
+    result = signal_route_spool_module.publish_mixed_notification_bus_prefix(
+        bus=bus, spool=spool, limit=100, observed_at=AT
+    )
+    assert result.published_count == 2
+    reader = signal_route_spool_module.ReadonlyNotificationEventRouteSpool(spool.paths.root)
+    rows = reader.routed_after_global_sequence(
+        after_sequence=0, through_sequence=4, limit=100, observed_at=AT
+    )
+    assert [type(row).__name__ for row in rows] == [
+        "SignalBusRoutedRecord",
+        "PriceAlertBusRoutedRecord",
+        "ConditionAlertBusRoutedRecord",
+        "SignalBusRoutedRecord",
+    ]
+    assert (
+        tuple((spool.paths.records / spool.paths.record_name(n)).read_bytes() for n in (1, 2))
+        == originals
+    )
+    assert reader.observed_prefix_receipt(observed_at=AT).prefix_row_count == 4
+    assert (
+        signal_route_spool_module.publish_mixed_notification_bus_prefix(
+            bus=bus, spool=spool, limit=100, observed_at=AT
+        ).published_count
+        == 0
+    )
+    reopened = signal_route_spool_module.ReadonlyNotificationEventRouteSpool(spool.paths.root)
+    assert (
+        reopened.routed_after_global_sequence(
+            after_sequence=0, through_sequence=4, limit=100, observed_at=AT
+        )
+        == rows
+    )
+    producer.close()
+
+
+@pytest.mark.parametrize("families", tuple(permutations(("legacy", "price", "condition"))))
+def test_all_six_family_orders_use_one_chain_reopen_replay_and_later_legacy(
+    tmp_path: Path, families: tuple[str, str, str]
+) -> None:
+    from rquant.condition_alert_route import install_condition_alert_history
+    from rquant.notification_state import NotificationStateStore
+    from rquant.paper_signal_consumer import (
+        PaperSignalConsumerStateStore,
+        consume_notification_events_to_paper,
+    )
+    from rquant.signal_route_spool import (
+        ConditionAlertRouteSpoolRecord,
+        PriceAlertRouteSpoolRecord,
+        ReadonlyNotificationEventRouteSpool,
+        SignalRouteSpoolRecord,
+    )
+    from tests.unit.test_condition_alert_route import condition_route_fixture
+    from tests.unit.test_paper_signal_consumer import _queue
+    from tests.unit.test_price_alert_event_contracts import AT
+    from tests.unit.test_price_alert_route import route_fixture
+    from tests.unit.test_price_alert_route_spool import legacy_route
+
+    producer, bus, price_activation, price_policy, price_source, price = route_fixture(tmp_path)
+    _, activation, policy, source, condition = condition_route_fixture(tmp_path, bus)
+    try:
+        for family in families:
+            if family == "legacy":
+                legacy_route(bus, "a", 1)
+            elif family == "price":
+                bus.commit_price_alert_route(
+                    activation=price_activation,
+                    policy=price_policy,
+                    source=price_source,
+                    record=price,
+                    source_inspected_at=AT,
+                    routed_at=AT,
+                )
+            else:
+                bus.commit_condition_alert_route(
+                    activation=activation,
+                    policy=policy,
+                    source=source,
+                    record=condition,
+                    source_inspected_at=AT,
+                    routed_at=AT,
+                )
+        spool = SignalRouteSpool(tmp_path / "six-family-spool")
+        assert (
+            signal_route_spool_module.publish_mixed_notification_bus_prefix(
+                bus=bus, spool=spool, limit=100, observed_at=AT
+            ).published_count
+            == 3
+        )
+        reader = ReadonlyNotificationEventRouteSpool(spool.paths.root)
+        rows = reader.routed_after_global_sequence(
+            after_sequence=0, through_sequence=3, limit=100, observed_at=AT
+        )
+        codecs = {
+            "legacy": SignalRouteSpoolRecord,
+            "price": PriceAlertRouteSpoolRecord,
+            "condition": ConditionAlertRouteSpoolRecord,
+        }
+        original_bytes = []
+        previous_hash = None
+        for index, (family, record) in enumerate(zip(families, rows, strict=True), start=1):
+            raw = (spool.paths.records / spool.paths.record_name(index)).read_bytes()
+            parsed = codecs[family].model_validate_json(raw)
+            assert parsed == codecs[family].create(
+                record=record, previous_record_hash=previous_hash
+            )
+            previous_hash = parsed.record_hash
+            original_bytes.append(raw)
+        reopened = ReadonlyNotificationEventRouteSpool(spool.paths.root)
+        assert (
+            reopened.routed_after_global_sequence(
+                after_sequence=0, through_sequence=3, limit=100, observed_at=AT
+            )
+            == rows
+        )
+        descriptor = reopened.source_descriptor()
+        notification = NotificationStateStore(tmp_path / "six-notification.sqlite3")
+        install_condition_alert_history(notification)
+        assert (
+            notification.replicate_mixed_notification_events(
+                descriptor, rows, observed_at=AT, source_inspected_at=AT
+            ).replicated_count
+            == 3
+        )
+        assert len(notification.outbox_records()) == 3
+        notify_reopened = NotificationStateStore(notification.path)
+        assert (
+            notify_reopened.replicate_mixed_notification_events(
+                descriptor, rows, observed_at=AT, source_inspected_at=AT
+            ).replicated_count
+            == 0
+        )
+        queue = _queue(tmp_path / "six-paper-queue.sqlite3")
+        paper = PaperSignalConsumerStateStore(tmp_path / "six-paper-state.sqlite3")
+        paper.install_condition_notification_history()
+        first = consume_notification_events_to_paper(
+            reopened, queue, paper, observed_at=AT, limit=3
+        )
+        assert first.delegated_count == 1 and first.ignored_non_trading_count == 2
+        position = families.index("condition") + 1
+        receipt = paper.condition_non_trading_receipt(position)
+        assert receipt is not None and queue.record(receipt.record.event_id) is None
+        paper_reopened = PaperSignalConsumerStateStore(paper.path)
+        assert paper_reopened.condition_non_trading_receipt(position) == receipt
+        assert (
+            consume_notification_events_to_paper(
+                reopened, queue, paper_reopened, observed_at=AT, limit=3
+            ).delegated_count
+            == 0
+        )
+        legacy_route(bus, "d", 2)
+        assert (
+            signal_route_spool_module.publish_mixed_notification_bus_prefix(
+                bus=bus, spool=spool, limit=100, observed_at=AT
+            ).published_count
+            == 1
+        )
+        assert (
+            consume_notification_events_to_paper(
+                reopened, queue, paper_reopened, observed_at=AT, limit=3
+            ).delegated_count
+            == 1
+        )
+        assert paper_reopened.cursor().last_global_sequence == 4
+        assert [
+            (spool.paths.records / spool.paths.record_name(index)).read_bytes()
+            for index in (1, 2, 3)
+        ] == original_bytes
+        assert queue.record(receipt.record.event_id) is None
+    finally:
+        producer.close()
+
+
+@pytest.mark.parametrize("failure", ["gap", "source", "payload", "future", "subclass", "unknown"])
+def test_condition_bad_prefix_is_rejected_before_any_new_immutable_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    from rquant.condition_alert_route import ConditionAlertBusRoutedRecord
+    from tests.unit.test_price_alert_event_contracts import AT
+
+    producer, bus, spool, originals = _condition_mixed_world(tmp_path)
+    rows = bus.routed_notification_events_after_global_sequence(
+        after_sequence=2, through_sequence=4, limit=100, observed_at=AT
+    )
+    record = rows[0]
+    if failure == "gap":
+        record = record.model_copy(update={"global_sequence": 4})
+    elif failure == "source":
+        record = record.model_copy(update={"bus_generation_id": "e" * 64})
+    elif failure == "payload":
+        record = record.model_copy(update={"payload_json": "{}"})
+    elif failure == "future":
+        record = record.model_copy(update={"received_at": AT + timedelta(seconds=1)})
+    elif failure == "subclass":
+
+        class Substituted(ConditionAlertBusRoutedRecord):
+            pass
+
+        record = Substituted.model_validate_json(record.wire_bytes())
+    else:
+        record = object()
+    before = (spool.paths.root / "current.json").read_bytes()
+    monkeypatch.setattr(
+        bus, "routed_notification_events_after_global_sequence", lambda **_: (record, rows[1])
+    )
+    with pytest.raises((TypeError, ValueError, RuntimeError)):
+        signal_route_spool_module.publish_mixed_notification_bus_prefix(
+            bus=bus, spool=spool, limit=100, observed_at=AT
+        )
+    assert (spool.paths.root / "current.json").read_bytes() == before
+    assert (
+        tuple((spool.paths.records / spool.paths.record_name(n)).read_bytes() for n in (1, 2))
+        == originals
+    )
+    assert not (spool.paths.records / spool.paths.record_name(3)).exists()
+    producer.close()
 
 
 def _signal(seed: str) -> SignalEnvelope:

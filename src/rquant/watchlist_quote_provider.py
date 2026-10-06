@@ -46,8 +46,7 @@ def _select_watchlist_rows(
         ts_code = code_map.get(raw_code[-6:])
         if ts_code is None:
             continue
-        rows.append(
-            {
+        selected: dict[str,object] = {
                 "ts_code": ts_code,
                 "price": float(row["最新价"]),
                 "open": float(row["今开"]),
@@ -56,7 +55,17 @@ def _select_watchlist_rows(
                 "volume": float(row["成交量"]),
                 "amount": float(row["成交额"]),
             }
-        )
+        for raw_name,target in (("昨收","pre_close"),("涨跌幅","pct_chg"),("换手率","turnover_rate"),
+            ("涨停价","up_limit"),("float_shares","float_shares")):
+            if raw_name in snapshot.columns and pd.notna(row[raw_name]):
+                selected[target]=float(row[raw_name])
+        if "时间戳" in snapshot.columns and pd.notna(row["时间戳"]):
+            selected["vendor_time_text"]=str(row["时间戳"])
+        if "source_observed_at" in snapshot.columns and pd.notna(row["source_observed_at"]):
+            selected["source_observed_at"]=row["source_observed_at"]
+        if "no_price_limit" in snapshot.columns and pd.notna(row["no_price_limit"]):
+            selected["no_price_limit"]=row["no_price_limit"]
+        rows.append(selected)
     return rows
 
 

@@ -168,3 +168,46 @@ def test_configuration_application_reopens_published_control_actions(tmp_path):
     published = source.read(as_of=EXECUTION_TIME)
     assert published.configuration.version == 2 and published.operator == applied
     assert applied.status == "applied" and not applied.paused and _item(published, True).can_pause
+
+
+@pytest.mark.parametrize(
+    ("users", "allowed"),
+    (
+        (frozenset(f"user{index:02d}" for index in range(17)), False),
+        (frozenset({""}), False),
+        (frozenset({"alice smith"}), False),
+        (frozenset({"a" * 65}), False),
+        (frozenset({"alice"}), True),
+        (frozenset(f"user{index:02d}" for index in range(16)), True),
+    ),
+    ids=("17-names", "empty", "space", "65-chars", "alice", "16-names"),
+)
+def test_merged_paper_users_preserve_bounded_exact_settings_contract(
+    users: frozenset[str], allowed: bool, tmp_path: object
+) -> None:
+    from pathlib import Path
+
+    from pydantic import ValidationError
+
+    assert isinstance(tmp_path, Path)
+
+    def settings() -> WebSettings:
+        return WebSettings(
+            serving_root=tmp_path,
+            ingress_socket_path=tmp_path / "ingress.sock",
+            proxy_proof_file=tmp_path / "proxy.proof",
+            paper_portfolio_enabled=True,
+            paper_portfolio_users=users,
+        )
+
+    if allowed:
+        accepted = settings()
+        assert accepted.paper_portfolio_enabled is True
+        assert accepted.paper_portfolio_users == users
+    else:
+        with pytest.raises(ValidationError) as error:
+            settings()
+        assert any(
+            detail["loc"] == ("paper_portfolio_users",)
+            for detail in error.value.errors(include_url=False)
+        )

@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
+import json
 from unittest.mock import patch
 
 import pandas as pd
@@ -19,6 +20,25 @@ from rquant.presets import ScreenPreset
 from rquant.screen.pool_ranking import PoolRankingPlan
 from rquant.screen.rules import not_st
 from rquant.storage.duckdb import DuckDBStore
+
+
+def _seed_daily_fixture_sources(store: DuckDBStore, frame: pd.DataFrame | None = None) -> None:
+    """These pipeline isolation tests mock the evaluator, but its input dates are real."""
+    if frame is not None:
+        day=store._conn.execute("SELECT MAX(trade_date) FROM daily_bar").fetchone()[0]
+        for row in frame.itertuples(index=False,name=None):
+            values=dict(zip(frame.columns,row,strict=True))
+            store._conn.execute("INSERT INTO daily_bar(ts_code,trade_date,close,pct_chg) VALUES (?,?,?,?) ON CONFLICT DO NOTHING",[values["ts_code"],day,values.get("CLOSE[0]"),values.get("PCT_CHG[0]")])
+    rows = store._conn.execute("SELECT ts_code,trade_date FROM daily_bar ORDER BY trade_date,ts_code").fetchall()
+    if not rows:
+        return
+    first, last = min(day for _,day in rows), max(day for _,day in rows)
+    days = {day for _,day in rows}
+    for offset in range((last-first).days+1):
+        day = first + timedelta(days=offset)
+        store._conn.execute("INSERT INTO trade_calendar(exchange,cal_date,is_open,source,updated_at) VALUES ('SSE',?,?, 'fixture',?) ON CONFLICT DO NOTHING",[day,day in days,datetime(2026,1,1,tzinfo=UTC)])
+    for code,day in rows:
+        store._conn.execute("INSERT INTO stock_status_daily(ts_code,trade_date,name,is_st,name_source,st_source,available_at,ingested_at) VALUES (?,?,'fixture',FALSE,'fixture','fixture',?,?) ON CONFLICT DO NOTHING",[code,day,datetime.combine(day,datetime.min.time(),UTC),datetime(2026,1,1,tzinfo=UTC)])
 
 
 @pytest.fixture()
@@ -96,6 +116,10 @@ def test_ranked_daily_pool_filters_risk_then_commits_only_top_members_and_receip
             "CIRC_MV[0]": [30.0, 20.0, 10.0],
         }
     )
+    from rquant.screen.ranking import load_twenty_day_adjusted_returns
+    frame = frame.merge(load_twenty_day_adjusted_returns(store._conn,sessions[-1],list(codes)),on="ts_code",validate="one_to_one")
+    for code,circ,turnover in zip(codes,(30,20,10),(3,2,1),strict=True):
+        store._conn.execute("INSERT INTO daily_basic(ts_code,trade_date,circ_mv,turnover_rate) VALUES (?,?,?,?)",[code,sessions[-1],circ,turnover])
     preset = ScreenPreset(
         name="ranked",
         description="",
@@ -111,6 +135,7 @@ def test_ranked_daily_pool_filters_risk_then_commits_only_top_members_and_receip
             }
         ),
     )
+    _seed_daily_fixture_sources(store,frame)
     with (
         patch("rquant.pipeline.PRESET_SCREENS", {"ranked": preset}),
         patch("rquant.pipeline.screen", return_value=frame) as screened,
@@ -123,7 +148,9 @@ def test_ranked_daily_pool_filters_risk_then_commits_only_top_members_and_receip
     )
     saved = store.query_screen_result(sessions[-1].isoformat(), "ranked")
     assert saved["ts_code"].tolist() == ["000002.SZ"]
-    assert saved.iloc[0]["extra"] is None
+    assert json.loads(saved.iloc[0]["extra"]) == {"ranking_score":100.0,"rank_position":1}
+    proof = store.query_screen_run_evidence(sessions[-1].isoformat(), "ranked")
+    assert proof is not None and proof.ranking_plan_digest is not None
     receipt = store.query_screen_run_receipt(sessions[-1].isoformat(), "ranked")
     assert receipt is not None
     assert receipt.hit_count == 1
@@ -140,6 +167,7 @@ def test_ranked_daily_pool_fails_if_all_metric_facts_are_unknown(store: DuckDBSt
         {"ts_code": ["000001.SZ"], "name": ["样本"], "CLOSE[0]": [10.0],
          "PCT_CHG[0]": [0.0]}
     )
+    frame["RETURN_20D_PCT[0]"] = float("nan")
     preset = ScreenPreset(
         name="ranked",
         description="",
@@ -149,6 +177,7 @@ def test_ranked_daily_pool_fails_if_all_metric_facts_are_unknown(store: DuckDBSt
              "top_n": 1}
         ),
     )
+    _seed_daily_fixture_sources(store,frame)
     with (
         patch("rquant.pipeline.PRESET_SCREENS", {"ranked": preset}),
         patch("rquant.pipeline.screen", return_value=frame),
@@ -235,6 +264,7 @@ class TestRunDailyPipeline:
                 rules=[not_st()],
             ),
         }
+        _seed_daily_fixture_sources(store,mock_df)
         with (
             patch("rquant.pipeline.PRESET_SCREENS", test_presets),
             patch("rquant.pipeline.screen", return_value=mock_df),
@@ -341,6 +371,7 @@ class TestRunDailyPipeline:
             offset_days=1,
         )
         empty_df = pd.DataFrame(columns=["ts_code", "name", "CLOSE[0]", "PCT_CHG[0]"])
+        _seed_daily_fixture_sources(store,empty_df)
         with (
             patch("rquant.pipeline.PRESET_SCREENS", {"child": child_preset}),
             patch("rquant.pipeline.screen", return_value=empty_df) as mock_scr,
@@ -406,6 +437,7 @@ class TestBlacklistFilter:
                 rules=[not_st()],
             ),
         }
+        _seed_daily_fixture_sources(store,mock_df)
         with (
             patch("rquant.pipeline.PRESET_SCREENS", test_presets),
             patch("rquant.pipeline.screen", return_value=mock_df),
@@ -438,6 +470,7 @@ class TestBlacklistFilter:
                 rules=[not_st()],
             ),
         }
+        _seed_daily_fixture_sources(store,mock_df)
         with (
             patch("rquant.pipeline.PRESET_SCREENS", test_presets),
             patch("rquant.pipeline.screen", return_value=mock_df),
@@ -623,6 +656,7 @@ class TestPipelineFaultIsolation:
                 raise KeyError("BODY_UPPER[1]")  # 模拟某 preset 引用缺失列
             return good_df
 
+        _seed_daily_fixture_sources(store,good_df)
         with (
             patch("rquant.pipeline.PRESET_SCREENS", presets),
             patch("rquant.pipeline.screen", side_effect=screen_mock),

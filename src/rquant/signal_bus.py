@@ -15,6 +15,16 @@ from typing import Annotated, Literal, Self
 
 from pydantic import Field, StrictInt, StringConstraints, field_validator, model_validator
 
+from rquant.condition_alert_route import (
+    ConditionAlertBusEventRecord,
+    ConditionAlertBusRoutedRecord,
+    ConditionAlertRecipientPolicy,
+)
+from rquant.condition_alert_runtime_contracts import (
+    ConditionAlertProducerEventRecord,
+    ConditionAlertRuntimeActivation,
+    ConditionAlertSourceDescriptor,
+)
 from rquant.delivery_contracts import (
     DeliveryChannel,
     DeliveryTarget,
@@ -2076,6 +2086,7 @@ class SignalBusStore:
         lease_for: timedelta,
         limit: int,
         include_price: bool,
+        include_condition: bool = False,
     ) -> tuple[OutboxRecord, ...]:
         worker = worker_id.strip()
         claimed_at = _normalize_time(now)
@@ -2113,6 +2124,9 @@ class SignalBusStore:
                     "SELECT signal_id FROM signal_envelope\n                    "
                     "WHERE json_extract(payload_json, '$.envelope_schema') = "
                     "'rquant.price-alert-event/v1'\n                  ))\n         "
+                    "AND (? OR signal_id NOT IN (SELECT signal_id FROM signal_envelope "
+                    "WHERE json_extract(payload_json, '$.envelope_schema') = "
+                    "'rquant.condition-alert-event/v1')) "
                     "       ORDER BY COALESCE(next_attempt_at, created_at),\n     "
                     "                    global_sequence, created_at, outbox_id\n "
                     "               LIMIT ?\n                "
@@ -2123,6 +2137,7 @@ class SignalBusStore:
                     now_text,
                     now_text,
                     include_price,
+                    include_condition,
                     limit,
                 ),
             ).fetchall()
@@ -2161,6 +2176,36 @@ class SignalBusStore:
     def _price_alert_failpoint(self, _point: str) -> None:
         """Fault-injection boundary for the dedicated price transaction."""
 
+    def install_condition_alert_route_v1(self, activation: ConditionAlertRuntimeActivation) -> None:
+        from rquant.condition_alert_route import install_condition_alert_route
+
+        install_condition_alert_route(self, activation)
+
+    def _condition_alert_failpoint(self, _point: str) -> None:
+        """Fault injection before the original condition/bus/outbox transaction commit."""
+
+    def commit_condition_alert_route(
+        self,
+        *,
+        activation: ConditionAlertRuntimeActivation,
+        policy: ConditionAlertRecipientPolicy,
+        source: ConditionAlertSourceDescriptor,
+        record: ConditionAlertProducerEventRecord,
+        source_inspected_at: datetime,
+        routed_at: datetime,
+    ) -> ConditionAlertBusRoutedRecord:
+        from rquant.condition_alert_route import route_condition_alert_event
+
+        return route_condition_alert_event(
+            self,
+            activation=activation,
+            policy=policy,
+            source=source,
+            record=record,
+            source_inspected_at=source_inspected_at,
+            routed_at=routed_at,
+        )
+
     def commit_price_alert_route(
         self,
         *,
@@ -2185,8 +2230,8 @@ class SignalBusStore:
 
     def notification_event(
         self, identifier: int | str
-    ) -> SignalBusSignalRecord | PriceAlertBusEventRecord | None:
-        from rquant.price_alert_route import notification_record
+    ) -> SignalBusSignalRecord | PriceAlertBusEventRecord | ConditionAlertBusEventRecord | None:
+        from rquant.condition_alert_route import notification_record
 
         with self._read_snapshot() as connection:
             return notification_record(connection, identifier)
@@ -2198,7 +2243,9 @@ class SignalBusStore:
         through_sequence: int,
         observed_at: datetime,
         limit: int,
-    ) -> tuple[SignalBusSignalRecord | PriceAlertBusEventRecord, ...]:
+    ) -> tuple[
+        SignalBusSignalRecord | PriceAlertBusEventRecord | ConditionAlertBusEventRecord, ...
+    ]:
         return self._notification_events(
             after_sequence=after_sequence,
             through_sequence=through_sequence,
@@ -2214,7 +2261,9 @@ class SignalBusStore:
         through_sequence: int,
         observed_at: datetime,
         limit: int,
-    ) -> tuple[SignalBusRoutedRecord | PriceAlertBusRoutedRecord, ...]:
+    ) -> tuple[
+        SignalBusRoutedRecord | PriceAlertBusRoutedRecord | ConditionAlertBusRoutedRecord, ...
+    ]:
         return self._notification_events(
             after_sequence=after_sequence,
             through_sequence=through_sequence,
@@ -2235,10 +2284,12 @@ class SignalBusStore:
         SignalBusSignalRecord
         | SignalBusRoutedRecord
         | PriceAlertBusEventRecord
-        | PriceAlertBusRoutedRecord,
+        | PriceAlertBusRoutedRecord
+        | ConditionAlertBusEventRecord
+        | ConditionAlertBusRoutedRecord,
         ...,
     ]:
-        from rquant.price_alert_route import PriceAlertBusEventRecord, notification_record
+        from rquant.condition_alert_route import notification_record
 
         if (
             type(after_sequence) is not int
@@ -2269,7 +2320,13 @@ class SignalBusStore:
                     raise ValueError("mixed notification source has a sequence gap")
                 available_at = (
                     record.event.available_at
-                    if isinstance(record, PriceAlertBusEventRecord)
+                    if type(record)
+                    in {
+                        PriceAlertBusEventRecord,
+                        PriceAlertBusRoutedRecord,
+                        ConditionAlertBusEventRecord,
+                        ConditionAlertBusRoutedRecord,
+                    }
                     else record.signal.available_at
                 )
                 if record.received_at > visible_at or available_at > visible_at:

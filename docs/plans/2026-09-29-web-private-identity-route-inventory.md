@@ -1,6 +1,6 @@
 # Web `current_user` 路由清单
 
-对应 [私有身份边界](2026-09-29-web-private-identity-boundary.md)。以下为当前代码中的全部 121 个 `current_user` 依赖路由；`/api/v1` 前缀已包含。公开类即使收到裸用户头，也只得到 `viewer=None`，不能据此取得身份。私有类统一使用已验证的代理身份；已有 CSRF、角色和业务条件仍单独检查。
+对应 [私有身份边界](2026-09-29-web-private-identity-boundary.md)。以下为当前代码中的全部 135 个 `current_user` 依赖路由；`/api/v1` 前缀已包含。公开类即使收到裸用户头，也只得到 `viewer=None`，不能据此取得身份。私有类统一使用已验证的代理身份；已有 CSRF、角色和业务条件仍单独检查。
 
 ## 公开读取（20）
 
@@ -27,7 +27,7 @@
 | GET | `/api/v1/data/issues` |
 | GET | `/api/v1/data/fundamentals/summary` |
 
-## 私有读取（59）
+## 私有读取（66）
 
 | 方法 | 路径 |
 |---|---|
@@ -90,10 +90,17 @@
 | GET | `/api/v1/experiments/compare` |
 | GET | `/api/v1/experiments/families/{family_id}/heatmap` |
 | GET | `/api/v1/experiments/results/{experiment_id}/statistics` |
+| GET | `/api/v1/screen/query/history` |
+| GET | `/api/v1/screen/query/presets` |
+| GET | `/api/v1/screen/query/executions/{execution_id}` |
+| GET | `/api/v1/screen/query/executions/{execution_id}/results` |
+| GET | `/api/v1/screen/query/alert-drafts/{draft_id}` |
+| GET | `/api/v1/monitor/condition-rules` |
+| GET | `/api/v1/monitor/condition-rules/head` |
 
 名单按认证 owner 过滤。服务日志能力在未登录时只返回空列表，日志正文仍拒绝；普通任务、池子、监控、研究和审计页面则直接返回 401。公开的 `meta` 在没有有效证明时不显示 viewer。
 
-## 受保护操作（42）
+## 受保护操作（49）
 
 | 方法 | 路径 |
 |---|---|
@@ -139,6 +146,13 @@
 | POST | `/api/v1/strategy-templates/commands/resume` |
 | POST | `/api/v1/strategy-templates/{strategy_id}/runs` |
 | POST | `/api/v1/strategy-templates/{strategy_id}/runs/resume` |
+| POST | `/api/v1/screen/query/execute` |
+| POST | `/api/v1/screen/query/lookup` |
+| POST | `/api/v1/screen/query/resume` |
+| POST | `/api/v1/screen/query/presets/save` |
+| POST | `/api/v1/screen/query/alert-draft` |
+| POST | `/api/v1/monitor/condition-rules/commands` |
+| POST | `/api/v1/monitor/condition-rules/commands/resume` |
 
 公式检查、单股预览、运行选股及自然语言预览不持久写入，但会消耗计算或付费模型资源，所以按受保护操作处理。其余操作由现有 CSRF 与命令准入继续约束；代理证明不替代这些条件。
 

@@ -65,6 +65,7 @@ class PaperSignalPolicySettings(RuntimeContractModel):
 
 
 class PaperConsumerSettings(PaperSignalPolicySettings):
+    condition_history_enabled: StrictBool = False
     signal_bus_path: Path
     queue_path: Path
     consumer_state_path: Path
@@ -81,6 +82,7 @@ class PaperConsumerSettings(PaperSignalPolicySettings):
 
 
 class PaperBrokerSettings(PaperSignalPolicySettings):
+    condition_history_enabled: StrictBool = False
     signal_spool_root: Path
     queue_path: Path
     consumer_state_path: Path
@@ -195,6 +197,8 @@ def paper_consumer_builder(*, clock: Callable[[], datetime]) -> RuntimeServiceBu
             settings.consumer_state_path,
             busy_timeout_ms=settings.busy_timeout_ms,
         )
+        if settings.condition_history_enabled:
+            state.install_condition_notification_history()
 
         def step() -> RuntimeStepResult:
             if settings.paused:
@@ -334,6 +338,8 @@ def paper_broker_builder(
             settings.consumer_state_path,
             busy_timeout_ms=settings.busy_timeout_ms,
         )
+        if settings.condition_history_enabled:
+            state.install_condition_notification_history()
         authority_publisher = None
         portfolio_view_source = None
         portfolio_sequence_floor = None

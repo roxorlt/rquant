@@ -4266,6 +4266,1701 @@
         "title": "ClosedDayRows",
         "type": "object"
       },
+      "ConditionAlertBarCloseFrequency": {
+        "additionalProperties": false,
+        "properties": {
+          "bar_size": {
+            "const": "1min",
+            "default": "1min",
+            "title": "Bar Size",
+            "type": "string"
+          },
+          "kind": {
+            "const": "bar_close",
+            "default": "bar_close",
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "title": "ConditionAlertBarCloseFrequency",
+        "type": "object"
+      },
+      "ConditionAlertEventEnvelope": {
+        "additionalProperties": false,
+        "properties": {
+          "available_at": {
+            "format": "date-time",
+            "title": "Available At",
+            "type": "string"
+          },
+          "channels": {
+            "items": {
+              "$ref": "#/components/schemas/DeliveryChannel"
+            },
+            "maxItems": 2,
+            "minItems": 1,
+            "title": "Channels",
+            "type": "array"
+          },
+          "daily_anchor_date": {
+            "format": "date",
+            "title": "Daily Anchor Date",
+            "type": "string"
+          },
+          "decision_time": {
+            "format": "date-time",
+            "title": "Decision Time",
+            "type": "string"
+          },
+          "envelope_schema": {
+            "const": "rquant.condition-alert-event/v1",
+            "default": "rquant.condition-alert-event/v1",
+            "title": "Envelope Schema",
+            "type": "string"
+          },
+          "evaluation_contract_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Evaluation Contract Sha256",
+            "type": "string"
+          },
+          "event_id": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Event Id",
+            "type": "string"
+          },
+          "event_time": {
+            "format": "date-time",
+            "title": "Event Time",
+            "type": "string"
+          },
+          "expires_at": {
+            "format": "date-time",
+            "title": "Expires At",
+            "type": "string"
+          },
+          "feature_snapshot_id": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Feature Snapshot Id",
+            "type": "string"
+          },
+          "frequency_bucket": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Frequency Bucket",
+            "type": "string"
+          },
+          "frequency_policy_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Frequency Policy Sha256",
+            "type": "string"
+          },
+          "member_digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Member Digest",
+            "type": "string"
+          },
+          "owner_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Owner Id",
+            "type": "string"
+          },
+          "previous_truth": {
+            "enum": [
+              "true",
+              "false",
+              "unknown"
+            ],
+            "title": "Previous Truth",
+            "type": "string"
+          },
+          "priority": {
+            "enum": [
+              "P0",
+              "P1",
+              "P2",
+              "P3"
+            ],
+            "title": "Priority",
+            "type": "string"
+          },
+          "producer_commit": {
+            "pattern": "^[0-9a-f]{40}$",
+            "title": "Producer Commit",
+            "type": "string"
+          },
+          "producer_manifest_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Producer Manifest Sha256",
+            "type": "string"
+          },
+          "raw_batch_id": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Raw Batch Id",
+            "type": "string"
+          },
+          "rule_body_hash": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Rule Body Hash",
+            "type": "string"
+          },
+          "rule_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Rule Id",
+            "type": "string"
+          },
+          "rule_name": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Rule Name",
+            "type": "string"
+          },
+          "rule_version": {
+            "minimum": 1.0,
+            "title": "Rule Version",
+            "type": "integer"
+          },
+          "scope_version": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Scope Version",
+            "type": "string"
+          },
+          "source_epoch": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Source Epoch",
+            "type": "string"
+          },
+          "source_identity": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Source Identity",
+            "type": "string"
+          },
+          "stock_name": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Stock Name",
+            "type": "string"
+          },
+          "trigger_kind": {
+            "enum": [
+              "matched",
+              "recovered"
+            ],
+            "title": "Trigger Kind",
+            "type": "string"
+          },
+          "truth": {
+            "enum": [
+              "true",
+              "false"
+            ],
+            "title": "Truth",
+            "type": "string"
+          },
+          "ts_code": {
+            "pattern": "^[0-9]{6}\\.(?:SH|SZ|BJ)$",
+            "title": "Ts Code",
+            "type": "string"
+          }
+        },
+        "required": [
+          "owner_id",
+          "rule_id",
+          "rule_name",
+          "priority",
+          "channels",
+          "rule_version",
+          "rule_body_hash",
+          "scope_version",
+          "member_digest",
+          "ts_code",
+          "stock_name",
+          "trigger_kind",
+          "previous_truth",
+          "truth",
+          "source_identity",
+          "raw_batch_id",
+          "feature_snapshot_id",
+          "daily_anchor_date",
+          "event_time",
+          "decision_time",
+          "available_at",
+          "expires_at",
+          "evaluation_contract_sha256",
+          "frequency_policy_sha256",
+          "frequency_bucket",
+          "producer_manifest_sha256",
+          "producer_commit",
+          "source_epoch",
+          "event_id"
+        ],
+        "title": "ConditionAlertEventEnvelope",
+        "type": "object"
+      },
+      "ConditionAlertEveryEvaluationFrequency": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "const": "every_evaluation",
+            "default": "every_evaluation",
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "title": "ConditionAlertEveryEvaluationFrequency",
+        "type": "object"
+      },
+      "ConditionAlertGovernance": {
+        "additionalProperties": false,
+        "properties": {
+          "channels": {
+            "items": {
+              "$ref": "#/components/schemas/DeliveryChannel"
+            },
+            "maxItems": 2,
+            "minItems": 1,
+            "title": "Channels",
+            "type": "array"
+          },
+          "dedup_window_seconds": {
+            "default": 60,
+            "maximum": 3600.0,
+            "minimum": 0.0,
+            "title": "Dedup Window Seconds",
+            "type": "integer"
+          },
+          "notify_recovery": {
+            "default": false,
+            "title": "Notify Recovery",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "channels"
+        ],
+        "title": "ConditionAlertGovernance",
+        "type": "object"
+      },
+      "ConditionAlertMarketScope": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "const": "market",
+            "default": "market",
+            "title": "Kind",
+            "type": "string"
+          },
+          "universe_policy": {
+            "const": "trusted_current",
+            "default": "trusted_current",
+            "title": "Universe Policy",
+            "type": "string"
+          }
+        },
+        "title": "ConditionAlertMarketScope",
+        "type": "object"
+      },
+      "ConditionAlertOrigin": {
+        "additionalProperties": false,
+        "properties": {
+          "command_hash": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Command Hash",
+            "type": "string"
+          },
+          "cutoff": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cutoff"
+          },
+          "definition_hash": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Definition Hash",
+            "type": "string"
+          },
+          "draft_id": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{24}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Draft Id"
+          },
+          "execution_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Execution Id",
+            "type": "string"
+          },
+          "member_rank_digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Member Rank Digest",
+            "type": "string"
+          },
+          "mode": {
+            "enum": [
+              "daily",
+              "intraday"
+            ],
+            "title": "Mode",
+            "type": "string"
+          },
+          "result_digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Result Digest",
+            "type": "string"
+          },
+          "source_identity": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Source Identity",
+            "type": "string"
+          },
+          "trade_date": {
+            "format": "date",
+            "title": "Trade Date",
+            "type": "string"
+          }
+        },
+        "required": [
+          "execution_id",
+          "command_hash",
+          "definition_hash",
+          "result_digest",
+          "member_rank_digest",
+          "source_identity",
+          "mode",
+          "trade_date"
+        ],
+        "title": "ConditionAlertOrigin",
+        "type": "object"
+      },
+      "ConditionAlertPerSymbolMinutesFrequency": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "const": "per_symbol_minutes",
+            "default": "per_symbol_minutes",
+            "title": "Kind",
+            "type": "string"
+          },
+          "minutes": {
+            "maximum": 60.0,
+            "minimum": 1.0,
+            "title": "Minutes",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "minutes"
+        ],
+        "title": "ConditionAlertPerSymbolMinutesFrequency",
+        "type": "object"
+      },
+      "ConditionAlertPoolScope": {
+        "additionalProperties": false,
+        "properties": {
+          "definition_version": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Definition Version",
+            "type": "string"
+          },
+          "kind": {
+            "const": "pool",
+            "default": "pool",
+            "title": "Kind",
+            "type": "string"
+          },
+          "pool_name": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Pool Name",
+            "type": "string"
+          },
+          "result_version": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Result Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "pool_name",
+          "definition_version",
+          "result_version"
+        ],
+        "title": "ConditionAlertPoolScope",
+        "type": "object"
+      },
+      "ConditionAlertRouteReceipt": {
+        "additionalProperties": false,
+        "properties": {
+          "decision_fingerprint": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Decision Fingerprint",
+            "type": "string"
+          },
+          "disposition": {
+            "enum": [
+              "routed",
+              "no_target",
+              "expired"
+            ],
+            "title": "Disposition",
+            "type": "string"
+          },
+          "event_id": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Event Id",
+            "type": "string"
+          },
+          "owner_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Owner Id",
+            "type": "string"
+          },
+          "reason_code": {
+            "anyOf": [
+              {
+                "enum": [
+                  "no_owner_target",
+                  "target_capability_unavailable",
+                  "binding_inactive",
+                  "routing_policy_retired"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason Code"
+          },
+          "receipt_schema": {
+            "const": "rquant.condition-alert-route-receipt/v1",
+            "default": "rquant.condition-alert-route-receipt/v1",
+            "title": "Receipt Schema",
+            "type": "string"
+          },
+          "routed_at": {
+            "format": "date-time",
+            "title": "Routed At",
+            "type": "string"
+          },
+          "routing_policy_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Routing Policy Sha256",
+            "type": "string"
+          },
+          "rule_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Rule Id",
+            "type": "string"
+          },
+          "rule_version": {
+            "minimum": 1.0,
+            "title": "Rule Version",
+            "type": "integer"
+          },
+          "scope_version": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Scope Version",
+            "type": "string"
+          },
+          "source_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Source Id",
+            "type": "string"
+          },
+          "source_inspected_at": {
+            "format": "date-time",
+            "title": "Source Inspected At",
+            "type": "string"
+          },
+          "source_sequence": {
+            "minimum": 1.0,
+            "title": "Source Sequence",
+            "type": "integer"
+          },
+          "target_count": {
+            "maximum": 2.0,
+            "minimum": 0.0,
+            "title": "Target Count",
+            "type": "integer"
+          },
+          "target_manifest_hash": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Target Manifest Hash",
+            "type": "string"
+          },
+          "targets": {
+            "items": {
+              "$ref": "#/components/schemas/DeliveryTarget"
+            },
+            "maxItems": 2,
+            "title": "Targets",
+            "type": "array"
+          }
+        },
+        "required": [
+          "source_id",
+          "source_sequence",
+          "event_id",
+          "owner_id",
+          "rule_id",
+          "rule_version",
+          "scope_version",
+          "decision_fingerprint",
+          "disposition",
+          "reason_code",
+          "routing_policy_sha256",
+          "target_manifest_hash",
+          "targets",
+          "target_count",
+          "source_inspected_at",
+          "routed_at"
+        ],
+        "title": "ConditionAlertRouteReceipt",
+        "type": "object"
+      },
+      "ConditionAlertRuleCommandReceipt": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "enum": [
+              "save",
+              "set_enabled",
+              "delete"
+            ],
+            "title": "Action",
+            "type": "string"
+          },
+          "command_id": {
+            "title": "Command Id",
+            "type": "string"
+          },
+          "consumer_state": {
+            "default": "unknown",
+            "enum": [
+              "active",
+              "unknown"
+            ],
+            "title": "Consumer State",
+            "type": "string"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "rule_id": {
+            "title": "Rule Id",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "pending",
+              "processing",
+              "saved_syncing",
+              "published",
+              "superseded",
+              "conflict",
+              "capacity",
+              "scope_invalid",
+              "failed",
+              "rejected",
+              "uncertain",
+              "not_found"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "version": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Version"
+          }
+        },
+        "required": [
+          "command_id",
+          "rule_id",
+          "action",
+          "status",
+          "message"
+        ],
+        "title": "ConditionAlertRuleCommandReceipt",
+        "type": "object"
+      },
+      "ConditionAlertRuleCommandRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "enum": [
+              "save",
+              "set_enabled",
+              "delete"
+            ],
+            "title": "Action",
+            "type": "string"
+          },
+          "command_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Command Id",
+            "type": "string"
+          },
+          "enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enabled"
+          },
+          "expected_version": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Version"
+          },
+          "generation_id": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Generation Id",
+            "type": "string"
+          },
+          "requested_at": {
+            "format": "date-time",
+            "title": "Requested At",
+            "type": "string"
+          },
+          "rule": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ConditionAlertRuleDefinition-Input"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "rule_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Rule Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "command_id",
+          "requested_at",
+          "generation_id",
+          "rule_id",
+          "action"
+        ],
+        "title": "ConditionAlertRuleCommandRequest",
+        "type": "object"
+      },
+      "ConditionAlertRuleDefinition-Input": {
+        "additionalProperties": false,
+        "properties": {
+          "conditions": {
+            "items": {
+              "$ref": "#/components/schemas/RuleCall"
+            },
+            "maxItems": 26,
+            "minItems": 1,
+            "title": "Conditions",
+            "type": "array"
+          },
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "frequency": {
+            "default": {
+              "kind": "every_evaluation"
+            },
+            "discriminator": {
+              "mapping": {
+                "bar_close": "#/components/schemas/ConditionAlertBarCloseFrequency",
+                "every_evaluation": "#/components/schemas/ConditionAlertEveryEvaluationFrequency",
+                "per_symbol_minutes": "#/components/schemas/ConditionAlertPerSymbolMinutesFrequency"
+              },
+              "propertyName": "kind"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ConditionAlertEveryEvaluationFrequency"
+              },
+              {
+                "$ref": "#/components/schemas/ConditionAlertPerSymbolMinutesFrequency"
+              },
+              {
+                "$ref": "#/components/schemas/ConditionAlertBarCloseFrequency"
+              }
+            ],
+            "title": "Frequency"
+          },
+          "governance": {
+            "$ref": "#/components/schemas/ConditionAlertGovernance"
+          },
+          "name": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "origin": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ConditionAlertOrigin"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "priority": {
+            "enum": [
+              "P0",
+              "P1",
+              "P2",
+              "P3"
+            ],
+            "title": "Priority",
+            "type": "string"
+          },
+          "ranking": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ScreenRankingPlan"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "rule_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Rule Id",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "scope": {
+            "discriminator": {
+              "mapping": {
+                "market": "#/components/schemas/ConditionAlertMarketScope",
+                "pool": "#/components/schemas/ConditionAlertPoolScope",
+                "sector": "#/components/schemas/ConditionAlertSectorScope",
+                "watchlist": "#/components/schemas/ConditionAlertWatchlistScope"
+              },
+              "propertyName": "kind"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ConditionAlertMarketScope"
+              },
+              {
+                "$ref": "#/components/schemas/ConditionAlertPoolScope"
+              },
+              {
+                "$ref": "#/components/schemas/ConditionAlertWatchlistScope"
+              },
+              {
+                "$ref": "#/components/schemas/ConditionAlertSectorScope"
+              }
+            ],
+            "title": "Scope"
+          },
+          "source_policy": {
+            "$ref": "#/components/schemas/ConditionAlertSourcePolicy",
+            "default": {
+              "condition_semantics_version": "screen-registry/v1",
+              "daily_anchor": "previous_closed_session",
+              "intraday_contract_id": "intraday-pit",
+              "minimum_intraday_contract_version": 3
+            }
+          },
+          "trading_hours": {
+            "$ref": "#/components/schemas/ConditionAlertTradingHours-Input",
+            "default": {
+              "timezone": "Asia/Shanghai",
+              "windows": [
+                {
+                  "end": "11:30:00",
+                  "start": "09:30:00"
+                },
+                {
+                  "end": "14:57:00",
+                  "start": "13:00:00"
+                }
+              ]
+            }
+          }
+        },
+        "required": [
+          "rule_id",
+          "name",
+          "priority",
+          "enabled",
+          "conditions",
+          "scope",
+          "governance"
+        ],
+        "title": "ConditionAlertRuleDefinition",
+        "type": "object"
+      },
+      "ConditionAlertRuleDefinition-Output": {
+        "additionalProperties": false,
+        "properties": {
+          "conditions": {
+            "items": {
+              "$ref": "#/components/schemas/RuleCall"
+            },
+            "maxItems": 26,
+            "minItems": 1,
+            "title": "Conditions",
+            "type": "array"
+          },
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "frequency": {
+            "default": {
+              "kind": "every_evaluation"
+            },
+            "discriminator": {
+              "mapping": {
+                "bar_close": "#/components/schemas/ConditionAlertBarCloseFrequency",
+                "every_evaluation": "#/components/schemas/ConditionAlertEveryEvaluationFrequency",
+                "per_symbol_minutes": "#/components/schemas/ConditionAlertPerSymbolMinutesFrequency"
+              },
+              "propertyName": "kind"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ConditionAlertEveryEvaluationFrequency"
+              },
+              {
+                "$ref": "#/components/schemas/ConditionAlertPerSymbolMinutesFrequency"
+              },
+              {
+                "$ref": "#/components/schemas/ConditionAlertBarCloseFrequency"
+              }
+            ],
+            "title": "Frequency"
+          },
+          "governance": {
+            "$ref": "#/components/schemas/ConditionAlertGovernance"
+          },
+          "name": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "origin": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ConditionAlertOrigin"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "priority": {
+            "enum": [
+              "P0",
+              "P1",
+              "P2",
+              "P3"
+            ],
+            "title": "Priority",
+            "type": "string"
+          },
+          "ranking": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ScreenRankingPlan"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "rule_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Rule Id",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "scope": {
+            "discriminator": {
+              "mapping": {
+                "market": "#/components/schemas/ConditionAlertMarketScope",
+                "pool": "#/components/schemas/ConditionAlertPoolScope",
+                "sector": "#/components/schemas/ConditionAlertSectorScope",
+                "watchlist": "#/components/schemas/ConditionAlertWatchlistScope"
+              },
+              "propertyName": "kind"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ConditionAlertMarketScope"
+              },
+              {
+                "$ref": "#/components/schemas/ConditionAlertPoolScope"
+              },
+              {
+                "$ref": "#/components/schemas/ConditionAlertWatchlistScope"
+              },
+              {
+                "$ref": "#/components/schemas/ConditionAlertSectorScope"
+              }
+            ],
+            "title": "Scope"
+          },
+          "source_policy": {
+            "$ref": "#/components/schemas/ConditionAlertSourcePolicy",
+            "default": {
+              "condition_semantics_version": "screen-registry/v1",
+              "daily_anchor": "previous_closed_session",
+              "intraday_contract_id": "intraday-pit",
+              "minimum_intraday_contract_version": 3
+            }
+          },
+          "trading_hours": {
+            "$ref": "#/components/schemas/ConditionAlertTradingHours-Output",
+            "default": {
+              "timezone": "Asia/Shanghai",
+              "windows": [
+                {
+                  "end": "11:30:00",
+                  "start": "09:30:00"
+                },
+                {
+                  "end": "14:57:00",
+                  "start": "13:00:00"
+                }
+              ]
+            }
+          }
+        },
+        "required": [
+          "rule_id",
+          "name",
+          "priority",
+          "enabled",
+          "conditions",
+          "scope",
+          "governance"
+        ],
+        "title": "ConditionAlertRuleDefinition",
+        "type": "object"
+      },
+      "ConditionAlertRuleHeadData": {
+        "additionalProperties": false,
+        "properties": {
+          "availability": {
+            "enum": [
+              "ready",
+              "not_activated",
+              "unavailable"
+            ],
+            "title": "Availability",
+            "type": "string"
+          },
+          "item": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ConditionAlertRuleItem"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "rule_id": {
+            "title": "Rule Id",
+            "type": "string"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "enum": [
+                  "live",
+                  "deleted",
+                  "absent"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status"
+          },
+          "version": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Version"
+          }
+        },
+        "required": [
+          "availability",
+          "rule_id",
+          "status",
+          "version",
+          "item"
+        ],
+        "title": "ConditionAlertRuleHeadData",
+        "type": "object"
+      },
+      "ConditionAlertRuleItem": {
+        "additionalProperties": false,
+        "properties": {
+          "evaluated_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Evaluated At"
+          },
+          "last_triggered_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Triggered At"
+          },
+          "matched_count": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Matched Count"
+          },
+          "ranking_digest": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ranking Digest"
+          },
+          "rule": {
+            "$ref": "#/components/schemas/ConditionAlertRuleDefinition-Output"
+          },
+          "rule_id": {
+            "title": "Rule Id",
+            "type": "string"
+          },
+          "scope_message": {
+            "title": "Scope Message",
+            "type": "string"
+          },
+          "scope_status": {
+            "enum": [
+              "bound",
+              "unavailable"
+            ],
+            "title": "Scope Status",
+            "type": "string"
+          },
+          "status_label": {
+            "default": "未运行",
+            "enum": [
+              "正常",
+              "注意",
+              "异常",
+              "未运行",
+              "等待开盘"
+            ],
+            "title": "Status Label",
+            "type": "string"
+          },
+          "unknown_count": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unknown Count"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
+            "type": "string"
+          },
+          "version": {
+            "minimum": 1.0,
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "rule_id",
+          "version",
+          "rule",
+          "updated_at",
+          "scope_status",
+          "scope_message"
+        ],
+        "title": "ConditionAlertRuleItem",
+        "type": "object"
+      },
+      "ConditionAlertRuleListData": {
+        "additionalProperties": false,
+        "properties": {
+          "availability": {
+            "enum": [
+              "ready",
+              "not_activated",
+              "unavailable"
+            ],
+            "title": "Availability",
+            "type": "string"
+          },
+          "available_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Available At"
+          },
+          "blocks": {
+            "items": {
+              "$ref": "#/components/schemas/ScreenBlock"
+            },
+            "maxItems": 26,
+            "title": "Blocks",
+            "type": "array"
+          },
+          "can_enable": {
+            "title": "Can Enable",
+            "type": "boolean"
+          },
+          "can_write": {
+            "title": "Can Write",
+            "type": "boolean"
+          },
+          "enable_message": {
+            "title": "Enable Message",
+            "type": "string"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/ConditionAlertRuleItem"
+            },
+            "maxItems": 100,
+            "title": "Items",
+            "type": "array"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "ranking_metrics": {
+            "items": {
+              "$ref": "#/components/schemas/ScreenOption"
+            },
+            "title": "Ranking Metrics",
+            "type": "array"
+          },
+          "scopes": {
+            "items": {
+              "$ref": "#/components/schemas/ConditionAlertScopeOption"
+            },
+            "maxItems": 1000,
+            "title": "Scopes",
+            "type": "array"
+          },
+          "triggers": {
+            "items": {
+              "$ref": "#/components/schemas/ConditionAlertTriggerItem"
+            },
+            "maxItems": 100,
+            "title": "Triggers",
+            "type": "array"
+          },
+          "write_message": {
+            "title": "Write Message",
+            "type": "string"
+          }
+        },
+        "required": [
+          "availability",
+          "message",
+          "available_at",
+          "items",
+          "scopes",
+          "blocks",
+          "ranking_metrics",
+          "can_write",
+          "write_message",
+          "can_enable",
+          "enable_message",
+          "triggers"
+        ],
+        "title": "ConditionAlertRuleListData",
+        "type": "object"
+      },
+      "ConditionAlertScopeOption": {
+        "additionalProperties": false,
+        "properties": {
+          "available": {
+            "title": "Available",
+            "type": "boolean"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "member_count": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Member Count"
+          },
+          "message": {
+            "default": "",
+            "title": "Message",
+            "type": "string"
+          },
+          "scope": {
+            "discriminator": {
+              "mapping": {
+                "market": "#/components/schemas/ConditionAlertMarketScope",
+                "pool": "#/components/schemas/ConditionAlertPoolScope",
+                "sector": "#/components/schemas/ConditionAlertSectorScope",
+                "watchlist": "#/components/schemas/ConditionAlertWatchlistScope"
+              },
+              "propertyName": "kind"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ConditionAlertMarketScope"
+              },
+              {
+                "$ref": "#/components/schemas/ConditionAlertPoolScope"
+              },
+              {
+                "$ref": "#/components/schemas/ConditionAlertWatchlistScope"
+              },
+              {
+                "$ref": "#/components/schemas/ConditionAlertSectorScope"
+              }
+            ],
+            "title": "Scope"
+          }
+        },
+        "required": [
+          "label",
+          "scope",
+          "available"
+        ],
+        "title": "ConditionAlertScopeOption",
+        "type": "object"
+      },
+      "ConditionAlertSectorScope": {
+        "additionalProperties": false,
+        "properties": {
+          "component_source_version": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Component Source Version",
+            "type": "string"
+          },
+          "kind": {
+            "const": "sector",
+            "default": "sector",
+            "title": "Kind",
+            "type": "string"
+          },
+          "sector_code": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Sector Code",
+            "type": "string"
+          },
+          "sector_system": {
+            "enum": [
+              "industry",
+              "concept"
+            ],
+            "title": "Sector System",
+            "type": "string"
+          }
+        },
+        "required": [
+          "sector_system",
+          "sector_code",
+          "component_source_version"
+        ],
+        "title": "ConditionAlertSectorScope",
+        "type": "object"
+      },
+      "ConditionAlertSourcePolicy": {
+        "additionalProperties": false,
+        "properties": {
+          "condition_semantics_version": {
+            "const": "screen-registry/v1",
+            "default": "screen-registry/v1",
+            "title": "Condition Semantics Version",
+            "type": "string"
+          },
+          "daily_anchor": {
+            "const": "previous_closed_session",
+            "default": "previous_closed_session",
+            "title": "Daily Anchor",
+            "type": "string"
+          },
+          "intraday_contract_id": {
+            "const": "intraday-pit",
+            "default": "intraday-pit",
+            "title": "Intraday Contract Id",
+            "type": "string"
+          },
+          "minimum_intraday_contract_version": {
+            "default": 3,
+            "enum": [
+              3,
+              4
+            ],
+            "title": "Minimum Intraday Contract Version",
+            "type": "integer"
+          }
+        },
+        "title": "ConditionAlertSourcePolicy",
+        "type": "object"
+      },
+      "ConditionAlertTargetReceipt": {
+        "additionalProperties": false,
+        "properties": {
+          "attempted_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Attempted At"
+          },
+          "channel": {
+            "enum": [
+              "pushdeer",
+              "pushplus"
+            ],
+            "title": "Channel",
+            "type": "string"
+          },
+          "provider_receipt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider Receipt"
+          },
+          "recipient_id": {
+            "title": "Recipient Id",
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "pending",
+              "succeeded",
+              "failed",
+              "unknown",
+              "cancelled"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "channel",
+          "recipient_id",
+          "state",
+          "attempted_at",
+          "provider_receipt"
+        ],
+        "title": "ConditionAlertTargetReceipt",
+        "type": "object"
+      },
+      "ConditionAlertTimeWindow-Input": {
+        "additionalProperties": false,
+        "properties": {
+          "end": {
+            "format": "time",
+            "title": "End",
+            "type": "string"
+          },
+          "start": {
+            "format": "time",
+            "title": "Start",
+            "type": "string"
+          }
+        },
+        "required": [
+          "start",
+          "end"
+        ],
+        "title": "ConditionAlertTimeWindow",
+        "type": "object"
+      },
+      "ConditionAlertTimeWindow-Output": {
+        "additionalProperties": false,
+        "properties": {
+          "end": {
+            "title": "End",
+            "type": "string"
+          },
+          "start": {
+            "title": "Start",
+            "type": "string"
+          }
+        },
+        "required": [
+          "start",
+          "end"
+        ],
+        "title": "ConditionAlertTimeWindow",
+        "type": "object"
+      },
+      "ConditionAlertTradingHours-Input": {
+        "additionalProperties": false,
+        "properties": {
+          "timezone": {
+            "const": "Asia/Shanghai",
+            "default": "Asia/Shanghai",
+            "title": "Timezone",
+            "type": "string"
+          },
+          "windows": {
+            "default": [
+              {
+                "end": "11:30:00",
+                "start": "09:30:00"
+              },
+              {
+                "end": "14:57:00",
+                "start": "13:00:00"
+              }
+            ],
+            "items": {
+              "$ref": "#/components/schemas/ConditionAlertTimeWindow-Input"
+            },
+            "title": "Windows",
+            "type": "array"
+          }
+        },
+        "title": "ConditionAlertTradingHours",
+        "type": "object"
+      },
+      "ConditionAlertTradingHours-Output": {
+        "additionalProperties": false,
+        "properties": {
+          "timezone": {
+            "const": "Asia/Shanghai",
+            "default": "Asia/Shanghai",
+            "title": "Timezone",
+            "type": "string"
+          },
+          "windows": {
+            "default": [
+              {
+                "end": "11:30:00",
+                "start": "09:30:00"
+              },
+              {
+                "end": "14:57:00",
+                "start": "13:00:00"
+              }
+            ],
+            "items": {
+              "$ref": "#/components/schemas/ConditionAlertTimeWindow-Output"
+            },
+            "title": "Windows",
+            "type": "array"
+          }
+        },
+        "title": "ConditionAlertTradingHours",
+        "type": "object"
+      },
+      "ConditionAlertTriggerItem": {
+        "additionalProperties": false,
+        "properties": {
+          "attempted_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Attempted At"
+          },
+          "delivery_state": {
+            "enum": [
+              "pending",
+              "succeeded",
+              "failed",
+              "unknown",
+              "cancelled"
+            ],
+            "title": "Delivery State",
+            "type": "string"
+          },
+          "event": {
+            "$ref": "#/components/schemas/ConditionAlertEventEnvelope"
+          },
+          "global_sequence": {
+            "minimum": 1.0,
+            "title": "Global Sequence",
+            "type": "integer"
+          },
+          "provider_receipt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider Receipt"
+          },
+          "route": {
+            "$ref": "#/components/schemas/ConditionAlertRouteReceipt"
+          },
+          "targets": {
+            "items": {
+              "$ref": "#/components/schemas/ConditionAlertTargetReceipt"
+            },
+            "maxItems": 2,
+            "title": "Targets",
+            "type": "array"
+          }
+        },
+        "required": [
+          "event",
+          "route",
+          "global_sequence",
+          "delivery_state"
+        ],
+        "title": "ConditionAlertTriggerItem",
+        "type": "object"
+      },
+      "ConditionAlertWatchlistScope": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "const": "watchlist",
+            "default": "watchlist",
+            "title": "Kind",
+            "type": "string"
+          },
+          "membership_version": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Membership Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "membership_version"
+        ],
+        "title": "ConditionAlertWatchlistScope",
+        "type": "object"
+      },
       "ConditionTemplateEntry": {
         "additionalProperties": false,
         "properties": {
@@ -4591,6 +6286,69 @@
           "description_zh"
         ],
         "title": "DailyFactorField",
+        "type": "object"
+      },
+      "DailyWriterCapability": {
+        "additionalProperties": false,
+        "properties": {
+          "canonical_generation_id": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Canonical Generation Id",
+            "type": "string"
+          },
+          "canonical_receipt_id": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Canonical Receipt Id",
+            "type": "string"
+          },
+          "completed_at": {
+            "format": "date-time",
+            "title": "Completed At",
+            "type": "string"
+          },
+          "contract": {
+            "const": "daily-screen-writer/v1",
+            "default": "daily-screen-writer/v1",
+            "title": "Contract",
+            "type": "string"
+          },
+          "serving_generation_id": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Serving Generation Id",
+            "type": "string"
+          },
+          "source_generation_id": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Source Generation Id",
+            "type": "string"
+          },
+          "verified_evidence_version": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Verified Evidence Version",
+            "type": "string"
+          },
+          "verified_result_version": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Verified Result Version",
+            "type": "string"
+          },
+          "writer_contract_fingerprint": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Writer Contract Fingerprint",
+            "type": "string"
+          }
+        },
+        "required": [
+          "serving_generation_id",
+          "writer_contract_fingerprint",
+          "verified_result_version",
+          "verified_evidence_version",
+          "completed_at",
+          "canonical_receipt_id",
+          "canonical_generation_id",
+          "source_generation_id"
+        ],
+        "title": "DailyWriterCapability",
         "type": "object"
       },
       "DataAuditHealthData": {
@@ -5229,6 +6987,33 @@
         "title": "DeliveriesSummary",
         "type": "object"
       },
+      "DeliveryChannel": {
+        "enum": [
+          "pushdeer",
+          "pushplus"
+        ],
+        "title": "DeliveryChannel",
+        "type": "string"
+      },
+      "DeliveryTarget": {
+        "additionalProperties": false,
+        "properties": {
+          "channel": {
+            "$ref": "#/components/schemas/DeliveryChannel"
+          },
+          "recipient_id": {
+            "minLength": 1,
+            "title": "Recipient Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "recipient_id",
+          "channel"
+        ],
+        "title": "DeliveryTarget",
+        "type": "object"
+      },
       "DrawdownDecision": {
         "additionalProperties": false,
         "properties": {
@@ -5686,6 +7471,38 @@
           "serving"
         ],
         "title": "Envelope[CatalogList]",
+        "type": "object"
+      },
+      "Envelope_ConditionAlertRuleHeadData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/ConditionAlertRuleHeadData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[ConditionAlertRuleHeadData]",
+        "type": "object"
+      },
+      "Envelope_ConditionAlertRuleListData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/ConditionAlertRuleListData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[ConditionAlertRuleListData]",
         "type": "object"
       },
       "Envelope_DailyData_": {
@@ -6911,6 +8728,45 @@
           "message"
         ],
         "title": "ErrorItem",
+        "type": "object"
+      },
+      "ExecuteScreenQuery": {
+        "additionalProperties": false,
+        "properties": {
+          "command_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Command Id",
+            "type": "string"
+          },
+          "definition": {
+            "$ref": "#/components/schemas/ScreenQueryDefinition"
+          },
+          "kind": {
+            "const": "execute_screen_query",
+            "default": "execute_screen_query",
+            "title": "Kind",
+            "type": "string"
+          },
+          "page_size": {
+            "default": 20,
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Page Size",
+            "type": "integer"
+          },
+          "requested_at": {
+            "format": "date-time",
+            "title": "Requested At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "command_id",
+          "requested_at",
+          "definition"
+        ],
+        "title": "ExecuteScreenQuery",
         "type": "object"
       },
       "ExecutionCostApplicability": {
@@ -23987,6 +25843,162 @@
         "title": "ProjectionInfo",
         "type": "object"
       },
+      "PublishedDailyScreenEvidence": {
+        "additionalProperties": false,
+        "properties": {
+          "canonical_generation_id": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Canonical Generation Id"
+          },
+          "canonical_receipt_id": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Canonical Receipt Id"
+          },
+          "completed_at": {
+            "format": "date-time",
+            "title": "Completed At",
+            "type": "string"
+          },
+          "content_digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Content Digest",
+            "type": "string"
+          },
+          "decision_at": {
+            "format": "date-time",
+            "title": "Decision At",
+            "type": "string"
+          },
+          "definition_version": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Definition Version",
+            "type": "string"
+          },
+          "evidence_version": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Evidence Version",
+            "type": "string"
+          },
+          "hit_count": {
+            "maximum": 8000.0,
+            "minimum": 0.0,
+            "title": "Hit Count",
+            "type": "integer"
+          },
+          "member_rank_digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Member Rank Digest",
+            "type": "string"
+          },
+          "persisted_extra_digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Persisted Extra Digest",
+            "type": "string"
+          },
+          "preset_name": {
+            "title": "Preset Name",
+            "type": "string"
+          },
+          "ranking_plan_digest": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ranking Plan Digest"
+          },
+          "result_version": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Result Version",
+            "type": "string"
+          },
+          "source_generation_id": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Generation Id"
+          },
+          "source_identity": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Source Identity",
+            "type": "string"
+          },
+          "source_kind": {
+            "const": "daily_writer",
+            "title": "Source Kind",
+            "type": "string"
+          },
+          "trade_date": {
+            "format": "date",
+            "title": "Trade Date",
+            "type": "string"
+          },
+          "universe_count": {
+            "maximum": 8000.0,
+            "minimum": 0.0,
+            "title": "Universe Count",
+            "type": "integer"
+          },
+          "unknown_count": {
+            "maximum": 8000.0,
+            "minimum": 0.0,
+            "title": "Unknown Count",
+            "type": "integer"
+          },
+          "writer_contract_fingerprint": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Writer Contract Fingerprint",
+            "type": "string"
+          }
+        },
+        "required": [
+          "trade_date",
+          "preset_name",
+          "definition_version",
+          "result_version",
+          "source_kind",
+          "source_identity",
+          "content_digest",
+          "decision_at",
+          "universe_count",
+          "hit_count",
+          "unknown_count",
+          "ranking_plan_digest",
+          "member_rank_digest",
+          "persisted_extra_digest",
+          "writer_contract_fingerprint",
+          "evidence_version",
+          "completed_at"
+        ],
+        "title": "PublishedDailyScreenEvidence",
+        "type": "object"
+      },
       "PublishedPool": {
         "properties": {
           "definition": {
@@ -25591,6 +27603,26 @@
         "title": "RoundTripStats",
         "type": "object"
       },
+      "RuleCall": {
+        "description": "单条积木调用。name 必须存在于 REGISTRY，args 由各 RuleSpec.args_model 校验。",
+        "properties": {
+          "args": {
+            "additionalProperties": true,
+            "title": "Args",
+            "type": "object"
+          },
+          "name": {
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "RuleCall",
+        "type": "object"
+      },
       "RunPaperPortfolioResearch": {
         "additionalProperties": false,
         "properties": {
@@ -26463,6 +28495,168 @@
         "title": "ScheduledTasksData",
         "type": "object"
       },
+      "ScreenAlertDraft": {
+        "additionalProperties": false,
+        "properties": {
+          "capabilities": {
+            "$ref": "#/components/schemas/ScreenAlertDraftCapabilities"
+          },
+          "conditions": {
+            "items": {
+              "$ref": "#/components/schemas/RuleCall"
+            },
+            "maxItems": 26,
+            "minItems": 1,
+            "title": "Conditions",
+            "type": "array"
+          },
+          "content_hash": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Content Hash"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "definition": {
+            "$ref": "#/components/schemas/ScreenQueryDefinition"
+          },
+          "draft_id": {
+            "pattern": "^[0-9a-f]{24}$",
+            "title": "Draft Id",
+            "type": "string"
+          },
+          "expires_at": {
+            "format": "date-time",
+            "title": "Expires At",
+            "type": "string"
+          },
+          "origin": {
+            "$ref": "#/components/schemas/ConditionAlertOrigin"
+          },
+          "preferred_scope": {
+            "$ref": "#/components/schemas/ConditionAlertMarketScope",
+            "default": {
+              "kind": "market",
+              "universe_policy": "trusted_current"
+            }
+          },
+          "ranking": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ScreenRankingPlan"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "source_policy": {
+            "$ref": "#/components/schemas/ConditionAlertSourcePolicy",
+            "default": {
+              "condition_semantics_version": "screen-registry/v1",
+              "daily_anchor": "previous_closed_session",
+              "intraday_contract_id": "intraday-pit",
+              "minimum_intraday_contract_version": 3
+            }
+          },
+          "suggested_name": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Suggested Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "draft_id",
+          "created_at",
+          "expires_at",
+          "suggested_name",
+          "origin",
+          "definition",
+          "conditions",
+          "ranking",
+          "capabilities"
+        ],
+        "title": "ScreenAlertDraft",
+        "type": "object"
+      },
+      "ScreenAlertDraftCapabilities": {
+        "additionalProperties": false,
+        "properties": {
+          "condition_count": {
+            "maximum": 26.0,
+            "minimum": 1.0,
+            "title": "Condition Count",
+            "type": "integer"
+          },
+          "consumer_state": {
+            "const": "awaiting_consumer",
+            "default": "awaiting_consumer",
+            "title": "Consumer State",
+            "type": "string"
+          },
+          "message": {
+            "default": "提醒草稿已生成，尚未生效。",
+            "title": "Message",
+            "type": "string"
+          },
+          "ranking_imported": {
+            "title": "Ranking Imported",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "condition_count",
+          "ranking_imported"
+        ],
+        "title": "ScreenAlertDraftCapabilities",
+        "type": "object"
+      },
+      "ScreenAlertDraftRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "command_hash": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Command Hash",
+            "type": "string"
+          },
+          "command_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Command Id",
+            "type": "string"
+          },
+          "execution_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Execution Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "command_id",
+          "execution_id",
+          "command_hash"
+        ],
+        "title": "ScreenAlertDraftRequest",
+        "type": "object"
+      },
       "ScreenBlock": {
         "properties": {
           "category": {
@@ -26550,7 +28744,8 @@
           "source_kind": {
             "enum": [
               "serving",
-              "replica"
+              "replica",
+              "intraday"
             ],
             "title": "Source Kind",
             "type": "string"
@@ -26585,6 +28780,302 @@
           "key"
         ],
         "title": "ScreenCondition",
+        "type": "object"
+      },
+      "ScreenExecuteAction": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "const": "execute",
+            "default": "execute",
+            "title": "Action",
+            "type": "string"
+          },
+          "command": {
+            "$ref": "#/components/schemas/ExecuteScreenQuery"
+          }
+        },
+        "required": [
+          "command"
+        ],
+        "title": "ScreenExecuteAction",
+        "type": "object"
+      },
+      "ScreenExecutionResults": {
+        "additionalProperties": false,
+        "properties": {
+          "artifact_sha256": {
+            "title": "Artifact Sha256",
+            "type": "string"
+          },
+          "execution_id": {
+            "title": "Execution Id",
+            "type": "string"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          },
+          "rows": {
+            "items": {
+              "$ref": "#/components/schemas/ScreenRow"
+            },
+            "title": "Rows",
+            "type": "array"
+          }
+        },
+        "required": [
+          "execution_id",
+          "artifact_sha256",
+          "rows",
+          "next_cursor"
+        ],
+        "title": "ScreenExecutionResults",
+        "type": "object"
+      },
+      "ScreenExecutionView": {
+        "additionalProperties": false,
+        "properties": {
+          "artifact_sha256": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Artifact Sha256"
+          },
+          "base_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Base Count"
+          },
+          "command_hash": {
+            "title": "Command Hash",
+            "type": "string"
+          },
+          "completed_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completed At"
+          },
+          "definition": {
+            "$ref": "#/components/schemas/ScreenQueryDefinition"
+          },
+          "execution_id": {
+            "title": "Execution Id",
+            "type": "string"
+          },
+          "failure_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failure Code"
+          },
+          "member_rank_sha256": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Member Rank Sha256"
+          },
+          "original_command": {
+            "$ref": "#/components/schemas/ExecuteScreenQuery"
+          },
+          "plan_hash": {
+            "title": "Plan Hash",
+            "type": "string"
+          },
+          "ranked_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ranked Count"
+          },
+          "sequence": {
+            "minimum": 1.0,
+            "title": "Sequence",
+            "type": "integer"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ScreenSourceInfo"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "started_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Started At"
+          },
+          "status": {
+            "enum": [
+              "pending",
+              "processing",
+              "succeeded",
+              "failed",
+              "source_expired",
+              "unknown"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "steps": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ScreenStep"
+            },
+            "title": "Steps",
+            "type": "array"
+          },
+          "total": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Total"
+          },
+          "unknown_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unknown Count"
+          }
+        },
+        "required": [
+          "execution_id",
+          "sequence",
+          "command_hash",
+          "plan_hash",
+          "definition",
+          "original_command",
+          "status"
+        ],
+        "title": "ScreenExecutionView",
+        "type": "object"
+      },
+      "ScreenHistoryView": {
+        "additionalProperties": false,
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/ScreenExecutionView"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          },
+          "owner_scope_tag": {
+            "title": "Owner Scope Tag",
+            "type": "string"
+          }
+        },
+        "required": [
+          "owner_scope_tag",
+          "items",
+          "next_cursor"
+        ],
+        "title": "ScreenHistoryView",
+        "type": "object"
+      },
+      "ScreenLookupAction": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "const": "lookup",
+            "default": "lookup",
+            "title": "Action",
+            "type": "string"
+          },
+          "original": {
+            "discriminator": {
+              "mapping": {
+                "execute": "#/components/schemas/ScreenExecuteAction",
+                "presets_save": "#/components/schemas/ScreenPresetSaveAction"
+              },
+              "propertyName": "action"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ScreenExecuteAction"
+              },
+              {
+                "$ref": "#/components/schemas/ScreenPresetSaveAction"
+              }
+            ],
+            "title": "Original"
+          }
+        },
+        "required": [
+          "original"
+        ],
+        "title": "ScreenLookupAction",
         "type": "object"
       },
       "ScreenNlPreviewData": {
@@ -26788,6 +29279,311 @@
         "title": "ScreenParameter",
         "type": "object"
       },
+      "ScreenPresetDefinition": {
+        "additionalProperties": false,
+        "properties": {
+          "definition": {
+            "$ref": "#/components/schemas/ScreenQueryDefinition"
+          },
+          "name": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "preset_id": {
+            "pattern": "^[A-Za-z0-9_-]{1,80}$",
+            "title": "Preset Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "preset_id",
+          "name",
+          "definition"
+        ],
+        "title": "ScreenPresetDefinition",
+        "type": "object"
+      },
+      "ScreenPresetSaveAction": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "const": "presets_save",
+            "default": "presets_save",
+            "title": "Action",
+            "type": "string"
+          },
+          "request": {
+            "$ref": "#/components/schemas/ScreenPresetSaveRequest"
+          }
+        },
+        "required": [
+          "request"
+        ],
+        "title": "ScreenPresetSaveAction",
+        "type": "object"
+      },
+      "ScreenPresetSaveRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "command_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Command Id",
+            "type": "string"
+          },
+          "expected_version": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Version"
+          },
+          "preset": {
+            "$ref": "#/components/schemas/ScreenPresetDefinition"
+          },
+          "requested_at": {
+            "format": "date-time",
+            "title": "Requested At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "command_id",
+          "requested_at",
+          "preset"
+        ],
+        "title": "ScreenPresetSaveRequest",
+        "type": "object"
+      },
+      "ScreenQueryDefinition": {
+        "additionalProperties": false,
+        "properties": {
+          "conditions": {
+            "items": {
+              "$ref": "#/components/schemas/RuleCall"
+            },
+            "maxItems": 26,
+            "minItems": 1,
+            "title": "Conditions",
+            "type": "array"
+          },
+          "cutoff": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cutoff"
+          },
+          "description": {
+            "default": "",
+            "maxLength": 500,
+            "title": "Description",
+            "type": "string"
+          },
+          "mode": {
+            "default": "daily",
+            "enum": [
+              "daily",
+              "intraday"
+            ],
+            "title": "Mode",
+            "type": "string"
+          },
+          "ranking": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ScreenRankingPlan"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "source_identity": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Source Identity",
+            "type": "string"
+          },
+          "source_kind": {
+            "enum": [
+              "serving",
+              "replica",
+              "intraday"
+            ],
+            "title": "Source Kind",
+            "type": "string"
+          },
+          "trade_date": {
+            "format": "date",
+            "title": "Trade Date",
+            "type": "string"
+          }
+        },
+        "required": [
+          "trade_date",
+          "source_kind",
+          "source_identity",
+          "conditions"
+        ],
+        "title": "ScreenQueryDefinition",
+        "type": "object"
+      },
+      "ScreenQueryPreset": {
+        "additionalProperties": false,
+        "properties": {
+          "command_hash": {
+            "title": "Command Hash",
+            "type": "string"
+          },
+          "definition": {
+            "$ref": "#/components/schemas/ScreenQueryDefinition"
+          },
+          "name": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "preset_id": {
+            "pattern": "^[A-Za-z0-9_-]{1,80}$",
+            "title": "Preset Id",
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
+            "type": "string"
+          },
+          "version": {
+            "minimum": 1.0,
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "preset_id",
+          "name",
+          "definition",
+          "version",
+          "updated_at",
+          "command_hash"
+        ],
+        "title": "ScreenQueryPreset",
+        "type": "object"
+      },
+      "ScreenQueryReadData": {
+        "additionalProperties": false,
+        "properties": {
+          "alert_draft": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ScreenAlertDraft"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "available": {
+            "default": true,
+            "title": "Available",
+            "type": "boolean"
+          },
+          "daily_run_evidence": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/PublishedDailyScreenEvidence"
+            },
+            "title": "Daily Run Evidence",
+            "type": "array"
+          },
+          "daily_writer_capability": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DailyWriterCapability"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "execution": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ScreenExecutionView"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "history": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ScreenHistoryView"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "owner_scope_tag": {
+            "title": "Owner Scope Tag",
+            "type": "string"
+          },
+          "presets": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ScreenQueryPreset"
+            },
+            "title": "Presets",
+            "type": "array"
+          },
+          "receipt": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PageControlReceipt"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "results": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ScreenExecutionResults"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "owner_scope_tag"
+        ],
+        "title": "ScreenQueryReadData",
+        "type": "object"
+      },
       "ScreenRankingCondition": {
         "additionalProperties": false,
         "properties": {
@@ -26840,6 +29636,40 @@
           "top_n"
         ],
         "title": "ScreenRankingPlan",
+        "type": "object"
+      },
+      "ScreenResumeAction": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "const": "resume",
+            "default": "resume",
+            "title": "Action",
+            "type": "string"
+          },
+          "original": {
+            "discriminator": {
+              "mapping": {
+                "execute": "#/components/schemas/ScreenExecuteAction",
+                "presets_save": "#/components/schemas/ScreenPresetSaveAction"
+              },
+              "propertyName": "action"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ScreenExecuteAction"
+              },
+              {
+                "$ref": "#/components/schemas/ScreenPresetSaveAction"
+              }
+            ],
+            "title": "Original"
+          }
+        },
+        "required": [
+          "original"
+        ],
+        "title": "ScreenResumeAction",
         "type": "object"
       },
       "ScreenRow": {
@@ -27041,6 +29871,39 @@
             ],
             "title": "Cursor"
           },
+          "decision_cutoff": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Decision Cutoff"
+          },
+          "intraday_source_identity": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Intraday Source Identity"
+          },
+          "mode": {
+            "default": "daily",
+            "enum": [
+              "daily",
+              "intraday"
+            ],
+            "title": "Mode",
+            "type": "string"
+          },
           "page_size": {
             "default": 20,
             "maximum": 100.0,
@@ -27085,8 +29948,74 @@
       },
       "ScreenSourceInfo": {
         "properties": {
+          "coverage_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Coverage Count"
+          },
+          "cutoff": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cutoff"
+          },
+          "daily_anchor_date": {
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Daily Anchor Date"
+          },
           "identity": {
             "title": "Identity",
+            "type": "string"
+          },
+          "intraday_source_identity": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Intraday Source Identity"
+          },
+          "missing_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Missing Count"
+          },
+          "mode": {
+            "default": "daily",
+            "enum": [
+              "daily",
+              "intraday"
+            ],
+            "title": "Mode",
             "type": "string"
           },
           "updated_at": {
@@ -32351,6 +35280,153 @@
         ]
       }
     },
+    "/api/v1/monitor/condition-rules": {
+      "get": {
+        "operationId": "list_condition_rules_api_v1_monitor_condition_rules_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_ConditionAlertRuleListData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "我的条件规则",
+        "tags": [
+          "monitor"
+        ]
+      }
+    },
+    "/api/v1/monitor/condition-rules/commands": {
+      "post": {
+        "operationId": "submit_condition_rule_api_v1_monitor_condition_rules_commands_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConditionAlertRuleCommandRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConditionAlertRuleCommandReceipt"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "保存、启停或删除条件规则",
+        "tags": [
+          "monitor"
+        ]
+      }
+    },
+    "/api/v1/monitor/condition-rules/commands/resume": {
+      "post": {
+        "operationId": "resume_condition_rule_api_v1_monitor_condition_rules_commands_resume_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConditionAlertRuleCommandRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConditionAlertRuleCommandReceipt"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "继续核对原条件规则操作",
+        "tags": [
+          "monitor"
+        ]
+      }
+    },
+    "/api/v1/monitor/condition-rules/head": {
+      "get": {
+        "operationId": "condition_head_api_v1_monitor_condition_rules_head_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "rule_id",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Rule Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_ConditionAlertRuleHeadData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "条件规则当前设置",
+        "tags": [
+          "monitor"
+        ]
+      }
+    },
     "/api/v1/monitor/price-rules": {
       "get": {
         "operationId": "list_price_rules_api_v1_monitor_price_rules_get",
@@ -34115,6 +37191,22 @@
     "/api/v1/screen/blocks": {
       "get": {
         "operationId": "get_blocks_api_v1_screen_blocks_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "mode",
+            "required": false,
+            "schema": {
+              "default": "daily",
+              "enum": [
+                "daily",
+                "intraday"
+              ],
+              "title": "Mode",
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -34125,6 +37217,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
           }
         },
         "summary": "选股条件目录",
@@ -34169,6 +37271,450 @@
           }
         },
         "summary": "预览一句话选股条件",
+        "tags": [
+          "screen"
+        ]
+      }
+    },
+    "/api/v1/screen/query/alert-draft": {
+      "post": {
+        "operationId": "create_alert_draft_api_v1_screen_query_alert_draft_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ScreenAlertDraftRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScreenQueryReadData"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "带入选股条件提醒草稿",
+        "tags": [
+          "screen"
+        ]
+      }
+    },
+    "/api/v1/screen/query/alert-drafts/{draft_id}": {
+      "get": {
+        "operationId": "get_alert_draft_api_v1_screen_query_alert_drafts__draft_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "draft_id",
+            "required": true,
+            "schema": {
+              "pattern": "^[0-9a-f]{24}$",
+              "title": "Draft Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScreenQueryReadData"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "读取本人提醒草稿",
+        "tags": [
+          "screen"
+        ]
+      }
+    },
+    "/api/v1/screen/query/execute": {
+      "post": {
+        "operationId": "execute_screen_query_api_v1_screen_query_execute_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExecuteScreenQuery"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScreenQueryReadData"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "执行并记录选股",
+        "tags": [
+          "screen"
+        ]
+      }
+    },
+    "/api/v1/screen/query/executions/{execution_id}": {
+      "get": {
+        "operationId": "get_screen_execution_api_v1_screen_query_executions__execution_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "execution_id",
+            "required": true,
+            "schema": {
+              "title": "Execution Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScreenQueryReadData"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "读取原选股请求",
+        "tags": [
+          "screen"
+        ]
+      }
+    },
+    "/api/v1/screen/query/executions/{execution_id}/results": {
+      "get": {
+        "operationId": "get_screen_results_api_v1_screen_query_executions__execution_id__results_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "execution_id",
+            "required": true,
+            "schema": {
+              "title": "Execution Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 1024,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScreenQueryReadData"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "读取原选股结果",
+        "tags": [
+          "screen"
+        ]
+      }
+    },
+    "/api/v1/screen/query/history": {
+      "get": {
+        "operationId": "get_screen_history_api_v1_screen_query_history_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 1024,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScreenQueryReadData"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "读取本人选股历史",
+        "tags": [
+          "screen"
+        ]
+      }
+    },
+    "/api/v1/screen/query/lookup": {
+      "post": {
+        "operationId": "lookup_screen_query_api_v1_screen_query_lookup_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ScreenLookupAction"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScreenQueryReadData"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "查询原选股命令",
+        "tags": [
+          "screen"
+        ]
+      }
+    },
+    "/api/v1/screen/query/presets": {
+      "get": {
+        "operationId": "get_screen_presets_api_v1_screen_query_presets_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScreenQueryReadData"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "读取本人常用条件",
+        "tags": [
+          "screen"
+        ]
+      }
+    },
+    "/api/v1/screen/query/presets/save": {
+      "post": {
+        "operationId": "save_screen_preset_api_v1_screen_query_presets_save_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ScreenPresetSaveRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScreenQueryReadData"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "保存本人常用条件",
+        "tags": [
+          "screen"
+        ]
+      }
+    },
+    "/api/v1/screen/query/resume": {
+      "post": {
+        "operationId": "resume_screen_query_api_v1_screen_query_resume_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ScreenResumeAction"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScreenQueryReadData"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "恢复原选股命令",
         "tags": [
           "screen"
         ]

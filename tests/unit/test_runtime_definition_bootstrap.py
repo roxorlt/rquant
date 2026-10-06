@@ -20,8 +20,8 @@ def test_builtin_definition_plan_is_complete_and_content_addressed() -> None:
     plan = plan_builtin_definitions(producer_commit=COMMIT)
     registry = BuiltinStrategyEvaluatorRegistry(producer_commit=COMMIT)
 
-    assert plan.feature_contract_versions == (1, 2, 3)
-    assert len(plan.feature_contract_fingerprints) == 3
+    assert plan.feature_contract_versions == (1, 2, 3, 4)
+    assert len(plan.feature_contract_fingerprints) == 4
     assert tuple(binding.strategy_id for binding in plan.strategies) == (
         "auction_gap",
         "growth_board_surge",
@@ -30,6 +30,7 @@ def test_builtin_definition_plan_is_complete_and_content_addressed() -> None:
     assert len({binding.registration_fingerprint for binding in plan.strategies}) == 3
     for binding in plan.strategies:
         definition = registry.load_definition(binding.strategy_id, binding.strategy_version)
+        assert definition.spec.min_feature_contract_version == 3
         assert binding.candidate_schema_fingerprint == definition.candidate_schema_fingerprint
         assert binding.strategy_spec_fingerprint == definition.spec.spec_fingerprint
         assert binding.executable_fingerprint == definition.executable_fingerprint
@@ -64,6 +65,8 @@ def test_builtin_definition_bootstrap_is_idempotent_and_matches_plan(tmp_path: P
     for binding in plan.strategies:
         record = reader.read_strategy_spec(binding.registration_fingerprint, as_of=NOW)
         assert record is not None
+        assert record.feature_contract_version == 3
+        assert record.feature_contract_fingerprint == plan.feature_contract_fingerprints[2]
         assert record.candidate_schema_fingerprint == binding.candidate_schema_fingerprint
         assert record.executable_fingerprint == binding.executable_fingerprint
 

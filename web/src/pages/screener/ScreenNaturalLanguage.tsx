@@ -3,8 +3,8 @@ import { ApiError } from "@/api/client";
 import {
   fetchScreenNlPreview,
   type ScreenBlock,
-  type ScreenCatalogData,
   type ScreenNlPreviewData,
+  type ScreenNlPreviewRequest,
 } from "@/api/screen";
 import { Button, Panel, type ParameterValue, Tip } from "@/ui";
 
@@ -14,9 +14,10 @@ const RECENT_DESCRIPTIONS_KEY = "rquant.screen.recent-descriptions.v1";
 const RECENT_LIMIT = 5;
 const DESCRIPTION_LIMIT = 500;
 
-function readRecentDescriptions(): string[] {
+function readRecentDescriptions(scope: string | null): string[] {
   try {
-    const raw = window.sessionStorage.getItem(RECENT_DESCRIPTIONS_KEY);
+    if (scope === null) return [];
+    const raw = window.sessionStorage.getItem(`${RECENT_DESCRIPTIONS_KEY}:${scope}`);
     if (!raw || raw.length > 16_384) return [];
     const stored: unknown = JSON.parse(raw);
     if (!Array.isArray(stored)) return [];
@@ -141,6 +142,9 @@ function errorText(error: unknown): string {
 }
 
 export function ScreenNaturalLanguage({
+  ownerScope = null,
+  description = "",
+  onDescriptionChange,
   available,
   sourceKind,
   sourceIdentity,
@@ -152,8 +156,11 @@ export function ScreenNaturalLanguage({
   onUndo,
   onConflict,
 }: {
+  ownerScope?: string | null;
+  description?: string;
+  onDescriptionChange?: (description: string) => void;
   available: boolean;
-  sourceKind: ScreenCatalogData["source_kind"] | null;
+  sourceKind: ScreenNlPreviewRequest["source_kind"] | null;
   sourceIdentity: string | null;
   tradeDate: string | null;
   conditionRevision: number;
@@ -163,7 +170,7 @@ export function ScreenNaturalLanguage({
   onUndo: () => void;
   onConflict: () => void;
 }) {
-  const [instruction, setInstruction] = useState("");
+  const [instruction, setInstruction] = useState(description);
   const [suggestion, setSuggestion] = useState<{
     conditions: EditableScreenCondition[];
     descriptions: ConditionDescription[];
@@ -171,7 +178,7 @@ export function ScreenNaturalLanguage({
   const [applied, setApplied] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [recentDescriptions, setRecentDescriptions] = useState(readRecentDescriptions);
+  const [recentDescriptions, setRecentDescriptions] = useState(() => readRecentDescriptions(ownerScope));
   const recentRef = useRef(recentDescriptions);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const controllerRef = useRef<AbortController | null>(null);
@@ -186,6 +193,9 @@ export function ScreenNaturalLanguage({
   });
   const contextRef = useRef(context);
   const runRevisionRef = useRef(successfulRunRevision);
+
+  useEffect(() => { setInstruction(description); }, [description]);
+  useEffect(() => { const next = readRecentDescriptions(ownerScope); recentRef.current = next; setRecentDescriptions(next); }, [ownerScope]);
 
   useEffect(() => {
     if (runRevisionRef.current === successfulRunRevision) return;
@@ -223,7 +233,7 @@ export function ScreenNaturalLanguage({
     recentRef.current = next;
     setRecentDescriptions(next);
     try {
-      window.sessionStorage.setItem(RECENT_DESCRIPTIONS_KEY, JSON.stringify(next));
+      if (ownerScope !== null) window.sessionStorage.setItem(`${RECENT_DESCRIPTIONS_KEY}:${ownerScope}`, JSON.stringify(next));
     } catch {
       // The current tab still keeps the in-memory list when storage is unavailable.
     }
@@ -232,6 +242,7 @@ export function ScreenNaturalLanguage({
   const recallDescription = (description: string) => {
     discardPending();
     setInstruction(description);
+    onDescriptionChange?.(description);
     textareaRef.current?.focus();
   };
 
@@ -317,6 +328,7 @@ export function ScreenNaturalLanguage({
                 value={instruction}
                 onChange={(event) => {
                   setInstruction(event.target.value);
+                  onDescriptionChange?.(event.target.value);
                   discardPending();
                 }}
               />

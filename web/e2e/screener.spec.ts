@@ -1,7 +1,166 @@
-import { expect, test } from "@playwright/test";
+import { expect, type Page, type Response, test } from "@playwright/test";
 import type { Schemas } from "../src/api/client.ts";
 import { findJargon } from "../src/test/jargon.ts";
 import { expectNoHorizontalOverflow, watch } from "./watch.ts";
+
+type Execute = Schemas["ExecuteScreenQuery"];
+type RunData = Schemas["ScreenRunData"];
+const ownerScope = "1".repeat(64);
+function privateScreenData(
+  change: Partial<Schemas["ScreenQueryReadData"]> = {},
+): Schemas["ScreenQueryReadData"] {
+  return {
+    available: true,
+    owner_scope_tag: ownerScope,
+    presets: [],
+    daily_run_evidence: [],
+    ...change,
+  };
+}
+
+// Transport fixture over the same invented 30-stock universe; backend math has separate evidence.
+function screenResult(command: Execute, change: Partial<RunData> = {}): RunData {
+  const ranking = command.definition.ranking;
+  const rows: Schemas["ScreenRow"][] = Array.from({ length: 30 }, (_, offset) => offset + 1)
+    .filter((index) => index % 10 !== 0)
+    .map((index, offset) => ({
+      ts_code: `${600000 + index}.SH`,
+      name: `样本${String(index).padStart(2, "0")}`,
+      close: 10 + index,
+      pct_chg: index - 15,
+      rank_position: ranking ? offset + 1 : null,
+      ranking_score: ranking ? 100 - offset : null,
+    }));
+  return {
+    trade_date: command.definition.trade_date,
+    status: "ready",
+    base_count: 30,
+    total: 27,
+    unknown_count: 0,
+    ranked_count: ranking ? Math.min(ranking.top_n, rows.length) : null,
+    steps: [{ label: "排除 ST", count: 27, unknown_count: 0 }],
+    rows: ranking ? rows.slice(0, ranking.top_n) : rows,
+    next_cursor: null,
+    source: {
+      mode: command.definition.mode,
+      identity: command.definition.source_identity,
+      updated_at: "2026-09-24T07:31:00Z",
+    },
+    ...change,
+  };
+}
+
+async function screenCommands(
+  page: Page,
+  reply: (command: Execute) => RunData = screenResult,
+): Promise<void> {
+  const records = new Map<
+    string,
+    { original: string; command: Execute; data: RunData; execution: Schemas["ScreenExecutionView"] }
+  >();
+  await page.route("**/api/v1/screen/query/history?*", (route) =>
+    route.fulfill({
+      json: privateScreenData({
+        history: {
+          owner_scope_tag: ownerScope,
+          items: [...records.values()].map((record) => record.execution).reverse(),
+          next_cursor: null,
+        },
+      }),
+    }),
+  );
+  await page.route("**/api/v1/screen/query/presets", (route) =>
+    route.fulfill({ json: privateScreenData() }),
+  );
+  await page.route("**/api/v1/screen/query/execute", async (route) => {
+    const command: Execute = route.request().postDataJSON();
+    expect(route.request().headers()["x-rquant-csrf"]).toBe("1");
+    expect(command.kind).toBe("execute_screen_query");
+    expect(command.command_id).not.toBe("");
+    const original = JSON.stringify(command);
+    const prior = records.get(command.command_id);
+    if (prior) expect(original).toBe(prior.original);
+    else {
+      const data = reply(command);
+      expect(data.source?.identity).toBe(command.definition.source_identity);
+      expect(data.trade_date).toBe(command.definition.trade_date);
+      const execution: Schemas["ScreenExecutionView"] = {
+        execution_id: command.command_id,
+        sequence: records.size + 1,
+        command_hash: "b".repeat(64),
+        plan_hash: "c".repeat(64),
+        original_command: command,
+        definition: command.definition,
+        source: data.source,
+        started_at: command.requested_at,
+        completed_at: command.requested_at,
+        status: "succeeded",
+        base_count: data.base_count,
+        total: data.total,
+        unknown_count: data.unknown_count,
+        ranked_count: data.ranked_count,
+        steps: data.steps,
+        artifact_sha256: "d".repeat(64),
+        member_rank_sha256: "e".repeat(64),
+        failure_code: null,
+      };
+      records.set(command.command_id, { original, command, data, execution });
+    }
+    await route.fulfill({
+      json: privateScreenData({
+        receipt: {
+          command_id: command.command_id,
+          status: "succeeded",
+          enqueued_at: command.requested_at,
+          completed_at: command.requested_at,
+          result: {},
+          error: null,
+        },
+      }),
+    });
+  });
+  await page.route(
+    /\/api\/v1\/screen\/query\/executions\/[^/?]+(?:\/results)?(?:\?.*)?$/,
+    async (route) => {
+      const url = new URL(route.request().url());
+      const match = url.pathname.match(/\/executions\/([^/]+)(\/results)?$/);
+      const record = match ? records.get(decodeURIComponent(match[1] ?? "")) : undefined;
+      if (!record) {
+        await route.fulfill({ status: 404, json: { detail: "未找到原请求。" } });
+        return;
+      }
+      expect(JSON.stringify(record.execution.original_command)).toBe(record.original);
+      if (!match?.[2]) {
+        await route.fulfill({ json: privateScreenData({ execution: record.execution }) });
+        return;
+      }
+      const cursor = url.searchParams.get("cursor");
+      const prefix = `${record.command.command_id}:`;
+      const offset = cursor?.startsWith(prefix)
+        ? Number(cursor.slice(prefix.length))
+        : cursor === null
+          ? 0
+          : Number.NaN;
+      if (!Number.isInteger(offset) || offset < 0 || offset > record.data.rows.length) {
+        await route.fulfill({ status: 422, json: { detail: "原结果游标不匹配。" } });
+        return;
+      }
+      const limit = record.command.page_size ?? 20;
+      const next = offset + limit;
+      const results: Schemas["ScreenExecutionResults"] = {
+        execution_id: record.command.command_id,
+        artifact_sha256: record.execution.artifact_sha256 ?? "d".repeat(64),
+        rows: record.data.rows.slice(offset, next),
+        next_cursor: next < record.data.rows.length ? `${prefix}${next}` : null,
+      };
+      await route.fulfill({ json: privateScreenData({ results }) });
+    },
+  );
+}
+
+test.beforeEach(async ({ page }) => {
+  await screenCommands(page);
+});
 
 test("单股公式预览先检查再判断，来源换代后桌面与手机要求重跑", async ({ page }, testInfo) => {
   const watcher = watch(page);
@@ -20,7 +179,7 @@ test("单股公式预览先检查再判断，来源换代后桌面与手机要�
     const response = await route.fetch();
     const body = (await response.json()) as Schemas["Envelope_ScreenCatalogData_"];
     body.data.source_kind = "replica";
-    body.data.source = { identity, updated_at: "2026-09-24T07:31:00Z" };
+    body.data.source = { mode: "daily", identity, updated_at: "2026-09-24T07:31:00Z" };
     await route.fulfill({ response, json: body });
   });
   await page.route("**/api/v1/screen/tdx/parse", async (route) => {
@@ -121,9 +280,9 @@ test("中文条件筛选、翻页和个股详情在桌面与手机宽度可用",
 test("一句话建议经键盘预览和人工应用，手机手改后才运行真实筛选", async ({ page }, testInfo) => {
   const watcher = watch(page);
   const previews: Schemas["ScreenNlPreviewRequest"][] = [];
-  const runs: Schemas["ScreenRunRequest"][] = [];
+  const runs: Execute[] = [];
   let sourceIdentity: string | null = null;
-  await page.route("**/api/v1/screen/blocks", async (route) => {
+  await page.route(/\/api\/v1\/screen\/blocks\?mode=daily$/, async (route) => {
     const response = await route.fetch();
     const body = (await response.json()) as Schemas["Envelope_ScreenCatalogData_"];
     body.data.nl_generate_available = true;
@@ -148,11 +307,10 @@ test("一句话建议经键盘预览和人工应用，手机手改后才运行�
       } satisfies Schemas["ScreenNlPreviewData"],
     });
   });
-  await page.route("**/api/v1/screen/run", async (route) => {
-    const request = route.request().postDataJSON() as Schemas["ScreenRunRequest"];
-    expect(request.source_identity).toBe(sourceIdentity);
+  await screenCommands(page, (request) => {
+    expect(request.definition.source_identity).toBe(sourceIdentity);
     runs.push(request);
-    await route.continue();
+    return screenResult(request);
   });
 
   await page.setViewportSize({ width: 1440, height: 900 });
@@ -190,9 +348,9 @@ test("一句话建议经键盘预览和人工应用，手机手改后才运行�
   await expect(page.getByRole("button", { name: "撤销应用" })).toHaveCount(0);
   await page.getByRole("button", { name: "运行筛选" }).click();
   await expect.poll(() => runs.length).toBe(2);
-  expect(runs[1]?.conditions).toEqual([
-    { key: "not_st", args: {} },
-    { key: "circ_mv_lt", args: { threshold_yi: 90, offset: 0 } },
+  expect(runs[1]?.definition.conditions).toEqual([
+    { name: "not_st", args: {} },
+    { name: "circ_mv_lt", args: { threshold_yi: 90, offset: 0 } },
   ]);
   await expect(page.getByText(/条件已改，请重新运行/)).toHaveCount(0);
   await description.fill("下一次想看的股票");
@@ -209,10 +367,14 @@ test("一句话建议经键盘预览和人工应用，手机手改后才运行�
 
 test("自定义 RSI 周期和偏移在桌面与手机可输入并提交", async ({ page }) => {
   const watcher = watch(page);
-  const requests: Schemas["ScreenRunRequest"][] = [];
+  const requests: Execute[] = [];
   let fulfilled = 0;
-  const source = { identity: "a".repeat(64), updated_at: "2026-09-24T07:31:00Z" };
-  await page.route("**/api/v1/screen/blocks", async (route) => {
+  const source: Schemas["ScreenSourceInfo"] = {
+    mode: "daily",
+    identity: "a".repeat(64),
+    updated_at: "2026-09-24T07:31:00Z",
+  };
+  await page.route(/\/api\/v1\/screen\/blocks\?mode=daily$/, async (route) => {
     const response = await route.fetch();
     const body = (await response.json()) as Schemas["Envelope_ScreenCatalogData_"];
     body.data.source_kind = "replica";
@@ -229,20 +391,11 @@ test("自定义 RSI 周期和偏移在桌面与手机可输入并提交", async 
     period.hint = "可填 2–60 个交易日";
     await route.fulfill({ response, json: body });
   });
-  await page.route("**/api/v1/screen/run", async (route) => {
-    const request = route.request().postDataJSON() as Schemas["ScreenRunRequest"];
+  await screenCommands(page, (request) => {
     requests.push(request);
-    const response = await route.fetch({
-      postData: JSON.stringify({
-        ...request,
-        source_identity: null,
-        conditions: [{ key: "not_st", args: {} }],
-      }),
-    });
-    const body = (await response.json()) as Schemas["Envelope_ScreenRunData_"];
-    body.data.source = source;
-    await route.fulfill({ response, json: body });
+    expect(request.definition.source_identity).toBe(source.identity);
     fulfilled += 1;
+    return screenResult(request, { source });
   });
 
   await page.setViewportSize({ width: 1440, height: 900 });
@@ -255,8 +408,8 @@ test("自定义 RSI 周期和偏移在桌面与手机可输入并提交", async 
   await page.getByRole("spinbutton", { name: "相对日期" }).fill("30");
   await page.getByRole("button", { name: "运行筛选" }).click();
   await expect.poll(() => requests.length).toBe(1);
-  expect(requests[0]?.conditions[1]).toEqual({
-    key: "rsi_oversold",
+  expect(requests[0]?.definition.conditions[1]).toEqual({
+    name: "rsi_oversold",
     args: { period: 7, threshold: 30, offset: 30 },
   });
   await expectNoHorizontalOverflow(page, "custom RSI desktop");
@@ -267,7 +420,7 @@ test("自定义 RSI 周期和偏移在桌面与手机可输入并提交", async 
   await page.getByRole("button", { name: "运行筛选" }).click();
   await expect.poll(() => requests.length).toBe(2);
   await expect.poll(() => fulfilled).toBe(2);
-  expect(requests[1]?.conditions[1]?.args?.period).toBe(14);
+  expect(requests[1]?.definition.conditions[1]?.args?.period).toBe(14);
   await expectNoHorizontalOverflow(page, "custom RSI phone");
   expect(findJargon(await page.locator("main").innerText())).toEqual([]);
   expect(watcher.problems).toEqual([]);
@@ -312,16 +465,14 @@ test("排名条件可编辑、折算并按分数稳定翻页，手机上可修�
 
 test("手机宽度明确展示未判定股票，不把未知写成零命中", async ({ page }) => {
   const watcher = watch(page);
-  await page.route("**/api/v1/screen/run", async (route) => {
-    const response = await route.fetch();
-    const body = (await response.json()) as Schemas["Envelope_ScreenRunData_"];
-    body.data.total = 0;
-    body.data.unknown_count = 1;
-    body.data.steps = [{ label: "排除 ST", count: 0, unknown_count: 1 }];
-    body.data.rows = [];
-    body.data.next_cursor = null;
-    await route.fulfill({ response, json: body });
-  });
+  await screenCommands(page, (request) =>
+    screenResult(request, {
+      total: 0,
+      unknown_count: 1,
+      steps: [{ label: "排除 ST", count: 0, unknown_count: 1 }],
+      rows: [],
+    }),
+  );
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto("./#/screener");
   await page.getByRole("button", { name: "运行筛选" }).click();
@@ -338,25 +489,21 @@ test("选股来源独立换代后保留条件，失效时桌面与手机都要�
   let identity = "a".repeat(64);
   let unavailable = false;
   let catalogReads = 0;
-  await page.route("**/api/v1/screen/blocks", async (route) => {
+  await page.route(/\/api\/v1\/screen\/blocks\?mode=daily$/, async (route) => {
     catalogReads += 1;
     const response = await route.fetch();
     const body = (await response.json()) as Schemas["Envelope_ScreenCatalogData_"];
     body.data.source_kind = "replica";
-    body.data.source = unavailable ? null : { identity, updated_at: "2026-09-24T07:31:00Z" };
+    body.data.source = unavailable
+      ? null
+      : { mode: "daily", identity, updated_at: "2026-09-24T07:31:00Z" };
     body.data.available = !unavailable;
     if (unavailable) body.data.dates = [];
     await route.fulfill({ response, json: body });
   });
-  await page.route("**/api/v1/screen/run", async (route) => {
-    const request = route.request().postDataJSON() as Schemas["ScreenRunRequest"];
-    expect(request.source_identity).toBe(identity);
-    const response = await route.fetch({
-      postData: JSON.stringify({ ...request, source_identity: null }),
-    });
-    const body = (await response.json()) as Schemas["Envelope_ScreenRunData_"];
-    body.data.source = { identity, updated_at: "2026-09-24T07:31:00Z" };
-    await route.fulfill({ response, json: body });
+  await screenCommands(page, (request) => {
+    expect(request.definition.source_identity).toBe(identity);
+    return screenResult(request);
   });
 
   await page.setViewportSize({ width: 1440, height: 900 });
@@ -399,12 +546,12 @@ test("选股来源独立换代后保留条件，失效时桌面与手机都要�
 test("基本面条件在桌面和手机按单位输入，来源更新会清掉旧结果", async ({ page }) => {
   const watcher = watch(page);
   let identity = "a".repeat(64);
-  const requests: Schemas["ScreenRunRequest"][] = [];
-  await page.route("**/api/v1/screen/blocks", async (route) => {
+  const requests: Execute[] = [];
+  await page.route(/\/api\/v1\/screen\/blocks\?mode=daily$/, async (route) => {
     const response = await route.fetch();
     const body = (await response.json()) as Schemas["Envelope_ScreenCatalogData_"];
     body.data.source_kind = "replica";
-    body.data.source = { identity, updated_at: "2026-09-24T07:31:00Z" };
+    body.data.source = { mode: "daily", identity, updated_at: "2026-09-24T07:31:00Z" };
     body.data.available = true;
     const options = [
       { value: "PE_TTM[0]", label: "市盈率（倍）" },
@@ -421,31 +568,14 @@ test("基本面条件在桌面和手机按单位输入，来源更新会清掉�
     }
     await route.fulfill({ response, json: body });
   });
-  await page.route("**/api/v1/screen/run", async (route) => {
-    const body = route.request().postDataJSON() as Schemas["ScreenRunRequest"];
+  await screenCommands(page, (body) => {
     requests.push(body);
-    await route.fulfill({
-      status: 200,
-      json: {
-        data: {
-          trade_date: body.trade_date,
-          status: "ready",
-          base_count: 2,
-          total: 1,
-          unknown_count: 1,
-          steps: [{ label: "基本面条件", count: 1, unknown_count: 1 }],
-          rows: [{ ts_code: "600001.SH", name: "样本01", close: 11, pct_chg: 1 }],
-          next_cursor: null,
-          source: { identity, updated_at: "2026-09-24T07:31:00Z" },
-        },
-        serving: {
-          state: "ready",
-          generation_id: "b".repeat(64),
-          built_at: "2026-09-24T07:30:00Z",
-          age_seconds: 60,
-          detail: null,
-        },
-      },
+    return screenResult(body, {
+      base_count: 2,
+      total: 1,
+      unknown_count: 1,
+      steps: [{ label: "基本面条件", count: 1, unknown_count: 1 }],
+      rows: [{ ts_code: "600001.SH", name: "样本01", close: 11, pct_chg: 1 }],
     });
   });
 
@@ -460,8 +590,11 @@ test("基本面条件在桌面和手机按单位输入，来源更新会清掉�
   await peLimit.fill("9");
   await page.getByRole("button", { name: "运行筛选" }).click();
   await expect(page.getByText("命中 1 只", { exact: false })).toBeVisible();
-  expect(requests[0]?.source_identity).toBe(identity);
-  expect(requests[0]?.conditions[1]).toEqual({ key: "gt", args: { left: "PE_TTM[0]", right: 9 } });
+  expect(requests[0]?.definition.source_identity).toBe(identity);
+  expect(requests[0]?.definition.conditions[1]).toEqual({
+    name: "gt",
+    args: { left: "PE_TTM[0]", right: 9 },
+  });
   await expectNoHorizontalOverflow(page, "fundamental screen desktop");
 
   await page.setViewportSize({ width: 390, height: 844 });
@@ -472,8 +605,8 @@ test("基本面条件在桌面和手机按单位输入，来源更新会清掉�
   await page.getByRole("spinbutton", { name: "上限（%）" }).fill("15");
   await page.getByRole("button", { name: "运行筛选" }).click();
   await expect.poll(() => requests.length).toBe(2);
-  expect(requests[1]?.conditions.at(-1)).toEqual({
-    key: "between",
+  expect(requests[1]?.definition.conditions.at(-1)).toEqual({
+    name: "between",
     args: { field: "ROE[0]", low: 8, high: 15 },
   });
   await expect(page.getByText(/未判定 1 只/)).toBeVisible();
@@ -487,6 +620,27 @@ test("基本面条件在桌面和手机按单位输入，来源更新会清掉�
   expect(watcher.problems).toEqual([]);
 });
 
+function isScreenHistoryResponse(response: Response): boolean {
+  return (
+    response.request().method() === "GET" &&
+    new URL(response.url()).pathname.endsWith("/api/v1/screen/query/history")
+  );
+}
+
+async function advanceServingClock(page: Page): Promise<void> {
+  const isMeta = (response: Response) =>
+    response.request().method() === "GET" &&
+    new URL(response.url()).pathname.endsWith("/api/v1/meta");
+  const firstMeta = page.waitForResponse(isMeta);
+  const refreshedHistory = page.waitForResponse(isScreenHistoryResponse);
+  await page.clock.runFor(15_000);
+  await (await firstMeta).finished();
+  await (await refreshedHistory).finished();
+  const secondMeta = page.waitForResponse(isMeta);
+  await page.clock.runFor(16_000);
+  await (await secondMeta).finished();
+}
+
 test("默认 Serving 换代重取选股目录，并要求旧结果重新筛选", async ({ page }) => {
   const watcher = watch(page);
   let generationId = "a".repeat(64);
@@ -498,32 +652,34 @@ test("默认 Serving 换代重取选股目录，并要求旧结果重新筛选",
     body.serving.generation_id = generationId;
     await route.fulfill({ response, json: body });
   });
-  await page.route("**/api/v1/screen/blocks", async (route) => {
+  await page.route(/\/api\/v1\/screen\/blocks\?mode=daily$/, async (route) => {
     catalogReads += 1;
     const response = await route.fetch();
     const body = (await response.json()) as Schemas["Envelope_ScreenCatalogData_"];
     body.data.source_kind = "serving";
-    body.data.source = { identity: generationId, updated_at: "2026-09-24T07:31:00Z" };
+    body.data.source = {
+      mode: "daily",
+      identity: generationId,
+      updated_at: "2026-09-24T07:31:00Z",
+    };
     await route.fulfill({ response, json: body });
   });
-  await page.route("**/api/v1/screen/run", async (route) => {
-    const request = route.request().postDataJSON() as Schemas["ScreenRunRequest"];
-    expect(request.source_identity).toBe(generationId);
-    const response = await route.fetch({
-      postData: JSON.stringify({ ...request, source_identity: null }),
-    });
-    const body = (await response.json()) as Schemas["Envelope_ScreenRunData_"];
-    body.data.source = { identity: generationId, updated_at: "2026-09-24T07:31:00Z" };
-    await route.fulfill({ response, json: body });
+  await screenCommands(page, (request) => {
+    expect(request.definition.source_identity).toBe(generationId);
+    return screenResult(request);
   });
 
   await page.clock.install();
+  const initialHistory = page.waitForResponse(isScreenHistoryResponse);
   await page.goto("./#/screener");
+  await (await initialHistory).finished();
+  const executedHistory = page.waitForResponse(isScreenHistoryResponse);
   await page.getByRole("button", { name: "运行筛选" }).click();
   await expect(page.getByText("命中 27 只")).toBeVisible();
+  await (await executedHistory).finished();
   expect(catalogReads).toBe(1);
   generationId = "b".repeat(64);
-  await page.clock.fastForward(31_000);
+  await advanceServingClock(page);
   await expect.poll(() => catalogReads).toBe(2);
   await expect(page.getByRole("status")).toContainText("选股数据已更新，请重新筛选");
   await expect(page.getByRole("table", { name: "选股结果" })).toHaveCount(0);
@@ -548,7 +704,7 @@ test("首次 Serving 数据代到来后，无需手动刷新即可运行选股",
     }
     await route.fulfill({ response, json: body });
   });
-  await page.route("**/api/v1/screen/blocks", async (route) => {
+  await page.route(/\/api\/v1\/screen\/blocks\?mode=daily$/, async (route) => {
     catalogReads += 1;
     const response = await route.fetch();
     const body = (await response.json()) as Schemas["Envelope_ScreenCatalogData_"];
@@ -557,18 +713,24 @@ test("首次 Serving 数据代到来后，无需手动刷新即可运行选股",
       body.data.dates = [];
       body.data.source = null;
     } else {
-      body.data.source = { identity: generationId, updated_at: "2026-09-24T07:31:00Z" };
+      body.data.source = {
+        mode: "daily",
+        identity: generationId,
+        updated_at: "2026-09-24T07:31:00Z",
+      };
     }
     await route.fulfill({ response, json: body });
   });
 
   await page.clock.install();
+  const initialHistory = page.waitForResponse(isScreenHistoryResponse);
   await page.goto("./#/screener");
+  await (await initialHistory).finished();
   await expect(page.getByText("选股数据暂不可用")).toBeVisible();
   await expect(page.getByRole("button", { name: "运行筛选" })).toBeDisabled();
   expect(catalogReads).toBe(1);
   generationId = "a".repeat(64);
-  await page.clock.fastForward(31_000);
+  await advanceServingClock(page);
   await expect.poll(() => catalogReads).toBe(2);
   await expect(page.getByRole("button", { name: "运行筛选" })).toBeEnabled();
   expect(watcher.problems).toEqual([]);
