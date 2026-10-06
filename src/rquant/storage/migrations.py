@@ -15,6 +15,7 @@ from rquant.storage.schema import (
     BASE_DDL,
     DAILY_BASIC_VALUATION_OBSERVATION_DDLS,
     DATA_AUDIT_RUN_DDL,
+    DATA_CENTER_COMPLETION_DDLS,
     DATA_METADATA_TABLE_DDLS,
     DATA_REPAIR_AUDIT_DDL,
     DATASET_SNAPSHOT_BINDING_DDL,
@@ -196,6 +197,8 @@ MIGRATIONS: tuple[Migration, ...] = (
         name="atomic daily screen input and ranking evidence",
         statements=(SCREEN_RUN_EVIDENCE_DDL,),
     ),
+    Migration(version=17,name='transaction-bound data center completion receipts',
+              statements=DATA_CENTER_COMPLETION_DDLS),
 )
 
 

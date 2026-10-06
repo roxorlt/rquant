@@ -6,14 +6,17 @@ import {
   useBackfillPlanDetail,
   useBackfillPlans,
 } from "@/api/endpoints";
+import { useCurrentGeneration } from "@/api/useMeta";
 import { formatCount } from "@/format/number";
 import { shanghaiDateOf } from "@/format/time";
 import { Button, EmptyState, PageSkeleton, Panel, RelativeTime, StatusBadge, Tip } from "@/ui";
+import { BackfillExecutionPanel } from "./BackfillExecutionPanel";
 import { BackfillPlanCommandForm } from "./BackfillPlanCommandForm";
 import type {
   BackfillPlanCommandSession,
   BackfillPlanCommandSnapshot,
 } from "./backfillPlanCommandSession";
+import type { DataCenterCommandSession } from "./dataCenterCommandSession";
 
 interface PagePosition {
   cursors: (string | null)[];
@@ -285,12 +288,14 @@ function ProgressPanel({
 export function BackfillPlanPanel({
   commandSession,
   command,
+  executionSession,
   canSubmit,
   requestOpen,
   onCloseRequest,
 }: {
   commandSession: BackfillPlanCommandSession;
   command: BackfillPlanCommandSnapshot;
+  executionSession?: DataCenterCommandSession;
   canSubmit: boolean;
   requestOpen: boolean;
   onCloseRequest: () => void;
@@ -300,13 +305,24 @@ export function BackfillPlanPanel({
   const refreshedSuccess = useRef<string | null>(null);
   const cursor = page.cursors[page.index] ?? null;
   const plans = useBackfillPlans(cursor, page.generation);
+  const currentGeneration = useCurrentGeneration();
   const generation = page.generation ?? plans.serving?.generation_id ?? null;
+  const indexCurrent =
+    currentGeneration !== undefined &&
+    currentGeneration !== null &&
+    generation === currentGeneration &&
+    plans.serving?.generation_id === currentGeneration &&
+    !plans.isFetching &&
+    !plans.error;
   const items = plans.data?.source_state === "ready" ? plans.data.items : [];
   const activeHash = items.some((item) => item.plan_hash === selectedHash)
     ? selectedHash
     : (items[0]?.plan_hash ?? null);
   const selected = items.find((item) => item.plan_hash === activeHash);
-  const detail = useBackfillPlanDetail(activeHash, generation);
+  const detail = useBackfillPlanDetail(
+    indexCurrent ? activeHash : null,
+    indexCurrent ? generation : null,
+  );
   const progress = plans.data?.progress;
   const matchingTask =
     command.journal?.taskId && progress?.task_id === command.journal.taskId
@@ -334,8 +350,7 @@ export function BackfillPlanPanel({
     setPage(FIRST_PAGE);
     setSelectedHash(null);
     void plans.refetch();
-    if (activeHash) void detail.refetch();
-  }, [matchingTask, progress?.status, plans.refetch, detail.refetch, activeHash]);
+  }, [matchingTask, progress?.status, plans.refetch]);
 
   function reload() {
     setPage(FIRST_PAGE);
@@ -444,7 +459,9 @@ export function BackfillPlanPanel({
             </div>
           </section>
           <section className="dc-plan-preview" aria-label="计划详情">
-            {activeHash === null ? (
+            {!indexCurrent ? (
+              <PageSkeleton label="计划详情加载中" />
+            ) : activeHash === null ? (
               <EmptyState title="这页没有计划" hint="刷新计划后再试" />
             ) : detail.isLoading ? (
               <PageSkeleton label="计划详情加载中" />
@@ -463,6 +480,17 @@ export function BackfillPlanPanel({
               <>
                 {selected && selected.rank > 0 ? <p className="dc-plan-older">历史计划</p> : null}
                 <PlanDetail plan={detail.data.plan} />
+                <BackfillExecutionPanel
+                  mode="backfill"
+                  executionSession={executionSession}
+                  plan={detail.data.plan}
+                  planTaskId={
+                    progress?.status === "succeeded" &&
+                    progress.plan_hash === detail.data.plan.plan_hash
+                      ? (progress.task_id ?? null)
+                      : null
+                  }
+                />
               </>
             ) : (
               <EmptyState title="计划详情暂时不可用" hint="刷新计划后重试" />

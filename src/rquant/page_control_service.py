@@ -40,6 +40,7 @@ from rquant.page_control import (
     AckAlert,
     BackfillPlanPageControlBackend,
     DataAuditReportPageControlBackend,
+    DataCenterExecutionPageControlBackend,
     FactorDefinitionPageControlBackend,
     FormulaMarketPageControlBackend,
     FormulaPoolPageControlBackend,
@@ -151,6 +152,7 @@ def build_page_control_service(
     experiment_backend: ExperimentPageControlBackend | None = None,
     backfill_plan_backend: BackfillPlanPageControlBackend | None = None,
     data_audit_report_backend: DataAuditReportPageControlBackend | None = None,
+    data_center_execution_backend: DataCenterExecutionPageControlBackend | None = None,
     formula_market_backend: FormulaMarketPageControlBackend | None = None,
     formula_pool_backend: FormulaPoolPageControlBackend | None = None,
     factor_definition_backend: FactorDefinitionPageControlBackend | None = None,
@@ -179,6 +181,7 @@ def build_page_control_service(
         experiment_backend=experiment_backend,
         backfill_plan_backend=backfill_plan_backend,
         data_audit_report_backend=data_audit_report_backend,
+        data_center_execution_backend=data_center_execution_backend,
         formula_market_backend=formula_market_backend,
         formula_pool_backend=formula_pool_backend,
         factor_definition_backend=factor_definition_backend,
@@ -210,6 +213,7 @@ def build_page_control_service_with_dependencies(
     experiment_backend: ExperimentPageControlBackend | None = None,
     backfill_plan_backend: BackfillPlanPageControlBackend | None = None,
     data_audit_report_backend: DataAuditReportPageControlBackend | None = None,
+    data_center_execution_backend: DataCenterExecutionPageControlBackend | None = None,
     formula_market_backend: FormulaMarketPageControlBackend | None = None,
     formula_pool_backend: FormulaPoolPageControlBackend | None = None,
     factor_definition_backend: FactorDefinitionPageControlBackend | None = None,
@@ -264,6 +268,15 @@ def build_page_control_service_with_dependencies(
         if screen_query_cursor_key is None
         else ScreenQueryHistory(outbox, cursor_key=screen_query_cursor_key)
     )
+    profile_path=_settings().data_center_runtime_profile_path
+    if profile_path is not None:
+        from rquant.data_center_maintenance_runtime import build_data_center_execution_backend,build_data_center_plan_backend,build_data_center_audit_backend
+        if data_center_execution_backend is None:
+            data_center_execution_backend=build_data_center_execution_backend(profile_path,clock=clock)
+        if backfill_plan_backend is None:
+            backfill_plan_backend=build_data_center_plan_backend(profile_path,clock=clock)
+        if data_audit_report_backend is None:
+            data_audit_report_backend=build_data_center_audit_backend(profile_path,clock=clock)
     return PageControlService(
         outbox=outbox,
         consumer=PageControlConsumer(
@@ -279,6 +292,7 @@ def build_page_control_service_with_dependencies(
             backfill_plan_backend=backfill_plan_backend,
             experiment_backend=experiment_backend,
             data_audit_report_backend=data_audit_report_backend,
+            data_center_execution_backend=data_center_execution_backend,
             formula_market_backend=formula_market_backend,
             formula_pool_backend=formula_pool_backend,
             factor_definition_backend=factor_definition_backend,

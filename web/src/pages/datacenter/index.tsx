@@ -1,9 +1,10 @@
-import { useMemo, useState, useSyncExternalStore } from "react";
+import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import { submitBackfillPlanCommand } from "@/api/backfillPlanCommand";
 import {
   type CatalogDataset,
   type CatalogField,
   type CatalogSummary,
+  submitDataCenterCommand,
   useCatalog,
   useCatalogDataset,
 } from "@/api/endpoints";
@@ -25,6 +26,8 @@ import { AuditPanel } from "./AuditPanel";
 import { BackfillPlanPanel } from "./BackfillPlanPanel";
 import { BackfillPlanCommandSession } from "./backfillPlanCommandSession";
 import { DailyReportPanel } from "./DailyReportPanel";
+import { CollectionScopeBadge } from "./DatasetReportPanel";
+import { createDataCenterCommandSession } from "./dataCenterCommandSession";
 import { FinancialPanel } from "./FinancialPanel";
 import "./datacenter.css";
 
@@ -137,7 +140,13 @@ function DatasetList({
   );
 }
 
-function DatasetDetail({ dataset }: { dataset: CatalogDataset }) {
+function DatasetDetail({
+  dataset,
+  generation,
+}: {
+  dataset: CatalogDataset;
+  generation: string | null;
+}) {
   const [query, setQuery] = useState("");
   const [showHistoricalAudit, setShowHistoricalAudit] = useState(false);
   const needle = query.trim().toLocaleLowerCase();
@@ -182,6 +191,7 @@ function DatasetDetail({ dataset }: { dataset: CatalogDataset }) {
           </div>
         </dl>
       </Panel>
+      <CollectionScopeBadge datasetId={dataset.dataset_id} generation={generation} />
       <DailyReportPanel datasetId={dataset.dataset_id} />
       <Panel
         title="字段字典"
@@ -342,7 +352,11 @@ function CatalogView() {
           ) : detail.isLoading ? (
             <PageSkeleton label="字段说明加载中" />
           ) : detail.data ? (
-            <DatasetDetail key={detail.data.dataset_id} dataset={detail.data} />
+            <DatasetDetail
+              key={detail.data.dataset_id}
+              dataset={detail.data}
+              generation={detail.serving?.generation_id ?? null}
+            />
           ) : (
             <Panel>
               <EmptyState title="暂时读不到字段说明" hint="返回目录后重试" />
@@ -356,6 +370,15 @@ function CatalogView() {
 
 export default function DataCenterPage() {
   const meta = useMeta();
+  const [executionSession] = useState(() =>
+    createDataCenterCommandSession(submitDataCenterCommand),
+  );
+  const viewer = meta.data?.data.viewer ?? null;
+  const generation = meta.data?.data.generation?.generation_id ?? null;
+  useEffect(
+    () => executionSession.sync(viewer, generation),
+    [executionSession, viewer, generation],
+  );
   const [commandSession] = useState(
     () =>
       new BackfillPlanCommandSession(
@@ -429,11 +452,12 @@ export default function DataCenterPage() {
       {view === "catalog" ? (
         <CatalogView />
       ) : view === "financial" ? (
-        <FinancialPanel />
+        <FinancialPanel executionSession={executionSession} />
       ) : (
         <BackfillPlanPanel
           commandSession={commandSession}
           command={command}
+          executionSession={executionSession}
           canSubmit={!!meta.data?.data.viewer}
           requestOpen={requestOpen}
           onCloseRequest={() => setRequestOpen(false)}

@@ -41,6 +41,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run queued read-only backfill plan jobs")
     parser.add_argument("--state-path", required=True, type=_state_path)
     parser.add_argument("--plan-directory", required=True, type=_absolute_path)
+    parser.add_argument("--runtime-profile", type=_absolute_path)
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--once", action="store_true", help="claim at most one job, then exit")
     mode.add_argument("--poll", action="store_true", help="wait for queued jobs until stopped")
@@ -65,11 +66,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         previous_handlers[signum] = signal.signal(signum, request_stop)
 
     try:
-        store = BackfillPlanJobStore(
-            state_path=args.state_path,
-            plan_directory=args.plan_directory,
-        )
-        worker = BackfillPlanJobWorker(store)
+        if args.runtime_profile is None:
+            store = BackfillPlanJobStore(
+                state_path=args.state_path,
+                plan_directory=args.plan_directory,
+            )
+            worker = BackfillPlanJobWorker(store)
+        else:
+            from rquant.data_center_maintenance_runtime import (
+                build_data_center_plan_worker,
+                load_data_center_runtime_profile,
+            )
+            profile = load_data_center_runtime_profile(args.runtime_profile)
+            if (profile.plan_state_path, profile.plan_directory) != (args.state_path, args.plan_directory):
+                raise ValueError("runtime profile differs from the supplied original plan state and directory")
+            worker = build_data_center_plan_worker(args.runtime_profile, stop_requested=stopped.is_set)
         idle_reported = False
         while not stopped.is_set():
             receipt = worker.run_one()

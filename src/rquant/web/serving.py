@@ -84,31 +84,34 @@ class GenerationTracker:
         with self._refresh_lock:
             if self._closed:
                 return
-            self._last_check = self._monotonic()
             try:
-                reader = ServingReader(self.root)
-                pointer = reader.current_pointer()
-            except Exception as error:  # the root or pointer is unreadable
-                self._record_failure(f"serving 指针不可读：{_error_text(error)}")
-                return
-            with self._lock:
-                current = self._current
-            if current is not None and current.lease.manifest.generation_id == (
-                pointer.generation_id
-            ):
-                self._record_failure(None)
-                return
-            try:
-                lease = reader.acquire_generation()
-            except Exception as error:
-                self._record_failure(
-                    f"新数据代 {pointer.generation_id[:8]} 校验失败：{_error_text(error)}"
-                )
-                return
-            if self._closed:
-                lease.close()
-                return
-            self._install(lease)
+                try:
+                    reader = ServingReader(self.root)
+                    pointer = reader.current_pointer()
+                except Exception as error:  # the root or pointer is unreadable
+                    self._record_failure(f"serving 指针不可读：{_error_text(error)}")
+                    return
+                with self._lock:
+                    current = self._current
+                if current is not None and current.lease.manifest.generation_id == (
+                    pointer.generation_id
+                ):
+                    self._record_failure(None)
+                    return
+                try:
+                    lease = reader.acquire_generation()
+                except Exception as error:
+                    self._record_failure(
+                        f"新数据代 {pointer.generation_id[:8]} 校验失败：{_error_text(error)}"
+                    )
+                    return
+                if self._closed:
+                    lease.close()
+                    return
+                self._install(lease)
+            finally:
+                # An incomplete check must not suppress an overdue sibling refresh.
+                self._last_check = self._monotonic()
 
     def maybe_refresh(self) -> None:
         last = self._last_check

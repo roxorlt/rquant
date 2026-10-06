@@ -126,10 +126,12 @@ def project_data_audit_report(
             }
             for result in report.datasets
         )
-    return tuple(
+    projections=tuple(
         ServingProjectionPayload(table_name=name, available_at=available_at, rows=rows[name])
         for name in sorted(rows)
     )
+    from rquant.data_collection_projection import project_data_collection
+    return tuple(sorted((*projections,*project_data_collection(report,available_at=available_at)),key=lambda item:item.table_name))
 
 
 def read_catalog_audit_projection_rows(

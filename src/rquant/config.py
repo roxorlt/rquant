@@ -50,6 +50,12 @@ class Settings(BaseSettings):
     data_dir: Path
     duckdb_path: Path
     duckdb_readonly_path: Path | None = None
+    primary_writer_gate_path: Path | None = None
+    data_center_execution_policy_path: Path | None = None
+    data_center_runtime_profile_path: Path | None = None
+    data_center_financial_archive_path: Path | None = None
+    data_center_backfill_execute_enabled: bool = False
+    data_center_financial_collect_enabled: bool = False
     backfill_state_path: Path | None = None
     backfill_state_busy_timeout_ms: int = Field(default=5_000, ge=1)
     backfill_planner_memory_limit_mb: int = Field(default=2_048, ge=256)
@@ -352,6 +358,10 @@ class Settings(BaseSettings):
 
     @field_validator(
         "duckdb_readonly_path",
+        "primary_writer_gate_path",
+        "data_center_execution_policy_path",
+        "data_center_runtime_profile_path",
+        "data_center_financial_archive_path",
         "research_db_path",
         "research_readonly_db_path",
         "research_lake_dir",
@@ -366,6 +376,10 @@ class Settings(BaseSettings):
 
     @field_validator(
         "duckdb_readonly_path",
+        "primary_writer_gate_path",
+        "data_center_execution_policy_path",
+        "data_center_runtime_profile_path",
+        "data_center_financial_archive_path",
         "research_db_path",
         "research_readonly_db_path",
         "research_lake_dir",

@@ -48,6 +48,8 @@ from rquant.web.pool_editor_gateway import PoolCommandGateway, PoolCommandTransp
 from rquant.web.pool_nl_preview import PoolNlRateLimiter
 from rquant.web.proxy_identity import ProxyIdentityVerifier
 from rquant.web.routes import (
+    backfill_execution,
+    data_collection,
     backfill_plan_commands,
     backfill_plans,
     backtests,
@@ -118,6 +120,7 @@ API_TITLE = "rQuant Web API"
 #: release that does not touch the API leaves the OpenAPI snapshot unchanged.
 API_VERSION = "1"
 _WRITE_BODY_LIMITS = {
+    "/api/v1/data/executions/commands": backfill_execution.MAX_REQUEST_BYTES,
     "/api/v1/monitor/condition-rules/commands": condition_alert_rules_routes.MAX_COMMAND_REQUEST_BYTES,
     "/api/v1/monitor/condition-rules/commands/resume": condition_alert_rules_routes.MAX_COMMAND_REQUEST_BYTES,
     "/api/v1/screen/query/execute": screen_history_routes.MAX_REQUEST_BYTES,
@@ -672,6 +675,8 @@ def create_app(
         dependencies=private,
     )
     app.include_router(fundamentals.router, prefix="/api/v1", tags=["data-center"])
+    app.include_router(backfill_execution.router,prefix='/api/v1',tags=['data-center'],dependencies=private)
+    app.include_router(data_collection.router,prefix='/api/v1',tags=['data-center'],dependencies=private)
     app.include_router(
         backfill_plans.router, prefix="/api/v1", tags=["data-audit"], dependencies=private
     )

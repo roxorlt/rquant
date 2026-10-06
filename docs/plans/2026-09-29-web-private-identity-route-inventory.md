@@ -1,6 +1,6 @@
 # Web `current_user` 路由清单
 
-对应 [私有身份边界](2026-09-29-web-private-identity-boundary.md)。以下为当前代码中的全部 141 个 `current_user` 依赖路由；`/api/v1` 前缀已包含。公开类即使收到裸用户头，也只得到 `viewer=None`，不能据此取得身份。私有类统一使用已验证的代理身份；已有 CSRF、角色和业务条件仍单独检查。
+对应 [私有身份边界](2026-09-29-web-private-identity-boundary.md)。以下为当前代码中的全部 145 个 `current_user` 依赖路由；`/api/v1` 前缀已包含。公开类即使收到裸用户头，也只得到 `viewer=None`，不能据此取得身份。私有类统一使用已验证的代理身份；已有 CSRF、角色和业务条件仍单独检查。
 
 ## 公开读取（20）
 
@@ -27,7 +27,7 @@
 | GET | `/api/v1/data/issues` |
 | GET | `/api/v1/data/fundamentals/summary` |
 
-## 私有读取（67）
+## 私有读取（70）
 
 | 方法 | 路径 |
 |---|---|
@@ -79,6 +79,9 @@
 | GET | `/api/v1/pools/formula` |
 | GET | `/api/v1/pools/formula/{base_name}/members` |
 | GET | `/api/v1/data/report` |
+| GET | `/api/v1/data/collection` |
+| GET | `/api/v1/data/executions` |
+| GET | `/api/v1/data/financial-sources` |
 | GET | `/api/v1/data/audit-report/calendar` |
 | GET | `/api/v1/data/backfill-plans` |
 | GET | `/api/v1/data/backfill-plans/{plan_hash}` |
@@ -101,7 +104,7 @@
 
 名单按认证 owner 过滤。服务日志能力在未登录时只返回空列表，日志正文仍拒绝；普通任务、池子、监控、研究和审计页面则直接返回 401。公开的 `meta` 在没有有效证明时不显示 viewer。
 
-## 受保护操作（54）
+## 受保护操作（55）
 
 | 方法 | 路径 |
 |---|---|
@@ -121,6 +124,7 @@
 | POST | `/api/v1/screen/tdx/market/commands` |
 | POST | `/api/v1/pools/formula/commands` |
 | POST | `/api/v1/data/audit-report/commands` |
+| POST | `/api/v1/data/executions/commands` |
 | POST | `/api/v1/data/backfill-plans/commands` |
 | POST | `/api/v1/tasks/jobs/commands` |
 | POST | `/api/v1/tasks/controls/lookup` |

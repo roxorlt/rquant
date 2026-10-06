@@ -1299,6 +1299,17 @@ PAGE_PROJECTION_CONTRACTS: Mapping[str, ServingProjectionContract] = MappingProx
             max_rows=256,
             max_bytes=128 * 1024,
         ),
+        "data_center_execution": _contract("lab_jobs",(("execution_id","string"),("owner","string"),("status_json","string")),
+            ("execution_id",),max_rows=50,max_bytes=416*1024),
+        "data_center_execution_event": _contract("lab_jobs",(("event_id","string"),("execution_id","string"),("owner","string"),
+            ("event_type","string"),("occurred_at","timestamp"),("task_id","string"),("task_status","string"),
+            ("attempts","int"),("control_sequence","int"),("failure_code","string")),("event_id",),max_rows=20,max_bytes=32*1024,
+            event_time_columns=("occurred_at",)),
+        "data_center_execution_state": _contract("lab_jobs",(("configured","bool"),("backfill_enabled","bool"),
+            ("financial_enabled","bool"),("may_start","bool"),("observed_at","timestamp")),("observed_at",),max_rows=1,max_bytes=1024),
+        "data_center_financial_source": _contract("lab_jobs",(("api_name","string"),("permission_status","string"),
+            ("evidence_source","string"),("scope_start","string"),("scope_end","string"),("expires_at","string"),
+            ("remaining_units","int"),("total_units","int"),("resets_at","string")),("api_name",),max_rows=7,max_bytes=32*1024),
         "audit_report_overview": _contract(
             "lab_jobs",
             (
@@ -1395,6 +1406,11 @@ PAGE_PROJECTION_CONTRACTS: Mapping[str, ServingProjectionContract] = MappingProx
             ("report_hash", "dataset_id"),
             max_rows=24,
             max_bytes=2 * 1024 * 1024,
+        ),
+        "data_collection_dataset": _contract(
+            "lab_jobs",
+            (("report_hash","string"),("dataset_id","string"),("source_binding_sha256","string"),("evidence_json","string")),
+            ("report_hash","dataset_id"),max_rows=24,max_bytes=192*1024,
         ),
         "audit_report_job": _contract(
             "lab_jobs",

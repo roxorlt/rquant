@@ -13,13 +13,16 @@ from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING,Literal
 from uuid import uuid4
 
 import duckdb
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from rquant.data_audit_evidence import MAX_AUDIT_DAYS, DailyBarNullFieldSpec
+from rquant.data_collection_contracts import AuditCollectionReference
+if TYPE_CHECKING:
+    from rquant.data_collection_authority import VerifiedCollectionFile
 from rquant.data_audit_report import (
     AuditReplicaFileIdentity,
     DataAuditReplicaChangedError,
@@ -53,6 +56,7 @@ class DataAuditReportJobRequest(_JobModel):
     audit_start: date
     observed_through: date
     null_fields: tuple[DailyBarNullFieldSpec, ...] = Field(min_length=1, max_length=9)
+    collection_reference: AuditCollectionReference | None = None
 
     @field_validator("primary_path", "replica_path")
     @classmethod
@@ -124,7 +128,8 @@ class _Claim:
 
 def _canonical_request(request: DataAuditReportJobRequest) -> str:
     return json.dumps(
-        request.model_dump(mode="json"), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        request.model_dump(mode="json",exclude={'collection_reference'} if request.collection_reference is None else set()),
+        ensure_ascii=False, sort_keys=True, separators=(",", ":")
     )
 
 
@@ -166,6 +171,8 @@ class DataAuditReportJobStore:
         report_directory: Path,
         clock: Callable[[], datetime] | None = None,
         lease_seconds: int = 120,
+        collection_directory: Path | None = None,
+        collection_snapshot_root: Path | None = None,
     ) -> None:
         if not state_path.is_absolute() or not report_directory.is_absolute():
             raise ValueError("audit job paths must be absolute")
@@ -175,6 +182,13 @@ class DataAuditReportJobStore:
         self.report_directory = report_directory
         self.clock = clock or (lambda: datetime.now(UTC))
         self.lease_seconds = lease_seconds
+        self.collection_directory = collection_directory
+        self.collection_snapshot_root = collection_snapshot_root
+        for path in (collection_directory,collection_snapshot_root):
+            if path is not None and (not path.is_absolute() or path.is_symlink() or path.resolve(strict=False)!=path):
+                raise ValueError('collection paths must be absolute and canonical')
+        if collection_directory is not None:
+            collection_directory.mkdir(mode=0o700,parents=True,exist_ok=True)
         state_path.parent.mkdir(parents=True, exist_ok=True)
         with closing(self._connect()) as connection:
             connection.execute("PRAGMA journal_mode = WAL")
@@ -229,6 +243,16 @@ class DataAuditReportJobStore:
                     ON data_audit_report_job_event(task_id, event_id)
                     """
                 )
+                if collection_directory is not None:
+                    connection.execute('''CREATE TABLE IF NOT EXISTS data_collection_source (
+                        event_id TEXT PRIMARY KEY, sequence INTEGER NOT NULL UNIQUE,
+                        reference_json TEXT NOT NULL,task_id TEXT)''')
+                    connection.execute('''CREATE TABLE IF NOT EXISTS data_collection_cursor (
+                        singleton INTEGER PRIMARY KEY CHECK(singleton=1),sequence INTEGER NOT NULL,
+                        event_id TEXT NOT NULL,task_id TEXT NOT NULL)''')
+                    columns={row[1] for row in connection.execute('PRAGMA table_info(data_collection_source)')}
+                    if 'pin_released_at' not in columns:
+                        connection.execute('ALTER TABLE data_collection_source ADD COLUMN pin_released_at TEXT')
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.state_path, timeout=5, isolation_level=None)
@@ -283,20 +307,37 @@ class DataAuditReportJobStore:
         )
 
     def submit(self, request: DataAuditReportJobRequest) -> DataAuditReportJobReceipt:
+        with self._transaction() as connection:
+            task_id=self._submit_on(connection,request)
+        return self.status(task_id)
+
+    def _submit_on(self, connection: sqlite3.Connection,
+                   request: DataAuditReportJobRequest,*,
+                   verified_collection_file: VerifiedCollectionFile | None = None) -> str:
         request = DataAuditReportJobRequest.model_validate(request)
         payload = _canonical_request(request)
         digest = hashlib.sha256(payload.encode()).hexdigest()
         now = _utc(self.clock)
-        with self._transaction() as connection:
-            existing = connection.execute(
+        initial_digest=None
+        if verified_collection_file is not None:
+            from rquant.data_collection_authority import VerifiedCollectionFile,load_collection_proof
+            verified=VerifiedCollectionFile.model_validate(verified_collection_file)
+            if (request.collection_reference is None or self.collection_directory is None or
+                request.collection_reference!=verified.collection_reference or request.replica_file_identity!=verified.identity):
+                raise ValueError('internal verified collection file differs from original request')
+            proof=load_collection_proof(self.collection_directory,request.collection_reference)
+            if proof.replica_sha256!=verified.replica_sha256:
+                raise ValueError('internal verified digest differs from sealed source')
+            initial_digest=verified.replica_sha256
+        existing = connection.execute(
                 "SELECT * FROM data_audit_report_job WHERE idempotency_key = ?",
                 (request.idempotency_key,),
             ).fetchone()
-            if existing is not None:
+        if existing is not None:
                 if existing["request_json"] != payload or existing["request_sha256"] != digest:
                     raise ValueError("idempotency key already binds a different audit request")
                 task_id = existing["task_id"]
-            else:
+        else:
                 current = capture_data_audit_replica_identity(
                     request.primary_path, request.replica_path
                 )
@@ -323,8 +364,8 @@ class DataAuditReportJobStore:
                     """
                     INSERT INTO data_audit_report_job (
                         task_id, idempotency_key, request_json, request_sha256,
-                        status, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, 'queued', ?, ?)
+                        status, created_at, updated_at,replica_sha256
+                    ) VALUES (?, ?, ?, ?, 'queued', ?, ?,?)
                     """,
                     (
                         task_id,
@@ -333,6 +374,7 @@ class DataAuditReportJobStore:
                         digest,
                         now.isoformat(),
                         now.isoformat(),
+                        initial_digest,
                     ),
                 )
                 self._record_event(
@@ -342,7 +384,7 @@ class DataAuditReportJobStore:
                     attempts=0,
                     occurred_at=now.isoformat(),
                 )
-        return self.status(task_id)
+        return task_id
 
     @staticmethod
     def _receipt(row: sqlite3.Row) -> DataAuditReportJobReceipt:
@@ -382,7 +424,9 @@ class DataAuditReportJobStore:
                 or report.observed_through != request.observed_through
                 or report.null_fields
                 != tuple(sorted(request.null_fields, key=lambda field: field.field_name))
-                or report.collection_status != "collection_unconfirmed"
+                or (request.collection_reference is None and report.collection_status != "collection_unconfirmed")
+                or (request.collection_reference is not None and (
+                    report.schema_version!=3 or getattr(report,'collection_reference',None)!=request.collection_reference))
             ):
                 raise ValueError("audit report and stored task disagree")
         except (OSError, ValueError) as exc:
@@ -482,6 +526,41 @@ class DataAuditReportJobStore:
             )
             for row in reversed(rows)
         )
+
+    def retry_failed(self, task_id: str, *,
+                     expected_collection_reference: AuditCollectionReference,
+                     maintenance_recovery: bool = False) -> DataAuditReportJobReceipt:
+        """Explicitly requeue the same immutable request; source verification stays in the original worker."""
+        if not maintenance_recovery:
+            raise ValueError('original audit retry requires explicit maintenance recovery')
+        if _TASK_ID.fullmatch(task_id) is None:
+            raise ValueError('audit report task identity is invalid')
+        now=_utc(self.clock).isoformat()
+        with self._transaction() as connection:
+            row=connection.execute('SELECT * FROM data_audit_report_job WHERE task_id=?',[task_id]).fetchone()
+            if row is None:
+                raise LookupError('original audit report task is missing')
+            if len(row['request_json'].encode())>16*1024:
+                raise ValueError('original audit report request exceeds capacity')
+            request=DataAuditReportJobRequest.model_validate_json(row['request_json'])
+            if (_canonical_request(request)!=row['request_json'] or
+                    hashlib.sha256(row['request_json'].encode()).hexdigest()!=row['request_sha256'] or
+                    request.collection_reference!=expected_collection_reference):
+                raise ValueError('original audit report retry binding changed')
+            if row['status'] not in {'queued','running','succeeded'}:
+                if row['status']!='failed' or row['lease_token'] is not None or row['lease_until'] is not None:
+                    raise ValueError('original audit report still has a claim')
+                if row['attempts']>=6:
+                    raise ValueError('original audit report retry attempt capacity reached')
+                if connection.execute("SELECT 1 FROM data_audit_report_job WHERE status IN ('queued','running') LIMIT 1").fetchone():
+                    raise ValueError('another audit report task is active')
+                changed=connection.execute("UPDATE data_audit_report_job SET status='queued',error_code=NULL,updated_at=? "
+                    "WHERE task_id=? AND status='failed' AND lease_token IS NULL AND lease_until IS NULL AND attempts=?",
+                    [now,task_id,row['attempts']]).rowcount
+                if changed!=1:
+                    raise ValueError('original audit report retry lost its state')
+                self._record_event(connection,task_id=task_id,event_type='queued',attempts=row['attempts'],occurred_at=now)
+        return self.status(task_id)
 
     def _claim(self) -> _Claim | None:
         now = _utc(self.clock)
@@ -674,6 +753,9 @@ class DataAuditReportJobWorker:
                 expected_file_sha256=claim.replica_sha256,
                 on_replica_sha256=lambda digest: self.store._record_replica_sha256(claim, digest),
                 include_catalog=True,
+                collection_reference=request.collection_reference,
+                collection_directory=self.store.collection_directory,
+                collection_snapshot_root=self.store.collection_snapshot_root,
             )
             report = load_data_audit_report(report_path)
             if lost.is_set():

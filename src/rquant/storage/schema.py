@@ -1270,3 +1270,21 @@ VERSIONED_COMPATIBILITY_DDL = [
 # Compatibility export for callers outside rQuant; schema initialization uses
 # BASE_DDL plus the versioned registry in storage.migrations.
 ALL_DDL = [*BASE_DDL, *VERSIONED_COMPATIBILITY_DDL]
+DATA_CENTER_COMPLETION_DDLS = (
+    '''CREATE TABLE IF NOT EXISTS ingestion_commit_receipt (
+        event_id VARCHAR PRIMARY KEY, receipt_id VARCHAR NOT NULL UNIQUE,
+        sequence BIGINT NOT NULL UNIQUE, trade_date DATE NOT NULL,
+        collector_id VARCHAR NOT NULL, run_id VARCHAR NOT NULL,
+        payload_json VARCHAR NOT NULL, committed_at TIMESTAMPTZ NOT NULL
+    )''',
+    '''CREATE TABLE IF NOT EXISTS backfill_day_commit_receipt (
+        execution_id VARCHAR NOT NULL, task_id VARCHAR NOT NULL, receipt_id VARCHAR NOT NULL UNIQUE,
+        trade_date DATE NOT NULL, payload_json VARCHAR NOT NULL,
+        committed_at TIMESTAMPTZ NOT NULL, PRIMARY KEY(execution_id,task_id)
+    )''',
+    '''CREATE TABLE IF NOT EXISTS data_center_financial_runtime_receipt (
+        execution_id VARCHAR NOT NULL, task_id VARCHAR NOT NULL, receipt_id VARCHAR NOT NULL UNIQUE,
+        payload_json VARCHAR NOT NULL, committed_at TIMESTAMPTZ NOT NULL,
+        PRIMARY KEY(execution_id,task_id)
+    )''',
+)

@@ -51,6 +51,8 @@ def _parser() -> argparse.ArgumentParser:
     mode.add_argument("--once", action="store_true", help="claim at most one job, then exit")
     mode.add_argument("--poll", action="store_true", help="wait for queued jobs until stopped")
     parser.add_argument("--poll-interval", type=_poll_interval)
+    parser.add_argument('--runtime-profile',type=_absolute_canonical_path)
+    parser.add_argument('--bridge',action='store_true',help='admit at most one sealed source per original worker round')
     return parser
 
 
@@ -79,6 +81,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.once and args.poll_interval is not None:
         parser.error("--poll-interval requires --poll")
+    if args.bridge and args.runtime_profile is None:
+        parser.error('--bridge requires an explicit --runtime-profile')
     poll_interval = args.poll_interval if args.poll_interval is not None else 5.0
 
     stopped = Event()
@@ -92,14 +96,46 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         _require_safe_paths(args.state_path, args.report_directory)
+        profile=None
+        if args.runtime_profile is not None:
+            from rquant.data_center_maintenance_runtime import load_data_center_runtime_profile
+            profile=load_data_center_runtime_profile(args.runtime_profile)
+            if (profile.maintenance.audit_state_path,profile.maintenance.audit_directory)!=(args.state_path,args.report_directory):
+                raise ValueError('runner paths differ from the original runtime profile')
         store = DataAuditReportJobStore(
             state_path=args.state_path,
             report_directory=args.report_directory,
+            collection_directory=None if profile is None else profile.maintenance.collection_directory,
+            collection_snapshot_root=None if profile is None else profile.maintenance.collection_snapshot_root,
         )
         worker = DataAuditReportJobWorker(store)
+        bridge=None
+        if args.bridge:
+            from rquant.data_collection_bridge import DataCollectionBridge
+            from rquant.data_audit_evidence import DailyBarNullFieldSpec
+            bridge=DataCollectionBridge(store,null_fields=tuple(DailyBarNullFieldSpec(field_name=name,
+                max_null_numerator=0,max_null_denominator=1) for name in sorted(profile.maintenance.audit_null_fields)),
+                stop_requested=stopped.is_set,hash_timeout_seconds=profile.maintenance.hash_timeout_seconds)
         idle_reported = False
         while not stopped.is_set():
+            if bridge is not None:
+                try:
+                    bridge.run_one()
+                except ValueError as error:
+                    if str(error) not in {'another audit report task is active','audit report task cooldown has not elapsed'}:
+                        raise
             receipt = worker.run_one()
+            restoration=receipt if receipt is not None and receipt.status=='succeeded' else store.latest_success() if receipt is None and profile is not None else None
+            if profile is not None and restoration is not None:
+                from rquant.backfill_execute import load_execution_policy
+                from rquant.data_collection_authority import restore_collection_report_replica
+                from rquant.data_audit_report import CollectionDataAuditReport,load_data_audit_report,data_audit_report_path
+                report=load_data_audit_report(data_audit_report_path(store.report_directory,restoration.report_hash))
+                if isinstance(report,CollectionDataAuditReport):
+                    policy=load_execution_policy(profile.policy_path)
+                    restore_collection_report_replica(store,restoration.task_id,replica_path=profile.maintenance.replica_path,
+                        primary_writer_gate=policy.primary_writer_gate,hash_timeout_seconds=profile.maintenance.hash_timeout_seconds,
+                        stop_requested=stopped.is_set)
             if receipt is None:
                 if args.once:
                     print('{"status":"idle"}', flush=True)

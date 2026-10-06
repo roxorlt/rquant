@@ -103,6 +103,8 @@ class LabJobsPublisherSettings(RuntimeContractModel):
     audit_report_job_directory: Path | None = None
     backfill_plan_directory: Path | None = None
     backfill_plan_job_state_path: Path | None = None
+    data_center_state_path: Path | None = None
+    data_center_policy_path: Path | None = None
     authority_root: Path
     max_jobs: StrictInt = Field(default=100, gt=0, le=100)
     eta_completed_limit: StrictInt = Field(default=256, ge=3, le=256)
@@ -115,6 +117,8 @@ class LabJobsPublisherSettings(RuntimeContractModel):
         "audit_report_job_directory",
         "backfill_plan_directory",
         "backfill_plan_job_state_path",
+        "data_center_state_path",
+        "data_center_policy_path",
         "authority_root",
     )
     @classmethod
@@ -127,6 +131,10 @@ class LabJobsPublisherSettings(RuntimeContractModel):
 
     @model_validator(mode="after")
     def require_page_reader(self) -> LabJobsPublisherSettings:
+        if (self.data_center_state_path is None)!=(self.data_center_policy_path is None):
+            raise ValueError('data center paths require paired settings')
+        if self.data_center_state_path is not None and self.research_metadata_path is None:
+            raise ValueError('data center state requires original research metadata')
         if self.audit_report_path is not None and self.research_metadata_path is None:
             raise ValueError("audit_report_path requires research_metadata_path")
         if (self.audit_report_job_state_path is None) != (self.audit_report_job_directory is None):
@@ -359,6 +367,8 @@ def lab_jobs_publisher_builder(
                     audit_report_job_directory=settings.audit_report_job_directory,
                     backfill_plan_directory=settings.backfill_plan_directory,
                     backfill_plan_job_state_path=settings.backfill_plan_job_state_path,
+                    data_center_state_path=settings.data_center_state_path,
+                    data_center_policy_path=settings.data_center_policy_path,
                 )
 
                 def page_projection_reader(

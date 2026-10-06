@@ -724,6 +724,77 @@ class SubmitDataAuditReport(PageControlCommand):
         return self
 
 
+class PrepareBackfillExecution(PageControlCommand):
+    kind: Literal['prepare_backfill_execution'] = 'prepare_backfill_execution'
+    actor_id: str = Field(min_length=1,max_length=256)
+    plan_task_id: str = Field(pattern=r'^[0-9a-f]{32}$')
+    plan_hash: str = Field(pattern=r'^[0-9a-f]{64}$')
+
+
+class ExecuteBackfillPlan(PageControlCommand):
+    kind: Literal['execute_backfill_plan'] = 'execute_backfill_plan'
+    actor_id: str = Field(min_length=1,max_length=256)
+    execution_id: str = Field(pattern=r'^[0-9a-f]{64}$')
+    intent_id: str = Field(pattern=r'^[0-9a-f]{64}$')
+    prepare_command_id: str = Field(min_length=1,max_length=128)
+    plan_task_id: str = Field(pattern=r'^[0-9a-f]{32}$')
+    plan_hash: str = Field(pattern=r'^[0-9a-f]{64}$')
+    exact_dates_sha256: str = Field(pattern=r'^[0-9a-f]{64}$')
+    confirmed: Literal[True]
+
+
+class PauseDataCenterExecution(PageControlCommand):
+    kind: Literal['pause_data_center_execution'] = 'pause_data_center_execution'
+    actor_id: str = Field(min_length=1,max_length=256)
+    execution_id: str = Field(pattern=r'^[0-9a-f]{64}$')
+    expected_sequence: StrictInt = Field(ge=1)
+
+
+class ResumeDataCenterExecution(PageControlCommand):
+    kind: Literal['resume_data_center_execution'] = 'resume_data_center_execution'
+    actor_id: str = Field(min_length=1,max_length=256)
+    execution_id: str = Field(pattern=r'^[0-9a-f]{64}$')
+    expected_sequence: StrictInt = Field(ge=1)
+
+
+class PrepareFinancialCollection(PageControlCommand):
+    kind: Literal['prepare_financial_collection'] = 'prepare_financial_collection'
+    actor_id: str = Field(min_length=1,max_length=256)
+    audit_report_hash: str = Field(pattern=r'^[0-9a-f]{64}$')
+    security_scope: Literal['available_securities','selected_securities']
+    selected_securities: tuple[str,...] = Field(default=(),max_length=250)
+    start_date: date
+    end_date: date
+    report_periods: tuple[date,...] = Field(min_length=1,max_length=41)
+
+    @model_validator(mode='after')
+    def bind_scope(self) -> PrepareFinancialCollection:
+        if not 1<=(self.end_date-self.start_date).days+1<=3660:
+            raise ValueError('financial request dates exceed fixed range')
+        if self.selected_securities!=tuple(sorted(set(self.selected_securities))):
+            raise ValueError('selected securities must be unique and ordered')
+        if (self.security_scope=='selected_securities')!=bool(self.selected_securities):
+            raise ValueError('financial security scope differs from selection')
+        if self.report_periods!=tuple(sorted(set(self.report_periods))) or any(
+                period>self.end_date or (period.month,period.day) not in {(3,31),(6,30),(9,30),(12,31)} for period in self.report_periods):
+            raise ValueError('financial report periods must be ordered quarter ends')
+        return self
+
+
+class ExecuteFinancialCollection(PageControlCommand):
+    kind: Literal['execute_financial_collection'] = 'execute_financial_collection'
+    actor_id: str = Field(min_length=1,max_length=256)
+    execution_id: str = Field(pattern=r'^[0-9a-f]{64}$')
+    intent_id: str = Field(pattern=r'^[0-9a-f]{64}$')
+    prepare_command_id: str = Field(min_length=1,max_length=128)
+    plan_hash: str = Field(pattern=r'^[0-9a-f]{64}$')
+    confirmed: Literal[True]
+
+
+DataCenterExecutionCommand = PrepareBackfillExecution | ExecuteBackfillPlan | PauseDataCenterExecution | ResumeDataCenterExecution | PrepareFinancialCollection | ExecuteFinancialCollection
+DATA_CENTER_EXECUTION_COMMAND_TYPES = (PrepareBackfillExecution,ExecuteBackfillPlan,PauseDataCenterExecution,ResumeDataCenterExecution,PrepareFinancialCollection,ExecuteFinancialCollection)
+
+
 class SubmitFormulaMarketRun(PageControlCommand):
     kind: Literal["submit_formula_market_run"] = "submit_formula_market_run"
     actor_id: str = Field(min_length=1, max_length=256)
@@ -770,6 +841,12 @@ class BackfillPlanPageControlBackend(Protocol):
     def submit(self, command: SubmitBackfillPlan) -> JsonValue: ...
 
     def recover(self, command: SubmitBackfillPlan) -> JsonValue | None: ...
+
+
+class DataCenterExecutionPageControlBackend(Protocol):
+    def submit(self,command: DataCenterExecutionCommand) -> JsonValue: ...
+
+    def recover(self,command: DataCenterExecutionCommand) -> JsonValue | None: ...
 
 
 class DataAuditReportPageControlBackend(Protocol):
@@ -851,6 +928,7 @@ PageControlCommandValue = Annotated[
     | SubmitLabCommand
     | SubmitBackfillPlan
     | SubmitDataAuditReport
+    | DataCenterExecutionCommand
     | SubmitFormulaMarketRun
     | ExportLabArtifactZip
     | SubmitPortfolioBacktest
@@ -3066,6 +3144,7 @@ class PageControlConsumer:
         experiment_backend: ExperimentPageControlBackend | None = None,
         backfill_plan_backend: BackfillPlanPageControlBackend | None = None,
         data_audit_report_backend: DataAuditReportPageControlBackend | None = None,
+        data_center_execution_backend: DataCenterExecutionPageControlBackend | None = None,
         formula_market_backend: FormulaMarketPageControlBackend | None = None,
         formula_pool_backend: FormulaPoolPageControlBackend | None = None,
         factor_definition_backend: FactorDefinitionPageControlBackend | None = None,
@@ -3097,6 +3176,7 @@ class PageControlConsumer:
         self.experiment_backend = experiment_backend
         self.backfill_plan_backend = backfill_plan_backend
         self.data_audit_report_backend = data_audit_report_backend
+        self.data_center_execution_backend = data_center_execution_backend
         self.formula_market_backend = formula_market_backend
         self.formula_pool_backend = formula_pool_backend
         self.factor_definition_backend = factor_definition_backend
@@ -3995,6 +4075,8 @@ class PageControlConsumer:
             return self._backfill_plan_backend().submit(command)
         if isinstance(command, SubmitDataAuditReport):
             return self._data_audit_report_backend().submit(command)
+        if isinstance(command, DATA_CENTER_EXECUTION_COMMAND_TYPES):
+            return self._data_center_execution_backend().submit(command)
         if isinstance(command, SubmitFormulaMarketRun):
             return self._formula_market_backend().submit(command)
         if isinstance(command, ExportLabArtifactZip):
@@ -4017,6 +4099,11 @@ class PageControlConsumer:
         if self.data_audit_report_backend is None:
             raise RuntimeError("data audit report backend is unavailable")
         return self.data_audit_report_backend
+
+    def _data_center_execution_backend(self) -> DataCenterExecutionPageControlBackend:
+        if self.data_center_execution_backend is None:
+            raise RuntimeError('data center execution backend is unavailable')
+        return self.data_center_execution_backend
 
     def _formula_market_backend(self) -> FormulaMarketPageControlBackend:
         if self.formula_market_backend is None:
@@ -4307,6 +4394,8 @@ class PageControlConsumer:
             return self._backfill_plan_backend().recover(command)
         if isinstance(command, SubmitDataAuditReport):
             return self._data_audit_report_backend().recover(command)
+        if isinstance(command, DATA_CENTER_EXECUTION_COMMAND_TYPES):
+            return self._data_center_execution_backend().recover(command)
         if isinstance(command, SubmitFormulaMarketRun):
             return self._formula_market_backend().recover(command)
         if isinstance(command, SaveFormulaPoolV1):

@@ -67,6 +67,7 @@ from rquant.storage.duckdb import (
 )
 from rquant.storage.migrations import initialize_schema
 from rquant.trade_calendar import TradeCalendarConflictError
+from rquant.storage.primary_writer_gate import PrimaryWriterGate, PrimaryWriterLease, configured_primary_gate
 
 # 云端 daily/monitor 流水线权威产出，本地无独立增量 → 整表替换
 REPLACE_TABLES: tuple[str, ...] = (
@@ -1550,8 +1551,23 @@ def _sync_table(
     return TableSyncResult(table=table, mode=mode, rows=src_rows)
 
 
+def _snapshot_writer_lease(db_path: Path, borrowed: PrimaryWriterLease | None = None) -> tuple[PrimaryWriterLease | None,bool]:
+    config=configured_primary_gate(db_path,getattr(settings,'primary_writer_gate_path',None))
+    if borrowed is not None:
+        borrowed.verify(db_path)
+        if config is not None and config!=borrowed.config:
+            raise ValueError('borrowed writer lease differs from configured original profile')
+        return borrowed,False
+    return (None,False) if config is None else (PrimaryWriterGate(config).acquire(),True)
+
+
+def _publish_replica_generation_sidecar(temporary_path: Path, generation_path: Path) -> None:
+    os.replace(temporary_path, generation_path)
+
+
 def refresh_readonly_replica(
-    db_path: Path | None = None, replica_path: Path | None = None
+    db_path: Path | None = None, replica_path: Path | None = None, *,
+    primary_writer_lease: PrimaryWriterLease | None = None,
 ) -> tuple[bool, str]:
     """把主库原子复制成只读副本（cp → 只读验证 → os.replace）。
 
@@ -1568,7 +1584,12 @@ def refresh_readonly_replica(
     wal_path = db_path.with_name(db_path.name + ".wal")
     guard: duckdb.DuckDBPyConnection | None = None
     verify: duckdb.DuckDBPyConnection | None = None
+    lease: PrimaryWriterLease | None = None
+    owns_lease=False
+    operation_started=False
     try:
+        lease,owns_lease=_snapshot_writer_lease(db_path,primary_writer_lease)
+        operation_started=True
         guard = duckdb.connect(str(db_path), read_only=True)
         if wal_path.exists():
             raise RuntimeError(
@@ -1594,17 +1615,22 @@ def refresh_readonly_replica(
             output_path=generation_tmp,
             source_before=source_before,
         )
+        if lease is not None:
+            lease.verify(db_path)
         os.replace(tmp, replica_path)
-        os.replace(generation_tmp, generation_path)
+        _publish_replica_generation_sidecar(generation_tmp, generation_path)
     except Exception as e:
-        _remove_replica_temp_safely(tmp)
-        _remove_replica_temp_safely(generation_tmp)
+        if operation_started:
+            _remove_replica_temp_safely(tmp)
+            _remove_replica_temp_safely(generation_tmp)
         return False, f"副本刷新失败：{e}"
     finally:
         if verify is not None:
             _close_replica_connection_safely(verify, "verify")
         if guard is not None:
             _close_replica_connection_safely(guard, "guard")
+        if owns_lease and lease is not None:
+            lease.close()
     return True, "副本已刷新"
 
 
@@ -1626,9 +1652,14 @@ def sync_from_backup(
             backup_path, db_path, f"云端备份不存在：{backup_path}"
         )
 
+    lease=None
+    owns_lease=False
     try:
+        lease,owns_lease=_snapshot_writer_lease(db_path)
         conn = _rescue_stale_wal(db_path)
     except Exception as e:
+        if owns_lease and lease is not None:
+            lease.close()
         logger.exception("research-sync 打开主库失败")
         return _failure_report(backup_path, db_path, f"打开主库失败：{e}")
 
@@ -1719,7 +1750,11 @@ def sync_from_backup(
                 )
             )
     finally:
-        conn.close()
+        try:
+            conn.close()
+        finally:
+            if owns_lease and lease is not None:
+                lease.close()
 
     report = ResearchSyncReport(
         backup_path=str(backup_path),
@@ -1782,9 +1817,14 @@ def restore_research_tables(
             source_path, db_path, f"恢复源不存在：{source_path}"
         )
 
+    lease=None
+    owns_lease=False
     try:
+        lease,owns_lease=_snapshot_writer_lease(db_path)
         conn = _rescue_stale_wal(db_path)
     except Exception as e:
+        if owns_lease and lease is not None:
+            lease.close()
         logger.exception("research-restore 打开主库失败")
         return _failure_report(source_path, db_path, f"打开主库失败：{e}")
 
@@ -1822,7 +1862,11 @@ def restore_research_tables(
             TableSyncResult(table="<sync>", mode="error", detail=str(e)[:200])
         )
     finally:
-        conn.close()
+        try:
+            conn.close()
+        finally:
+            if owns_lease and lease is not None:
+                lease.close()
 
     report = ResearchSyncReport(
         backup_path=str(source_path),

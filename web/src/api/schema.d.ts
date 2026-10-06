@@ -294,6 +294,74 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/data/collection": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 查看实际采集范围 */
+        get: operations["get_collection_api_v1_data_collection_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/data/executions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 查看数据任务进度 */
+        get: operations["get_data_center_executions_api_v1_data_executions_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/data/executions/commands": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 确认、开始、暂停或继续数据任务 */
+        post: operations["submit_data_center_command_api_v1_data_executions_commands_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/data/financial-sources": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 查看财务接口权益和当前额度 */
+        get: operations["get_financial_sources_api_v1_data_financial_sources_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/data/fundamentals/summary": {
         parameters: {
             query?: never;
@@ -2898,9 +2966,9 @@ export interface components {
             collection_label: string;
             /**
              * Collection Status
-             * @constant
+             * @enum {string}
              */
-            collection_status: "collection_unconfirmed";
+            collection_status: "collection_unconfirmed" | "collection_partial";
             /**
              * Coverage Conclusion
              * @constant
@@ -2963,7 +3031,7 @@ export interface components {
              * Schema Version
              * @enum {integer}
              */
-            schema_version: 1 | 2;
+            schema_version: 1 | 2 | 3;
             /**
              * Source Mode
              * @constant
@@ -3836,6 +3904,24 @@ export interface components {
             /** Row Count */
             row_count: number;
         };
+        /** CollectionDatasetView */
+        CollectionDatasetView: {
+            /** Completed Through */
+            completed_through: string | null;
+            /** Dataset Id */
+            dataset_id: string;
+            /** Name */
+            name: string;
+            /** Scopes */
+            scopes: components["schemas"]["DatasetCollectionClaim"][];
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "verified" | "partial" | "unconfirmed";
+            /** Status Label */
+            status_label: string;
+        };
         /** ConditionAlertBarCloseFrequency */
         ConditionAlertBarCloseFrequency: {
             /**
@@ -4703,6 +4789,70 @@ export interface components {
              */
             source_state: "ready" | "not_published" | "unavailable";
         };
+        /** DataCenterCommandReceipt */
+        DataCenterCommandReceipt: {
+            /** Command Id */
+            command_id: string;
+            confirmation?: components["schemas"]["ExecutionConfirmation"] | null;
+            execution?: components["schemas"]["ExecutionView"] | null;
+            /** Execution Id */
+            execution_id?: string | null;
+            /** Message */
+            message: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "prepared" | "queued" | "control_accepted" | "pending" | "processing" | "failed" | "ambiguous";
+        };
+        /** DataCollectionData */
+        DataCollectionData: {
+            /**
+             * Coverage Label
+             * @default 全市场覆盖尚未核验
+             * @constant
+             */
+            coverage_label: "全市场覆盖尚未核验";
+            /**
+             * Datasets
+             * @default []
+             */
+            datasets: components["schemas"]["CollectionDatasetView"][];
+            /** Report Hash */
+            report_hash?: string | null;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "ready" | "not_published" | "unavailable";
+        };
+        /** DatasetCollectionClaim */
+        DatasetCollectionClaim: {
+            /** Content Sha256 */
+            content_sha256: string;
+            /**
+             * Coverage Complete
+             * @default false
+             * @constant
+             */
+            coverage_complete: false;
+            /** Dataset Id */
+            dataset_id: string;
+            /** Row Count */
+            row_count: number;
+            /**
+             * Scope
+             * @enum {string}
+             */
+            scope: "actual_date_rows" | "actual_snapshot_partition" | "actual_financial_queries" | "actual_receipt_set";
+            /** Source Api */
+            source_api: string;
+            /**
+             * Trade Date
+             * Format: date
+             */
+            trade_date: string;
+        };
         /** DatasetFrequencyCount */
         DatasetFrequencyCount: {
             /** Frequency */
@@ -5053,6 +5203,16 @@ export interface components {
             data: components["schemas"]["DataAuditReportData"];
             serving: components["schemas"]["ServingMeta"];
         };
+        /** Envelope[DataCollectionData] */
+        Envelope_DataCollectionData_: {
+            data: components["schemas"]["DataCollectionData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[ExecutionIndexData] */
+        Envelope_ExecutionIndexData_: {
+            data: components["schemas"]["ExecutionIndexData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
         /** Envelope[ExperimentCapabilities] */
         Envelope_ExperimentCapabilities_: {
             data: components["schemas"]["ExperimentCapabilities"];
@@ -5141,6 +5301,11 @@ export interface components {
         /** Envelope[FactorTrackingPanel] */
         Envelope_FactorTrackingPanel_: {
             data: components["schemas"]["FactorTrackingPanel"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[FinancialSourcesData] */
+        Envelope_FinancialSourcesData_: {
+            data: components["schemas"]["FinancialSourcesData"];
             serving: components["schemas"]["ServingMeta"];
         };
         /** Envelope[FormulaMarketJobDetailData] */
@@ -5416,6 +5581,66 @@ export interface components {
             /** Summary */
             summary: string;
         };
+        /** ExecuteBackfillRequest */
+        ExecuteBackfillRequest: {
+            /** Command Id */
+            command_id: string;
+            /**
+             * Confirmed
+             * @constant
+             */
+            confirmed: true;
+            /** Exact Dates Sha256 */
+            exact_dates_sha256: string;
+            /** Execution Id */
+            execution_id: string;
+            /** Intent Id */
+            intent_id: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "execute_backfill_plan";
+            /** Plan Hash */
+            plan_hash: string;
+            /** Plan Task Id */
+            plan_task_id: string;
+            /** Prepare Command Id */
+            prepare_command_id: string;
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+        };
+        /** ExecuteFinancialRequest */
+        ExecuteFinancialRequest: {
+            /** Command Id */
+            command_id: string;
+            /**
+             * Confirmed
+             * @constant
+             */
+            confirmed: true;
+            /** Execution Id */
+            execution_id: string;
+            /** Intent Id */
+            intent_id: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "execute_financial_collection";
+            /** Plan Hash */
+            plan_hash: string;
+            /** Prepare Command Id */
+            prepare_command_id: string;
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+        };
         /** ExecuteScreenQuery */
         ExecuteScreenQuery: {
             /** Command Id */
@@ -5432,6 +5657,71 @@ export interface components {
              * @default 20
              */
             page_size: number;
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+        };
+        /** ExecutionConfirmation */
+        ExecutionConfirmation: {
+            /**
+             * End Date
+             * Format: date
+             */
+            end_date: string;
+            /** Exact Dates Sha256 */
+            exact_dates_sha256?: string | null;
+            /** Execution Id */
+            execution_id: string;
+            /**
+             * Expires At
+             * Format: date-time
+             */
+            expires_at: string;
+            /** Intent Id */
+            intent_id: string;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "backfill" | "financial";
+            /** Missing Date Count */
+            missing_date_count?: number | null;
+            /** Plan Hash */
+            plan_hash: string;
+            /** Plan Task Id */
+            plan_task_id?: string | null;
+            /** Prepare Command Id */
+            prepare_command_id: string;
+            /** Query Count */
+            query_count?: number | null;
+            /**
+             * Report Periods
+             * @default []
+             */
+            report_periods: string[];
+            /** Security Count */
+            security_count?: number | null;
+            /**
+             * Start Date
+             * Format: date
+             */
+            start_date: string;
+        };
+        /** ExecutionControlRequest */
+        ExecutionControlRequest: {
+            /** Command Id */
+            command_id: string;
+            /** Execution Id */
+            execution_id: string;
+            /** Expected Sequence */
+            expected_sequence: number;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "pause_data_center_execution" | "resume_data_center_execution";
             /**
              * Requested At
              * Format: date-time
@@ -5526,6 +5816,106 @@ export interface components {
             sell_bps: string;
         };
         ExecutionCostSpec: unknown;
+        /** ExecutionEventView */
+        ExecutionEventView: {
+            /** Detail */
+            detail?: string | null;
+            /** Event Id */
+            event_id: string;
+            /** Execution Id */
+            execution_id: string;
+            /** Name */
+            name: string;
+            /**
+             * Occurred At
+             * Format: date-time
+             */
+            occurred_at: string;
+            /** Status Label */
+            status_label: string;
+        };
+        /** ExecutionIndexData */
+        ExecutionIndexData: {
+            /**
+             * Backfill Enabled
+             * @default false
+             */
+            backfill_enabled: boolean;
+            /**
+             * Configured
+             * @default false
+             */
+            configured: boolean;
+            /**
+             * Events
+             * @default []
+             */
+            events: components["schemas"]["ExecutionEventView"][];
+            /**
+             * Executions
+             * @default []
+             */
+            executions: components["schemas"]["ExecutionView"][];
+            /**
+             * Financial Enabled
+             * @default false
+             */
+            financial_enabled: boolean;
+            /**
+             * May Start
+             * @default false
+             */
+            may_start: boolean;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "ready" | "not_published" | "unavailable";
+        };
+        /** ExecutionView */
+        ExecutionView: {
+            /** Audit Report Hash */
+            audit_report_hash: string | null;
+            /** Can Pause */
+            can_pause: boolean;
+            /** Can Resume */
+            can_resume: boolean;
+            /** Completed Tasks */
+            completed_tasks: number;
+            /** Completion Verified */
+            completion_verified: boolean;
+            /** Control Sequence */
+            control_sequence: number;
+            /** Current Date */
+            current_date: string | null;
+            /** Execution Id */
+            execution_id: string;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "backfill" | "financial";
+            /** Name */
+            name: string;
+            /** Pause Applied */
+            pause_applied: boolean;
+            /** Pause Requested */
+            pause_requested: boolean;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "queued" | "running" | "paused" | "partial" | "verifying" | "failed" | "completed";
+            /** Status Label */
+            status_label: string;
+            /** Total Tasks */
+            total_tasks: number;
+            /**
+             * Updated At
+             * Format: date-time
+             */
+            updated_at: string;
+        };
         /** ExperimentAttemptRow */
         ExperimentAttemptRow: {
             /**
@@ -7990,6 +8380,50 @@ export interface components {
              * @enum {string}
              */
             label: "尚无来源记录" | "披露尚未可见" | "字段缺值" | "来源证据不足" | "日历待核验" | "候选数量超限" | "数值不可用" | "其他原因";
+        };
+        /** FinancialSourceView */
+        FinancialSourceView: {
+            /**
+             * Api Name
+             * @enum {string}
+             */
+            api_name: "fina_indicator" | "income" | "balancesheet" | "cashflow" | "forecast" | "express" | "dividend";
+            /** Evidence Source */
+            evidence_source?: ("supplier_account_response" | "offline_fixture") | null;
+            /** Expires At */
+            expires_at?: string | null;
+            /** Name */
+            name: string;
+            /** Permission Label */
+            permission_label: string;
+            /**
+             * Permission Status
+             * @enum {string}
+             */
+            permission_status: "verified" | "unknown" | "unavailable";
+            /** Remaining Units */
+            remaining_units?: number | null;
+            /** Resets At */
+            resets_at?: string | null;
+            /** Scope End */
+            scope_end?: string | null;
+            /** Scope Start */
+            scope_start?: string | null;
+            /** Total Units */
+            total_units?: number | null;
+        };
+        /** FinancialSourcesData */
+        FinancialSourcesData: {
+            /**
+             * Sources
+             * @default []
+             */
+            sources: components["schemas"]["FinancialSourceView"][];
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "ready" | "not_published" | "unavailable";
         };
         /** FinancialSummarySource */
         FinancialSummarySource: {
@@ -10998,6 +11432,65 @@ export interface components {
              * @default 0
              */
             min_target_amount: string;
+        };
+        /** PrepareBackfillRequest */
+        PrepareBackfillRequest: {
+            /** Command Id */
+            command_id: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "prepare_backfill_execution";
+            /** Plan Hash */
+            plan_hash: string;
+            /** Plan Task Id */
+            plan_task_id: string;
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+        };
+        /** PrepareFinancialRequest */
+        PrepareFinancialRequest: {
+            /** Audit Report Hash */
+            audit_report_hash: string;
+            /** Command Id */
+            command_id: string;
+            /**
+             * End Date
+             * Format: date
+             */
+            end_date: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "prepare_financial_collection";
+            /** Report Periods */
+            report_periods: string[];
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+            /**
+             * Security Scope
+             * @default available_securities
+             * @enum {string}
+             */
+            security_scope: "available_securities" | "selected_securities";
+            /**
+             * Selected Securities
+             * @default []
+             */
+            selected_securities: string[];
+            /**
+             * Start Date
+             * Format: date
+             */
+            start_date: string;
         };
         /** PrepareUnitRun */
         PrepareUnitRun: {
@@ -14415,6 +14908,132 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_CatalogDatasetDetail_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_collection_api_v1_data_collection_get: {
+        parameters: {
+            query?: {
+                generation?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_DataCollectionData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_data_center_executions_api_v1_data_executions_get: {
+        parameters: {
+            query?: {
+                generation?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_ExecutionIndexData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    submit_data_center_command_api_v1_data_executions_commands_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PrepareBackfillRequest"] | components["schemas"]["ExecuteBackfillRequest"] | components["schemas"]["PrepareFinancialRequest"] | components["schemas"]["ExecuteFinancialRequest"] | components["schemas"]["ExecutionControlRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DataCenterCommandReceipt"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_financial_sources_api_v1_data_financial_sources_get: {
+        parameters: {
+            query?: {
+                generation?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_FinancialSourcesData_"];
                 };
             };
             /** @description Validation Error */

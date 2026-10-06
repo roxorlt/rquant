@@ -449,7 +449,7 @@ def _read_report(borrowed: BorrowedGeneration) -> DataAuditReportData:
         overview=AuditReportOverview.model_validate(
             {
                 **overview.model_dump(),
-                "collection_label": "采集未确认",
+                "collection_label": "部分核验" if overview.collection_status=='collection_partial' else "采集未确认",
                 "coverage_label": "覆盖情况待确认",
                 "quality_label": {
                     "not_fully_assessed": "尚未完整检查",

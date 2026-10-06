@@ -75,6 +75,7 @@ class _TransportScope:
     logical_request_id: str
     next_ordinal: int = 1
     receipts: list[SourceTransportCallReceipt] = field(default_factory=list)
+    resume_api_name: str | None = None
 
 
 class QuotaBoundTransportObserver:
@@ -122,6 +123,8 @@ class QuotaBoundTransportObserver:
         *,
         logical_request_id: str,
         observed_at: datetime,
+        next_call_ordinal: int = 1,
+        resume_api_name: str | None = None,
     ) -> Iterator[None]:
         identifier = logical_request_id.strip()
         if not identifier:
@@ -129,8 +132,27 @@ class QuotaBoundTransportObserver:
         if self._scope.get() is not None:
             raise SourceQuotaConflictError("transport quota scopes cannot be nested")
         normalize_aware_utc(observed_at)
+        if type(next_call_ordinal) is not int or next_call_ordinal < 1:
+            raise SourceQuotaConflictError('transport resume ordinal must be positive')
+        if next_call_ordinal > 1:
+            api = '' if resume_api_name is None else resume_api_name.strip()
+            attempts = self.request_attempts(identifier)
+            if not api or len(attempts) != next_call_ordinal-1:
+                raise SourceQuotaConflictError('transport resume cannot skip durable attempts')
+            expected_ids: set[str] = set()
+            for ordinal in range(1,next_call_ordinal):
+                previous = self.get_call_attempt(logical_request_id=identifier,
+                                                api_name=api,call_ordinal=ordinal)
+                if previous is None or previous.outcome is not SourceQuotaAttemptOutcome.FAILURE:
+                    raise SourceQuotaConflictError('transport resume requires continuous failed attempts')
+                expected_ids.add(previous.attempt_id)
+            if expected_ids != {item.attempt_id for item in attempts}:
+                raise SourceQuotaConflictError('transport resume request/API binding conflicts')
+        elif resume_api_name is not None:
+            raise SourceQuotaConflictError('first transport scope cannot claim resume evidence')
         token: Token[_TransportScope | None] = self._scope.set(
-            _TransportScope(logical_request_id=identifier)
+            _TransportScope(logical_request_id=identifier,next_ordinal=next_call_ordinal,
+                            resume_api_name=resume_api_name)
         )
         try:
             yield
@@ -211,6 +233,8 @@ class QuotaBoundTransportObserver:
         normalized_api = api_name.strip()
         if not normalized_api:
             raise ValueError("api_name must be nonempty")
+        if scope.resume_api_name is not None and normalized_api != scope.resume_api_name:
+            raise SourceQuotaConflictError('resumed transport API changed')
         ordinal = scope.next_ordinal
         scope.next_ordinal += 1
         attempt_id = self._attempt_id(
