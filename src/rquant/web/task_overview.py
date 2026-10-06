@@ -23,6 +23,7 @@ from rquant.web.models.tasks import (
 )
 from rquant.web.serving import BorrowedGeneration
 from rquant.web.status import Status, UserState, service_status
+from rquant.task_unit_control import TaskUnitRunEvidence
 
 _OPS_TABLES = ("ops_host_status", "ops_unit_status", "ops_resource_status")
 _SLICES = (
@@ -154,13 +155,14 @@ def unavailable_services(
 
 def _projection_counts(borrowed: BorrowedGeneration) -> dict[str, int] | None:
     rows = borrowed.cursor.execute(
-        "SELECT table_name, available, row_count FROM projection_status "
+        "SELECT table_name, available, row_count, owner_dataset_id, owner_generation_id, available_at FROM projection_status "
         "WHERE table_name IN ('ops_host_status', 'ops_unit_status', 'ops_resource_status') "
         "ORDER BY table_name LIMIT 4"
     ).fetchall()
-    if len(rows) != len(_OPS_TABLES) or any(available is not True for _, available, _ in rows):
+    mark = _mark(borrowed, "ops_status")
+    if len(rows) != len(_OPS_TABLES) or mark is None or any(available is not True or owner != "ops_status" or generation != mark.generation_id or at != mark.event_time or at > borrowed.manifest.built_at for _, available, _, owner, generation, at in rows):
         return None
-    counts = {str(name): count for name, _available, count in rows}
+    counts = {str(name): count for name, _available, count, *_ in rows}
     if set(counts) != set(_OPS_TABLES):
         return None
     for name, count in counts.items():
@@ -271,6 +273,14 @@ def ops_sections(
     sample = _ops_sample(borrowed, mark)
     if sample is None:
         return unavailable_ops("任务状态暂时无法核实，等待下一次更新。")
+    from rquant.task_control_admission import read_task_center_view
+
+    try:
+        task_view = read_task_center_view(borrowed)
+    except ValueError:
+        return unavailable_ops("任务材料暂时无法核实，等待下一次更新。")
+    cpu = {} if task_view is None else {item.slice_name: item for item in task_view.cpu}
+    runs = {} if task_view is None else {item.unit: item for item in task_view.runs}
     phase = market_phase(now, None if day is None else day.is_trading_day)
     remaining_seconds = (sample.sampled_at + _OPS_TTL - now).total_seconds()
     scheduled = ScheduledTasksData(
@@ -281,28 +291,7 @@ def ops_sections(
         expires_at=sample.sampled_at + _OPS_TTL,
         remaining_seconds=remaining_seconds,
         items=[
-            ScheduledTaskItem(
-                name=item.label,
-                status=StatusInfo.of(_timer_status(item, phase, now)),
-                last_trigger_at=item.last_trigger_at,
-                next_at=item.next_at,
-                duration_seconds=(
-                    (item.service_exit_at - item.service_start_at).total_seconds()
-                    if item.last_result is not None
-                    and item.service_start_at is not None
-                    and item.service_exit_at is not None
-                    else None
-                ),
-                result_label=(
-                    "未知"
-                    if item.last_result is None
-                    else "成功"
-                    if item.last_result == "success"
-                    else "失败"
-                ),
-                timer_unit=item.timer,
-                service_unit=item.service,
-            )
+            _scheduled_item(item, runs.get(item.service), phase=phase, now=now)
             for item in sample.units
         ],
     )
@@ -330,13 +319,29 @@ def ops_sections(
                 slice_unit=item.slice_name,
                 memory_current_bytes=item.memory_current_bytes,
                 memory_peak_bytes=item.memory_peak_bytes,
+                cpu_usage_percent=None if item.slice_name not in cpu or cpu[item.slice_name].percent is None else float(cpu[item.slice_name].percent),
+                cpu_note="暂无可信 CPU 数据" if item.slice_name not in cpu or cpu[item.slice_name].percent is None else "同次采集的使用率",
             )
             for name, item in zip(_GROUP_NAMES, display_resources[1:], strict=True)
         ],
-        cpu_usage_percent=None,
-        cpu_note="暂无可信 CPU 数据",
+        cpu_usage_percent=None if parent.slice_name not in cpu or cpu[parent.slice_name].percent is None else float(cpu[parent.slice_name].percent),
+        cpu_note="暂无可信 CPU 数据" if parent.slice_name not in cpu or cpu[parent.slice_name].percent is None else "同次采集的总使用率",
     )
     return scheduled, resources
+
+
+def _scheduled_item(item: OpsUnitEvidence, run: TaskUnitRunEvidence | None, *, phase: MarketPhase, now: datetime) -> ScheduledTaskItem:
+    current = run is not None and run.invocation_id == item.service_invocation_id
+    result_label = "成功" if current and run.status == "succeeded" else "失败" if current and run.status == "failed" else "运行中" if current else "归属待确认" if run is not None else "未知"
+    origin = "手动运行" if current and run.origin == "manual" else "定时运行" if current and run.origin == "timer" else "外部运行" if current else "待确认"
+    previous = None
+    if run is not None and not current and run.origin == "manual":
+        previous = "上次手动运行成功（历史）" if run.status == "succeeded" else "上次手动运行失败（历史）" if run.status == "failed" else "上次手动运行结果待确认（历史）"
+    return ScheduledTaskItem(name=item.label, status=StatusInfo.of(_timer_status(item, phase, now)),
+        last_trigger_at=item.last_trigger_at, next_at=item.next_at, timer_unit=item.timer, service_unit=item.service,
+        result_label=result_label, duration_seconds=run.duration_ns / 1_000_000_000 if current and run.duration_ns is not None else None,
+        started_at=run.started_at if current else None, ended_at=run.ended_at if current else None,
+        invocation_id=run.invocation_id if current else None, origin_label=origin, previous_result_label=previous)
 
 
 def service_section(

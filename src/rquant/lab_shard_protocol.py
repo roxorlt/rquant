@@ -1237,7 +1237,11 @@ class LabClaimSpool(_TypedSpoolBase):
         claim_advance_hook: Callable[[LabSpoolClaim], None] | None = None,
         mutation_guard: Callable[[], object] | None = None,
         publish_receipt_publisher: SourceBrokerV2AuthorityRef | None = None,
+        expected_scheduling_barrier_identity: str | None = None,
     ) -> None:
+        if expected_scheduling_barrier_identity is not None and not re.fullmatch(r"[0-9a-f]{64}", expected_scheduling_barrier_identity):
+            raise ValueError("scheduling capability identity must be an exact digest")
+        self._expected_scheduling_barrier_identity = expected_scheduling_barrier_identity
         super().__init__(root, mutation_guard=mutation_guard)
         self.current_dir = self.root / "current"
         self.retired_dir = self.root / "archive" / "retired"
@@ -1792,52 +1796,121 @@ class LabClaimSpool(_TypedSpoolBase):
         """Persist the single execution point-of-admission under the claim lock."""
         validated = _validate_spool_claim(claim)
         with self._exclusive_lock():
-            self._cleanup_admission_temporaries_locked()
-            if self._revocation_locked(validated) is not None:
-                raise LabClaimRevokedError(
-                    f"claim {validated.claim_token} was revoked before execution admission"
-                )
-            if self._retired_blocks_locked(validated):
-                raise LabClaimSupersededError(
-                    "claim was terminally retired before execution admission"
-                )
-            current_path = self._current_path(validated.job_id, validated.shard_id)
-            if not self._managed_entry_exists(current_path, current_path.parent):
-                raise LabClaimSupersededError(
-                    "claim has no durable high-water at execution admission"
-                )
-            marker = self._load_current_locked(validated.job_id, validated.shard_id)
-            if marker.claim != validated:
-                raise LabClaimSupersededError(
-                    "claim is not the durable high-water at execution admission"
-                )
-            consumed_path = self._consumed_path(validated.claim_token)
-            if not self._managed_entry_exists(consumed_path, consumed_path.parent):
-                raise LabClaimNotConsumedError(
-                    f"claim {validated.claim_token} has no consumed delivery receipt"
-                )
-            consumed = self._load_consumed_locked(validated.claim_token)
-            if consumed.receipt.claim != validated:
-                raise RequestContentConflictError(
-                    f"claim_token {validated.claim_token} has conflicting receipt"
-                )
-            if consumed.receipt.status != "consumed":
-                raise LabClaimRevokedError(
-                    f"claim {validated.claim_token} has legacy revocation evidence"
-                )
-            admission = LabExecutionAdmission(
-                claim=validated,
-                delivery_content_hash=consumed.receipt.content_hash,
+            return self._admit_execution_locked(validated)
+
+    def _admit_execution_locked(self, validated: LabSpoolClaim) -> LabAdmittedExecution:
+        self._cleanup_admission_temporaries_locked()
+        if self._revocation_locked(validated) is not None:
+            raise LabClaimRevokedError(
+                f"claim {validated.claim_token} was revoked before execution admission"
             )
+        if self._retired_blocks_locked(validated):
+            raise LabClaimSupersededError(
+                "claim was terminally retired before execution admission"
+            )
+        current_path = self._current_path(validated.job_id, validated.shard_id)
+        if not self._managed_entry_exists(current_path, current_path.parent):
+            raise LabClaimSupersededError(
+                "claim has no durable high-water at execution admission"
+            )
+        marker = self._load_current_locked(validated.job_id, validated.shard_id)
+        if marker.claim != validated:
+            raise LabClaimSupersededError(
+                "claim is not the durable high-water at execution admission"
+            )
+        consumed_path = self._consumed_path(validated.claim_token)
+        if not self._managed_entry_exists(consumed_path, consumed_path.parent):
+            raise LabClaimNotConsumedError(
+                f"claim {validated.claim_token} has no consumed delivery receipt"
+            )
+        consumed = self._load_consumed_locked(validated.claim_token)
+        if consumed.receipt.claim != validated:
+            raise RequestContentConflictError(
+                f"claim_token {validated.claim_token} has conflicting receipt"
+            )
+        if consumed.receipt.status != "consumed":
+            raise LabClaimRevokedError(
+                f"claim {validated.claim_token} has legacy revocation evidence"
+            )
+        admission = LabExecutionAdmission(
+            claim=validated,
+            delivery_content_hash=consumed.receipt.content_hash,
+        )
+        admission_path = self._admission_path(validated.claim_token)
+        if self._managed_entry_exists(admission_path, admission_path.parent):
+            existing = self._load_admission_locked(validated.claim_token)
+            if existing.admission != admission:
+                raise RequestContentConflictError(
+                    f"claim_token {validated.claim_token} has conflicting admission"
+                )
+            self._require_scheduling_execution_locked(validated, admitted=True)
+            return existing
+        self._require_scheduling_execution_locked(validated, admitted=False)
+        return self._publish_admission_locked(admission)
+
+    def _require_scheduling_execution_locked(self, claim: LabSpoolClaim, *, admitted: bool, for_ack: bool = False) -> object:
+        from rquant.lab_scheduling_control import read_scheduling_barrier_at, require_scheduling_claim
+
+        descriptor = self._active_root_descriptor
+        if descriptor is None:
+            raise ValueError("scheduling execution is outside the original claim lock")
+        observed = os.fstat(descriptor)
+        marker = read_scheduling_barrier_at(descriptor, expected_root=(observed.st_dev, observed.st_ino))
+        require_scheduling_claim(marker, claim, expected_identity=self._expected_scheduling_barrier_identity, admitted=admitted, for_ack=for_ack)
+        return marker
+
+    @contextmanager
+    def scheduling_execution_start(self, claim: LabSpoolClaim, *, now: datetime) -> Iterator[None]:
+        """Persist ACK intent and retain the original claim lock through the actual ACK."""
+        from rquant.lab_scheduling_control import LabSchedulingExecution, read_scheduling_execution_at, write_scheduling_execution_at
+        from rquant.runtime_contracts import canonical_sha256
+
+        validated = _validate_spool_claim(claim)
+        with self._exclusive_lock():
             admission_path = self._admission_path(validated.claim_token)
-            if self._managed_entry_exists(admission_path, admission_path.parent):
-                existing = self._load_admission_locked(validated.claim_token)
-                if existing.admission != admission:
-                    raise RequestContentConflictError(
-                        f"claim_token {validated.claim_token} has conflicting admission"
-                    )
-                return existing
-            return self._publish_admission_locked(admission)
+            admitted = self._managed_entry_exists(admission_path, admission_path.parent)
+            marker = self._require_scheduling_execution_locked(validated, admitted=admitted, for_ack=True)
+            if marker is not None:
+                self._admit_execution_locked(validated)
+                descriptor = self._active_root_descriptor
+                assert descriptor is not None
+                existing = read_scheduling_execution_at(descriptor, validated.claim_token)
+                if existing is not None:
+                    existing.require_claim(validated, marker=marker)
+                    raise ValueError("original scheduling ACK intent already attempted or closed")
+                write_scheduling_execution_at(descriptor, LabSchedulingExecution(claim_token=validated.claim_token, claim_hash=canonical_sha256(validated), barrier_identity=marker.barrier_identity, root_generation=marker.root_generation, queue_fingerprint=marker.queue_identity.fingerprint, intent_at=now))
+            yield
+
+    def close_scheduling_execution(self, claim: LabSpoolClaim, *, now: datetime) -> None:
+        """Called only after the original isolated child has been joined and closed."""
+        from rquant.lab_scheduling_control import LabSchedulingExecution, read_scheduling_barrier_at, read_scheduling_execution_at, write_scheduling_execution_at
+        from rquant.runtime_contracts import canonical_sha256
+
+        validated = _validate_spool_claim(claim)
+        with self._exclusive_lock():
+            descriptor = self._active_root_descriptor
+            assert descriptor is not None
+            observed = os.fstat(descriptor)
+            marker = read_scheduling_barrier_at(descriptor, expected_root=(observed.st_dev, observed.st_ino))
+            if marker is None and self._expected_scheduling_barrier_identity is None:
+                return
+            if marker is None or marker.barrier_identity != self._expected_scheduling_barrier_identity:
+                raise ValueError("scheduling cleanup requires the original installed capability")
+            admission_path = self._admission_path(validated.claim_token)
+            if not self._managed_entry_exists(admission_path, admission_path.parent):
+                return
+            admission = self._load_admission_locked(validated.claim_token)
+            if admission.admission.claim != validated:
+                raise ValueError("scheduling cleanup original admission differs")
+            previous = read_scheduling_execution_at(descriptor, validated.claim_token)
+            if previous is not None:
+                previous.require_claim(validated, marker=marker)
+                if previous.closed_at is not None:
+                    return
+                value = LabSchedulingExecution.model_validate(previous.model_dump() | {"closed_at": now})
+            else:
+                value = LabSchedulingExecution(claim_token=validated.claim_token, claim_hash=canonical_sha256(validated), barrier_identity=marker.barrier_identity, root_generation=marker.root_generation, queue_fingerprint=marker.queue_identity.fingerprint, closed_at=now)
+            write_scheduling_execution_at(descriptor, value)
 
     def is_admitted(self, claim: LabSpoolClaim) -> bool:
         """Return whether immutable execution-admission history exists for the claim."""

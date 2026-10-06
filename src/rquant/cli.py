@@ -5291,6 +5291,15 @@ def cmd_lab_scheduler(args: argparse.Namespace) -> int:
                 claim_advance_hook=artifact_reclaimer.reclaim,
                 mutation_guard=runtime_identity_guard,
             )
+            from rquant.task_center_runtime import build_lab_scheduling_control
+            from rquant.lab_scheduling_control import LabSchedulingMaintenanceScope
+            scheduling_control = build_lab_scheduling_control(getattr(args, "task_center_profile", None), store=store,
+                producer_commit=code_sha, runtime_root=settings.lab_runtime_dir_resolved,
+                claim_spool_root=settings.lab_job_claim_dir_resolved,
+                maintenance_scope=LabSchedulingMaintenanceScope(report_root=settings.lab_job_report_dir_resolved,
+                    artifact_commit_root=settings.lab_artifact_commit_dir_resolved, final_artifact_root=settings.lab_final_artifact_dir_resolved)
+                    if getattr(args, "task_center_profile", None) is not None else None,
+                production_mode=settings.app_env == "prod")
             scheduler = LabScheduler(
                 store=store,
                 spool=LabCommandSpool(
@@ -5339,6 +5348,7 @@ def cmd_lab_scheduler(args: argparse.Namespace) -> int:
                 full_integrity_remediation_authorizer=highwater.remediation_authorizer,
                 full_integrity_degradation_reporter=highwater.degradation_reporter,
                 v2_emit_permit=v2_emit_permit,
+                scheduling_control=scheduling_control,
             )
             readiness = _lab_daemon_readiness_context(
                 args,
@@ -5717,9 +5727,14 @@ def cmd_lab_worker(args: argparse.Namespace) -> int:
         "worker",
         mutation_guard=runtime_identity_guard,
     ) as daemon_lock:
+        from rquant.task_center_runtime import task_center_worker_barrier_identity
+        scheduling_identity = task_center_worker_barrier_identity(getattr(args, "task_center_profile", None),
+            producer_commit=code_sha, runtime_root=settings.lab_runtime_dir_resolved,
+            claim_spool_root=settings.lab_job_claim_dir_resolved, production_mode=settings.app_env == "prod")
         claim_spool = LabClaimSpool(
             settings.lab_job_claim_dir_resolved,
             mutation_guard=runtime_identity_guard,
+            expected_scheduling_barrier_identity=scheduling_identity,
         )
         publication_verifier = _build_lab_claim_publication_worker_verifier(
             settings=settings,
@@ -8401,6 +8416,13 @@ def build_parser() -> argparse.ArgumentParser:
                 help="仅供受控 systemd oneshot 在同一进程内预演并执行当前不可变 generation",
             )
 
+    task_snapshot_p = sub.add_parser("ops-task-snapshot", help="发布同次任务状态与受信 CPU 材料")
+    task_snapshot_p.add_argument("--manifest", type=Path, required=True)
+    task_snapshot_p.add_argument("--manifest-public-key", type=Path, required=True)
+    task_snapshot_p.add_argument("--authority-root", type=Path, required=True)
+    task_snapshot_p.add_argument("--producer-commit", type=_parse_commit_sha, required=True)
+    task_snapshot_p.add_argument("--task-center-profile", type=Path, default=None)
+
     lab_run_p = sub.add_parser(
         "lab-run",
         help="执行 Strategy Lab 后台任务 spec（UI「后台运行」派生，内部命令）",
@@ -8476,6 +8498,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_formal_runtime_bootstrap_arguments(lab_scheduler_p)
     lab_scheduler_p.add_argument("--runtime-deployment-root", type=Path, required=True)
+    lab_scheduler_p.add_argument("--task-center-profile", type=Path, default=None)
     _add_formal_runtime_deployment_arguments(lab_scheduler_p)
     lab_scheduler_p.add_argument(
         "--once",
@@ -8493,6 +8516,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="运行 Strategy Lab 后台分片 worker",
     )
     _add_formal_runtime_bootstrap_arguments(lab_worker_p)
+    lab_worker_p.add_argument("--task-center-profile", type=Path, default=None)
     _add_formal_runtime_deployment_arguments(lab_worker_p)
     lab_worker_p.add_argument(
         "--worker-id",
@@ -8642,7 +8666,28 @@ def build_parser() -> argparse.ArgumentParser:
 #: (`tests/unit/test_cli_configuration_free_dispatch.py` pins that), so `main()` hands them the
 #: same early dispatch. Every other command keeps failing closed on missing configuration (T9-9);
 #: add a command here only after proving it never reaches `rquant.config`.
+def cmd_ops_task_snapshot(args: argparse.Namespace) -> int:
+    from rquant.authority_path_security import read_secure_regular_file
+    from rquant.ops_status import OpsStatusCollector
+    from rquant.ops_status_serving import collect_and_publish_ops_tasks
+    from rquant.task_center_runtime import TaskUnitRunSource, load_task_center_control_profile
+
+    key = read_secure_regular_file(args.manifest_public_key, expected_uid=os.geteuid(), expected_gid=os.getegid(),
+        allowed_modes=frozenset({0o600, 0o644}), max_bytes=4096)
+    source = None
+    if args.task_center_profile is not None:
+        profile = load_task_center_control_profile(args.task_center_profile, producer_commit=args.producer_commit, runtime_root=args.task_center_profile.parent)
+        if profile.unit_journal_identity is None:
+            raise ValueError("task snapshot profile has no exact original unit journal identity")
+        source = TaskUnitRunSource(identity=profile.unit_journal_identity)
+    pointer = collect_and_publish_ops_tasks(manifest_path=args.manifest, manifest_public_key_pem=key,
+        authority_root=args.authority_root, producer_commit=args.producer_commit, collector=OpsStatusCollector(), run_source=source)
+    print(pointer.model_dump_json())
+    return 0
+
+
 CONFIGURATION_FREE_COMMANDS: Final[dict[str, Callable[[argparse.Namespace], int]]] = {
+    "ops-task-snapshot": cmd_ops_task_snapshot,
     "runtime-deployment-profile": cmd_runtime_deployment_profile,
     "runtime-production-prerequisites": cmd_runtime_production_prerequisites,
     "runtime-production-profile": cmd_runtime_production_profile,

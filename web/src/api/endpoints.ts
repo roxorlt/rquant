@@ -217,6 +217,7 @@ export async function fetchServiceLogPage(
   level: LogLevel | null,
   cursor: string | null,
   signal: AbortSignal,
+  invocationId?: string | null,
 ): Promise<JournalPage> {
   const { data, response } = await apiClient().GET("/api/v1/tasks/services/{unit}/logs", {
     params: {
@@ -226,11 +227,16 @@ export async function fetchServiceLogPage(
         page_size: 100,
         ...(level ? { level } : {}),
         ...(cursor ? { cursor } : {}),
+        ...(invocationId ? { invocation_id: invocationId } : {}),
       },
     },
     signal,
   });
-  return unwrap(data, response);
+  const page = unwrap(data, response);
+  if (invocationId && page.invocation_id !== invocationId) {
+    throw new ApiError(409, "日志已更新，请重新查看。");
+  }
+  return page;
 }
 
 export function deadlineFromRemaining(

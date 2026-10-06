@@ -60,6 +60,7 @@ from rquant.web.condition_alert_commands import ConditionRuleScopeResolver, cond
 from rquant.web.models.screen import ScreenRunData
 
 if TYPE_CHECKING:
+    from rquant.task_control import TaskControlPageControlBackend
     from rquant.config import Settings
     from rquant.experiment_platform_commands import ExperimentPageControlBackend
     from rquant.paper_portfolio_commands import PaperPortfolioPageControlBackend
@@ -155,6 +156,7 @@ def build_page_control_service(
     factor_definition_backend: FactorDefinitionPageControlBackend | None = None,
     strategy_authoring_backend: StrategyAuthoringPageControlBackend | None = None,
     paper_portfolio_backend: PaperPortfolioPageControlBackend | None = None,
+    task_control_backend: TaskControlPageControlBackend | None = None,
     screen_query_executor: Callable[[ScreenQueryDefinition], ScreenRunData] | None = None,
     screen_query_cursor_key: bytes | None = None,
     condition_rule_scope: ConditionRuleScopeResolver | None = None,
@@ -182,6 +184,7 @@ def build_page_control_service(
         factor_definition_backend=factor_definition_backend,
         strategy_authoring_backend=strategy_authoring_backend,
         paper_portfolio_backend=paper_portfolio_backend,
+        task_control_backend=task_control_backend,
         screen_query_executor=screen_query_executor,
         screen_query_cursor_key=screen_query_cursor_key,
         condition_rule_scope=condition_rule_scope,
@@ -212,6 +215,7 @@ def build_page_control_service_with_dependencies(
     factor_definition_backend: FactorDefinitionPageControlBackend | None = None,
     strategy_authoring_backend: StrategyAuthoringPageControlBackend | None = None,
     paper_portfolio_backend: PaperPortfolioPageControlBackend | None = None,
+    task_control_backend: TaskControlPageControlBackend | None = None,
     screen_query_executor: Callable[[ScreenQueryDefinition], ScreenRunData] | None = None,
     screen_query_cursor_key: bytes | None = None,
     condition_rule_scope: ConditionRuleScopeResolver | None = None,
@@ -246,7 +250,15 @@ def build_page_control_service_with_dependencies(
     )
     if screen_query_cursor_key is not None:
         prepare_private_screen_outbox(path)
-    outbox = PageControlOutbox(path)
+    if task_control_backend is not None:
+        from rquant.task_control import TaskControlPageControlBackend
+
+        if type(task_control_backend) is not TaskControlPageControlBackend or Path(os.path.abspath(path)) != task_control_backend.journal.path:
+            raise ValueError("task control backend differs from original PageControl path")
+        task_control_backend.journal.identity()
+        outbox = task_control_backend.journal.outbox
+    else:
+        outbox = PageControlOutbox(path)
     screen_history = (
         None
         if screen_query_cursor_key is None
@@ -272,6 +284,7 @@ def build_page_control_service_with_dependencies(
             factor_definition_backend=factor_definition_backend,
             strategy_authoring_backend=strategy_authoring_backend,
             paper_portfolio_backend=paper_portfolio_backend,
+            task_control_backend=task_control_backend,
             screen_query_history=screen_history,
             screen_query_executor=screen_query_executor,
             condition_rule_scope=condition_rule_scope,

@@ -126,6 +126,7 @@ class JournalPage(RuntimeContractModel):
     scope: Literal["本机本次开机以来的服务日志（含手动运行）"] = _SCOPE
     entries: tuple[JournalEntry, ...] = Field(max_length=_MAX_PAGE_SIZE)
     next_cursor: StrictStr | None = None
+    invocation_id: StrictStr | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
 
 
 CommandRunner = Callable[[tuple[str, ...], float, int], bytes]
@@ -201,6 +202,7 @@ def _parse_rows(
     since: datetime | None,
     level: str | None,
     max_rows: int,
+    invocation_id: str | None = None,
 ) -> list[tuple[str, JournalEntry]]:
     if len(payload) > _MAX_BYTES or (payload and not payload.endswith(b"\n")):
         raise ValueError
@@ -226,6 +228,7 @@ def _parse_rows(
             or cursor in seen
             or row.get("_BOOT_ID") != boot
             or row.get("_SYSTEMD_UNIT") != unit
+            or invocation_id is not None and row.get("_SYSTEMD_INVOCATION_ID") != invocation_id
         ):
             raise ValueError
         seen.add(cursor)
@@ -296,12 +299,13 @@ class JournalLogReader:
             decoded = strict_json_loads(body)
             if (
                 type(decoded) is not dict
-                or set(decoded) != {"unit", "boot", "manifest", "host", "since", "level", "journal"}
+                or set(decoded) not in ({"unit", "boot", "manifest", "host", "since", "level", "journal"}, {"unit", "boot", "manifest", "host", "since", "level", "journal", "version", "invocation"})
                 or any(type(value) is not str for value in decoded.values())
                 or canonical_json_bytes(decoded) != body
                 or _JOURNAL_CURSOR.fullmatch(decoded["journal"]) is None
                 or _BOOT_ID.fullmatch(decoded["boot"]) is None
                 or _DIGEST.fullmatch(decoded["manifest"]) is None
+                or "version" in decoded and (decoded["version"] != "2" or _BOOT_ID.fullmatch(decoded["invocation"]) is None)
             ):
                 raise ValueError
         except (UnicodeError, ValueError, TypeError):
@@ -316,6 +320,7 @@ class JournalLogReader:
         level: str | None = None,
         page_size: int = 100,
         cursor: str | None = None,
+        invocation_id: str | None = None,
     ) -> JournalPage:
         now = self.clock()
         if (
@@ -329,6 +334,7 @@ class JournalLogReader:
             or type(page_size) is not int
             or not 1 <= page_size <= _MAX_PAGE_SIZE
             or (cursor is not None and type(cursor) is not str)
+            or (invocation_id is not None and (type(invocation_id) is not str or _BOOT_ID.fullmatch(invocation_id) is None))
         ):
             raise JournalRequestError
         if not now - _SEVEN_DAYS <= since <= now:
@@ -360,7 +366,9 @@ class JournalLogReader:
                 "since": since_utc.isoformat(),
                 "level": level or "",
             }
-            if prior is not None and any(prior[key] != value for key, value in binding.items()):
+            if invocation_id is not None:
+                binding |= {"version": "2", "invocation": invocation_id}
+            if prior is not None and (set(prior) - {"journal"} != set(binding) or any(prior[key] != value for key, value in binding.items())):
                 raise JournalCursorError
             remaining = _MAX_SECONDS - (self.monotonic() - started)
             if remaining <= 0:
@@ -378,6 +386,7 @@ class JournalLogReader:
                 f"--lines={limit}",
                 *((f"--cursor={prior['journal']}",) if prior is not None else ()),
                 f"_SYSTEMD_UNIT={unit}",
+                *((f"_SYSTEMD_INVOCATION_ID={invocation_id}",) if invocation_id is not None else ()),
             )
             try:
                 payload = self.command_runner(argv, remaining, _MAX_BYTES)
@@ -390,6 +399,7 @@ class JournalLogReader:
                     since=since_utc if prior is None else None,
                     level=level,
                     max_rows=limit,
+                    invocation_id=invocation_id,
                 )
             except Exception:
                 raise JournalUnavailableError from None
@@ -424,6 +434,7 @@ class JournalLogReader:
                 service_label=installed.label,
                 entries=tuple(entry for _, entry in visible),
                 next_cursor=next_cursor,
+                invocation_id=invocation_id,
             )
         except (JournalRequestError, JournalCursorError, JournalUnavailableError):
             raise

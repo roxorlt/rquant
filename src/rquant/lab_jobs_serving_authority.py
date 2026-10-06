@@ -830,7 +830,10 @@ class LabJobsServingSourceReader:
     def __call__(self, observed_at: datetime, /) -> SourceReadResult:
         observed = normalize_aware_utc(observed_at)
         from rquant.experiment_platform_projection import legacy_job_snapshot
+        from rquant.task_center_projection import scheduling_projection
 
+        first_control = self.reader.scheduling_state()
+        control_projections = () if first_control is None else (scheduling_projection(first_control, cutoff=observed),)
         first = legacy_job_snapshot(self.reader, limit=self.max_jobs)
         first_page = first.page
         self._validate_summaries(first_page, observed_at=observed)
@@ -856,6 +859,7 @@ class LabJobsServingSourceReader:
             self.page_projection_reader(observed) if self.page_projection_reader is not None else ()
         )
         base_projections = (
+            *control_projections,
             *_event_projections(first, observed_at=observed),
             *strategy_projections,
             *page_projections,
@@ -868,6 +872,8 @@ class LabJobsServingSourceReader:
         projections = (*base_projections, *factor_result_projections)
 
         second = legacy_job_snapshot(self.reader, limit=self.max_jobs)
+        if self.reader.scheduling_state() != first_control:
+            raise LabJobsServingAuthorityIntegrityError("scheduler state changed while building serving source")
         second_page = second.page
         if second.page != first.page:
             raise LabJobsServingAuthorityIntegrityError(
@@ -897,6 +903,7 @@ class LabJobsServingSourceReader:
             repeated_factor_results = self.factor_result_projection_reader(
                 observed,
                 other_projections=(
+                    *control_projections,
                     *_event_projections(second, observed_at=observed),
                     *repeated_strategy_projections,
                     *repeated_page_projections,
@@ -908,6 +915,7 @@ class LabJobsServingSourceReader:
                 )
 
         payload = LabJobsPayload(
+            scheduling_control=first_control,
             lab_jobs=tuple(
                 sorted(
                     records,

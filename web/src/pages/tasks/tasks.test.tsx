@@ -11,6 +11,22 @@ import { server } from "@/test/server";
 
 type Overview = Schemas["TaskOverviewData"];
 
+beforeEach(() => {
+  server.use(
+    http.get("*/api/v1/tasks/control-capabilities", () =>
+      HttpResponse.json({
+        generation_id: tasksEnvelope().serving.generation_id,
+        units: [],
+        can_control_scheduling: false,
+        can_recover_units: false,
+        can_recover_scheduling: false,
+        scheduling: { available: false, note: "调度状态尚未发布。" },
+        note: "任务操作尚未开放。",
+      }),
+    ),
+  );
+});
+
 const second: Schemas["ResearchJobItem"] = {
   job_id: "00000000-0000-0000-0000-000000000002",
   strategy_name: "历史回放",
@@ -56,6 +72,7 @@ function overviewEnvelope(
             next_at: "2026-09-25T01:30:00Z",
             duration_seconds: null,
             result_label: "未知",
+            origin_label: "待确认",
             timer_unit: "rquant-daily.timer",
             service_unit: "rquant-daily.service",
           },
@@ -93,12 +110,14 @@ function overviewEnvelope(
             slice_unit: "rquant-live.slice",
             memory_current_bytes: 536_870_912,
             memory_peak_bytes: 805_306_368,
+            cpu_note: "暂无可信 CPU 数据",
           },
         ],
         cpu_usage_percent: null,
         cpu_note: "暂无可信 CPU 数据",
       },
       research: tasksEnvelope().data,
+      scheduling: { available: false, note: "调度状态尚未发布。" },
       ...overrides,
     },
   };
@@ -107,6 +126,546 @@ function overviewEnvelope(
 function overviewHandler(envelope = overviewEnvelope()) {
   return http.get("*/api/v1/tasks/overview", () => HttpResponse.json(envelope));
 }
+
+describe("任务中心原请求和全局调度", () => {
+  function taskCapabilities(writer = false): Schemas["TaskControlCapabilitiesData"] {
+    return {
+      generation_id: tasksEnvelope().serving.generation_id,
+      units: [
+        {
+          unit: "rquant-daily.service",
+          can_request: true,
+          requires_confirmation: writer,
+          reason: "执行前会再次核验。",
+        },
+      ],
+      can_control_scheduling: true,
+      can_recover_units: true,
+      can_recover_scheduling: true,
+      scheduling: {
+        available: true,
+        desired_version: 0,
+        applied_version: 0,
+        desired_paused: false,
+        applied_paused: false,
+        draining_count: 0,
+        note: "研究调度正常。",
+      },
+      note: "执行前会再次核验。",
+    };
+  }
+
+  it("keeps the exact original UUID after a lost unit reply and only looks it up", async () => {
+    const submitted: Schemas["RequestUnitRun"][] = [];
+    const looked: Schemas["RequestUnitRun"][] = [];
+    server.use(
+      overviewHandler(),
+      http.get("*/api/v1/tasks/control-capabilities", () => HttpResponse.json(taskCapabilities())),
+      http.post("*/api/v1/tasks/units/rquant-daily.service/run", async ({ request }) => {
+        submitted.push((await request.json()) as Schemas["RequestUnitRun"]);
+        return HttpResponse.json({ detail: "结果待确认，请核验原请求。" }, { status: 503 });
+      }),
+      http.post("*/api/v1/tasks/controls/lookup", async ({ request }) => {
+        const body = (await request.json()) as Schemas["RequestUnitRun"];
+        looked.push(body);
+        return HttpResponse.json({
+          command_id: body.command_id,
+          original_request: body,
+          status: "started",
+          message: "本次运行已开始。",
+          can_resume: true,
+          started_at: "2026-09-24T07:31:30Z",
+          invocation_id: "a".repeat(32),
+        });
+      }),
+    );
+    const user = userEvent.setup();
+    renderApp("/tasks");
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "立即运行日线更新" })).toBeEnabled(),
+    );
+    await user.click(screen.getByRole("button", { name: "立即运行日线更新" }));
+    await user.click(await screen.findByRole("button", { name: "确认运行" }));
+    expect(await screen.findByText("运行结果待确认，请核验原请求。")).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "核验日线更新原请求" }));
+    expect(await screen.findByText("本次运行已开始。")).toBeVisible();
+    expect(submitted).toHaveLength(1);
+    expect(looked).toEqual(submitted);
+    expect(screen.getByRole("button", { name: "立即运行日线更新" })).toBeDisabled();
+  });
+
+  it("global scheduling waits for applied state and never pauses an individual job", async () => {
+    const controls: Schemas["SetLabSchedulingPaused"][] = [];
+    let applied = false;
+    const ready = overviewEnvelope({ scheduling: taskCapabilities().scheduling });
+    server.use(
+      http.get("*/api/v1/tasks/overview", () =>
+        HttpResponse.json(
+          applied
+            ? overviewEnvelope({
+                scheduling: {
+                  available: true,
+                  desired_version: 1,
+                  applied_version: 1,
+                  desired_paused: true,
+                  applied_paused: true,
+                  draining_count: 0,
+                  note: "研究调度已暂停。",
+                },
+              })
+            : ready,
+        ),
+      ),
+      http.get("*/api/v1/tasks/control-capabilities", () => HttpResponse.json(taskCapabilities())),
+      http.post("*/api/v1/tasks/scheduling/commands", async ({ request }) => {
+        const body = (await request.json()) as Schemas["SetLabSchedulingPaused"];
+        controls.push(body);
+        return HttpResponse.json({
+          command_id: body.command_id,
+          original_request: body,
+          status: "submitted",
+          message: "请求已受理，等待调度应用。",
+          can_resume: true,
+          desired_version: 1,
+        });
+      }),
+    );
+    const user = userEvent.setup();
+    renderApp("/tasks");
+    await user.click(await screen.findByRole("button", { name: "暂停研究调度" }));
+    await user.click(await screen.findByRole("button", { name: "确认暂停" }));
+    expect(await screen.findByText("请求已受理，等待调度应用。")).toBeVisible();
+    expect(screen.queryByText("研究调度已暂停。")).not.toBeInTheDocument();
+    expect(controls).toHaveLength(1);
+    expect(controls[0]).toMatchObject({
+      kind: "set_lab_scheduling_paused",
+      expected_version: 0,
+      paused: true,
+    });
+    expect(controls[0]).not.toHaveProperty("job_id");
+    applied = true;
+    await user.click(screen.getByRole("button", { name: "刷新" }));
+    expect(await screen.findByText("研究调度已暂停。")).toBeVisible();
+  });
+
+  it("another administrator CAS cannot settle a lost original scheduling UUID", async () => {
+    const submitted: Schemas["SetLabSchedulingPaused"][] = [];
+    const looked: Schemas["SetLabSchedulingPaused"][] = [];
+    let shared = taskCapabilities().scheduling;
+    server.use(
+      http.get("*/api/v1/tasks/overview", () =>
+        HttpResponse.json(overviewEnvelope({ scheduling: shared })),
+      ),
+      http.get("*/api/v1/tasks/control-capabilities", () =>
+        HttpResponse.json({ ...taskCapabilities(), scheduling: shared }),
+      ),
+      http.post("*/api/v1/tasks/scheduling/commands", async ({ request }) => {
+        submitted.push((await request.json()) as Schemas["SetLabSchedulingPaused"]);
+        return HttpResponse.json({ detail: "结果待确认，请核验原请求。" }, { status: 503 });
+      }),
+      http.post("*/api/v1/tasks/controls/lookup", async ({ request }) => {
+        const body = (await request.json()) as Schemas["SetLabSchedulingPaused"];
+        looked.push(body);
+        if (looked.length === 1) {
+          const other = { ...body, command_id: "00000000-0000-0000-0000-000000000001" };
+          return HttpResponse.json({
+            command_id: other.command_id,
+            original_request: other,
+            status: "applied",
+            message: "研究调度已暂停。",
+            can_resume: false,
+            desired_version: 1,
+          });
+        }
+        return HttpResponse.json({
+          command_id: body.command_id,
+          original_request: body,
+          status: looked.length === 2 ? "submitted" : "applied",
+          message: looked.length === 2 ? "请求已受理，等待核验。" : "研究调度已暂停。",
+          can_resume: looked.length === 2,
+          desired_version: looked.length === 2 ? null : 1,
+        });
+      }),
+    );
+    const user = userEvent.setup();
+    renderApp("/tasks");
+    await user.click(await screen.findByRole("button", { name: "暂停研究调度" }));
+    await user.click(await screen.findByRole("button", { name: "确认暂停" }));
+    expect(await screen.findByText("调度结果待确认，请核验原请求。")).toBeVisible();
+    const original = submitted[0];
+    if (original === undefined) throw new Error("original scheduling request missing");
+    expect(submitted).toHaveLength(1);
+    expect(original).toMatchObject({ expected_version: 0, paused: true });
+    expect(screen.getByRole("button", { name: "恢复研究调度" })).toBeDisabled();
+
+    shared = {
+      available: true,
+      desired_version: 1,
+      applied_version: 1,
+      desired_paused: true,
+      applied_paused: true,
+      draining_count: 0,
+      note: "研究调度已暂停。",
+    };
+    await user.click(screen.getByRole("button", { name: "刷新" }));
+    expect(await screen.findByText("研究调度已暂停。")).toBeVisible();
+    expect(screen.getByText("调度结果待确认，请核验原请求。")).toBeVisible();
+    expect(screen.getByRole("button", { name: "暂停研究调度" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "恢复研究调度" })).toBeDisabled();
+
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      await user.click(screen.getByRole("button", { name: "核验调度原请求" }));
+      await waitFor(() => expect(looked).toHaveLength(attempt));
+      await waitFor(() =>
+        expect(screen.getByRole("button", { name: "核验调度原请求" })).toBeEnabled(),
+      );
+      expect(screen.getByRole("button", { name: "恢复研究调度" })).toBeDisabled();
+      expect(looked[attempt - 1]).toEqual(original);
+      expect(submitted).toHaveLength(1);
+    }
+    expect(await screen.findByText("请求已受理，等待核验。")).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "核验调度原请求" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "恢复研究调度" })).toBeEnabled());
+    expect(screen.queryByRole("button", { name: "核验调度原请求" })).not.toBeInTheDocument();
+    expect(looked).toEqual([original, original, original]);
+    expect(submitted).toEqual([original]);
+  });
+
+  it("writer preparation binds the original run and cancellation sends no start", async () => {
+    const preparations: Schemas["PrepareUnitRun"][] = [];
+    const runs: Schemas["RequestUnitRun"][] = [];
+    const csrf: (string | null)[] = [];
+    server.use(
+      overviewHandler(),
+      http.get("*/api/v1/tasks/control-capabilities", () =>
+        HttpResponse.json(taskCapabilities(true)),
+      ),
+      http.post("*/api/v1/tasks/units/rquant-daily.service/run/prepare", async ({ request }) => {
+        const body = (await request.json()) as Schemas["PrepareUnitRun"];
+        preparations.push(body);
+        csrf.push(request.headers.get("X-Rquant-Csrf"));
+        return HttpResponse.json({
+          command_id: body.command_id,
+          original_request: body,
+          status: "prepared",
+          message: "准备已完成，请确认本次运行。",
+          can_resume: false,
+          confirmation_id: "00000000-0000-4000-8000-000000000003",
+          confirmation_expires_at: new Date(Date.now() + 60_000).toISOString(),
+        });
+      }),
+      http.post("*/api/v1/tasks/units/rquant-daily.service/run", async ({ request }) => {
+        const body = (await request.json()) as Schemas["RequestUnitRun"];
+        runs.push(body);
+        csrf.push(request.headers.get("X-Rquant-Csrf"));
+        return HttpResponse.json({
+          command_id: body.command_id,
+          original_request: body,
+          status: "started",
+          message: "本次运行已开始。",
+          can_resume: true,
+        });
+      }),
+    );
+    const user = userEvent.setup();
+    renderApp("/tasks");
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "立即运行日线更新" })).toBeEnabled(),
+    );
+    await user.click(screen.getByRole("button", { name: "立即运行日线更新" }));
+    const first = await screen.findByRole("dialog", { name: "运行日线更新" });
+    expect(within(first).getByRole("button", { name: "确认运行" })).toBeDisabled();
+    await user.click(within(first).getByRole("button", { name: /取\s*消/ }));
+    expect(runs).toHaveLength(0);
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "立即运行日线更新" })).toHaveFocus(),
+    );
+    await user.click(screen.getByRole("button", { name: "立即运行日线更新" }));
+    const second = await screen.findByRole("dialog", { name: "运行日线更新" });
+    await user.type(within(second).getByRole("textbox"), "日线更新");
+    await user.click(within(second).getByRole("button", { name: "确认运行" }));
+    expect(await screen.findByText("本次运行已开始。")).toBeVisible();
+    expect(preparations).toHaveLength(2);
+    expect(runs).toHaveLength(1);
+    expect(runs[0]).toMatchObject({
+      ...preparations[1]?.run,
+      confirmation_id: "00000000-0000-4000-8000-000000000003",
+    });
+    expect(runs[0]?.command_id).not.toBe(preparations[0]?.run.command_id);
+    expect(csrf).toEqual(["1", "1", "1"]);
+  });
+
+  it("a definite 422 refusal releases the run control instead of locking unknown", async () => {
+    let attempts = 0;
+    server.use(
+      overviewHandler(),
+      http.get("*/api/v1/tasks/control-capabilities", () => HttpResponse.json(taskCapabilities())),
+      http.post("*/api/v1/tasks/units/rquant-daily.service/run", () => {
+        attempts += 1;
+        return HttpResponse.json({ detail: "private-implementation-error" }, { status: 422 });
+      }),
+    );
+    const user = userEvent.setup();
+    renderApp("/tasks");
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "立即运行日线更新" })).toBeEnabled(),
+    );
+    await user.click(screen.getByRole("button", { name: "立即运行日线更新" }));
+    await user.click(await screen.findByRole("button", { name: "确认运行" }));
+    expect(await screen.findByText("请求已拒绝，请刷新状态后再操作。")).toBeVisible();
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "立即运行日线更新" })).toBeEnabled(),
+    );
+    expect(screen.queryByRole("button", { name: "核验日线更新原请求" })).toBeNull();
+    expect(attempts).toBe(1);
+    expect(document.body).not.toHaveTextContent("private-implementation-error");
+  });
+
+  it("retains original recovery when the current scheduled source loses its row", async () => {
+    const submitted: Schemas["RequestUnitRun"][] = [];
+    const looked: Schemas["RequestUnitRun"][] = [];
+    let missing = false;
+    server.use(
+      http.get("*/api/v1/tasks/overview", () =>
+        HttpResponse.json(
+          missing
+            ? overviewEnvelope({
+                scheduled: {
+                  ...overviewEnvelope().data.scheduled,
+                  source_state: "unavailable",
+                  source_label: "任务状态暂不可用",
+                  items: [],
+                  remaining_seconds: null,
+                },
+              })
+            : overviewEnvelope(),
+        ),
+      ),
+      http.get("*/api/v1/tasks/control-capabilities", () =>
+        HttpResponse.json(missing ? { ...taskCapabilities(), units: [] } : taskCapabilities()),
+      ),
+      http.post("*/api/v1/tasks/units/rquant-daily.service/run", async ({ request }) => {
+        submitted.push((await request.json()) as Schemas["RequestUnitRun"]);
+        return HttpResponse.json({ detail: "unknown" }, { status: 503 });
+      }),
+      http.post("*/api/v1/tasks/controls/lookup", async ({ request }) => {
+        const body = (await request.json()) as Schemas["RequestUnitRun"];
+        looked.push(body);
+        return HttpResponse.json({
+          command_id: body.command_id,
+          original_request: body,
+          status: "unknown",
+          message: "本次结果待确认。",
+          can_resume: true,
+        });
+      }),
+    );
+    const user = userEvent.setup();
+    renderApp("/tasks");
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "立即运行日线更新" })).toBeEnabled(),
+    );
+    await user.click(screen.getByRole("button", { name: "立即运行日线更新" }));
+    await user.click(await screen.findByRole("button", { name: "确认运行" }));
+    expect(await screen.findByText("运行结果待确认，请核验原请求。")).toBeVisible();
+    missing = true;
+    await user.click(screen.getByRole("button", { name: "刷新" }));
+    expect(await screen.findByText("任务状态暂不可用")).toBeVisible();
+    await user.click(await screen.findByRole("button", { name: "核验日线更新原请求" }));
+    expect(await screen.findByText("本次结果待确认。")).toBeVisible();
+    expect(looked).toEqual(submitted);
+    expect(submitted).toHaveLength(1);
+    expect(screen.getByRole("button", { name: "立即运行日线更新" })).toBeDisabled();
+  });
+
+  it("a new same-owner generation keeps only the old UUID recovery and never retargets it", async () => {
+    const oldGeneration = tasksEnvelope().serving.generation_id;
+    let generation = oldGeneration;
+    const submitted: Schemas["RequestUnitRun"][] = [];
+    const looked: Schemas["RequestUnitRun"][] = [];
+    const grants: string[] = [];
+    server.use(
+      http.get("*/api/v1/tasks/overview", () =>
+        HttpResponse.json({
+          ...overviewEnvelope(),
+          serving: { ...tasksEnvelope().serving, generation_id: generation },
+        }),
+      ),
+      http.get("*/api/v1/tasks/control-capabilities", ({ request }) => {
+        grants.push(new URL(request.url).searchParams.get("generation_id") ?? "");
+        return HttpResponse.json({ ...taskCapabilities(), generation_id: generation });
+      }),
+      http.post("*/api/v1/tasks/units/rquant-daily.service/run", async ({ request }) => {
+        submitted.push((await request.json()) as Schemas["RequestUnitRun"]);
+        return HttpResponse.json({}, { status: 503 });
+      }),
+      http.post("*/api/v1/tasks/controls/lookup", async ({ request }) => {
+        const body = (await request.json()) as Schemas["RequestUnitRun"];
+        looked.push(body);
+        return HttpResponse.json({
+          command_id: body.command_id,
+          original_request: body,
+          status: "unknown",
+          message: "原代结果待确认。",
+          can_resume: true,
+        });
+      }),
+    );
+    const user = userEvent.setup();
+    const { queryClient } = renderApp("/tasks");
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "立即运行日线更新" })).toBeEnabled(),
+    );
+    await user.click(screen.getByRole("button", { name: "立即运行日线更新" }));
+    await user.click(await screen.findByRole("button", { name: "确认运行" }));
+    expect(await screen.findByText("运行结果待确认，请核验原请求。")).toBeVisible();
+    generation = "b".repeat(64);
+    queryClient.setQueryData(["meta"], metaEnvelope({ generationId: generation }));
+    await waitFor(() => expect(grants).toContain(generation));
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "核验日线更新原请求" })).toBeEnabled(),
+    );
+    await user.click(screen.getByRole("button", { name: "核验日线更新原请求" }));
+    expect(await screen.findByText("原代结果待确认。")).toBeVisible();
+    expect(looked).toEqual(submitted);
+    expect(looked[0]?.generation_id).toBe(oldGeneration);
+    expect(submitted).toHaveLength(1);
+  });
+
+  it("a viewer change drops a late unit reply and clears the previous private UUID", async () => {
+    let viewer = "alice";
+    const deferred: { release: (() => void) | null } = { release: null };
+    const submitted: Schemas["RequestUnitRun"][] = [];
+    server.use(
+      overviewHandler(),
+      http.get("*/api/v1/tasks/control-capabilities", () =>
+        HttpResponse.json(
+          viewer === "alice"
+            ? taskCapabilities()
+            : {
+                ...taskCapabilities(),
+                units: [],
+                can_control_scheduling: false,
+                can_recover_units: false,
+                can_recover_scheduling: false,
+              },
+        ),
+      ),
+      http.post("*/api/v1/tasks/units/rquant-daily.service/run", async ({ request }) => {
+        const body = (await request.json()) as Schemas["RequestUnitRun"];
+        submitted.push(body);
+        await new Promise<void>((resolve) => {
+          deferred.release = resolve;
+        });
+        return HttpResponse.json({
+          command_id: body.command_id,
+          original_request: body,
+          status: "started",
+          message: "此前本人的敏感回执",
+          can_resume: true,
+        });
+      }),
+    );
+    const user = userEvent.setup();
+    const { queryClient } = renderApp("/tasks");
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "立即运行日线更新" })).toBeEnabled(),
+    );
+    await user.click(screen.getByRole("button", { name: "立即运行日线更新" }));
+    await user.click(await screen.findByRole("button", { name: "确认运行" }));
+    await waitFor(() => expect(submitted).toHaveLength(1));
+    viewer = "bob";
+    queryClient.setQueryData(["meta"], metaEnvelope({ viewer }));
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "核验日线更新原请求" })).toBeNull(),
+    );
+    if (deferred.release === null) throw new Error("unit request was not actually pending");
+    deferred.release();
+    await user.click(await screen.findByRole("button", { name: "刷新" }));
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "立即运行日线更新" })).toBeNull(),
+    );
+    expect(document.body).not.toHaveTextContent("此前本人的敏感回执");
+    expect(submitted).toHaveLength(1);
+  });
+
+  it("renders measured zero CPU for the host and each group without turning unknown into zero", async () => {
+    const original = overviewEnvelope().data.resources;
+    const firstGroup = original.groups[0];
+    if (!firstGroup) throw new Error("synthetic resource group is missing");
+    server.use(
+      overviewHandler(
+        overviewEnvelope({
+          resources: {
+            ...original,
+            cpu_usage_percent: 0,
+            groups: [
+              { ...firstGroup, cpu_usage_percent: 0 },
+              {
+                name: "维护任务",
+                slice_unit: "rquant-maintenance.slice",
+                memory_current_bytes: 0,
+                memory_peak_bytes: 0,
+                cpu_usage_percent: null,
+                cpu_note: "空组尚无完整计数",
+              },
+            ],
+          },
+        }),
+      ),
+    );
+    renderApp("/tasks");
+    const groups = await screen.findByRole("table", { name: "资源分组" });
+    expect(within(groups).getByRole("row", { name: /实时服务/ })).toHaveTextContent("0.0%");
+    expect(within(groups).getByRole("row", { name: /维护任务/ })).not.toHaveTextContent("0.0%");
+    expect(screen.getByRole("region", { name: "资源概况" })).toHaveTextContent("CPU0.0%");
+  });
+
+  it("keeps the exact invocation in every result-log request and rejects a swapped log scope", async () => {
+    const original = overviewEnvelope().data.scheduled;
+    const firstTask = original.items[0];
+    if (!firstTask) throw new Error("synthetic scheduled task is missing");
+    const invocation = "d".repeat(32);
+    const requests: URL[] = [];
+    server.use(
+      overviewHandler(
+        overviewEnvelope({
+          scheduled: {
+            ...original,
+            items: [
+              {
+                ...firstTask,
+                invocation_id: invocation,
+                origin_label: "手动运行",
+                result_label: "已完成",
+              },
+            ],
+          },
+        }),
+      ),
+      http.get("*/api/v1/tasks/services/log-capabilities", () =>
+        HttpResponse.json({ units: ["rquant-daily.service"] }),
+      ),
+      http.get("*/api/v1/tasks/services/:unit/logs", ({ request }) => {
+        requests.push(new URL(request.url));
+        return HttpResponse.json({
+          service_label: "每日任务",
+          scope: "本机本次开机以来的服务日志（含手动运行）",
+          invocation_id: "e".repeat(32),
+          entries: [{ at: "2026-09-24T07:31:00Z", level: "信息", text: "任务已完成" }],
+          next_cursor: null,
+        });
+      }),
+    );
+    const user = userEvent.setup();
+    renderApp("/tasks");
+    await user.click(await screen.findByRole("button", { name: "查看日线更新的运行日志" }));
+    expect(await screen.findByText("日志已更新，请重新查看。")).toBeVisible();
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.searchParams.get("invocation_id")).toBe(invocation);
+    expect(screen.queryByText("任务已完成")).toBeNull();
+  });
+});
 
 function eventsData(
   overrides: Partial<Schemas["ResearchTaskEventsData"]> = {},

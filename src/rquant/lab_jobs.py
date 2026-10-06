@@ -25,6 +25,12 @@ from weakref import ReferenceType, ref
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+if TYPE_CHECKING:
+    from rquant.lab_scheduling_control import (
+        LabSchedulingBarrierPort, LabSchedulingCommandReceipt,
+        LabSchedulingControlState, LabSchedulingQueueIdentity,
+    )
+
 from rquant.adapter_manifest import VerifyOnlyEd25519Keyring
 from rquant.current_claim_authority import PersistentCurrentClaimAuthority
 from rquant.lab_artifact_protocol import (
@@ -4040,8 +4046,20 @@ def _validate_current_schema(connection: sqlite3.Connection) -> None:
 
     try:
         _validate_v16_schema(connection)
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        control = connection.execute(
+            "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='lab_scheduler_control'"
+        ).fetchone()
+        if version == 17:
+            from rquant.lab_scheduling_control import validate_scheduling_schema
+
+            validate_scheduling_schema(connection)
+        elif control is not None:
+            raise LabDatabaseIdentityError("scheduling control requires explicit schema17")
     except LabDatabaseIdentityError as exc:
         raise LabDatabaseIdentityError("lab jobs SQLite v16 current schema is invalid") from exc
+    except ValueError as exc:
+        raise LabDatabaseIdentityError("lab jobs SQLite schema17 scheduling contract is invalid") from exc
 
 
 def _migrate_v13_to_v14(connection: sqlite3.Connection) -> None:
@@ -4729,7 +4747,7 @@ def _validate_database_identity(
         )
     except InvalidStoredJobError as exc:
         raise LabDatabaseIdentityError(str(exc)) from exc
-    versions = accepted_versions or frozenset({_SCHEMA_VERSION})
+    versions = accepted_versions or frozenset({_SCHEMA_VERSION, 17})
     if application_id == _APPLICATION_ID:
         if user_version not in versions:
             expected = ", ".join(str(version) for version in sorted(versions))
@@ -4894,6 +4912,11 @@ class LabJobReader:
                     )
                 )
         return tuple(revisions)
+
+    def scheduling_state(self) -> LabSchedulingControlState | None:
+        from rquant.lab_scheduling_control import scheduling_reader_state
+
+        return scheduling_reader_state(self)
 
     @contextmanager
     def _read_snapshot(self, *, label: str) -> Iterator[sqlite3.Connection]:
@@ -5892,6 +5915,7 @@ class LabJobReader:
     def _advance_integrity_anchor(
         self,
         *,
+        schema_generation: int,
         database_generation: tuple[int, int],
         mutation_epoch: int,
         chain_generation: int,
@@ -5941,7 +5965,7 @@ class LabJobReader:
         if self.highwater_observer is not None:
             self.highwater_observer.observe(
                 database_generation=database_generation,
-                schema_generation=_SCHEMA_VERSION,
+                schema_generation=schema_generation,
                 mutation_epoch=mutation_epoch,
                 chain_generation=chain_generation,
                 chain_head_hash=chain_head_hash,
@@ -5998,6 +6022,7 @@ class LabJobReader:
                 checked_chain_entries=checked_chain_entries,
             )
             self._advance_integrity_anchor(
+                schema_generation=connection.execute("PRAGMA user_version").fetchone()[0],
                 database_generation=database_generation,
                 mutation_epoch=epoch,
                 chain_generation=chain_generation,
@@ -6134,6 +6159,7 @@ class LabJobReader:
             table_counts=LabGraphIntegrityTableCounts.model_validate(table_counts),
         )
         self._advance_integrity_anchor(
+            schema_generation=connection.execute("PRAGMA user_version").fetchone()[0],
             database_generation=database_generation,
             mutation_epoch=epoch,
             chain_generation=chain_generation,
@@ -7280,6 +7306,7 @@ class LabJobStore:
         self.busy_timeout_ms = busy_timeout_ms
         self.identity_authority = identity_authority
         self.mutation_guard = mutation_guard
+        self.scheduling_control_enabled = False
         if identity_authority is not None and identity_authority.path != self.path:
             raise ValueError("SQLite identity authority path mismatch")
 
@@ -7456,6 +7483,7 @@ class LabJobStore:
                         _V14_SCHEMA_VERSION,
                         _V15_SCHEMA_VERSION,
                         _SCHEMA_VERSION,
+                        17,
                     }
                 ),
             )
@@ -7481,6 +7509,7 @@ class LabJobStore:
                         _V14_SCHEMA_VERSION,
                         _V15_SCHEMA_VERSION,
                         _SCHEMA_VERSION,
+                        17,
                     }
                 ),
             )
@@ -7489,6 +7518,10 @@ class LabJobStore:
                 field="PRAGMA user_version",
                 minimum=0,
             )
+            if starting_version == 17:
+                _validate_current_schema(connection)
+                connection.commit()
+                return
             if unclaimed:
                 connection.execute(f"PRAGMA application_id = {self.APPLICATION_ID}")
             elif starting_version == _LEGACY_SCHEMA_VERSION:
@@ -8292,6 +8325,28 @@ class LabJobStore:
             heartbeat_at=acquired_at,
             expires_at=expires_at,
         )
+
+    def scheduling_identity(self) -> LabSchedulingQueueIdentity:
+        from rquant.lab_scheduling_control import scheduling_identity
+
+        return scheduling_identity(self)
+
+    def scheduling_state(self) -> LabSchedulingControlState | None:
+        from rquant.lab_scheduling_control import scheduling_state
+
+        return scheduling_state(self)
+
+    def scheduling_receipt(self, request_id: UUID) -> LabSchedulingCommandReceipt | None:
+        from rquant.lab_scheduling_control import scheduling_receipt
+
+        return scheduling_receipt(self, request_id)
+
+    def enable_scheduling_control(
+        self, *, lease: LabLeaseRecord, barrier_port: LabSchedulingBarrierPort, now: datetime,
+    ) -> LabSchedulingControlState:
+        from rquant.lab_scheduling_control import enable_scheduling_control
+
+        return enable_scheduling_control(self, lease=lease, barrier_port=barrier_port, now=now)
 
     @staticmethod
     def _validate_lease(
@@ -14324,6 +14379,10 @@ class LabJobStore:
 
         with self._transaction() as connection:
             self._validate_lease(connection, lease, now=current)
+            from rquant.lab_scheduling_control import scheduling_allows_dispatch
+
+            if not scheduling_allows_dispatch(connection, capability_loaded=self.scheduling_control_enabled):
+                return selected(None)
             active_worker = connection.execute(
                 """
                 SELECT 1 FROM lab_shard

@@ -42,6 +42,7 @@ from rquant.lab_jobs import (
     JobStatus,
     LabJobReader,
 )
+from rquant.lab_scheduling_control import LabSchedulingCommandEnvelope, LabSchedulingCommandReceipt, LabSchedulingSubmission
 from rquant.portfolio_backtest_adapter import PortfolioBacktestRunInput
 from rquant.research_gate import ResearchGateDecision
 from rquant.research_run_spec import (
@@ -651,6 +652,31 @@ class LabCommandSubmissionFacade:
         if self.experiment_template_binding is not None and self.experiment_template_binding.store.registry is not experiment_registry:
             raise ValueError("private template directory needs the same original experiment registry")
 
+    def submit_scheduling_control(self, envelope: LabSchedulingCommandEnvelope) -> LabSchedulingSubmission:
+        envelope = LabSchedulingCommandEnvelope.model_validate(envelope)
+        existing = self.spool.find(envelope.request_id)
+        if existing is not None:
+            saved = existing.envelope if isinstance(existing, LabSpoolEntry) else existing.receipt
+            if type(saved) not in (LabSchedulingCommandEnvelope, LabSchedulingCommandReceipt) or saved.content_hash != envelope.content_hash:
+                raise RequestContentConflictError("scheduler original UUID has different content or scope")
+        else:
+            current = self.reader.scheduling_state()
+            if current is None or current.queue_identity != envelope.command.queue_identity:
+                raise ValueError("global scheduling is unavailable for the original queue")
+            existing = self.spool.publish(envelope)
+        if isinstance(existing, LabSpoolEntry):
+            if existing.envelope != envelope:
+                raise RequestContentConflictError("scheduler original request differs")
+            receipt = None
+            status = "pending"
+            generation = (existing.device, existing.inode)
+        else:
+            receipt = LabSchedulingCommandReceipt.model_validate(existing.receipt)
+            status = receipt.status
+            observed = existing.path.lstat()
+            generation = (observed.st_dev, observed.st_ino)
+        return LabSchedulingSubmission(request_id=envelope.request_id, content_hash=envelope.content_hash, queue_identity=envelope.command.queue_identity, expected_version=envelope.command.expected_version, status=status, spool_path=existing.path, spool_generation=generation, receipt=receipt)
+
     @staticmethod
     def _experiment_submission_intent(
         envelope: LabCommandEnvelope,
@@ -1100,6 +1126,13 @@ class LabCommandSubmissionFacade:
             )
         if existing is None:
             return None
+        saved = existing.envelope if isinstance(existing, LabSpoolEntry) else existing.receipt
+        if isinstance(saved, (LabSchedulingCommandEnvelope, LabSchedulingCommandReceipt)):
+            return CommandSubmissionConflict(
+                request_id=envelope.request_id,
+                job_id=envelope.command.job_id,
+                reason="interaction_content_conflict",
+            )
         content_hash = (
             existing.envelope.content_hash
             if isinstance(existing, LabSpoolEntry)

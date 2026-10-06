@@ -42,6 +42,7 @@ from rquant.lab_job_protocol import (
     RequestContentConflictError,
     SubmitJobCommand,
 )
+from rquant.lab_scheduling_control import LabSchedulingBarrierPort, LabSchedulingCommandEnvelope
 from rquant.lab_jobs import (
     CurrentSchedulerFenceReceipt,
     FormalSubmissionAuthorityError,
@@ -376,8 +377,14 @@ class LabScheduler:
         source_stage_owner_id: str | None = None,
         max_source_stage_per_tick: int = 32,
         v2_emit_permit: Callable[[str], object] | None = None,
+        scheduling_control: LabSchedulingBarrierPort | None = None,
         clock: Callable[[], datetime] = _system_clock,
     ) -> None:
+        if scheduling_control is not None and (type(scheduling_control) is not LabSchedulingBarrierPort or scheduling_control._store is not store):
+            raise TypeError("scheduler global control requires this original queue's concrete metadata port")
+        self.scheduling_control = scheduling_control
+        if scheduling_control is None:
+            store.scheduling_control_enabled = False
         if not owner_id.strip():
             raise ValueError("owner_id must not be empty")
         if heartbeat_seconds < 1:
@@ -1068,6 +1075,14 @@ class LabScheduler:
     def _v2_emit_permit(self, record: LabClaimPublicationRecord):
         """Acquire the rollout fence before any V2 stage/queue side effect."""
 
+        if self.scheduling_control is not None:
+            lease, now = self._mutation_context()
+            if not self.scheduling_control.source_emit_permission(record, lease=lease, now=now):
+                yield False
+                return
+        elif self.store.scheduling_state() is not None:
+            yield False
+            return
         if self._v2_emit_permit_provider is None:
             yield True
             return
@@ -1754,6 +1769,10 @@ class LabScheduler:
                 self._synchronize_lifecycle(job.job_id, observed_at=recovery_now)
         else:
             lease, recovery_now = self._mutation_context()
+        if self.scheduling_control is not None:
+            if self.store.scheduling_state() is None:
+                self.store.enable_scheduling_control(lease=lease, barrier_port=self.scheduling_control, now=recovery_now)
+            self.scheduling_control.reconcile(lease=lease, now=recovery_now)
         self._verify_runtime()
         source_stage = self._recover_source_stage(lease=lease, now=recovery_now)
         authority_now = recovery_now
@@ -1787,6 +1806,16 @@ class LabScheduler:
             authority_now = mutation_now
             deadline_lease = lease
             deadline_now = mutation_now
+            if isinstance(entry.envelope, LabSchedulingCommandEnvelope):
+                if self.scheduling_control is None:
+                    raise RuntimeError("scheduler control capability is unavailable; global command remains pending")
+                receipt = self.scheduling_control.apply_command(entry.envelope, lease=lease, now=mutation_now)
+                processed += 1
+                applied += int(receipt.status == "applied")
+                rejected += int(receipt.status == "rejected")
+                self.spool.ack(entry, receipt)
+                self.scheduling_control.reconcile(lease=lease, now=mutation_now)
+                continue
             try:
                 self._verify_runtime()
                 receipt = self.store.apply_command(

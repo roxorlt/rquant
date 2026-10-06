@@ -2130,6 +2130,57 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/tasks/control-capabilities": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 任务执行与调度权限 */
+        get: operations["capabilities_api_v1_tasks_control_capabilities_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tasks/controls/lookup": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 核验任务原请求 */
+        post: operations["lookup_api_v1_tasks_controls_lookup_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tasks/controls/resume": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 恢复任务原请求回执 */
+        post: operations["resume_api_v1_tasks_controls_resume_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/tasks/jobs": {
         parameters: {
             query?: never;
@@ -2215,6 +2266,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/tasks/scheduling/commands": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 暂停或恢复研究调度 */
+        post: operations["scheduling_api_v1_tasks_scheduling_commands_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/tasks/services/log-capabilities": {
         parameters: {
             query?: never;
@@ -2243,6 +2311,40 @@ export interface paths {
         get: operations["get_service_logs_api_v1_tasks_services__unit__logs_get"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tasks/units/{unit}/run": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 请求运行精确任务 */
+        post: operations["run_unit_api_v1_tasks_units__unit__run_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tasks/units/{unit}/run/prepare": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 准备本次任务运行 */
+        post: operations["prepare_unit_api_v1_tasks_units__unit__run_prepare_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -8397,6 +8499,8 @@ export interface components {
         JournalPage: {
             /** Entries */
             entries: components["schemas"]["JournalEntry"][];
+            /** Invocation Id */
+            invocation_id?: string | null;
             /** Next Cursor */
             next_cursor?: string | null;
             /**
@@ -10895,6 +10999,24 @@ export interface components {
              */
             min_target_amount: string;
         };
+        /** PrepareUnitRun */
+        PrepareUnitRun: {
+            /** Command Id */
+            command_id: string;
+            /** Generation Id */
+            generation_id: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "prepare_unit_run";
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+            run: components["schemas"]["TaskUnitRunDraft"];
+        };
         /** PriceAlertNotificationFact */
         PriceAlertNotificationFact: {
             /**
@@ -11539,6 +11661,27 @@ export interface components {
             /** Tracking Error */
             tracking_error: number | null;
         };
+        /** RequestUnitRun */
+        RequestUnitRun: {
+            /** Command Id */
+            command_id: string;
+            /** Confirmation Id */
+            confirmation_id?: string | null;
+            /** Generation Id */
+            generation_id: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "request_unit_run";
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+            /** Unit */
+            unit: string;
+        };
         /** ResearchJobItem */
         ResearchJobItem: {
             /** Available Actions */
@@ -11631,6 +11774,13 @@ export interface components {
         };
         /** ResourceGroupItem */
         ResourceGroupItem: {
+            /**
+             * Cpu Note
+             * @default 暂无可信 CPU 数据
+             */
+            cpu_note: string;
+            /** Cpu Usage Percent */
+            cpu_usage_percent?: number | null;
             /** Memory Current Bytes */
             memory_current_bytes: number | null;
             /** Memory Peak Bytes */
@@ -12047,16 +12197,29 @@ export interface components {
         ScheduledTaskItem: {
             /** Duration Seconds */
             duration_seconds: number | null;
+            /** Ended At */
+            ended_at?: string | null;
+            /** Invocation Id */
+            invocation_id?: string | null;
             /** Last Trigger At */
             last_trigger_at: string | null;
             /** Name */
             name: string;
             /** Next At */
             next_at: string | null;
+            /**
+             * Origin Label
+             * @default 待确认
+             */
+            origin_label: string;
+            /** Previous Result Label */
+            previous_result_label?: string | null;
             /** Result Label */
             result_label: string;
             /** Service Unit */
             service_unit: string;
+            /** Started At */
+            started_at?: string | null;
             status: components["schemas"]["StatusInfo"];
             /** Timer Unit */
             timer_unit: string;
@@ -12689,6 +12852,27 @@ export interface components {
             /** Trade Date */
             trade_date: string | null;
         };
+        /** SetLabSchedulingPaused */
+        SetLabSchedulingPaused: {
+            /** Command Id */
+            command_id: string;
+            /** Expected Version */
+            expected_version: number;
+            /** Generation Id */
+            generation_id: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "set_lab_scheduling_paused";
+            /** Paused */
+            paused: boolean;
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+        };
         /** SetPaperAccountPaused */
         SetPaperAccountPaused: {
             /** Account Id */
@@ -13235,6 +13419,76 @@ export interface components {
             /** Name */
             name: string;
         };
+        /** TaskControlCapabilitiesData */
+        TaskControlCapabilitiesData: {
+            /**
+             * Can Control Scheduling
+             * @default false
+             */
+            can_control_scheduling: boolean;
+            /**
+             * Can Recover Scheduling
+             * @default false
+             */
+            can_recover_scheduling: boolean;
+            /**
+             * Can Recover Units
+             * @default false
+             */
+            can_recover_units: boolean;
+            /** Generation Id */
+            generation_id?: string | null;
+            /**
+             * Note
+             * @default 任务操作尚未开放。
+             */
+            note: string;
+            /**
+             * @default {
+             *       "available": false,
+             *       "note": "调度状态尚未发布。"
+             *     }
+             */
+            scheduling: components["schemas"]["TaskSchedulingView"];
+            /**
+             * Units
+             * @default []
+             */
+            units: components["schemas"]["TaskUnitControlChoice"][];
+        };
+        /** TaskControlCommandData */
+        TaskControlCommandData: {
+            /**
+             * Can Resume
+             * @default false
+             */
+            can_resume: boolean;
+            /** Command Id */
+            command_id: string;
+            /** Confirmation Expires At */
+            confirmation_expires_at?: string | null;
+            /** Confirmation Id */
+            confirmation_id?: string | null;
+            /** Desired Version */
+            desired_version?: number | null;
+            /** Duration Seconds */
+            duration_seconds?: number | null;
+            /** Ended At */
+            ended_at?: string | null;
+            /** Invocation Id */
+            invocation_id?: string | null;
+            /** Message */
+            message: string;
+            /** Original Request */
+            original_request: components["schemas"]["PrepareUnitRun"] | components["schemas"]["RequestUnitRun"] | components["schemas"]["SetLabSchedulingPaused"];
+            /** Started At */
+            started_at?: string | null;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "not_found" | "pending" | "prepared" | "submitted" | "started" | "succeeded" | "failed" | "unknown" | "rejected";
+        };
         /** TaskOverviewData */
         TaskOverviewData: {
             /**
@@ -13250,7 +13504,66 @@ export interface components {
             research: components["schemas"]["ResearchJobsData"];
             resources: components["schemas"]["ResourcesData"];
             scheduled: components["schemas"]["ScheduledTasksData"];
+            /**
+             * @default {
+             *       "available": false,
+             *       "note": "调度状态尚未发布。"
+             *     }
+             */
+            scheduling: components["schemas"]["TaskSchedulingView"];
             services: components["schemas"]["RuntimeServicesData"];
+        };
+        /** TaskSchedulingView */
+        TaskSchedulingView: {
+            /** Accepted At */
+            accepted_at?: string | null;
+            /** Applied At */
+            applied_at?: string | null;
+            /** Applied Paused */
+            applied_paused?: boolean | null;
+            /** Applied Version */
+            applied_version?: number | null;
+            /**
+             * Available
+             * @default false
+             */
+            available: boolean;
+            /** Desired Paused */
+            desired_paused?: boolean | null;
+            /** Desired Version */
+            desired_version?: number | null;
+            /** Draining Count */
+            draining_count?: number | null;
+            /**
+             * Note
+             * @default 调度状态尚未发布。
+             */
+            note: string;
+        };
+        /** TaskUnitControlChoice */
+        TaskUnitControlChoice: {
+            /** Can Request */
+            can_request: boolean;
+            /** Reason */
+            reason: string;
+            /** Requires Confirmation */
+            requires_confirmation: boolean;
+            /** Unit */
+            unit: string;
+        };
+        /** TaskUnitRunDraft */
+        TaskUnitRunDraft: {
+            /** Command Id */
+            command_id: string;
+            /** Generation Id */
+            generation_id: string;
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+            /** Unit */
+            unit: string;
         };
         /** TdxParseData */
         TdxParseData: {
@@ -17412,6 +17725,103 @@ export interface operations {
             };
         };
     };
+    capabilities_api_v1_tasks_control_capabilities_get: {
+        parameters: {
+            query?: {
+                generation_id?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskControlCapabilitiesData"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    lookup_api_v1_tasks_controls_lookup_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PrepareUnitRun"] | components["schemas"]["RequestUnitRun"] | components["schemas"]["SetLabSchedulingPaused"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskControlCommandData"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    resume_api_v1_tasks_controls_resume_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PrepareUnitRun"] | components["schemas"]["RequestUnitRun"] | components["schemas"]["SetLabSchedulingPaused"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskControlCommandData"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     get_jobs_api_v1_tasks_jobs_get: {
         parameters: {
             query?: {
@@ -17571,6 +17981,39 @@ export interface operations {
             };
         };
     };
+    scheduling_api_v1_tasks_scheduling_commands_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetLabSchedulingPaused"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskControlCommandData"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     get_log_capabilities_api_v1_tasks_services_log_capabilities_get: {
         parameters: {
             query?: never;
@@ -17594,6 +18037,7 @@ export interface operations {
     get_service_logs_api_v1_tasks_services__unit__logs_get: {
         parameters: {
             query: {
+                invocation_id?: string;
                 since: string;
                 level?: "emerg" | "alert" | "crit" | "err" | "warning" | "notice" | "info" | "debug";
                 page_size?: number;
@@ -17614,6 +18058,76 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["JournalPage"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    run_unit_api_v1_tasks_units__unit__run_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                unit: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RequestUnitRun"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskControlCommandData"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    prepare_unit_api_v1_tasks_units__unit__run_prepare_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                unit: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PrepareUnitRun"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskControlCommandData"];
                 };
             };
             /** @description Validation Error */

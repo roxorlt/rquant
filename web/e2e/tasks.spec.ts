@@ -55,6 +55,7 @@ const OVERVIEW_ENVELOPE: components["schemas"]["Envelope_TaskOverviewData_"] = {
   data: {
     can_control_research_jobs: false,
     can_view_research_logs: false,
+    scheduling: { available: false, note: "调度状态尚未发布。" },
     scheduled: {
       source_state: "ready",
       source_label: "定时任务",
@@ -69,6 +70,7 @@ const OVERVIEW_ENVELOPE: components["schemas"]["Envelope_TaskOverviewData_"] = {
         next_at: "2026-09-25T01:30:00Z",
         duration_seconds: null,
         result_label: "未知",
+        origin_label: "待确认",
         timer_unit: `rquant-sample-${index}.timer`,
         service_unit: `rquant-sample-${index}.service`,
       })),
@@ -103,6 +105,7 @@ const OVERVIEW_ENVELOPE: components["schemas"]["Envelope_TaskOverviewData_"] = {
         {
           name: "实时服务",
           slice_unit: "rquant-live.slice",
+          cpu_note: "暂无可信 CPU 数据",
           memory_current_bytes: 536_870_912,
           memory_peak_bytes: 805_306_368,
         },

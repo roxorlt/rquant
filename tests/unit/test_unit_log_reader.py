@@ -149,6 +149,40 @@ def _reader(
     )
 
 
+def test_tsc_11_invocation_filter_actual_rows_and_signed_cursor_binding(signed_manifest: tuple[Path, bytes]) -> None:
+    invocation = "a" * 32
+    calls: list[tuple[str, ...]] = []
+
+    def runner(argv: tuple[str, ...], _timeout: float, _limit: int) -> bytes:
+        calls.append(argv)
+        return _json_lines(_row("cursor-a", _SYSTEMD_INVOCATION_ID=invocation), _row("cursor-b", _SYSTEMD_INVOCATION_ID=invocation))
+
+    reader = _reader(signed_manifest, runner)
+    page = reader.read(unit=DAILY, since=SINCE, page_size=1, invocation_id=invocation)
+    assert page.invocation_id == invocation and page.next_cursor is not None
+    assert f"_SYSTEMD_INVOCATION_ID={invocation}" in calls[0]
+    with pytest.raises(JournalCursorError):
+        reader.read(unit=DAILY, since=SINCE, page_size=1, invocation_id="b" * 32, cursor=page.next_cursor)
+    assert len(calls) == 1
+    with pytest.raises(JournalCursorError):
+        reader.read(unit=DAILY, since=SINCE, page_size=1, cursor=page.next_cursor)
+
+
+def test_tsc_11_filter_cannot_accept_other_or_missing_invocation(signed_manifest: tuple[Path, bytes]) -> None:
+    for row in (_row("cursor-a"), _row("cursor-a", _SYSTEMD_INVOCATION_ID="b" * 32)):
+        reader = _reader(signed_manifest, lambda *_: _json_lines(row))
+        with pytest.raises(JournalUnavailableError):
+            reader.read(unit=DAILY, since=SINCE, invocation_id="a" * 32)
+
+
+def test_tsc_11_empty_actual_filtered_log_is_empty_not_missing_service(signed_manifest: tuple[Path, bytes]) -> None:
+    reader = _reader(signed_manifest, lambda *_: b"")
+    page = reader.read(unit=DAILY, since=SINCE, invocation_id="a" * 32)
+    assert page.entries == () and page.service_label == "每日任务" and page.invocation_id == "a" * 32
+    with pytest.raises(JournalRequestError):
+        reader.read(unit=DAILY, since=SINCE, invocation_id="a" * 33)
+
+
 def test_linux_boot_uuid_is_compacted_for_journal_and_page_cursor(
     signed_manifest: tuple[Path, bytes],
 ) -> None:

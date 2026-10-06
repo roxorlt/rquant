@@ -17,10 +17,11 @@ from threading import RLock
 from typing import Annotated, Literal
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, RootModel, model_validator
 
 from rquant.private_fs import rename_noreplace_at
 from rquant.research_run_spec import ResearchRunSpec
+from rquant.lab_scheduling_control import LabSchedulingCommandEnvelope, LabSchedulingCommandReceipt
 from rquant.strict_json import (
     canonical_json_bytes,
     canonical_model_json_bytes,
@@ -208,16 +209,32 @@ class LabCommandReceipt(LabProtocolModel):
     job_version: int | None = Field(default=None, strict=True, ge=0)
 
 
+class _SpoolEnvelope(RootModel[Annotated[LabCommandEnvelope | LabSchedulingCommandEnvelope, Field(discriminator="schema_version")]]):
+    model_config = ConfigDict(frozen=True, revalidate_instances="always")
+
+
+class _SpoolReceipt(RootModel[Annotated[LabCommandReceipt | LabSchedulingCommandReceipt, Field(discriminator="schema_version")]]):
+    model_config = ConfigDict(frozen=True, revalidate_instances="always")
+
+
+def _parse_spool_envelope(payload: str | bytes) -> LabCommandEnvelope | LabSchedulingCommandEnvelope:
+    return strict_model_validate_canonical_json(_SpoolEnvelope, payload).root
+
+
+def _parse_spool_receipt(payload: str | bytes) -> LabCommandReceipt | LabSchedulingCommandReceipt:
+    return strict_model_validate_canonical_json(_SpoolReceipt, payload).root
+
+
 class LabSpoolEntry(LabProtocolModel):
     path: Path
-    envelope: LabCommandEnvelope
+    envelope: LabCommandEnvelope | LabSchedulingCommandEnvelope
     device: int = Field(ge=0)
     inode: int = Field(ge=1)
 
 
 class LabAcknowledgedCommand(LabProtocolModel):
     path: Path
-    receipt: LabCommandReceipt
+    receipt: LabCommandReceipt | LabSchedulingCommandReceipt
 
 
 class LabQuarantinedCommand(LabProtocolModel):
@@ -2437,9 +2454,11 @@ class LabCommandSpool:
 
     def publish(
         self,
-        envelope: LabCommandEnvelope,
+        envelope: LabCommandEnvelope | LabSchedulingCommandEnvelope,
     ) -> LabSpoolEntry | LabAcknowledgedCommand:
-        validated = LabCommandEnvelope.model_validate(envelope)
+        if type(envelope) not in (LabCommandEnvelope, LabSchedulingCommandEnvelope):
+            raise TypeError("command spool requires an exact original or scheduler envelope")
+        validated = type(envelope).model_validate(envelope)
         command = validated.command
         if (
             isinstance(command, SubmitJobCommand)
@@ -2465,10 +2484,12 @@ class LabCommandSpool:
                     raise RequestContentConflictError(
                         f"request_id {validated.request_id} already has different content"
                     )
-                if receipt.job_id != validated.command.job_id:
+                if isinstance(validated, LabCommandEnvelope) and (not isinstance(receipt, LabCommandReceipt) or receipt.job_id != validated.command.job_id):
                     raise InvalidCommandEnvelopeError(
                         f"ack job_id does not match request_id {validated.request_id}"
                     )
+                if isinstance(validated, LabSchedulingCommandEnvelope) and (not isinstance(receipt, LabSchedulingCommandReceipt) or receipt.queue_identity != validated.command.queue_identity):
+                    raise InvalidCommandEnvelopeError("scheduler ACK queue differs from original request")
                 return LabAcknowledgedCommand(path=ack_path, receipt=receipt)
             if pending_path is not None:
                 existing = self.load(pending_path)
@@ -2494,7 +2515,7 @@ class LabCommandSpool:
                 file_identity=identity,
             ) from exc
         try:
-            envelope = strict_model_validate_canonical_json(LabCommandEnvelope, payload)
+            envelope = _parse_spool_envelope(payload)
         except Exception as exc:
             raise InvalidCommandEnvelopeError(
                 f"invalid command envelope {candidate.name}: {exc}",
@@ -2527,7 +2548,9 @@ class LabCommandSpool:
         entries: dict[int, LabSpoolEntry] = {}
         for index, path in enumerate(paths):
             try:
-                entries[index] = self.load(path)
+                entry = self.load(path)
+                if isinstance(entry.envelope, LabCommandEnvelope):
+                    entries[index] = entry
             except InvalidCommandEnvelopeError:
                 continue
         edges: list[set[int]] = [set() for _path in paths]
@@ -2589,12 +2612,13 @@ class LabCommandSpool:
     def ack(
         self,
         entry: LabSpoolEntry,
-        receipt: LabCommandReceipt,
+        receipt: LabCommandReceipt | LabSchedulingCommandReceipt,
     ) -> LabAcknowledgedCommand:
         if (
             receipt.request_id != entry.envelope.request_id
             or receipt.content_hash != entry.envelope.content_hash
-            or receipt.job_id != entry.envelope.command.job_id
+            or isinstance(entry.envelope, LabCommandEnvelope) and (not isinstance(receipt, LabCommandReceipt) or receipt.job_id != entry.envelope.command.job_id)
+            or isinstance(entry.envelope, LabSchedulingCommandEnvelope) and (not isinstance(receipt, LabSchedulingCommandReceipt) or receipt.queue_identity != entry.envelope.command.queue_identity)
         ):
             raise ValueError("receipt does not match command envelope")
         with self._exclusive_lock():
@@ -2613,11 +2637,11 @@ class LabCommandSpool:
             self._unlink_pending(entry.path, device=entry.device, inode=entry.inode)
             return LabAcknowledgedCommand(path=target, receipt=receipt)
 
-    def load_receipt(self, path: Path) -> LabCommandReceipt:
+    def load_receipt(self, path: Path) -> LabCommandReceipt | LabSchedulingCommandReceipt:
         candidate, payload, _file_stat = self._read_regular_child(Path(path), self.ack_dir)
         filename_request_id = self._ack_request_id(candidate.name)
         try:
-            receipt = strict_model_validate_canonical_json(LabCommandReceipt, payload)
+            receipt = _parse_spool_receipt(payload)
         except Exception as exc:
             raise InvalidCommandEnvelopeError(
                 f"invalid command receipt {candidate.name}: {exc}"
@@ -2732,7 +2756,7 @@ class LabCommandSpool:
                 )
                 try:
                     _sequence, filename_request_id = self._pending_name_parts(normalized.name)
-                    envelope = strict_model_validate_canonical_json(LabCommandEnvelope, payload)
+                    envelope = _parse_spool_envelope(payload)
                 except (InvalidCommandEnvelopeError, ValueError):
                     envelope = None
                     filename_request_id = None

@@ -241,6 +241,7 @@ def test_admin_reads_only_a_typed_bounded_service_page(tmp_path: Path) -> None:
     assert response.json() == {
         "service_label": "每日任务",
         "scope": "本机本次开机以来的服务日志（含手动运行）",
+        "invocation_id": None,
         "entries": [
             {
                 "at": NOW.isoformat().replace("+00:00", "Z"),
@@ -700,7 +701,7 @@ def test_openapi_describes_the_bounded_log_filters(tmp_path: Path) -> None:
     app = create_app(WebSettings(serving_root=tmp_path), background=False)
     operation = app.openapi()["paths"]["/api/v1/tasks/services/{unit}/logs"]["get"]
     parameters = {item["name"]: item for item in operation["parameters"]}
-    assert set(parameters) == {"unit", "since", "level", "page_size", "cursor"}
+    assert set(parameters) == {"unit", "since", "level", "page_size", "cursor", "invocation_id"}
     assert parameters["since"]["required"] is True
     assert parameters["since"]["schema"]["format"] == "date-time"
     assert parameters["page_size"]["schema"]["maximum"] == 498

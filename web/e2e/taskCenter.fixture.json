@@ -1,0 +1,1388 @@
+{
+  "fixture_clock": "2026-10-06T01:14:40+00:00",
+  "authority_proof": false,
+  "meta": {
+    "data": {
+      "server_time": "2026-10-06T01:14:40Z",
+      "viewer": "alice",
+      "generation": {
+        "generation_id": "fb05ba58dcf0098f060e7057a7f73ed401cc5e161b79003fc57835137fa7d149",
+        "built_at": "2026-10-06T01:14:40Z",
+        "published_at": "2026-10-06T01:14:40Z",
+        "previous_generation_id": null,
+        "producer_commit": "0e5b0e5b0e5b0e5b0e5b0e5b0e5b0e5b0e5b0e5b",
+        "schema_version": 3,
+        "age_seconds": 0.0
+      },
+      "datasets": [
+        {
+          "dataset_id": "lab_jobs",
+          "name": "研究任务",
+          "user_status": {
+            "state": "ok",
+            "label": "按时",
+            "reason": "按时更新"
+          },
+          "status": "fresh",
+          "event_time": "2026-10-06T01:14:00Z",
+          "published_at": "2026-10-06T01:14:20Z",
+          "sequence": 1,
+          "reason": null
+        },
+        {
+          "dataset_id": "ops_status",
+          "name": "其他数据",
+          "user_status": {
+            "state": "ok",
+            "label": "按时",
+            "reason": "按时更新"
+          },
+          "status": "fresh",
+          "event_time": "2026-10-06T01:14:00Z",
+          "published_at": "2026-10-06T01:14:20Z",
+          "sequence": 1,
+          "reason": null
+        },
+        {
+          "dataset_id": "paper_accounts",
+          "name": "模拟账户",
+          "user_status": {
+            "state": "ok",
+            "label": "按时",
+            "reason": "按时更新"
+          },
+          "status": "fresh",
+          "event_time": "2026-10-06T01:14:00Z",
+          "published_at": "2026-10-06T01:14:20Z",
+          "sequence": 1,
+          "reason": null
+        },
+        {
+          "dataset_id": "promotions",
+          "name": "策略晋级",
+          "user_status": {
+            "state": "ok",
+            "label": "按时",
+            "reason": "按时更新"
+          },
+          "status": "fresh",
+          "event_time": "2026-10-06T01:14:00Z",
+          "published_at": "2026-10-06T01:14:20Z",
+          "sequence": 1,
+          "reason": null
+        },
+        {
+          "dataset_id": "reference_slow",
+          "name": "参考数据",
+          "user_status": {
+            "state": "ok",
+            "label": "按时",
+            "reason": "按时更新"
+          },
+          "status": "fresh",
+          "event_time": "2026-09-24T01:25:00Z",
+          "published_at": "2026-09-24T01:25:00Z",
+          "sequence": 1,
+          "reason": null
+        },
+        {
+          "dataset_id": "reference_slow_authority",
+          "name": "参考数据签发",
+          "user_status": {
+            "state": "ok",
+            "label": "按时",
+            "reason": "按时更新"
+          },
+          "status": "fresh",
+          "event_time": "2026-09-24T01:25:00Z",
+          "published_at": "2026-09-24T01:25:00Z",
+          "sequence": 1,
+          "reason": null
+        },
+        {
+          "dataset_id": "reference_slow_contract",
+          "name": "参考数据校验",
+          "user_status": {
+            "state": "ok",
+            "label": "按时",
+            "reason": "按时更新"
+          },
+          "status": "fresh",
+          "event_time": "2026-09-24T01:25:00Z",
+          "published_at": "2026-09-24T01:25:00Z",
+          "sequence": 1,
+          "reason": null
+        },
+        {
+          "dataset_id": "runtime_health",
+          "name": "服务心跳",
+          "user_status": {
+            "state": "ok",
+            "label": "按时",
+            "reason": "按时更新"
+          },
+          "status": "fresh",
+          "event_time": "2026-10-06T01:14:00Z",
+          "published_at": "2026-10-06T01:14:20Z",
+          "sequence": 1,
+          "reason": null
+        },
+        {
+          "dataset_id": "signals",
+          "name": "盘中信号",
+          "user_status": {
+            "state": "ok",
+            "label": "按时",
+            "reason": "按时更新"
+          },
+          "status": "fresh",
+          "event_time": "2026-10-06T01:14:00Z",
+          "published_at": "2026-10-06T01:14:20Z",
+          "sequence": 1,
+          "reason": null
+        }
+      ],
+      "projections": [
+        {
+          "table_name": "alert_ack",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "signals",
+          "available_at": null
+        },
+        {
+          "table_name": "alert_ack_state",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "signals",
+          "available_at": null
+        },
+        {
+          "table_name": "alert_event",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "signals",
+          "available_at": null
+        },
+        {
+          "table_name": "alert_overview",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "signals",
+          "available_at": null
+        },
+        {
+          "table_name": "alert_source_coverage",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "signals",
+          "available_at": null
+        },
+        {
+          "table_name": "audit_report_dataset",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "lab_jobs",
+          "available_at": null
+        },
+        {
+          "table_name": "audit_report_issue",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "lab_jobs",
+          "available_at": null
+        },
+        {
+          "table_name": "audit_report_job",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "lab_jobs",
+          "available_at": null
+        },
+        {
+          "table_name": "audit_report_job_event",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "lab_jobs",
+          "available_at": null
+        },
+        {
+          "table_name": "audit_report_month",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "lab_jobs",
+          "available_at": null
+        },
+        {
+          "table_name": "audit_report_overview",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "lab_jobs",
+          "available_at": null
+        },
+        {
+          "table_name": "audit_report_rule",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "lab_jobs",
+          "available_at": null
+        },
+        {
+          "table_name": "backfill_plan_archive",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "lab_jobs",
+          "available_at": null
+        },
+        {
+          "table_name": "backfill_plan_catalog",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "lab_jobs",
+          "available_at": null
+        },
+        {
+          "table_name": "backfill_plan_event",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "lab_jobs",
+          "available_at": null
+        },
+        {
+          "table_name": "backfill_plan_index",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "lab_jobs",
+          "available_at": null
+        },
+        {
+          "table_name": "backfill_plan_job",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "lab_jobs",
+          "available_at": null
+        },
+        {
+          "table_name": "backfill_plan_preview",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "lab_jobs",
+          "available_at": null
+        },
+        {
+          "table_name": "backfill_plan_progress",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "lab_jobs",
+          "available_at": null
+        },
+        {
+          "table_name": "canvas_definition",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "signals",
+          "available_at": null
+        },
+        {
+          "table_name": "canvas_diagnostic",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "signals",
+          "available_at": null
+        },
+        {
+          "table_name": "canvas_hit",
+          "available": true,
+          "reason": null,
+          "owner_dataset_id": "signals",
+          "available_at": "2026-10-06T01:14:10Z"
+        },
+        {
+          "table_name": "canvas_latest_trade_date",
+          "available": true,
+          "reason": null,
+          "owner_dataset_id": "signals",
+          "available_at": "2026-10-06T01:14:10Z"
+        },
+        {
+          "table_name": "daily_bar",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "reference_slow_authority",
+          "available_at": null
+        },
+        {
+          "table_name": "dashboard_summary",
+          "available": true,
+          "reason": null,
+          "owner_dataset_id": "runtime_health",
+          "available_at": "2026-10-06T01:14:30Z"
+        },
+        {
+          "table_name": "data_audit_issue",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "lab_jobs",
+          "available_at": null
+        },
+        {
+          "table_name": "data_audit_status",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "lab_jobs",
+          "available_at": null
+        },
+        {
+          "table_name": "dc_board",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "reference_slow_authority",
+          "available_at": null
+        },
+        {
+          "table_name": "dc_board_member",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "reference_slow_authority",
+          "available_at": null
+        },
+        {
+          "table_name": "experiment_attempt",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "promotions",
+          "available_at": null
+        },
+        {
+          "table_name": "experiment_attempt_window",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "promotions",
+          "available_at": null
+        },
+        {
+          "table_name": "experiment_private_attempt",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "promotions",
+          "available_at": null
+        },
+        {
+          "table_name": "experiment_private_family",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "promotions",
+          "available_at": null
+        },
+        {
+          "table_name": "experiment_private_window",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "promotions",
+          "available_at": null
+        },
+        {
+          "table_name": "factor_definition",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "lab_jobs",
+          "available_at": null
+        },
+        {
+          "table_name": "factor_definition_state",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "lab_jobs",
+          "available_at": null
+        },
+        {
+          "table_name": "factor_result_display",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "lab_jobs",
+          "available_at": null
+        },
+        {
+          "table_name": "factor_result_index",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "lab_jobs",
+          "available_at": null
+        },
+        {
+          "table_name": "factor_result_state",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "lab_jobs",
+          "available_at": null
+        },
+        {
+          "table_name": "factor_tracking",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "lab_jobs",
+          "available_at": null
+        },
+        {
+          "table_name": "factor_tracking_state",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "lab_jobs",
+          "available_at": null
+        },
+        {
+          "table_name": "formula_market_job",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "lab_jobs",
+          "available_at": null
+        },
+        {
+          "table_name": "formula_market_job_state",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "lab_jobs",
+          "available_at": null
+        },
+        {
+          "table_name": "formula_pool_definition",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "signals",
+          "available_at": null
+        },
+        {
+          "table_name": "formula_pool_latest_result",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "signals",
+          "available_at": null
+        },
+        {
+          "table_name": "formula_pool_state",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "signals",
+          "available_at": null
+        },
+        {
+          "table_name": "intraday_kline",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "signals",
+          "available_at": null
+        },
+        {
+          "table_name": "kpl_concept_member",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "reference_slow_authority",
+          "available_at": null
+        },
+        {
+          "table_name": "lab_job_event",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "lab_jobs",
+          "available_at": null
+        },
+        {
+          "table_name": "lab_job_event_window",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "lab_jobs",
+          "available_at": null
+        },
+        {
+          "table_name": "lab_scheduler_control",
+          "available": true,
+          "reason": null,
+          "owner_dataset_id": "lab_jobs",
+          "available_at": "2026-10-06T01:14:00Z"
+        },
+        {
+          "table_name": "legacy_notification",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "signals",
+          "available_at": null
+        },
+        {
+          "table_name": "legacy_notification_status",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "signals",
+          "available_at": null
+        },
+        {
+          "table_name": "manual_watchlist",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "signals",
+          "available_at": null
+        },
+        {
+          "table_name": "manual_watchlist_state",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "signals",
+          "available_at": null
+        },
+        {
+          "table_name": "market_liquidity",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "reference_slow_authority",
+          "available_at": null
+        },
+        {
+          "table_name": "market_overview",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "signals",
+          "available_at": null
+        },
+        {
+          "table_name": "market_snapshot",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "signals",
+          "available_at": null
+        },
+        {
+          "table_name": "minute_coverage",
+          "available": true,
+          "reason": null,
+          "owner_dataset_id": "signals",
+          "available_at": "2026-10-06T01:14:10Z"
+        },
+        {
+          "table_name": "monitor_event",
+          "available": true,
+          "reason": null,
+          "owner_dataset_id": "signals",
+          "available_at": "2026-10-06T01:14:10Z"
+        },
+        {
+          "table_name": "nl_screen_universe",
+          "available": true,
+          "reason": null,
+          "owner_dataset_id": "reference_slow_authority",
+          "available_at": "2026-09-24T01:25:00Z"
+        },
+        {
+          "table_name": "ops_host_status",
+          "available": true,
+          "reason": null,
+          "owner_dataset_id": "ops_status",
+          "available_at": "2026-10-06T01:14:00Z"
+        },
+        {
+          "table_name": "ops_resource_status",
+          "available": true,
+          "reason": null,
+          "owner_dataset_id": "ops_status",
+          "available_at": "2026-10-06T01:14:00Z"
+        },
+        {
+          "table_name": "ops_task_cpu",
+          "available": true,
+          "reason": null,
+          "owner_dataset_id": "ops_status",
+          "available_at": "2026-10-06T01:14:00Z"
+        },
+        {
+          "table_name": "ops_task_runs",
+          "available": true,
+          "reason": null,
+          "owner_dataset_id": "ops_status",
+          "available_at": "2026-10-06T01:14:00Z"
+        },
+        {
+          "table_name": "ops_unit_status",
+          "available": true,
+          "reason": null,
+          "owner_dataset_id": "ops_status",
+          "available_at": "2026-10-06T01:14:00Z"
+        },
+        {
+          "table_name": "paper_fill_history",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "paper_accounts",
+          "available_at": null
+        },
+        {
+          "table_name": "paper_order_history",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "paper_accounts",
+          "available_at": null
+        },
+        {
+          "table_name": "paper_order_window",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "paper_accounts",
+          "available_at": null
+        },
+        {
+          "table_name": "paper_portfolio_account",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "paper_accounts",
+          "available_at": null
+        },
+        {
+          "table_name": "paper_portfolio_material",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "paper_accounts",
+          "available_at": null
+        },
+        {
+          "table_name": "paper_portfolio_state",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "paper_accounts",
+          "available_at": null
+        },
+        {
+          "table_name": "pool2_watch",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "signals",
+          "available_at": null
+        },
+        {
+          "table_name": "pool_definition",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "signals",
+          "available_at": null
+        },
+        {
+          "table_name": "pool_member_return",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "signals",
+          "available_at": null
+        },
+        {
+          "table_name": "pool_membership",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "signals",
+          "available_at": null
+        },
+        {
+          "table_name": "price_alert_rule",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "signals",
+          "available_at": null
+        },
+        {
+          "table_name": "price_alert_rule_state",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "signals",
+          "available_at": null
+        },
+        {
+          "table_name": "price_alert_runtime",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "signals",
+          "available_at": null
+        },
+        {
+          "table_name": "price_alert_runtime_attempt",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "signals",
+          "available_at": null
+        },
+        {
+          "table_name": "price_alert_runtime_event",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "signals",
+          "available_at": null
+        },
+        {
+          "table_name": "price_alert_runtime_state",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "signals",
+          "available_at": null
+        },
+        {
+          "table_name": "pulse_alert",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "signals",
+          "available_at": null
+        },
+        {
+          "table_name": "pulse_history",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "signals",
+          "available_at": null
+        },
+        {
+          "table_name": "research_artifact_index",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "lab_jobs",
+          "available_at": null
+        },
+        {
+          "table_name": "research_gate_metadata",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "lab_jobs",
+          "available_at": null
+        },
+        {
+          "table_name": "risk_blacklist",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "reference_slow_authority",
+          "available_at": null
+        },
+        {
+          "table_name": "screen_bounds",
+          "available": true,
+          "reason": null,
+          "owner_dataset_id": "signals",
+          "available_at": "2026-10-06T01:14:10Z"
+        },
+        {
+          "table_name": "screen_result",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "signals",
+          "available_at": null
+        },
+        {
+          "table_name": "screen_run_receipt",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "signals",
+          "available_at": null
+        },
+        {
+          "table_name": "signal_observed_prefix",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "signals",
+          "available_at": null
+        },
+        {
+          "table_name": "stock_basic",
+          "available": true,
+          "reason": null,
+          "owner_dataset_id": "reference_slow_authority",
+          "available_at": "2026-09-24T01:25:00Z"
+        },
+        {
+          "table_name": "strategy_catalog",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "strategy_catalog",
+          "available_at": null
+        },
+        {
+          "table_name": "strategy_catalog_parameter",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "strategy_catalog",
+          "available_at": null
+        },
+        {
+          "table_name": "strategy_definition",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "lab_jobs",
+          "available_at": null
+        },
+        {
+          "table_name": "strategy_definition_state",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "lab_jobs",
+          "available_at": null
+        },
+        {
+          "table_name": "strategy_summary",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "lab_jobs",
+          "available_at": null
+        },
+        {
+          "table_name": "strategy_template_source",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "lab_jobs",
+          "available_at": null
+        },
+        {
+          "table_name": "strategy_trade",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "lab_jobs",
+          "available_at": null
+        },
+        {
+          "table_name": "surge_event",
+          "available": true,
+          "reason": null,
+          "owner_dataset_id": "signals",
+          "available_at": "2026-10-06T01:14:10Z"
+        },
+        {
+          "table_name": "surge_runtime_config",
+          "available": false,
+          "reason": "projection_not_published",
+          "owner_dataset_id": "signals",
+          "available_at": null
+        },
+        {
+          "table_name": "trade_calendar",
+          "available": true,
+          "reason": null,
+          "owner_dataset_id": "reference_slow_authority",
+          "available_at": "2026-09-24T01:25:00Z"
+        }
+      ],
+      "market": {
+        "trade_date": "2026-10-06",
+        "phase": "non_trading_day",
+        "phase_label": "休市",
+        "is_trading_day": false,
+        "previous_trading_day": "2026-09-30",
+        "next_trading_day": "2026-10-08"
+      }
+    },
+    "serving": {
+      "generation_id": "fb05ba58dcf0098f060e7057a7f73ed401cc5e161b79003fc57835137fa7d149",
+      "built_at": "2026-10-06T01:14:40Z",
+      "age_seconds": 0.0,
+      "state": "ready",
+      "message": null,
+      "detail": "serving generation verified"
+    }
+  },
+  "overview": {
+    "data": {
+      "scheduled": {
+        "source_state": "ready",
+        "source_label": "定时任务",
+        "source_note": null,
+        "source_updated_at": "2026-10-06T01:14:00Z",
+        "expires_at": "2026-10-06T01:16:00Z",
+        "remaining_seconds": 80.0,
+        "items": [
+          {
+            "name": "定时任务",
+            "status": {
+              "state": "crit",
+              "label": "异常",
+              "reason": "定时任务没有正确安装"
+            },
+            "last_trigger_at": null,
+            "next_at": null,
+            "duration_seconds": null,
+            "result_label": "未知",
+            "timer_unit": "rquant-artifact-retention.timer",
+            "service_unit": "rquant-artifact-retention.service",
+            "started_at": null,
+            "ended_at": null,
+            "invocation_id": null,
+            "origin_label": "待确认",
+            "previous_result_label": null
+          },
+          {
+            "name": "定时任务",
+            "status": {
+              "state": "crit",
+              "label": "异常",
+              "reason": "定时任务没有正确安装"
+            },
+            "last_trigger_at": null,
+            "next_at": null,
+            "duration_seconds": null,
+            "result_label": "未知",
+            "timer_unit": "rquant-backup.timer",
+            "service_unit": "rquant-backup.service",
+            "started_at": null,
+            "ended_at": null,
+            "invocation_id": null,
+            "origin_label": "待确认",
+            "previous_result_label": null
+          },
+          {
+            "name": "定时任务",
+            "status": {
+              "state": "crit",
+              "label": "异常",
+              "reason": "定时任务没有正确安装"
+            },
+            "last_trigger_at": null,
+            "next_at": null,
+            "duration_seconds": null,
+            "result_label": "未知",
+            "timer_unit": "rquant-daily-report.timer",
+            "service_unit": "rquant-daily-report.service",
+            "started_at": null,
+            "ended_at": null,
+            "invocation_id": null,
+            "origin_label": "待确认",
+            "previous_result_label": null
+          },
+          {
+            "name": "定时任务",
+            "status": {
+              "state": "crit",
+              "label": "异常",
+              "reason": "定时任务没有正确安装"
+            },
+            "last_trigger_at": null,
+            "next_at": null,
+            "duration_seconds": null,
+            "result_label": "未知",
+            "timer_unit": "rquant-daily.timer",
+            "service_unit": "rquant-daily.service",
+            "started_at": null,
+            "ended_at": null,
+            "invocation_id": null,
+            "origin_label": "待确认",
+            "previous_result_label": null
+          },
+          {
+            "name": "定时任务",
+            "status": {
+              "state": "crit",
+              "label": "异常",
+              "reason": "定时任务没有正确安装"
+            },
+            "last_trigger_at": null,
+            "next_at": null,
+            "duration_seconds": null,
+            "result_label": "未知",
+            "timer_unit": "rquant-kpl-snapshot.timer",
+            "service_unit": "rquant-kpl-snapshot.service",
+            "started_at": null,
+            "ended_at": null,
+            "invocation_id": null,
+            "origin_label": "待确认",
+            "previous_result_label": null
+          },
+          {
+            "name": "定时任务",
+            "status": {
+              "state": "crit",
+              "label": "异常",
+              "reason": "定时任务没有正确安装"
+            },
+            "last_trigger_at": null,
+            "next_at": null,
+            "duration_seconds": null,
+            "result_label": "未知",
+            "timer_unit": "rquant-midday-report.timer",
+            "service_unit": "rquant-midday-report.service",
+            "started_at": null,
+            "ended_at": null,
+            "invocation_id": null,
+            "origin_label": "待确认",
+            "previous_result_label": null
+          },
+          {
+            "name": "定时任务",
+            "status": {
+              "state": "crit",
+              "label": "异常",
+              "reason": "定时任务没有正确安装"
+            },
+            "last_trigger_at": null,
+            "next_at": null,
+            "duration_seconds": null,
+            "result_label": "未知",
+            "timer_unit": "rquant-monitor-watchdog.timer",
+            "service_unit": "rquant-monitor-watchdog.service",
+            "started_at": null,
+            "ended_at": null,
+            "invocation_id": null,
+            "origin_label": "待确认",
+            "previous_result_label": null
+          },
+          {
+            "name": "定时任务",
+            "status": {
+              "state": "crit",
+              "label": "异常",
+              "reason": "定时任务没有正确安装"
+            },
+            "last_trigger_at": null,
+            "next_at": null,
+            "duration_seconds": null,
+            "result_label": "未知",
+            "timer_unit": "rquant-monitor.timer",
+            "service_unit": "rquant-monitor.service",
+            "started_at": null,
+            "ended_at": null,
+            "invocation_id": null,
+            "origin_label": "待确认",
+            "previous_result_label": null
+          },
+          {
+            "name": "定时任务",
+            "status": {
+              "state": "crit",
+              "label": "异常",
+              "reason": "定时任务没有正确安装"
+            },
+            "last_trigger_at": null,
+            "next_at": null,
+            "duration_seconds": null,
+            "result_label": "未知",
+            "timer_unit": "rquant-morning-pulse.timer",
+            "service_unit": "rquant-morning-pulse.service",
+            "started_at": null,
+            "ended_at": null,
+            "invocation_id": null,
+            "origin_label": "待确认",
+            "previous_result_label": null
+          },
+          {
+            "name": "定时任务",
+            "status": {
+              "state": "crit",
+              "label": "异常",
+              "reason": "定时任务没有正确安装"
+            },
+            "last_trigger_at": null,
+            "next_at": null,
+            "duration_seconds": null,
+            "result_label": "未知",
+            "timer_unit": "rquant-pre-market-check.timer",
+            "service_unit": "rquant-pre-market-check.service",
+            "started_at": null,
+            "ended_at": null,
+            "invocation_id": null,
+            "origin_label": "待确认",
+            "previous_result_label": null
+          },
+          {
+            "name": "定时任务",
+            "status": {
+              "state": "crit",
+              "label": "异常",
+              "reason": "定时任务没有正确安装"
+            },
+            "last_trigger_at": null,
+            "next_at": null,
+            "duration_seconds": null,
+            "result_label": "未知",
+            "timer_unit": "rquant-replica-sync.timer",
+            "service_unit": "rquant-replica-sync.service",
+            "started_at": null,
+            "ended_at": null,
+            "invocation_id": null,
+            "origin_label": "待确认",
+            "previous_result_label": null
+          },
+          {
+            "name": "定时任务",
+            "status": {
+              "state": "crit",
+              "label": "异常",
+              "reason": "定时任务没有正确安装"
+            },
+            "last_trigger_at": null,
+            "next_at": null,
+            "duration_seconds": null,
+            "result_label": "未知",
+            "timer_unit": "rquant-research-ingest.timer",
+            "service_unit": "rquant-research-ingest.service",
+            "started_at": null,
+            "ended_at": null,
+            "invocation_id": null,
+            "origin_label": "待确认",
+            "previous_result_label": null
+          },
+          {
+            "name": "定时任务",
+            "status": {
+              "state": "crit",
+              "label": "异常",
+              "reason": "定时任务没有正确安装"
+            },
+            "last_trigger_at": null,
+            "next_at": null,
+            "duration_seconds": null,
+            "result_label": "未知",
+            "timer_unit": "rquant-surge-watch.timer",
+            "service_unit": "rquant-surge-watch.service",
+            "started_at": null,
+            "ended_at": null,
+            "invocation_id": null,
+            "origin_label": "待确认",
+            "previous_result_label": null
+          },
+          {
+            "name": "定时任务",
+            "status": {
+              "state": "crit",
+              "label": "异常",
+              "reason": "定时任务没有正确安装"
+            },
+            "last_trigger_at": null,
+            "next_at": null,
+            "duration_seconds": null,
+            "result_label": "未知",
+            "timer_unit": "rquant-tushare-token-reminder.timer",
+            "service_unit": "rquant-tushare-token-reminder.service",
+            "started_at": null,
+            "ended_at": null,
+            "invocation_id": null,
+            "origin_label": "待确认",
+            "previous_result_label": null
+          }
+        ]
+      },
+      "services": {
+        "source_state": "ready",
+        "source_label": "运行服务",
+        "source_note": null,
+        "source_updated_at": "2026-10-06T01:14:20Z",
+        "items": [
+          {
+            "name": "竞价撮合数据",
+            "plane_label": "盘中",
+            "status": {
+              "state": "waiting",
+              "label": "等待开盘",
+              "reason": "盘中服务，休市日不运行"
+            },
+            "heartbeat_at": null,
+            "service_id": "auction-match.source.v1"
+          },
+          {
+            "name": "分钟特征",
+            "plane_label": "盘中",
+            "status": {
+              "state": "ok",
+              "label": "正常",
+              "reason": "运行中"
+            },
+            "heartbeat_at": null,
+            "service_id": "feature.intraday-pit.v1"
+          },
+          {
+            "name": "研究任务",
+            "plane_label": "研究",
+            "status": {
+              "state": "idle",
+              "label": "未运行",
+              "reason": "没有收到这个服务的心跳"
+            },
+            "heartbeat_at": null,
+            "service_id": "lab-jobs.serving.v1"
+          },
+          {
+            "name": "通知推送",
+            "plane_label": "盘中",
+            "status": {
+              "state": "warn",
+              "label": "注意",
+              "reason": "影子模式：正式推送开通前只记录不发送"
+            },
+            "heartbeat_at": null,
+            "service_id": "notifier.admin.shadow.v1"
+          },
+          {
+            "name": "模拟撮合",
+            "plane_label": "盘中",
+            "status": {
+              "state": "ok",
+              "label": "正常",
+              "reason": "运行中"
+            },
+            "heartbeat_at": null,
+            "service_id": "paper-broker.shadow-main.v1"
+          },
+          {
+            "name": "参考数据发布",
+            "plane_label": "盘中",
+            "status": {
+              "state": "crit",
+              "label": "异常",
+              "reason": "连续失败 239 次"
+            },
+            "heartbeat_at": "2026-10-06T01:14:25Z",
+            "service_id": "reference-slow.publisher.v1"
+          },
+          {
+            "name": "页面数据发布",
+            "plane_label": "页面数据",
+            "status": {
+              "state": "ok",
+              "label": "正常",
+              "reason": "运行中"
+            },
+            "heartbeat_at": null,
+            "service_id": "serving-publisher.primary.v1"
+          },
+          {
+            "name": "信号路由",
+            "plane_label": "盘中",
+            "status": {
+              "state": "ok",
+              "label": "正常",
+              "reason": "运行中"
+            },
+            "heartbeat_at": null,
+            "service_id": "signal-router.all-strategies.v1"
+          }
+        ]
+      },
+      "resources": {
+        "source_state": "ready",
+        "source_label": "资源使用",
+        "source_note": null,
+        "source_updated_at": "2026-10-06T01:14:00Z",
+        "expires_at": "2026-10-06T01:16:00Z",
+        "remaining_seconds": 80.0,
+        "host_memory_total_bytes": null,
+        "host_memory_available_bytes": null,
+        "rquant_memory_current_bytes": null,
+        "rquant_memory_peak_bytes": null,
+        "groups": [
+          {
+            "name": "盘中",
+            "slice_unit": "rquant-live.slice",
+            "memory_current_bytes": null,
+            "memory_peak_bytes": null,
+            "cpu_usage_percent": null,
+            "cpu_note": "暂无可信 CPU 数据"
+          },
+          {
+            "name": "页面数据",
+            "slice_unit": "rquant-serving.slice",
+            "memory_current_bytes": null,
+            "memory_peak_bytes": null,
+            "cpu_usage_percent": null,
+            "cpu_note": "暂无可信 CPU 数据"
+          },
+          {
+            "name": "研究",
+            "slice_unit": "rquant-research.slice",
+            "memory_current_bytes": null,
+            "memory_peak_bytes": null,
+            "cpu_usage_percent": null,
+            "cpu_note": "暂无可信 CPU 数据"
+          },
+          {
+            "name": "维护",
+            "slice_unit": "rquant-maintenance.slice",
+            "memory_current_bytes": null,
+            "memory_peak_bytes": null,
+            "cpu_usage_percent": null,
+            "cpu_note": "暂无可信 CPU 数据"
+          }
+        ],
+        "cpu_usage_percent": null,
+        "cpu_note": "暂无可信 CPU 数据"
+      },
+      "research": {
+        "source_state": "empty",
+        "source_label": "还没有研究任务",
+        "source_note": null,
+        "source_updated_at": "2026-10-06T01:14:00Z",
+        "total": 0,
+        "counts": {
+          "queued": 0,
+          "running": 0,
+          "checkpointed": 0,
+          "succeeded": 0,
+          "failed": 0,
+          "cancelled": 0,
+          "other": 0
+        },
+        "page_size": 20,
+        "items": [],
+        "next_cursor": null
+      },
+      "can_view_research_logs": false,
+      "can_control_research_jobs": false,
+      "scheduling": {
+        "available": true,
+        "desired_version": 0,
+        "applied_version": 0,
+        "desired_paused": false,
+        "applied_paused": false,
+        "draining_count": 0,
+        "accepted_at": "2026-10-06T01:14:00Z",
+        "applied_at": "2026-10-06T01:14:00Z",
+        "note": "研究调度正常。"
+      }
+    },
+    "serving": {
+      "generation_id": "fb05ba58dcf0098f060e7057a7f73ed401cc5e161b79003fc57835137fa7d149",
+      "built_at": "2026-10-06T01:14:40Z",
+      "age_seconds": 0.0,
+      "state": "ready",
+      "message": null,
+      "detail": "serving generation verified"
+    }
+  },
+  "unit_capabilities": {
+    "generation_id": "fb05ba58dcf0098f060e7057a7f73ed401cc5e161b79003fc57835137fa7d149",
+    "units": [
+      {
+        "unit": "rquant-backup.service",
+        "can_request": true,
+        "requires_confirmation": false,
+        "reason": "执行前会再次核验。"
+      }
+    ],
+    "can_control_scheduling": false,
+    "can_recover_units": true,
+    "can_recover_scheduling": false,
+    "scheduling": {
+      "available": true,
+      "desired_version": 0,
+      "applied_version": 0,
+      "desired_paused": false,
+      "applied_paused": false,
+      "draining_count": 0,
+      "accepted_at": "2026-10-06T01:14:00Z",
+      "applied_at": "2026-10-06T01:14:00Z",
+      "note": "研究调度正常。"
+    },
+    "note": "执行前会再次核验。"
+  },
+  "scheduling_capabilities": {
+    "generation_id": "fb05ba58dcf0098f060e7057a7f73ed401cc5e161b79003fc57835137fa7d149",
+    "units": [],
+    "can_control_scheduling": true,
+    "can_recover_units": false,
+    "can_recover_scheduling": true,
+    "scheduling": {
+      "available": true,
+      "desired_version": 0,
+      "applied_version": 0,
+      "desired_paused": false,
+      "applied_paused": false,
+      "draining_count": 0,
+      "accepted_at": "2026-10-06T01:14:00Z",
+      "applied_at": "2026-10-06T01:14:00Z",
+      "note": "研究调度正常。"
+    },
+    "note": "执行前会再次核验。"
+  }
+}

@@ -5801,16 +5801,17 @@ class LabWorker:
                         # requests serialize on this same gate, so they observe either
                         # a pre-ACK stop or an already committed post-ACK execution.
                         try:
-                            _send_wire(
-                                child.connection,
-                                _IsolationStartAck(
-                                    accepted=True,
-                                    not_after_monotonic_microseconds=spec_child_deadline,
-                                    execution_limit_microseconds=ack_live_limit_microseconds,
-                                ),
-                                deadline_microseconds=spec_child_deadline,
-                                cancel_requested=self._stop.is_set,
-                            )
+                            with self.claim_spool.scheduling_execution_start(claim, now=_utc(self.clock())):
+                                _send_wire(
+                                    child.connection,
+                                    _IsolationStartAck(
+                                        accepted=True,
+                                        not_after_monotonic_microseconds=spec_child_deadline,
+                                        execution_limit_microseconds=ack_live_limit_microseconds,
+                                    ),
+                                    deadline_microseconds=spec_child_deadline,
+                                    cancel_requested=self._stop.is_set,
+                                )
                         except (InterruptedError, TimeoutError):
                             raise
                         except Exception as exc:
@@ -5975,6 +5976,12 @@ class LabWorker:
                         label="isolated shard",
                         allow_graceful_termination=(stop_reason is None and preemption is None),
                     )
+                except BaseException as exc:
+                    cleanup_errors.append(exc)
+
+            if not cleanup_errors:
+                try:
+                    self.claim_spool.close_scheduling_execution(claim, now=_utc(self.clock()))
                 except BaseException as exc:
                     cleanup_errors.append(exc)
 

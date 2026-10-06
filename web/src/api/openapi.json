@@ -17436,6 +17436,18 @@
             "title": "Entries",
             "type": "array"
           },
+          "invocation_id": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{32}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Invocation Id"
+          },
           "next_cursor": {
             "anyOf": [
               {
@@ -24823,6 +24835,43 @@
         "title": "PortfolioWeightRule",
         "type": "object"
       },
+      "PrepareUnitRun": {
+        "additionalProperties": false,
+        "properties": {
+          "command_id": {
+            "title": "Command Id",
+            "type": "string"
+          },
+          "generation_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Generation Id",
+            "type": "string"
+          },
+          "kind": {
+            "const": "prepare_unit_run",
+            "default": "prepare_unit_run",
+            "title": "Kind",
+            "type": "string"
+          },
+          "requested_at": {
+            "format": "date-time",
+            "title": "Requested At",
+            "type": "string"
+          },
+          "run": {
+            "$ref": "#/components/schemas/TaskUnitRunDraft"
+          }
+        },
+        "required": [
+          "command_id",
+          "requested_at",
+          "generation_id",
+          "run"
+        ],
+        "title": "PrepareUnitRun",
+        "type": "object"
+      },
       "PriceAlertNotificationFact": {
         "additionalProperties": false,
         "properties": {
@@ -26815,6 +26864,56 @@
         "title": "RelativeMetrics",
         "type": "object"
       },
+      "RequestUnitRun": {
+        "additionalProperties": false,
+        "properties": {
+          "command_id": {
+            "title": "Command Id",
+            "type": "string"
+          },
+          "confirmation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Confirmation Id"
+          },
+          "generation_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Generation Id",
+            "type": "string"
+          },
+          "kind": {
+            "const": "request_unit_run",
+            "default": "request_unit_run",
+            "title": "Kind",
+            "type": "string"
+          },
+          "requested_at": {
+            "format": "date-time",
+            "title": "Requested At",
+            "type": "string"
+          },
+          "unit": {
+            "pattern": "^[A-Za-z0-9_.@-]{1,128}\\.service$",
+            "title": "Unit",
+            "type": "string"
+          }
+        },
+        "required": [
+          "command_id",
+          "requested_at",
+          "generation_id",
+          "unit"
+        ],
+        "title": "RequestUnitRun",
+        "type": "object"
+      },
       "ResearchJobItem": {
         "properties": {
           "available_actions": {
@@ -27151,6 +27250,24 @@
       },
       "ResourceGroupItem": {
         "properties": {
+          "cpu_note": {
+            "default": "暂无可信 CPU 数据",
+            "title": "Cpu Note",
+            "type": "string"
+          },
+          "cpu_usage_percent": {
+            "anyOf": [
+              {
+                "maximum": 100.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cpu Usage Percent"
+          },
           "memory_current_bytes": {
             "anyOf": [
               {
@@ -28352,6 +28469,30 @@
             ],
             "title": "Duration Seconds"
           },
+          "ended_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ended At"
+          },
+          "invocation_id": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{32}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Invocation Id"
+          },
           "last_trigger_at": {
             "anyOf": [
               {
@@ -28381,6 +28522,22 @@
             ],
             "title": "Next At"
           },
+          "origin_label": {
+            "default": "待确认",
+            "title": "Origin Label",
+            "type": "string"
+          },
+          "previous_result_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Previous Result Label"
+          },
           "result_label": {
             "title": "Result Label",
             "type": "string"
@@ -28389,6 +28546,18 @@
             "maxLength": 128,
             "title": "Service Unit",
             "type": "string"
+          },
+          "started_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Started At"
           },
           "status": {
             "$ref": "#/components/schemas/StatusInfo"
@@ -30313,6 +30482,51 @@
         "title": "SessionInfo",
         "type": "object"
       },
+      "SetLabSchedulingPaused": {
+        "additionalProperties": false,
+        "properties": {
+          "command_id": {
+            "title": "Command Id",
+            "type": "string"
+          },
+          "expected_version": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Expected Version",
+            "type": "integer"
+          },
+          "generation_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Generation Id",
+            "type": "string"
+          },
+          "kind": {
+            "const": "set_lab_scheduling_paused",
+            "default": "set_lab_scheduling_paused",
+            "title": "Kind",
+            "type": "string"
+          },
+          "paused": {
+            "title": "Paused",
+            "type": "boolean"
+          },
+          "requested_at": {
+            "format": "date-time",
+            "title": "Requested At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "command_id",
+          "requested_at",
+          "generation_id",
+          "expected_version",
+          "paused"
+        ],
+        "title": "SetLabSchedulingPaused",
+        "type": "object"
+      },
       "SetPaperAccountPaused": {
         "additionalProperties": false,
         "properties": {
@@ -31826,6 +32040,208 @@
         "title": "TableItem",
         "type": "object"
       },
+      "TaskControlCapabilitiesData": {
+        "additionalProperties": false,
+        "properties": {
+          "can_control_scheduling": {
+            "default": false,
+            "title": "Can Control Scheduling",
+            "type": "boolean"
+          },
+          "can_recover_scheduling": {
+            "default": false,
+            "title": "Can Recover Scheduling",
+            "type": "boolean"
+          },
+          "can_recover_units": {
+            "default": false,
+            "title": "Can Recover Units",
+            "type": "boolean"
+          },
+          "generation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Generation Id"
+          },
+          "note": {
+            "default": "任务操作尚未开放。",
+            "title": "Note",
+            "type": "string"
+          },
+          "scheduling": {
+            "$ref": "#/components/schemas/TaskSchedulingView",
+            "default": {
+              "available": false,
+              "note": "调度状态尚未发布。"
+            }
+          },
+          "units": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/TaskUnitControlChoice"
+            },
+            "maxItems": 32,
+            "title": "Units",
+            "type": "array"
+          }
+        },
+        "title": "TaskControlCapabilitiesData",
+        "type": "object"
+      },
+      "TaskControlCommandData": {
+        "additionalProperties": false,
+        "properties": {
+          "can_resume": {
+            "default": false,
+            "title": "Can Resume",
+            "type": "boolean"
+          },
+          "command_id": {
+            "title": "Command Id",
+            "type": "string"
+          },
+          "confirmation_expires_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Confirmation Expires At"
+          },
+          "confirmation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Confirmation Id"
+          },
+          "desired_version": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Desired Version"
+          },
+          "duration_seconds": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Duration Seconds"
+          },
+          "ended_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ended At"
+          },
+          "invocation_id": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{32}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Invocation Id"
+          },
+          "message": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Message",
+            "type": "string"
+          },
+          "original_request": {
+            "discriminator": {
+              "mapping": {
+                "prepare_unit_run": "#/components/schemas/PrepareUnitRun",
+                "request_unit_run": "#/components/schemas/RequestUnitRun",
+                "set_lab_scheduling_paused": "#/components/schemas/SetLabSchedulingPaused"
+              },
+              "propertyName": "kind"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/PrepareUnitRun"
+              },
+              {
+                "$ref": "#/components/schemas/RequestUnitRun"
+              },
+              {
+                "$ref": "#/components/schemas/SetLabSchedulingPaused"
+              }
+            ],
+            "title": "Original Request"
+          },
+          "started_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Started At"
+          },
+          "status": {
+            "enum": [
+              "not_found",
+              "pending",
+              "prepared",
+              "submitted",
+              "started",
+              "succeeded",
+              "failed",
+              "unknown",
+              "rejected"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "command_id",
+          "original_request",
+          "status",
+          "message"
+        ],
+        "title": "TaskControlCommandData",
+        "type": "object"
+      },
       "TaskOverviewData": {
         "properties": {
           "can_control_research_jobs": {
@@ -31847,6 +32263,13 @@
           "scheduled": {
             "$ref": "#/components/schemas/ScheduledTasksData"
           },
+          "scheduling": {
+            "$ref": "#/components/schemas/TaskSchedulingView",
+            "default": {
+              "available": false,
+              "note": "调度状态尚未发布。"
+            }
+          },
           "services": {
             "$ref": "#/components/schemas/RuntimeServicesData"
           }
@@ -31858,6 +32281,172 @@
           "research"
         ],
         "title": "TaskOverviewData",
+        "type": "object"
+      },
+      "TaskSchedulingView": {
+        "additionalProperties": false,
+        "properties": {
+          "accepted_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Accepted At"
+          },
+          "applied_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Applied At"
+          },
+          "applied_paused": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Applied Paused"
+          },
+          "applied_version": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Applied Version"
+          },
+          "available": {
+            "default": false,
+            "title": "Available",
+            "type": "boolean"
+          },
+          "desired_paused": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Desired Paused"
+          },
+          "desired_version": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Desired Version"
+          },
+          "draining_count": {
+            "anyOf": [
+              {
+                "maximum": 64.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Draining Count"
+          },
+          "note": {
+            "default": "调度状态尚未发布。",
+            "title": "Note",
+            "type": "string"
+          }
+        },
+        "title": "TaskSchedulingView",
+        "type": "object"
+      },
+      "TaskUnitControlChoice": {
+        "additionalProperties": false,
+        "properties": {
+          "can_request": {
+            "title": "Can Request",
+            "type": "boolean"
+          },
+          "reason": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Reason",
+            "type": "string"
+          },
+          "requires_confirmation": {
+            "title": "Requires Confirmation",
+            "type": "boolean"
+          },
+          "unit": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Unit",
+            "type": "string"
+          }
+        },
+        "required": [
+          "unit",
+          "can_request",
+          "requires_confirmation",
+          "reason"
+        ],
+        "title": "TaskUnitControlChoice",
+        "type": "object"
+      },
+      "TaskUnitRunDraft": {
+        "additionalProperties": false,
+        "properties": {
+          "command_id": {
+            "title": "Command Id",
+            "type": "string"
+          },
+          "generation_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Generation Id",
+            "type": "string"
+          },
+          "requested_at": {
+            "format": "date-time",
+            "title": "Requested At",
+            "type": "string"
+          },
+          "unit": {
+            "pattern": "^[A-Za-z0-9_.@-]{1,128}\\.service$",
+            "title": "Unit",
+            "type": "string"
+          }
+        },
+        "required": [
+          "command_id",
+          "requested_at",
+          "generation_id",
+          "unit"
+        ],
+        "title": "TaskUnitRunDraft",
         "type": "object"
       },
       "TdxParseData": {
@@ -38675,6 +39264,177 @@
         ]
       }
     },
+    "/api/v1/tasks/control-capabilities": {
+      "get": {
+        "operationId": "capabilities_api_v1_tasks_control_capabilities_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "generation_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Generation Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskControlCapabilitiesData"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "任务执行与调度权限",
+        "tags": [
+          "tasks"
+        ]
+      }
+    },
+    "/api/v1/tasks/controls/lookup": {
+      "post": {
+        "operationId": "lookup_api_v1_tasks_controls_lookup_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "discriminator": {
+                  "mapping": {
+                    "prepare_unit_run": "#/components/schemas/PrepareUnitRun",
+                    "request_unit_run": "#/components/schemas/RequestUnitRun",
+                    "set_lab_scheduling_paused": "#/components/schemas/SetLabSchedulingPaused"
+                  },
+                  "propertyName": "kind"
+                },
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/PrepareUnitRun"
+                  },
+                  {
+                    "$ref": "#/components/schemas/RequestUnitRun"
+                  },
+                  {
+                    "$ref": "#/components/schemas/SetLabSchedulingPaused"
+                  }
+                ],
+                "title": "Body"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskControlCommandData"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "核验任务原请求",
+        "tags": [
+          "tasks"
+        ]
+      }
+    },
+    "/api/v1/tasks/controls/resume": {
+      "post": {
+        "operationId": "resume_api_v1_tasks_controls_resume_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "discriminator": {
+                  "mapping": {
+                    "prepare_unit_run": "#/components/schemas/PrepareUnitRun",
+                    "request_unit_run": "#/components/schemas/RequestUnitRun",
+                    "set_lab_scheduling_paused": "#/components/schemas/SetLabSchedulingPaused"
+                  },
+                  "propertyName": "kind"
+                },
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/PrepareUnitRun"
+                  },
+                  {
+                    "$ref": "#/components/schemas/RequestUnitRun"
+                  },
+                  {
+                    "$ref": "#/components/schemas/SetLabSchedulingPaused"
+                  }
+                ],
+                "title": "Body"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskControlCommandData"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "恢复任务原请求回执",
+        "tags": [
+          "tasks"
+        ]
+      }
+    },
     "/api/v1/tasks/jobs": {
       "get": {
         "operationId": "get_jobs_api_v1_tasks_jobs_get",
@@ -38930,6 +39690,47 @@
         ]
       }
     },
+    "/api/v1/tasks/scheduling/commands": {
+      "post": {
+        "operationId": "scheduling_api_v1_tasks_scheduling_commands_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetLabSchedulingPaused"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskControlCommandData"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "暂停或恢复研究调度",
+        "tags": [
+          "tasks"
+        ]
+      }
+    },
     "/api/v1/tasks/services/log-capabilities": {
       "get": {
         "operationId": "get_log_capabilities_api_v1_tasks_services_log_capabilities_get",
@@ -38961,6 +39762,15 @@
             "required": true,
             "schema": {
               "title": "Unit",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "invocation_id",
+            "required": false,
+            "schema": {
+              "pattern": "^[0-9a-f]{32}$",
               "type": "string"
             }
           },
@@ -39036,6 +39846,114 @@
           }
         },
         "summary": "服务运行日志",
+        "tags": [
+          "tasks"
+        ]
+      }
+    },
+    "/api/v1/tasks/units/{unit}/run": {
+      "post": {
+        "operationId": "run_unit_api_v1_tasks_units__unit__run_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "unit",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Unit",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RequestUnitRun"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskControlCommandData"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "请求运行精确任务",
+        "tags": [
+          "tasks"
+        ]
+      }
+    },
+    "/api/v1/tasks/units/{unit}/run/prepare": {
+      "post": {
+        "operationId": "prepare_unit_api_v1_tasks_units__unit__run_prepare_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "unit",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Unit",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PrepareUnitRun"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskControlCommandData"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "准备本次任务运行",
         "tags": [
           "tasks"
         ]
