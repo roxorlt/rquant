@@ -5,7 +5,8 @@ from __future__ import annotations
 import hashlib
 import importlib
 import importlib.util
-import socket
+import subprocess
+import sys
 from datetime import timedelta
 from pathlib import Path
 
@@ -494,17 +495,29 @@ def test_corrupted_parquet_is_refused_before_reader_yields(tmp_path: Path) -> No
     assert not tuple(lake.glob(".industry-reader-*"))
 
 
-def test_ordinary_module_import_does_not_initialize_settings_or_network(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from rquant.config import Settings
+def test_ordinary_module_import_does_not_initialize_settings_or_network() -> None:
+    root = Path(__file__).resolve().parents[2]
+    source = f"""
+import sys
+sys.path[:0] = [{str(root / 'src')!r}, {str(root)!r}]
+import socket
+from rquant.config import Settings
 
-    def forbidden(*args: object, **kwargs: object) -> None:
-        pytest.fail("ordinary industry import initialized settings or network")
+def forbidden(*args: object, **kwargs: object) -> None:
+    raise AssertionError("ordinary industry import initialized settings or network")
 
-    monkeypatch.setattr(Settings, "__init__", forbidden)
-    monkeypatch.setattr(socket, "socket", forbidden)
-    importlib.reload(_module())
+Settings.__init__ = forbidden
+socket.socket = forbidden
+import rquant.factor.industry_source
+"""
+    completed = subprocess.run(
+        [sys.executable, "-B", "-c", source],
+        cwd=root,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_provider_delisted_alias_is_retained_raw_but_excluded_from_computation(

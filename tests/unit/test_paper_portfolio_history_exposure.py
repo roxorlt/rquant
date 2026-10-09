@@ -104,10 +104,15 @@ def test_unknown_industry_has_explicit_exposure_gap_and_no_estimated_attribution
     assert any(item.kind == "unknown" for item in value.exposure.rows)
 
 
-def test_future_or_detached_industry_material_is_rejected(tmp_path: Path) -> None:
+def test_future_or_detached_industry_material_is_rejected(
+    tmp_path: Path, request: pytest.FixtureRequest
+) -> None:
     from rquant.paper_portfolio_exposure import calculate_paper_exposure
 
     broker, basis, _, _ = filled(tmp_path)
+    owner_connection = broker._connect()
+    request.addfinalizer(owner_connection.close)
+    assert not owner_connection.in_transaction
     frame = ledger_source(broker).read(configuration=basis.configuration, as_of=EXECUTION_TIME, prices={"600000.SH": Decimal("1")})
     with pytest.raises(ValueError):
         calculate_paper_exposure(frame, industry_material(basis.configuration, frame, future=True), as_of=frame.as_of)

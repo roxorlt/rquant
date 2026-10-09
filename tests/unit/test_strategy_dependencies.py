@@ -19,20 +19,44 @@ from rquant.strategy_dependencies import (
 
 
 def test_three_strategy_dependency_contracts_are_unique_and_explicit() -> None:
-    assert set(STRATEGY_EXECUTION_DEPENDENCIES) == {
+    market_strategies = {
         "n_shape",
         "growth_board_surge",
         "auction_gap",
     }
+    materialized_contracts = {
+        "portfolio_backtest": ("portfolio-daily-v1", "portfolio_backtest_input"),
+        "minute_runtime_replay": (
+            "minute-runtime-replay-input/v2",
+            "minute_runtime_replay_input",
+        ),
+        "minute_parameter_replay": (
+            "minute-parameter-replay-input/v1",
+            "minute_parameter_replay_input",
+        ),
+        "paper_backtest_band": ("paper-research-input/v1", "paper_research_input"),
+        "paper_reconcile": ("paper-research-input/v1", "paper_research_input"),
+    }
+    assert set(STRATEGY_EXECUTION_DEPENDENCIES) == market_strategies | set(
+        materialized_contracts
+    )
     for strategy_id, contract in STRATEGY_EXECUTION_DEPENDENCIES.items():
         assert contract.strategy_id == strategy_id
         table_names = [item.table_name for item in contract.materialized_tables]
         assert len(table_names) == len(set(table_names))
-        assert "minute_bar" in contract.lake_datasets
-        assert {"daily_bar", "stock_status_daily", "trade_calendar"} <= set(
-            table_names
-        )
-        assert "index_daily_bar" in table_names
+        if strategy_id in market_strategies:
+            assert "minute_bar" in contract.lake_datasets
+            assert {"daily_bar", "stock_status_daily", "trade_calendar"} <= set(
+                table_names
+            )
+            assert "index_daily_bar" in table_names
+        else:
+            contract_version, table_name = materialized_contracts[strategy_id]
+            assert contract.contract_version == contract_version
+            assert contract.lake_datasets == ()
+            assert contract.materialized_tables == (
+                StrategyTableDependency(dataset_id=table_name, table_name=table_name),
+            )
 
     assert "auction_bar" in strategy_execution_dependencies(
         "auction_gap"

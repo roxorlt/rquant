@@ -162,12 +162,16 @@ def _invoke(
     action: str = "prepare",
     filename: str = "result.json",
 ) -> tuple[int, dict[str, Any], bytes]:
-    from rquant import cli, config
+    from rquant import config
+
+    settings_before = config._SETTINGS
 
     def forbidden_settings() -> None:
         pytest.fail("Historical CLI called Settings")
 
     monkeypatch.setattr(config, "get_settings", forbidden_settings)
+    from rquant import cli
+
     _api()
     source = tmp_path / "input.json"
     raw = json.dumps(payload, ensure_ascii=False).encode()
@@ -180,7 +184,7 @@ def _invoke(
     )
     exit_code = cli.main()
     assert source.read_bytes() == raw
-    assert config._SETTINGS is None
+    assert config._SETTINGS is settings_before
     return exit_code, json.loads(output.read_bytes()), raw
 
 

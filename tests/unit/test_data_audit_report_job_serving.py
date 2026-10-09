@@ -25,6 +25,7 @@ from rquant.data_audit_report_jobs import (
     DataAuditReportJobRequest,
     DataAuditReportJobStore,
     DataAuditReportJobWorker,
+    _canonical_request,
 )
 from rquant.runtime_builder_authority import LabJobsPublisherSettings
 from rquant.serving_page_projection_source import (
@@ -38,9 +39,6 @@ from rquant.serving_read_models import (
 )
 from rquant.storage.duckdb import DuckDBStore
 from tests.unit.test_data_audit_report import END, START, _database
-
-# Real state/artifact inode ctime must precede the fixture observation.
-OBSERVED = datetime.now(UTC) + timedelta(minutes=5)
 
 
 class _Clock:
@@ -91,7 +89,7 @@ def _source(research: Path, state: Path, reports: Path) -> DuckDBLabPageProjecti
 
 
 def _rows(source: DuckDBLabPageProjectionSource) -> dict[str, tuple[object, ...]]:
-    snapshot = source(OBSERVED)
+    snapshot = source(datetime.now(UTC))
     return {projection.table_name: projection.rows for projection in snapshot.projections}
 
 
@@ -170,11 +168,12 @@ def test_v2_success_receipt_artifact_serving_and_api_share_identity(tmp_path: Pa
     report = load_data_audit_report(path)
     assert isinstance(report, CatalogDataAuditReport) and len(report.datasets) == 24
     assert path.name == f"data-audit-v2-{finished.report_hash}.json"
-    job = read_data_audit_report_job_snapshot(store.state_path, observed_at=OBSERVED)
+    observed = datetime.now(UTC)
+    job = read_data_audit_report_job_snapshot(store.state_path, observed_at=observed)
     assert job.successful is not None and job.successful.receipt == finished
     assert report.source.snapshot_label == f"sha256:{job.successful.replica_sha256}"
 
-    snapshot = _source(research, store.state_path, store.report_directory)(OBSERVED)
+    snapshot = _source(research, store.state_path, store.report_directory)(observed)
     projections = tuple(
         item for item in snapshot.projections if item.table_name.startswith("audit_report_")
     )
@@ -186,7 +185,7 @@ def test_v2_success_receipt_artifact_serving_and_api_share_identity(tmp_path: Pa
 
     # The existing publisher fixture uses minute sequence offsets. Keep its build
     # later than the real inode times instead of backdating source identities.
-    sequence = int((OBSERVED - FIXTURE_BUILT_AT).total_seconds() // 60) + 1
+    sequence = int((observed - FIXTURE_BUILT_AT).total_seconds() // 60) + 1
     root = tmp_path / "serving"
     manifest = build_web_fixture(
         root, "baseline", sequence=sequence, audit_report_projections=projections
@@ -280,7 +279,8 @@ def test_latest_failure_keeps_verified_older_report_and_separate_times(tmp_path:
     assert failure is not None and failure.status == "failed"
 
     source = _source(research, store.state_path, store.report_directory)
-    snapshot = source(OBSERVED)
+    observed = datetime.now(UTC)
+    snapshot = source(observed)
     projections = {item.table_name: item for item in snapshot.projections}
     job = projections["audit_report_job"].rows[0]
     overview = projections["audit_report_overview"].rows[0]
@@ -306,7 +306,7 @@ def test_latest_failure_keeps_verified_older_report_and_separate_times(tmp_path:
     } == {projections["audit_report_job"].available_at}
     tables = build_serving_read_models(
         ServingReadModelInput(
-            observed_at=OBSERVED,
+            observed_at=observed,
             projections=tuple(
                 ServingProjectionInput.bind(
                     item, owner_dataset_id="lab_jobs", owner_generation_id="a" * 64
@@ -346,7 +346,7 @@ def test_success_report_must_match_stored_request(tmp_path: Path) -> None:
         ).fetchone()[0]
         request = json.loads(raw)
         request["audit_start"] = (START + timedelta(days=1)).isoformat()
-        changed = json.dumps(request, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        changed = _canonical_request(DataAuditReportJobRequest.model_validate(request))
         connection.execute(
             "UPDATE data_audit_report_job SET request_json = ?, request_sha256 = ? "
             "WHERE task_id = ?",
@@ -392,12 +392,12 @@ def test_orphan_sqlite_sidecar_cannot_be_reported_as_empty_state(tmp_path: Path)
     shm = Path(f"{store.state_path}-shm")
     shm.write_bytes(b"orphan")
     with pytest.raises(ValueError, match="sidecar|WAL"):
-        read_data_audit_report_job_snapshot(store.state_path, observed_at=OBSERVED)
+        read_data_audit_report_job_snapshot(store.state_path, observed_at=datetime.now(UTC))
     shm.unlink()
     store.state_path.unlink()
     Path(f"{store.state_path}-wal").write_bytes(b"orphan")
     with pytest.raises(ValueError, match="sidecar|WAL"):
-        read_data_audit_report_job_snapshot(store.state_path, observed_at=OBSERVED)
+        read_data_audit_report_job_snapshot(store.state_path, observed_at=datetime.now(UTC))
 
 
 def test_latest_and_success_are_read_in_one_sqlite_snapshot(

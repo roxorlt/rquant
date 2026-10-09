@@ -15,6 +15,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
+from functools import lru_cache
 from pathlib import Path
 from threading import Lock
 from types import TracebackType
@@ -3215,9 +3216,14 @@ def _normalized_sql_tokens(sql: str) -> tuple[tuple[str, str], ...]:
     return tuple(without_optional_exists)
 
 
+@lru_cache(maxsize=128)
+def _normalized_expected_sql_tokens(expected: str) -> tuple[tuple[str, str], ...]:
+    return _normalized_sql_tokens(expected)
+
+
 def _sql_ddl_equivalent(expected: str, actual: str) -> bool:
     try:
-        return _normalized_sql_tokens(expected) == _normalized_sql_tokens(actual)
+        return _normalized_expected_sql_tokens(expected) == _normalized_sql_tokens(actual)
     except ValueError:
         return False
 

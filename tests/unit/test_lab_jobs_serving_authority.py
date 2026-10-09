@@ -636,10 +636,10 @@ def test_unknown_lab_publisher_failure_does_not_replace_authority(
     authority = LabJobsServingAuthorityPublisher(reader=source, publisher=_publisher(tmp_path))
     first = authority.publish(OBSERVED_AT)
 
-    def unknown_failure(*, limit: int):  # type: ignore[no-untyped-def]
+    def unknown_failure(_reader: LabJobReader, *, limit: int) -> None:
         raise RuntimeError("unclassified failure")
 
-    monkeypatch.setattr(source.reader, "list_published_jobs_with_events", unknown_failure)
+    monkeypatch.setattr("rquant.experiment_platform_projection.legacy_job_snapshot", unknown_failure)
     with pytest.raises(RuntimeError, match="unclassified failure"):
         authority.publish(OBSERVED_AT + timedelta(seconds=1))
     loaded = ServingSourceAuthorityReader(

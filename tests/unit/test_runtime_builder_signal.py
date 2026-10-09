@@ -5,6 +5,7 @@ import json
 import os
 import sqlite3
 from collections.abc import Callable
+from contextlib import closing
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -1005,6 +1006,71 @@ def test_notifier_loads_providers_outside_manifest_and_maps_backlog(tmp_path: Pa
     assert len(result.source_generations["signal_route_spool"]) == 64
     assert result.degraded_reasons == ()
     assert state.outbox_records()[0].status is OutboxStatus.SUCCEEDED
+
+
+@pytest.mark.parametrize("mixed_installed", [False, True], ids=["v1", "mixed"])
+def test_notifier_owner_history_controls_real_mixed_input(
+    tmp_path: Path, mixed_installed: bool
+) -> None:
+    from rquant.price_alert_route import install_price_alert_history
+    from rquant.signal_route_spool import publish_mixed_notification_bus_prefix
+    from tests.unit.test_price_alert_event_contracts import AT
+    from tests.unit.test_price_alert_route_spool import mixed_fixture
+
+    producer, bus, _activation, one, price, three = mixed_fixture(tmp_path)
+    try:
+        publish_mixed_notification_bus_prefix(
+            bus=bus,
+            spool=SignalRouteSpool(tmp_path / "signal-spool"),
+            limit=100,
+            observed_at=AT,
+        )
+        state = NotificationStateStore(tmp_path / "notification-state.sqlite3")
+        if mixed_installed:
+            install_price_alert_history(state)
+        before = state.replication_cursor()
+        step = notifier_builder(provider_loader=lambda: {}, clock=lambda: AT)(
+            _notifier_manifest(tmp_path)
+        )
+        if mixed_installed:
+            assert step().output_sequence == 3
+            assert state.notification_event(price.event.event_id).event == price.event
+            assert state.signal(one.signal_id) == one
+            assert state.signal(three.signal_id) == three
+            assert step().output_sequence == 3
+            assert len(state.outbox_records()) == 3
+        else:
+            with pytest.raises((TypeError, ValueError, RuntimeError)):
+                step()
+            assert state.replication_cursor() == before
+            assert state.outbox_records() == ()
+            with state._read_snapshot() as connection:
+                assert connection.execute("SELECT COUNT(*) FROM signal_envelope").fetchone()[0] == 0
+    finally:
+        producer.close()
+
+
+@pytest.mark.parametrize("fault", ["partial", "protocol"])
+def test_notifier_rejects_invalid_owner_history_at_build(tmp_path: Path, fault: str) -> None:
+    from rquant.price_alert_route import install_price_alert_history
+
+    state = NotificationStateStore(tmp_path / "notification-state.sqlite3")
+    install_price_alert_history(state)
+    with closing(sqlite3.connect(state.path)) as connection, connection:
+        if fault == "partial":
+            connection.execute("DROP TABLE price_alert_route_receipt")
+        else:
+            connection.execute(
+                "UPDATE signal_bus_metadata SET metadata_value='invalid' "
+                "WHERE metadata_key='mixed_notification_history'"
+            )
+    before = state.replication_cursor()
+    with pytest.raises(ValueError, match="mixed notification history"):
+        notifier_builder(provider_loader=lambda: {}, clock=lambda: NOW)(
+            _notifier_manifest(tmp_path)
+        )
+    assert state.replication_cursor() == before
+    assert state.outbox_records() == ()
 
 
 def test_notifier_default_loader_uses_scoped_environment_before_claim(

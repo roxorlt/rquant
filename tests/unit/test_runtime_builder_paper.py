@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Callable
+from contextlib import closing
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -172,6 +174,63 @@ def test_paper_consumer_delegates_signal_with_durable_cursor(tmp_path: Path) -> 
     assert first.source_generations["signal_bus"] == bus.source_descriptor().generation_id
     assert replay.processed_count == 0
     assert replay.output_sequence == 1
+
+
+def test_v1_paper_broker_rejects_real_mixed_spool_without_advancing(tmp_path: Path) -> None:
+    from rquant.paper_signal_consumer import PaperSignalConsumerStateStore
+    from rquant.signal_route_spool import publish_mixed_notification_bus_prefix
+    from tests.unit.test_price_alert_event_contracts import AT
+    from tests.unit.test_price_alert_route_spool import mixed_fixture
+
+    producer, bus, _activation, _one, _price, _three = mixed_fixture(tmp_path)
+    try:
+        publish_mixed_notification_bus_prefix(
+            bus=bus,
+            spool=SignalRouteSpool(tmp_path / "signal-spool"),
+            limit=100,
+            observed_at=AT,
+        )
+        state = PaperSignalConsumerStateStore(tmp_path / "consumer.sqlite3")
+        before = state.cursor()
+        step = paper_broker_builder(
+            clock=lambda: AT,
+            quote_resolver=lambda *args: pytest.fail("rejected source must not execute"),
+            trade_date_resolver=lambda now: now.date(),
+        )(_manifest(tmp_path, RuntimeServiceKind.PAPER_BROKER))
+        with pytest.raises((TypeError, ValueError, RuntimeError)):
+            step()
+        assert state.cursor() == before
+        with closing(sqlite3.connect(tmp_path / "queue.sqlite3")) as connection:
+            assert connection.execute("SELECT COUNT(*) FROM paper_signal_queue").fetchone()[0] == 0
+        with closing(sqlite3.connect(tmp_path / "broker.sqlite3")) as connection:
+            assert connection.execute("SELECT COUNT(*) FROM paper_order").fetchone()[0] == 0
+    finally:
+        producer.close()
+
+
+@pytest.mark.parametrize("fault", ["partial", "protocol", "owner"])
+def test_paper_broker_rejects_invalid_owner_history_at_build(tmp_path: Path, fault: str) -> None:
+    from rquant.paper_signal_consumer import PaperSignalConsumerStateStore
+
+    state = PaperSignalConsumerStateStore(tmp_path / "consumer.sqlite3")
+    state.install_mixed_notification_history()
+    with closing(sqlite3.connect(state.path)) as connection, connection:
+        if fault == "partial":
+            connection.execute("DROP TABLE paper_price_non_trading_receipt")
+        elif fault == "protocol":
+            connection.execute("UPDATE paper_notification_history SET protocol='invalid'")
+        else:
+            connection.execute(
+                "UPDATE paper_notification_history SET consumer_fingerprint=?", ("f" * 64,)
+            )
+    before = state.cursor()
+    with pytest.raises(ValueError, match="paper mixed history"):
+        paper_broker_builder(
+            clock=lambda: NOW,
+            quote_resolver=lambda *args: pytest.fail("invalid owner must not execute"),
+            trade_date_resolver=lambda now: now.date(),
+        )(_manifest(tmp_path, RuntimeServiceKind.PAPER_BROKER))
+    assert state.cursor() == before
 
 
 def test_retired_paper_consumer_pause_never_advances_its_cursor(tmp_path: Path) -> None:

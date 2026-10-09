@@ -9,7 +9,7 @@ from datetime import UTC, date, datetime, time
 from typing import Literal
 from zoneinfo import ZoneInfo
 
-import duckdb
+from duckdb import Error as DuckDBError
 import pandas as pd
 from pydantic import ValidationError
 
@@ -238,7 +238,7 @@ class ScreenApplicationService:
                 context = intraday_screen_context(
                     borrowed, now=self.clock(), replica=self.replica, rsi=self.rsi
                 )
-            except (ValueError, RuntimeError, duckdb.Error):
+            except (ValueError, RuntimeError, DuckDBError):
                 return ScreenCatalogData(
                     source_kind="intraday",
                     blocks=screen_blocks(daily_anchor=True),
@@ -361,7 +361,7 @@ class ScreenApplicationService:
                 context = intraday_screen_context(
                     borrowed, now=self.clock(), replica=self.replica, rsi=self.rsi
                 )
-            except (ValueError, RuntimeError, duckdb.Error) as error:
+            except (ValueError, RuntimeError, DuckDBError) as error:
                 raise ScreenApplicationError(503, "盘中数据暂不可用，请稍后重试。") from error
             body = ScreenRunRequest(
                 trade_date=definition.trade_date,
@@ -621,7 +621,7 @@ class ScreenApplicationService:
             context = intraday_screen_context(
                 borrowed, now=self.clock(), replica=self.replica, rsi=self.rsi
             )
-        except (ValueError, RuntimeError, duckdb.Error) as error:
+        except (ValueError, RuntimeError, DuckDBError) as error:
             raise ScreenApplicationError(503, "盘中数据暂不可用，请稍后重试。") from error
         actual = context.snapshot.source
         if (
@@ -680,7 +680,7 @@ class ScreenApplicationService:
             ScreenReplicaBudgetError,
         ) as error:
             raise ScreenApplicationError(503, "上个交易日的数据暂不可用，请稍后重试。") from error
-        except duckdb.Error as error:
+        except DuckDBError as error:
             raise ScreenApplicationError(503, "盘中数据暂不可用，请稍后重试。") from error
         except (ValueError, KeyError) as error:
             raise ScreenApplicationError(422, "所选盘中条件暂不可用，请刷新目录。") from error

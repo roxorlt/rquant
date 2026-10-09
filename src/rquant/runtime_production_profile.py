@@ -1926,7 +1926,7 @@ def build_production_runtime_profile(
                     },
                     "money": {"quantum": "0.01", "rounding": "HALF_UP"},
                 },
-                "limit": 128,
+                "limit": 100,
                 "raw_spool_root": str(minute_root),
                 "trade_calendar_path": str(config.trade_calendar_path),
                 "trade_calendar_sha256": config.trade_calendar_sha256,
@@ -2103,11 +2103,8 @@ def build_production_runtime_profile(
                 settings["details_enabled"] = True
             elif manifest.service_kind is RuntimeServiceKind.SERVING_PUBLISHER:
                 settings["health_ops_binding"] = binding.model_dump(mode="json")
-            configured.append(
-                RuntimeServiceManifest.model_validate(
-                    manifest.model_dump(mode="python") | {"settings": settings}
-                )
-            )
+            payload = manifest.model_dump(mode="python") | {"settings": settings}
+            configured.append(RuntimeServiceManifest.model_validate(payload))
         manifests = configured
     capabilities = {manifest.service_id: () for manifest in manifests}
     capabilities[reference_source_id] = (

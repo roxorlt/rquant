@@ -22,7 +22,7 @@ from tests.unit.test_paper_research_submission import fixture
 from tests.unit.test_paper_signal_worker import EXECUTION_TIME
 
 
-def host(tmp_path):
+def host(tmp_path, test_request: pytest.FixtureRequest | None = None):
     page, backend, runtime, request, jobs = fixture(tmp_path)
     directory = PaperResearchRuntimeDirectory(states=(runtime.state,), expected_identities=(runtime.state.identity(),))
     runs = backend.research_backend
@@ -45,6 +45,10 @@ def host(tmp_path):
     result_reader = PaperResearchResultReader(backend=runs, reader=runs.facade.reader,
                                                artifact_reader=ArtifactPreviewReader(reader=runs.facade.reader, artifact_root=artifacts.root))
     source = runs.preparer.source_for(request.account_id, "alice")
+    if test_request is not None:
+        # Readonly peers need the original owner's WAL until pytest teardown.
+        owner_connection = source.broker._connect()
+        test_request.addfinalizer(owner_connection.close)
     source.research_results = result_reader
     return page, backend, runtime, request, scheduler, worker, finalizer, result_reader, source
 
@@ -59,8 +63,12 @@ def accept_and_change_head(page, backend, runtime, request, scheduler):
     return job_id, owned
 
 
-def test_original_scheduler_worker_seal_finalizer_and_exact_reader_close_after_head_change(tmp_path):
-    page, backend, runtime, request, scheduler, worker, finalizer, reader, _ = host(tmp_path)
+def test_original_scheduler_worker_seal_finalizer_and_exact_reader_close_after_head_change(
+    tmp_path, request: pytest.FixtureRequest
+):
+    page, backend, runtime, request, scheduler, worker, finalizer, reader, _ = host(
+        tmp_path, request
+    )
     try:
         job_id, owned = accept_and_change_head(page, backend, runtime, request, scheduler)
         entry = worker.claim_spool.pending()[0]

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from contextlib import nullcontext
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -30,6 +29,7 @@ from rquant.strategy_promotion_contracts import (
     NativeMinuteSelection,
     StrategyPromotionTarget,
 )
+from tests.unit.test_minute_backtest_producer import source_seed
 
 
 class _PlanBoundaryReachedError(Exception):
@@ -38,12 +38,7 @@ class _PlanBoundaryReachedError(Exception):
 
 @pytest.fixture
 def preparation_time(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
-    raw = json.loads(
-        (Path(__file__).parents[1] / "fixtures/minute-report-sealed-result.json").read_bytes()
-    )
-    seed = MinuteSourceContentSeed.model_validate_json(
-        json.dumps(raw["result"]["publication"]["seed"])
-    )
+    seed = source_seed(tmp_path)
     start = seed.provenance.published_at + timedelta(hours=1)
     native = seed.native_registration
     target = StrategyPromotionTarget(

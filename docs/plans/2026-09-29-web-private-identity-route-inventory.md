@@ -1,6 +1,6 @@
 # Web `current_user` 路由清单
 
-对应 [私有身份边界](2026-09-29-web-private-identity-boundary.md)。以下为当前代码中的全部 162 个 `current_user` 依赖路由；`/api/v1` 前缀已包含。公开类即使收到裸用户头，也只得到 `viewer=None`，不能据此取得身份。私有类统一使用已验证的代理身份；已有 CSRF、角色和业务条件仍单独检查。
+对应 [私有身份边界](2026-09-29-web-private-identity-boundary.md)。以下为当前代码中的全部 186 个 `current_user` 依赖路由；`/api/v1` 前缀已包含。公开类即使收到裸用户头，也只得到 `viewer=None`，不能据此取得身份。私有类统一使用已验证的代理身份；已有 CSRF、角色和业务条件仍单独检查。
 
 ## 公开读取（20）
 
@@ -27,7 +27,7 @@
 | GET | `/api/v1/data/issues` |
 | GET | `/api/v1/data/fundamentals/summary` |
 
-## 私有读取（78）
+## 私有读取（93）
 
 | 方法 | 路径 |
 |---|---|
@@ -45,6 +45,7 @@
 | GET | `/api/v1/paper-portfolios/{account_id}/research/{job_id}/download` |
 | GET | `/api/v1/monitor/channels` |
 | GET | `/api/v1/monitor/timeline` |
+| GET | `/api/v1/monitor/runtime` |
 | GET | `/api/v1/monitor/price-rules` |
 | GET | `/api/v1/monitor/price-rules/head` |
 | GET | `/api/v1/monitor/price-rules/runtime` |
@@ -66,7 +67,21 @@
 | GET | `/api/v1/backtests/portfolio/runs/{job_id}/rows` |
 | GET | `/api/v1/backtests/portfolio/runs/{job_id}/report.html` |
 | GET | `/api/v1/backtests/portfolio/runs/{job_id}/exports/{request_id}.zip` |
+| GET | `/api/v1/backtests/minute-runtime/capabilities` |
+| GET | `/api/v1/backtests/minute-runtime/sources` |
+| GET | `/api/v1/backtests/minute-runtime/runs` |
+| GET | `/api/v1/backtests/minute-runtime/parameter-sources` |
+| GET | `/api/v1/backtests/minute-runtime/studies/capabilities` |
+| GET | `/api/v1/backtests/minute-runtime/studies` |
+| GET | `/api/v1/backtests/minute-runtime/studies/{command_id}` |
+| GET | `/api/v1/backtests/minute-runtime/studies/{command_id}/heatmap` |
+| GET | `/api/v1/backtests/minute-runtime/runs/{job_id}` |
+| GET | `/api/v1/backtests/minute-runtime/runs/{job_id}/nav` |
+| GET | `/api/v1/backtests/minute-runtime/runs/{job_id}/rows` |
+| GET | `/api/v1/backtests/minute-runtime/runs/{job_id}/report.html` |
+| GET | `/api/v1/backtests/minute-runtime/runs/{job_id}/exports/{request_id}.zip` |
 | GET | `/api/v1/strategies` |
+| GET | `/api/v1/strategy-promotions/{strategy_id}` |
 | GET | `/api/v1/strategy-templates` |
 | GET | `/api/v1/strategy-templates/sources` |
 | GET | `/api/v1/strategy-templates/{strategy_id}` |
@@ -112,7 +127,7 @@
 
 名单按认证 owner 过滤。服务日志能力在未登录时只返回空列表，日志正文仍拒绝；普通任务、池子、监控、研究和审计页面则直接返回 401。公开的 `meta` 在没有有效证明时不显示 viewer。
 
-## 受保护操作（64）
+## 受保护操作（73）
 
 | 方法 | 路径 |
 |---|---|
@@ -130,6 +145,9 @@
 | POST | `/api/v1/experiments/commands` |
 | POST | `/api/v1/backtests/portfolio/runs` |
 | POST | `/api/v1/backtests/portfolio/exports` |
+| POST | `/api/v1/backtests/minute-runtime/runs` |
+| POST | `/api/v1/backtests/minute-runtime/exports` |
+| POST | `/api/v1/backtests/minute-runtime/studies` |
 | POST | `/api/v1/watchlist/commands` |
 | POST | `/api/v1/screen/nl-preview` |
 | POST | `/api/v1/screen/tdx/market/commands` |
@@ -143,6 +161,9 @@
 | POST | `/api/v1/tasks/scheduling/commands` |
 | POST | `/api/v1/tasks/units/{unit}/run` |
 | POST | `/api/v1/tasks/units/{unit}/run/prepare` |
+| POST | `/api/v1/tasks/notifications/mode/prepare` |
+| POST | `/api/v1/tasks/notifications/mode` |
+| POST | `/api/v1/tasks/monitor/builtins/commands` |
 | POST | `/api/v1/paper-portfolios/{account_id}/configuration` |
 | POST | `/api/v1/paper-portfolios/{account_id}/pause/prepare` |
 | POST | `/api/v1/paper-portfolios/{account_id}/pause/confirm` |
@@ -167,6 +188,9 @@
 | POST | `/api/v1/strategy-templates/commands/resume` |
 | POST | `/api/v1/strategy-templates/{strategy_id}/runs` |
 | POST | `/api/v1/strategy-templates/{strategy_id}/runs/resume` |
+| POST | `/api/v1/strategy-promotions/commands` |
+| POST | `/api/v1/strategy-promotions/commands/lookup` |
+| POST | `/api/v1/strategy-promotions/commands/resume` |
 | POST | `/api/v1/screen/query/execute` |
 | POST | `/api/v1/screen/query/lookup` |
 | POST | `/api/v1/screen/query/resume` |

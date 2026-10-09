@@ -1308,11 +1308,13 @@ def test_builtin_registry_preserves_injected_strategy_evaluator_loader(
         evaluator_loader: object,
         clock: object,
         runtime_root: object = None,
+        native_forward_source_factory: object = None,
     ) -> object:
         observed.update(
             evaluator_loader=evaluator_loader,
             clock=clock,
             runtime_root=runtime_root,
+            native_forward_source_factory=native_forward_source_factory,
         )
         return lambda _manifest: lambda: None
 
@@ -1330,6 +1332,7 @@ def test_builtin_registry_preserves_injected_strategy_evaluator_loader(
 
     assert RuntimeServiceKind.STRATEGY_LIVE in registry.registered_kinds
     assert observed["evaluator_loader"] is injected_loader
+    assert observed["native_forward_source_factory"] is None
 
 
 def test_builtin_registry_fans_in_profile_completion_signer_to_strategy_builder(

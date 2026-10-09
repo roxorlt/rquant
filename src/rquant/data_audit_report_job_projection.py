@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 import re
 import sqlite3
@@ -19,6 +18,7 @@ from rquant.data_audit_report_jobs import (
     DataAuditReportJobEvent,
     DataAuditReportJobReceipt,
     DataAuditReportJobRequest,
+    _canonical_request,
 )
 from rquant.runtime_contracts import AwareUtcDatetime, RuntimeContractModel, normalize_aware_utc
 from rquant.serving_read_models import ServingProjectionPayload
@@ -239,9 +239,7 @@ def _request(row: sqlite3.Row) -> DataAuditReportJobRequest:
     if not isinstance(raw, str) or len(raw.encode("utf-8")) > _MAX_REQUEST_BYTES:
         raise ValueError("audit task request exceeds bound")
     request = DataAuditReportJobRequest.model_validate_json(raw)
-    canonical = json.dumps(
-        request.model_dump(mode="json"), ensure_ascii=False, sort_keys=True, separators=(",", ":")
-    )
+    canonical = _canonical_request(request)
     if canonical != raw or row["request_sha256"] != hashlib.sha256(raw.encode("utf-8")).hexdigest():
         raise ValueError("audit task request hash disagrees")
     return request

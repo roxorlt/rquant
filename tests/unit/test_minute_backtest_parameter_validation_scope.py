@@ -158,11 +158,15 @@ def test_first_description_is_built_once_and_every_reuse_checks_both_guards(
     with owner.minute_parameter_validation_scope():
         first = owner.minute_parameter_validation_plan(parameters, producer_commit="a" * 40)
         assert len(captures) == 2
+        state = owner._PARAMETER_VALIDATION_STATE.get()
+        assert state is not None
+        entry = state[(parameters.model_dump_json(), "a" * 40)]
+        adopted_guards = (entry.builder_guard, entry.executable_guard)
         checks.clear()
         with owner.minute_parameter_validation_scope():
             assert owner.minute_parameter_validation_plan(parameters, producer_commit="a" * 40) == first
         assert len(captures) == 2
-        assert set(checks) == {id(guard) for guard in captures}
+        assert set(checks) == {id(guard) for guard in adopted_guards}
     with owner.minute_parameter_validation_scope():
         assert owner.minute_parameter_validation_plan(parameters, producer_commit="a" * 40) == first
         assert len(captures) == 4

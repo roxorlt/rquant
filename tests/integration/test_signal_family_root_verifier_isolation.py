@@ -703,12 +703,17 @@ class TestRootImportClosure:
     #: builds one `RLock`, one empty dict and three constants -- no file descriptor, no
     #: signal handler, no thread. Nothing here reaches a database driver, a builder, or any
     #: surface module, which is what FORBIDDEN_MODULES below actually guards.
+    #: The completed React runtime adds `runtime_health_details` through the already
+    #: allowed `runtime_service_control`. At import it declares typed models and bounded
+    #: constants; its only unconditional rquant imports are the already allowed
+    #: `runtime_contracts` and `strict_json`. Ops and snapshot imports stay deferred.
     ALLOWED_MODULES = (
         "rquant",
         "rquant.authority_path_security",
         "rquant.privilege_launcher",
         "rquant.runtime_authority",
         "rquant.runtime_contracts",
+        "rquant.runtime_health_details",
         "rquant.runtime_read_interrupt",
         "rquant.runtime_service_control",
         "rquant.runtime_service_entrypoint",

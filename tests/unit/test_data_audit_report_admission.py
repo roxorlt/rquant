@@ -12,6 +12,7 @@ import pytest
 from pydantic import ValidationError
 
 from rquant.data_audit_evidence import DailyBarNullFieldSpec
+from rquant.data_audit_report import data_audit_report_path
 from rquant.data_audit_report_jobs import (
     DataAuditReportArtifactUnavailableError,
     DataAuditReportJobWorker,
@@ -244,7 +245,7 @@ def test_crash_after_queue_recovers_binding_even_if_completed_artifact_is_damage
 
     completed = DataAuditReportJobWorker(backend.store).run_one()
     assert completed is not None and completed.report_hash is not None
-    artifact = tmp_path / "reports" / f"data-audit-v1-{completed.report_hash}.json"
+    artifact = data_audit_report_path(tmp_path / "reports", completed.report_hash)
     artifact.chmod(0o600)
     artifact.write_bytes(b"damaged")
     with pytest.raises(DataAuditReportArtifactUnavailableError):
@@ -401,7 +402,7 @@ def test_worker_receipt_keeps_collection_unverified(tmp_path: Path) -> None:
     completed = DataAuditReportJobWorker(backend.store).run_one()
     assert completed is not None and completed.status == "succeeded"
     report = load_data_audit_report(
-        tmp_path / "reports" / f"data-audit-v1-{completed.report_hash}.json"
+        data_audit_report_path(tmp_path / "reports", completed.report_hash)
     )
     assert report.source.mode == "production_unverified"
     assert report.collection_status == "collection_unconfirmed"

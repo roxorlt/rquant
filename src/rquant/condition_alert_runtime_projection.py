@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Mapping
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Literal, Self
 from weakref import WeakKeyDictionary
 
@@ -100,6 +100,11 @@ def condition_rule_projections(
         snapshot.activated_at > now or any(row.updated_at > now for row in snapshot.rows)
     ):
         raise ValueError("condition authority is not yet visible")
+    available = (
+        datetime(1970, 1, 1, tzinfo=UTC)
+        if snapshot is None
+        else max((snapshot.activated_at, *(row.updated_at for row in snapshot.rows)))
+    )
     state = "unavailable" if unavailable else "not_activated" if snapshot is None else "ready"
     head = (
         None
@@ -120,7 +125,7 @@ def condition_rule_projections(
                     "body_json": None if head is None else head.wire_bytes().decode(),
                 },
             ),
-            available_at=now,
+            available_at=available,
         ),
         ServingProjectionPayload(
             table_name="condition_alert_rule",
@@ -135,7 +140,7 @@ def condition_rule_projections(
                 }
                 for row in snapshot.rows
             ),
-            available_at=now,
+            available_at=available,
         ),
     )
 

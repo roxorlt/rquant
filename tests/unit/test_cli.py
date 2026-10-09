@@ -5946,9 +5946,16 @@ class TestLabWorkerCli:
         calls: list[str] = []
 
         class FakeSpool:
-            def __init__(self, path: Path, *, mutation_guard: object) -> None:
+            def __init__(
+                self,
+                path: Path,
+                *,
+                mutation_guard: object,
+                expected_scheduling_barrier_identity: str | None = None,
+            ) -> None:
                 calls.append(f"spool:{path.name}")
                 assert callable(mutation_guard)
+                assert expected_scheduling_barrier_identity is None
 
         class FakeWorker:
             def __init__(self, **kwargs: object) -> None:
@@ -6224,8 +6231,15 @@ class TestLabWorkerCli:
         )["runtime_authority_id"]
 
         class MinimalSpool:
-            def __init__(self, _path: Path, *, mutation_guard: object) -> None:
+            def __init__(
+                self,
+                _path: Path,
+                *,
+                mutation_guard: object,
+                expected_scheduling_barrier_identity: str | None = None,
+            ) -> None:
                 assert callable(mutation_guard)
+                assert expected_scheduling_barrier_identity is None
 
         class MinimalWorker:
             def __init__(self, **kwargs: object) -> None:
@@ -6311,8 +6325,15 @@ class TestLabWorkerCli:
         calls: list[str] = []
 
         class FakeSpool:
-            def __init__(self, _path: Path, *, mutation_guard: object) -> None:
+            def __init__(
+                self,
+                _path: Path,
+                *,
+                mutation_guard: object,
+                expected_scheduling_barrier_identity: str | None = None,
+            ) -> None:
                 assert callable(mutation_guard)
+                assert expected_scheduling_barrier_identity is None
 
         class FakeWorker:
             def __init__(self, **_kwargs: object) -> None:

@@ -21,6 +21,7 @@ from rquant.experiment_platform_projection import (
 from rquant.experiment_registry import ExperimentRegistryReadonlyReader, HypothesisFamilyManifest
 from rquant.lab_job_center import LabCommandSubmissionFacade
 from rquant.lab_job_protocol import LabCommandEnvelope
+from rquant.lab_jobs import LabJobReader, LabJobStore
 from rquant.portfolio_backtest_source import build_portfolio_plan
 from rquant.promotions_serving_authority import PromotionsSourceReader
 from rquant.runtime_contracts import canonical_sha256
@@ -152,14 +153,9 @@ def test_exp22_actual_registry_ab501_legacy501_source_and_owner_pagination(
     )
     assert old.truncated and old.oldest_registered_at == NOW + timedelta(seconds=4)
 
-    class NoExecutedJobs:
-        def get_job(self, job_id):
-            return None
-
-        def get_artifact_preview_authority(self, job_id):
-            return None
-
-    private = ExperimentPrivateProjectionReader(registry=reader, jobs=NoExecutedJobs())
+    jobs = LabJobStore(tmp_path / "lab-jobs.sqlite")
+    jobs.initialize()
+    private = ExperimentPrivateProjectionReader(registry=reader, jobs=LabJobReader(jobs.path))
     source = PromotionsSourceReader(
         registry=reader, include_experiments=True, private_experiment_reader=private
     )(observed)

@@ -12,8 +12,13 @@ from tests.unit.test_paper_portfolio_reductions import execute_plan, fixture, ma
 from tests.unit.test_paper_signal_worker import EXECUTION_TIME, TRADE_DATE, NEXT_TRADE_DATE, _policy, _quote
 
 
-def test_t1_rejection_is_not_reissued_with_every_same_day_observation(tmp_path: Path) -> None:
+def test_t1_rejection_is_not_reissued_with_every_same_day_observation(
+    tmp_path: Path, request: pytest.FixtureRequest
+) -> None:
     broker, runtime, at = fixture(tmp_path)
+    owner_connection = broker._connect()
+    request.addfinalizer(owner_connection.close)
+    assert not owner_connection.in_transaction
     at += timedelta(minutes=1)
     material(runtime, at, ".75")
     plan = runtime.plan_risk_reductions(broker, decision_at=at, trade_date=TRADE_DATE,
@@ -29,8 +34,13 @@ def test_t1_rejection_is_not_reissued_with_every_same_day_observation(tmp_path: 
 
 
 @pytest.mark.parametrize("boundary", ["pending", "prepared", "broker_submitted"])
-def test_original_reduction_keeps_one_plan_through_prepare_submit_and_recovery(tmp_path: Path, boundary: str) -> None:
+def test_original_reduction_keeps_one_plan_through_prepare_submit_and_recovery(
+    tmp_path: Path, boundary: str, request: pytest.FixtureRequest
+) -> None:
     broker, runtime, _ = fixture(tmp_path)
+    owner_connection = broker._connect()
+    request.addfinalizer(owner_connection.close)
+    assert not owner_connection.in_transaction
     at = EXECUTION_TIME + timedelta(days=3, minutes=2)
     material(runtime, at, ".75")
     plan = runtime.plan_risk_reductions(broker, decision_at=at, trade_date=NEXT_TRADE_DATE,

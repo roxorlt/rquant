@@ -1,28 +1,44 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
 from pydantic import ValidationError
 
 from rquant.auction_gap_strategy import AuctionGapConfig, auction_candidate_mask
+from rquant.live_spool import LiveBatchSpool
 from rquant.minute_backtest_commands import SubmitMinuteReplay
 from rquant.minute_backtest_parameter_artifact import MinuteParameterSealedReplayReader
 from rquant.minute_backtest_parameter_definition import build_minute_parameter_definition
 from rquant.minute_backtest_parameter_evaluators import parameter_entry_evaluator
-from rquant.minute_backtest_parameter_features import MinuteParameterCandidate, project_minute_parameter_features
+from rquant.minute_backtest_parameter_features import (
+    MinuteParameterCandidate,
+    project_minute_parameter_features,
+)
 from rquant.minute_backtest_parameters import MinuteAuctionGapParameters, MinuteParameterSet
-from rquant.live_spool import LiveBatchSpool
 from rquant.runtime_paper_quote import PaperQuoteCandidateMissingError, PaperTradeCalendarError
 from rquant.signal_contracts import SignalAction
 from rquant.strategy_runner import StrategyCandidateState
 from rquant.strategy_spec import StrategyLifecycleState
 from rquant.web.models.minute_backtests import (
-    MinuteCreateRequest, MinuteJobsData, MinuteParameterJob, MinuteParameterResultSource, MinuteSummaryData,
+    MinuteCreateRequest,
+    MinuteJobsData,
+    MinuteParameterJob,
+    MinuteParameterResultSource,
+    MinuteSummaryData,
 )
+from tests.integration.test_minute_backtest_parameter_installed import (
+    installed_parameters as installed_parameters,
+)
+from tests.integration.test_minute_backtest_parameter_installed import (
+    sealed_parameters as sealed_parameters,
+)
+from tests.support.minute_backtest_installed import installed_minute as installed_minute
 
 POLICY = "keep_candidate_mark_unavailable"
 COMMIT = "a" * 40
@@ -156,14 +172,42 @@ def test_job_recovery_binds_versioned_policy_and_semantic_metadata() -> None:
             MinuteParameterJob.model_validate(job.model_dump(mode="python") | {"evaluator_semantic_version": wrong})
 
 
-def test_current_result_read_model_keeps_original_v1_sealed_identity_and_summary() -> None:
+@pytest.mark.parametrize("installed_parameters", ["auction_gap"], indirect=True, scope="module")
+def test_current_result_read_model_keeps_original_v1_sealed_identity_and_summary(
+    sealed_parameters: SimpleNamespace,
+) -> None:
     raw = (ORIGINAL.parent / "parameter-sealed-full.json").read_bytes()
-    sealed = MinuteParameterSealedReplayReader._sealed_result_model().model_validate_json(raw)
-    assert sealed.complete_result_hash == "8ec2f6150e950aa97e2cfd15638597f03588622d626436535744065fb90a0ce9"
+    assert hashlib.sha256(raw).hexdigest() == (
+        "568d461a20fa5d332288639ca94c653add79c999fccbb6cc2f9f2a739f96a027"
+    )
+    archived = json.loads(raw)
+    assert archived["complete_result_hash"] == (
+        "8ec2f6150e950aa97e2cfd15638597f03588622d626436535744065fb90a0ce9"
+    )
+    original_summary = MinuteSummaryData.model_validate_json(
+        json.dumps(
+            json.loads((ORIGINAL.parent / "parameter-family-public-summary.json").read_bytes())["data"]
+        )
+    )
+    assert original_summary.job.parameters.model_dump(mode="json") == (
+        archived["result"]["replay"]["parameters"]
+    )
+    assert original_summary.result_hash == archived["complete_result_hash"]
+
+    current_raw = (sealed_parameters.context.root / "parameter-sealed-full.json").read_bytes()
+    sealed = MinuteParameterSealedReplayReader._sealed_result_model().model_validate_json(current_raw)
+    assert sealed.result.replay.parameters.model_dump(mode="json") == (
+        archived["result"]["replay"]["parameters"]
+    )
     assert sealed.result.replay.parameters.fingerprint == "cf55e58ade9c03001b916efd043a5d28822133ed65824f4fad5ae82cffc9dc43"
     assert sealed.result.replay.parameters.schema_version == 1
     assert sealed.result.replay.parameters.evaluator_semantic_version == "2.0.0"
-    summary = MinuteSummaryData.model_validate_json(json.dumps(json.loads((ORIGINAL.parent / "parameter-family-public-summary.json").read_bytes())["data"]))
+    response = sealed_parameters.web.client.get(
+        f"/api/v1/backtests/minute-runtime/runs/{sealed_parameters.job_id}"
+    )
+    assert response.status_code == 200, response.text
+    (sealed_parameters.context.root / "parameter-family-public-summary.json").write_text(response.text)
+    summary = MinuteSummaryData.model_validate_json(json.dumps(response.json()["data"]))
     assert summary.job.parameters == sealed.result.replay.parameters
     assert summary.result_hash == sealed.complete_result_hash
     assert summary.job.evaluator_semantic_version == "2.0.0"

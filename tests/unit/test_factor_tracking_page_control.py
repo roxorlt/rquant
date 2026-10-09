@@ -125,7 +125,7 @@ def test_tracking_private_socket_permissions_original_receipt_and_cleanup(tmp_pa
 
     service, backend, outbox, _, _, body = _control(tmp_path)
     web_uid = os.geteuid() + 1
-    with TemporaryDirectory(prefix="ft-", dir="/private/tmp") as directory:
+    with TemporaryDirectory(prefix="ft-", dir=Path("/tmp").resolve()) as directory:
         private = Path(directory)
         os.chown(private, os.geteuid(), os.getegid())
         private.chmod(0o710)

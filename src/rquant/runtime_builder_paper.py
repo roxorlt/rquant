@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import closing
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -14,8 +15,10 @@ from rquant.paper_broker import BrokerCostPolicy, PaperBrokerStore
 from rquant.paper_ledger_anchor import Ed25519PaperLedgerAnchorVerifier
 from rquant.paper_portfolio_runtime import PaperPortfolioRuntimeCatalog
 from rquant.paper_signal_consumer import (
+    _MIXED_HISTORY_TABLES,
     PaperSignalConsumerStateStore,
     consume_notification_events_to_paper,
+    consume_signal_bus_to_paper,
 )
 from rquant.paper_signal_worker import (
     PaperSignalPolicy,
@@ -34,7 +37,7 @@ from rquant.runtime_service_entrypoint import (
 )
 from rquant.signal_bus import SignalBusStore
 from rquant.signal_contracts import SignalAction
-from rquant.signal_route_spool import ReadonlyNotificationEventRouteSpool
+from rquant.signal_route_spool import ReadonlyNotificationEventRouteSpool, ReadonlySignalRouteSpool
 
 if TYPE_CHECKING:
     from rquant.runtime_health_details import RuntimeHealthMetric
@@ -320,7 +323,6 @@ def paper_broker_builder(
             constraint_generation_resolver = None
         policy = settings.signal_policy(manifest.producer_commit)
         cost_policy = settings.cost_policy()
-        source = ReadonlyNotificationEventRouteSpool(settings.signal_spool_root)
         queue = PaperSignalQueueStore(
             settings.queue_path,
             policy=policy,
@@ -355,6 +357,24 @@ def paper_broker_builder(
         )
         if settings.condition_history_enabled:
             state.install_condition_notification_history()
+        with closing(state._connect()) as connection:
+            mixed_installed = (
+                connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE tbl_name IN (?,?) LIMIT 1",
+                    _MIXED_HISTORY_TABLES,
+                ).fetchone()
+                is not None
+            )
+            if mixed_installed:
+                state._require_mixed_history(connection)
+        source = (
+            ReadonlyNotificationEventRouteSpool(settings.signal_spool_root)
+            if mixed_installed
+            else ReadonlySignalRouteSpool(settings.signal_spool_root)
+        )
+        consume = (
+            consume_notification_events_to_paper if mixed_installed else consume_signal_bus_to_paper
+        )
         authority_publisher = None
         portfolio_view_source = None
         portfolio_sequence_floor = None
@@ -540,7 +560,7 @@ def paper_broker_builder(
                     watermark_advanced=False,
                     health_metrics=last_health_metrics,
                 )
-            consumed = consume_notification_events_to_paper(
+            consumed = consume(
                 source,
                 queue,
                 state,

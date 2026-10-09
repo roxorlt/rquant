@@ -626,12 +626,15 @@ def test_a_corrupt_route_spool_still_stops_the_paper_broker(idle_chain: RouteAWo
     assert "spool" in (heartbeat.last_error or ""), heartbeat.last_error
     assert PeerArtifactUnavailableError.__name__ not in (heartbeat.last_error or "")
 
-    #: and the same spool, replaced outright, is refused while the step is still built
+    #: The same spool, replaced outright, is refused by the first step as well.
     for entry in sorted(spool_root(idle_chain).rglob("*"), reverse=True):
         entry.unlink() if entry.is_file() else entry.rmdir()
     spool_root(idle_chain).rmdir()
     spool_root(idle_chain).write_bytes(b"not a spool directory")
-    with pytest.raises(Exception) as raised:
-        run_role(idle_chain, BROKER_ROLE, instance=broker)
-    assert not isinstance(raised.value, PeerArtifactUnavailableError)
-    assert "spool" in str(raised.value)
+    _code, violations, heartbeat = run_role(idle_chain, BROKER_ROLE, instance=broker)
+    assert violations == [], violations
+    assert heartbeat is not None
+    assert heartbeat.total_successes == 0
+    assert heartbeat.total_failures == 1
+    assert "spool" in (heartbeat.last_error or ""), heartbeat.last_error
+    assert PeerArtifactUnavailableError.__name__ not in (heartbeat.last_error or "")

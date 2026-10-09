@@ -56,7 +56,7 @@ def test_actual_private_save_run_worker_and_separate_permissions(
         FactorDefinitionRegistry(Path(config.registry_identity.path))
     )
     uid, gid = os.geteuid() + 1, os.getegid()
-    directory = Path(tempfile.mkdtemp(prefix="fneu-", dir="/private/tmp"))
+    directory = Path(tempfile.mkdtemp(prefix="fneu-", dir=Path("/tmp").resolve()))
     os.chown(directory, os.geteuid(), gid)
     directory.chmod(0o710)
     definition_server = build_factor_definition_admission_server(

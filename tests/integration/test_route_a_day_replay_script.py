@@ -336,7 +336,15 @@ def test_the_replayed_day_reaches_a_same_day_serving_generation_inside_the_sandb
     output = result.stdout + result.stderr
     (sandbox,) = replay_root.iterdir()
     summary = json.loads((sandbox / "summary.json").read_text(encoding="utf-8"))
-    assert result.returncode == 0, output[-6000:]
+    assert result.returncode == 0, (
+        output[-6000:]
+        + "\n".join(
+            f"\n{name} at {crash['at']}:\n{crash['traceback']}"
+            for name, role in summary.get("roles", {}).items()
+            if name.startswith("notifier.")
+            for crash in role.get("crashes", [])
+        )
+    )
 
     #: sandbox-only writes: the fake host is untouched, and the replay root is the only
     #: new thing next to it
@@ -439,7 +447,15 @@ def test_six_short_codes_and_a_stale_candidate_still_reach_a_same_day_generation
     output = result.stdout + result.stderr
     (sandbox,) = (tmp_path / "replay").iterdir()
     summary = json.loads((sandbox / "summary.json").read_text(encoding="utf-8"))
-    assert result.returncode == 0, output[-6000:]
+    assert result.returncode == 0, (
+        output[-6000:]
+        + "\n".join(
+            f"\n{name} at {crash['at']}:\n{crash['traceback']}"
+            for name, role in summary.get("roles", {}).items()
+            if name.startswith("notifier.")
+            for crash in role.get("crashes", [])
+        )
+    )
     assert _tree(host["data"]) == before
     assert summary["stubs"]["listing_classification"] == "off"
     roles = summary["roles"]
@@ -519,7 +535,15 @@ def test_two_generations_reach_a_same_day_generation_with_signals_past_the_rollo
     output = result.stdout + result.stderr
     (sandbox,) = (tmp_path / "replay").iterdir()
     summary = json.loads((sandbox / "summary.json").read_text(encoding="utf-8"))
-    assert result.returncode == 0, output[-6000:]
+    assert result.returncode == 0, (
+        output[-6000:]
+        + "\n".join(
+            f"\n{name} at {crash['at']}:\n{crash['traceback']}"
+            for name, role in summary.get("roles", {}).items()
+            if name.startswith("notifier.")
+            for crash in role.get("crashes", [])
+        )
+    )
     assert _tree(host["data"]) == before
     assert summary["stubs"]["listing_classification"] == "off"
     assert len(summary["world"]["generations"]) == 2

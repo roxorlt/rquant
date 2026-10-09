@@ -1,7 +1,7 @@
 """Immutable price proof for one materialized pool run."""
 
 import math
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -19,6 +19,7 @@ from rquant.research_sync import sync_from_backup
 from rquant.runtime_contracts import canonical_sha256
 from rquant.storage.duckdb import DuckDBStore
 from rquant.storage.migrations import MIGRATIONS, initialize_schema
+from rquant.trade_calendar import TradeCalendarDay
 
 DAY = date(2026, 8, 4)
 STAMP = datetime(2026, 8, 4, 9, 0, tzinfo=UTC)
@@ -333,6 +334,17 @@ def test_pipeline_writes_v2_price_receipt_for_same_members_with_new_close(
 
     path = tmp_path / "pipeline.duckdb"
     with DuckDBStore(path) as store:
+        previous_day = DAY - timedelta(days=1)
+        store.upsert_trade_calendar(
+            [
+                TradeCalendarDay(exchange="SSE", cal_date=previous_day, is_open=True),
+                TradeCalendarDay(exchange="SSE", cal_date=DAY, is_open=True),
+            ]
+        )
+        store._conn.execute(
+            "INSERT INTO daily_bar (ts_code, trade_date, close) VALUES ('A', ?, 10.5)",
+            [previous_day],
+        )
         store._conn.execute(
             "INSERT INTO daily_bar (ts_code, trade_date, close) VALUES ('A', ?, 10.5)",
             [DAY],

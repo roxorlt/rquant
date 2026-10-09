@@ -5,7 +5,9 @@ import base64
 import hashlib
 import os
 from datetime import UTC, datetime
+from functools import lru_cache
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
 import pytest
@@ -30,7 +32,7 @@ NOW = datetime(2026, 10, 7, 0, 0, tzinfo=UTC)
 FIXTURE_SHA = "d670d16f860f0f11247c64ecf0985fc45316bb4e7dcaa6cb6f1180c618a958b8"
 
 
-def original_fixture() -> dict[str, object]:
+def archived_fixture() -> dict[str, object]:
     import hashlib
 
     path = Path(__file__).resolve().parents[2] / "data/verification/minute-engine-completion-20261007/core-implementation-01/behavior/daily-n_shape-bar_end.json"
@@ -39,8 +41,36 @@ def original_fixture() -> dict[str, object]:
     return json.loads(data)
 
 
+@lru_cache(maxsize=1)
+def _current_fixture_bytes() -> bytes:
+    from rquant.minute_backtest_runner import run_minute_runtime_replay
+    from tests.integration.test_minute_backtest_runtime_parity import _input, _original_replay, _save_parity_evidence
+
+    with TemporaryDirectory(prefix="minute-native-current-abi-") as directory:
+        root = Path(directory).resolve()
+        value, receipt = _input(root, "n_shape", daily_quotes=True)
+        expected = _original_replay(value, receipt, root / "paper")
+        result = run_minute_runtime_replay(value, expected=receipt, research_root=root / "backtest")
+        for actual, original in ((result.signals, expected["signals"]), (result.orders, expected["orders"]),
+            (result.fills, expected["fills"]), (result.queue_records, expected["queue"]),
+            (result.account, expected["account"]),
+            (tuple(item.account for item in result.daily_valuations), expected["daily_accounts"]),
+            (tuple(proof.quote for item in result.daily_valuations for proof in item.price_proofs), expected["daily_quotes"])):
+            assert actual == original
+        path = root / "current-abi-parity.json"
+        _save_parity_evidence(path, value, receipt, expected, result)
+        return path.read_bytes()
+
+
+def original_fixture() -> dict[str, object]:
+    # The old capture remains byte-checked; current execution needs its own ABI binding.
+    archived_fixture()
+    return json.loads(_current_fixture_bytes())
+
+
 def source_seed(tmp_path: Path) -> MinuteSourceContentSeed:
     value = FrozenMinuteRuntimeInput.model_validate_json(json.dumps(original_fixture()["frozen_input"]))
+    reference_sha = hashlib.sha256(_current_fixture_bytes()).hexdigest()
     definitions = tmp_path / "definitions"
     plan = plan_builtin_definitions(producer_commit=value.producer_commit)
     bootstrap_builtin_definitions(definitions, producer_commit=value.producer_commit,
@@ -92,8 +122,8 @@ def source_seed(tmp_path: Path) -> MinuteSourceContentSeed:
             acquisition_commit=value.producer_commit, captured_at=None, timing_evidence_object_key=None)
             for x in origins), publication_evidence=tuple(proofs), extracted_at=NOW, published_at=NOW,
         extractor_code_commit=value.producer_commit, extractor_fingerprint="a" * 64,
-        research_code_commit=value.producer_commit, source_index_sha256="e43e80bc6d17c789d1e61418f5cb07268f2e7e52201704c0ed86b7b614cf606b",
-        code_files=(MinuteCodeFile(logical_name="synthetic_fixture_reference", content_sha256=FIXTURE_SHA),),
+        research_code_commit=value.producer_commit, source_index_sha256=reference_sha,
+        code_files=(MinuteCodeFile(logical_name="synthetic_current_abi_fixture_reference", content_sha256=reference_sha),),
         replay_start=value.tick_times[0], replay_end=value.tick_times[-1],
         native_definition_replay_available_at=value.available_at, visibility_policy=policy)
     runtime = MinuteRuntimeContent.from_runtime(value)

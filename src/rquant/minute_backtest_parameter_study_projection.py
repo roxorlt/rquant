@@ -649,7 +649,23 @@ def _minute_study_input_semantic_components(parameters: object, *, producer_comm
             # Inspect the current root source as well as loaded code/bindings.
             # A file edit which leaves an imported object alive is still live.
             try:
-                source = ast.dump(ast.parse(textwrap.dedent(inspect.getsource(function))),
+                try:
+                    source_tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
+                except SyntaxError:
+                    if function.__code__.co_name != "<lambda>":
+                        raise
+                    try:
+                        source_lines, _ = inspect.findsource(function)
+                    except OSError as exc:
+                        raise ExecutableDependencyError("minute input lambda source unavailable") from exc
+                    # An argument-line fragment is not a standalone statement.
+                    # Locate its expression in the same actual file and line.
+                    lambdas = tuple(node for node in ast.walk(ast.parse("".join(source_lines)))
+                        if isinstance(node, ast.Lambda) and node.lineno == function.__code__.co_firstlineno)
+                    if len(lambdas) != 1:
+                        raise ExecutableDependencyError("minute input lambda source position is ambiguous")
+                    source_tree = lambdas[0]
+                source = ast.dump(source_tree,
                     annotate_fields=True, include_attributes=False)
             except OSError as exc:
                 if function is _ParameterReadUnitContentEntries.__init__:

@@ -56,8 +56,10 @@ def test_pinned_gate_and_primary_identity_cannot_change(tmp_path: Path, change: 
     elif change == 'hardlink':
         os.link(lock,tmp_path/'alias.lock')
     elif change == 'replace':
-        lock.unlink()
+        lock.rename(tmp_path/'original.lock')
         lock.touch(mode=0o600)
+        replacement = lock.stat()
+        assert (replacement.st_dev, replacement.st_ino) != (config.lock_device, config.lock_inode)
     elif change == 'chmod':
         lock.chmod(0o644)
     else:

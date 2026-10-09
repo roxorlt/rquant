@@ -262,7 +262,7 @@ def _real_run_web_client(tmp_path: Path) -> Iterator[tuple[object, ...]]:
             clock=lambda: _AS_OF,
         ),
     )
-    directory = Path(tempfile.mkdtemp(prefix="frfix-", dir="/private/tmp"))
+    directory = Path(tempfile.mkdtemp(prefix="frfix-", dir=Path("/tmp").resolve()))
     os.chown(directory, os.geteuid(), os.getegid())
     directory.chmod(0o710)
     socket = directory / "run.sock"
@@ -350,7 +350,7 @@ def test_real_unix_web_plan_rejection_is_bound_and_editable(tmp_path: Path) -> N
         "jobs": 0,
         "outbox_receipt": None,
     }
-    Path("/private/tmp/rquant-factor-run-entry-fr-final-01-http-contract.json").write_text(
+    (tmp_path / "rquant-factor-run-entry-fr-final-01-http-contract.json").write_text(
         json.dumps(exported, ensure_ascii=False, indent=2)
     )
 
@@ -468,6 +468,6 @@ def test_real_unix_web_source_date_bounds_are_editable_rejections(
         "outbox_receipt": None,
     }
     prefix = "date" if boundary == "start_before_source" else "end-date"
-    Path(
-        f"/private/tmp/rquant-factor-run-entry-fr-final-01-{prefix}-http-contract.json"
+    (
+        tmp_path / f"rquant-factor-run-entry-fr-final-01-{prefix}-http-contract.json"
     ).write_text(json.dumps(exported, ensure_ascii=False, indent=2))

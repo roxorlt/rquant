@@ -995,6 +995,7 @@ def _serve(
             logger.exception("Factor archive admission listener disabled during startup")
     screen_server = None
     ai_server = None
+    task_server = None
     server_class = _server_class_for_host(host)
     try:
         if screen_config is not None:

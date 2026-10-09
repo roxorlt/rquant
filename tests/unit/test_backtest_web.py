@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient as RawClient
 from rquant.lab_jobs import (
     CommandAvailability,
     LabJobCommandContext,
+    LabJobListFilters,
     LabJobPage,
     LabJobProgress,
     LabJobSummary,
@@ -41,7 +42,7 @@ def web_module() -> ModuleType:
 
 
 @pytest.fixture
-def portfolio_web(tmp_path: Path):
+def portfolio_web(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     ledger, artifacts, bundle, authority = sealed_portfolio(tmp_path)
     job = authority.job
     availability = CommandAvailability(pause=False, resume=False, cancel=False, retry=False)
@@ -57,7 +58,7 @@ def portfolio_web(tmp_path: Path):
     ledger.get_command_context = lambda selected: (
         LabJobCommandContext(job=job, availability=availability) if selected == job.job_id else None
     )
-    ledger.list_jobs = lambda **kwargs: LabJobPage(
+    listing = LabJobPage(
         items=(
             LabJobSummary(
                 job_id=job.job_id,
@@ -80,6 +81,21 @@ def portfolio_web(tmp_path: Path):
         has_more=False,
         next_cursor=None,
     )
+
+    def listing_page(
+        reader: object,
+        *,
+        filters: LabJobListFilters | None = None,
+        limit: int = 50,
+        cursor: str | None = None,
+    ) -> LabJobPage:
+        assert reader is ledger
+        assert filters == LabJobListFilters(keyword="portfolio_backtest")
+        assert limit == 20
+        assert cursor is None
+        return listing
+
+    monkeypatch.setattr("rquant.experiment_platform_projection.legacy_job_page", listing_page)
     source = PortfolioSourceOption(
         key=bundle.frozen.config.source_key,
         version=1,

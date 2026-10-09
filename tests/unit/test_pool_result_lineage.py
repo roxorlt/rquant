@@ -35,7 +35,9 @@ def _definition(directory: Path, name: str, *, parent: str | None = None) -> str
     return canonical_sha256(raw)
 
 
-def _market(store: DuckDBStore, days: tuple[date, ...]) -> None:
+def _market(
+    store: DuckDBStore, days: tuple[date, ...], *, codes: tuple[str, ...] = ("X",)
+) -> None:
     start, end = min(days), max(days)
     store.upsert_trade_calendar(
         [
@@ -48,10 +50,11 @@ def _market(store: DuckDBStore, days: tuple[date, ...]) -> None:
         ]
     )
     for day in days:
-        store._conn.execute(
-            "INSERT INTO daily_bar (ts_code, trade_date, close) VALUES ('X', ?, 1)",
-            [day],
-        )
+        for code in codes:
+            store._conn.execute(
+                "INSERT INTO daily_bar (ts_code, trade_date, close) VALUES (?, ?, 1)",
+                [code, day],
+            )
 
 
 def _frame(*codes: str) -> pd.DataFrame:
@@ -78,7 +81,7 @@ def test_same_day_rerun_replaces_members_and_receipt_even_when_zero(tmp_path: Pa
     directory = tmp_path / "defs"
     version = _definition(directory, "pool")
     with DuckDBStore(tmp_path / "db.duckdb") as store:
-        _market(store, (date(2026, 8, 4),))
+        _market(store, (date(2026, 8, 4),), codes=("A", "B"))
         with patch("rquant.pipeline.screen", side_effect=(_frame("B", "A"), _frame())):
             first = run_daily_screen_stage(
                 "2026-08-04", preset_names=["user/pool"], store=store,
@@ -103,7 +106,7 @@ def test_same_day_rerun_replaces_members_and_receipt_even_when_zero(tmp_path: Pa
 
 def test_builtin_run_version_matches_publication_definition(tmp_path: Path) -> None:
     with DuckDBStore(tmp_path / "db.duckdb") as store:
-        _market(store, (date(2026, 8, 4),))
+        _market(store, (date(2026, 8, 3), date(2026, 8, 4)))
         with patch("rquant.pipeline.screen", return_value=_frame("X")):
             result = run_daily_screen_stage(
                 "2026-08-04", preset_names=["n-shape-pool1"], store=store,
@@ -228,7 +231,7 @@ def test_parent_rerun_changes_child_bound_result_version(tmp_path: Path) -> None
     _definition(directory, "parent")
     _definition(directory, "child", parent="user/parent")
     with DuckDBStore(tmp_path / "db.duckdb") as store:
-        _market(store, (date(2026, 8, 3), date(2026, 8, 4)))
+        _market(store, (date(2026, 8, 3), date(2026, 8, 4)), codes=("A", "B"))
         with patch("rquant.pipeline.screen", return_value=_frame("A")):
             run_daily_screen_stage(
                 "2026-08-03", preset_names=["user/parent"], store=store,
@@ -286,7 +289,7 @@ def test_snapshot_and_receipt_roll_back_if_receipt_insert_fails(tmp_path: Path) 
     directory = tmp_path / "defs"
     _definition(directory, "pool")
     with DuckDBStore(tmp_path / "db.duckdb") as store:
-        _market(store, (date(2026, 8, 4),))
+        _market(store, (date(2026, 8, 4),), codes=("OLD", "NEW"))
         with patch("rquant.pipeline.screen", return_value=_frame("OLD")):
             run_daily_screen_stage(
                 "2026-08-04", preset_names=["user/pool"], store=store,
@@ -316,7 +319,7 @@ def test_enclosing_daily_transaction_rolls_back_failed_receipt_write(
     directory = tmp_path / "defs"
     _definition(directory, "pool")
     with DuckDBStore(tmp_path / "db.duckdb") as store:
-        _market(store, (date(2026, 8, 4),))
+        _market(store, (date(2026, 8, 4),), codes=("OLD", "NEW"))
         with patch("rquant.pipeline.screen", return_value=_frame("OLD")):
             run_daily_screen_stage(
                 "2026-08-04", preset_names=["user/pool"], store=store,
@@ -354,7 +357,7 @@ def test_research_sync_replaces_members_and_receipts_in_one_generation(
     _definition(directory, "pool")
     for path, member in ((source_path, "CLOUD"), (local_path, "LOCAL")):
         with DuckDBStore(path) as store:
-            _market(store, (date(2026, 8, 4),))
+            _market(store, (date(2026, 8, 4),), codes=(member,))
             with patch("rquant.pipeline.screen", return_value=_frame(member)):
                 run_daily_screen_stage(
                     "2026-08-04", preset_names=["user/pool"], store=store,
@@ -383,7 +386,7 @@ def test_old_source_without_receipts_replaces_members_and_clears_unverifiable_pr
     _definition(directory, "pool")
     for path, member in ((source_path, "CLOUD"), (local_path, "LOCAL")):
         with DuckDBStore(path) as store:
-            _market(store, (date(2026, 8, 4),))
+            _market(store, (date(2026, 8, 4),), codes=(member,))
             with patch("rquant.pipeline.screen", return_value=_frame(member)):
                 run_daily_screen_stage(
                     "2026-08-04", preset_names=["user/pool"], store=store,
@@ -415,7 +418,7 @@ def test_later_sync_failure_rolls_back_both_result_tables(
     _definition(directory, "pool")
     for path, member in ((source_path, "CLOUD"), (local_path, "LOCAL")):
         with DuckDBStore(path) as store:
-            _market(store, (date(2026, 8, 4),))
+            _market(store, (date(2026, 8, 4),), codes=(member,))
             with patch("rquant.pipeline.screen", return_value=_frame(member)):
                 run_daily_screen_stage(
                     "2026-08-04", preset_names=["user/pool"], store=store,

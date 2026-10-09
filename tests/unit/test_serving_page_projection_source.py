@@ -2859,7 +2859,16 @@ def test_an_unchanged_replica_is_not_opened_again_by_the_page_projection(
     assert opens[0] == 1
     assert source.last_replica_read is not None
     assert source.last_replica_read.opened is False
-    assert {snapshot.content_sha256 for snapshot in snapshots} == {snapshots[0].content_sha256}
+    condition_tables = {"condition_alert_rule_state", "condition_alert_rule"}
+    original = {item.table_name: item for item in snapshots[0].projections}
+    assert condition_tables <= original.keys()
+    assert len({snapshot.content_sha256 for snapshot in snapshots}) == 1
+    for snapshot in snapshots:
+        assert snapshot.available_at == snapshots[0].available_at
+        current = {item.table_name: item for item in snapshot.projections}
+        assert current.keys() == original.keys()
+        for table_name, projection in current.items():
+            assert projection == original[table_name]
 
 
 def test_the_page_projection_opens_exactly_once_more_after_the_replica_is_replaced(

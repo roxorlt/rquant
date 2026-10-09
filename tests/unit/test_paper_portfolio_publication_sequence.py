@@ -12,12 +12,16 @@ from tests.unit.test_paper_portfolio_view_source import market
 from tests.unit.test_paper_signal_worker import EXECUTION_TIME, _policy
 
 
-def fixture(tmp_path: Path):
+def fixture(tmp_path: Path, test_request: pytest.FixtureRequest | None = None):
     from rquant.paper_portfolio_view_source import PaperPortfolioViewSource
     from rquant.paper_portfolio_projection import PaperPortfolioSnapshot
     from rquant.paper_signal_worker import PaperSignalQueueStore
 
     broker, _, _, runtime = filled(tmp_path)
+    if test_request is not None:
+        # Readonly peers need the original owner's WAL until pytest teardown.
+        owner_connection = broker._connect()
+        test_request.addfinalizer(owner_connection.close)
     at = EXECUTION_TIME+timedelta(seconds=1)
     market(runtime, at=at)
     source = PaperPortfolioViewSource(runtime, broker=broker, queue=PaperSignalQueueStore(tmp_path/"queue.sqlite", policy=_policy()))
@@ -63,8 +67,10 @@ def test_different_complete_valuation_increments_publication_without_changing_le
     assert source.publication_sequence(changed, minimum_sequence=revision) == second
 
 
-def test_corrupt_publication_state_and_sequence_budget_fail_closed(tmp_path: Path) -> None:
-    source, value = fixture(tmp_path)
+def test_corrupt_publication_state_and_sequence_budget_fail_closed(
+    tmp_path: Path, request: pytest.FixtureRequest
+) -> None:
+    source, value = fixture(tmp_path, request)
     source.publication_sequence(value, minimum_sequence=0)
     with source.runtime.state._connection(write=True) as connection:
         connection.execute("UPDATE portfolio_publication SET sequence=-1,identity='bad'")
@@ -74,8 +80,10 @@ def test_corrupt_publication_state_and_sequence_budget_fail_closed(tmp_path: Pat
         source.publication_sequence(value, minimum_sequence=2**63-1)
 
 
-def test_old_financial_authority_is_reobserved_at_current_cutoff_without_new_revision(tmp_path: Path) -> None:
-    source, value = fixture(tmp_path)
+def test_old_financial_authority_is_reobserved_at_current_cutoff_without_new_revision(
+    tmp_path: Path, request: pytest.FixtureRequest
+) -> None:
+    source, value = fixture(tmp_path, request)
     old = source.broker.account_authority_snapshot(as_of=value.available_at, market_prices={"600000.SH": Decimal(2)},
                                                  producer_commit=source.runtime.producer_commit)
     new = source.runtime.account_authority(source.broker, cutoff=value.available_at+timedelta(seconds=1), prices={"600000.SH": Decimal(2)})

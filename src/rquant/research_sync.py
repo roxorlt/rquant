@@ -74,6 +74,7 @@ REPLACE_TABLES: tuple[str, ...] = (
     "stock_basic",
     "screen_result",
     "screen_run_receipt",
+    "screen_run_evidence",
     "pool2_watch",
     "risk_blacklist",
 )
@@ -134,10 +135,13 @@ LOCAL_ONLY_TABLES: tuple[str, ...] = (
     "data_audit_run",
     "data_repair_audit",
     "limit_up_pool_write_guard",
+    "ingestion_commit_receipt",
+    "backfill_day_commit_receipt",
     # 财务 PIT 首次观察、导入游标与基本面版本 head 均以本地主库为权威。
     "financial_observation",
     "financial_import_batch",
     "financial_import_cursor",
+    "data_center_financial_runtime_receipt",
     "daily_basic_valuation_observation",
     "daily_basic_valuation_batch",
     "fundamental_daily_version",

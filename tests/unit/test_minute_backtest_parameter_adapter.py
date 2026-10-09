@@ -434,6 +434,7 @@ def original_execution(
             spool=spool,
             experiment_registry=experiments,
             definition_registry=definitions,
+            minute_parameter_catalog=catalog,
             clock=lambda: now,
         )
         command = SubmitJobCommand(job_id=uuid4(), spec=spec, max_attempts=2)

@@ -1,7 +1,6 @@
 """Exact private query and the original family role fence; no worker replay."""
 from __future__ import annotations
 
-import importlib
 from pathlib import Path
 from uuid import UUID
 
@@ -55,13 +54,32 @@ def test_private_report_query_refuses_another_complete_artifact(changes: dict[st
 
 
 def test_family_role_read_can_nest_in_original_minute_execution_sh(tmp_path: Path) -> None:
-    # Reuse the original accepted roles/private registry/Lab helper. No substitute owner.
-    original = importlib.import_module('tests.unit.test_minute_experiment_result_owner')
-    chain = original.build_chain(tmp_path / 'roles')
-    with chain.roles.locked(read_only=True):
-        values = chain.owner()._role('fixture-owner')
-        assert values['role'] == 'admin'
-        assert values['outbox_identity'] == chain.roles.require_outbox_identity()
+    from rquant.collaboration_roles import RoleEntry, RoleState
+    from rquant.experiment_platform_projection import ExperimentPrivateResultAuthority
+    from rquant.experiment_registry import ExperimentRegistry, ExperimentRegistryReadonlyReader
+    from rquant.lab_jobs import LabJobReader, LabJobStore
+    from rquant.minute_experiment_result_owner import MinuteExperimentResultOwner
+    from tests.unit.test_minute_backtest_study_control import control
+
+    service = control(tmp_path)
+    (tmp_path / "roles.json").write_text(RoleState.create(
+        revision=1, users=(RoleEntry(username="fixture-owner", role="admin"),),
+    ).model_dump_json())
+    roles = service.collaboration
+    registry = ExperimentRegistry(tmp_path / "experiments.sqlite3", managed_trust_root=tmp_path)
+    jobs = LabJobStore(tmp_path / "jobs.sqlite3")
+    jobs.initialize()
+    owner = MinuteExperimentResultOwner(
+        private_authority=ExperimentPrivateResultAuthority(
+            ExperimentRegistryReadonlyReader(registry.path, managed_trust_root=tmp_path),
+        ),
+        jobs=LabJobReader(jobs.path),
+        roles=roles,
+    )
+    with roles.locked(read_only=True):
+        values = owner._role("fixture-owner")
+        assert values["role"] == "admin"
+        assert values["outbox_identity"] == roles.require_outbox_identity()
 
 
 def test_private_owner_permission_failure_never_falls_back(

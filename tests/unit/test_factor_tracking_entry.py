@@ -120,7 +120,7 @@ def test_tracking_private_to_worker_projection_and_archived_head_pause(tmp_path:
             clock=lambda: _AT,
         ),
     )
-    with TemporaryDirectory(prefix="ft-e2e-", dir="/private/tmp") as directory:
+    with TemporaryDirectory(prefix="ft-e2e-", dir=Path("/tmp").resolve()) as directory:
         private = Path(directory)
         os.chown(private, os.geteuid(), os.getegid())
         private.chmod(0o710)

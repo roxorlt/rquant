@@ -64,6 +64,7 @@ from rquant.signal_bus import (
 from rquant.notifier_operator import MonitorControlReadSettings, read_monitor_control_state
 from rquant.signal_route_spool import (
     ReadonlyNotificationEventRouteSpool,
+    ReadonlySignalRouteSpool,
     SignalRouteSpool,
     publish_mixed_notification_bus_prefix,
 )
@@ -660,7 +661,7 @@ def _inspect_signal_source(
 
 
 def _read_routed_prefix_at(
-    source: ReadonlyNotificationEventRouteSpool,
+    source: ReadonlySignalRouteSpool | ReadonlyNotificationEventRouteSpool,
     *,
     after_sequence: int,
     through_sequence: int,
@@ -1339,7 +1340,31 @@ def notifier_builder(
 
                 with store._read_snapshot() as connection:
                     _require_condition_delivery(connection)
-        source = ReadonlyNotificationEventRouteSpool(settings.signal_spool_root)
+        from rquant.price_alert_route import _HISTORY_TABLES, _history_installed
+
+        with store._read_snapshot() as connection:
+            mixed_installed = (
+                connection.execute(
+                    "SELECT 1 FROM signal_bus_metadata "
+                    "WHERE metadata_key='mixed_notification_history'"
+                ).fetchone()
+                is not None
+                or connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE tbl_name IN (?,?,?) LIMIT 1",
+                    _HISTORY_TABLES,
+                ).fetchone()
+                is not None
+            )
+            if mixed_installed:
+                _history_installed(connection)
+        source = (
+            ReadonlyNotificationEventRouteSpool(settings.signal_spool_root)
+            if mixed_installed
+            else ReadonlySignalRouteSpool(settings.signal_spool_root)
+        )
+        replicate = (
+            store.replicate_mixed_notification_events if mixed_installed else store.replicate
+        )
         authority_publisher: ServingSourceAuthorityPublisher | None = None
         authority_reader: ServingSourceAuthorityReader | None = None
         previous_authority_reader: ServingSourceAuthorityReader | None = None
@@ -1602,17 +1627,6 @@ def notifier_builder(
                 through_sequence=descriptor.high_watermark,
                 observed_at=observed_at,
                 limit=min(settings.batch_limit, 100),
-            )
-            with store._read_snapshot() as connection:
-                mixed_installed = (
-                    connection.execute(
-                        "SELECT 1 FROM signal_bus_metadata WHERE metadata_key='m"
-                        "ixed_notification_history'"
-                    ).fetchone()
-                    is not None
-                )
-            replicate = (
-                store.replicate_mixed_notification_events if mixed_installed else store.replicate
             )
             replicated = replicate(
                 descriptor,

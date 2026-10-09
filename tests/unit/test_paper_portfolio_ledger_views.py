@@ -41,8 +41,13 @@ def close_material(configuration, *, day=TRADE_DATE, price="2", status="normal")
                                                        observed_at=at, available_at=at, source_snapshot_id="e" * 64, industry_l1="银行"),))
 
 
-def test_complete_reader_pins_original_revision_and_does_not_write_ledger(tmp_path: Path) -> None:
+def test_complete_reader_pins_original_revision_and_does_not_write_ledger(
+    tmp_path: Path, request: pytest.FixtureRequest
+) -> None:
     broker, basis, _, _ = filled(tmp_path)
+    owner_connection = broker._connect()
+    request.addfinalizer(owner_connection.close)
+    assert not owner_connection.in_transaction
     paths = (broker.path, broker.path.with_name(broker.path.name + "-wal"))
     before = tuple(sha256(path.read_bytes()).hexdigest() if path.exists() else None for path in paths)
     source = ledger_source(broker)
@@ -76,10 +81,15 @@ def test_close_nav_uses_contemporaneous_close_and_original_fee_cash(tmp_path: Pa
 
 
 @pytest.mark.parametrize("status,price", [("missing", None), ("error", None)])
-def test_missing_close_is_a_gap_without_last_fill_price_or_zero(tmp_path: Path, status: str, price: None) -> None:
+def test_missing_close_is_a_gap_without_last_fill_price_or_zero(
+    tmp_path: Path, status: str, price: None, request: pytest.FixtureRequest
+) -> None:
     from rquant.paper_portfolio_views import PaperPortfolioViewStore
 
     broker, basis, _, runtime = filled(tmp_path)
+    owner_connection = broker._connect()
+    request.addfinalizer(owner_connection.close)
+    assert not owner_connection.in_transaction
     value = close_material(basis.configuration, status=status, price=price)
     result = PaperPortfolioViewStore(runtime.state).record_close(ledger_source(broker), value, published_at=value.available_at)
     assert result.status == "unavailable" and result.account is None and result.normalized_nav is None

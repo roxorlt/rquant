@@ -46,11 +46,16 @@ def test_role_source_uses_full_original_frame_and_same_applied_control(tmp_path:
     assert value.nav == ()
 
 
-def test_missing_or_stale_mark_preserves_history_without_substitute_nav(tmp_path: Path) -> None:
+def test_missing_or_stale_mark_preserves_history_without_substitute_nav(
+    tmp_path: Path, request: pytest.FixtureRequest
+) -> None:
     from rquant.paper_portfolio_view_source import PaperPortfolioViewSource
     from rquant.paper_portfolio_history import paper_history_page
 
     broker, _, _, runtime = filled(tmp_path)
+    owner_connection = broker._connect()
+    request.addfinalizer(owner_connection.close)
+    assert not owner_connection.in_transaction
     at = EXECUTION_TIME+timedelta(seconds=1)
     market(runtime, at=at, price=None, status="missing")
     queue = PaperSignalQueueStore(tmp_path / "queue.sqlite", policy=_policy())

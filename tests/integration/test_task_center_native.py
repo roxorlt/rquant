@@ -119,7 +119,9 @@ def test_tsc_01_real_private_task_transport_prepare_original_uuid_recovery_and_c
     web_uid = os.geteuid() + 1
     server = None
     worker = None
-    with tempfile.TemporaryDirectory(prefix="m13-private-", dir="/private/tmp") as directory:
+    with tempfile.TemporaryDirectory(
+        prefix="m13-private-", dir=Path("/tmp").resolve()
+    ) as directory:
         root = Path(directory)
         os.chown(root, os.geteuid(), os.getegid(), follow_symlinks=False); root.chmod(0o710)
         assert (root.stat().st_uid, root.stat().st_gid, stat.S_IMODE(root.stat().st_mode)) == (os.geteuid(), os.getegid(), 0o710)

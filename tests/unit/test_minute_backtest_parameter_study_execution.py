@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from datetime import UTC, date, datetime, timedelta
 from importlib import import_module, util
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from uuid import uuid4
 
 import pandas as pd
@@ -13,6 +14,25 @@ import pytest
 from rquant.experiment_registry import DateRange
 from rquant.minute_backtest_parameter_adapter import MinuteParameterFormalReplayResult
 from rquant.minute_backtest_performance import build_minute_performance
+from tests.integration.test_minute_backtest_parameter_installed import (
+    installed_parameters as installed_parameters,
+)
+from tests.integration.test_minute_backtest_parameter_installed import (
+    sealed_parameters as sealed_parameters,
+)
+from tests.support.minute_backtest_installed import installed_minute as installed_minute
+from tests.unit.test_minute_backtest_parameter_adapter import (
+    ParameterExecution,
+)
+from tests.unit.test_minute_backtest_parameter_adapter import (
+    complete_seed as complete_seed,
+)
+from tests.unit.test_minute_backtest_parameter_adapter import (
+    original_execution as original_execution,
+)
+from tests.unit.test_minute_backtest_parameter_adapter import (
+    source_root as source_root,
+)
 
 
 def study_execution() -> ModuleType:
@@ -453,11 +473,11 @@ def test_carrier_changed_recipe_cannot_reuse_an_original_prepared_marker(
         api.MinuteParameterPreparedStudyTrial.model_validate(changed)
 
 
-def test_carrier_archived_actual_seal_keeps_validation_trade_out_of_training() -> None:
-    import json
-
+@pytest.mark.parametrize("installed_parameters", [True], indirect=True, scope="module")
+def test_carrier_archived_actual_seal_keeps_validation_trade_out_of_training(
+    sealed_parameters: SimpleNamespace,
+) -> None:
     from rquant.minute_backtest_commands import MinuteRunEffect, SubmitMinuteReplay
-    from rquant.minute_backtest_parameter_artifact import MinuteParameterSealedReplayResult
     from rquant.minute_backtest_parameter_optimizer import (
         MinuteStudyTrainingObservation,
         rank_minute_study_training,
@@ -480,7 +500,7 @@ def test_carrier_archived_actual_seal_keeps_validation_trade_out_of_training() -
         == "5fafd9d2c5a4e3f9c17c3f6843c700fc3768ff2b3d5ca3a819e10feb572cdc1d"
     )
     command = SubmitMinuteReplay.model_validate_json(json.dumps(json.loads(control)["command"]))
-    sealed = MinuteParameterSealedReplayResult.model_validate_json(payload)
+    archived = json.loads(payload)
     effect_bytes = (archive / "minute-run-effect.json").read_bytes()
     assert hashlib.sha256(effect_bytes).hexdigest() == (
         "2f313c88331bcf1e9d3650ee270e9e53e417db71a5612c90acf54d9e020fa314"
@@ -499,9 +519,42 @@ def test_carrier_archived_actual_seal_keeps_validation_trade_out_of_training() -
         == records["effect"]["command_hash"]
         == (marker.command_hash)
     )
+    assert marker.command.spec.model_dump(mode="json") == archived["accepted_spec"]
+    assert str(marker.command.job_id) == archived["job_id"]
+
+    # The original bytes retain their original ABI; this seal is made by the current finalizer.
+    sealed = sealed_parameters.full
+    command = sealed_parameters.command
+    assert sealed.result.replay.parameters.model_dump(mode="json") == (
+        archived["result"]["replay"]["parameters"]
+    )
+    with sealed_parameters.web.outbox._connect() as connection:
+        connection.execute("PRAGMA query_only = ON")
+        records = {
+            name: dict(
+                connection.execute(
+                    f"SELECT * FROM page_control_{name} WHERE command_id=?", (command.command_id,)
+                ).fetchone()
+            )
+            for name in ("command", "effect")
+        }
+    effect_json = records["effect"]["original_admission_json"]
+    marker = MinuteRunEffect.model_validate_json(effect_json)
+    assert records["command"]["status"] == records["effect"]["status"] == "succeeded"
+    assert json.loads(records["command"]["payload_json"]) == command.model_dump(mode="json")
+    assert (
+        records["command"]["command_hash"] == records["effect"]["command_hash"] == marker.command_hash
+    )
     assert marker.command.spec == sealed.accepted_spec and marker.command.job_id == sealed.job_id
+    (sealed_parameters.context.root / "minute-run-effect.json").write_text(effect_json)
+    (sealed_parameters.context.root / "page-control-accepted-records.json").write_text(
+        json.dumps(records)
+    )
     binding = sealed.result.replay.study_binding
     assert binding is not None and binding == sealed.result.publication.frozen.runtime.study_binding
+    archived_binding = archived["result"]["replay"]["study_binding"]
+    for name in ("train_range", "validation_range", "frozen_outer_test_range"):
+        assert getattr(binding, name).model_dump(mode="json") == archived_binding[name]
     binding.verify_request(command.config)
     assert marker.config_hash == binding.request_hash
     assert sealed.job_id == study_execution().minute_job_id(command.actor_id, command.command_id)
@@ -600,7 +653,7 @@ def three_part_request(
 
 
 @pytest.fixture(scope="module")
-def original_result() -> MinuteParameterFormalReplayResult:
+def original_result(original_execution: ParameterExecution) -> MinuteParameterFormalReplayResult:
     # Actual original adapter wire. It is deliberately not a claimed physical seal.
     path = (
         Path(__file__).resolve().parents[2]
@@ -611,7 +664,11 @@ def original_result() -> MinuteParameterFormalReplayResult:
     assert hashlib.sha256(data).hexdigest() == (
         "0b49a8c831bb08b63caf1cbfc3ef0671e971881ac851c453e3bae2e8af20cdfa"
     )
-    return MinuteParameterFormalReplayResult.model_validate_json(data)
+    current = original_execution.result
+    assert current.replay.parameters.model_dump(mode="json") == (
+        json.loads(data)["replay"]["parameters"]
+    )
+    return current
 
 
 def window(start: date = date(2026, 7, 31), end: date = date(2026, 8, 3)) -> DateRange:

@@ -337,6 +337,7 @@ def test_paper_builder_metric_binds_selected_old_generation_and_cutoff(tmp_path:
 
 def _paper_source_fixture(
     tmp_path: Path,
+    test_request: pytest.FixtureRequest | None = None,
 ) -> tuple[PaperPortfolioViewSource, PaperPortfolioSnapshot]:
     import sqlite3
     from contextlib import closing
@@ -349,6 +350,10 @@ def _paper_source_fixture(
     from tests.unit.test_paper_signal_worker import EXECUTION_TIME, _policy
 
     broker, _, _, runtime = filled(tmp_path)
+    if test_request is not None:
+        owner_connection = broker._connect()
+        test_request.addfinalizer(owner_connection.close)
+        assert not owner_connection.in_transaction
     at = EXECUTION_TIME + timedelta(seconds=1)
     market(runtime, at=at)
     source = PaperPortfolioViewSource(
@@ -512,12 +517,13 @@ def test_unsealed_or_wrong_dates_cannot_publish_comparison(tmp_path: Path) -> No
 
 def test_original_past_risk_decision_transfers_policy_without_fake_current_freshness(
     tmp_path: Path,
+    request: pytest.FixtureRequest,
 ) -> None:
     from rquant.portfolio.drawdown import DrawdownRule
     from rquant.runtime_builder_paper import paper_health_metrics_for_publication
     from tests.unit.test_paper_portfolio_view_source import market
 
-    source, original = _paper_source_fixture(tmp_path)
+    source, original = _paper_source_fixture(tmp_path, request)
     configuration = source.runtime.state.configuration
     configuration = type(configuration).model_validate(
         configuration.model_copy(

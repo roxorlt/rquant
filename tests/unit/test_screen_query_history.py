@@ -286,6 +286,7 @@ def test_original_factory_keeps_paper_control_and_private_history_on_same_outbox
     tmp_path: Path, factory_name: str
 ) -> None:
     from rquant import page_control_service
+    from rquant.screen.query_history import prepare_private_screen_outbox
     from tests.unit.test_paper_portfolio_page_control import (
         paused_request,
         service_for,
@@ -295,6 +296,7 @@ def test_original_factory_keeps_paper_control_and_private_history_on_same_outbox
     tmp_path.chmod(0o700)
     root_dir = tmp_path / "paper"
     root_dir.mkdir(mode=0o700)
+    prepare_private_screen_outbox(root_dir / "journal.sqlite")
     old_control, backend, operator, _ = service_for(root_dir)
     factory = getattr(page_control_service, factory_name)
     control = factory(

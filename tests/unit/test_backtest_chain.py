@@ -192,7 +192,7 @@ def test_pb02_pb03_pb09_actual_native_worker_original_journal_to_sealed_result(
         lifecycle_synchronizer=ExperimentLifecycleCoordinator(facade),
         clock=lambda: NOW,
     )
-    socket_root = Path(tempfile.mkdtemp(prefix="pb-chain-", dir="/private/tmp"))
+    socket_root = Path(tempfile.mkdtemp(prefix="pb-chain-", dir=Path("/tmp").resolve()))
     old_tmp = os.environ.get("TMPDIR")
     old_tempdir = tempfile.tempdir
     os.environ["TMPDIR"] = str(socket_root)

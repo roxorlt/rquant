@@ -1,14 +1,14 @@
 {
   "schema_version": 1,
-  "revision": 166,
-  "updated_at": "2026-10-09T21:17:01+08:00",
+  "revision": 168,
+  "updated_at": "2026-10-10T00:41:04+08:00",
   "thread_id": "01a0dd53-e9c9-7b73-a7b5-843473fcd6ac",
   "worktree": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-source-integration",
   "branch": "cdx/20260929-factor-source-integration",
   "goal_state": {
     "reported_status": "active",
-    "last_updated_at": "2026-10-09T20:18:32+08:00",
-    "current_turn": "pr323_frozen_actual_repairs_targeted_recheck_before_CI",
+    "last_updated_at": "2026-10-10T00:41:04+08:00",
+    "current_turn": "R12_actual_CI_repairs_frozen_derived_metadata_and_one_combined_review",
     "stored_block_reason": "正式指数来源及32日资料仍缺；生产安装切流授权和实际开市日观察按固定6项处理。",
     "explicit_goal_token_budget": null,
     "resume_control": "get_goal已实际返回active；当前无需再点Target继续。",
@@ -17,10 +17,10 @@
     "previous_goal_turn_evidence": "r12-auction-python311312-accepted-20261009-01.json：两版本原54节点通过并核原记录；集中审查形成唯一FCR-001并交原实现者。",
     "last_observation": {
       "classification": "actual_progress",
-      "observed_at": "2026-10-09T20:18:32+08:00",
-      "actual": "本批CI补修及必要快照已冻结。标准3.12刷新和check通过，仅5项初始化快照更新，3处原摘要恢复；完整行、字节、异常、哨兵和零写条件保持。原审查者只复核本批19叶差异，随后同一PR运行仓库CI；原功能、构建和审查证据继续复用。",
-      "evidence": "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-repairs-r07-policy-02/check-result.json",
-      "next": "原审查者定向复核后，提交同一PR并执行仓库CI；正式来源与上线条件保持。"
+      "observed_at": "2026-10-10T00:41:04+08:00",
+      "actual": "本批实际CI补修已停写。事件兼容、精确导入边界和独立参考已验；notifier消息保留完整异常。原4096条调度用例一次通过，221秒。清单23,091项，保留全部原场景；新增19个拒绝场景合并执行后通过既定6MiB容量。待一次组合增量审查和正式CI。",
+      "evidence": "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-collection-01/EV.json",
+      "next": "标准派生元数据、一次组合增量审查、同一PR必要CI；正式资料和上线条件保持。"
     },
     "previous_blocked_audit": {
       "consecutive_goal_turns_without_available_safe_implementation": 3,
@@ -30,7 +30,7 @@
     },
     "blocked_audit": {
       "consecutive_goal_turns_without_available_safe_implementation": 0,
-      "condition": "已取得真实CI失败，存在明确的必要局部修复与验证路径。",
+      "condition": "本批已验补修正在整合，存在元数据、增量审查和正式CI的必要路径。",
       "update_goal_blocked_threshold": 3
     }
   },
@@ -60,21 +60,19 @@
       0,
       0
     ],
-    "acceptance_and_rollout_hours": [
-      6,
-      12
-    ],
+    "acceptance_and_rollout_hours": null,
     "local_candidate_elapsed_days": [
       1,
       3
     ],
-    "confidence": "19项本地已验、6项剩余。当前仅完成新参数双版本门禁和一次集中候选审查；实际阻断修复归R12。正式资料、生产安装切换和20个实际开市日另列，原日期窗口不重置。",
+    "confidence": "原6–12小时及R12的3–6小时已失效。本批补修已冻；一次增量审查和正式CI仍待实测。不重置原目标窗口。",
     "assumptions": [
       "本地19项已验收，14个模块已本地验证；正式市场资料不由合成资料替代。",
-      "唯一集中候选审查及原19叶CI补修复核已通过；新增实际阻断只作定向修复和复核，复用有效测试。",
-      "验收及上线原估6–12工程小时；正式资料、授权等待和20个实际开市日另计。",
+      "唯一集中候选审查及原19叶CI补修复核已通过；本批实际阻断修复已冻；只作组合增量复核，复用有效测试。",
       "不增加新的设计、重构或审查阶段；必要验收完成后收尾。",
-      "原10月8–10日候选目标窗口保持，不因更新重置日期。"
+      "原10月8–10日候选目标窗口保持，不因更新重置日期。",
+      "完整CI33项已有终态：18通过、10失败、4取消、1跳过。取消的完整分片不算通过；修后双版本门禁仍待。",
+      "资料、生产授权和20个实际开市日另计。原工程工时估计保留在retired_estimates。"
     ],
     "excluded_waits": [
       "CSI 与正式供应商来源获取",
@@ -152,6 +150,18 @@
           6
         ],
         "reason": "R07 normal06 still exceeds12s; remaining cost must be measured before aggregate estimate is reliable"
+      },
+      {
+        "at": "2026-10-09T23:42:22+08:00",
+        "acceptance_and_rollout_hours": [
+          6,
+          12
+        ],
+        "R12_remaining_hours": [
+          3,
+          6
+        ],
+        "reason": "完整CI实际失败与四个超时使原估计失效；保留旧估计，不据此承诺日期。"
       }
     ],
     "implementation_estimate_condition": "已列本地功能补齐完成；若集中审查发现真实阻断，定向修复工时另更新，不增加交付项。",
@@ -182,7 +192,8 @@
       "独立UI实际通过后，原页面实现者给R08/R09真实联验合计12–20分钟，复用现有产物/脚本/原结果且不新增功能；替代旧两项2–4.5h，合计只计一次。结合R02、R06、R07，功能余量粗估3–6h；主域性能失败或新增绑定证据可调整，资料/授权等待另列，原日期窗口保持。",
       "完整输入读取方案已批准并冻结：可信首验加全部当前文件、权限、记录和live规则，替代同一链重复input unit/expected/registry/plan装配。六处现有接点，公有正式权限正文保持。原审查者集中核新设计边界，实现者并行固定接口，尚未写新产品代码。当前代码仍source05，原21.782/20.997秒证据复用，12秒未过。 下一普通候选3–6h非达标承诺；首个45–90分钟检查点从SPEC后实际实施起算。",
       "00:42：完整输入证明的冻结候选普通两GET均过12秒，原四组事实和控制资料保持。R08/R09原安装联验已交回pages，原交付标准有限事实映射并行；不增加交付数、逐子项审查或重复全量验证。"
-    ]
+    ],
+    "estimate_status": "pending_measured_CI_completion"
   },
   "tasks": [
     {
@@ -2418,7 +2429,7 @@
       "title": "整体候选最终验收",
       "category": "acceptance",
       "status": "in_progress",
-      "owner": "Root整合；原审查者只核两处新增改动及派生路径",
+      "owner": "Root整合四个互不覆盖写集；原审查者只核冻结后的组合增量",
       "modules": [
         "M1",
         "M2",
@@ -2436,10 +2447,7 @@
         "M15",
         "M16"
       ],
-      "remaining_hours": [
-        3,
-        6
-      ],
+      "remaining_hours": null,
       "dependencies": [
         "R01",
         "R02",
@@ -2485,10 +2493,17 @@
         "data/verification/goal-progress-root/release-preconditions-20261009-01/web-wave-02-03.json",
         "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-generation-bootstrap-diagnostic-01/verification.json",
         "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-generation-cause-01/root-result-05.json",
-        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-web-openapi-import-01/EV.json"
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-web-openapi-import-01/EV.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-wave02-full-suite-failures-index-01.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave02-owner-route-fix-01/receipt.json",
+        "data/verification/goal-progress-root/ci-full-wave02-web-strategy-contracts-fix-01/import-isolation-01/node-compaction-01/EV.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave02-audit-driver-reference-01/HANDOFF.md",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave02-replay-notifier-cause-01/assertion-message-01/EV.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave02-cancelled-shard-cause-01/expected-only-cache-fix-01/EV.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-collection-01/EV.json"
       ],
       "closure_level": "pending",
-      "last_progress": "本批19个文件定向复核通过。版本188af226的CI已有18项通过，10个完整测试分片仍在运行；网页1208项测试及构建通过。当前只处理两类实际阻断：无业务配置的API导入已修复，原快照一致、日终22项回归通过；运行时两版本失败原因仍被隐藏，已仅在测试入口增加异常日志，本地原两例通过。接下来只核两处新增改动和必要派生路径，复用有效结果，不增加交付项。",
+      "last_progress": "本批实际CI补修已停写。事件兼容、精确导入边界和独立参考已验；notifier消息保留完整异常。原4096条调度用例一次通过，221秒。清单23,091项，保留全部原场景；新增19个拒绝场景合并执行后通过既定6MiB容量。待一次组合增量审查和正式CI。",
       "submilestones": [
         {
           "name": "网页最终候选准备门禁",
@@ -2564,6 +2579,25 @@
           "scope": "34稳定叶及7派生元数据",
           "remaining_blockers": [],
           "test_execution_claimed_for_collection": false
+        },
+        {
+          "name": "实际CI补修与必要清单",
+          "state": "repairs_frozen_original_results_reused_one_combined_delta_review_pending",
+          "evidence": [
+            "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave02-owner-route-fix-01/receipt.json",
+            "data/verification/goal-progress-root/ci-full-wave02-web-strategy-contracts-fix-01/import-isolation-01/node-compaction-01/EV.json",
+            "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave02-audit-driver-reference-01/HANDOFF.md",
+            "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave02-replay-notifier-cause-01/assertion-message-01/EV.json",
+            "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave02-cancelled-shard-cause-01/expected-only-cache-fix-01/EV.json",
+            "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-collection-01/EV.json"
+          ],
+          "case_count": 23091,
+          "manifest_cap_bytes": 6291456,
+          "manifest_total_bytes": 6291388,
+          "original_case_coverage_preserved": true,
+          "new_negative_scenarios_executed": 19,
+          "complete4096_node_passed_seconds": 221.22,
+          "production_change": false
         }
       ],
       "conditional_acceptance_gates": [
@@ -2612,7 +2646,9 @@
         }
       ],
       "pull_request": "https://github.com/roxorlt/rquant/pull/323",
-      "candidate_commit": "188af2261ace57270e30424394e1402f8e4e6cbc"
+      "candidate_commit": "a73c04c31efb1b8ad5ffd333b73a442249f648b1",
+      "remaining_hours_note": "原估已失效；本批补修已停写，组合增量审查及修后正式CI耗时待实测。",
+      "published_candidate_commit": "188af2261ace57270e30424394e1402f8e4e6cbc"
     },
     {
       "id": "R13",
@@ -3761,6 +3797,24 @@
       "type": "actual_ci_two_gate_repairs",
       "added_ids": [],
       "description": "本批19个文件定向复核通过。版本188af226的CI已有18项通过，10个完整测试分片仍在运行；网页1208项测试及构建通过。当前只处理两类实际阻断：无业务配置的API导入已修复，原快照一致、日终22项回归通过；运行时两版本失败原因仍被隐藏，已仅在测试入口增加异常日志，本地原两例通过。接下来只核两处新增改动和必要派生路径，复用有效结果，不增加交付项。"
+    },
+    {
+      "date": "2026-10-09T23:42:22+08:00",
+      "type": "minimum_scope_actual_CI_convergence",
+      "added_ids": [],
+      "description": "完整CI已结束：33项中18通过、10失败、4取消、1跳过。实际失败已按共享接点集中补修；有效功能、构建和原审查结果复用。当前仅剩事件owner兼容、精确导入边界、审计参考恢复和notifier完整异常诊断四条独立流。候选冻结后只审新增差异，再跑必要CI；不另开全仓审计、重构或逐项重复审查。",
+      "rules_read": {
+        "global_sha256": "df0381e851d96e112a14fbb5a943b84be6d7a5b076170413268e814f8b6182c4",
+        "worktree_sha256": "fa3076d4709599bcd77de35a5c30950b1e8cbd43de47fe8bb66bdd04b9c93a44"
+      },
+      "unlimited_time_and_repairs_change_scope": false
+    },
+    {
+      "at": "2026-10-10T00:41:04+08:00",
+      "task_id": "R12",
+      "delivery_unit_added": false,
+      "actual": "本批实际CI补修已停写。事件兼容、精确导入边界和独立参考已验；notifier消息保留完整异常。原4096条调度用例一次通过，221秒。清单23,091项，保留全部原场景；新增19个拒绝场景合并执行后通过既定6MiB容量。待一次组合增量审查和正式CI。",
+      "scope": "实际阻断修复及必要派生清单；规则已重读并同步，时长次数授权不扩大范围。"
     }
   ],
   "update_policy": [
@@ -3783,7 +3837,7 @@
         "tasks": [
           "R12"
         ],
-        "work": "独占四既有消费者测试验证FCR-001；产品只读，不重复型检/构建，不增加审查。",
+        "work": "精确Error-only/纯定义导入边界；保留零配置及零连接验证。",
         "status": "completed"
       },
       {
@@ -3807,7 +3861,7 @@
         "tasks": [
           "R12"
         ],
-        "work": "三叶真实Ruff失败修复；保留旧策略AST和执行指纹。",
+        "work": "只取得一个原回放的完整notifier异常；冻结其它叶，未授权猜测修复。",
         "status": "completed"
       },
       {
@@ -3824,7 +3878,7 @@
           "R12"
         ],
         "work": "原19个文件复核通过；下一步只复核两处新增改动及派生路径。",
-        "status": "queued"
+        "status": "waiting_for_frozen_delta"
       },
       {
         "agent": "/root/ai_assistance_completion_impl",
@@ -3848,7 +3902,15 @@
           "R12"
         ],
         "status": "completed",
-        "work": "同一fixture显式关闭连接、固定创建时间已冻；三条标准调用证据收尾。"
+        "work": "事件owner原v1与mixed路径兼容；两产品叶和两直接测试叶。"
+      },
+      {
+        "agent": "/root/ci_task_entrypoints",
+        "tasks": [
+          "R12"
+        ],
+        "status": "completed",
+        "work": "按既有规则恢复缺失独立审计参考；保留原失败和只读/清理约束。"
       }
     ],
     "configured_max_threads": 15,
@@ -3857,9 +3919,15 @@
       "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-source-integration/.codex/config.toml"
     ],
     "live_reload_verified": true,
-    "root_work": "仅复核两处新增改动及派生路径；保留当前完整CI，取得真实运行时原因后局部补修。",
+    "root_work": "核冻结输入和有效证据，维护固定清单；完成后一次增量复核与同PR必要CI。",
     "waiting_subagents": 0,
     "runtime_capacity_evidence": "本轮app运行环境重新初始化后的原生元数据明确提供16个并发槽位，包含Root；不是修改配置后推断即时生效。",
-    "active_subagents": []
+    "active_subagents": [
+      "/root/r07_candidate_metadata",
+      "/root/study_perf_resume",
+      "/root/ci_task_entrypoints",
+      "/root/parameter_family_acceptance"
+    ],
+    "next": "Root统一派生元数据后，原审查者只审组合增量；不增加逐子任务审查。"
   }
 }
