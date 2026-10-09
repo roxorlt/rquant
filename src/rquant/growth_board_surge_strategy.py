@@ -685,7 +685,10 @@ def prior_days_had_surge(
 
 
 def passes_growth_listing_filter(listed_trading_days: int, config: GrowthBoardSurgeConfig) -> bool:
-    return config.min_listing_trading_days <= 0 or listed_trading_days >= config.min_listing_trading_days
+    return (
+        config.min_listing_trading_days <= 0
+        or listed_trading_days >= config.min_listing_trading_days
+    )
 
 
 def passes_growth_fresh_filter(prior_surge: bool | None, config: GrowthBoardSurgeConfig) -> bool:
@@ -704,7 +707,9 @@ def passes_growth_board_filter(
     amt_ratio = board_strength.get("board_auction_amount_ratio")
     if gap_ratio is None or float(gap_ratio) < config.min_board_gap_up_ratio:
         return False
-    if amt_ratio is None or float(amt_ratio) < config.min_board_auction_amount_ratio:
+    if (  # noqa: SIM103 -- 冻结 evaluator AST，保持旧封存指纹。
+        amt_ratio is None or float(amt_ratio) < config.min_board_auction_amount_ratio
+    ):
         return False
     return True
 
@@ -869,11 +874,15 @@ def evaluate_growth_entry(
         }
         if board_strength is not None:
             raw_factor_values["board_gap_up_ratio"] = board_strength.get("board_gap_up_ratio")
-            raw_factor_values["board_auction_amount_ratio"] = board_strength.get("board_auction_amount_ratio")
+            raw_factor_values["board_auction_amount_ratio"] = board_strength.get(
+                "board_auction_amount_ratio"
+            )
         factor_score = score_feature_terms(raw_factor_values, GROWTH_SURGE_B_V1_SCORE_TERMS)
         if config.enable_factor_confirm and factor_score < config.factor_score_threshold:
             return GrowthEntryCheck(factor_score=factor_score, raw_factor_values=raw_factor_values)
-    return GrowthEntryCheck(eligible=True, factor_score=factor_score, raw_factor_values=raw_factor_values)
+    return GrowthEntryCheck(
+        eligible=True, factor_score=factor_score, raw_factor_values=raw_factor_values
+    )
 
 
 def _previous_window_date(window_dates: list[date], trading_date: date) -> date | None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import grp
+import importlib
 import json
 import os
 import pwd
@@ -154,6 +155,9 @@ class _Authority:
 
 def _serve_child(root: Path, ready_fd: int, stop_fd: int, parses: c_uint) -> None:
     try:
+        # Load the Outbox's late schema imports while the CI checkout is still readable.
+        for module in ("rquant.screen.alert_draft", "rquant.ai_usage"):
+            importlib.import_module(module)
         _drop_to(PAGE_UID)
         control = root / "control"
         outbox = PageControlOutbox(control / "control.sqlite3")

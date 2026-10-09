@@ -1,14 +1,14 @@
 {
   "schema_version": 1,
-  "revision": 162,
-  "updated_at": "2026-10-09T18:46:43+08:00",
+  "revision": 165,
+  "updated_at": "2026-10-09T20:18:32+08:00",
   "thread_id": "01a0dd53-e9c9-7b73-a7b5-843473fcd6ac",
   "worktree": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-source-integration",
   "branch": "cdx/20260929-factor-source-integration",
   "goal_state": {
     "reported_status": "active",
-    "last_updated_at": "2026-10-09T18:46:43+08:00",
-    "current_turn": "final_candidate_review_closed_commit_and_exact_CI_launch",
+    "last_updated_at": "2026-10-09T20:18:32+08:00",
+    "current_turn": "pr323_frozen_actual_repairs_targeted_recheck_before_CI",
     "stored_block_reason": "正式指数来源及32日资料仍缺；生产安装切流授权和实际开市日观察按固定6项处理。",
     "explicit_goal_token_budget": null,
     "resume_control": "get_goal已实际返回active；当前无需再点Target继续。",
@@ -17,10 +17,10 @@
     "previous_goal_turn_evidence": "r12-auction-python311312-accepted-20261009-01.json：两版本原54节点通过并核原记录；集中审查形成唯一FCR-001并交原实现者。",
     "last_observation": {
       "classification": "actual_progress",
-      "observed_at": "2026-10-09T18:46:43+08:00",
-      "actual": "新增41叶CI差异由原审查者一次定向复核PASS，FCR-001保持关闭，0新阻断；完整清单与3.12精确元数据已冻。",
-      "evidence": "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-delta-review-accepted-root.json",
-      "next": "提交同一候选并创建草稿PR，执行仓库必需CI；正式来源及生产阶段仍按原条件。"
+      "observed_at": "2026-10-09T20:18:32+08:00",
+      "actual": "本批CI补修及必要快照已冻结。标准3.12刷新和check通过，仅5项初始化快照更新，3处原摘要恢复；完整行、字节、异常、哨兵和零写条件保持。原审查者只复核本批19叶差异，随后同一PR运行仓库CI；原功能、构建和审查证据继续复用。",
+      "evidence": "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-repairs-r07-policy-02/check-result.json",
+      "next": "原审查者定向复核后，提交同一PR并执行仓库CI；正式来源与上线条件保持。"
     },
     "previous_blocked_audit": {
       "consecutive_goal_turns_without_available_safe_implementation": 3,
@@ -30,7 +30,7 @@
     },
     "blocked_audit": {
       "consecutive_goal_turns_without_available_safe_implementation": 0,
-      "condition": "两项实际CI前置问题正在最小修复，同一候选仍可推进。",
+      "condition": "已取得真实CI失败，存在明确的必要局部修复与验证路径。",
       "update_goal_blocked_threshold": 3
     }
   },
@@ -2418,7 +2418,7 @@
       "title": "整体候选最终验收",
       "category": "acceptance",
       "status": "in_progress",
-      "owner": "Root整合同一候选Git和必要CI门禁",
+      "owner": "Root整合；原审查者定向复核本批CI补修",
       "modules": [
         "M1",
         "M2",
@@ -2477,10 +2477,12 @@
         "data/verification/goal-progress-root/fcr001-review-and-dist-accepted-root-20261009-01.json",
         "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-import-and-inputs-accepted-root.json",
         "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-delta-review-01/DERIVED-DELTA.json",
-        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-delta-review-accepted-root.json"
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-delta-review-accepted-root.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-fixes-root-accepted-partials-01.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-repairs-r07-policy-02/check-result.json"
       ],
       "closure_level": "pending",
-      "last_progress": "产品审查/FCR-001和最终构建已验，新增41叶CI差异原审查者定向PASS。23,081节点清单及3.12精确policy冻结，0新增阻断。准备提交同一候选启动仓库CI，合法正面链仍待。",
+      "last_progress": "本批CI补修及必要快照已冻结。标准3.12刷新和check通过，仅5项初始化快照更新，3处原摘要恢复；完整行、字节、异常、哨兵和零写条件保持。原审查者只复核本批19叶差异，随后同一PR运行仓库CI；原功能、构建和审查证据继续复用。",
       "submilestones": [
         {
           "name": "网页最终候选准备门禁",
@@ -2602,7 +2604,9 @@
           "passed_each": 12,
           "reuse_condition": "两测试叶及直接依赖与冻结相同；311格式AST等价已核。仅合成renderer，不替代物理封存及正式历史。"
         }
-      ]
+      ],
+      "pull_request": "https://github.com/roxorlt/rquant/pull/323",
+      "candidate_commit": "1cdf121fe374c33082abbf53db3df044d72d1eb1"
     },
     {
       "id": "R13",
@@ -3727,6 +3731,24 @@
       "type": "same_candidate_CI_delta_review_accepted",
       "added_ids": [],
       "description": "原审查者集中核完必要CI增量，无新增阻断；提交同一候选进入仓库CI。固定25项、19完成6剩余，正式资料和生产条件保持。"
+    },
+    {
+      "date": "2026-10-09T19:09:51+08:00",
+      "type": "actual_ci_scope_convergence",
+      "added_ids": [],
+      "description": "PR323首轮CI结束；集中实际阻断并行最小修复。固定25项、19本地完成、6剩余。全局及WT规则已重读，所有活动子代理已同步反过度工程规则，不删既有资料或扩大目标。"
+    },
+    {
+      "date": "2026-10-09T19:51:45+08:00",
+      "type": "actual_ci_repairs_frozen",
+      "added_ids": [],
+      "description": "本批CI补修已冻结：格式门禁、52项页面测试、24项身份测试聚焦验证通过；精确清单只改1个跨平台标签。原Linux运行时2例通过，未复现远端失败。现仅标准刷新确定性快照、原审查者定向复核和同候选CI；不扩大范围。"
+    },
+    {
+      "date": "2026-10-09T20:18:32+08:00",
+      "type": "actual_ci_repair_snapshot_freeze",
+      "added_ids": [],
+      "description": "本批CI补修及必要快照已冻结。标准3.12刷新和check通过，仅5项初始化快照更新，3处原摘要恢复；完整行、字节、异常、哨兵和零写条件保持。原审查者只复核本批19叶差异，随后同一PR运行仓库CI；原功能、构建和审查证据继续复用。"
     }
   ],
   "update_policy": [
@@ -3755,9 +3777,9 @@
       {
         "agent": "/root/r03_scope_closure",
         "tasks": [
-          "R07"
+          "R12"
         ],
-        "work": "限定只读诊断找到原 evaluator 表达式接点；原实现者已修复，诊断记录收尾，不追加审查。",
+        "work": "只读定位R07-B06与Linuxgeneration实际失败，给最小接点后停止。",
         "status": "completed"
       },
       {
@@ -3765,25 +3787,23 @@
         "tasks": [
           "R12"
         ],
-        "work": "两版本原54节点通过，输入与原报告已Root核验，资源清理后结束。",
+        "work": "只读定位跨平台1个测试节点身份差异，不全收集或改门禁。",
         "status": "completed"
       },
       {
         "agent": "/root/parameter_family_acceptance",
         "tasks": [
-          "R06",
-          "R02"
+          "R12"
         ],
-        "work": "后端产品已冻结；真实新版回放和旧封存兼容通过，必要只读回归及证据收尾。",
+        "work": "三叶真实Ruff失败修复；保留旧策略AST和执行指纹。",
         "status": "completed"
       },
       {
         "agent": "/root/study_pages_completion",
         "tasks": [
-          "R08",
-          "R09"
+          "R12"
         ],
-        "work": "两项本地验收已关闭。小EV已冻结，六会话自然exit0，8原控制及四私有根和端口已Root核清；停止本写流。",
+        "work": "只修Web18项实际失败及直接测试接点，保持完整用户交互和权限断言。",
         "status": "completed"
       },
       {
@@ -3791,15 +3811,15 @@
         "tasks": [
           "R12"
         ],
-        "work": "新增34+7叶CI差异定向PASS，无新增阻断；原FCR-001保持关闭，未运行测试，已归还。",
-        "status": "completed"
+        "work": "复用原候选与41叶审查结论；本轮只复核新19叶实际CI补修。",
+        "status": "queued"
       },
       {
         "agent": "/root/ai_assistance_completion_impl",
         "tasks": [
           "R12"
         ],
-        "work": "FCR-001五产品和共享hook修复，hook6项绿；原同UUID幂等及必要型检继续。",
+        "work": "定位Linux三UID测试缺既有依赖，仅授权原测试叶补齐。",
         "status": "completed"
       },
       {
@@ -3808,7 +3828,7 @@
           "R12"
         ],
         "status": "completed",
-        "work": "CI本机路径和两处环境材料局部修复已冻结；原6+17项回归通过，材料保持原值。"
+        "work": "两叶格式与导入修复已冻结；36项Ruff红转绿，AST等价，无新增测试。"
       },
       {
         "agent": "/root/r07_candidate_metadata",
@@ -3816,7 +3836,7 @@
           "R12"
         ],
         "status": "completed",
-        "work": "23,081节点完整收集和标准清单验证通过；原容量/算法/skip/Darwin保持，冻结并清理。"
+        "work": "同一fixture显式关闭连接、固定创建时间已冻；三条标准调用证据收尾。"
       }
     ],
     "configured_max_threads": 15,
@@ -3825,26 +3845,9 @@
       "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-source-integration/.codex/config.toml"
     ],
     "live_reload_verified": true,
-    "root_work": "维护固定交付数和真实估时；整合独立写集；共享接口单一负责人，最后候选仅一次R12独立审查。",
+    "root_work": "本批补修与必要快照已冻；原审查者只核新增差异，随后同一PR执行仓库门禁。",
     "waiting_subagents": 0,
     "runtime_capacity_evidence": "本轮app运行环境重新初始化后的原生元数据明确提供16个并发槽位，包含Root；不是修改配置后推断即时生效。",
-    "active_subagents": [
-      {
-        "agent": "/root/ci_fixture_portability",
-        "tasks": [
-          "R12"
-        ],
-        "work": "修CI绝对路径和归档输出；使原synthetic fixture满足当前Lab快照接口，保持值与断言。",
-        "status": "running"
-      },
-      {
-        "agent": "/root/r07_candidate_metadata",
-        "tasks": [
-          "R12"
-        ],
-        "work": "仅登记既有验收归档类别并聚焦回归；随后按既有生成器冻结最终候选元数据。",
-        "status": "running"
-      }
-    ]
+    "active_subagents": []
   }
 }

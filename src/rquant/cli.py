@@ -150,8 +150,8 @@ def _ingest_with_retry(trade_date: str) -> int | None:
     - 数据未就绪（bar_count == 0）：旧默认按原规则长间隔重试。
       显式采集配置只有完整 SSE 日历证明关闭时返回 None，立即正常退出。
     """
-    from rquant.ingest import ingest_daily
     from rquant.config import settings
+    from rquant.ingest import ingest_daily
     profile_path=settings.data_center_runtime_profile_path
 
     for attempt in range(1, _RETRY_COUNT + 1):
@@ -675,10 +675,14 @@ def _run_backfill_supervised_worker(
 
 
 def cmd_data_center_run(args: argparse.Namespace) -> int:
-    from rquant.backfill_execute import load_execution_policy,require_execution_policy
+    from rquant.backfill_execute import load_execution_policy, require_execution_policy
     from rquant.backfill_execute_contracts import maintenance_window
-    from rquant.data_center_maintenance_runtime import (load_data_center_runtime_profile,build_data_center_worker,
-        run_guarded_data_center_round,verify_maintenance_process_reaped)
+    from rquant.data_center_maintenance_runtime import (
+        build_data_center_worker,
+        load_data_center_runtime_profile,
+        run_guarded_data_center_round,
+        verify_maintenance_process_reaped,
+    )
     if not args.apply:
         raise ValueError('maintenance execution requires explicit --apply')
     profile=load_data_center_runtime_profile(args.profile)
@@ -698,7 +702,10 @@ def cmd_data_center_run(args: argparse.Namespace) -> int:
     hard_deadline=min(window.terminate_at,now+timedelta(seconds=1830))
     # Fixed native child in this installed source; there is no second task queue.
     source_root=str(Path(__file__).resolve().parent.parent)
-    bootstrap='import sys; sys.path.insert(0,sys.argv.pop(1)); from rquant.cli import main; raise SystemExit(main())'
+    bootstrap=(
+        'import sys; sys.path.insert(0,sys.argv.pop(1)); '
+        'from rquant.cli import main; raise SystemExit(main())'
+    )
     command=[sys.executable,'-I','-B','-c',bootstrap,source_root,'data-center-run','--profile',str(args.profile),
         '--execution-id',args.execution_id,'--owner',args.owner,'--apply','--deadline-worker']
     code=_run_deadline_supervised_process(command,deadline=hard_deadline)
@@ -3364,7 +3371,9 @@ def cmd_surge_watch(args: argparse.Namespace) -> int:
             raise ValueError("historical simulation cannot publish a live builtin source")
         outlet = load_original_builtin_source_outlet(_Path(binding))
         if not outlet.captures("original_surge") or not outlet.captures("original_pulse"):
-            raise ValueError("surge source binding must retain its same-batch Surge and Pulse sources")
+            raise ValueError(
+                "surge source binding must retain its same-batch Surge and Pulse sources"
+            )
     setup_logging()
     config = SurgeConfig(
         k_cum=args.k_cum,
@@ -3377,8 +3386,10 @@ def cmd_surge_watch(args: argparse.Namespace) -> int:
     if args.simulate:
         return run_simulate(_Path(args.simulate), dry_run=args.dry_run, config=config)
     if outlet is not None:
-        return run_surge_watch(dry_run=args.dry_run, force_session=args.force_session, config=config,
-            max_ticks=args.max_ticks, builtin_outlet=outlet)
+        return run_surge_watch(
+            dry_run=args.dry_run, force_session=args.force_session, config=config,
+            max_ticks=args.max_ticks, builtin_outlet=outlet
+        )
     return run_surge_watch(
         dry_run=args.dry_run,
         force_session=args.force_session,
@@ -5201,19 +5212,30 @@ def cmd_lab_launchd_uninstall(args: argparse.Namespace) -> int:
     return 0
 
 
-def _load_installed_minute_runtime(args: argparse.Namespace, settings: Settings, code_sha: str) -> InstalledMinuteReplay | None:
-    from rquant.minute_backtest_installation import MINUTE_INSTALLATION_ENV, load_minute_replay_installation
+def _load_installed_minute_runtime(
+    args: argparse.Namespace, settings: Settings, code_sha: str
+) -> InstalledMinuteReplay | None:
+    from rquant.minute_backtest_installation import (
+        MINUTE_INSTALLATION_ENV,
+        load_minute_replay_installation,
+    )
 
-    selected = getattr(args, "minute_replay_installation", None) or os.environ.get(MINUTE_INSTALLATION_ENV)
+    selected = getattr(args, "minute_replay_installation", None) or os.environ.get(
+        MINUTE_INSTALLATION_ENV
+    )
     if not selected:
         return None
     installed = load_minute_replay_installation(Path(selected), expected_code_sha=code_sha)
     profile = installed.profile
-    if (profile.runtime_root, profile.lab_jobs_path, profile.command_spool_path, profile.final_artifact_root,
-        profile.metadata_identity.source_path, profile.research_lake_root) != (
-        settings.lab_runtime_dir_resolved, settings.lab_jobs_path_resolved, settings.lab_job_command_dir_resolved,
-        settings.lab_final_artifact_dir_resolved, settings.research_readonly_db_path_resolved,
-        settings.research_lake_dir_resolved):
+    if (
+        profile.runtime_root, profile.lab_jobs_path, profile.command_spool_path,
+        profile.final_artifact_root, profile.metadata_identity.source_path,
+        profile.research_lake_root
+    ) != (
+        settings.lab_runtime_dir_resolved, settings.lab_jobs_path_resolved,
+        settings.lab_job_command_dir_resolved, settings.lab_final_artifact_dir_resolved,
+        settings.research_readonly_db_path_resolved, settings.research_lake_dir_resolved
+    ):
         raise ValueError("minute installed paths differ from original daemon settings")
     return installed
 
@@ -5383,15 +5405,21 @@ def cmd_lab_scheduler(args: argparse.Namespace) -> int:
                 claim_advance_hook=artifact_reclaimer.reclaim,
                 mutation_guard=runtime_identity_guard,
             )
-            from rquant.task_center_runtime import build_lab_scheduling_control
             from rquant.lab_scheduling_control import LabSchedulingMaintenanceScope
-            scheduling_control = build_lab_scheduling_control(getattr(args, "task_center_profile", None), store=store,
+            from rquant.task_center_runtime import build_lab_scheduling_control
+            scheduling_control = build_lab_scheduling_control(
+                getattr(args, "task_center_profile", None), store=store,
                 producer_commit=code_sha, runtime_root=settings.lab_runtime_dir_resolved,
                 claim_spool_root=settings.lab_job_claim_dir_resolved,
-                maintenance_scope=LabSchedulingMaintenanceScope(report_root=settings.lab_job_report_dir_resolved,
-                    artifact_commit_root=settings.lab_artifact_commit_dir_resolved, final_artifact_root=settings.lab_final_artifact_dir_resolved)
-                    if getattr(args, "task_center_profile", None) is not None else None,
-                production_mode=settings.app_env == "prod")
+                maintenance_scope=(
+                    LabSchedulingMaintenanceScope(
+                        report_root=settings.lab_job_report_dir_resolved,
+                        artifact_commit_root=settings.lab_artifact_commit_dir_resolved,
+                        final_artifact_root=settings.lab_final_artifact_dir_resolved
+                    ) if getattr(args, "task_center_profile", None) is not None else None
+                ),
+                production_mode=settings.app_env == "prod"
+            )
             from rquant.lab_job_center import ExperimentLifecycleCoordinator
 
             scheduler = LabScheduler(
@@ -5410,8 +5438,14 @@ def cmd_lab_scheduler(args: argparse.Namespace) -> int:
                 claim_worker_ids=settings.lab_scheduler_worker_id_list,
                 shard_lease_seconds=settings.lab_scheduler_shard_lease_seconds,
                 max_reports_per_tick=settings.lab_scheduler_max_reports_per_tick,
-                adapter_registry=default_strategy_job_adapter_registry() if minute_installation is None else minute_installation.registry,
-                lifecycle_synchronizer=None if minute_installation is None else ExperimentLifecycleCoordinator(minute_installation.commands),
+                adapter_registry=(
+                    default_strategy_job_adapter_registry() if minute_installation is None
+                    else minute_installation.registry
+                ),
+                lifecycle_synchronizer=(
+                    None if minute_installation is None
+                    else ExperimentLifecycleCoordinator(minute_installation.commands)
+                ),
                 max_plans_per_tick=settings.lab_scheduler_max_plans_per_tick,
                 max_claims_per_tick=settings.lab_scheduler_max_claims_per_tick,
                 max_claim_authority_per_tick=(settings.lab_scheduler_max_claim_authority_per_tick),
@@ -5794,15 +5828,18 @@ def cmd_lab_worker(args: argparse.Namespace) -> int:
         settings=settings,
         resource_admission=resource_admission,
     )
-    shard_runtime_manifest = minute_installation.shard_manifest if minute_installation is not None else build_builtin_shard_runtime_manifest(
-        catalog_path=settings.research_readonly_db_path_resolved,
-        forbidden_paths=(
-            settings.duckdb_path,
-            settings.duckdb_readonly_path_resolved,
-            settings.research_db_path_resolved,
-        ),
-        snapshot_root=settings.lab_worker_artifact_dir_resolved,
-        research_lake_root=settings.research_lake_dir_resolved,
+    shard_runtime_manifest = (
+        minute_installation.shard_manifest if minute_installation is not None
+        else build_builtin_shard_runtime_manifest(
+            catalog_path=settings.research_readonly_db_path_resolved,
+            forbidden_paths=(
+                settings.duckdb_path,
+                settings.duckdb_readonly_path_resolved,
+                settings.research_db_path_resolved,
+            ),
+            snapshot_root=settings.lab_worker_artifact_dir_resolved,
+            research_lake_root=settings.research_lake_dir_resolved,
+        )
     )
 
     for label, path in (
@@ -5826,9 +5863,12 @@ def cmd_lab_worker(args: argparse.Namespace) -> int:
         mutation_guard=runtime_identity_guard,
     ) as daemon_lock:
         from rquant.task_center_runtime import task_center_worker_barrier_identity
-        scheduling_identity = task_center_worker_barrier_identity(getattr(args, "task_center_profile", None),
+        scheduling_identity = task_center_worker_barrier_identity(
+            getattr(args, "task_center_profile", None),
             producer_commit=code_sha, runtime_root=settings.lab_runtime_dir_resolved,
-            claim_spool_root=settings.lab_job_claim_dir_resolved, production_mode=settings.app_env == "prod")
+            claim_spool_root=settings.lab_job_claim_dir_resolved,
+            production_mode=settings.app_env == "prod"
+        )
         claim_spool = LabClaimSpool(
             settings.lab_job_claim_dir_resolved,
             mutation_guard=runtime_identity_guard,
@@ -5996,7 +6036,10 @@ def cmd_lab_finalizer(args: argparse.Namespace) -> int:
                 verified_code_sha_provider=runtime_identity_guard,
                 finalizer_authority_key_provider=keyring.signing_key,
                 finalizer_authority_verification_key_provider=keyring.verification_key,
-                adapter_registry=default_strategy_job_adapter_registry() if minute_installation is None else minute_installation.registry,
+                adapter_registry=(
+                    default_strategy_job_adapter_registry() if minute_installation is None
+                    else minute_installation.registry
+                ),
             )
             daemon = LabFinalizerDaemon(
                 reader=reader,
@@ -8789,18 +8832,25 @@ def cmd_ops_task_snapshot(args: argparse.Namespace) -> int:
     from rquant.ops_status_serving import collect_and_publish_ops_tasks
     from rquant.task_center_runtime import TaskUnitRunSource, load_task_center_control_profile
 
-    key = read_secure_regular_file(args.manifest_public_key, expected_uid=os.geteuid(), expected_gid=os.getegid(),
-        allowed_modes=frozenset({0o600, 0o644}), max_bytes=4096)
+    key = read_secure_regular_file(
+        args.manifest_public_key, expected_uid=os.geteuid(), expected_gid=os.getegid(),
+        allowed_modes=frozenset({0o600, 0o644}), max_bytes=4096
+    )
     source = None
     if args.task_center_profile is not None:
-        profile = load_task_center_control_profile(args.task_center_profile, producer_commit=args.producer_commit, runtime_root=args.task_center_profile.parent)
+        profile = load_task_center_control_profile(
+            args.task_center_profile, producer_commit=args.producer_commit,
+            runtime_root=args.task_center_profile.parent
+        )
         if profile.unit_journal_identity is None:
             raise ValueError("task snapshot profile has no exact original unit journal identity")
         source = TaskUnitRunSource(identity=profile.unit_journal_identity)
-    pointer = collect_and_publish_ops_tasks(manifest_path=args.manifest, manifest_public_key_pem=key,
+    pointer = collect_and_publish_ops_tasks(
+        manifest_path=args.manifest, manifest_public_key_pem=key,
         authority_root=args.authority_root, producer_commit=args.producer_commit,
         collector=OpsStatusCollector(observe_host_cpu=getattr(args, "observe_host_cpu", False)),
-        run_source=source)
+        run_source=source
+    )
     print(pointer.model_dump_json())
     return 0
 

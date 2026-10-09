@@ -96,7 +96,16 @@ function fillDates() {
     fireEvent.change(screen.getByLabelText(label ?? ""), { target: { value } });
   }
 }
+async function openMinutePlayback() {
+  await screen.findByRole("button", { name: /^(打开|收起)分钟回放$/ });
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: /^(打开|收起)分钟回放$/ })).toBeEnabled(),
+  );
+  const entry = screen.getByRole("button", { name: /^(打开|收起)分钟回放$/ });
+  if (entry.textContent === "打开分钟回放") await userEvent.click(entry);
+}
 async function openParameters() {
+  await openMinutePlayback();
   await waitFor(() => expect(screen.getByLabelText("回测配置")).toBeEnabled());
   fireEvent.change(screen.getByLabelText("回测配置"), { target: { value: "parameters" } });
   await screen.findByRole("option", { name: /完整分钟验证资料/ });
@@ -232,6 +241,7 @@ it("a new viewer/generation clears private drafts and cannot restore the previou
       metaEnvelope({ viewer: "other-researcher", generationId: "b".repeat(64) }),
     );
   });
+  await openMinutePlayback();
   await waitFor(() => expect(screen.getByLabelText("回测配置")).toHaveValue("fixed"));
   expect(screen.queryByLabelText("最长持仓（交易日）")).not.toBeInTheDocument();
   await openParameters();
@@ -391,6 +401,7 @@ it("API08 selects parameter and fixed jobs by their actual UUID and exposes the 
   const summary = installResult();
   const user = userEvent.setup();
   renderApp("/backtest?view=minute");
+  await openMinutePlayback();
   await screen.findByRole("region", { name: "N字形 · 参数回测 · 版本 1" });
   const tasks = screen.getByRole("table", { name: "分钟策略任务" });
   expect(within(tasks).getByText("N字形 · 参数回测 · 版本 1")).toBeVisible();
@@ -441,6 +452,7 @@ it.each([
     );
     const user = userEvent.setup();
     renderApp("/backtest?view=minute");
+    await openMinutePlayback();
     await screen.findByRole("region", { name: `${name} · 参数回测 · 版本 1` });
     await user.click(screen.getByRole("button", { name: "参数与来源" }));
     const drawer = await screen.findByRole("dialog", { name: "参数与来源" });
@@ -461,6 +473,7 @@ it.each([
   async (nature, label) => {
     installResult({ ...parameterResultSource, source_nature: nature });
     renderApp("/backtest?view=minute");
+    await openMinutePlayback();
     const panel = await screen.findByRole("region", { name: "N字形 · 参数回测 · 版本 1" });
     expect(
       within(panel).getByText(new RegExp(`2026-07-31 至 2026-08-03 · ${label}`)),
@@ -473,6 +486,7 @@ it.each(["running", "sealing", "failed"] as const)(
   async (status) => {
     installResult(parameterResultSource, { ...parameterJob, status });
     renderApp("/backtest?view=minute");
+    await openMinutePlayback();
     const panel = await screen.findByRole("region", { name: "N字形 · 参数回测 · 版本 1" });
     expect(
       within(panel).getByText(
@@ -490,6 +504,7 @@ it("API08 closes private recipe details when the viewer and generation change", 
   installResult();
   const user = userEvent.setup();
   const { queryClient } = renderApp("/backtest?view=minute");
+  await openMinutePlayback();
   await user.click(await screen.findByRole("button", { name: "参数与来源" }));
   await screen.findByRole("dialog", { name: "参数与来源" });
   server.use(

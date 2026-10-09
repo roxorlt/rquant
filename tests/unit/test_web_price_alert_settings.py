@@ -80,6 +80,7 @@ def test_incomplete_price_admission_cannot_start(missing: str) -> None:
         ("price_alert_admission_shared_gid", True),
         ("price_alert_admission_service_uid", os.geteuid()),
     ],
+    ids=(None, None, None, None, None, None, None, "same-service-uid"),
 )
 def test_price_admission_rejects_unsafe_path_or_identity(field: str, value: object) -> None:
     with pytest.raises(ValueError):

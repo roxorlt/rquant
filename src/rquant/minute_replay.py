@@ -160,7 +160,9 @@ def evaluate_n_shape_entry(
     """原六种入场判断；调用者提供截至当前 bar 的累计事实。"""
     if first_signal_time is not None and first_signal_time > quote_time:
         raise ValueError("first signal time is in the future")
-    positive_prior = [amount for amount in prior_amounts[-config.amount_surge_lookback:] if amount > 0]
+    positive_prior = [
+        amount for amount in prior_amounts[-config.amount_surge_lookback:] if amount > 0
+    ]
     average_prior_amount = sum(positive_prior) / len(positive_prior) if positive_prior else None
     is_amount_surge = (
         average_prior_amount is not None
@@ -179,7 +181,10 @@ def evaluate_n_shape_entry(
     factor_score: float | None = None
     if config.entry_mode == "factor_confirm" and is_signal:
         factor_score = score_feature_terms(
-            {**(static_factors or {}), "vwap_position": latest_price / vwap if vwap is not None and vwap > 0 else None},
+            {
+                **(static_factors or {}),
+                "vwap_position": latest_price / vwap if vwap is not None and vwap > 0 else None,
+            },
             N_SHAPE_B_V1_SCORE_TERMS,
         )
     if config.entry_mode == "first_break":
@@ -964,25 +969,24 @@ def _find_entry_snapshot(
             clocked_amount_history.append((quote_time.time(), minute_amount))
             continue
 
-        if config.entry_mode == "break_retest":
-            if entry_check.eligible:
-                signal_features = build_intraday_relative_volume_features(
-                    store,
-                    item.ts_code,
-                    quote_time,
-                    current_minute_amount=minute_amount,
-                    current_cum_amount=cum_amount,
-                    current_day_amounts=clocked_amount_history,
-                    freq=config.freq,
-                )
-                snapshot = _build_snapshot(
-                    "minute_break_retest",
-                    idx,
-                    quote,
-                    signal_features,
-                )
-                if snapshot is not None:
-                    return snapshot
+        if config.entry_mode == "break_retest" and entry_check.eligible:
+            signal_features = build_intraday_relative_volume_features(
+                store,
+                item.ts_code,
+                quote_time,
+                current_minute_amount=minute_amount,
+                current_cum_amount=cum_amount,
+                current_day_amounts=clocked_amount_history,
+                freq=config.freq,
+            )
+            snapshot = _build_snapshot(
+                "minute_break_retest",
+                idx,
+                quote,
+                signal_features,
+            )
+            if snapshot is not None:
+                return snapshot
 
         if (
             config.entry_mode == "late_confirm"

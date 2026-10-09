@@ -7,9 +7,9 @@ from __future__ import annotations
 
 import math
 import time
-from decimal import Decimal
 from collections.abc import Callable
 from datetime import date, datetime
+from decimal import Decimal
 from typing import Any, Literal, TypeVar, cast
 
 import pandas as pd
@@ -51,7 +51,9 @@ def normalize_sdk_nullable_response(api_name: str,response: pd.DataFrame) -> pd.
             is_nan=isinstance(value,float) and math.isnan(value)
             if value is pd.NA or is_nan:
                 if column not in nullable:
-                    raise ValueError('nonfinite or pandas missing value is outside nullable source fields')
+                    raise ValueError(
+                        'nonfinite or pandas missing value is outside nullable source fields'
+                    )
                 value=None
             elif isinstance(value,float) and not math.isfinite(value):
                 raise ValueError('supplier infinity cannot become a missing value')
@@ -177,7 +179,9 @@ class TushareAdapter:
         observer = getattr(self, "_transport_observer", None)
         if getattr(self,'_sdk_null_normalization',None) is not None:
             if observer is None:
-                raise SourceQuotaConflictError('source null normalization requires a bound original observer')
+                raise SourceQuotaConflictError(
+                    'source null normalization requires a bound original observer'
+                )
             original=call
             def normalized() -> _T:
                 result=original()
@@ -310,14 +314,29 @@ class TushareAdapter:
         return None
 
     def _financial_raw(self,api_name: str,parameters: dict[str,str]) -> pd.DataFrame:
-        required={'ts_code','period'} if api_name=='fina_indicator' else {'ts_code','ann_date'} if api_name=='dividend' else {'ts_code','start_date','end_date'}
-        if api_name not in {'fina_indicator','income','balancesheet','cashflow','forecast','express','dividend'} or set(parameters)!=required:
+        required=(
+            {'ts_code','period'} if api_name=='fina_indicator'
+            else {'ts_code','ann_date'} if api_name=='dividend'
+            else {'ts_code','start_date','end_date'}
+        )
+        if (
+            api_name not in {
+                'fina_indicator','income','balancesheet','cashflow','forecast','express','dividend'
+            }
+            or set(parameters)!=required
+        ):
             raise ValueError('financial SDK request is outside the original whitelist')
         for name,value in parameters.items():
             if name=='ts_code':
-                if len(value)!=9 or value[:6].isdigit() is False or value[6:] not in {'.SH','.SZ','.BJ'}:
+                if (
+                    len(value)!=9 or value[:6].isdigit() is False
+                    or value[6:] not in {'.SH','.SZ','.BJ'}
+                ):
                     raise ValueError('financial SDK security is invalid')
-            elif len(value)!=8 or not value.isascii() or not value.isdigit() or datetime.strptime(value,'%Y%m%d').strftime('%Y%m%d')!=value:
+            elif (
+                len(value)!=8 or not value.isascii() or not value.isdigit()
+                or datetime.strptime(value,'%Y%m%d').strftime('%Y%m%d')!=value
+            ):
                 raise ValueError('financial SDK date is invalid')
         if parameters.get('start_date','')>parameters.get('end_date','99999999'):
             raise ValueError('financial SDK date window is reversed')
@@ -328,19 +347,29 @@ class TushareAdapter:
         return self._financial_raw('fina_indicator',{'ts_code':ts_code,'period':period})
 
     def income(self,*,ts_code: str,start_date: str,end_date: str) -> pd.DataFrame:
-        return self._financial_raw('income',{'ts_code':ts_code,'start_date':start_date,'end_date':end_date})
+        return self._financial_raw(
+            'income',{'ts_code':ts_code,'start_date':start_date,'end_date':end_date}
+        )
 
     def balancesheet(self,*,ts_code: str,start_date: str,end_date: str) -> pd.DataFrame:
-        return self._financial_raw('balancesheet',{'ts_code':ts_code,'start_date':start_date,'end_date':end_date})
+        return self._financial_raw(
+            'balancesheet',{'ts_code':ts_code,'start_date':start_date,'end_date':end_date}
+        )
 
     def cashflow(self,*,ts_code: str,start_date: str,end_date: str) -> pd.DataFrame:
-        return self._financial_raw('cashflow',{'ts_code':ts_code,'start_date':start_date,'end_date':end_date})
+        return self._financial_raw(
+            'cashflow',{'ts_code':ts_code,'start_date':start_date,'end_date':end_date}
+        )
 
     def forecast(self,*,ts_code: str,start_date: str,end_date: str) -> pd.DataFrame:
-        return self._financial_raw('forecast',{'ts_code':ts_code,'start_date':start_date,'end_date':end_date})
+        return self._financial_raw(
+            'forecast',{'ts_code':ts_code,'start_date':start_date,'end_date':end_date}
+        )
 
     def express(self,*,ts_code: str,start_date: str,end_date: str) -> pd.DataFrame:
-        return self._financial_raw('express',{'ts_code':ts_code,'start_date':start_date,'end_date':end_date})
+        return self._financial_raw(
+            'express',{'ts_code':ts_code,'start_date':start_date,'end_date':end_date}
+        )
 
     def dividend(self,*,ts_code: str,ann_date: str) -> pd.DataFrame:
         return self._financial_raw('dividend',{'ts_code':ts_code,'ann_date':ann_date})

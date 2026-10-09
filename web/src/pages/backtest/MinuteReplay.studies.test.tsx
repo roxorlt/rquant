@@ -890,6 +890,7 @@ it("clears current private results, axis inspection and draft selection on viewe
     expect(screen.queryByRole("dialog", { name: "研究依据" })).not.toBeInTheDocument(),
   );
   expect(screen.queryByRole("region", { name: "验证结果" })).not.toBeInTheDocument();
+  await userEvent.click(screen.getByRole("button", { name: "新建研究" }));
   expect(screen.getByLabelText("研究训练开始")).toHaveValue("");
   expect(screen.queryByRole("button", { name: "重试原研究" })).not.toBeInTheDocument();
 });

@@ -17,7 +17,11 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, model_validator
 
 if TYPE_CHECKING:
-    from rquant.backfill_execute_contracts import BackfillExecutionIntent, BackfillExecutionSpec, MaintenanceExecutionStatus
+    from rquant.backfill_execute_contracts import (
+        BackfillExecutionIntent,
+        BackfillExecutionSpec,
+        MaintenanceExecutionStatus,
+    )
     from rquant.financial_runtime import FinancialExecutionIntent, FinancialExecutionSpec
 
 BackfillTaskStatus: TypeAlias = Literal["pending", "running", "succeeded", "failed"]
@@ -650,12 +654,16 @@ class BackfillStateStore:
                 execution_id TEXT NOT NULL, owner TEXT NOT NULL, payload_json TEXT NOT NULL,
                 content_hash TEXT NOT NULL, expires_at TEXT NOT NULL, consumed_command_id TEXT
             )''')
-            connection.execute('''CREATE TABLE IF NOT EXISTS data_center_maintenance_execution (
-                execution_id TEXT PRIMARY KEY, owner TEXT NOT NULL, manifest_id TEXT NOT NULL UNIQUE,
-                primary_generation TEXT NOT NULL, spec_json TEXT NOT NULL, spec_hash TEXT NOT NULL,
-                status TEXT NOT NULL, status_json TEXT NOT NULL,
-                FOREIGN KEY(manifest_id) REFERENCES backfill_manifest(manifest_id)
-            )''')
+            connection.execute(
+                'CREATE TABLE IF NOT EXISTS data_center_maintenance_execution (\n'
+                '                execution_id TEXT PRIMARY KEY, owner TEXT NOT NULL, '
+                'manifest_id TEXT NOT NULL UNIQUE,\n'
+                '                primary_generation TEXT NOT NULL, spec_json TEXT NOT NULL, '
+                'spec_hash TEXT NOT NULL,\n'
+                '                status TEXT NOT NULL, status_json TEXT NOT NULL,\n'
+                '                FOREIGN KEY(manifest_id) '
+                'REFERENCES backfill_manifest(manifest_id)\n'
+                '            )')
             connection.execute('''CREATE UNIQUE INDEX IF NOT EXISTS data_center_maintenance_active
                 ON data_center_maintenance_execution(primary_generation)
                 WHERE status IN ('queued','running','verifying')''')
@@ -669,12 +677,16 @@ class BackfillStateStore:
         if not self.maintenance_enabled:
             raise ValueError('controlled maintenance is not configured')
 
-    def maintenance_intent_by_command(self,command_id: str,*,owner: str) -> BackfillExecutionIntent | None:
+    def maintenance_intent_by_command(
+            self,command_id: str,*,owner: str
+    ) -> BackfillExecutionIntent | None:
         from rquant.backfill_execute_contracts import BackfillExecutionIntent
         self._require_maintenance()
         connection=self._connect()
         try:
-            row=connection.execute('SELECT owner,payload_json,content_hash FROM data_center_maintenance_intent WHERE prepare_command_id=?',
+            row=connection.execute(
+                'SELECT owner,payload_json,content_hash FROM data_center_maintenance_intent '
+                'WHERE prepare_command_id=?',
                 (command_id,)).fetchone()
             if row is None:
                 return None
@@ -687,36 +699,47 @@ class BackfillStateStore:
         finally:
             connection.close()
 
-    def persist_maintenance_intent(self,intent: BackfillExecutionIntent | FinancialExecutionIntent) -> BackfillExecutionIntent | FinancialExecutionIntent:
+    def persist_maintenance_intent(
+            self,intent: BackfillExecutionIntent | FinancialExecutionIntent
+    ) -> BackfillExecutionIntent | FinancialExecutionIntent:
         from rquant.backfill_execute_contracts import BackfillExecutionIntent
         from rquant.financial_runtime import FinancialExecutionIntent
         self._require_maintenance()
-        model=FinancialExecutionIntent if isinstance(intent,FinancialExecutionIntent) else BackfillExecutionIntent
+        model=(FinancialExecutionIntent
+            if isinstance(intent,FinancialExecutionIntent) else BackfillExecutionIntent)
         intent=model.model_validate_json(intent.model_dump_json())
         payload=intent.model_dump_json()
         if len(payload.encode())>8_000_000:
             raise ValueError('execution confirmation exceeds bounded capacity')
         with self._write_transaction() as connection:
-            old=connection.execute('SELECT payload_json FROM data_center_maintenance_intent WHERE prepare_command_id=?',
+            old=connection.execute(
+                'SELECT payload_json FROM data_center_maintenance_intent '
+                'WHERE prepare_command_id=?',
                 (intent.prepare_command_id,)).fetchone()
             if old is not None:
                 if old['payload_json']!=payload:
                     raise ValueError('same confirmation command has different content')
                 return intent
-            if connection.execute('SELECT COUNT(*) FROM data_center_maintenance_intent').fetchone()[0]>=4096:
+            if connection.execute(
+                    'SELECT COUNT(*) FROM data_center_maintenance_intent').fetchone()[0]>=4096:
                 raise ValueError('execution confirmation history capacity reached')
             connection.execute('''INSERT INTO data_center_maintenance_intent
                 (intent_id,prepare_command_id,execution_id,owner,payload_json,content_hash,expires_at)
-                VALUES (?,?,?,?,?,?,?)''',(intent.intent_id,intent.prepare_command_id,intent.execution_id,intent.owner,
+                VALUES (?,?,?,?,?,?,?)''',
+                (intent.intent_id,intent.prepare_command_id,intent.execution_id,intent.owner,
                 payload,intent.intent_id,_encode_time(intent.expires_at)))
         return intent
 
-    def financial_intent_by_command(self,command_id: str,*,owner: str) -> FinancialExecutionIntent | None:
+    def financial_intent_by_command(
+            self,command_id: str,*,owner: str
+    ) -> FinancialExecutionIntent | None:
         from rquant.financial_runtime import FinancialExecutionIntent
         self._require_maintenance()
         connection=self._connect()
         try:
-            row=connection.execute('SELECT owner,payload_json,content_hash FROM data_center_maintenance_intent WHERE prepare_command_id=?',
+            row=connection.execute(
+                'SELECT owner,payload_json,content_hash FROM data_center_maintenance_intent '
+                'WHERE prepare_command_id=?',
                 (command_id,)).fetchone()
             if row is None:
                 return None
@@ -730,16 +753,23 @@ class BackfillStateStore:
             connection.close()
 
     @staticmethod
-    def _maintenance_status_on(connection: sqlite3.Connection,execution_id: str,*,owner: str) -> MaintenanceExecutionStatus:
+    def _maintenance_status_on(
+            connection: sqlite3.Connection,execution_id: str,*,owner: str
+    ) -> MaintenanceExecutionStatus:
         from rquant.backfill_execute_contracts import MaintenanceExecutionStatus
-        row=connection.execute('SELECT owner,manifest_id,status,status_json FROM data_center_maintenance_execution WHERE execution_id=?',
+        row=connection.execute(
+            'SELECT owner,manifest_id,status,status_json FROM data_center_maintenance_execution '
+            'WHERE execution_id=?',
             (execution_id,)).fetchone()
         if row is None or row['owner']!=owner:
             raise ValueError('owned maintenance execution is unavailable')
         value=MaintenanceExecutionStatus.model_validate_json(row['status_json'])
-        if value.status!=row['status'] or value.manifest_id!=row['manifest_id'] or value.owner!=owner or value.execution_id!=execution_id:
+        if (value.status!=row['status'] or value.manifest_id!=row['manifest_id']
+                or value.owner!=owner or value.execution_id!=execution_id):
             raise ValueError('maintenance status binding changed')
-        counts=connection.execute('SELECT COUNT(*) AS total,SUM(status=\'succeeded\') AS completed FROM backfill_task WHERE manifest_id=?',
+        counts=connection.execute(
+            'SELECT COUNT(*) AS total,SUM(status=\'succeeded\') AS completed '
+            'FROM backfill_task WHERE manifest_id=?',
             (value.manifest_id,)).fetchone()
         if value.total_tasks!=counts['total']:
             raise ValueError('maintenance task manifest count changed')
@@ -753,12 +783,16 @@ class BackfillStateStore:
         finally:
             connection.close()
 
-    def get_backfill_execution_spec(self,execution_id: str,*,owner: str) -> BackfillExecutionSpec | None:
+    def get_backfill_execution_spec(
+            self,execution_id: str,*,owner: str
+    ) -> BackfillExecutionSpec | None:
         from rquant.backfill_execute_contracts import BackfillExecutionSpec
         self._require_maintenance()
         connection=self._connect()
         try:
-            row=connection.execute('SELECT owner,spec_json,spec_hash FROM data_center_maintenance_execution WHERE execution_id=?',
+            row=connection.execute(
+                'SELECT owner,spec_json,spec_hash FROM data_center_maintenance_execution '
+                'WHERE execution_id=?',
                 (execution_id,)).fetchone()
             if row is None:
                 return None
@@ -773,33 +807,47 @@ class BackfillStateStore:
 
     def admit_backfill_execution(self,spec: BackfillExecutionSpec,manifest: BackfillManifestInput,*,
                                 now: datetime | None = None) -> MaintenanceExecutionStatus:
-        from rquant.backfill_execute_contracts import BackfillExecutionSpec,MaintenanceExecutionStatus
+        from rquant.backfill_execute_contracts import (
+            BackfillExecutionSpec,
+            MaintenanceExecutionStatus,
+        )
         self._require_maintenance()
         spec=BackfillExecutionSpec.model_validate_json(spec.model_dump_json())
         observed=_normalize_time(now or _utc_now())
-        if manifest.manifest_id!=spec.manifest_id or manifest.payload.get('execution_id')!=spec.execution_id:
+        if (manifest.manifest_id!=spec.manifest_id
+                or manifest.payload.get('execution_id')!=spec.execution_id):
             raise ValueError('original manifest differs from immutable execution')
         payload=spec.model_dump_json()
         with self._write_transaction() as connection:
-            previous=connection.execute('SELECT owner,spec_json FROM data_center_maintenance_execution WHERE execution_id=?',
+            previous=connection.execute(
+                'SELECT owner,spec_json FROM data_center_maintenance_execution '
+                'WHERE execution_id=?',
                 (spec.execution_id,)).fetchone()
             if previous is not None:
                 if previous['owner']!=spec.owner or previous['spec_json']!=payload:
                     raise ValueError('same execution identity has different content')
                 return self._maintenance_status_on(connection,spec.execution_id,owner=spec.owner)
-            intent=connection.execute('SELECT payload_json,consumed_command_id FROM data_center_maintenance_intent WHERE intent_id=?',
+            intent=connection.execute(
+                'SELECT payload_json,consumed_command_id FROM data_center_maintenance_intent '
+                'WHERE intent_id=?',
                 (spec.intent.intent_id,)).fetchone()
             if (intent is None or intent['payload_json']!=spec.intent.model_dump_json()
-                    or intent['consumed_command_id'] is not None or not spec.intent.issued_at<=observed<spec.intent.expires_at):
+                    or intent['consumed_command_id'] is not None
+                    or not spec.intent.issued_at<=observed<spec.intent.expires_at):
                 raise ValueError('execution confirmation is missing, consumed or expired')
-            if connection.execute('SELECT COUNT(*) FROM data_center_maintenance_execution').fetchone()[0]>=4096:
+            if connection.execute(
+                    'SELECT COUNT(*) FROM data_center_maintenance_execution').fetchone()[0]>=4096:
                 raise ValueError('maintenance execution history capacity reached')
             primary=spec.intent.primary_identity.generation_id
-            occupied=connection.execute('''SELECT execution_id FROM data_center_maintenance_execution WHERE primary_generation=?
-                AND status IN ('queued','running','verifying')''',(primary,)).fetchone()
+            occupied=connection.execute(
+                'SELECT execution_id FROM data_center_maintenance_execution '
+                'WHERE primary_generation=?\n'
+                "                AND status IN ('queued','running','verifying')",
+                (primary,)).fetchone()
             if occupied is not None:
                 raise ValueError('another maintenance execution owns the physical primary')
-            self._persist_manifest_on(connection,manifest,_encode_time(observed),self._content_hash(self._canonical_manifest(manifest)))
+            self._persist_manifest_on(connection,manifest,_encode_time(observed),
+                self._content_hash(self._canonical_manifest(manifest)))
             status=MaintenanceExecutionStatus(execution_id=spec.execution_id,owner=spec.owner,kind='backfill',
                 manifest_id=spec.manifest_id,plan_task_id=spec.plan_task_id,plan_sha256=spec.plan.content_sha256,
                 source_generation_id=spec.intent.source_generation_id,policy_generation=spec.intent.policy_generation,
@@ -807,18 +855,25 @@ class BackfillStateStore:
                 created_at=observed,updated_at=observed)
             connection.execute('''INSERT INTO data_center_maintenance_execution
                 (execution_id,owner,manifest_id,primary_generation,spec_json,spec_hash,status,status_json)
-                VALUES (?,?,?,?,?,?,?,?)''',(spec.execution_id,spec.owner,spec.manifest_id,primary,payload,
-                self._content_hash(spec.model_dump(mode='json')),status.status,status.model_dump_json()))
-            connection.execute('UPDATE data_center_maintenance_intent SET consumed_command_id=? WHERE intent_id=?',
+                VALUES (?,?,?,?,?,?,?,?)''',
+                (spec.execution_id,spec.owner,spec.manifest_id,primary,payload,
+                self._content_hash(spec.model_dump(mode='json')),
+                status.status,status.model_dump_json()))
+            connection.execute(
+                'UPDATE data_center_maintenance_intent SET consumed_command_id=? WHERE intent_id=?',
                 (spec.execute_command_id,spec.intent.intent_id))
             return status
 
-    def get_financial_execution_spec(self,execution_id: str,*,owner: str) -> FinancialExecutionSpec | None:
+    def get_financial_execution_spec(
+            self,execution_id: str,*,owner: str
+    ) -> FinancialExecutionSpec | None:
         from rquant.financial_runtime import FinancialExecutionSpec
         self._require_maintenance()
         connection=self._connect()
         try:
-            row=connection.execute('SELECT owner,spec_json,spec_hash FROM data_center_maintenance_execution WHERE execution_id=?',
+            row=connection.execute(
+                'SELECT owner,spec_json,spec_hash FROM data_center_maintenance_execution '
+                'WHERE execution_id=?',
                 (execution_id,)).fetchone()
             if row is None:
                 return None
@@ -831,62 +886,84 @@ class BackfillStateStore:
         finally:
             connection.close()
 
-    def admit_financial_execution(self,spec: FinancialExecutionSpec,manifest: BackfillManifestInput,*,
+    def admit_financial_execution(
+            self,spec: FinancialExecutionSpec,manifest: BackfillManifestInput,*,
             now: datetime | None = None) -> MaintenanceExecutionStatus:
-        from rquant.financial_runtime import FinancialExecutionSpec,build_financial_manifest
         from rquant.backfill_execute_contracts import MaintenanceExecutionStatus
+        from rquant.financial_runtime import FinancialExecutionSpec, build_financial_manifest
         self._require_maintenance()
         spec=FinancialExecutionSpec.model_validate_json(spec.model_dump_json())
         observed=_normalize_time(now or _utc_now())
-        if manifest!=build_financial_manifest(spec.plan) or len(spec.model_dump_json().encode())>8_000_000:
+        if (manifest!=build_financial_manifest(spec.plan)
+                or len(spec.model_dump_json().encode())>8_000_000):
             raise ValueError('original financial manifest differs or exceeds capacity')
         payload=spec.model_dump_json()
         with self._write_transaction() as connection:
-            previous=connection.execute('SELECT owner,spec_json FROM data_center_maintenance_execution WHERE execution_id=?',
+            previous=connection.execute(
+                'SELECT owner,spec_json FROM data_center_maintenance_execution '
+                'WHERE execution_id=?',
                 (spec.execution_id,)).fetchone()
             if previous is not None:
                 if previous['owner']!=spec.owner or previous['spec_json']!=payload:
                     raise ValueError('same financial execution identity has different content')
                 return self._maintenance_status_on(connection,spec.execution_id,owner=spec.owner)
-            intent=connection.execute('SELECT payload_json,consumed_command_id FROM data_center_maintenance_intent WHERE intent_id=?',
+            intent=connection.execute(
+                'SELECT payload_json,consumed_command_id FROM data_center_maintenance_intent '
+                'WHERE intent_id=?',
                 (spec.intent.intent_id,)).fetchone()
-            if (intent is None or intent['payload_json']!=spec.intent.model_dump_json() or intent['consumed_command_id'] is not None
+            if (intent is None or intent['payload_json']!=spec.intent.model_dump_json()
+                    or intent['consumed_command_id'] is not None
                     or not spec.intent.issued_at<=observed<spec.intent.expires_at):
                 raise ValueError('financial confirmation is missing, consumed or expired')
-            if connection.execute('SELECT COUNT(*) FROM data_center_maintenance_execution').fetchone()[0]>=4096:
+            if connection.execute(
+                    'SELECT COUNT(*) FROM data_center_maintenance_execution').fetchone()[0]>=4096:
                 raise ValueError('maintenance execution history capacity reached')
             primary=spec.plan.primary_identity.generation_id
-            if connection.execute("SELECT 1 FROM data_center_maintenance_execution WHERE primary_generation=? AND status IN ('queued','running','verifying')",(primary,)).fetchone() is not None:
+            if connection.execute(
+                    'SELECT 1 FROM data_center_maintenance_execution WHERE primary_generation=? '
+                    "AND status IN ('queued','running','verifying')",
+                    (primary,)).fetchone() is not None:
                 raise ValueError('another maintenance execution owns the physical primary')
-            self._persist_manifest_on(connection,manifest,_encode_time(observed),self._content_hash(self._canonical_manifest(manifest)))
-            status=MaintenanceExecutionStatus(execution_id=spec.execution_id,owner=spec.owner,kind='financial',manifest_id=spec.manifest_id,
+            self._persist_manifest_on(connection,manifest,_encode_time(observed),
+                self._content_hash(self._canonical_manifest(manifest)))
+            status=MaintenanceExecutionStatus(
+                execution_id=spec.execution_id,owner=spec.owner,kind='financial',
+                manifest_id=spec.manifest_id,
                 plan_sha256=spec.plan.content_sha256,source_generation_id=spec.plan.source_generation_id,
                 policy_generation=spec.admission_policy.policy_generation,status='queued',control_sequence=1,
                 total_tasks=len(manifest.tasks),completed_tasks=0,created_at=observed,updated_at=observed)
             connection.execute('''INSERT INTO data_center_maintenance_execution
                 (execution_id,owner,manifest_id,primary_generation,spec_json,spec_hash,status,status_json)
-                VALUES (?,?,?,?,?,?,?,?)''',(spec.execution_id,spec.owner,spec.manifest_id,primary,payload,
-                self._content_hash(spec.model_dump(mode='json')),status.status,status.model_dump_json()))
-            connection.execute('UPDATE data_center_maintenance_intent SET consumed_command_id=? WHERE intent_id=?',
+                VALUES (?,?,?,?,?,?,?,?)''',
+                (spec.execution_id,spec.owner,spec.manifest_id,primary,payload,
+                self._content_hash(spec.model_dump(mode='json')),
+                status.status,status.model_dump_json()))
+            connection.execute(
+                'UPDATE data_center_maintenance_intent SET consumed_command_id=? WHERE intent_id=?',
                 (spec.execute_command_id,spec.intent.intent_id))
             return status
 
-    def maintenance_control(self,execution_id: str,*,owner: str,command_id: str,expected_sequence: int,
+    def maintenance_control(
+            self,execution_id: str,*,owner: str,command_id: str,expected_sequence: int,
             action: Literal['pause','resume'],now: datetime | None = None,
             policy_generation: str | None = None) -> MaintenanceExecutionStatus:
         from rquant.backfill_execute_contracts import MaintenanceExecutionStatus
         self._require_maintenance()
         observed=_normalize_time(now or _utc_now())
-        payload=_json_dumps({'execution_id':execution_id,'owner':owner,'expected_sequence':expected_sequence,'action':action})
+        payload=_json_dumps({'execution_id':execution_id,'owner':owner,
+            'expected_sequence':expected_sequence,'action':action})
         with self._write_transaction() as connection:
-            previous=connection.execute('SELECT payload_json,result_json FROM data_center_maintenance_control WHERE command_id=?',
+            previous=connection.execute(
+                'SELECT payload_json,result_json FROM data_center_maintenance_control '
+                'WHERE command_id=?',
                 (command_id,)).fetchone()
             if previous is not None:
                 if previous['payload_json']!=payload:
                     raise ValueError('same maintenance control command has different content')
                 return MaintenanceExecutionStatus.model_validate_json(previous['result_json'])
             current=self._maintenance_status_on(connection,execution_id,owner=owner)
-            if current.control_sequence!=expected_sequence or current.status in {'completed','failed'}:
+            if (current.control_sequence!=expected_sequence
+                    or current.status in {'completed','failed'}):
                 raise ValueError('maintenance control version is stale or terminal')
             changes={'control_sequence':expected_sequence+1,'updated_at':observed}
             if action=='pause':
@@ -901,24 +978,34 @@ class BackfillStateStore:
                 raise ValueError('unknown maintenance control action')
             updated=MaintenanceExecutionStatus.model_validate(current.model_dump(mode='python')|changes)
             try:
-                connection.execute('UPDATE data_center_maintenance_execution SET status=?,status_json=? WHERE execution_id=?',
+                connection.execute(
+                    'UPDATE data_center_maintenance_execution SET status=?,status_json=? '
+                    'WHERE execution_id=?',
                     (updated.status,updated.model_dump_json(),execution_id))
             except sqlite3.IntegrityError as error:
-                raise ValueError('another maintenance execution owns the physical primary') from error
-            if connection.execute('SELECT COUNT(*) FROM data_center_maintenance_control').fetchone()[0]>=8192:
+                raise ValueError(
+                    'another maintenance execution owns the physical primary') from error
+            if connection.execute(
+                    'SELECT COUNT(*) FROM data_center_maintenance_control').fetchone()[0]>=8192:
                 raise ValueError('maintenance control history capacity reached')
-            connection.execute('INSERT INTO data_center_maintenance_control(command_id,execution_id,payload_json,result_json) VALUES (?,?,?,?)',
+            connection.execute(
+                'INSERT INTO data_center_maintenance_control'
+                '(command_id,execution_id,payload_json,result_json) VALUES (?,?,?,?)',
                 (command_id,execution_id,payload,updated.model_dump_json()))
             return updated
 
     def maintenance_control_by_command(self,command_id: str,*,execution_id: str,owner: str,
-            expected_sequence: int,action: Literal['pause','resume']) -> MaintenanceExecutionStatus | None:
+            expected_sequence: int,action: Literal['pause','resume']
+    ) -> MaintenanceExecutionStatus | None:
         from rquant.backfill_execute_contracts import MaintenanceExecutionStatus
         self._require_maintenance()
-        expected=_json_dumps({'execution_id':execution_id,'owner':owner,'expected_sequence':expected_sequence,'action':action})
+        expected=_json_dumps({'execution_id':execution_id,'owner':owner,
+            'expected_sequence':expected_sequence,'action':action})
         connection=self._connect()
         try:
-            row=connection.execute('SELECT payload_json,result_json FROM data_center_maintenance_control WHERE command_id=?',(command_id,)).fetchone()
+            row=connection.execute(
+                'SELECT payload_json,result_json FROM data_center_maintenance_control '
+                'WHERE command_id=?',(command_id,)).fetchone()
             if row is None:
                 return None
             if row['payload_json']!=expected:
@@ -930,37 +1017,48 @@ class BackfillStateStore:
     def transition_maintenance(self,execution_id: str,*,owner: str,expected_sequence: int,
             status: Literal['running','paused','partial','verifying','failed','completed'],
             failure_code: str | None = None,current_date: date | None = None,
-            completion_sha256: str | None = None,audit_task_id: str | None = None,audit_report_sha256: str | None = None,
-            now: datetime | None = None,connection: sqlite3.Connection | None = None) -> MaintenanceExecutionStatus:
+            completion_sha256: str | None = None,audit_task_id: str | None = None,
+            audit_report_sha256: str | None = None,
+            now: datetime | None = None,connection: sqlite3.Connection | None = None
+    ) -> MaintenanceExecutionStatus:
         from rquant.backfill_execute_contracts import MaintenanceExecutionStatus
         self._require_maintenance()
         if connection is None:
             with self._write_transaction() as opened:
-                return self.transition_maintenance(execution_id,owner=owner,expected_sequence=expected_sequence,status=status,
-                    failure_code=failure_code,current_date=current_date,completion_sha256=completion_sha256,
-                    audit_task_id=audit_task_id,audit_report_sha256=audit_report_sha256,now=now,connection=opened)
+                return self.transition_maintenance(
+                    execution_id,owner=owner,expected_sequence=expected_sequence,status=status,
+                    failure_code=failure_code,current_date=current_date,
+                    completion_sha256=completion_sha256,audit_task_id=audit_task_id,
+                    audit_report_sha256=audit_report_sha256,now=now,connection=opened)
         if not connection.in_transaction:
             raise ValueError('maintenance transition requires original state transaction')
         current=self._maintenance_status_on(connection,execution_id,owner=owner)
         if current.control_sequence!=expected_sequence or current.status in {'completed','failed'}:
             raise ValueError('maintenance transition is stale or terminal')
         if status in {'paused','partial','failed','completed'}:
-            running=connection.execute("SELECT COUNT(*) FROM backfill_task WHERE manifest_id=? AND status='running'",(current.manifest_id,)).fetchone()[0]
+            running=connection.execute(
+                "SELECT COUNT(*) FROM backfill_task WHERE manifest_id=? AND status='running'",
+                (current.manifest_id,)).fetchone()[0]
             if running:
-                raise ValueError('active original claim must be released before releasing maintenance slot')
+                raise ValueError(
+                    'active original claim must be released before releasing maintenance slot')
         if status=='completed' and current.completed_tasks!=current.total_tasks:
             raise ValueError('unfinished original tasks cannot complete maintenance')
         updated=MaintenanceExecutionStatus.model_validate(current.model_dump(mode='python')|{
             'status':status,'control_sequence':expected_sequence+1,'pause_applied':status=='paused',
-            'updated_at':_normalize_time(now or _utc_now()),'failure_code':failure_code,'current_date':current_date,
-            'completion_sha256':completion_sha256,'audit_task_id':audit_task_id or current.audit_task_id,
+            'updated_at':_normalize_time(now or _utc_now()),'failure_code':failure_code,
+            'current_date':current_date,'completion_sha256':completion_sha256,
+            'audit_task_id':audit_task_id or current.audit_task_id,
             'audit_report_sha256':audit_report_sha256 or current.audit_report_sha256})
-        connection.execute('UPDATE data_center_maintenance_execution SET status=?,status_json=? WHERE execution_id=?',
+        connection.execute(
+            'UPDATE data_center_maintenance_execution SET status=?,status_json=? '
+            'WHERE execution_id=?',
             (updated.status,updated.model_dump_json(),execution_id))
         return updated
 
     def verify_maintenance_claim(self,connection: sqlite3.Connection,claim: ClaimedBackfillTask,*,
-            execution_id: str,owner: str,expected_sequence: int,now: datetime) -> MaintenanceExecutionStatus:
+            execution_id: str,owner: str,expected_sequence: int,now: datetime
+    ) -> MaintenanceExecutionStatus:
         self._require_maintenance()
         current=self._maintenance_status_on(connection,execution_id,owner=owner)
         if (current.manifest_id!=claim.manifest_id or current.control_sequence!=expected_sequence
@@ -968,7 +1066,8 @@ class BackfillStateStore:
             raise StaleTaskClaimError('maintenance slot or control sequence changed')
         self._require_manifest_active(connection,claim.manifest_id)
         self._require_current_claim(connection,claim)
-        row=connection.execute('SELECT lease_expires_at FROM backfill_task WHERE manifest_id=? AND task_id=?',
+        row=connection.execute(
+            'SELECT lease_expires_at FROM backfill_task WHERE manifest_id=? AND task_id=?',
             (claim.manifest_id,claim.task_id)).fetchone()
         if row is None or _decode_time(row['lease_expires_at'])<=_normalize_time(now):
             raise StaleTaskClaimError('original maintenance claim lease expired')
@@ -1132,16 +1231,23 @@ class BackfillStateStore:
         lease_expires_at = claimed_at + timedelta(seconds=lease_seconds)
         with self._write_transaction() as connection:
             self._require_manifest_active(connection, manifest_id)
-            metadata_present=connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='data_center_maintenance_execution'").fetchone()
+            metadata_present=connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='data_center_maintenance_execution'").fetchone()
             controlled=None if metadata_present is None else connection.execute(
-                'SELECT execution_id,status,status_json FROM data_center_maintenance_execution WHERE manifest_id=?',(manifest_id,)).fetchone()
+                'SELECT execution_id,status,status_json FROM data_center_maintenance_execution '
+                'WHERE manifest_id=?',(manifest_id,)).fetchone()
             if controlled is not None:
                 from rquant.backfill_execute_contracts import MaintenanceExecutionStatus
                 control=MaintenanceExecutionStatus.model_validate_json(controlled['status_json'])
-                if (controlled['execution_id']!=maintenance_execution_id or controlled['status']!='running'
+                if (controlled['execution_id']!=maintenance_execution_id
+                        or controlled['status']!='running'
                         or control.pause_requested or control.pause_applied):
-                    raise StaleTaskClaimError('controlled manifest requires its current maintenance slot')
-                occupied=connection.execute("SELECT 1 FROM backfill_task WHERE manifest_id=? AND status='running' AND lease_expires_at>? LIMIT 1",
+                    raise StaleTaskClaimError(
+                        'controlled manifest requires its current maintenance slot')
+                occupied=connection.execute(
+                    "SELECT 1 FROM backfill_task WHERE manifest_id=? AND status='running' "
+                    'AND lease_expires_at>? LIMIT 1',
                     (manifest_id,_encode_time(claimed_at))).fetchone()
                 if occupied is not None:
                     return None
@@ -1345,7 +1451,9 @@ class BackfillStateStore:
         with self._write_transaction() as connection:
             self._release_claim_on(connection,claim,now=now)
 
-    def _release_claim_on(self,connection: sqlite3.Connection,claim: ClaimedBackfillTask,*,now: datetime | None) -> None:
+    def _release_claim_on(
+            self,connection: sqlite3.Connection,claim: ClaimedBackfillTask,*,now: datetime | None
+    ) -> None:
         released_at = _normalize_time(now or _utc_now())
         attempts = claim.attempt if claim.recovery_only else max(claim.attempt - 1, 0)
         task_row = self._require_current_claim(connection, claim)
@@ -1372,25 +1480,32 @@ class BackfillStateStore:
                 (_encode_time(released_at), claim.manifest_id),
             )
 
-    def release_expired_maintenance_claims(self,execution_id: str,*,owner: str,expected_sequence: int,
+    def release_expired_maintenance_claims(
+            self,execution_id: str,*,owner: str,expected_sequence: int,
             now: datetime | None = None) -> int:
         self._require_maintenance()
         observed=_normalize_time(now or _utc_now())
         with self._write_transaction() as connection:
             current=self._maintenance_status_on(connection,execution_id,owner=owner)
-            if current.control_sequence!=expected_sequence or current.status not in {'queued','running','verifying'}:
+            if (current.control_sequence!=expected_sequence
+                    or current.status not in {'queued','running','verifying'}):
                 raise StaleTaskClaimError('maintenance pause control changed')
             self._require_manifest_active(connection,current.manifest_id)
-            rows=connection.execute("SELECT * FROM backfill_task WHERE manifest_id=? AND status='running' AND lease_expires_at<=? ORDER BY ordinal LIMIT 4097",
+            rows=connection.execute(
+                "SELECT * FROM backfill_task WHERE manifest_id=? AND status='running' "
+                'AND lease_expires_at<=? ORDER BY ordinal LIMIT 4097',
                 (current.manifest_id,_encode_time(observed))).fetchall()
             if len(rows)>4096:
                 raise ValueError('original maintenance task scope exceeds frozen capacity')
             for row in rows:
-                claim=ClaimedBackfillTask(manifest_id=current.manifest_id,task_id=row['task_id'],ordinal=row['ordinal'],
-                    payload=_json_object(row['payload_json']),attempt=row['attempts'],max_attempts=row['max_attempts'],
-                    worker_id=row['worker_id'],claim_token=row['claim_token'],claimed_at=_decode_time(row['claimed_at']),
+                claim=ClaimedBackfillTask(
+                    manifest_id=current.manifest_id,task_id=row['task_id'],ordinal=row['ordinal'],
+                    payload=_json_object(row['payload_json']),attempt=row['attempts'],
+                    max_attempts=row['max_attempts'],worker_id=row['worker_id'],
+                    claim_token=row['claim_token'],claimed_at=_decode_time(row['claimed_at']),
                     lease_expires_at=_decode_time(row['lease_expires_at']),
-                    recovery_only=bool(row['recovery_attempted']) and row['attempts']>=row['max_attempts'])
+                    recovery_only=bool(row['recovery_attempted'])
+                    and row['attempts']>=row['max_attempts'])
                 self._release_claim_on(connection,claim,now=observed)
             return len(rows)
 

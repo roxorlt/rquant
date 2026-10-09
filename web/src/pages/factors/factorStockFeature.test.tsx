@@ -234,12 +234,14 @@ it.each([stockCapability, mixedStockCapability])(
 it("来源缺失或能力错配只保留表达式，历史结果仍按自己的来源显示", async () => {
   publish();
   const app = renderApp("/factors");
+  const user = userEvent.setup();
   const create = await screen.findByRole("button", { name: "新建因子" });
   await waitFor(() => expect(create).toBeEnabled());
   await userEvent.click(create);
   const dialog = screen.getByRole("dialog", { name: "新建因子" });
   const expression = within(dialog).getByRole("textbox", { name: "表达式" });
-  await userEvent.type(expression, "ma_alignment + price_percentile_250d");
+  await user.click(expression);
+  await user.paste("ma_alignment + price_percentile_250d");
   const generation = metaEnvelope().serving.generation_id;
   act(() =>
     app.queryClient.setQueryData(["factors", "capabilities", generation, "tester", 0], {

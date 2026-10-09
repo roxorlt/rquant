@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import math
 import hashlib
 import json
+import math
 import time
 from collections.abc import Callable, Sequence
 from datetime import UTC, date, datetime
@@ -12,13 +12,13 @@ from typing import Literal, Protocol
 
 import pandas as pd
 from loguru import logger
-from pydantic import ConfigDict,Field
-from rquant.runtime_contracts import RuntimeContractModel,canonical_sha256
+from pydantic import ConfigDict, Field
 
 from rquant.ingest import (
     _derive_target_daily_states,
     _load_target_daily_state_inputs,
 )
+from rquant.runtime_contracts import RuntimeContractModel, canonical_sha256
 from rquant.security_status import (
     DEFAULT_REQUEST_INTERVAL_SECONDS,
     NAMECHANGE_EARLIEST_DATE,
@@ -132,7 +132,8 @@ class PreparedMarketFrames(RuntimeContractModel):
     adj_factor: pd.DataFrame
 
 
-def prepare_market_frames(adapter: MarketDailyAdapter,trade_date: date,*,strict_date_scope: bool = False,
+def prepare_market_frames(adapter: MarketDailyAdapter,trade_date: date,*,
+        strict_date_scope: bool = False,
         api_sleep: float = _API_SLEEP,sleep: Callable[[float],None] = time.sleep,
         on_operation: Callable[[bool],None] | None = None) -> PreparedMarketFrames:
     """Reuse the original three requests and normalizers, outside any writer transaction."""
@@ -147,7 +148,9 @@ def prepare_market_frames(adapter: MarketDailyAdapter,trade_date: date,*,strict_
             if response.empty or {'ts_code','trade_date'}-set(response.columns):
                 raise ValueError('exact-day response is empty or lacks required keys')
             parsed=pd.to_datetime(response['trade_date'],errors='raise').dt.date
-            if parsed.isna().any() or set(parsed)!={trade_date} or response.duplicated(['ts_code','trade_date']).any() or response['ts_code'].isna().any():
+            if (parsed.isna().any() or set(parsed)!={trade_date}
+                    or response.duplicated(['ts_code','trade_date']).any()
+                    or response['ts_code'].isna().any()):
                 raise ValueError('exact-day response has wrong dates, null keys or duplicate keys')
             if len(response)>8000 or len(response.columns)>128:
                 raise ValueError('exact-day response exceeds row/column capacity')
@@ -156,9 +159,11 @@ def prepare_market_frames(adapter: MarketDailyAdapter,trade_date: date,*,strict_
                     raise ValueError('exact-day response has nonfinite numeric values')
         frames.append(_filter_prepared_date(response,trade_date))
         sleep(api_sleep)
-    if strict_date_scope and any(_frame_codes(frame)!=_frame_codes(frames[0]) for frame in frames[1:]):
+    if strict_date_scope and any(
+            _frame_codes(frame)!=_frame_codes(frames[0]) for frame in frames[1:]):
         raise ValueError('exact-day price, valuation and adjustment securities differ')
-    return PreparedMarketFrames(trade_date=trade_date,daily=frames[0],daily_basic=frames[1],adj_factor=frames[2])
+    return PreparedMarketFrames(
+        trade_date=trade_date,daily=frames[0],daily_basic=frames[1],adj_factor=frames[2])
 
 
 def _frame_codes(*frames: pd.DataFrame) -> set[str]:
@@ -504,7 +509,8 @@ def backfill_market_daily(
 def _prepared_frame_sha256(frame: pd.DataFrame) -> str:
     """Hash original derived inputs/results without rounding their float64 values."""
     digest=hashlib.sha256()
-    digest.update(json.dumps(tuple(str(name) for name in frame.columns),separators=(',',':')).encode())
+    digest.update(json.dumps(
+        tuple(str(name) for name in frame.columns),separators=(',',':')).encode())
     digest.update(len(frame).to_bytes(8,'big'))
     for name in frame.columns:
         values=frame[name]
@@ -520,7 +526,8 @@ def _prepared_frame_sha256(frame: pd.DataFrame) -> str:
         else:
             normalized=[]
             for value in values:
-                if value is None or value is pd.NA or value is pd.NaT or (isinstance(value,float) and math.isnan(value)):
+                if (value is None or value is pd.NA or value is pd.NaT
+                        or (isinstance(value,float) and math.isnan(value))):
                     normalized.append(None)
                 elif isinstance(value,(date,datetime)):
                     normalized.append({'stored_date_or_time':value.isoformat()})
@@ -528,7 +535,9 @@ def _prepared_frame_sha256(frame: pd.DataFrame) -> str:
                     normalized.append(value.item())
                 else:
                     normalized.append(value)
-            digest.update(json.dumps(normalized,ensure_ascii=False,sort_keys=True,separators=(',',':'),allow_nan=False).encode())
+            digest.update(json.dumps(
+                normalized,ensure_ascii=False,sort_keys=True,
+                separators=(',',':'),allow_nan=False).encode())
     return digest.hexdigest()
 
 
@@ -542,7 +551,9 @@ class PreparedDailyStateTail(RuntimeContractModel):
     rows: pd.DataFrame
 
 
-def _bounded_state_tail_inputs(store: DuckDBStore,codes: tuple[str,...],start: date,end: date) -> tuple[pd.DataFrame,dict]:
+def _bounded_state_tail_inputs(
+        store: DuckDBStore,codes: tuple[str,...],start: date,end: date
+) -> tuple[pd.DataFrame,dict]:
     if not 1<=len(codes)<=250 or len(set(codes))!=len(codes) or not 0<=(end-start).days<3660:
         raise ValueError('controlled state tail exceeds frozen source scope')
     count,latest,name_bytes=store._conn.execute('''SELECT COUNT(*),MAX(daily.trade_date),
@@ -553,7 +564,8 @@ def _bounded_state_tail_inputs(store: DuckDBStore,codes: tuple[str,...],start: d
         raise ValueError('controlled state input exceeds row/material budget')
     missing=store._conn.execute('''SELECT daily.ts_code FROM daily_bar AS daily
         LEFT JOIN stock_status_daily AS status USING(ts_code,trade_date)
-        WHERE daily.ts_code=ANY(?) AND daily.trade_date>=? AND status.ts_code IS NULL LIMIT 1''',[list(codes),start]).fetchone()
+        WHERE daily.ts_code=ANY(?) AND daily.trade_date>=? AND status.ts_code IS NULL LIMIT 1''',
+        [list(codes),start]).fetchone()
     if missing is not None:
         raise ValueError('controlled state source is missing verified security status')
     rows,seeds=_load_target_daily_state_inputs(store,start,list(codes))
@@ -566,7 +578,9 @@ def _state_source_sha256(rows: pd.DataFrame,seeds: dict) -> str:
     return canonical_sha256({'rows_sha256':_prepared_frame_sha256(rows),'seeds':seeds})
 
 
-def prepare_daily_state_tail(store: DuckDBStore,codes: list[str],*,start_date: date,end_date: date) -> PreparedDailyStateTail:
+def prepare_daily_state_tail(
+        store: DuckDBStore,codes: list[str],*,start_date: date,end_date: date
+) -> PreparedDailyStateTail:
     """Prepare one original <=250-security state batch before taking writer protection."""
     ordered=tuple(sorted(set(codes)))
     store._conn.execute('BEGIN')
@@ -576,7 +590,8 @@ def prepare_daily_state_tail(store: DuckDBStore,codes: list[str],*,start_date: d
         if len(rows)>250*3660 or rows.memory_usage(index=True,deep=True).sum()>256*1024**2:
             raise ValueError('controlled state result exceeds frozen material budget')
         prepared=PreparedDailyStateTail(codes=ordered,start_date=start_date,end_date=end_date,
-            source_sha256=_state_source_sha256(inputs,seeds),rows_sha256=_prepared_frame_sha256(rows),rows=rows.copy(deep=True))
+            source_sha256=_state_source_sha256(inputs,seeds),
+            rows_sha256=_prepared_frame_sha256(rows),rows=rows.copy(deep=True))
         store._conn.execute('COMMIT')
         return prepared
     except BaseException:
@@ -590,18 +605,24 @@ def _write_prepared_state_tail(store: DuckDBStore,prepared: PreparedDailyStateTa
         raise ValueError('controlled state existing mode requires an actual outer transaction')
     inputs,seeds=_bounded_state_tail_inputs(store,prepared.codes,prepared.start_date,prepared.end_date)
     rows=prepared.rows.copy(deep=True)
-    if _state_source_sha256(inputs,seeds)!=prepared.source_sha256 or _prepared_frame_sha256(rows)!=prepared.rows_sha256:
+    if (_state_source_sha256(inputs,seeds)!=prepared.source_sha256
+            or _prepared_frame_sha256(rows)!=prepared.rows_sha256):
         raise ValueError('controlled state source or prepared result changed')
     column_sql=', '.join(_STATE_COLUMNS)
-    store._conn.execute(f'CREATE TEMP TABLE {_STATE_STAGE} AS SELECT {column_sql} FROM daily_state WHERE FALSE')
+    store._conn.execute(
+        f'CREATE TEMP TABLE {_STATE_STAGE} AS SELECT {column_sql} FROM daily_state WHERE FALSE')
     if not rows.empty:
         store._conn.register(_STATE_BATCH_STAGE,rows)
         try:
-            store._conn.execute(f'INSERT INTO {_STATE_STAGE} ({column_sql}) SELECT {column_sql} FROM {_STATE_BATCH_STAGE}')
+            store._conn.execute(
+                f'INSERT INTO {_STATE_STAGE} ({column_sql}) '
+                f'SELECT {column_sql} FROM {_STATE_BATCH_STAGE}')
         finally:
             store._conn.unregister(_STATE_BATCH_STAGE)
-    store._conn.execute('DELETE FROM daily_state WHERE ts_code=ANY(?) AND trade_date>=?',[list(prepared.codes),prepared.start_date])
-    store._conn.execute(f'INSERT INTO daily_state ({column_sql}) SELECT {column_sql} FROM {_STATE_STAGE}')
+    store._conn.execute('DELETE FROM daily_state WHERE ts_code=ANY(?) AND trade_date>=?',
+        [list(prepared.codes),prepared.start_date])
+    store._conn.execute(
+        f'INSERT INTO daily_state ({column_sql}) SELECT {column_sql} FROM {_STATE_STAGE}')
     store._conn.execute(f'DROP TABLE {_STATE_STAGE}')
     return len(rows)
 
@@ -624,7 +645,8 @@ def recompute_daily_state(
     if transaction_mode not in {'own','existing'}:
         raise ValueError('invalid daily state transaction mode')
     if transaction_mode=='existing':
-        if prepared_tail is None or tuple(sorted(set(codes or ())))!=prepared_tail.codes or start_date!=prepared_tail.start_date or batch_size>250:
+        if (prepared_tail is None or tuple(sorted(set(codes or ())))!=prepared_tail.codes
+                or start_date!=prepared_tail.start_date or batch_size>250):
             raise ValueError('controlled state source scope differs from prepared batch')
         return _write_prepared_state_tail(store,prepared_tail)
     if prepared_tail is not None:
