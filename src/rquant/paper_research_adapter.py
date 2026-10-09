@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import duckdb
 import pandas as pd
+from pydantic import TypeAdapter
 
 from rquant.lab_shard_protocol import LabShardWorkPlan
 from rquant.paper_research import (FrozenPaperResearchInput, MAX_PAPER_RESEARCH_INPUT_BYTES, PAPER_RESEARCH_INPUT_TABLE,
-                                    PaperResearchAdapterCatalog, PaperResearchRunParameters)
+                                    PaperResearchAdapterCatalog, NativePaperResearchAdapterCatalog, PaperResearchCatalog, PaperResearchRunParameters)
 from rquant.research_run_spec import ResearchJobType, ResearchRunSpec
 from rquant.resource_admission import ResearchAdapterSourceUsage
 from rquant.strategy_job_adapters import (DateBucketShardInput, LabShardExecutionResult, LabShardTable, StrategyJobAdapterRegistry,
@@ -38,9 +39,11 @@ class PaperResearchAdapter:
     adapter_version = "1"
     job_type = ResearchJobType.STRATEGY_REPLAY
 
-    def __init__(self, task_name: str, *, catalog: PaperResearchAdapterCatalog) -> None:
-        if type(catalog) is not PaperResearchAdapterCatalog or task_name not in ("paper_reconcile", "paper_backtest_band"):
+    def __init__(self, task_name: str, *, catalog: PaperResearchCatalog) -> None:
+        if type(catalog) not in {PaperResearchAdapterCatalog, NativePaperResearchAdapterCatalog} or task_name not in ("paper_reconcile", "paper_backtest_band"):
             raise TypeError("paper adapter requires its exact finite task and typed catalog")
+        if type(catalog) is NativePaperResearchAdapterCatalog and task_name != "paper_backtest_band":
+            raise ValueError("native reconciliation uses its original full financial ledger, not Portfolio targeting")
         self.strategy_name = self.snapshot_strategy_name = task_name
         self.adapter_id = "paper-reconcile" if task_name == "paper_reconcile" else "paper-backtest-band"
         self.catalog = catalog
@@ -97,8 +100,9 @@ class PaperResearchAdapter:
             LabShardTable(name="paper_result", frame=pd.DataFrame(({"result_hash": result.fingerprint, "payload": result.model_dump_json()},))),))
 
 
-def paper_research_adapter_registry(catalog: PaperResearchAdapterCatalog) -> StrategyJobAdapterRegistry:
-    catalog = PaperResearchAdapterCatalog.model_validate(catalog.model_dump(mode="python"))
+def paper_research_adapter_registry(catalog: PaperResearchCatalog) -> StrategyJobAdapterRegistry:
+    catalog = TypeAdapter(PaperResearchCatalog).validate_python(catalog.model_dump(mode="python"))
     original = default_strategy_job_adapter_registry()
     builtin = tuple(original.get(item.adapter_id, item.adapter_version) for item in original.closed_descriptor().adapters)
-    return StrategyJobAdapterRegistry((*builtin, PaperResearchAdapter("paper_reconcile", catalog=catalog), PaperResearchAdapter("paper_backtest_band", catalog=catalog)))
+    tasks = ("paper_backtest_band",) if type(catalog) is NativePaperResearchAdapterCatalog else ("paper_reconcile", "paper_backtest_band")
+    return StrategyJobAdapterRegistry((*builtin, *(PaperResearchAdapter(task, catalog=catalog) for task in tasks)))

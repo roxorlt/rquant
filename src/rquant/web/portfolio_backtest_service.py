@@ -146,6 +146,7 @@ class PortfolioWebService:
         exports: PortfolioZipExportFacade | None = None,
     ) -> None:
         self.reader, self.results, self.exports = reader, results, exports
+        self.collaboration = None
         self.sources = tuple(
             PortfolioSourceOption.model_validate(source.model_dump(mode="python"))
             for source in sources
@@ -189,6 +190,14 @@ class PortfolioWebService:
             raise LookupError("找不到这次组合回测。")
         if is_private_portfolio_job(context.job):
             raise LookupError("找不到这次组合回测。")
+        role_can_write = True
+        if self.collaboration is not None:
+            from rquant.web.collaboration_gateway import COLLABORATION_ACTOR
+            actor = COLLABORATION_ACTOR.get()
+            if actor is None:
+                raise PermissionError("original current portfolio actor is unavailable")
+            self.collaboration.result_owner(actor, domain="portfolio", job_id=str(job_id), spec_hash=context.job.spec_hash)
+            role_can_write = self.collaboration.me(actor).can_research
         job, availability = context.job, context.availability
         authority = self.reader.get_artifact_preview_authority(job_id)
         status: Literal[
@@ -224,10 +233,10 @@ class PortfolioWebService:
             updated_at=job.updated_at,
             result_hash=None if authority is None else authority.evidence.complete_result_hash,
             progress=progress,
-            can_pause=availability.pause,
-            can_resume=availability.resume,
-            can_cancel=availability.cancel,
-            can_retry=availability.retry,
+            can_pause=availability.pause and role_can_write,
+            can_resume=availability.resume and role_can_write,
+            can_cancel=availability.cancel and role_can_write,
+            can_retry=availability.retry and role_can_write,
         )
 
     def jobs(self, *, limit: int, cursor: str | None) -> PortfolioJobsData:
@@ -239,11 +248,15 @@ class PortfolioWebService:
             limit=limit,
             cursor=cursor,
         )
-        jobs = tuple(
-            self.job(item.job_id, progress=item.progress.fraction)
-            for item in page.items
-            if item.strategy_name == "portfolio_backtest"
-        )
+        selected = []
+        for item in page.items:
+            if item.strategy_name == "portfolio_backtest":
+                try:
+                    selected.append(self.job(item.job_id, progress=item.progress.fraction))
+                except (LookupError, PermissionError):
+                    if self.collaboration is None:
+                        raise
+        jobs = tuple(selected)
         return PortfolioJobsData(available=True, jobs=jobs, next_cursor=page.next_cursor)
 
     def summary(self, job_id: UUID) -> PortfolioSummaryData:
@@ -263,7 +276,7 @@ class PortfolioWebService:
                 message="完成后在这里查看净值、成交和报告。",
                 can_report=False,
             )
-        result = self.results.read(job_id, expected_result_hash=job.result_hash)
+        result = self.read_result(job_id, expected_result_hash=job.result_hash)
         bundle = result.bundle
         performance = (
             None
@@ -304,7 +317,7 @@ class PortfolioWebService:
         self, job_id: UUID, name: str, result_hash: str, offset: int, limit: int
     ) -> PortfolioViewReadResult:
         self.job(job_id)
-        self.results.read(job_id, expected_result_hash=result_hash)
+        self.read_result(job_id, expected_result_hash=result_hash)
         return self.results.read_view(
             job_id,
             table_name="portfolio_" + name,
@@ -312,6 +325,12 @@ class PortfolioWebService:
             offset=offset,
             limit=limit,
         )
+
+    def read_result(self, job_id: UUID, *, expected_result_hash: str):
+        from rquant.web.collaboration_gateway import COLLABORATION_ACTOR
+        return self.results.read(job_id, expected_result_hash=expected_result_hash,
+            private_owner=COLLABORATION_ACTOR.get() if self.collaboration is not None else None,
+            collaboration=self.collaboration)
 
     def nav(self, job_id: UUID, *, result_hash: str) -> PortfolioNavData:
         view = self._view(job_id, "nav", result_hash, 0, 1830)

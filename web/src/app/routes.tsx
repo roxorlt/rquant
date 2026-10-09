@@ -28,6 +28,8 @@ const PAGE_COMPONENTS: Record<PageId, LazyPage> = {
 const ReportsPage = lazy(() => import("@/reports/ReportsPage"));
 const ReportPage = lazy(() => import("@/reports/ReportPage"));
 const LicensesPage = lazy(() => import("./LicensesPage"));
+const UsersPage = lazy(() => import("@/pages/collaboration/UsersPage"));
+const AuditPage = lazy(() => import("@/pages/collaboration/AuditPage"));
 
 export const appRoutes: RouteObject[] = [
   {
@@ -43,6 +45,8 @@ export const appRoutes: RouteObject[] = [
       { path: "reports", element: <ReportsPage />, handle: { title: "报告" } },
       { path: "reports/:reportId", element: <ReportPage />, handle: { title: "报告" } },
       { path: "licenses", element: <LicensesPage />, handle: { title: "开源许可" } },
+      { path: "users", element: <UsersPage />, handle: { title: "用户与权限" } },
+      { path: "audit", element: <AuditPage />, handle: { title: "操作记录" } },
       { path: "*", element: <NotFound />, handle: { title: "页面不存在" } },
     ],
   },

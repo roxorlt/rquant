@@ -15,6 +15,7 @@ from rquant.paper_portfolio_history import PaperHistoryPage, paper_history_page
 from rquant.paper_contracts import PaperSide
 from rquant.paper_portfolio_models import PaperPortfolioConfiguration, PaperPortfolioStateIdentity
 from rquant.paper_portfolio_projection import PaperPortfolioPublishedAccount, PaperPortfolioSnapshot
+from rquant.paper_portfolio_view_source import publish_paper_band_position
 from rquant.paper_research_commands import RunPaperPortfolioResearch, PaperResearchSubmissionReceipt
 from rquant.paper_research_artifact import PaperResearchSummary
 from rquant.perf import equity_curve
@@ -134,12 +135,13 @@ def detail(account_id: _Account, request: Request, response: Response, viewer: _
         period=row.attribution
         attribution=None if period is None else PaperPeriodAttributionView(start_at=period.source.period.start_at,end_at=period.source.period.end_at,
             status=period.view.status,result=period.view.attribution,reason=period.view.reason)
+        if row.band_position is None:
+            row=publish_paper_band_position(row)
         position="unavailable"
         comparison_dates=row.complete_comparison_dates()
         band=row.band if row.band is not None and comparison_dates==row.band.dates else None
-        if band is not None:
-            last, bound=row.nav[-1].normalized_nav,row.band.points[-1]
-            position="inside" if bound.lower <= last <= bound.upper else "outside"
+        if band is not None and row.band_position is not None:
+            position=row.band_position
         item=_item(row,writable)
         data=PaperPortfolioDetailData(**item.model_dump(mode="python",exclude={"can_reconcile","can_band"}), can_reconcile=runnable and row.status=="complete",
             can_band=runnable and bool(choices) and comparison_dates is not None, nav=row.nav,risk=row.risk,

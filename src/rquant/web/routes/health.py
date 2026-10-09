@@ -8,9 +8,24 @@ from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
-from rquant.dashboard.runtime_console_data import RuntimeConsoleSections, RuntimeServiceRow
+from rquant.dashboard.runtime_console_data import (
+    ConsoleLimits,
+    RuntimeConsoleSections,
+    RuntimeServiceRow,
+    read_runtime_console_sections,
+    read_runtime_health_service_details,
+)
+from rquant.runtime_contracts import canonical_sha256
+from rquant.runtime_health_details import (
+    RuntimeHealthAsOfValidity,
+    RuntimeHealthComparisonScope,
+    RuntimeHealthPortfolioScope,
+    RuntimeHealthRealtimeValidity,
+    RuntimeHealthRetainedOrderScope,
+    RuntimeHealthValidatedMetric,
+)
 from rquant.serving_contracts import FreshnessStatus, ServingGenerationManifest
 from rquant.web import readers
 from rquant.web.calendar import CalendarDay, calendar_day
@@ -22,10 +37,17 @@ from rquant.web.models.health import (
     ErrorItem,
     FreshnessItem,
     HealthData,
+    HealthExposureItem,
+    HealthLayer,
+    HealthLink,
+    HealthMetricItem,
+    HealthObservation,
+    HealthServiceDetail,
     PageDataStatus,
     ServiceItem,
     TableItem,
 )
+from rquant.web.paper_portfolio_reader import read_paper_portfolios
 from rquant.web.security import current_user
 from rquant.web.serving import BorrowedGeneration, serving_meta
 from rquant.web.status import (
@@ -70,17 +92,296 @@ class GenerationContext:
 
 def generation_context(borrowed: BorrowedGeneration, now: datetime) -> GenerationContext:
     day = calendar_day(borrowed.cursor, shanghai_trade_date(now))
+    tables = readers.table_states(borrowed.cursor)
+    sections = read_runtime_console_sections(
+        borrowed.cursor,
+        limits=ConsoleLimits(
+            services=500,
+            signals=500,
+            deliveries=500,
+            paper_accounts=20,
+            paper_holdings=500,
+            lab_jobs=1,
+            promotions=1,
+        ),
+    )
+    if (
+        tables.get("runtime_health_detail_context") is not None
+        and tables["runtime_health_detail_context"].available
+    ):
+        sections = RuntimeConsoleSections.model_validate(
+            sections.model_dump(mode="python")
+            | {"services": read_runtime_health_service_details(borrowed.cursor, sections.services)}
+        )
     return GenerationContext(
         borrowed=borrowed,
         now=now,
         day=day,
         phase=market_phase(now, day.is_trading_day),
-        tables=readers.table_states(borrowed.cursor),
-        sections=readers.sections(borrowed.cursor),
+        tables=tables,
+        sections=sections,
     )
 
 
 # ------------------------------------------------------------------ services
+
+_LAYER_SPECS = (
+    (
+        "host",
+        "主机与服务",
+        ("host_cpu", "slice_cpu", "host_memory", "slice_memory"),
+        (("/tasks", "任务与调度"),),
+    ),
+    (
+        "market",
+        "行情数据",
+        ("minute_delay", "minute_missing_codes"),
+        (("/datacenter", "数据中心"),),
+    ),
+    (
+        "strategy",
+        "策略与信号",
+        ("strategy_duration", "strategy_candidates"),
+        (("/strategies", "策略"), ("/screener", "选股"), ("/monitor", "盯盘")),
+    ),
+    ("orders", "模拟订单", ("order_rejection_ratio",), (("/paper", "模拟盘"),)),
+    ("risk", "组合风险", ("portfolio_risk", "portfolio_exposure"), (("/paper", "组合风控"),)),
+    (
+        "comparison",
+        "收益对照",
+        ("return_comparison",),
+        (("/paper", "模拟账户"), ("/backtest", "回测结果")),
+    ),
+)
+_METRIC_NAMES = {
+    "host_cpu": "主机 CPU",
+    "slice_cpu": "服务组 CPU",
+    "host_memory": "主机可用内存",
+    "slice_memory": "服务组内存",
+    "minute_delay": "批次延迟",
+    "minute_missing_codes": "缺失股票",
+    "strategy_duration": "评估耗时",
+    "strategy_candidates": "已处理候选",
+    "order_rejection_ratio": "拒单率",
+    "portfolio_risk": "风控结果",
+    "portfolio_exposure": "现金权重",
+    "return_comparison": "回测对照",
+}
+_OBSERVATION_NAMES = {
+    "processed_candidates": "已处理候选",
+    "accepted": "已接收",
+    "received": "已接收",
+    "orders": "订单",
+    "signals": "信号",
+    "batch_rows": "批次行数",
+}
+
+
+def _metric_status(item: RuntimeHealthValidatedMetric) -> StatusInfo:
+    if item.availability != "available":
+        return StatusInfo(
+            state=UserState.IDLE, label="未运行", reason="尚无可核验观测，缺失值不代表零"
+        )
+    state = {"normal": UserState.OK, "attention": UserState.WARN, "abnormal": UserState.CRIT}.get(
+        item.verdict, UserState.WARN
+    )
+    return StatusInfo(
+        state=state,
+        label={UserState.OK: "正常", UserState.WARN: "注意", UserState.CRIT: "异常"}[state],
+        reason="已核验数值，尚无判断规则" if item.verdict == "unassessed" else "按原业务规则判断",
+    )
+
+
+def health_layers(context: GenerationContext, viewer: str | None) -> list[HealthLayer]:
+    from rquant.paper_portfolio_projection import PaperPortfolioPublishedAccount
+
+    private_scopes = (
+        RuntimeHealthRetainedOrderScope,
+        RuntimeHealthPortfolioScope,
+        RuntimeHealthComparisonScope,
+    )
+    original = tuple(
+        item
+        for row in context.sections.services
+        if row.details is not None
+        for item in row.details.metrics_at(context.now)
+    )
+    accounts: dict[str, PaperPortfolioPublishedAccount] = {}
+    account_labels: dict[str, str] = {}
+    if viewer is not None and any(
+        isinstance(item.metric.scope, private_scopes) for item in original
+    ):
+        snapshot = read_paper_portfolios(context.borrowed)
+        if snapshot is not None:
+            accounts = {
+                row.configuration.binding.account_id: row for row in snapshot.for_owner(viewer)
+            }
+            account_labels = {key: f"组合 {index + 1}" for index, key in enumerate(accounts)}
+    paper_generation = next(
+        (
+            row.generation_id
+            for row in context.manifest.watermarks
+            if row.dataset_id == "paper_accounts"
+        ),
+        None,
+    )
+    visible: list[RuntimeHealthValidatedMetric] = []
+    exposure: list[HealthExposureItem] = []
+    for item in original:
+        metric, scope = item.metric, item.metric.scope
+        if isinstance(scope, private_scopes):
+            account = accounts.get(scope.account_id)
+            if account is None:
+                continue
+            cfg = account.configuration
+            exact = metric.source_generation_id == paper_generation
+            if isinstance(scope, (RuntimeHealthRetainedOrderScope, RuntimeHealthPortfolioScope)):
+                exact = (
+                    exact
+                    and scope.configuration_identity == cfg.fingerprint
+                    and account.frame is not None
+                    and scope.ledger_revision == (
+                        account.risk.ledger_revision
+                        if metric.metric_id == "portfolio_risk"
+                        and isinstance(metric.validity, RuntimeHealthAsOfValidity)
+                        and metric.validity.basis == "past_risk_decision"
+                        and account.risk is not None
+                        else account.frame.ledger_revision
+                    )
+                )
+            else:
+                band = account.band
+                exact = (
+                    exact
+                    and band is not None
+                    and scope.baseline_identity == band.backtest_source_hash
+                    and scope.strategy_version == cfg.binding.strategy_version
+                    and scope.parameter_fingerprint == cfg.binding.parameter_fingerprint
+                    and scope.cost_identity == cfg.binding.cost_spec_id
+                    and account.calendar is not None
+                    and scope.calendar_identity == account.calendar.source_identity
+                    and scope.comparison_dates == account.complete_comparison_dates()
+                )
+            if not exact:
+                item = RuntimeHealthValidatedMetric(
+                    metric=metric, availability="unavailable", reason_code="owner_source_changed"
+                )
+            elif metric.metric_id == "portfolio_exposure" and item.availability == "available":
+                # The original complete account graph retains every original row.
+                result = None if account.exposure is None else account.exposure.exposure
+                receipt = account.exposure_receipt
+                cash = (
+                    None
+                    if result is None
+                    else next((row for row in result.rows if row.kind == "cash"), None)
+                )
+                if receipt is None or cash is None or cash.portfolio_weight != item.value:
+                    raise ValueError("health cash weight differs from original same-read exposure")
+                exposure.extend(
+                    HealthExposureItem(
+                        kind=row.kind,
+                        name=row.industry_l1 or ("现金" if row.kind == "cash" else "未分类"),
+                        portfolio_weight=row.portfolio_weight,
+                        benchmark_weight=row.benchmark_weight,
+                        deviation=row.deviation,
+                        observed_at=metric.observed_at,
+                        scope_key=canonical_sha256(scope),
+                        scope_label=account_labels[scope.account_id],
+                        scope_detail=scope.model_dump_json(),
+                        source_name=dataset_label(metric.owner_dataset_id),
+                        source_generation_id=metric.source_generation_id,
+                        source_identity=metric.source_identity,
+                        valid_until=metric.validity.valid_until
+                        if isinstance(metric.validity, RuntimeHealthRealtimeValidity)
+                        else None,
+                        link=HealthLink(href="/paper", label="原组合风控"),
+                    )
+                    for row in result.rows
+                )
+        visible.append(item)
+    layers: list[HealthLayer] = []
+    for key, name, ids, destinations in _LAYER_SPECS:
+        links = [HealthLink(href=href, label=label) for href, label in destinations]
+        selected = [item for item in visible if item.metric.metric_id in ids]
+        metrics = []
+        for item in selected:
+            metric = item.metric
+            as_of = isinstance(metric.validity, RuntimeHealthAsOfValidity)
+            realtime = isinstance(metric.validity, RuntimeHealthRealtimeValidity)
+            basis = (
+                "as_of"
+                if as_of
+                else "realtime"
+                if realtime or metric.fresh_until is not None
+                else "unknown"
+            )
+            scope_label = (
+                "最近保留订单"
+                if metric.metric_id == "order_rejection_ratio"
+                else "已完成回测区间"
+                if metric.metric_id == "return_comparison"
+                else "当前主机"
+                if metric.metric_id.startswith("host_")
+                else "服务组"
+                if metric.metric_id.startswith("slice_")
+                else "原业务范围"
+            )
+            if isinstance(metric.scope, private_scopes):
+                scope_label = account_labels[metric.scope.account_id] + " · " + scope_label
+            metric_name = _METRIC_NAMES[metric.metric_id]
+            if metric.metric_id.startswith("slice_"):
+                group_name = {
+                    "rquant.slice": "全部服务",
+                    "rquant-live.slice": "盘中服务",
+                    "rquant-serving.slice": "页面服务",
+                    "rquant-research.slice": "研究服务",
+                    "rquant-maintenance.slice": "维护服务",
+                }.get(metric.scope.slice_id, "服务组")
+                metric_name = group_name + (" CPU" if metric.unit == "ratio" else "内存")
+            metrics.append(
+                HealthMetricItem(
+                    key=canonical_sha256(
+                        {
+                            "id": metric.metric_id,
+                            "source": metric.source_identity,
+                            "scope": metric.scope,
+                        }
+                    ),
+                    name=metric_name,
+                    value=item.value,
+                    unit=metric.unit,
+                    status=_metric_status(item),
+                    available=item.availability == "available",
+                    observed_at=metric.observed_at,
+                    valid_until=metric.validity.valid_until if realtime else metric.fresh_until,
+                    temporal_basis=basis,
+                    scope_label=scope_label,
+                    scope_detail=metric.scope.model_dump_json(),
+                    event_time_start=metric.event_time_start,
+                    event_time_end=metric.event_time_end,
+                    available_at=metric.available_at,
+                    source_name=dataset_label(metric.owner_dataset_id),
+                    source_generation_id=metric.source_generation_id,
+                    link=links[0],
+                )
+            )
+        status = min(
+            (item.status for item in metrics),
+            key=lambda state: STATE_ORDER[state.state],
+            default=StatusInfo(state=UserState.IDLE, label="未运行", reason="尚无可核验观测"),
+        )
+        layers.append(
+            HealthLayer(
+                key=key,
+                name=name,
+                status=status,
+                observed_at=max((item.observed_at for item in metrics), default=None),
+                metrics=metrics,
+                exposure=exposure if key == "risk" else [],
+                links=links,
+            )
+        )
+    return layers
 
 
 def reference_published_on(manifest: ServingGenerationManifest) -> date | None:
@@ -137,6 +438,39 @@ def service_item(
         backlog_count=row.backlog_count,
         consecutive_failures=row.consecutive_failures,
         last_error=row.last_error,
+        detail=None
+        if row.details is None
+        else HealthServiceDetail(
+            available=row.details.availability == "available",
+            reason="观测已核验" if row.details.availability == "available" else "尚无可核验观测",
+            observed_at=row.details.observed_at,
+            source_name="原服务心跳",
+            started_at=None
+            if row.details.startup_witness is None
+            else row.details.startup_witness.started_at,
+            observations=[]
+            if row.observations is None
+            or any(
+                isinstance(
+                    item.metric.scope,
+                    (
+                        RuntimeHealthRetainedOrderScope,
+                        RuntimeHealthPortfolioScope,
+                        RuntimeHealthComparisonScope,
+                    ),
+                )
+                for item in row.details.metrics
+            )
+            else [
+                HealthObservation(
+                    key=key, label=_OBSERVATION_NAMES.get(key, "业务计数"), value=value
+                )
+                for key, value in row.observations.items()
+            ],
+            degraded_reason=None
+            if not row.degraded_detail
+            else "部分功能暂不可用，请查看原运行日志",
+        ),
     )
 
 
@@ -350,6 +684,7 @@ def build_health(
     *,
     stale_after: timedelta,
     fallback_detail: str | None,
+    viewer: str | None = None,
 ) -> HealthData:
     services = service_items(context)
     return HealthData(
@@ -360,6 +695,8 @@ def build_health(
             context, stale_after=stale_after, fallback_detail=fallback_detail
         ),
         errors=error_items(services),
+        layers=health_layers(context, viewer),
+        viewer_id=viewer,
     )
 
 
@@ -378,6 +715,17 @@ def empty_health(stale_after: timedelta) -> HealthData:
             unpublished=[],
         ),
         errors=[],
+        layers=[
+            HealthLayer(
+                key=key,
+                name=name,
+                status=StatusInfo(state=UserState.IDLE, label="未运行", reason="尚无可核验观测"),
+                observed_at=None,
+                metrics=[],
+                links=[HealthLink(href=href, label=label) for href, label in destinations],
+            )
+            for key, name, _ids, destinations in _LAYER_SPECS
+        ],
     )
 
 
@@ -393,13 +741,19 @@ def get_health(
     with web.tracker.borrow() as borrowed:
         meta = serving_meta(borrowed, now=now, stale_after=stale_after, failure=web.tracker.failure)
         if borrowed is None:
-            data = empty_health(stale_after)
+            data = empty_health(stale_after).model_copy(update={"viewer_id": _viewer})
         else:
-            data = build_health(
-                generation_context(borrowed, now),
-                stale_after=stale_after,
-                fallback_detail=borrowed.fallback_detail,
-            )
+            try:
+                data = build_health(
+                    generation_context(borrowed, now),
+                    stale_after=stale_after,
+                    fallback_detail=borrowed.fallback_detail,
+                    viewer=_viewer,
+                )
+            except ValueError as error:
+                raise HTTPException(
+                    status_code=503, detail="健康详情暂时无法核验，请稍后刷新"
+                ) from error
     if meta.generation_id is not None:
         response.headers["X-Rquant-Generation"] = meta.generation_id
     return Envelope[HealthData](data=data, serving=meta)

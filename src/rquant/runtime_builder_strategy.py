@@ -8,8 +8,9 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from pydantic import Field, StrictInt, field_validator, model_validator
+from pydantic import Field, StrictBool, StrictInt, field_validator, model_validator
 
 from rquant.definition_registry import (
     DefinitionExecutableIntegrityError,
@@ -46,6 +47,9 @@ from rquant.strategy_runner import (
     StrategyEvaluator,
     StrategyRunnerStore,
 )
+
+if TYPE_CHECKING:
+    from rquant.paper_research_runtime import NativeMinuteForwardViewSource
 
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 #: `RuntimeStepResult.observations` key: candidates of the newest feature batch the
@@ -129,6 +133,7 @@ class _DeferredRouteDrainAuthority:
 
 
 class StrategyLiveRuntimeSettings(RuntimeContractModel):
+    health_metrics_enabled: StrictBool = False
     feature_spool_root: Path
     runner_state_path: Path
     definition_registry_root: Path
@@ -268,6 +273,9 @@ def strategy_live_builder(
     completion_attestation_signer: CompletionAttestationSigner | None = None,
     completion_attestation_active_key_id: str | None = None,
     runtime_root: Path | None = None,
+    native_forward_source_factory: Callable[
+        [StrategyRunnerStore, RuntimeServiceManifest], NativeMinuteForwardViewSource
+    ] | None = None,
 ) -> RuntimeServiceBuilder:
     """Build one stateful strategy step without dynamic imports or production I/O."""
 
@@ -437,16 +445,14 @@ def strategy_live_builder(
             )
             if calendar.content_sha256 != settings.calendar_content_sha256:
                 raise ValueError("strategy calendar content identity does not match settings")
-            deferred_bus: DeferredPeerArtifact[ReadonlySignalRouteAuthority] = (
-                DeferredPeerArtifact(
-                    reader="strategy_live",
-                    artifact="signal bus",
+            deferred_bus: DeferredPeerArtifact[ReadonlySignalRouteAuthority] = DeferredPeerArtifact(
+                reader="strategy_live",
+                artifact="signal bus",
+                path=signal_bus_path,
+                open_artifact=lambda: ReadonlySignalRouteAuthority(
                     path=signal_bus_path,
-                    open_artifact=lambda: ReadonlySignalRouteAuthority(
-                        path=signal_bus_path,
-                        expected_routing_policy_fingerprint=routing_policy_fingerprint,
-                    ),
-                )
+                    expected_routing_policy_fingerprint=routing_policy_fingerprint,
+                ),
             )
             deferred_bus.probe()
             route_authority = _DeferredRouteDrainAuthority(deferred_bus)
@@ -460,13 +466,25 @@ def strategy_live_builder(
                 producer_manifest_fingerprint=manifest.manifest_fingerprint,
             )
 
+        native_forward_source = None
+        if native_forward_source_factory is not None:
+            from rquant.paper_research_runtime import NativeMinuteForwardViewSource
+            native_forward_source = native_forward_source_factory(runner, manifest)
+            if (type(native_forward_source) is not NativeMinuteForwardViewSource
+                or native_forward_source.runtime.runner is not runner
+                or native_forward_source.runtime.manifest != manifest):
+                raise TypeError("native forward factory must bind the same original runner and manifest")
+            native_forward_source.runtime.require_original_peers()
+
         #: the newest feature batch's skipped-candidate count, carried through the
         #: iterations that find no new batch: batches arrive once a minute and the loop
         #: runs every two seconds, so reporting only "this iteration" would read 0 on 29 of
         #: every 30 heartbeats while a held position's feed is stale
         skipped_observation: dict[str, int] = {}
+        last_health_metrics = None
 
         def step() -> RuntimeStepResult:
+            nonlocal last_health_metrics
             summary = run_strategy_live_batch(
                 feature_spool=feature_spool.get(),
                 candidate_universe_loader=candidate_universe_loader,
@@ -485,6 +503,9 @@ def strategy_live_builder(
                 producer_instance_id=settings.producer_instance_id,
                 producer_version=settings.producer_version,
                 completion_attestation=completion_attestation,
+                health_metrics_enabled=settings.health_metrics_enabled,
+                completion_clock=clock,
+                native_forward_source=native_forward_source,
             )
             backlog = max(
                 0,
@@ -494,6 +515,10 @@ def strategy_live_builder(
                 skipped_observation[STRATEGY_SKIPPED_CANDIDATES_OBSERVATION] = (
                     summary.last_batch_skipped_candidates
                 )
+            if summary.last_batch_health is not None:
+                from rquant.strategy_live_service import strategy_health_metrics
+
+                last_health_metrics = strategy_health_metrics(summary.last_batch_health)
             return RuntimeStepResult(
                 input_sequence=summary.last_feature_sequence,
                 output_sequence=summary.runner_signal_high_watermark,
@@ -504,6 +529,7 @@ def strategy_live_builder(
                     "runner_signal": runner.source_generation_id,
                 },
                 observations=skipped_observation,
+                health_metrics=last_health_metrics,
             )
 
         if runner.identity_rotation is not None:

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { useNavigate } from "react-router";
-import { ApiError } from "@/api/client";
+import { ApiError, type Schemas } from "@/api/client";
 import {
   fetchScreenExecutionResults,
   isFundamentalScreenField,
@@ -41,6 +41,7 @@ import {
   type ScreenQueryCommandSnapshot,
 } from "./screenQueryCommandSession";
 import "./screener.css";
+import { AiScreenBacktest } from "@/app/AiAssistantDrawer";
 
 type Draft = ScreenConditionDraft;
 const PAGE_SIZE = 20;
@@ -201,6 +202,7 @@ export default function ScreenerPage() {
   const [initialized, setInitialized] = useState(false);
   const nextId = useRef(1);
   const undoDraft = useRef<Draft[] | null>(null);
+  const undoRanking = useRef<{ rows: RankingDraft[]; topN: string } | null>(null);
   const [conditionRevision, setConditionRevision] = useState(0);
   const nextRankId = useRef(1);
   const lastSourceIdentity = useRef<string | null | undefined>(undefined);
@@ -286,6 +288,7 @@ export default function ScreenerPage() {
     setPageIndex(0);
     setForcedStaleReason("source");
     undoDraft.current = null;
+    undoRanking.current = null;
     setError(null);
     setActiveExecution(null);
   }, [catalog.data]);
@@ -404,6 +407,7 @@ export default function ScreenerPage() {
   function markManualConditionEdit() {
     draftEpoch.current += 1;
     undoDraft.current = null;
+    undoRanking.current = null;
     setConditionRevision((current) => current + 1);
   }
 
@@ -430,9 +434,24 @@ export default function ScreenerPage() {
     setDraft((current) => current.filter((item) => item.id !== id));
   }
 
-  function applySuggestion(conditions: EditableScreenCondition[]) {
+  function applySuggestion(
+    conditions: EditableScreenCondition[],
+    ranking?: Schemas["ScreenRankingPlan"] | null,
+  ) {
     draftEpoch.current += 1;
     undoDraft.current = draft;
+    if (ranking !== undefined) {
+      undoRanking.current = { rows: rankDraft, topN };
+      setRankDraft(
+        (ranking?.conditions ?? []).map((row) => ({
+          id: nextRankId.current++,
+          metric: row.metric,
+          ascending: row.ascending,
+          weight: String(row.weight),
+        })),
+      );
+      setTopN(String(ranking?.top_n ?? 20));
+    }
     setDraft(
       conditions.map((condition) => ({
         id: nextId.current++,
@@ -447,7 +466,13 @@ export default function ScreenerPage() {
     if (undoDraft.current === null) return;
     draftEpoch.current += 1;
     setDraft(undoDraft.current);
+    if (undoRanking.current) {
+      setRankDraft(undoRanking.current.rows);
+      setTopN(undoRanking.current.topN);
+      undoRanking.current = null;
+    }
     undoDraft.current = null;
+    undoRanking.current = null;
     setForcedStaleReason(null);
   }
 
@@ -472,6 +497,7 @@ export default function ScreenerPage() {
       }));
       draftEpoch.current += 1;
       undoDraft.current = null;
+      undoRanking.current = null;
       setDraft(restored);
       setTradeDate(definition.trade_date);
       setDescription(definition.description);
@@ -614,6 +640,7 @@ export default function ScreenerPage() {
         key === currentSnapshotKey.current
       ) {
         undoDraft.current = null;
+        undoRanking.current = null;
         setSuccessfulRunRevision((current) => current + 1);
       }
       void privateHistory.refetch();
@@ -1007,6 +1034,11 @@ export default function ScreenerPage() {
             onPrevious={() => runPage(pageIndex - 1, cursors[pageIndex - 1] ?? null)}
             onNext={() => runPage(pageIndex + 1, result?.next_cursor ?? null)}
             usesFundamental={applied !== null && usesFundamental(applied.conditions)}
+          />
+          <AiScreenBacktest
+            viewer={viewer ?? null}
+            execution={activeExecution}
+            blocked={running || (result !== null && stale)}
           />
           <ScreenAlertImport
             key={`alert-${scope ?? "anonymous"}`}

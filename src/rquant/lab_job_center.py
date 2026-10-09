@@ -19,6 +19,7 @@ from rquant.definition_registry import ImmutableDefinitionRegistry, StrategySpec
 from rquant.experiment_registry import (
     ExperimentAttempt,
     ExperimentRegistry,
+    ExperimentRegistryReadonlyReader,
     ExperimentSubmissionIntent,
     FormalExperimentPlan,
     IncompleteHypothesisFamilyError,
@@ -73,11 +74,17 @@ from rquant.strategy_template_adapter import (
     strategy_template_adapter_registry,
     template_adapter_id,
 )
-from rquant.strict_json import canonical_json_bytes
+from rquant.strict_json import canonical_json_bytes, strict_model_validate_json
+from rquant.minute_backtest_formal_adapter import MinuteFormalRunInput, minute_formal_adapter_registry
+from rquant.minute_backtest_producer import MinuteReplayCatalog
+from rquant.minute_backtest_parameter_adapter import MinuteParameterFormalReplayAdapter, MinuteParameterFormalRunInput
+from rquant.minute_backtest_parameter_producer import MinuteParameterReplayCatalog, MinuteParameterResolvedReadUnit
+from rquant.strategy_job_adapters import StrategyJobAdapterRegistry
 
 _CLEAN_CODE_SHA = re.compile(r"^[0-9a-f]{40}$")
 _MAX_RESEARCH_DATE_SPAN_DAYS = 5 * 366
 _MAX_WALK_FORWARD_FOLDS = 64
+_MAX_PRIVATE_PUBLICATION_BYTES = 1024 * 1024
 
 if TYPE_CHECKING:
     from rquant.experiment_platform import ExperimentChildAdmission, ExperimentPlatformStore
@@ -145,7 +152,9 @@ ResearchRunInput: TypeAlias = Annotated[
     | AuctionGapRunInput
     | GrowthBoardSurgeRunInput
     | StrategyTemplateRunInput
-    | PortfolioBacktestRunInput,
+    | PortfolioBacktestRunInput
+    | MinuteFormalRunInput
+    | MinuteParameterFormalRunInput,
     Field(discriminator="kind"),
 ]
 
@@ -249,6 +258,10 @@ def _run_identity(
             "portfolio-backtest",
             run_input.parameters,
         )
+    if isinstance(run_input, MinuteParameterFormalRunInput):
+        return ("minute_parameter_replay", ResearchJobType.STRATEGY_REPLAY, "minute-parameter-replay", run_input.parameters)
+    if isinstance(run_input, MinuteFormalRunInput):
+        return ("minute_runtime_replay", ResearchJobType.STRATEGY_REPLAY, "minute-runtime-replay", run_input.parameters)
     raise TypeError(f"unsupported research run input: {type(run_input).__name__}")
 
 
@@ -319,16 +332,22 @@ def _preflight_research_plan(
     *,
     template_catalog: StrategyTemplateAdapterCatalog | None = None,
     paper_catalog: PaperResearchAdapterCatalog | None = None,
+    minute_catalog: MinuteReplayCatalog | None = None,
+    parameter_catalog: MinuteParameterReplayCatalog | None = None,
 ) -> None:
     try:
         from rquant.paper_research_adapter import paper_research_adapter_registry
-        if template_catalog is not None and paper_catalog is not None:
+        if sum(x is not None for x in (template_catalog, paper_catalog, minute_catalog, parameter_catalog)) > 1:
             raise ValueError("one original plan requires one exact owned catalog")
         registry = (
             (default_strategy_job_adapter_registry() if paper_catalog is None else paper_research_adapter_registry(paper_catalog))
             if template_catalog is None
             else strategy_template_adapter_registry(template_catalog)
         )
+        if minute_catalog is not None:
+            registry = minute_formal_adapter_registry(minute_catalog)
+        if parameter_catalog is not None:
+            registry = StrategyJobAdapterRegistry((MinuteParameterFormalReplayAdapter(parameter_catalog),))
         definitions = registry.plan(spec)
     except (OverflowError, TypeError, ValueError, ValidationError) as exc:
         raise ResearchJobSubmissionError("adapter_plan", str(exc)) from exc
@@ -377,6 +396,8 @@ def build_research_job_submission(
     trusted_strategy_registration: StrategySpecRegistration | None = None,
     formal_experiment_plan: FormalExperimentPlan | None = None,
     template_catalog: StrategyTemplateAdapterCatalog | None = None,
+    minute_catalog: MinuteReplayCatalog | None = None,
+    parameter_catalog: MinuteParameterReplayCatalog | None = None,
 ) -> ResearchJobSubmission:
     decision = ResearchGateDecision.model_validate(gate_decision)
     if not decision.allowed:
@@ -387,13 +408,25 @@ def build_research_job_submission(
     _validate_gate_snapshot(decision, dataset_snapshot)
     strategy_name, job_type, adapter_id, typed_parameters = _run_identity(run_input)
     _validate_run_input_bounds(run_input)
-    expected_contract = build_adapter_execution_contract(adapter_id, "1", code_sha)
+    parameter_run = isinstance(run_input, MinuteParameterFormalRunInput)
+    native_minute_run = isinstance(run_input, MinuteFormalRunInput) and not parameter_run
+    adapter_version = "2" if native_minute_run else "1"
+    if native_minute_run and minute_catalog is None:
+        raise PermissionError("minute formal submission requires an installed independent catalog")
+    if minute_catalog is not None and not native_minute_run:
+        raise PermissionError("minute catalog cannot grant authority to another research input")
+    if parameter_run and parameter_catalog is None:
+        raise PermissionError("parameter formal submission requires its complete installed fact catalog")
+    if parameter_catalog is not None and not parameter_run:
+        raise PermissionError("parameter catalog cannot grant authority to another research input")
+    expected_contract = build_adapter_execution_contract(adapter_id, adapter_version, code_sha)
     if feature_contract != expected_contract:
         raise ValueError("feature contract does not match the typed adapter and code SHA")
     try:
         arguments = tuple(
             _research_parameter(name, getattr(typed_parameters, name))
             for name in type(typed_parameters).model_fields
+            if not (parameter_run and name == "prepared_publication_json" and getattr(typed_parameters, name) is None)
         )
         parameters = ResearchRunParameters(
             strategy_name=strategy_name,
@@ -405,7 +438,7 @@ def build_research_job_submission(
             decision=decision,
             strategy_name=strategy_name,
             adapter_id=adapter_id,
-            adapter_version="1",
+            adapter_version=adapter_version,
             code_sha=code_sha,
             deadline=deadline,
             dataset_snapshot=dataset_snapshot,
@@ -433,7 +466,8 @@ def build_research_job_submission(
         )
     except (TypeError, ValueError, ValidationError) as exc:
         raise ResearchJobSubmissionError("input_bounds", str(exc)) from exc
-    _preflight_research_plan(spec, template_catalog=template_catalog)
+    _preflight_research_plan(spec, template_catalog=template_catalog, minute_catalog=minute_catalog,
+        parameter_catalog=parameter_catalog)
     command = SubmitJobCommand(
         job_id=job_id,
         spec=spec,
@@ -638,11 +672,26 @@ class LabCommandSubmissionFacade:
         clock: Callable[[], datetime] | None = None,
         template_directory: StrategyTemplateRuntimeDirectory | None = None,
         experiment_template_binding: ExperimentTemplateRuntimeBinding | None = None,
+        minute_parameter_catalog: MinuteParameterReplayCatalog | None = None,
+        resolved_read_unit: MinuteParameterResolvedReadUnit | None = None,
+        _minute_input_read: object | None = None,
     ) -> None:
         self.reader = reader
         self.spool = spool
         self.experiment_registry = experiment_registry
         self.definition_registry = definition_registry
+        self.minute_parameter_catalog = (None if minute_parameter_catalog is None else
+            MinuteParameterReplayCatalog.model_validate(minute_parameter_catalog.model_dump(mode="python")))
+        if resolved_read_unit is not None and type(resolved_read_unit) is not MinuteParameterResolvedReadUnit:
+            raise TypeError("parameter facade requires its exact lexical source unit")
+        self.resolved_read_unit = resolved_read_unit
+        if _minute_input_read is not None:
+            from rquant.minute_backtest_parameter_study_projection import _MinuteStudyVerifiedInputRead
+
+            if type(_minute_input_read) is not _MinuteStudyVerifiedInputRead:
+                raise TypeError("minute facade needs its actual authenticated lexical input read")
+            _minute_input_read._assert_active(reader=reader, catalog=self.minute_parameter_catalog)
+        self._minute_input_read = _minute_input_read
         self.clock = clock or (lambda: datetime.now(UTC))
         from rquant.strategy_template_runtime import require_template_runtime_directory
 
@@ -651,6 +700,29 @@ class LabCommandSubmissionFacade:
         self.experiment_template_binding = require_experiment_template_runtime_binding(experiment_template_binding)
         if self.experiment_template_binding is not None and self.experiment_template_binding.store.registry is not experiment_registry:
             raise ValueError("private template directory needs the same original experiment registry")
+
+    def parameter_definitions_for_spec(self, spec: ResearchRunSpec, *,
+        resolved_read_unit: MinuteParameterResolvedReadUnit | None = None,
+        _minute_input_read: object | None = None) -> ImmutableDefinitionRegistry:
+        if spec.parameters.strategy_name != "minute_parameter_replay" or self.minute_parameter_catalog is None or self.definition_registry is None:
+            raise PermissionError("parameter definition view requires the complete installed catalog and original registry")
+        input_read = self._minute_input_read if _minute_input_read is None else _minute_input_read
+        if input_read is not None:
+            from rquant.minute_backtest_parameter_study_projection import _MinuteStudyVerifiedInputRead
+
+            if type(input_read) is not _MinuteStudyVerifiedInputRead:
+                raise TypeError("minute definition view needs its exact authenticated lexical input read")
+            input_read._assert_active(reader=self.reader, catalog=self.minute_parameter_catalog, spec=spec)
+            return input_read._definition_registry()
+        unit = self.resolved_read_unit if resolved_read_unit is None else resolved_read_unit
+        adapter = (MinuteParameterFormalReplayAdapter(self.minute_parameter_catalog) if unit is None
+            else MinuteParameterFormalReplayAdapter(self.minute_parameter_catalog, resolved_read_unit=unit))
+        expected = adapter.expected(adapter.parameters(spec))
+        from rquant.minute_backtest_parameter_definition import minute_parameter_research_registry
+
+        return ImmutableDefinitionRegistry(self.definition_registry.root,
+            execution_registry=minute_parameter_research_registry(expected.frozen.runtime.parameters,
+                producer_commit=spec.code_sha))
 
     def submit_scheduling_control(self, envelope: LabSchedulingCommandEnvelope) -> LabSchedulingSubmission:
         envelope = LabSchedulingCommandEnvelope.model_validate(envelope)
@@ -754,6 +826,8 @@ class LabCommandSubmissionFacade:
         definitions = self.definition_registry
         if template_catalog is not None:
             definitions = directory.store.definition_registry(execution.strategy_id)
+        if command.spec.parameters.strategy_name == "minute_parameter_replay":
+            definitions = self.parameter_definitions_for_spec(command.spec)
         if definitions is None:
             raise FormalSubmissionAuthorityError(
                 "v3 research submission requires an authoritative Definition Registry"
@@ -836,6 +910,53 @@ class LabCommandSubmissionFacade:
             assert intent is not None
             platform.admit_publication(intent, now=self.clock())
 
+    def _validate_private_publication(self, envelope: LabCommandEnvelope) -> None:
+        command = envelope.command
+        if not isinstance(command, SubmitJobCommand) or command.spec.experiment is None:
+            return
+        from rquant.experiment_platform import (
+            ExperimentChildAdmission,
+            ExperimentPlatformStore,
+            PRIVATE_FAMILY_PREFIXES,
+            validate_experiment_publication_grant,
+        )
+
+        if not command.spec.experiment.hypothesis_family.startswith(PRIVATE_FAMILY_PREFIXES):
+            return
+        intent = self._experiment_submission_intent(envelope)
+        assert intent is not None
+        if type(self.experiment_registry) is not ExperimentRegistryReadonlyReader:
+            platform = self._private_experiment_platform(envelope)
+            assert platform is not None
+            platform.validate_publication(intent)
+            return
+        with self.experiment_registry._read_snapshot() as connection:
+            ExperimentPlatformStore._require_schema(connection)
+            rows = connection.execute(
+                "SELECT job_id,experiment_id,hypothesis_family,owner,"
+                "typeof(payload_json),length(CAST(payload_json AS BLOB)),"
+                "CASE WHEN typeof(payload_json)='text' AND "
+                "length(CAST(payload_json AS BLOB)) BETWEEN 2 AND ? "
+                "THEN payload_json END FROM experiment_child_admission "
+                "WHERE job_id=? LIMIT 2",
+                (_MAX_PRIVATE_PUBLICATION_BYTES, str(intent.job_id)),
+            ).fetchall()
+            if not rows:
+                validate_experiment_publication_grant(None, intent)
+                return
+            if len(rows) != 1 or rows[0][4] != "text" or rows[0][6] is None:
+                raise PermissionError("private publication child exceeds its complete byte budget")
+            row = rows[0]
+            child = strict_model_validate_json(ExperimentChildAdmission, row[6])
+            if (
+                (str(child.job_id), child.experiment_id, child.family_id, child.owner)
+                != tuple(row[:4])
+                or child.job_id != intent.job_id
+                or child.family_id != command.spec.experiment.hypothesis_family
+            ):
+                raise PermissionError("private publication scalar and complete child identities conflict")
+            validate_experiment_publication_grant(child, intent)
+
     def validate_prepared_experiment_submission(
         self,
         envelope: LabCommandEnvelope,
@@ -866,9 +987,7 @@ class LabCommandSubmissionFacade:
             raise FormalSubmissionAuthorityError(
                 "formal submission Experiment attempt identity conflicts with its plan"
             )
-        platform = self._private_experiment_platform(envelope)
-        if platform is not None:
-            platform.validate_publication(intent)
+        self._validate_private_publication(envelope)
 
     def _mark_experiment_submission_published(self, envelope: LabCommandEnvelope) -> None:
         intent = self._experiment_submission_intent(envelope)

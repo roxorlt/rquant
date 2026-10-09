@@ -336,6 +336,32 @@ def build_alert_read_projections(
                 ),
             }
         )
+    if "monitor_builtin_state" in by_name:
+        from rquant.condition_alert_runtime_projection import validate_monitor_runtime_projections
+
+        runtime = validate_monitor_runtime_projections(by_name)
+        window = runtime.builtin_window
+        complete = (ack is not None and window.state == "ready" and not window.truncated
+            and window.history_count == len(runtime.builtin_events))
+        extra = []
+        for item in runtime.builtin_events:
+            alert_id = stable_alert_id("monitor_builtin_event", item.event)
+            occurred = alert_event_at("monitor_builtin_event", item.event)
+            if occurred < first_at:
+                continue
+            acknowledgment = acknowledgments.get(alert_id)
+            confirmed = (acknowledgment is not None and ack is not None
+                and acknowledgment.actor_id == item.event.owner_id
+                and ack.activated_at <= occurred <= acknowledgment.confirmed_at)
+            extra.append({"source": "monitor_builtin_event", "alert_id": alert_id,
+                "occurred_at": occurred.isoformat(),
+                "confirmation_id": acknowledgment.confirmation_id if confirmed else None,
+                "confirmed_at": acknowledgment.confirmed_at.isoformat() if confirmed else None,
+                "eligible": complete and occurred >= ack.activated_at})
+        if len(events) + len(extra) > _MAX_ALERT_EVENTS or len(json.dumps(
+                (*events, *extra), ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode()) > _MAX_ALERT_EVENT_BYTES:
+            raise ValueError("builtin alert extension exceeds its original joint event budget")
+        events.extend(extra)
     events.sort(key=lambda row: (str(row["source"]), str(row["alert_id"])))
     observed = source.observed_at
     return (

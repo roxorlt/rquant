@@ -1,6 +1,6 @@
 """Operator requests, confirmed publication bodies and actual admission facts."""
 
-from typing import Literal, Self
+from typing import TYPE_CHECKING, Literal, Self
 from uuid import UUID
 
 from pydantic import Field, StrictBool, field_validator, model_validator
@@ -141,7 +141,23 @@ class OwnedSavePaperPortfolioConfiguration(SavePaperPortfolioConfiguration):
         return self
 
 
-from rquant.paper_research_commands import OwnedRunPaperPortfolioResearch, RunPaperPortfolioResearch
+if TYPE_CHECKING:
+    from rquant.paper_research_commands import OwnedRunPaperPortfolioResearch, RunPaperPortfolioResearch
 
-PaperPortfolioCommand = SetPaperAccountPaused | SavePaperPortfolioConfiguration | RunPaperPortfolioResearch
-OwnedPaperPortfolioCommand = OwnedSetPaperAccountPaused | OwnedSavePaperPortfolioConfiguration | OwnedRunPaperPortfolioResearch
+    PaperPortfolioCommand = SetPaperAccountPaused | SavePaperPortfolioConfiguration | RunPaperPortfolioResearch
+    OwnedPaperPortfolioCommand = OwnedSetPaperAccountPaused | OwnedSavePaperPortfolioConfiguration | OwnedRunPaperPortfolioResearch
+
+
+def __getattr__(name: str) -> object:
+    # The minute profile reads operator types before research types exist.
+    if name not in {"OwnedRunPaperPortfolioResearch", "RunPaperPortfolioResearch",
+                    "PaperPortfolioCommand", "OwnedPaperPortfolioCommand"}:
+        raise AttributeError(name)
+    from rquant.paper_research_commands import OwnedRunPaperPortfolioResearch, RunPaperPortfolioResearch
+
+    return {
+        "RunPaperPortfolioResearch": RunPaperPortfolioResearch,
+        "OwnedRunPaperPortfolioResearch": OwnedRunPaperPortfolioResearch,
+        "PaperPortfolioCommand": SetPaperAccountPaused | SavePaperPortfolioConfiguration | RunPaperPortfolioResearch,
+        "OwnedPaperPortfolioCommand": OwnedSetPaperAccountPaused | OwnedSavePaperPortfolioConfiguration | OwnedRunPaperPortfolioResearch,
+    }[name]

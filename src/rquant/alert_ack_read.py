@@ -32,6 +32,7 @@ class AlertGeneration(Protocol):
 
 
 _SOURCES: frozenset[str] = frozenset({"signal", "monitor_event", "surge_event"})
+_BUILTIN_SOURCE = "monitor_builtin_event"
 _SHA = frozenset("0123456789abcdef")
 _MAX_EVENTS = 20_000
 _MAX_ACKS = 10_000
@@ -93,9 +94,17 @@ class AlertReadModel:
     activated_at: datetime | None
     events: dict[tuple[AlertSource, str], _Event]
     acknowledgments: dict[str, AlertAcknowledgment]
+    builtin_count_as_of: datetime | None = None
+    builtin_eligible_ids: frozenset[str] = frozenset()
 
     def is_eligible(self, source: AlertSource, alert_id: str) -> bool:
         event = self.events.get((source, alert_id))
+        if source == _BUILTIN_SOURCE:
+            cutoff = self.builtin_count_as_of
+            return (event is not None and alert_id in self.builtin_eligible_ids
+                and alert_id not in self.acknowledgments and self.activated_at is not None
+                and cutoff is not None and event.eligible
+                and alert_window_start(count_as_of=cutoff, activated_at=self.activated_at) <= event.occurred_at <= cutoff)
         if (
             event is None
             or alert_id in self.acknowledgments
@@ -192,7 +201,7 @@ def _read_events(cursor: Any) -> dict[tuple[AlertSource, str], _Event]:
     )
     result: dict[tuple[AlertSource, str], _Event] = {}
     for source, alert_id, occurred, confirmation, confirmed, eligible in rows:
-        if source not in _SOURCES or not isinstance(alert_id, str) or not _sha(alert_id):
+        if source not in _SOURCES | {_BUILTIN_SOURCE} or not isinstance(alert_id, str) or not _sha(alert_id):
             raise ValueError("invalid published alert identity")
         if (confirmation is None) != (confirmed is None) or type(eligible) is not bool:
             raise ValueError("invalid published alert state")
@@ -481,6 +490,7 @@ def read_alert_ack(
     serving_ready: bool,
     now: datetime,
     stale_after: timedelta,
+    actor_id: str | None = None,
 ) -> AlertReadModel:
     """Read all five projections through one borrowed cursor; any gap fails closed."""
     if borrowed is None:
@@ -519,16 +529,65 @@ def read_alert_ack(
                 )
             ):
                 raise ValueError("alert acknowledgment projection disagrees with authority")
+        legacy = {key: event for key, event in events.items() if event.source in _SOURCES}
         ready = _ready_summary(
             overview=overview_rows[0],
             snapshot=snapshot,
             coverage=coverage,
-            events=events,
+            events=legacy,
             serving_ready=serving_ready,
             now=now,
             stale_after=stale_after,
             borrowed=borrowed,
         )
-        return AlertReadModel(ready or _INCOMPLETE, snapshot.activated_at, events, ack_by_id)
+        owned, cutoff, eligible = _verified_builtin_alerts(borrowed, events, snapshot=snapshot,
+            actor_id=actor_id, serving_ready=serving_ready, now=now, stale_after=stale_after)
+        visible = legacy | owned
+        if any(event.source == _BUILTIN_SOURCE for event in events.values()):
+            ack_by_id = {key: value for key, value in ack_by_id.items()
+                if key in {event.alert_id for event in visible.values()}}
+        return AlertReadModel(ready or _INCOMPLETE, snapshot.activated_at, visible, ack_by_id, cutoff, eligible)
     except (duckdb.Error, TypeError, ValueError, ValidationError):
         return _empty()
+
+
+def _verified_builtin_alerts(
+    borrowed: AlertGeneration, events: dict[tuple[AlertSource, str], _Event], *,
+    snapshot: AlertAckAuthoritySnapshot, actor_id: str | None, serving_ready: bool,
+    now: datetime, stale_after: timedelta,
+) -> tuple[dict[tuple[AlertSource, str], _Event], datetime | None, frozenset[str]]:
+    from rquant.condition_alert_runtime_projection import read_monitor_runtime
+
+    published = {key: event for key, event in events.items() if event.source == _BUILTIN_SOURCE}
+    if actor_id is None or not serving_ready:
+        return {}, None, frozenset()
+    try:
+        runtime = read_monitor_runtime(borrowed, now=now)
+        if runtime is None or runtime.builtin_window.state != "ready":
+            return {}, None, frozenset()
+        window = runtime.builtin_window
+        if window.truncated or window.history_count != len(runtime.builtin_events) or not timedelta(0) <= now - window.observed_at <= stale_after:
+            return {}, None, frozenset()
+        mark = next((row for row in borrowed.manifest.watermarks if row.dataset_id == "signals"), None)
+        if mark is None or mark.status is not FreshnessStatus.FRESH:
+            return {}, None, frozenset()
+        first = alert_window_start(count_as_of=window.observed_at, activated_at=datetime(1970, 1, 1, tzinfo=UTC))
+        originals = {stable_alert_id(_BUILTIN_SOURCE, row.event): row.event for row in runtime.builtin_events if first <= row.event.event_time <= window.observed_at}
+        if len(originals) != sum(first <= row.event.event_time <= window.observed_at for row in runtime.builtin_events) or set(originals) != {row.alert_id for row in published.values()}:
+            raise ValueError("builtin ACK source is incomplete")
+        ack_by_id = {row.alert_id: row for row in snapshot.rows}
+        owned, eligible = {}, set()
+        for key, projected in published.items():
+            original = originals[projected.alert_id]
+            acknowledgment = ack_by_id.get(projected.alert_id)
+            if (projected.occurred_at != original.event_time
+                    or acknowledgment is not None and acknowledgment.actor_id != original.owner_id):
+                raise ValueError("builtin ACK source differs from its actual original owner event")
+            if original.owner_id != actor_id:
+                continue
+            owned[key] = projected
+            if projected.eligible and snapshot.activated_at <= original.event_time:
+                eligible.add(projected.alert_id)
+        return owned, window.observed_at, frozenset(eligible)
+    except (duckdb.Error, TypeError, ValueError, ValidationError, AttributeError):
+        return {}, None, frozenset()

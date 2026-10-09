@@ -96,7 +96,7 @@ _PREVIEW_UNKNOWN = {
 }
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class ScreenApplicationError(Exception):
     status_code: int
     detail: str

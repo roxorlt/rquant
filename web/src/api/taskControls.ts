@@ -9,6 +9,9 @@ export type UnitPrepareRequest = Schemas["PrepareUnitRun"];
 export type SchedulingRequest = Schemas["SetLabSchedulingPaused"];
 export type SchedulingView = Schemas["TaskSchedulingView"];
 export type UnitControlChoice = Schemas["TaskUnitControlChoice"];
+export type NotifierPrepareRequest = Schemas["PrepareNotifierDeliveryMode"];
+export type NotifierModeRequest = Schemas["SetNotifierDeliveryMode"];
+export type BuiltinControlRequest = Schemas["SetMonitorBuiltinEnabled"];
 
 function fail(status: number): never {
   throw new ApiError(
@@ -37,6 +40,19 @@ function originalIdentity(body: TaskControlRequest): string {
     return JSON.stringify([...common, body.unit, body.confirmation_id ?? null]);
   if (body.kind === "set_lab_scheduling_paused")
     return JSON.stringify([...common, body.expected_version, body.paused]);
+  if (body.kind === "prepare_notifier_delivery_mode")
+    return JSON.stringify([
+      ...common,
+      body.run.command_id,
+      Date.parse(body.run.requested_at),
+      body.run.generation_id,
+      body.run.expected_revision,
+      body.run.mode,
+    ]);
+  if (body.kind === "set_notifier_delivery_mode")
+    return JSON.stringify([...common, body.expected_revision, body.mode, body.confirmation_id]);
+  if (body.kind === "set_monitor_builtin_enabled")
+    return JSON.stringify([...common, body.builtin_id, body.expected_revision, body.enabled]);
   throw new ApiError(503, "原请求暂无法核验。");
 }
 
@@ -104,6 +120,30 @@ export async function submitTaskControl(
   }
   if (body.kind === "set_lab_scheduling_paused") {
     const { data, response } = await apiClient().POST("/api/v1/tasks/scheduling/commands", {
+      body,
+      headers,
+      signal,
+    });
+    return boundResult(body, data, response);
+  }
+  if (body.kind === "prepare_notifier_delivery_mode") {
+    const { data, response } = await apiClient().POST("/api/v1/tasks/notifications/mode/prepare", {
+      body,
+      headers,
+      signal,
+    });
+    return boundResult(body, data, response);
+  }
+  if (body.kind === "set_notifier_delivery_mode") {
+    const { data, response } = await apiClient().POST("/api/v1/tasks/notifications/mode", {
+      body,
+      headers,
+      signal,
+    });
+    return boundResult(body, data, response);
+  }
+  if (body.kind === "set_monitor_builtin_enabled") {
+    const { data, response } = await apiClient().POST("/api/v1/tasks/monitor/builtins/commands", {
       body,
       headers,
       signal,

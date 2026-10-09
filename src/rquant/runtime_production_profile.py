@@ -15,7 +15,7 @@ from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Annotated, Literal
 
-from pydantic import Field, ValidationInfo, field_validator, model_validator
+from pydantic import Field, StrictBool, ValidationInfo, field_validator, model_validator
 
 from rquant.legacy_shadow_export import LegacyShadowRunnerManifestBinding
 from rquant.runtime_contracts import RuntimeContractModel
@@ -47,6 +47,7 @@ from rquant.runtime_deployment_profile import (
     RuntimeSchemaRolloutPolicy,
     ShadowRuntimeProfile,
 )
+from rquant.runtime_health_authority import RuntimeHealthOpsBinding
 from rquant.runtime_market_calendar_generation import (
     install_market_calendar_generation,
     market_calendar_generation_path,
@@ -114,6 +115,22 @@ class ProductionStrategyBinding(RuntimeContractModel):
 class ProductionRuntimeProfileInputs(RuntimeContractModel):
     producer_commit: CommitSha
     runtime_mode: RuntimeMode = "local-test"
+    health_ops_binding: RuntimeHealthOpsBinding | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    health_details_enabled: StrictBool = Field(
+        default=False, exclude_if=lambda value: value is False
+    )
+
+    @model_validator(mode="after")
+    def require_health_details_binding(self) -> ProductionRuntimeProfileInputs:
+        if self.health_details_enabled and (
+            self.health_ops_binding is None
+            or self.health_ops_binding.producer_commit != self.producer_commit
+        ):
+            raise ValueError("health details require this producer's exact signed Ops binding")
+        return self
+
     runtime_root: Path
     operational_database_path: Path
     #: The five-minute read-only replica. Live roles that only read may not open the main
@@ -825,6 +842,13 @@ def _manifest(
     stale_after_seconds: float,
     settings: dict[str, object],
 ) -> RuntimeServiceManifest:
+    if inputs.health_details_enabled and kind in {
+        RuntimeServiceKind.MARKET_MINUTE_SOURCE,
+        RuntimeServiceKind.STRATEGY_LIVE,
+        RuntimeServiceKind.PAPER_BROKER,
+    }:
+        # Bind the opt-in before shadow receipts capture the runner fingerprint.
+        settings = settings | {"health_metrics_enabled": True}
     return RuntimeServiceManifest(
         service_id=service_id,
         service_kind=kind,
@@ -2007,6 +2031,11 @@ def build_production_runtime_profile(
             settings={
                 "authority_root": str(root / "control" / "authority-runtime-health"),
                 "sources": health_sources,
+                **(
+                    {"ops_binding": config.health_ops_binding.model_dump(mode="json")}
+                    if config.health_ops_binding is not None
+                    else {}
+                ),
             },
         )
     )
@@ -2055,6 +2084,31 @@ def build_production_runtime_profile(
         )
     )
 
+    if config.health_details_enabled:
+        import socket
+
+        from rquant.ops_status import load_signed_ops_manifest
+
+        binding = config.health_ops_binding
+        assert binding is not None
+        load_signed_ops_manifest(
+            binding.install_manifest_path,
+            public_key_pem=binding.install_public_key_pem.encode("ascii"),
+            expected_host=socket.gethostname(),
+        )
+        configured: list[RuntimeServiceManifest] = []
+        for manifest in manifests:
+            settings = manifest.model_dump(mode="json")["settings"]
+            if manifest.service_kind is RuntimeServiceKind.RUNTIME_HEALTH_PUBLISHER:
+                settings["details_enabled"] = True
+            elif manifest.service_kind is RuntimeServiceKind.SERVING_PUBLISHER:
+                settings["health_ops_binding"] = binding.model_dump(mode="json")
+            configured.append(
+                RuntimeServiceManifest.model_validate(
+                    manifest.model_dump(mode="python") | {"settings": settings}
+                )
+            )
+        manifests = configured
     capabilities = {manifest.service_id: () for manifest in manifests}
     capabilities[reference_source_id] = (
         "TUSHARE_TOKEN_MAIN",

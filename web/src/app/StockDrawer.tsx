@@ -9,6 +9,7 @@ import {
 import { PriceChart } from "@/charts/PriceChart";
 import { formatPrice } from "@/format/number";
 import { Button, EmptyState, Pill, SideDrawer, SkeletonRows, Tip } from "@/ui";
+import { StockNewsDigest } from "./StockNewsDigest";
 
 export function StockDrawer({
   tsCode,
@@ -147,6 +148,7 @@ export function StockDrawer({
             </div>
           </div>
         )}
+        <StockNewsDigest viewer={watchlist.viewer} stockCode={tsCode} />
         <section className="stock-watchlist" aria-label="手动盯盘状态">
           <div className="stock-watchlist-head">
             <span className="hint">手动盯盘</span>

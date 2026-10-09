@@ -1,14 +1,18 @@
 import { expect, test } from "@playwright/test";
-import type { MetaEnvelope } from "../src/api/client.ts";
+import type { MetaEnvelope, Schemas } from "../src/api/client.ts";
 import type { MonitorChannelsData } from "../src/api/endpoints.ts";
+import { formatCount } from "../src/format/number.ts";
 import { findJargon } from "../src/test/jargon.ts";
 import { expectNoHorizontalOverflow, watch } from "./watch.ts";
 
+const nativeFactory = Boolean(process.env.RQ_E2E_MONITOR_NATIVE_FACTORY);
+
 for (const width of [1440, 390]) {
   test.describe(`告警时间线 ${width}px`, () => {
-    test.use({ viewport: { width, height: 844 } });
+    test.use({ viewport: { width, height: 844 }, hasTouch: width === 390 });
 
     test("shows published records and opens a stock from the keyboard", async ({ page }) => {
+      test.skip(nativeFactory, "Uses the original September published-record fixture.");
       const watcher = watch(page);
       await page.goto("./#/monitor");
       await expect(page.getByRole("heading", { level: 1, name: "盯盘与告警" })).toBeVisible();
@@ -64,8 +68,7 @@ for (const width of [1440, 390]) {
       await expect(page.getByRole("tooltip", { name: /2026-09-24/ })).toBeVisible();
       await page.mouse.move(5, 70);
       await expect(page.getByRole("tooltip", { name: /2026-09-24/ })).toHaveCount(0);
-      await expect(page.getByRole("button", { name: "新建规则" })).toHaveCount(0);
-      await expect(page.getByRole("button", { name: "确认" })).toHaveCount(0);
+      await expect(timeline.getByRole("button", { name: "确认" })).toHaveCount(0);
       await expectNoHorizontalOverflow(page, "monitor");
       expect(findJargon(await page.locator("main").innerText())).toEqual([]);
       const captureDir = process.env.RQ_E2E_CAPTURE_DIR;
@@ -89,6 +92,7 @@ for (const width of [1440, 390]) {
     test("keeps both verified channel cards readable and explains submission by keyboard", async ({
       page,
     }) => {
+      test.skip(nativeFactory, "This case only tests the old channel response presentation.");
       const metaResponse = await page.request.get("api/v1/meta");
       expect(metaResponse.ok()).toBe(true);
       const meta = (await metaResponse.json()) as MetaEnvelope;
@@ -140,6 +144,188 @@ for (const width of [1440, 390]) {
         }),
         contentType: "image/png",
       });
+    });
+
+    test("reads the original builtin owners and actual merged ledger without response substitution", async ({
+      page,
+    }) => {
+      test.skip(
+        !nativeFactory,
+        "Requires Root's original monitor pipeline, Serving publisher and trusted actor fixture.",
+      );
+      const watcher = watch(page);
+      const metaResponse = await page.request.get("api/v1/meta");
+      expect(metaResponse.ok()).toBe(true);
+      const meta = (await metaResponse.json()) as MetaEnvelope;
+      expect(meta.data.viewer).not.toBeNull();
+      await page.clock.setFixedTime(new Date(meta.data.server_time));
+      const response = await page.request.get("api/v1/monitor/runtime");
+      expect(response.ok()).toBe(true);
+      const runtime = (await response.json()) as Schemas["Envelope_MonitorRuntimeData_"];
+      expect(runtime.serving.generation_id).toBe(meta.serving.generation_id);
+      expect(runtime.data.state).toBe("ready");
+      const builtins = runtime.data.builtins ?? [];
+      const channels = runtime.data.channels ?? [];
+      expect(builtins).toHaveLength(4);
+      expect(channels.length).toBeGreaterThan(0);
+      const timelineResponse = await page.request.get("api/v1/monitor/timeline?page_size=50");
+      expect(timelineResponse.ok()).toBe(true);
+      const original = (await timelineResponse.json()) as Schemas["Envelope_MonitorTimelineData_"];
+      expect(original.serving.generation_id).toBe(runtime.serving.generation_id);
+      const market = original.data.items.find(
+        (item) => item.kind === "builtin" && item.subject === "market",
+      );
+      expect(market).toBeDefined();
+
+      await page.goto("./#/monitor");
+      await expect(page.getByRole("heading", { level: 1, name: "盯盘与告警" })).toBeVisible();
+      const rules = page.getByRole("region", { name: "内置规则" });
+      await expect(rules.getByRole("article")).toHaveCount(4);
+      for (const fact of builtins) {
+        const card = rules.getByRole("article", { name: fact.label, exact: true });
+        await expect(card.locator("dd").first()).toHaveText(formatCount(fact.matched_count));
+        const source = card.getByRole("button", { name: `${fact.label}来源说明` });
+        if (width === 390) await source.tap();
+        else await source.focus();
+        await expect(source).toHaveAttribute("aria-describedby", /\S/);
+        const tipId = await source.getAttribute("aria-describedby");
+        if (tipId === null) throw new Error("The source explanation is not linked to its control.");
+        const sourceTip = page.locator(`[role="tooltip"][id="${tipId}"]`);
+        await expect(sourceTip).toHaveCount(1);
+        await expect(sourceTip).toBeVisible();
+        await expect(sourceTip).toContainText(fact.source_note);
+        if (width === 390) await source.tap();
+        else await source.blur();
+        await expect(sourceTip).toHaveCount(0);
+      }
+      const current = page.getByRole("region", { name: "当前通道尝试" });
+      for (const fact of channels) {
+        const card = current.getByRole("article", {
+          name: `${fact.channel_label}当前通知`,
+          exact: true,
+        });
+        await expect(card).toBeVisible();
+        expect(fact.logical_count).toBeGreaterThan(0);
+        expect(fact.physical_requests).toBe(0);
+        await expect(
+          card
+            .locator(".monitor-channel-facts > div")
+            .filter({ has: page.locator("dt", { hasText: "逻辑通知" }) })
+            .locator("dd"),
+        ).toHaveText(formatCount(fact.logical_count));
+        await expect(
+          card
+            .locator(".monitor-channel-facts > div")
+            .filter({ has: page.locator("dt", { hasText: "成员尝试" }) })
+            .locator("dd"),
+        ).toHaveText(formatCount(fact.member_attempts));
+        await expect(
+          card
+            .locator(".monitor-channel-facts > div")
+            .filter({ has: page.locator("dt", { hasText: "实际请求" }) })
+            .locator("dd"),
+        ).toHaveText("0");
+        await expect(card.locator(".monitor-channel-rate")).toHaveText("—");
+      }
+      const timeline = page.getByRole("list", { name: "告警时间线" });
+      if (market?.kind === "builtin") {
+        const item = timeline
+          .locator(":scope > li")
+          .filter({ hasText: market.event_label })
+          .filter({ hasText: "全市场" })
+          .first();
+        await expect(item).toBeVisible();
+        await expect(item.getByRole("button", { name: /查看.+详情/ })).toHaveCount(0);
+      }
+      const sourceUnavailable = original.data.items.filter(
+        (item) =>
+          "acknowledgment" in item &&
+          item.acknowledgment !== undefined &&
+          !item.acknowledgment.eligible,
+      );
+      for (const item of sourceUnavailable) {
+        if (!("event_label" in item)) continue;
+        const records = timeline.locator(":scope > li").filter({ hasText: item.event_label });
+        if ((await records.count()) === 1)
+          await expect(records.getByRole("button", { name: "确认" })).toHaveCount(0);
+      }
+      await expectNoHorizontalOverflow(page, "original monitor owners");
+      expect(findJargon(await page.locator("main").innerText())).toEqual([]);
+      const captureDir = process.env.RQ_E2E_CAPTURE_DIR;
+      await test.info().attach(`monitor-original-${width}px`, {
+        body: await page.screenshot({
+          fullPage: true,
+          path: captureDir ? `${captureDir}/monitor-original-${width}.png` : undefined,
+        }),
+        contentType: "image/png",
+      });
+      expect(watcher.problems).toEqual([]);
+    });
+
+    test("prepares and cancels the original mode request without committing or pushing", async ({
+      page,
+    }) => {
+      test.skip(
+        !process.env.RQ_E2E_MONITOR_CONTROL_READY,
+        "Requires the original PageControl/operator with explicit signed synthetic Ops installation evidence; no real POST or Linux install is implied.",
+      );
+      const watcher = watch(page);
+      const metaResponse = await page.request.get("api/v1/meta");
+      expect(metaResponse.ok()).toBe(true);
+      const meta = (await metaResponse.json()) as MetaEnvelope;
+      await page.clock.setFixedTime(new Date(meta.data.server_time));
+      const capabilitiesResponse = await page.request.get(
+        `api/v1/tasks/control-capabilities?generation_id=${meta.serving.generation_id}`,
+      );
+      expect(capabilitiesResponse.ok()).toBe(true);
+      const capabilities =
+        (await capabilitiesResponse.json()) as Schemas["TaskControlCapabilitiesData"];
+      expect(capabilities.notifier_mode.available).toBe(true);
+      expect(capabilities.notifier_mode.can_request).toBe(true);
+      const destination = capabilities.notifier_mode.mode === "live" ? "仅记录" : "正式推送";
+      if (destination === "正式推送") expect(capabilities.notifier_mode.can_set_live).toBe(true);
+      let commits = 0;
+      page.on("request", (request) => {
+        if (
+          request.method() === "POST" &&
+          new URL(request.url()).pathname.endsWith("/tasks/notifications/mode")
+        )
+          commits += 1;
+      });
+      await page.goto("./#/monitor");
+      const switchMode = page.getByRole("button", { name: `切换为${destination}`, exact: true });
+      await expect(switchMode).toBeEnabled();
+      await switchMode.focus();
+      const prepared = page.waitForResponse(
+        (response) =>
+          response.request().method() === "POST" &&
+          new URL(response.url()).pathname.endsWith("/tasks/notifications/mode/prepare"),
+      );
+      await switchMode.press("Enter");
+      const actual = await prepared;
+      expect(actual.ok()).toBe(true);
+      const receipt = (await actual.json()) as Schemas["TaskControlCommandData"];
+      expect(receipt.status).toBe("prepared");
+      expect(receipt.original_request.kind).toBe("prepare_notifier_delivery_mode");
+      if (receipt.original_request.kind === "prepare_notifier_delivery_mode") {
+        expect(receipt.original_request.command_id).not.toBe(
+          receipt.original_request.run.command_id,
+        );
+        expect(receipt.original_request.generation_id).toBe(meta.serving.generation_id);
+      }
+      expect(receipt.confirmation_id).toBeTruthy();
+      expect(receipt.confirmation_expires_at).toBeTruthy();
+      const dialog = page.getByRole("dialog", { name: "切换通知模式" });
+      await expect(dialog).toBeVisible();
+      await expect(dialog.getByRole("button", { name: "确认切换" })).toBeDisabled();
+      await dialog.getByRole("textbox").fill(destination);
+      await expect(dialog.getByRole("button", { name: "确认切换" })).toBeEnabled();
+      await expectNoHorizontalOverflow(page, "original mode confirmation");
+      await dialog.getByRole("button", { name: /取消/ }).click();
+      await expect(dialog).toHaveCount(0);
+      await expect(switchMode).toBeFocused();
+      expect(commits).toBe(0);
+      expect(watcher.problems).toEqual([]);
     });
   });
 }

@@ -29,12 +29,16 @@ from rquant.experiment_platform import (
     ExperimentPreparationReceipt,
     ExperimentPreparationReservation,
     ExperimentSearchRequest,
+    ExperimentFamilyRequest,
+    NativeMinuteExperimentRequest,
+    NativeMinuteSourceProfile,
+    NativeMinutePhaseRead,
     ExperimentSourceProfile,
     Owner,
     Sha256,
     holdout_cutoff,
     stable_experiment_interaction,
-    stable_experiment_job,
+    experiment_family_job,
     validate_experiment_dates,
 )
 from rquant.experiment_platform_projection import ExperimentPrivateResultAuthority
@@ -63,8 +67,18 @@ from rquant.research_snapshot import ResearchExecutionSession
 from rquant.runtime_contracts import AwareUtcDatetime, RuntimeContractModel, canonical_sha256
 from rquant.storage.duckdb import DuckDBStore
 from rquant.strategy_template_artifact import StrategyTemplateSealedResultReader
+from rquant.minute_backtest_formal import PreparedMinuteRequest, build_minute_plan
+from rquant.minute_backtest_publication_contracts import MinuteSourceContentSeed, MinuteVisibilityPolicy
+from rquant.minute_backtest_producer import (
+    MinutePublicationReceipt, MinutePublicationReference, MinuteReplayCatalog,
+    PublishedMinuteInput, _secure_private_bytes, minute_metadata_identities,
+    open_gated_minute_store, publish_minute_input,
+)
+from rquant.experiment_platform_evidence import verify_native_preparation
+from rquant.strategy_promotion_contracts import NativeMinuteConfiguration
 
 if TYPE_CHECKING:
+    from rquant.minute_backtest_artifact import MinuteSealedReplayReader
     from rquant.experiment_platform_evidence import ExperimentIndependenceEvidence
     from rquant.experiment_platform_projection import (
         ExperimentAttemptFact,
@@ -87,7 +101,7 @@ class _ExperimentCommand(RuntimeContractModel):
 
 class RegisterExperimentFamily(_ExperimentCommand):
     kind: Literal["register_experiment_family"] = "register_experiment_family"
-    request: ExperimentSearchRequest
+    request: ExperimentFamilyRequest
 
 
 class CancelExperimentFamily(_ExperimentCommand):
@@ -228,6 +242,9 @@ class ExperimentFamilyPreparer:
         clock: Callable[[], datetime],
         max_task_seconds: int = 3600,
         template_binding: ExperimentTemplateBinding | None = None,
+        native_profiles: tuple[NativeMinuteSourceProfile, ...] = (),
+        native_phase_provider: Callable[[NativeMinutePhaseRead], MinuteSourceContentSeed] | None = None,
+        native_visibility_policies: tuple[MinuteVisibilityPolicy, ...] = (),
     ) -> None:
         self.store, self.definitions = store, definitions
         self.profiles = tuple(
@@ -251,9 +268,14 @@ class ExperimentFamilyPreparer:
         self._input_root_identity = (identity.st_dev, identity.st_ino)
         self.clock, self.max_task_seconds = clock, max_task_seconds
         self.template_binding = template_binding
+        self.native_profiles = tuple(NativeMinuteSourceProfile.model_validate(p.model_dump(mode="python")) for p in native_profiles)
+        if len(self.native_profiles) > 100 or len({p.source_identity for p in self.native_profiles}) != len(self.native_profiles):
+            raise ValueError("native source profiles exceed capacity or repeat")
+        self.native_phase_provider = native_phase_provider
+        self.native_visibility_policies = tuple(native_visibility_policies)
 
     def template_baseline(
-        self, owner: str, request: ExperimentSearchRequest
+        self, owner: str, request: ExperimentFamilyRequest
     ) -> ExperimentTemplateBaseline | None:
         if request.template is None:
             return None
@@ -261,7 +283,137 @@ class ExperimentFamilyPreparer:
             raise ValueError("original template source is not installed")
         return self.template_binding.baseline(owner=owner, request=request)
 
-    def profile(self, record: ExperimentFamilyRecord) -> ExperimentSourceProfile:
+    def native_profile(self, configuration: NativeMinuteConfiguration) -> NativeMinuteSourceProfile:
+        matches = tuple(p for p in self.native_profiles if p.selection == configuration.selection)
+        if len(matches) != 1 or not matches[0].phase_slice_available:
+            raise PermissionError("exact native owner/source/profile is not installed")
+        return matches[0]
+
+    def _recover_native_publication(self, reservation: ExperimentPreparationReservation) -> PublishedMinuteInput:
+        path = Path(reservation.source_path)
+        if path.parent.parent != self.input_root or path.name != "input.duckdb" or len(path.parent.name) != 32:
+            raise PermissionError("native reserved publication is outside its original private root")
+        data, receipt_file = _secure_private_bytes(path.parent / "publication.json")
+        receipt = MinutePublicationReceipt.model_validate_json(data)
+        _, source_file = _secure_private_bytes(path)
+        runtime = receipt.frozen.runtime
+        reference = MinutePublicationReference(source_key=runtime.source_key, source_version=runtime.source_version,
+            owner_id=runtime.owner_id, receipt=receipt_file, source=source_file)
+        catalog = MinuteReplayCatalog(entries=(reference,), installed_policies=self.native_visibility_policies)
+        actual = catalog.resolve(source_key=runtime.source_key, source_version=runtime.source_version, owner_id=runtime.owner_id)
+        if (actual.frozen.full_input_hash, actual.frozen.provenance.published_at) != (reservation.input_hash, reservation.created_at):
+            raise PermissionError("native interrupted publication differs from its original reservation")
+        request = ResearchGateRequest(mode="formal", strategy_name="minute_runtime_replay",
+            start_date=runtime.start_date, end_date=runtime.end_date, code_commit=runtime.producer_commit,
+            audit_run_id=runtime.audit_run_id, dataset_snapshot_id=runtime.dataset_snapshot_id,
+            dataset_binding_hash=receipt.binding.binding_hash)
+        with open_gated_minute_store(request, metadata_store_factory=self.metadata_store_factory,
+            lake_root=self.lake_root, catalog=catalog, source_key=runtime.source_key,
+            source_version=runtime.source_version, owner_id=runtime.owner_id) as (_, decision):
+            return PublishedMinuteInput(receipt=actual, reference=reference,
+                identity=DatasetSnapshotIdentity(snapshot_id=runtime.dataset_snapshot_id,
+                    binding_hash=actual.binding.binding_hash, audit_run_id=runtime.audit_run_id), gate_decision=decision)
+
+    def _prepare_native(self, record: ExperimentFamilyRecord, *, grant: ExperimentOuterGrant | None) -> ExperimentFamilyRecord:
+        if self.native_phase_provider is None:
+            raise PermissionError("native minute source provider is not installed")
+        if record.state == "cancelled":
+            raise ValueError("original preparing family was cancelled")
+        now, children, total = self.clock(), [], 0
+        for index, cfg in enumerate(record.actual_configurations):
+            profile = self.native_profile(cfg)
+            if record.phase == "search":
+                if grant is not None or self.store.policy().version != record.policy.version:
+                    raise ValueError("holdout policy changed before native search")
+                validate_experiment_dates(record.request, calendar=profile.calendar.open_dates,
+                    latest_complete=min(profile.latest_complete, holdout_cutoff(now, record.policy.months, calendar=profile.calendar.open_dates)))
+            elif (grant is None or grant.owner != record.owner or grant.request_id != record.request_id
+                or grant not in self.store.list_outer_grants(record.owner)
+                or record.family_id != "experiment-outer:" + grant.grant_id
+                or grant.source_identity != profile.source_identity):
+                raise PermissionError("native outer phase has no exact original grant/source")
+            window = DateRange(start_date=cfg.start_date, end_date=cfg.end_date)
+            if window.start_date < profile.coverage.start_date or window.end_date > profile.coverage.end_date:
+                raise PermissionError("native phase exceeds installed source coverage")
+            read = NativeMinutePhaseRead(owner=record.owner, family_id=record.family_id,
+                source_identity=profile.source_identity, source_key=cfg.source_key, source_version=cfg.source_version,
+                phase=record.phase, window=window, outer_grant_id=None if grant is None else grant.grant_id,
+                index=index, configuration=cfg)
+            previous = self.store.preparation(record.owner, record.family_id, index)
+            if previous is not None:
+                if previous.source_identity != profile.source_identity or not isinstance(previous.prepared, PreparedMinuteRequest):
+                    raise PermissionError("native original preparation/source identity changed")
+                identity, digest = _input_digest(Path(previous.source_path))
+                if (identity, digest) != (previous.file_identity, previous.file_sha256):
+                    raise PermissionError("native original prepared input changed")
+                prepared = previous.prepared
+            else:
+                reservation = self.store.preparation_reservation(record.owner, record.family_id, index)
+                if reservation is not None and reservation.source_identity != profile.source_identity:
+                    raise PermissionError("native reserved source identity changed")
+                if reservation is not None and Path(reservation.source_path).exists():
+                    published = self._recover_native_publication(reservation)
+                else:
+                    seed = MinuteSourceContentSeed.model_validate(self.native_phase_provider(read).model_dump(mode="python"))
+                    runtime = seed.runtime
+                    if (runtime.source_key, runtime.source_version, runtime.owner_id, runtime.producer_commit,
+                        runtime.market_calendar, runtime.execution_profile, runtime.start_date, runtime.end_date) != (
+                        read.publication_source_key, cfg.source_version, record.owner, profile.producer_commit,
+                        profile.calendar, profile.execution_profile, cfg.start_date, cfg.end_date):
+                        raise PermissionError("native phase provider returned another owner/source/profile/interval")
+                    publication_now = self.clock()
+                    if (
+                        seed.provenance.published_at > publication_now
+                        or seed.provenance.published_at < record.registered_at
+                    ):
+                        raise PermissionError("native publication time is not visible after its original request")
+                    audit, snapshot = minute_metadata_identities(seed)
+                    frozen = seed.freeze(audit_run_id=audit.audit_run_id, dataset_snapshot_id=snapshot.snapshot_id)
+                    if reservation is None:
+                        reservation = self.store.reserve_preparation(ExperimentPreparationReservation(
+                            owner=record.owner, family_id=record.family_id, index=index,
+                            source_identity=profile.source_identity, source_path=str(self.input_root / uuid4().hex / "input.duckdb"),
+                            input_hash=frozen.full_input_hash, created_at=seed.provenance.published_at))
+                    elif (reservation.input_hash, reservation.created_at) != (frozen.full_input_hash, seed.provenance.published_at):
+                        raise PermissionError("native original reservation cannot be rebound")
+                    directory = Path(reservation.source_path).parent
+                    directory.mkdir(mode=0o700, exist_ok=True)
+                    with self.metadata_store_factory() as metadata:
+                        published = publish_minute_input(seed, metadata_store=metadata, source_path=directory / "input.duckdb",
+                            receipt_path=directory / "publication.json", catalog=self.catalog, lake_root=self.lake_root,
+                            installed_policies=self.native_visibility_policies, now=seed.provenance.published_at)
+                minute_catalog = MinuteReplayCatalog(entries=(published.reference,), installed_policies=self.native_visibility_policies)
+                plan_now = self.clock()
+                prepared = build_minute_plan(published.receipt.frozen, published, catalog=minute_catalog,
+                    definitions=self.definitions, protocol=record.request.protocol, now=plan_now,
+                    deadline=now + timedelta(seconds=self.max_task_seconds), random_seed=record.request.seed,
+                    family_id=record.family_id, hypothesis_variant=f"native-configuration-{index}")
+                identity, digest = _input_digest(Path(reservation.source_path))
+                self.store.save_preparation(ExperimentPreparationReceipt(owner=record.owner, family_id=record.family_id,
+                    index=index, source_identity=profile.source_identity, source_path=reservation.source_path,
+                    file_identity=identity, file_sha256=digest, prepared=prepared, native_configuration=cfg))
+            verify_native_preparation(prepared, cfg)
+            if prepared.frozen.runtime.source_key != read.publication_source_key or prepared.frozen.runtime.market_calendar != profile.calendar:
+                raise PermissionError("native original phase source/calendar changed")
+            current = self.definitions.latest_strategy_spec(cfg.selection.target.strategy_id, as_of=now)
+            if current != prepared.frozen.native_registration:
+                raise PermissionError("native exact current definition changed")
+            total += sum(x.stat().st_size for x in (prepared.published.reference.source.path,
+                prepared.published.reference.receipt.path)) + prepared.published.receipt.snapshot_artifact_bytes
+            if total > MAX_FAMILY_INPUT_BYTES:
+                raise ValueError("complete native family input exceeds 512 MiB")
+            envelope = LabCommandEnvelope(request_id=LabCommandSubmissionFacade._request_id(
+                stable_experiment_interaction(record.owner, record.request_id, index)), command=prepared.submission(
+                    job_id=experiment_family_job(record, index)).command)
+            intent = LabCommandSubmissionFacade._experiment_submission_intent(envelope)
+            if intent is None:
+                raise ValueError("native complete formal child intent is absent")
+            children.append(ExperimentChildRegistration(config=cfg, plan=prepared.formal_plan, intent=intent, published=prepared.published))
+        return self.store.register_family_submission(owner=record.owner, request_id=record.request_id, children=tuple(children))
+
+    def profile(self, record: ExperimentFamilyRecord) -> ExperimentSourceProfile | NativeMinuteSourceProfile:
+        if isinstance(record.request, NativeMinuteExperimentRequest):
+            return self.native_profile(record.actual_configurations[0])
         matches = tuple(
             p
             for p in self.profiles
@@ -361,6 +513,8 @@ class ExperimentFamilyPreparer:
         checked = self.store.get_family(record.owner, record.family_id)
         if checked != record:
             raise ValueError("formal family preparation changed")
+        if isinstance(record.request, NativeMinuteExperimentRequest):
+            return self._prepare_native(record, grant=grant)
         if record.state == "ready":
             return record
         if record.state == "cancelled":
@@ -562,7 +716,7 @@ class ExperimentFamilyPreparer:
                     stable_experiment_interaction(record.owner, record.request_id, index)
                 ),
                 command=prepared.submission(
-                    job_id=stable_experiment_job(record.owner, record.request_id, index)
+                    job_id=experiment_family_job(record, index)
                 ).command,
             )
             intent = LabCommandSubmissionFacade._experiment_submission_intent(envelope)
@@ -589,6 +743,7 @@ class ExperimentCommandWriter:
         prepare: ExperimentFamilyPreparer,
         results: PortfolioResultReader | None = None,
         template_results: StrategyTemplateSealedResultReader | None = None,
+        native_results: MinuteSealedReplayReader | None = None,
         enabled: bool = False,
         owners: frozenset[str] = frozenset(),
         administrators: frozenset[str] = frozenset(),
@@ -600,6 +755,7 @@ class ExperimentCommandWriter:
         self.enabled, self.owners, self.administrators = enabled, owners, administrators
         self.private_authority = private_authority
         self.template_results = template_results
+        self.native_results = native_results
 
     def _owner(self, command: ExperimentCommand) -> None:
         if command.actor_id not in self.owners:
@@ -684,7 +840,7 @@ class ExperimentCommandWriter:
                 attempt = next(
                     (a for a in attempts if a.spec.experiment_id == command.experiment_id), None
                 )
-                if attempt is None or self.results is None or self.private_authority is None:
+                if attempt is None or self.private_authority is None:
                     raise ValueError("selected complete result is unavailable")
                 with self.store.registry._connect() as connection:
                     row = connection.execute(
@@ -696,7 +852,26 @@ class ExperimentCommandWriter:
                 from rquant.experiment_platform import ExperimentChildAdmission
 
                 child = ExperimentChildAdmission.model_validate_json(row[0])
-                if parent.template_baseline is not None:
+                if isinstance(parent.request, NativeMinuteExperimentRequest):
+                    from rquant.experiment_platform_evidence import read_native_preparation_result
+
+                    if self.native_results is None or parent.request.walk_forward_plan_hash is not None:
+                        raise ValueError("selected native parent complete reader is unavailable")
+                    job = self.commands.reader.get_job(child.job_id)
+                    if job is None:
+                        raise ValueError("selected native original job is unavailable")
+                    preparation = self.private_authority.authorize(job, command.actor_id)
+                    if not isinstance(preparation.prepared, PreparedMinuteRequest) or preparation.configuration not in parent.actual_configurations:
+                        raise PermissionError("selected native candidate lacks its original complete preparation")
+                    result = read_native_preparation_result(self.native_results, preparation.prepared,
+                        job_id=child.job_id, configuration=preparation.configuration, as_of=self.prepare.clock())
+                    if result is None or result.complete_result_hash != command.result_hash or (
+                        result.result.replay.status != "complete"
+                        or result.formal_plan != preparation.prepared.formal_plan
+                        or result.result.publication != preparation.prepared.published.receipt
+                    ):
+                        raise ValueError("selected native candidate lacks its full exact sealed result")
+                elif parent.template_baseline is not None:
                     if self.template_results is None:
                         raise ValueError("original template result reader is unavailable")
                     result = self.template_results.read_private(
@@ -712,6 +887,8 @@ class ExperimentCommandWriter:
                     ):
                         raise ValueError("selected template lacks its full exact sealed result")
                 else:
+                    if self.results is None:
+                        raise ValueError("selected original portfolio result reader is unavailable")
                     result = self.results.read(
                         child.job_id,
                         expected_result_hash=command.result_hash,
@@ -723,12 +900,17 @@ class ExperimentCommandWriter:
                         or result.bundle.frozen.config not in parent.actual_configurations
                     ):
                         raise ValueError("selected candidate has no full exact sealed result")
-                profile = self.prepare.profile(parent)
+                profile = (
+                    self.prepare.native_profile(preparation.configuration)
+                    if isinstance(parent.request, NativeMinuteExperimentRequest)
+                    else self.prepare.profile(parent)
+                )
                 policy = self.store.policy()
                 cutoff = min(
                     profile.latest_complete,
                     holdout_cutoff(
-                        self.prepare.clock(), policy.months, calendar=profile.calendar.dates
+                        self.prepare.clock(), policy.months,
+                        calendar=profile.calendar.open_dates if isinstance(profile, NativeMinuteSourceProfile) else profile.calendar.dates
                     ),
                 )
                 if parent.request.protocol.frozen_outer_test_range.end_date > cutoff:
@@ -838,7 +1020,7 @@ class ExperimentCommandWriter:
                     raise ValueError("complete formal family is not ready")
                 ids = []
                 for index in range(len(record.actual_configurations)):
-                    job_id = stable_experiment_job(record.owner, record.request_id, index)
+                    job_id = experiment_family_job(record, index)
                     intent = self.store.registry.get_submission_intent_for_job(job_id)
                     if intent is None:
                         raise ValueError("complete formal child intent is missing")

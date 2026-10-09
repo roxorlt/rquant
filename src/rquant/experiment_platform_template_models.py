@@ -16,12 +16,12 @@ from rquant.portfolio_backtest_models import FrozenPortfolioInput, PortfolioBack
 from rquant.research_run_spec import ResearchRunSpec
 from rquant.runtime_contracts import RuntimeContractModel
 from rquant.strategy_authoring_commands import (
+    ExperimentTemplateSelection,
     SaveStrategyTemplate,
     StrategyAuthoringIdentity,
     StrategyTemplateHead,
     StrategyTemplateReceipt,
 )
-from rquant.strategy_template import TEMPLATE_ID_PATTERN
 from rquant.strategy_template_adapter import (
     StrategyTemplateAdapter,
     StrategyTemplateAdapterCatalog,
@@ -30,11 +30,6 @@ from rquant.strategy_template_adapter import (
 from rquant.strategy_template_definition import StrategyTemplateExecutionVersion
 from rquant.strategy_template_run import FrozenStrategyTemplateInput
 from rquant.strategy_template_source import PublishedStrategyTemplateInput
-
-
-class ExperimentTemplateSelection(RuntimeContractModel):
-    strategy_id: str = Field(pattern=TEMPLATE_ID_PATTERN)
-    head: StrategyTemplateHead
 
 
 class ExperimentTemplateBaseline(RuntimeContractModel):

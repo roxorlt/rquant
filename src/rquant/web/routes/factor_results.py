@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from typing import Annotated
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, Response
 
@@ -14,6 +15,7 @@ from rquant.factor.result_serving import (
 )
 from rquant.serving_read_models import PAGE_PROJECTION_CONTRACTS, ServingProjectionPayload
 from rquant.web.envelope import Envelope
+from rquant.web.collaboration_gateway import CollaborationGateway, CollaborationUnavailableError
 from rquant.web.models.factor_results import (
     FactorResearchDisplay,
     FactorResultDetailData,
@@ -48,6 +50,22 @@ _DISPLAY_MESSAGES = {
     "available": "可查看研究图表。",
 }
 _BASIS_LABEL = "历史回溯研究；分组曲线不含撮合与交易费用。"
+
+
+def _owned(request: Request, actor: str | None, row: FactorResultIndexRow) -> bool:
+    web = request.app.state.web
+    if web.settings.collaboration_mode == "legacy":
+        return True
+    gateway = web.collaboration
+    if actor is None or type(gateway) is not CollaborationGateway:
+        raise HTTPException(503, "当前权限暂无法核验。")
+    try:
+        gateway.result_owner(actor, domain="factor", job_id=row.job_id, spec_hash=row.spec_sha256)
+        return True
+    except (PermissionError, LookupError):
+        return False
+    except CollaborationUnavailableError as exc:
+        raise HTTPException(503, "当前权限暂无法核验。") from exc
 
 
 def _neutralization_fields(display: object) -> dict[str, object]:
@@ -214,6 +232,10 @@ def list_factor_results(
         if generation_id is not None and meta.generation_id != generation_id:
             raise HTTPException(status_code=409, detail="数据已更新，请重新查看结果。")
         snapshot, items = _data(borrowed)
+        if snapshot is not None:
+            items = [item for item, row in zip(items, snapshot.index, strict=True) if _owned(request, _viewer, row)]
+        if web.settings.collaboration_mode == "enforced":
+            web.collaboration.me(_viewer)
     if meta.generation_id is not None:
         response.headers["X-Rquant-Generation"] = meta.generation_id
     return Envelope[FactorResultListData](
@@ -248,6 +270,9 @@ def get_factor_result(
     if meta.generation_id is not None:
         response.headers["X-Rquant-Generation"] = meta.generation_id
     item = next((item for item in items if item.job_id == job_id), None)
+    row = None if snapshot is None else next((row for row in snapshot.index if row.job_id == job_id), None)
+    if row is not None and not _owned(request, _viewer, row):
+        raise HTTPException(404, "找不到这份结果。")
     display = (
         None
         if snapshot is None
@@ -306,12 +331,64 @@ def get_factor_result(
         if item is None
         else "ready"
     )
+    if web.settings.collaboration_mode == "enforced":
+        web.collaboration.me(_viewer)
     return Envelope[FactorResultDetailData](
         data=FactorResultDetailData(
             availability=availability,
             available_at=None if snapshot is None else snapshot.available_at,
             result=item,
             research=research,
+            can_report=web.settings.collaboration_mode == "enforced" and item is not None
+            and item.status == "succeeded" and display is not None,
         ),
         serving=meta,
     )
+
+
+@router.get("/{job_id}/report", summary="下载因子封存报告")
+def factor_report(
+    request: Request,
+    _viewer: Annotated[str | None, Depends(current_user)],
+    job_id: Annotated[str, Path(pattern=r"^[0-9a-f]{32}$")],
+    generation_id: Annotated[str, Query(pattern=r"^[0-9a-f]{64}$")],
+) -> Response:
+    from rquant.sealed_result_html import render_factor_html
+    from rquant.sealed_result_ownership import SealedArtifactFact
+
+    web = request.app.state.web
+    gateway = web.collaboration
+    if web.settings.collaboration_mode != "enforced" or type(gateway) is not CollaborationGateway or _viewer is None:
+        raise HTTPException(503, "封存报告暂不可用。")
+    with web.tracker.borrow() as borrowed:
+        meta = serving_meta(borrowed, now=web.clock(), stale_after=web.settings.stale_after, failure=web.tracker.failure)
+        if generation_id != meta.generation_id:
+            raise HTTPException(409, "数据已更新，请重新查看结果。")
+        snapshot, _items = _data(borrowed)
+        row = None if snapshot is None else next((row for row in snapshot.index if row.job_id == job_id), None)
+        if row is None or not _owned(request, _viewer, row):
+            raise HTTPException(404, "找不到这份结果。")
+        display = next((display for indexed, display in zip(
+            (indexed for indexed in snapshot.index if indexed.display_status == "available"),
+            snapshot.displays, strict=True) if indexed.job_id == job_id), None)
+        if row.status != "succeeded" or display is None:
+            raise HTTPException(409, "完整结果尚未封存。")
+        # Factor's original completion authority is its terminal completion digest.
+        artifact = SealedArtifactFact(domain="factor", job_id=str(UUID(hex=job_id)),
+            spec_hash=row.spec_sha256, manifest_hash=row.completion_sha256,
+            complete_result_hash=row.full_artifact_sha256, full_artifact_hash=row.full_artifact_sha256,
+            result_payload_hash=row.result_sha256, input_hash=display.input_sha256,
+            display_hash=display.content_sha256, complete=True)
+        try:
+            binding = gateway.bind_sealed_artifact(_viewer, artifact)
+            raw = render_factor_html(display, binding=binding, current_artifact=artifact, requester=_viewer)
+            gateway.me(_viewer)
+        except (PermissionError, LookupError) as exc:
+            raise HTTPException(404, "找不到这份结果。") from exc
+        except ValueError as exc:
+            raise HTTPException(409, "报告资料待核对，请重新查看结果。") from exc
+    return Response(raw, media_type="text/html; charset=utf-8", headers={
+        "Cache-Control": "no-store", "Content-Disposition": 'attachment; filename="factor-report.html"',
+        "X-Rquant-Generation": generation_id, "X-Content-Type-Options": "nosniff",
+        "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'",
+    })

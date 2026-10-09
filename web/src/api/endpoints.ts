@@ -1,5 +1,5 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useCallback, useRef } from "react";
+import { useCallback, useEffect, useRef } from "react";
 import { ApiError, apiClient, type MetaEnvelope, type Schemas } from "./client";
 import type { paths } from "./schema";
 import { META_QUERY_KEY, useCurrentMeta } from "./useMeta";
@@ -9,6 +9,7 @@ export type OverviewEnvelope = Schemas["Envelope_OverviewData_"];
 export type OverviewData = Schemas["OverviewData"];
 export type HealthEnvelope = Schemas["Envelope_HealthData_"];
 export type HealthData = Schemas["HealthData"];
+export type MonitorRuntimeData = Schemas["MonitorRuntimeData"];
 export type ServiceItem = Schemas["ServiceItem"];
 export type FreshnessItem = Schemas["FreshnessItem"];
 export type SignalItem = Schemas["SignalItem"];
@@ -78,7 +79,12 @@ export function useOverview(): ServingQueryResult<OverviewData> {
 }
 
 export function useHealth(): ServingQueryResult<HealthData> {
-  return useServingQuery(["health"], fetchHealth);
+  const meta = useCurrentMeta();
+  const viewer = meta.data?.data.viewer ?? null;
+  const generation = meta.data?.data.generation?.generation_id ?? null;
+  return useServingQuery(["health", viewer, generation], fetchHealth, {
+    enabled: meta.data !== undefined,
+  });
 }
 
 export function usePools(): ServingQueryResult<PoolsData> {
@@ -92,12 +98,71 @@ export function useMonitorTimeline(
   cursor: string | null,
   refreshKey: number,
 ): ServingQueryResult<MonitorTimelineData> {
-  return useServingQuery(["monitor", "timeline", cursor, refreshKey], async () => {
-    const { data, response } = await apiClient().GET("/api/v1/monitor/timeline", {
-      params: { query: cursor ? { page_size: 20, cursor } : { page_size: 20 } },
+  const meta = useCurrentMeta();
+  const viewer = meta.data?.data.viewer ?? null;
+  const generation = meta.data?.data.generation?.generation_id ?? null;
+  const available =
+    meta.isFetchedAfterMount && !meta.isError && meta.data !== undefined && generation !== null;
+  const queryClient = useQueryClient();
+  useEffect(() => {
+    queryClient.removeQueries({
+      predicate: (entry) =>
+        entry.queryKey[0] === "monitor" &&
+        entry.queryKey[1] === "timeline" &&
+        (meta.isError || entry.queryKey[2] !== viewer || entry.queryKey[3] !== generation),
     });
-    return unwrap(data, response);
-  });
+  }, [queryClient, viewer, generation, meta.isError]);
+  const result = useServingQuery(
+    ["monitor", "timeline", viewer, generation, cursor, refreshKey],
+    async () => {
+      const { data, response } = await apiClient().GET("/api/v1/monitor/timeline", {
+        params: { query: cursor ? { page_size: 20, cursor } : { page_size: 20 } },
+      });
+      return unwrap(data, response);
+    },
+    { enabled: available },
+  );
+  return available
+    ? result
+    : {
+        ...result,
+        data: undefined,
+        serving: undefined,
+        isLoading: meta.isLoading || (!meta.isFetchedAfterMount && !meta.isError),
+      };
+}
+
+export function useMonitorRuntime(refreshKey: number): ServingQueryResult<MonitorRuntimeData> {
+  const meta = useCurrentMeta();
+  const viewer = meta.data?.data.viewer ?? null;
+  const generation = meta.data?.data.generation?.generation_id ?? null;
+  const available =
+    meta.isFetchedAfterMount && !meta.isError && viewer !== null && generation !== null;
+  const queryClient = useQueryClient();
+  useEffect(() => {
+    queryClient.removeQueries({
+      predicate: (entry) =>
+        entry.queryKey[0] === "monitor" &&
+        entry.queryKey[1] === "runtime" &&
+        (meta.isError || entry.queryKey[2] !== viewer || entry.queryKey[3] !== generation),
+    });
+  }, [queryClient, viewer, generation, meta.isError]);
+  const result = useServingQuery(
+    ["monitor", "runtime", viewer, generation, refreshKey],
+    async () => {
+      const { data, response } = await apiClient().GET("/api/v1/monitor/runtime");
+      return unwrap(data, response);
+    },
+    { enabled: available },
+  );
+  return available
+    ? result
+    : {
+        ...result,
+        data: undefined,
+        serving: undefined,
+        isLoading: meta.isLoading || (!meta.isFetchedAfterMount && !meta.isError),
+      };
 }
 
 export function useMonitorChannels(refreshKey: number): ServingQueryResult<MonitorChannelsData> {

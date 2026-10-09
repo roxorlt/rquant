@@ -10,6 +10,8 @@ import {
   type ExperimentSearch,
   type ExperimentWrite,
   type FormalExperiment,
+  isNativeExperimentConfiguration,
+  type NativeExperimentConfiguration,
   submitExperiment,
   useExperimentCapabilities,
   useExperimentComparison,
@@ -43,6 +45,7 @@ import {
   Tip,
 } from "@/ui";
 import "./experiments.css";
+import "./nativeExperiment.css";
 import { ExperimentTemplatePicker } from "./TemplatePicker";
 
 const statusLabel: Record<
@@ -137,6 +140,8 @@ function metricText(metric: ExperimentMetric): string {
 }
 
 function parameterSummary(config: FormalExperiment["configuration"]): string {
+  if (isNativeExperimentConfiguration(config))
+    return `分钟策略 · 第 ${config.selection.target.head.version} 版`;
   return `${config.weight_rule.max_positions} 只 · 现金 ${formatPercent(Number(config.weight_rule.cash_reserve) * 100)}`;
 }
 
@@ -153,13 +158,19 @@ function Metrics({ values }: { values: ExperimentMetric[] }) {
   );
 }
 
-function RowParameters({ item }: { item: Pick<FormalExperiment, "configuration" | "rules"> }) {
+function RowParameters({
+  item,
+  interactiveReady = true,
+}: {
+  item: Pick<FormalExperiment, "configuration" | "rules">;
+  interactiveReady?: boolean;
+}) {
   return (
     <div>
       <span>{parameterSummary(item.configuration)}</span>
       <details>
         <summary>全部参数</summary>
-        <Configuration value={item.configuration} />
+        <Configuration value={item.configuration} interactiveReady={interactiveReady} />
         {item.rules ? <TemplateRulesSummary rules={item.rules} sources={undefined} /> : null}
       </details>
     </div>
@@ -197,7 +208,183 @@ function metricColumn<T extends MetricRow>(
   };
 }
 
-function Configuration({ value }: { value: ExperimentResult["configuration"] }) {
+function NativeConfiguration({
+  value,
+  native,
+  interactiveReady,
+}: {
+  value: NativeExperimentConfiguration;
+  native?: ExperimentResult["native"];
+  interactiveReady: boolean;
+}) {
+  const { target, source_key, source_version, profile_hash } = value.selection;
+  const costs = native?.execution_costs;
+  const profile = native?.execution_profile;
+  const policy = profile?.paper_policy;
+  const initialCash = profile ? formatNumber(Number(profile.initial_cash)) : "—";
+  const lagSeconds = policy?.execution_lag.match(/^PT(\d+(?:\.\d+)?)S$/)?.[1];
+  const parameterRows = native?.parameters ?? [];
+  return (
+    <section aria-label="分钟策略配置">
+      <fieldset className="exp-native-controls" disabled={!interactiveReady}>
+        <dl className="exp-metrics exp-native-config">
+          <div>
+            <dt>策略</dt>
+            <dd>
+              {target.name} · 第 {target.head.version} 版
+            </dd>
+          </div>
+          <div>
+            <dt>区间</dt>
+            <dd className="num">
+              {value.start_date} — {value.end_date}
+            </dd>
+          </div>
+          <div>
+            <dt>来源</dt>
+            <dd>
+              <Tip interactive content={`来源 ${source_key}；第 ${source_version} 版`}>
+                <button type="button" className="exp-native-tip" aria-label="查看分钟数据来源">
+                  第 {source_version} 版
+                </button>
+              </Tip>
+            </dd>
+          </div>
+          <div>
+            <dt>策略类型</dt>
+            <dd>{target.source_kind === "builtin" ? "内置策略" : "策略模板"}</dd>
+          </div>
+          <div>
+            <dt>参数明细</dt>
+            <dd>
+              {parameterRows.length > 0 ? (
+                <dl className="exp-native-parameters" aria-label="原生策略参数">
+                  {parameterRows.map((parameter) => (
+                    <div key={parameter.name}>
+                      <dt>{parameter.label || "参数"}</dt>
+                      <dd>
+                        <span className="num">{parameter.display_value || "—"}</span>
+                        <Tip
+                          interactive
+                          content={`参数 ${parameter.name}；原值 ${JSON.stringify(parameter.value)}；参数摘要 ${target.parameter_fingerprint}`}
+                        >
+                          <button
+                            type="button"
+                            className="exp-native-tip"
+                            aria-label={`查看${parameter.label || "参数"}来源`}
+                          >
+                            详情
+                          </button>
+                        </Tip>
+                      </dd>
+                    </div>
+                  ))}
+                </dl>
+              ) : (
+                <Tip
+                  interactive
+                  content={`本结果未提供参数明细；参数摘要 ${target.parameter_fingerprint}`}
+                >
+                  <button type="button" className="exp-native-tip" aria-label="查看分钟参数来源">
+                    —
+                  </button>
+                </Tip>
+              )}
+            </dd>
+          </div>
+          <div>
+            <dt>执行配置</dt>
+            <dd>
+              <Tip
+                interactive
+                content={`配置 ${profile_hash}；定义 ${target.head.spec_fingerprint}${profile ? `；原执行配置 ${JSON.stringify(profile)}` : ""}`}
+              >
+                <button type="button" className="exp-native-tip" aria-label="查看分钟执行配置">
+                  已绑定
+                </button>
+              </Tip>
+            </dd>
+          </div>
+          <div>
+            <dt>初始资金</dt>
+            <dd className="num">{initialCash === "—" ? "—" : `${initialCash} 元`}</dd>
+          </div>
+          <div>
+            <dt>模拟数量</dt>
+            <dd>
+              {policy && Object.keys(policy.action_quantities).length > 0 ? (
+                <ul className="exp-native-quantities">
+                  {Object.entries(policy.action_quantities).map(([action, quantity]) => (
+                    <li key={action}>
+                      <Tip interactive content={`动作 ${action}；模拟账户 ${policy.account_id}`}>
+                        <button type="button" className="exp-native-tip">
+                          {Object.entries(ACTION_COPY).find(([key]) => key === action)?.[1] ||
+                            "其他动作"}{" "}
+                          · {formatCount(quantity)} 股
+                        </button>
+                      </Tip>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                "—"
+              )}
+            </dd>
+          </div>
+          <div>
+            <dt>执行延迟</dt>
+            <dd>
+              {policy ? (
+                <Tip interactive content={`原执行延迟 ${policy.execution_lag}`}>
+                  <button type="button" className="exp-native-tip" aria-label="查看分钟执行延迟">
+                    {lagSeconds === undefined ? "查看延迟" : `${lagSeconds} 秒`}
+                  </button>
+                </Tip>
+              ) : (
+                "—"
+              )}
+            </dd>
+          </div>
+          <div>
+            <dt>采集方式</dt>
+            <dd>{native ? (native.source_kind === "captured" ? "原始记录" : "历史重建") : "—"}</dd>
+          </div>
+          <div>
+            <dt>费用</dt>
+            <dd>
+              {costs ? (
+                <Tip
+                  interactive
+                  content={`费用摘要 ${target.cost_fingerprint}；原费用 ${JSON.stringify(costs)}`}
+                >
+                  <button type="button" className="exp-native-tip" aria-label="查看分钟策略费用">
+                    查看费用
+                  </button>
+                </Tip>
+              ) : (
+                "—"
+              )}
+            </dd>
+          </div>
+        </dl>
+      </fieldset>
+    </section>
+  );
+}
+
+function Configuration({
+  value,
+  native,
+  interactiveReady = true,
+}: {
+  value: ExperimentResult["configuration"];
+  native?: ExperimentResult["native"];
+  interactiveReady?: boolean;
+}) {
+  if (isNativeExperimentConfiguration(value))
+    return (
+      <NativeConfiguration value={value} native={native} interactiveReady={interactiveReady} />
+    );
   const cost = value.execution_cost_spec;
   return (
     <dl className="exp-metrics">
@@ -888,6 +1075,7 @@ function FormalExperimentsPage({
   const [compareOpen, setCompareOpen] = useState(false);
   const [selected, setSelected] = useState<FormalExperiment | null>(null);
   const [familyId, setFamilyId] = useState<string | null>(null);
+  const [familyReady, setFamilyReady] = useState(false);
   const [newOpen, setNewOpen] = useState(false);
   const [policyOpen, setPolicyOpen] = useState(false);
   const [months, setMonths] = useState(caps.policy?.months ?? 0);
@@ -957,6 +1145,7 @@ function FormalExperimentsPage({
     setChosen([]);
     setCompareOpen(false);
     setFamilyId(null);
+    setFamilyReady(false);
     setSelected(null);
     setUnseal(null);
     setNewOpen(false);
@@ -977,12 +1166,17 @@ function FormalExperimentsPage({
     setNewOpen(false);
     setPolicyOpen(false);
     setFamilyId(null);
+    setFamilyReady(false);
     setSelected(null);
     setUnseal(null);
   };
   const afterDrawerOpenChange = (open: boolean) => {
     if (open || !focusReturn.current) return;
     setDrawerClosed(true);
+  };
+  const afterFamilyOpenChange = (open: boolean) => {
+    setFamilyReady(open);
+    afterDrawerOpenChange(open);
   };
   useEffect(() => {
     const request = focusReturn.current;
@@ -1415,7 +1609,7 @@ function FormalExperimentsPage({
                   <article key={entry.experiment_id}>
                     <h3>实验 {index === 0 ? "A" : "B"}</h3>
                     <Metrics values={entry.metrics} />
-                    <Configuration value={entry.configuration} />
+                    <Configuration value={entry.configuration} native={entry.native} />
                     <ResultRules result={entry} />
                   </article>
                 ))}
@@ -1521,7 +1715,7 @@ function FormalExperimentsPage({
       <SideDrawer
         open={familyId !== null}
         onClose={close}
-        afterOpenChange={afterDrawerOpenChange}
+        afterOpenChange={afterFamilyOpenChange}
         wide
         title={currentFamily?.name ?? "实验详情"}
       >
@@ -1623,7 +1817,7 @@ function FormalExperimentsPage({
                       wrap: true,
                       cell: (slot) => (
                         <>
-                          <RowParameters item={slot} />
+                          <RowParameters item={slot} interactiveReady={familyReady} />
                           <details>
                             <summary>全部指标</summary>
                             <Metrics values={slot.metrics ?? []} />
@@ -1682,7 +1876,7 @@ function FormalExperimentsPage({
                         <Button variant="ghost" size="sm" onClick={() => setSelected(item)}>
                           第 {item.index + 1} 项
                         </Button>
-                        <RowParameters item={item} />
+                        <RowParameters item={item} interactiveReady={familyReady} />
                         <details>
                           <summary>全部指标</summary>
                           <Metrics values={item.metrics ?? []} />
@@ -1765,7 +1959,11 @@ function FormalExperimentsPage({
                   <span className="exp-help">结果来源</span>
                 </Tip>
                 <Curves results={[result.data]} />
-                <Configuration value={result.data.configuration} />
+                <Configuration
+                  value={result.data.configuration}
+                  native={result.data.native}
+                  interactiveReady={familyReady}
+                />
                 <ResultRules result={result.data} />
                 <h3>全区间指标</h3>
                 <Metrics values={result.data.metrics} />

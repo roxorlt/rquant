@@ -15,8 +15,9 @@ from typing import Annotated, Literal
 from pydantic import Field, StrictBool, StrictStr, model_validator
 
 from rquant.lab_scheduling_control import LabSchedulingControlState
+from rquant.delivery_contracts import NotificationRuntimeWindow
 from rquant.ops_status import OpsSnapshot
-from rquant.runtime_contracts import RuntimeContractModel, canonical_sha256, normalize_aware_utc
+from rquant.runtime_contracts import AwareUtcDatetime, RuntimeContractModel, canonical_sha256, normalize_aware_utc
 from rquant.serving_contracts import FreshnessStatus
 from rquant.serving_publisher import ServingReader
 from rquant.serving_read_models import PAGE_PROJECTION_CONTRACTS, ServingProjectionPayload
@@ -26,7 +27,9 @@ from rquant.task_unit_control import TaskUnitRunEvidence
 from rquant.web.serving import BorrowedGeneration
 from rquant.page_control import PageControlReceipt, PageControlService, PageControlStatus, PageControlCommandConflictError
 from rquant.task_control import TaskControlPageControlBackend, TaskControlSubmissionReference, TaskUnitConfirmation, TaskUnitEffect
-from rquant.task_control_commands import OwnedTaskControl, OwnedPrepareUnitRun, OwnedRequestUnitRun, OwnedSetLabSchedulingPaused, TaskControlRequest, TaskControlIdentity
+from rquant.task_control_commands import (OwnedTaskControl, OwnedPrepareUnitRun, OwnedRequestUnitRun, OwnedSetLabSchedulingPaused, TaskControlRequest, TaskControlIdentity,
+    OwnedPrepareNotifierDeliveryMode, OwnedSetNotifierDeliveryMode, OwnedSetMonitorBuiltinEnabled, NotifierModeConfirmation)
+from rquant.notifier_operator import NotifierModeState, MonitorBuiltinControlState, inspect_monitor_control_installation, read_monitor_control_state
 from rquant.lab_scheduling_control import LabSchedulingSubmission
 from rquant.factor_definition_admission import FactorDefinitionAdmissionClient, FactorDefinitionAdmissionServer, _ACTOR_ADAPTER, _UnixHTTPConnection, _peer_uid, build_factor_definition_admission_server
 from rquant.strict_json import canonical_json_bytes, strict_json_loads
@@ -39,10 +42,12 @@ class TaskCenterServingView(RuntimeContractModel):
     cpu: tuple[TaskCpuResult, ...] = Field(min_length=5, max_length=5)
     runs: tuple[TaskUnitRunEvidence, ...] = Field(max_length=32)
     scheduling_control: LabSchedulingControlState | None = None
+    notification_runtime: NotificationRuntimeWindow | None = None
 
     @property
     def material_hash(self) -> str:
-        return canonical_sha256(self)
+        return canonical_sha256(self.model_dump(mode="json", exclude={"notification_runtime"})
+            if self.notification_runtime is None else self)
 
 
 def _task_projection(borrowed: BorrowedGeneration, name: Literal["ops_task_cpu", "ops_task_runs", "lab_scheduler_control"]) -> ServingProjectionPayload | None:
@@ -109,8 +114,12 @@ def read_task_center_view(borrowed: BorrowedGeneration) -> TaskCenterServingView
         state = LabSchedulingControlState.model_validate_json(control.rows[0]["state_json"])
         if scheduling_projection(state, cutoff=control.available_at) != control:
             raise ValueError("scheduler projection does not match original state")
+    from rquant.condition_alert_runtime_projection import read_monitor_runtime
+
+    monitor = read_monitor_runtime(borrowed, now=borrowed.manifest.built_at)
     return TaskCenterServingView(generation_id=borrowed.manifest.generation_id, ops_generation_id=mark.generation_id,
-        snapshot=snapshot, cpu=tuple(by_slice[name] for name in SLICES), runs=evidence, scheduling_control=state)
+        snapshot=snapshot, cpu=tuple(by_slice[name] for name in SLICES), runs=evidence, scheduling_control=state,
+        notification_runtime=None if monitor is None else monitor.notification_window)
 
 
 class TaskCenterServingSource:
@@ -157,7 +166,15 @@ class TaskUnitRunCapability(RuntimeContractModel):
     mode: Literal["readonly", "writer"]
     can_request: StrictBool
     requires_confirmation: StrictBool
-    reason: Literal["available", "disabled", "busy", "window_closed", "source_unavailable"]
+    reason: Literal["available", "disabled", "busy", "window_closed", "source_unavailable", "cooldown"]
+
+
+class ManualTaskUnitRunCapability(TaskUnitRunCapability):
+    contract: Literal["rquant.manual-service-capability/v1"] = "rquant.manual-service-capability/v1"
+    unit: Literal["rquant-notify-test.service"] = "rquant-notify-test.service"
+    mode: Literal["readonly"] = "readonly"
+    requires_confirmation: Literal[True] = True
+    next_allowed_at: AwareUtcDatetime | None = None
 
 
 class TaskControlCapabilities(RuntimeContractModel):
@@ -166,17 +183,22 @@ class TaskControlCapabilities(RuntimeContractModel):
     source_payload_hash: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
     metadata_identity: TaskControlIdentity
     enabled: StrictBool
-    units: tuple[TaskUnitRunCapability, ...] = Field(max_length=32)
+    units: tuple[TaskUnitRunCapability | ManualTaskUnitRunCapability, ...] = Field(max_length=32)
     can_control_scheduling: StrictBool
     can_recover_units: StrictBool
     can_recover_scheduling: StrictBool
     scheduling_control: LabSchedulingControlState | None
+    notifier_mode: NotifierModeState | None = None
+    builtin_controls: tuple[MonitorBuiltinControlState, ...] = Field(default=(), max_length=4)
+    can_control_notifier_mode: StrictBool = False
+    can_set_notifier_live: StrictBool = False
+    can_control_builtins: StrictBool = False
 
     @model_validator(mode="after")
     def validate_unique(self) -> TaskControlCapabilities:
         if len({item.unit for item in self.units}) != len(self.units):
             raise ValueError("task capability exact unit set differs")
-        if not self.enabled and (any(item.can_request for item in self.units) or self.can_control_scheduling):
+        if not self.enabled and (any(item.can_request for item in self.units) or self.can_control_scheduling or self.can_control_notifier_mode or self.can_control_builtins):
             raise ValueError("disabled task capability cannot permit fresh effects")
         return self
 
@@ -190,6 +212,8 @@ class TaskControlAdmissionResult(RuntimeContractModel):
     confirmation: TaskUnitConfirmation | None = None
     unit_effect: TaskUnitEffect | None = None
     scheduling_submission: LabSchedulingSubmission | None = None
+    notifier_confirmation: NotifierModeConfirmation | None = None
+    monitor_state: NotifierModeState | MonitorBuiltinControlState | None = None
 
     @model_validator(mode="after")
     def validate_original(self) -> TaskControlAdmissionResult:
@@ -200,7 +224,28 @@ class TaskControlAdmissionResult(RuntimeContractModel):
             reference = TaskControlSubmissionReference.model_validate(self.receipt.result)
             if reference.model_dump(mode="json") != TaskControlPageControlBackend.reference(command):
                 raise ValueError("task response receipt differs from exact original accepted command")
-        if type(command) is OwnedPrepareUnitRun:
+        if type(command) in (OwnedPrepareNotifierDeliveryMode, OwnedSetNotifierDeliveryMode, OwnedSetMonitorBuiltinEnabled):
+            if any(value is not None for value in (self.confirmation, self.unit_effect, self.scheduling_submission)):
+                raise ValueError("monitor response contains another original effect")
+            if type(command) is OwnedPrepareNotifierDeliveryMode:
+                value = self.notifier_confirmation
+                if self.monitor_state is not None or self.receipt.status is PageControlStatus.SUCCEEDED and value is None:
+                    raise ValueError("mode preparation has no original confirmation")
+                if value is not None and (value.prepare_id, value.owner_id, value.run, value.context) != (command.command_id, command.owner_id, command.run, command.context):
+                    raise ValueError("mode preparation differs from its full original draft/source")
+            else:
+                value = self.monitor_state
+                if self.notifier_confirmation is not None or self.receipt.status is PageControlStatus.SUCCEEDED and value is None:
+                    raise ValueError("monitor operation has no exact original state")
+                if value is not None and (value.command_id, value.accepted_at, value.installation_sha256, value.revision) != (
+                        command.command_id, command.accepted_at, command.context.installation_sha256, command.expected_revision + 1):
+                    raise ValueError("monitor operation differs from its original UUID/revision")
+                if value is not None and (type(command) is OwnedSetNotifierDeliveryMode and (type(value) is not NotifierModeState or value.mode != command.mode or value.actor_id != command.owner_id)
+                        or type(command) is OwnedSetMonitorBuiltinEnabled and (type(value) is not MonitorBuiltinControlState or (value.owner_id, value.builtin_id, value.definition.enabled) != (command.owner_id, command.builtin_id, command.enabled))):
+                    raise ValueError("monitor state differs from its protected owner/kind")
+        elif self.notifier_confirmation is not None or self.monitor_state is not None:
+            raise ValueError("original task response contains another monitor effect")
+        elif type(command) is OwnedPrepareUnitRun:
             if self.unit_effect is not None or self.scheduling_submission is not None or self.receipt.status is PageControlStatus.SUCCEEDED and self.confirmation is None:
                 raise ValueError("unit prepare response contains another effect")
             if self.confirmation is not None and (self.confirmation.prepare_id, self.confirmation.owner_id, self.confirmation.run, self.confirmation.context) != (command.command_id, command.owner_id, command.run, command.context):
@@ -227,14 +272,16 @@ class TaskControlAdmission:
 
     @property
     def editor_users(self) -> frozenset[str]:
-        return frozenset((*self.backend.operators, *self.backend.scheduling_admins))
+        owners = () if self.backend.monitor_control is None else tuple(row.owner_id for row in
+            inspect_monitor_control_installation(self.backend.monitor_control, runtime_root=self.backend.monitor_runtime_root).builtin_definitions)
+        return frozenset((*self.backend.operators, *self.backend.scheduling_admins, *self.backend.notifier_admins, *owners))
 
     def capabilities(self, *, authenticated_actor_id: str, generation_id: str) -> TaskControlCapabilities:
         from rquant.task_unit_control import writer_window_allows
 
         actor = authenticated_actor_id
         operator, admin = actor in self.backend.operators, actor in self.backend.scheduling_admins
-        if not (operator or admin):
+        if actor not in self.editor_users:
             raise PermissionError("task capability is unavailable for current role")
         view = self.backend.source.read(generation_id=generation_id)
         entries: list[TaskUnitRunCapability] = []
@@ -247,10 +294,55 @@ class TaskControlAdmission:
                 published = by_unit.get(entry.unit)
                 reason = "disabled" if not (self.backend.enabled and policy.enabled and entry.enabled) else "source_unavailable" if published is None else "busy" if published.service_active_state in ("active", "activating", "reloading", "deactivating") or self.backend.journal.unit_unresolved(entry.unit, view.snapshot.boot_id) else "window_closed" if entry.mode == "writer" and not writer_window_allows(self.backend.clock()) else "available"
                 entries.append(TaskUnitRunCapability(unit=entry.unit, mode=entry.mode, can_request=reason == "available", requires_confirmation=entry.mode == "writer", reason=reason))
+            if self.backend.executor.manual_binding is not None:
+                from rquant.notifier_operator import MANUAL_SERVICE, guard_manual_service_run
+
+                next_allowed = self.backend.journal.manual_next_allowed_at()
+                reason = "source_unavailable"
+                try:
+                    receipt = self.backend.executor.read_manual_state()
+                    if (receipt.runtime_state.host_name, receipt.runtime_state.boot_id, receipt.material.ops_manifest_digest) != (
+                            view.snapshot.host_name, view.snapshot.boot_id, view.snapshot.manifest_digest):
+                        raise ValueError("manual capability differs from the original Ops source")
+                    if not (self.backend.enabled and receipt.material.install.enabled):
+                        reason = "disabled"
+                    elif self.backend.journal.unit_unresolved(MANUAL_SERVICE, view.snapshot.boot_id):
+                        reason = "busy"
+                    elif next_allowed is not None and self.backend.clock() < next_allowed:
+                        reason = "cooldown"
+                    else:
+                        guard_manual_service_run(receipt, now=self.backend.clock())
+                        reason = "available"
+                except (OSError, ValueError, PermissionError, TimeoutError):
+                    pass
+                entries.append(ManualTaskUnitRunCapability(can_request=reason == "available", reason=reason,
+                    next_allowed_at=next_allowed))
+        mode, builtins, monitor_ready, live_ready = None, (), False, False
+        if self.backend.monitor_control is not None:
+            try:
+                self.backend.monitor_context(view, actor=actor, now=self.backend.clock())
+                actual = read_monitor_control_state(self.backend.monitor_control, runtime_root=self.backend.monitor_runtime_root, now=self.backend.clock())
+                mode = actual.mode if actor in self.backend.notifier_admins else None
+                builtins = tuple(row for row in actual.builtins if row.owner_id == actor)
+                monitor_ready = self.backend.enabled
+                from rquant.notifier_operator import require_monitor_live_capability
+
+                if monitor_ready and actor in self.backend.notifier_admins:
+                    try:
+                        require_monitor_live_capability(view.notification_runtime, installed=actual.installation,
+                            current_mode=actual.mode, now=self.backend.clock())
+                        live_ready = True
+                    except ValueError:
+                        pass
+            except (OSError, ValueError, PermissionError, TimeoutError):
+                pass
         return TaskControlCapabilities(owner_id=actor, generation_id=view.generation_id, source_payload_hash=view.material_hash,
             metadata_identity=self.backend.journal.identity(), enabled=self.backend.enabled, units=tuple(entries),
             can_control_scheduling=bool(admin and self.backend.enabled and self.backend.lab_facade is not None and view.scheduling_control is not None),
-            can_recover_units=operator, can_recover_scheduling=admin, scheduling_control=view.scheduling_control if admin else None)
+            can_recover_units=operator, can_recover_scheduling=admin, scheduling_control=view.scheduling_control if admin else None,
+            notifier_mode=mode, builtin_controls=builtins, can_control_notifier_mode=monitor_ready and mode is not None,
+            can_set_notifier_live=live_ready,
+            can_control_builtins=monitor_ready and bool(builtins))
 
     def _bound(self, request: TaskControlRequest, actor: str, receipt: PageControlReceipt) -> TaskControlAdmissionResult:
         match = self.service.outbox.lookup_task_control_command(request, authenticated_actor_id=actor)
@@ -261,14 +353,22 @@ class TaskControlAdmission:
         challenge = None
         effect = None
         scheduling = None
+        notifier_confirmation, monitor_state = None, None
         if type(command) is OwnedPrepareUnitRun and self.backend.has_effect(command):
             challenge = self.backend.journal.prepare_confirmation(command)
         elif type(command) is OwnedRequestUnitRun:
             effect = self.backend.journal.run_effect(command)
         elif type(command) is OwnedSetLabSchedulingPaused and self.backend.has_effect(command):
             scheduling = self.backend.lab_facade.submit_scheduling_control(command.envelope)
+        elif type(command) in (OwnedPrepareNotifierDeliveryMode, OwnedSetNotifierDeliveryMode, OwnedSetMonitorBuiltinEnabled):
+            operation = self.backend.journal.monitor_operation(command)
+            if type(command) is OwnedPrepareNotifierDeliveryMode:
+                notifier_confirmation = operation
+            else:
+                monitor_state = operation
         return TaskControlAdmissionResult(original_request=request, owner_id=actor, accepted_command=command,
-            metadata_identity=command.metadata_identity, receipt=receipt, confirmation=challenge, unit_effect=effect, scheduling_submission=scheduling)
+            metadata_identity=command.metadata_identity, receipt=receipt, confirmation=challenge, unit_effect=effect, scheduling_submission=scheduling,
+            notifier_confirmation=notifier_confirmation, monitor_state=monitor_state)
 
     def lookup(self, request: TaskControlRequest, *, authenticated_actor_id: str) -> TaskControlAdmissionResult | None:
         with self._lock:

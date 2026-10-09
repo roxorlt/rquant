@@ -100,10 +100,10 @@ export function TaskUnitControls({
       result: pending?.body.command_id === body.command_id ? pending.result : null,
       message: "运行结果待确认，请核验原请求。",
     };
-    keep(record);
     setBusy(true);
     setNotice(null);
     try {
+      keep(record);
       const result =
         mode === "submit"
           ? await submitTaskControl(body, request.signal)
@@ -133,6 +133,12 @@ export function TaskUnitControls({
         onRefresh();
     } catch (error) {
       if (!current(token, owner, generation)) return;
+      if (error instanceof Error && error.name === "MonitorControlPersistenceError") {
+        setNotice(error.message);
+        const saved = memory.get(owner, unit);
+        if (saved) setPending({ ...saved, result: null });
+        return;
+      }
       const outcome = taskRequestError(error);
       if (outcome === "revoked") {
         keep(null);
@@ -161,7 +167,7 @@ export function TaskUnitControls({
     };
     setDraft(body);
     setNotice(null);
-    if (choice.requires_confirmation) {
+    if (choice.requires_confirmation || unit === "rquant-notify-test.service") {
       const prepare: UnitPrepareRequest = {
         kind: "prepare_unit_run",
         command_id: crypto.randomUUID(),
@@ -251,7 +257,9 @@ export function TaskUnitControls({
         description={
           confirmation === null
             ? "将请求运行一次。任务开始和完成后会显示实际结果。"
-            : "本次任务会写入数据。请核对后确认。"
+            : unit === "rquant-notify-test.service"
+              ? "将向已配置的通道提交测试消息。每 10 分钟最多一次，请核对后确认。"
+              : "本次任务会写入数据。请核对后确认。"
         }
         confirmName={name}
         expiresAt={

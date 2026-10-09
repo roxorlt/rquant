@@ -757,11 +757,13 @@ def test_builtin_registry_registers_dependency_free_concrete_builders(tmp_path: 
         RuntimeServiceKind.STRATEGY_LIVE,
         RuntimeServiceKind.SIGNAL_ROUTER,
         RuntimeServiceKind.NOTIFIER,
+        RuntimeServiceKind.PRICE_ALERT_RUNTIME,
         RuntimeServiceKind.PAPER_CONSTRAINT_PUBLISHER,
         RuntimeServiceKind.PAPER_BROKER,
         RuntimeServiceKind.RUNTIME_HEALTH_PUBLISHER,
         RuntimeServiceKind.LAB_JOBS_PUBLISHER,
         RuntimeServiceKind.LAB_ARTIFACT_CATALOG,
+        RuntimeServiceKind.MINUTE_STUDY_PROJECTION,
         RuntimeServiceKind.ARTIFACT_RETENTION,
         RuntimeServiceKind.PROMOTIONS_PUBLISHER,
         RuntimeServiceKind.SERVING_PUBLISHER,
@@ -993,9 +995,10 @@ def test_complete_builtin_registry_registers_watchlist_quote_source() -> None:
         serving_snapshot_loader=lambda _now: object(),  # type: ignore[arg-type]
     )
 
-    assert registry.registered_kinds == tuple(
-        kind for kind in RuntimeServiceKind if kind is not RuntimeServiceKind.PAPER_CONSUMER
-    )
+    assert set(registry.registered_kinds) == {
+        kind for kind in RuntimeServiceKind
+        if kind not in {RuntimeServiceKind.PAPER_CONSUMER, RuntimeServiceKind.CONDITION_ALERT_RUNTIME}
+    }
     assert RuntimeServiceKind.WATCHLIST_QUOTE_SOURCE in registry.registered_kinds
 
 

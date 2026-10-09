@@ -7,6 +7,7 @@ import io
 import os
 import stat
 import zipfile
+from collections.abc import Callable
 from contextlib import suppress
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -54,7 +55,10 @@ class PortfolioReadResult(RuntimeContractModel):
     def html_bytes(self) -> bytes:
         if self.bundle.html is None:
             raise ArtifactPreviewUnavailableError("complete sealed HTML is unavailable")
-        return self.bundle.html.encode("utf-8")
+        from rquant.sealed_result_html import validate_offline_html
+        content = self.bundle.html.encode("utf-8")
+        validate_offline_html(content)
+        return content
 
 
 class PortfolioResultReader:
@@ -98,11 +102,19 @@ class PortfolioResultReader:
         expected_result_hash: str | None = None,
         private_owner: str | None = None,
         private_authority: ExperimentPrivateResultAuthority | None = None,
+        collaboration: object | None = None,
     ) -> PortfolioReadResult:
         authority = self.reader.get_artifact_preview_authority(job_id)
         if authority is None or authority.job.spec.parameters.strategy_name != "portfolio_backtest":
             raise ArtifactPreviewUnavailableError("portfolio sealed result is unavailable")
         self._private_guard(authority.job, owner=private_owner, authority=private_authority)
+        original_owner = None
+        if collaboration is not None:
+            from rquant.web.collaboration_gateway import CollaborationGateway
+            if type(collaboration) is not CollaborationGateway or private_owner is None:
+                raise PermissionError("original current ownership gateway is required")
+            original_owner = collaboration.result_owner(private_owner, domain="portfolio", job_id=str(job_id),
+                spec_hash=authority.job.spec_hash)
         if (
             expected_result_hash is not None
             and authority.evidence.complete_result_hash != expected_result_hash
@@ -155,6 +167,9 @@ class PortfolioResultReader:
             or preview.manifest_hash != authority.evidence.manifest_hash
         ):
             raise ValueError("portfolio result identity changed while reading")
+        if original_owner is not None and collaboration.result_owner(private_owner, domain="portfolio",
+                job_id=str(job_id), spec_hash=preview.spec_hash) != original_owner:
+            raise PermissionError("current original portfolio owner changed during read")
         return PortfolioReadResult(
             job_id=job_id,
             spec_hash=preview.spec_hash,
@@ -256,258 +271,39 @@ class PortfolioZipExportFacade(LabJobZipExportFacade):
         self, job_id: UUID, *, expected_result_hash: str, request_id: UUID | None = None
     ) -> PortfolioZipReceipt:
         if request_id is not None:
-            recovered = self.recover_portfolio(
-                job_id, request_id=request_id, expected_result_hash=expected_result_hash
-            )
+            recovered = self.recover_portfolio(job_id, request_id=request_id, expected_result_hash=expected_result_hash)
             if recovered is not None:
                 return recovered
         result = self.result_reader.read(job_id, expected_result_hash=expected_result_hash)
-        html = result.html_bytes()
-        original = self.original_exports.export(job_id)
-        if original.byte_size > MAX_ZIP_BYTES:
-            raise ValueError("portfolio original ZIP exceeds byte budget")
-        request_id = request_id or uuid4()
-        descriptors: list[int] = []
-        request_fd: int | None = None
-        created_temporary: tuple[int, int] | None = None
-        try:
-            original_root = self.original_exports._open_bound_export_root()
-            descriptors.append(original_root)
-            original_job = self.original_exports._open_private_child(
-                original_root, original.job_id.hex, label="source job directory"
-            )
-            descriptors.append(original_job)
-            original_request = self.original_exports._open_private_child(
-                original_job, original.request_id.hex, label="source request directory"
-            )
-            descriptors.append(original_request)
-            source_fd = os.open("result.zip", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=original_request)
-            descriptors.append(source_fd)
-            source_before = os.fstat(source_fd)
-            if (
-                not stat.S_ISREG(source_before.st_mode)
-                or source_before.st_nlink != 1
-                or stat.S_IMODE(source_before.st_mode) != 0o600
-                or source_before.st_size != original.byte_size
-                or _sha256_descriptor(source_fd) != original.sha256
-            ):
-                raise LabArtifactIntegrityError("source ZIP identity differs from receipt")
-            with self._locked_export_root() as root_fd:
-                self._enforce_record_budget(root_fd)
-                job_fd = self._open_private_child(
-                    root_fd, job_id.hex, label="portfolio job directory", create=True
-                )
-                descriptors.append(job_fd)
-                request_fd = self._open_private_child(
-                    job_fd, request_id.hex, label="portfolio request directory", create=True
-                )
-                descriptors.append(request_fd)
-                self._discard_interrupted_temporary(request_fd)
-                output_fd = os.open(
-                    "result.tmp",
-                    os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                    0o600,
-                    dir_fd=request_fd,
-                )
-                output_identity = os.fstat(output_fd)
-                created_temporary = (output_identity.st_dev, output_identity.st_ino)
-                with (
-                    os.fdopen(output_fd, "w+b") as output,
-                    os.fdopen(os.dup(source_fd), "rb") as source,
-                ):
-                    source.seek(0)
-                    with (
-                        zipfile.ZipFile(source) as old,
-                        zipfile.ZipFile(
-                            _BudgetedZipWriter(output, self.max_zip_bytes),
-                            "w",
-                            compression=zipfile.ZIP_DEFLATED,
-                            compresslevel=9,
-                        ) as new,
-                    ):
-                        entries = old.infolist()
-                        names = [entry.filename for entry in entries]
-                        allowed = {
-                            "manifest.json",
-                            "SHA256SUMS",
-                            "spec.json",
-                            "metrics.json",
-                            "report.md",
-                            *(f"tables/{name}.parquet" for name in PORTFOLIO_TABLE_NAMES),
-                        }
-                        if (
-                            set(names) != allowed
-                            or len(names) != len(allowed)
-                            or any(entry.flag_bits & 1 for entry in entries)
-                        ):
-                            raise LabArtifactIntegrityError("source ZIP inventory differs")
-                        if sum(entry.file_size for entry in entries) > 256 * 1024 * 1024:
-                            raise ValueError("portfolio ZIP uncompressed byte budget exceeded")
-                        by_name = {entry.filename: entry for entry in entries}
-                        for name in sorted([*names, "report.html"]):
-                            info = zipfile.ZipInfo(name, (1980, 1, 1, 0, 0, 0))
-                            info.compress_type = zipfile.ZIP_DEFLATED
-                            info.external_attr = 0o100400 << 16
-                            if name == "report.html":
-                                new.writestr(info, html, compresslevel=9)
-                            else:
-                                with (
-                                    old.open(by_name[name]) as entry,
-                                    new.open(info, "w") as destination,
-                                ):
-                                    copied = 0
-                                    while chunk := entry.read(64 * 1024):
-                                        copied += len(chunk)
-                                        if copied > by_name[name].file_size:
-                                            raise LabArtifactIntegrityError(
-                                                "source ZIP entry length changed"
-                                            )
-                                        destination.write(chunk)
-                                    if copied != by_name[name].file_size:
-                                        raise LabArtifactIntegrityError(
-                                            "source ZIP entry is truncated"
-                                        )
-                    output.flush()
-                    os.fsync(output.fileno())
-                source_after = os.fstat(source_fd)
-                at_path = os.stat("result.zip", dir_fd=original_request, follow_symlinks=False)
-                if (
-                    _identity(source_after) != _identity(source_before)
-                    or _identity(at_path) != _identity(source_before)
-                    or _sha256_descriptor(source_fd) != original.sha256
-                ):
-                    raise LabArtifactIntegrityError("source ZIP changed during export")
-                if (
-                    self.result_reader.read(job_id, expected_result_hash=expected_result_hash)
-                    != result
-                ):
-                    raise LabArtifactIntegrityError("sealed portfolio changed during export")
-                _rename_noreplace(request_fd, "result.tmp", request_fd, "result.zip")
-                os.fsync(request_fd)
-                path = self.export_root / job_id.hex / request_id.hex / "result.zip"
-                receipt = self._build_receipt(request_id=request_id, job_id=job_id, path=path)
-                return PortfolioZipReceipt(
-                    **receipt.model_dump(mode="python"),
-                    result_hash=result.result_hash,
-                    bundle_hash=result.bundle.bundle_hash,
-                    html_sha256=result.bundle.html_sha256,
-                )
-        except BaseException:
-            if request_fd is not None and created_temporary is not None:
-                with suppress(FileNotFoundError):
-                    current = os.stat("result.tmp", dir_fd=request_fd, follow_symlinks=False)
-                    if (
-                        (current.st_dev, current.st_ino) == created_temporary
-                        and stat.S_ISREG(current.st_mode)
-                        and current.st_nlink == 1
-                    ):
-                        os.unlink("result.tmp", dir_fd=request_fd)
-            raise
-        finally:
-            for descriptor in reversed(descriptors):
-                os.close(descriptor)
 
+        def validate_unchanged() -> None:
+            if self.result_reader.read(job_id, expected_result_hash=expected_result_hash) != result:
+                raise LabArtifactIntegrityError("sealed portfolio changed during export")
+
+        receipt = _pack_verified_html_zip(facade=self, original_exports=self.original_exports,
+            job_id=job_id, request_id=request_id, html=result.html_bytes(), table_names=PORTFOLIO_TABLE_NAMES,
+            max_zip_bytes=self.max_zip_bytes, discard_temporary=self._discard_interrupted_temporary,
+            validate_unchanged=validate_unchanged)
+        return PortfolioZipReceipt(**receipt.model_dump(mode="python"), result_hash=result.result_hash,
+            bundle_hash=result.bundle.bundle_hash, html_sha256=result.bundle.html_sha256)
     def _discard_interrupted_temporary(self, request_fd: int) -> None:
-        # The original journal fixes this request slot before publication. Under
-        # the export lock only its private regular temporary may be rebuilt.
-        try:
-            descriptor = os.open("result.tmp", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=request_fd)
-        except FileNotFoundError:
-            return
-        try:
-            before = os.fstat(descriptor)
-            if (
-                not stat.S_ISREG(before.st_mode)
-                or before.st_nlink != 1
-                or before.st_uid != os.geteuid()
-                or stat.S_IMODE(before.st_mode) != 0o600
-                or before.st_size > self.max_zip_bytes
-            ):
-                raise LabArtifactIntegrityError("interrupted portfolio temporary is unsafe")
-            current = os.stat("result.tmp", dir_fd=request_fd, follow_symlinks=False)
-            if _identity(current) != _identity(before):
-                raise LabArtifactIntegrityError("interrupted portfolio temporary changed")
-            os.unlink("result.tmp", dir_fd=request_fd)
-            os.fsync(request_fd)
-        finally:
-            os.close(descriptor)
-
+        _discard_interrupted_html_temporary(request_fd, max_zip_bytes=self.max_zip_bytes)
     def recover_portfolio(
         self, job_id: UUID, *, request_id: UUID, expected_result_hash: str
     ) -> PortfolioZipReceipt | None:
         result = self.result_reader.read(job_id, expected_result_hash=expected_result_hash)
-        html = result.html_bytes()
-        authority = self.reader.get_artifact_preview_authority(job_id)
-        if authority is None or authority.evidence.complete_result_hash != result.result_hash:
-            raise LabArtifactIntegrityError("portfolio recovery result changed")
-        sealed = self.artifact_store.verify_sealed(authority.evidence.sealed_path)
-        if (sealed.manifest_hash, sealed.manifest.complete_result_hash, sealed.file_identities) != (
-            authority.evidence.manifest_hash,
-            authority.evidence.complete_result_hash,
-            authority.evidence.file_identities,
-        ):
-            raise LabArtifactIntegrityError("portfolio recovery artifact identity changed")
-        expected_hashes = self.artifact_store._expected_bound_hashes(sealed.manifest) | {
-            "report.html": hashlib.sha256(html).hexdigest()
-        }
-        descriptors: list[int] = []
-        try:
-            root_fd = self._open_bound_export_root()
-            descriptors.append(root_fd)
-            try:
-                job_fd = self._open_private_child(
-                    root_fd, job_id.hex, label="portfolio recovery job"
-                )
-                descriptors.append(job_fd)
-                request_fd = self._open_private_child(
-                    job_fd, request_id.hex, label="portfolio recovery request"
-                )
-                descriptors.append(request_fd)
-                fd = os.open("result.zip", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=request_fd)
-                descriptors.append(fd)
-            except FileNotFoundError:
-                return None
-            before = os.fstat(fd)
-            if (
-                not stat.S_ISREG(before.st_mode)
-                or before.st_nlink != 1
-                or stat.S_IMODE(before.st_mode) != 0o600
-                or before.st_size > self.max_zip_bytes
-            ):
-                raise LabArtifactIntegrityError("portfolio recovery ZIP is invalid")
-            with os.fdopen(os.dup(fd), "rb") as source, zipfile.ZipFile(source) as archive:
-                names = archive.namelist()
-                if len(names) != len(expected_hashes) or set(names) != set(expected_hashes):
-                    raise LabArtifactIntegrityError("portfolio recovery ZIP inventory differs")
-                if sum(info.file_size for info in archive.infolist()) > 256 * 1024 * 1024 + len(
-                    html
-                ):
-                    raise ValueError("portfolio recovery ZIP uncompressed budget exceeded")
-                for name in names:
-                    digest = hashlib.sha256()
-                    with archive.open(name) as entry:
-                        while chunk := entry.read(64 * 1024):
-                            digest.update(chunk)
-                    if digest.hexdigest() != expected_hashes[name]:
-                        raise LabArtifactIntegrityError("portfolio recovery ZIP content differs")
-            if _identity(os.fstat(fd)) != _identity(before) or _identity(
-                os.stat("result.zip", dir_fd=request_fd, follow_symlinks=False)
-            ) != _identity(before):
-                raise LabArtifactIntegrityError("portfolio recovery ZIP changed")
+
+        def validate_unchanged() -> None:
             if self.result_reader.read(job_id, expected_result_hash=expected_result_hash) != result:
                 raise LabArtifactIntegrityError("portfolio recovery result changed")
-            path = self.export_root / job_id.hex / request_id.hex / "result.zip"
-            receipt = self._build_receipt(job_id=job_id, request_id=request_id, path=path)
-            return PortfolioZipReceipt(
-                **receipt.model_dump(mode="python"),
-                result_hash=result.result_hash,
-                bundle_hash=result.bundle.bundle_hash,
-                html_sha256=result.bundle.html_sha256,
-            )
-        finally:
-            for descriptor in reversed(descriptors):
-                os.close(descriptor)
 
+        receipt = _recover_verified_html_zip(facade=self, job_id=job_id, request_id=request_id,
+            result_hash=result.result_hash, html=result.html_bytes(), max_zip_bytes=self.max_zip_bytes,
+            validate_unchanged=validate_unchanged)
+        if receipt is None:
+            return None
+        return PortfolioZipReceipt(**receipt.model_dump(mode="python"), result_hash=result.result_hash,
+            bundle_hash=result.bundle.bundle_hash, html_sha256=result.bundle.html_sha256)
     def read_bytes(self, receipt: PortfolioZipReceipt) -> bytes:
         checked = self._build_receipt(
             request_id=receipt.request_id, job_id=receipt.job_id, path=receipt.path
@@ -523,38 +319,282 @@ class PortfolioZipExportFacade(LabJobZipExportFacade):
             receipt.html_sha256,
         ):
             raise LabArtifactIntegrityError("portfolio ZIP result binding differs")
-        descriptors: list[int] = []
-        try:
-            root_fd = self._open_bound_export_root()
-            descriptors.append(root_fd)
-            job_fd = self._open_private_child(
-                root_fd, receipt.job_id.hex, label="portfolio download job"
+        return _read_verified_html_zip(facade=self, receipt=receipt, max_zip_bytes=self.max_zip_bytes)
+
+def _pack_verified_html_zip(*, facade: LabJobZipExportFacade, original_exports: LabJobZipExportFacade,
+    job_id: UUID, request_id: UUID | None, html: bytes, table_names: tuple[str, ...], max_zip_bytes: int,
+    discard_temporary: Callable[[int], None], validate_unchanged: Callable[[], None]) -> LabJobZipExportReceipt:
+    original = original_exports.export(job_id)
+    if original.byte_size > MAX_ZIP_BYTES:
+        raise ValueError("portfolio original ZIP exceeds byte budget")
+    request_id = request_id or uuid4()
+    descriptors: list[int] = []
+    request_fd: int | None = None
+    created_temporary: tuple[int, int] | None = None
+    try:
+        original_root = original_exports._open_bound_export_root()
+        descriptors.append(original_root)
+        original_job = original_exports._open_private_child(
+            original_root, original.job_id.hex, label="source job directory"
+        )
+        descriptors.append(original_job)
+        original_request = original_exports._open_private_child(
+            original_job, original.request_id.hex, label="source request directory"
+        )
+        descriptors.append(original_request)
+        source_fd = os.open("result.zip", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=original_request)
+        descriptors.append(source_fd)
+        source_before = os.fstat(source_fd)
+        if (
+            not stat.S_ISREG(source_before.st_mode)
+            or source_before.st_nlink != 1
+            or stat.S_IMODE(source_before.st_mode) != 0o600
+            or source_before.st_size != original.byte_size
+            or _sha256_descriptor(source_fd) != original.sha256
+        ):
+            raise LabArtifactIntegrityError("source ZIP identity differs from receipt")
+        with facade._locked_export_root() as root_fd:
+            facade._enforce_record_budget(root_fd)
+            job_fd = facade._open_private_child(
+                root_fd, job_id.hex, label="portfolio job directory", create=True
             )
             descriptors.append(job_fd)
-            request_fd = self._open_private_child(
-                job_fd, receipt.request_id.hex, label="portfolio download request"
+            request_fd = facade._open_private_child(
+                job_fd, request_id.hex, label="portfolio request directory", create=True
             )
             descriptors.append(request_fd)
-            file_fd = os.open("result.zip", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=request_fd)
-            descriptors.append(file_fd)
-            before = os.fstat(file_fd)
-            chunks: list[bytes] = []
-            length = 0
-            while chunk := os.read(file_fd, 64 * 1024):
-                length += len(chunk)
-                if length > self.max_zip_bytes:
-                    raise ValueError("portfolio ZIP download exceeds byte budget")
-                chunks.append(chunk)
-            payload = b"".join(chunks)
-            if (
-                _identity(os.fstat(file_fd)) != _identity(before)
-                or _identity(os.stat("result.zip", dir_fd=request_fd, follow_symlinks=False))
-                != _identity(before)
-                or len(payload) != receipt.byte_size
-                or hashlib.sha256(payload).hexdigest() != receipt.sha256
+            discard_temporary(request_fd)
+            output_fd = os.open(
+                "result.tmp",
+                os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=request_fd,
+            )
+            output_identity = os.fstat(output_fd)
+            created_temporary = (output_identity.st_dev, output_identity.st_ino)
+            with (
+                os.fdopen(output_fd, "w+b") as output,
+                os.fdopen(os.dup(source_fd), "rb") as source,
             ):
-                raise LabArtifactIntegrityError("portfolio ZIP changed while downloading")
-            return payload
-        finally:
-            for descriptor in reversed(descriptors):
-                os.close(descriptor)
+                source.seek(0)
+                with (
+                    zipfile.ZipFile(source) as old,
+                    zipfile.ZipFile(
+                        _BudgetedZipWriter(output, max_zip_bytes),
+                        "w",
+                        compression=zipfile.ZIP_DEFLATED,
+                        compresslevel=9,
+                    ) as new,
+                ):
+                    entries = old.infolist()
+                    names = [entry.filename for entry in entries]
+                    allowed = {
+                        "manifest.json",
+                        "SHA256SUMS",
+                        "spec.json",
+                        "metrics.json",
+                        "report.md",
+                        *(f"tables/{name}.parquet" for name in table_names),
+                    }
+                    if (
+                        set(names) != allowed
+                        or len(names) != len(allowed)
+                        or any(entry.flag_bits & 1 for entry in entries)
+                    ):
+                        raise LabArtifactIntegrityError("source ZIP inventory differs")
+                    if sum(entry.file_size for entry in entries) > 256 * 1024 * 1024:
+                        raise ValueError("portfolio ZIP uncompressed byte budget exceeded")
+                    by_name = {entry.filename: entry for entry in entries}
+                    for name in sorted([*names, "report.html"]):
+                        info = zipfile.ZipInfo(name, (1980, 1, 1, 0, 0, 0))
+                        info.compress_type = zipfile.ZIP_DEFLATED
+                        info.external_attr = 0o100400 << 16
+                        if name == "report.html":
+                            new.writestr(info, html, compresslevel=9)
+                        else:
+                            with (
+                                old.open(by_name[name]) as entry,
+                                new.open(info, "w") as destination,
+                            ):
+                                copied = 0
+                                while chunk := entry.read(64 * 1024):
+                                    copied += len(chunk)
+                                    if copied > by_name[name].file_size:
+                                        raise LabArtifactIntegrityError(
+                                            "source ZIP entry length changed"
+                                        )
+                                    destination.write(chunk)
+                                if copied != by_name[name].file_size:
+                                    raise LabArtifactIntegrityError(
+                                        "source ZIP entry is truncated"
+                                    )
+                output.flush()
+                os.fsync(output.fileno())
+            source_after = os.fstat(source_fd)
+            at_path = os.stat("result.zip", dir_fd=original_request, follow_symlinks=False)
+            if (
+                _identity(source_after) != _identity(source_before)
+                or _identity(at_path) != _identity(source_before)
+                or _sha256_descriptor(source_fd) != original.sha256
+            ):
+                raise LabArtifactIntegrityError("source ZIP changed during export")
+            validate_unchanged()
+            _rename_noreplace(request_fd, "result.tmp", request_fd, "result.zip")
+            os.fsync(request_fd)
+            path = facade.export_root / job_id.hex / request_id.hex / "result.zip"
+            receipt = facade._build_receipt(request_id=request_id, job_id=job_id, path=path)
+            return receipt
+    except BaseException:
+        if request_fd is not None and created_temporary is not None:
+            with suppress(FileNotFoundError):
+                current = os.stat("result.tmp", dir_fd=request_fd, follow_symlinks=False)
+                if (
+                    (current.st_dev, current.st_ino) == created_temporary
+                    and stat.S_ISREG(current.st_mode)
+                    and current.st_nlink == 1
+                ):
+                    os.unlink("result.tmp", dir_fd=request_fd)
+        raise
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def _discard_interrupted_html_temporary(request_fd: int, *, max_zip_bytes: int) -> None:
+    # The original journal fixes this request slot before publication. Under
+    # the export lock only its private regular temporary may be rebuilt.
+    try:
+        descriptor = os.open("result.tmp", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=request_fd)
+    except FileNotFoundError:
+        return
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_uid != os.geteuid()
+            or stat.S_IMODE(before.st_mode) != 0o600
+            or before.st_size > max_zip_bytes
+        ):
+            raise LabArtifactIntegrityError("interrupted portfolio temporary is unsafe")
+        current = os.stat("result.tmp", dir_fd=request_fd, follow_symlinks=False)
+        if _identity(current) != _identity(before):
+            raise LabArtifactIntegrityError("interrupted portfolio temporary changed")
+        os.unlink("result.tmp", dir_fd=request_fd)
+        os.fsync(request_fd)
+    finally:
+        os.close(descriptor)
+
+
+def _recover_verified_html_zip(*, facade: LabJobZipExportFacade, job_id: UUID, request_id: UUID,
+    result_hash: str, html: bytes, max_zip_bytes: int, validate_unchanged: Callable[[], None],
+    expected_bound_hashes: dict[str, str] | None = None) -> LabJobZipExportReceipt | None:
+    authority = facade.reader.get_artifact_preview_authority(job_id)
+    if authority is None or authority.evidence.complete_result_hash != result_hash:
+        raise LabArtifactIntegrityError("portfolio recovery result changed")
+    if expected_bound_hashes is None:
+        sealed = facade.artifact_store.verify_sealed(authority.evidence.sealed_path)
+        if (sealed.manifest_hash, sealed.manifest.complete_result_hash, sealed.file_identities) != (
+            authority.evidence.manifest_hash,
+            authority.evidence.complete_result_hash,
+            authority.evidence.file_identities,
+        ):
+            raise LabArtifactIntegrityError("portfolio recovery artifact identity changed")
+        expected_bound_hashes = facade.artifact_store._expected_bound_hashes(sealed.manifest)
+    else:
+        # Only a caller that has read every physical sealed table may supply this
+        # complete inventory. Its original physical/owner gate must run again.
+        validate_unchanged()
+    expected_hashes = expected_bound_hashes | {
+        "report.html": hashlib.sha256(html).hexdigest()
+    }
+    descriptors: list[int] = []
+    try:
+        root_fd = facade._open_bound_export_root()
+        descriptors.append(root_fd)
+        try:
+            job_fd = facade._open_private_child(
+                root_fd, job_id.hex, label="portfolio recovery job"
+            )
+            descriptors.append(job_fd)
+            request_fd = facade._open_private_child(
+                job_fd, request_id.hex, label="portfolio recovery request"
+            )
+            descriptors.append(request_fd)
+            fd = os.open("result.zip", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=request_fd)
+            descriptors.append(fd)
+        except FileNotFoundError:
+            return None
+        before = os.fstat(fd)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or stat.S_IMODE(before.st_mode) != 0o600
+            or before.st_size > max_zip_bytes
+        ):
+            raise LabArtifactIntegrityError("portfolio recovery ZIP is invalid")
+        with os.fdopen(os.dup(fd), "rb") as source, zipfile.ZipFile(source) as archive:
+            names = archive.namelist()
+            if len(names) != len(expected_hashes) or set(names) != set(expected_hashes):
+                raise LabArtifactIntegrityError("portfolio recovery ZIP inventory differs")
+            if sum(info.file_size for info in archive.infolist()) > 256 * 1024 * 1024 + len(
+                html
+            ):
+                raise ValueError("portfolio recovery ZIP uncompressed budget exceeded")
+            for name in names:
+                digest = hashlib.sha256()
+                with archive.open(name) as entry:
+                    while chunk := entry.read(64 * 1024):
+                        digest.update(chunk)
+                if digest.hexdigest() != expected_hashes[name]:
+                    raise LabArtifactIntegrityError("portfolio recovery ZIP content differs")
+        if _identity(os.fstat(fd)) != _identity(before) or _identity(
+            os.stat("result.zip", dir_fd=request_fd, follow_symlinks=False)
+        ) != _identity(before):
+            raise LabArtifactIntegrityError("portfolio recovery ZIP changed")
+        validate_unchanged()
+        path = facade.export_root / job_id.hex / request_id.hex / "result.zip"
+        receipt = facade._build_receipt(job_id=job_id, request_id=request_id, path=path)
+        return receipt
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def _read_verified_html_zip(*, facade: LabJobZipExportFacade, receipt: LabJobZipExportReceipt,
+    max_zip_bytes: int) -> bytes:
+    descriptors: list[int] = []
+    try:
+        root_fd = facade._open_bound_export_root()
+        descriptors.append(root_fd)
+        job_fd = facade._open_private_child(
+            root_fd, receipt.job_id.hex, label="portfolio download job"
+        )
+        descriptors.append(job_fd)
+        request_fd = facade._open_private_child(
+            job_fd, receipt.request_id.hex, label="portfolio download request"
+        )
+        descriptors.append(request_fd)
+        file_fd = os.open("result.zip", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=request_fd)
+        descriptors.append(file_fd)
+        before = os.fstat(file_fd)
+        chunks: list[bytes] = []
+        length = 0
+        while chunk := os.read(file_fd, 64 * 1024):
+            length += len(chunk)
+            if length > max_zip_bytes:
+                raise ValueError("portfolio ZIP download exceeds byte budget")
+            chunks.append(chunk)
+        payload = b"".join(chunks)
+        if (
+            _identity(os.fstat(file_fd)) != _identity(before)
+            or _identity(os.stat("result.zip", dir_fd=request_fd, follow_symlinks=False))
+            != _identity(before)
+            or len(payload) != receipt.byte_size
+            or hashlib.sha256(payload).hexdigest() != receipt.sha256
+        ):
+            raise LabArtifactIntegrityError("portfolio ZIP changed while downloading")
+        return payload
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)

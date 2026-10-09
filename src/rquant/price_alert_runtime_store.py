@@ -403,13 +403,23 @@ class PriceAlertRuntimeStore:
         finally:
             connection.close()
 
-    def _verify_installation(self) -> None:
+    def _verify_installation(self, connection: sqlite3.Connection | None = None) -> None:
+        from contextlib import nullcontext
         from rquant.price_alert_runtime_contracts import _activation_bytes
 
+        borrowed = connection is not None
+        if borrowed and (
+            type(connection) is not sqlite3.Connection or not connection.in_transaction
+            or self._closed or self._lock_descriptor < 0
+            or self._file_identity() != self._identity
+            or tuple(tuple(row) for row in connection.execute("PRAGMA database_list"))
+            != ((0, "main", str(self.path)),)
+        ):
+            raise ValueError("price installation requires its physical original active transaction")
         marker = _activation_bytes(
             self.path.with_name(self.path.name + ".identity.json"), self.path.parent
         )
-        with self._connection() as connection:
+        with (nullcontext(connection) if borrowed else self._connection()) as connection:
             tables = {
                 row[0]
                 for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
@@ -428,7 +438,13 @@ class PriceAlertRuntimeStore:
                 if tables != _TABLES | CONDITION_RUNTIME_TABLES or schema != set(
                     _INSTALL_SQL
                 ) | set(CONDITION_RUNTIME_SQL):
-                    raise ValueError("price runtime installation marker or schema differs")
+                    from rquant.monitor_builtin_runtime import BUILTIN_METADATA_SQL, verify_builtin_metadata
+
+                    builtin_tables = frozenset({"monitor_builtin_head", "monitor_builtin_day_dedupe"})
+                    if (tables != _TABLES | CONDITION_RUNTIME_TABLES | builtin_tables
+                            or schema != set(_INSTALL_SQL) | set(CONDITION_RUNTIME_SQL) | set(BUILTIN_METADATA_SQL)):
+                        raise ValueError("price runtime installation marker or schema differs")
+                    verify_builtin_metadata(connection)
                 verify_condition_runtime_namespace(connection)
             row = connection.execute(
                 "SELECT * FROM price_alert_runtime_identity WHERE key='current'"
@@ -462,6 +478,12 @@ class PriceAlertRuntimeStore:
             ).fetchone()
             if row["high_watermark"] != maximum or maximum != count:
                 raise ValueError("price runtime event sequence has regressed or has a gap")
+            if borrowed and (
+                not connection.in_transaction or self._file_identity() != self._identity
+                or tuple(tuple(row) for row in connection.execute("PRAGMA database_list"))
+                != ((0, "main", str(self.path)),)
+            ):
+                raise ValueError("price installation changed during its original borrowed read")
 
     def _source(self, connection: sqlite3.Connection) -> PriceAlertSourceDescriptor:
         row = connection.execute(

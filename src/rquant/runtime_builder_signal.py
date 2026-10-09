@@ -13,7 +13,7 @@ from loguru import logger
 from pydantic import Field, StrictBool, StrictInt, field_validator, model_validator
 
 from rquant.condition_alert_runtime_contracts import ConditionAlertActivationSettings
-from rquant.delivery_contracts import DeliveryChannel, OutboxStatus
+from rquant.delivery_contracts import DeliveryChannel, DeliveryTarget, OutboxStatus
 from rquant.formula_pool_serving_projection import FormulaPoolServingConfig
 from rquant.notification_state import NotificationServingSnapshot, NotificationStateStore
 from rquant.notification_worker import (
@@ -61,6 +61,7 @@ from rquant.signal_bus import (
     SignalBusStore,
     SignalRouteConflictError,
 )
+from rquant.notifier_operator import MonitorControlReadSettings, read_monitor_control_state
 from rquant.signal_route_spool import (
     ReadonlyNotificationEventRouteSpool,
     SignalRouteSpool,
@@ -337,6 +338,9 @@ class SignalRouterSettings(_SignalBusSettings):
 
 
 class NotifierSettings(RuntimeContractModel):
+    monitor_control: MonitorControlReadSettings | None = None
+    merge_enabled: StrictBool = False
+    merge_owner_id: str | None = Field(default=None, min_length=1, max_length=128)
     condition_alert_runtime: ConditionAlertActivationSettings | None = None
     condition_alert_runtime_manifest_path: Path | None = None
     condition_alert_peer: ConditionAlertPeerSettings | None = None
@@ -509,13 +513,34 @@ class NotifierSettings(RuntimeContractModel):
             raise ValueError("canvas projection active key cannot also be previous")
         return self
 
-    def open_store(self) -> NotificationStateStore:
+    @model_validator(mode="after")
+    def merge_budget_and_owner(self) -> NotifierSettings:
+        if self.merge_enabled and (
+            self.merge_owner_id is None or self.batch_limit > 100 or self.max_attempts > 5
+            or self.retry_base_seconds != 5 or self.retry_max_seconds != 300
+        ):
+            raise ValueError("notification merge requires an owner and original attempt/batch/retry limits")
+        if not self.merge_enabled and self.merge_owner_id is not None:
+            raise ValueError("merge owner requires explicit notification merge activation")
+        return self
+
+    def open_store(self, *, merge_binding: object | None = None) -> NotificationStateStore:
+        from rquant.delivery_contracts import NotificationMergeBinding
+
+        if self.merge_enabled:
+            if (type(merge_binding) is not NotificationMergeBinding
+                    or merge_binding.owner_id != self.merge_owner_id
+                    or merge_binding.mode != ("shadow" if self.suppress_delivery else "live")):
+                raise ValueError("notification merge requires its actual installed runtime binding")
+        elif merge_binding is not None:
+            raise ValueError("disabled notification merge cannot receive a binding")
         return NotificationStateStore(
             self.notification_state_path,
             busy_timeout_ms=self.busy_timeout_ms,
             retry_base_delay=timedelta(seconds=self.retry_base_seconds),
             retry_max_delay=timedelta(seconds=self.retry_max_seconds),
             max_attempts=self.max_attempts,
+            merge_binding=merge_binding,
         )
 
 
@@ -582,6 +607,37 @@ def _validated_providers(
             raise TypeError(f"provider for {channel.value} must implement deliver()")
         validated[channel] = provider
     return validated
+
+
+def _loaded_notification_targets(
+    providers: Mapping[DeliveryChannel, NotificationProvider],
+) -> tuple[DeliveryTarget, ...] | None:
+    from rquant.runtime_notification_providers import (
+        RecipientNotificationCapabilities, RecipientScopedNotificationProvider,
+        RecipientScopedProviderRegistry,
+    )
+
+    if type(providers) is not RecipientScopedProviderRegistry:
+        return None
+    targets = []
+    for channel, recipients in providers.recipient_ids.items():
+        provider = providers.get(channel)
+        if (type(provider) is not RecipientScopedNotificationProvider
+                or type(provider._capabilities) is not RecipientNotificationCapabilities
+                or provider._channel is not channel):
+            return None
+        for recipient in recipients:
+            if provider._capabilities.credential_for(channel, recipient) is None:
+                return None
+            targets.append(DeliveryTarget(channel=channel, recipient_id=recipient))
+    # The original alias migration admits the logical receiver only when every
+    # corresponding physical receiver has a loaded original credential.
+    for alias in providers.recipient_preflight.aliases:
+        if not all(DeliveryTarget(channel=alias.channel, recipient_id=value) in targets
+                   for value in alias.target_recipient_ids):
+            return None
+        targets.append(DeliveryTarget(channel=alias.channel, recipient_id=alias.source_recipient_id))
+    return tuple(sorted(set(targets), key=lambda row: (row.channel.value, row.recipient_id)))
 
 
 def _inspect_signal_source(
@@ -1251,7 +1307,30 @@ def notifier_builder(
                 runtime_root=runtime_root,
                 borrowed=price_peer,
             )
-        store = settings.open_store()
+        merge_binding = None
+        if settings.merge_enabled:
+            from rquant.delivery_contracts import NotificationMergeBinding
+
+            if runtime_root is None:
+                raise ValueError("notification merge requires the installed runtime generation")
+            installed = load_runtime_generation_tree(runtime_root)
+            original = installed.lineage(manifest.service_id).current
+            if original.manifest != manifest:
+                raise ValueError("notification merge differs from its actual installed manifest")
+            merge_binding = NotificationMergeBinding(
+                owner_id=settings.merge_owner_id, source_id="signal-route-spool/v1",
+                installation_sha256=manifest.manifest_fingerprint,
+                role_revision=manifest.service_spec.identity,
+                generation_id=installed.current_generation_id,
+                mode="shadow" if settings.suppress_delivery else "live",
+            )
+        store = settings.open_store(merge_binding=merge_binding)
+        if settings.monitor_control is not None:
+            if runtime_root is None or not settings.merge_enabled:
+                raise ValueError("notifier controls require the original installed merge owner")
+            current_control = read_monitor_control_state(settings.monitor_control, runtime_root=runtime_root, now=clock())
+            if current_control.installation.notifier_manifest_sha256 != manifest.manifest_fingerprint:
+                raise ValueError("notifier controls differ from this original role")
         if condition_peer is not None:
             if settings.condition_alert_peer.install_namespace:
                 store.install_condition_alert_delivery_v1(condition_activation)
@@ -1428,6 +1507,25 @@ def notifier_builder(
             }
 
         def step() -> RuntimeStepResult:
+            suppress_delivery = settings.suppress_delivery
+            if settings.monitor_control is not None:
+                from rquant.notifier_operator import notifier_mode_role_revision
+
+                applied = read_monitor_control_state(settings.monitor_control, runtime_root=runtime_root, now=clock())
+                if applied.installation.notifier_manifest_sha256 != manifest.manifest_fingerprint:
+                    raise ValueError("notifier actual installed role changed")
+                suppress_delivery = applied.mode.mode == "shadow"
+                store.merge_binding = type(merge_binding).model_validate(merge_binding.model_dump() | {
+                    "mode": applied.mode.mode,
+                    "role_revision": notifier_mode_role_revision(
+                        manifest.service_spec.identity, applied.mode)})
+
+                def current_mode() -> bool:
+                    latest = read_monitor_control_state(settings.monitor_control, runtime_root=runtime_root, now=clock())
+                    return latest.installation == applied.installation and latest.mode == applied.mode
+
+                store.merge_binding_guard = current_mode
+                store.record_applied_notifier_mode(applied.mode)
             #: Whether this iteration put a row in `notification_projection_authority`.
             #: `None` until a publish happens at all, so a notifier configured without a
             #: page projection reports nothing rather than a fabricated False (#271).
@@ -1458,7 +1556,7 @@ def notifier_builder(
                         history_limit=settings.serving_history_limit,
                         price_peer=price_peer,
                         price_activation=price_activation,
-                        price_shadow=settings.suppress_delivery,
+                        price_shadow=suppress_delivery,
                         price_paused=True,
                         condition_peer=condition_peer,
                         condition_activation=condition_activation,
@@ -1523,7 +1621,11 @@ def notifier_builder(
                 source_inspected_at=source_inspected_at,
             )
             loaded_providers = resolved_provider_loader()
-            if settings.suppress_delivery:
+            if settings.merge_enabled:
+                targets = _loaded_notification_targets(loaded_providers)
+                store.runtime_available_targets = targets
+                store.runtime_capability_observed_at = None if targets is None else clock()
+            if suppress_delivery:
                 loaded_providers = _shadow_providers(loaded_providers)
             recipient_migration = None
             inferred_channels: tuple[DeliveryChannel, ...] = ()
@@ -1551,7 +1653,7 @@ def notifier_builder(
                 condition_activation=condition_activation,
             )
             degraded: list[str] = []
-            if settings.suppress_delivery:
+            if suppress_delivery:
                 #: the heartbeat of a shadow notifier never reads as a clean live one
                 degraded.append("notifier:shadow_transport")
             if summary.failed_count:
@@ -1587,7 +1689,7 @@ def notifier_builder(
                     history_limit=settings.serving_history_limit,
                     price_peer=price_peer,
                     price_activation=price_activation,
-                    price_shadow=settings.suppress_delivery,
+                    price_shadow=suppress_delivery,
                     condition_peer=condition_peer,
                     condition_activation=condition_activation,
                 )

@@ -1,12 +1,9 @@
 import { useEffect, useRef, useState } from "react";
-import { ApiError } from "@/api/client";
-import {
-  type EditablePool,
-  type PoolNlPreview,
-  type PoolRuleChange,
-  previewPoolSentenceEdit,
-} from "@/api/poolEditor";
+import { useAiCapabilities } from "@/api/aiAssistance";
+import type { EditablePool, PoolNlPreview, PoolRuleChange } from "@/api/poolEditor";
 import type { ScreenBlock } from "@/api/screen";
+import { useCurrentMeta } from "@/api/useMeta";
+import { useAiGeneration } from "@/app/aiAssistanceSession";
 import { Button, Tip } from "@/ui";
 
 type RuleCall = PoolNlPreview["rule_calls"][number];
@@ -49,16 +46,12 @@ function changeDescription(change: PoolRuleChange, block: ScreenBlock | undefine
   return changed.length ? changed.join(" · ") : "参数已调整";
 }
 
-function previewError(error: unknown): string {
-  if (!(error instanceof ApiError)) return "暂无法生成，请稍后重试。";
-  if (error.status === 401 || error.status === 403) return "请先登录，再试一次。";
-  if (error.status === 409) return "规则已更新，请重新打开后再试。";
-  if (error.status === 422) return "没能确定修改内容，请说清条件和数值。";
-  if (error.status === 429) return "请求太频繁，请稍后再试。";
-  return "暂无法生成，请稍后重试。";
+export function PoolSentenceEdit(props: Parameters<typeof PoolSentenceEditBody>[0]) {
+  const viewer = useCurrentMeta().data?.data.viewer ?? null;
+  return <PoolSentenceEditBody key={viewer} {...props} />;
 }
 
-export function PoolSentenceEdit({
+function PoolSentenceEditBody({
   pool,
   generationId,
   verifiedVersion,
@@ -89,11 +82,13 @@ export function PoolSentenceEdit({
   const [instruction, setInstruction] = useState("");
   const [suggestion, setSuggestion] = useState<PoolNlPreview | null>(null);
   const [applied, setApplied] = useState(false);
-  const [loading, setLoading] = useState(false);
+  const viewer = useCurrentMeta().data?.data.viewer ?? null;
+  const request = useAiGeneration(viewer, `pool:${pool.key}`);
+  const capability = useAiCapabilities(viewer, open);
+  const loading = request.busy;
   const [error, setError] = useState<string | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const controllerRef = useRef<AbortController | null>(null);
-  const requestId = useRef(0);
+  const requestedBase = useRef<string | null>(null);
   const ruleBase = `${generationId}:${verifiedVersion}:${ruleRevision}`;
   const base = `${ruleBase}:${metadataRevision}`;
   const baseRef = useRef(base);
@@ -110,15 +105,11 @@ export function PoolSentenceEdit({
     const ruleBaseChanged = ruleBaseRef.current !== ruleBase;
     baseRef.current = base;
     ruleBaseRef.current = ruleBase;
-    requestId.current += 1;
-    controllerRef.current?.abort();
+    requestedBase.current = null;
     setSuggestion(null);
     if (ruleBaseChanged) setApplied(false);
-    setLoading(false);
     setError(null);
   }, [base, ruleBase]);
-
-  useEffect(() => () => controllerRef.current?.abort(), []);
 
   const unavailableReason =
     !generationId || verifiedVersion !== pool.version
@@ -132,58 +123,82 @@ export function PoolSentenceEdit({
             : undefined;
 
   const discardSuggestion = () => {
-    requestId.current += 1;
-    controllerRef.current?.abort();
-    setLoading(false);
+    requestedBase.current = null;
     setSuggestion(null);
     setError(null);
   };
 
   const requestPreview = async () => {
-    const trimmed = instruction.trim();
-    if (!available || !generationId || unavailableReason || !trimmed || trimmed.length > 500)
-      return;
-    const id = ++requestId.current;
-    controllerRef.current?.abort();
-    const controller = new AbortController();
-    controllerRef.current = controller;
-    const requestedBase = base;
-    const timeout = window.setTimeout(() => controller.abort(), 20_000);
-    setLoading(true);
+    requestedBase.current = base;
     setError(null);
     setSuggestion(null);
-    try {
-      const result = await previewPoolSentenceEdit(
-        {
-          pool_key: pool.key,
-          generation_id: generationId,
-          expected_version: pool.version,
-          instruction: trimmed,
-        },
-        controller.signal,
-      );
-      if (id !== requestId.current || requestedBase !== baseRef.current) return;
-      if (
-        result.pool_key !== pool.key ||
-        result.base_generation_id !== generationId ||
-        result.base_version !== pool.version
-      ) {
-        setError("规则已更新，请重新打开后再试。");
-        return;
+    if (request.original) {
+      if (request.view?.state === "reserved" || request.errorStatus === 404) {
+        await request.generate(request.original);
+      } else {
+        await request.lookup();
       }
-      if (result.changes.length === 0 || result.rule_calls.length === 0) {
-        setError("没有识别到变化，请说清要调整的条件。");
-        return;
-      }
-      setSuggestion(result);
-    } catch (caught) {
-      if (id === requestId.current && requestedBase === baseRef.current)
-        setError(controller.signal.aborted ? "生成超时，请稍后重试。" : previewError(caught));
-    } finally {
-      window.clearTimeout(timeout);
-      if (id === requestId.current) setLoading(false);
+      return;
     }
+    const trimmed = instruction.trim();
+    if (
+      !available ||
+      !generationId ||
+      unavailableReason ||
+      !viewer ||
+      !capability.data?.can_generate ||
+      !trimmed ||
+      trimmed.length > 500
+    )
+      return;
+    await request.generate({
+      purpose: "pool_edit",
+      request_id: crypto.randomUUID(),
+      pool_key: pool.key,
+      generation_id: generationId,
+      expected_version: pool.version,
+      instruction: trimmed,
+    });
   };
+
+  useEffect(() => {
+    const result = request.view?.result;
+    if (result?.purpose !== "pool_edit" || requestedBase.current !== base) return;
+    const current = result.base;
+    const fullBase = (value: EditablePool) =>
+      JSON.stringify([
+        value.key,
+        value.version,
+        value.display_name,
+        value.description,
+        value.depends_on,
+        value.delay_days,
+        value.rule_calls,
+        value.include_columns,
+        value.ranking,
+      ]);
+    if (
+      result.base_generation_id !== generationId ||
+      fullBase(current) !== fullBase(pool) ||
+      rulesChanged
+    ) {
+      setSuggestion(null);
+      setError("规则已更新，请重新打开后再试。");
+      return;
+    }
+    if (!result.changes.length || !result.rule_calls.length) {
+      setError("没有识别到变化，请说清要调整的条件。");
+      return;
+    }
+    setSuggestion({
+      pool_key: current.key,
+      base_version: current.version,
+      base_generation_id: result.base_generation_id,
+      rule_calls: result.rule_calls,
+      changes: result.changes,
+      message: result.message,
+    });
+  }, [request.view, base, generationId, pool, rulesChanged]);
 
   const apply = () => {
     if (
@@ -219,7 +234,7 @@ export function PoolSentenceEdit({
         </Button>
       </div>
       {open ? (
-        !available ? (
+        !available && !request.original ? (
           <p className="pools-note" role="status">
             暂不能生成，仍可手动编辑
           </p>
@@ -248,13 +263,37 @@ export function PoolSentenceEdit({
                 disabledReason={
                   loading
                     ? "正在生成，请稍候。"
-                    : (unavailableReason ??
-                      (!instruction.trim() ? "先写一句修改描述。" : undefined))
+                    : request.original
+                      ? undefined
+                      : (unavailableReason ??
+                        (capability.data?.can_generate
+                          ? !instruction.trim()
+                            ? "先写一句修改描述。"
+                            : undefined
+                          : (capability.data?.message ?? "调用尚未启用。")))
                 }
                 onClick={() => void requestPreview()}
               >
-                {loading ? "正在解析…" : "解析并预览"}
+                {loading
+                  ? "正在查看…"
+                  : request.original
+                    ? request.view?.state === "reserved" || request.errorStatus === 404
+                      ? "继续生成原请求"
+                      : "继续查看原请求"
+                    : "解析并预览"}
               </Button>
+              {request.original && (request.view?.state === "completed" || request.absent) ? (
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => {
+                    request.reset();
+                    discardSuggestion();
+                  }}
+                >
+                  新建描述
+                </Button>
+              ) : null}
               <Tip content="建议先应用到草稿，核对规则后再保存。">
                 <span className="pools-info">如何生效</span>
               </Tip>
@@ -262,9 +301,10 @@ export function PoolSentenceEdit({
             {unavailableReason && !applied ? (
               <p className="pools-note">{unavailableReason}</p>
             ) : null}
-            {error ? (
+            {error || request.error ? (
               <p className="pool-editor-error" role="alert">
-                {error}
+                {error ??
+                  (request.errorStatus === 409 ? "规则已更新，请重新打开后再试。" : request.error)}
               </p>
             ) : null}
             {suggestion ? (

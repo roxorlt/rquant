@@ -113,3 +113,4 @@ class FactorResultDetailData(BaseModel):
     available_at: datetime | None
     result: FactorResultItem | None
     research: FactorResearchDisplay | FactorStreamResearchDisplay | None
+    can_report: bool = False

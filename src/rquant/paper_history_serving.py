@@ -2,8 +2,49 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+from decimal import Decimal
+
+from pydantic import Field
+
 from rquant.paper_broker import PaperOrderHistorySnapshot
+from rquant.paper_contracts import PaperOrderStatus
+from rquant.runtime_contracts import RuntimeContractModel, canonical_sha256
 from rquant.serving_read_models import ServingProjectionPayload
+
+
+class PaperRetainedOrderSummary(RuntimeContractModel):
+    window_identity: str = Field(pattern=r"^[0-9a-f]{64}$")
+    retained_count: int = Field(strict=True, ge=0)
+    rejected_count: int = Field(strict=True, ge=0)
+    total_orders: int = Field(strict=True, ge=0)
+    rejection_ratio: Decimal | None
+    oldest_updated_at: datetime
+    newest_updated_at: datetime
+
+
+def paper_history_summary(snapshot: PaperOrderHistorySnapshot) -> PaperRetainedOrderSummary:
+    snapshot = PaperOrderHistorySnapshot.model_validate(snapshot.model_dump(mode="python"))
+    if any(
+        order.updated_at > snapshot.as_of or order.created_at > snapshot.as_of
+        for order in snapshot.orders
+    ):
+        raise ValueError("paper retained order window contains future material")
+    retained = len(snapshot.orders)
+    rejected = sum(order.status is PaperOrderStatus.REJECTED for order in snapshot.orders)
+    return PaperRetainedOrderSummary(
+        window_identity=canonical_sha256(snapshot),
+        retained_count=retained,
+        rejected_count=rejected,
+        total_orders=snapshot.total_orders,
+        rejection_ratio=None if not retained else Decimal(rejected) / Decimal(retained),
+        oldest_updated_at=min(
+            (order.updated_at for order in snapshot.orders), default=snapshot.as_of
+        ),
+        newest_updated_at=max(
+            (order.updated_at for order in snapshot.orders), default=snapshot.as_of
+        ),
+    )
 
 
 def paper_history_projections(

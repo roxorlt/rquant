@@ -20,6 +20,7 @@ from rquant.condition_alert_runtime_contracts import (
 )
 from rquant.delivery_contracts import DeliveryTarget, OutboxStatus
 from rquant.manual_watchlist import OwnerId
+from rquant.monitor_builtin_contracts import BuiltinConditionAlertEventEnvelope
 from rquant.price_alert_route import PriceAlertOwnerTargets, _targets, target_manifest_hash
 from rquant.price_alert_runtime_contracts import PriceSha256
 from rquant.runtime_contracts import AwareUtcDatetime, normalize_aware_utc
@@ -115,7 +116,7 @@ class ConditionAlertBusEventRecord(ConditionRuntimeModel):
     event_id: PriceSha256
     payload_hash: PriceSha256
     payload_json: StrictStr = Field(min_length=1, max_length=16 * 1024)
-    event: ConditionAlertEventEnvelope
+    event: ConditionAlertEventEnvelope | BuiltinConditionAlertEventEnvelope
     received_at: AwareUtcDatetime
     bus_generation_id: PriceSha256
     source: ConditionAlertSourceDescriptor
@@ -123,7 +124,7 @@ class ConditionAlertBusEventRecord(ConditionRuntimeModel):
 
     @field_validator("event", mode="before")
     @classmethod
-    def exact_event(cls, value: object) -> ConditionAlertEventEnvelope:
+    def exact_event(cls, value: object) -> ConditionAlertEventEnvelope | BuiltinConditionAlertEventEnvelope:
         return parse_condition_alert_event(
             canonical_json_bytes(value) if isinstance(value, dict) else value
         )
@@ -323,7 +324,7 @@ def notification_record(
         return None
     if (
         strict_json_loads(row["payload_json"]).get("envelope_schema")
-        != "rquant.condition-alert-event/v1"
+        not in {"rquant.condition-alert-event/v1", "rquant.builtin-condition-alert-event/v1"}
     ):
         return original_record(connection, identifier, routed=routed)
     record = _condition_record(connection, row["signal_id"])

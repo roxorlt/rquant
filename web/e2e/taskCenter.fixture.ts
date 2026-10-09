@@ -5,9 +5,23 @@ import raw from "./taskCenter.fixture.json" with { type: "json" };
 // state and transport; the original journal and native ACK proofs are separate.
 export const taskMeta = raw.meta as Schemas["Envelope_MetaData_"];
 export const taskOverview = raw.overview as Schemas["Envelope_TaskOverviewData_"];
-export const taskUnitCapabilities = raw.unit_capabilities as Schemas["TaskControlCapabilitiesData"];
-export const taskSchedulingCapabilities =
-  raw.scheduling_capabilities as Schemas["TaskControlCapabilitiesData"];
+const monitorDefaults = {
+  monitor_builtins: [],
+  notifier_mode: {
+    available: false,
+    can_request: false,
+    can_set_live: false,
+    note: "通知模式暂无法核验。",
+  },
+} satisfies Pick<Schemas["TaskControlCapabilitiesData"], "monitor_builtins" | "notifier_mode">;
+export const taskUnitCapabilities = {
+  ...monitorDefaults,
+  ...raw.unit_capabilities,
+} as Schemas["TaskControlCapabilitiesData"];
+export const taskSchedulingCapabilities = {
+  ...monitorDefaults,
+  ...raw.scheduling_capabilities,
+} as Schemas["TaskControlCapabilitiesData"];
 export const taskClock = raw.fixture_clock;
 function requiredGeneration(): string {
   const generation = taskOverview.serving.generation_id;

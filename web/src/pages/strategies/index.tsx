@@ -1,4 +1,6 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { ApiError } from "@/api/client";
+import { useCollaboration } from "@/api/collaboration";
 import {
   type StrategyCatalogItem,
   type StrategyParameter,
@@ -8,6 +10,8 @@ import { useCurrentMeta } from "@/api/useMeta";
 import { type DataColumn, DataTable } from "@/table/DataTable";
 import { Button, EmptyState, PageHeader, PageSkeleton, Panel, RelativeTime, Tip } from "@/ui";
 import "./strategies.css";
+import { usePromotionPrivateCleanup } from "./promotionCommands";
+import { StrategyPromotionPanel } from "./StrategyPromotionPanel";
 import { TemplateWorkspace } from "./TemplateWorkspace";
 
 const strategyColumns: DataColumn<StrategyCatalogItem>[] = [
@@ -49,9 +53,24 @@ const parameterColumns: DataColumn<StrategyParameter>[] = [
 
 export default function StrategiesPage() {
   const meta = useCurrentMeta();
+  const role = useCollaboration();
+  usePromotionPrivateCleanup(meta.data?.data.viewer, role.me?.state_sha256);
   const currentGeneration =
     meta.data === undefined ? undefined : (meta.data.data.generation?.generation_id ?? null);
   const catalog = useStrategyCatalog(currentGeneration);
+  const catalogConflict = catalog.error instanceof ApiError && catalog.error.status === 409;
+  const refreshedGeneration = useRef<string | null>(null);
+  const refetchMeta = meta.refetch;
+  useEffect(() => {
+    if (
+      catalogConflict &&
+      typeof currentGeneration === "string" &&
+      refreshedGeneration.current !== currentGeneration
+    ) {
+      refreshedGeneration.current = currentGeneration;
+      void refetchMeta();
+    }
+  }, [catalogConflict, currentGeneration, refetchMeta]);
   const [selection, setSelection] = useState<{ generationId: string; strategyId: string } | null>(
     null,
   );
@@ -69,7 +88,7 @@ export default function StrategiesPage() {
   return (
     <>
       <PageHeader eyebrow="策略与验证" title="策略" note="已核验的策略定义与当前参数" />
-      {!meta.isError && meta.data?.data.viewer ? (
+      {!meta.isError && !catalogConflict && !changed && meta.data?.data.viewer ? (
         <TemplateWorkspace
           key={`${meta.data.data.viewer}:${currentGeneration ?? "unavailable"}`}
           viewer={meta.data.data.viewer}
@@ -96,7 +115,10 @@ export default function StrategiesPage() {
         <Panel>
           <div className="strategy-state" role="alert">
             <p>{changed ? "数据已更新，请重新查看策略。" : catalog.error?.message}</p>
-            <Button size="sm" onClick={catalog.refetch}>
+            <Button
+              size="sm"
+              onClick={catalogConflict ? () => void meta.refetch() : catalog.refetch}
+            >
               重新加载
             </Button>
           </div>
@@ -143,6 +165,17 @@ export default function StrategiesPage() {
                 label="当前参数"
                 emptyText="当前定义没有参数"
               />
+              {meta.data?.data.viewer ? (
+                <StrategyPromotionPanel
+                  key={`${meta.data.data.viewer}:${currentGeneration}:${selected.strategy_id}:${selected.version}`}
+                  viewer={meta.data.data.viewer}
+                  generation={currentGeneration ?? null}
+                  ready={meta.data.serving.state === "ready"}
+                  sourceKind="builtin"
+                  strategyId={selected.strategy_id}
+                  version={selected.version}
+                />
+              ) : null}
             </Panel>
           ) : null}
         </div>

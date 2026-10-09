@@ -59,8 +59,13 @@ _Model = TypeVar("_Model", bound=BaseModel)
 
 def _can_write(request: Request, viewer: str | None) -> bool:
     web = request.app.state.web
+    current = getattr(request.state, "collaboration", None)
+    role_can_write = web.settings.collaboration_mode != "enforced" or (
+        current is not None and current.username == viewer and current.can_research
+    )
     return bool(
         viewer is not None
+        and role_can_write
         and web.settings.ingress_socket_path is not None
         and web.proxy_identity is not None
         and viewer in web.settings.lab_control_users
@@ -86,6 +91,8 @@ def _read(operation: Callable[[], _Model]) -> _Model:
     try:
         return operation()
     except LookupError as error:
+        raise HTTPException(404, "找不到这次组合回测。") from error
+    except PermissionError as error:
         raise HTTPException(404, "找不到这次组合回测。") from error
     except ArtifactPreviewUnavailableError as error:
         raise HTTPException(409, "结果尚未保存完成，请稍后刷新。") from error
@@ -204,8 +211,10 @@ def report(
     result_hash: Annotated[str, Query(pattern=r"^[0-9a-f]{64}$")],
 ) -> Response:
     service = _service(request)
-    _read(lambda: service.job(job_id))
-    read = _read(lambda: service.results.read(job_id, expected_result_hash=result_hash))
+    before = _read(lambda: service.job(job_id))
+    if before.result_hash != result_hash:
+        raise HTTPException(409, "报告结果已改变，请刷新后重试。")
+    read = _read(lambda: service.read_result(job_id, expected_result_hash=result_hash))
     try:
         html = read.html_bytes()
     except ArtifactPreviewUnavailableError as error:
@@ -216,7 +225,7 @@ def report(
         headers={
             "Content-Disposition": 'attachment; filename="portfolio-report.html"',
             "Content-Security-Policy": (
-                "default-src 'none'; style-src 'unsafe-inline'; img-src data:; "
+                "default-src 'none'; style-src 'unsafe-inline'; "
                 "base-uri 'none'; frame-ancestors 'none'"
             ),
             "X-Rquant-Generation": result_hash,
@@ -242,6 +251,9 @@ def download_zip(
     exports = service.exports
     if exports is None:
         raise HTTPException(503, "报告下载暂不可用，请稍后重试。")
+    before = _read(lambda: service.job(job_id))
+    if before.result_hash != result_hash:
+        raise HTTPException(409, "报告结果已改变，请刷新后重试。")
     try:
         receipt = exports.recover_portfolio(
             job_id, request_id=request_id, expected_result_hash=result_hash
@@ -249,6 +261,9 @@ def download_zip(
         if receipt is None:
             raise HTTPException(404, "报告尚未准备好，请重试原导出请求。")
         content = exports.read_bytes(receipt)
+        after = _read(lambda: service.job(job_id))
+        if after.result_hash != result_hash:
+            raise ValueError("portfolio result generation changed during download")
     except (ValueError, ArtifactPreviewIntegrityError) as error:
         raise HTTPException(409, "报告校验未通过，请重试原导出请求。") from error
     return Response(

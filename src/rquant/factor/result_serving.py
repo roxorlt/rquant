@@ -5,10 +5,15 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+import os
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from rquant.collaboration_commands import PageControlRoleAuthority
+    from rquant.serving_page_projection_source import _ReadonlyPageControlAuditReader
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
@@ -56,6 +61,81 @@ def _load_display(
     if version == 2:
         return _load_factor_stream_display_with_identity(root, digest)
     raise ValueError("unknown factor display version")
+
+
+def _sealed_full_files(record: FactorJobRecord, root: Path) -> tuple[tuple[str, tuple[int, ...]], ...]:
+    """Read original sealed bytes and hashes; do not replay factor mathematics."""
+    from rquant.factor.member_archive import _check_identities, _read_file
+    from rquant.factor.result_artifact import (
+        MAX_FACTOR_RESEARCH_ARTIFACT_BYTES, _READ_FLAGS, _file_identity,
+        _open_private_root, _require_named_regular,
+    )
+    from rquant.factor.stream_job_artifact import FactorStreamArtifactReference, MAX_STREAM_FULL_BYTES, MAX_STREAM_JOURNAL_MANIFEST_BYTES
+
+    completion = record.completion
+    if completion is None:
+        raise ValueError("original full factor result has not been sealed")
+    descriptor = _open_private_root(root)
+    try:
+        identities = {"": _file_identity(os.fstat(descriptor))}
+        if record.spec.schema_version == 2:
+            reference = completion.full_reference
+            raw, identity = _read_file(descriptor, reference.filename, MAX_STREAM_FULL_BYTES, reference.sha256)
+            if len(raw) != reference.byte_count:
+                raise ValueError("original full factor receipt byte count differs")
+            full = strict_canonical_json_loads(raw)
+            if (not isinstance(full, dict) or type(full.get("schema_version")) is not int
+                    or full["schema_version"] != 2 or full.get("spec") != record.spec.model_dump(mode="json")
+                    or full.get("content_sha256") != _digest({key: value for key, value in full.items() if key != "content_sha256"})
+                    or not isinstance(full.get("result"), dict)
+                    or full["result"].get("sha256") != completion.result_sha256):
+                raise ValueError("original full factor result binding differs")
+            journal_ref = FactorStreamArtifactReference.model_validate(full.get("journal_reference"))
+            if journal_ref.kind != "journal":
+                raise ValueError("original factor full result has no sealed journal")
+            journal_raw, journal_identity = _read_file(descriptor, journal_ref.filename,
+                MAX_STREAM_JOURNAL_MANIFEST_BYTES, journal_ref.sha256)
+            journal = strict_canonical_json_loads(journal_raw)
+            if (len(journal_raw) != journal_ref.byte_count or journal != full.get("journal")
+                    or not isinstance(journal, dict) or journal.get("spec_sha256") != record.spec_sha256
+                    or journal.get("result_sha256") != completion.result_sha256):
+                raise ValueError("original factor journal receipt differs")
+            identities[reference.filename], identities[journal_ref.filename] = identity, journal_identity
+        else:
+            name = f"factor-research-v1-{completion.artifact_sha256}.json"
+            if completion.artifact_filename != name or not 0 < completion.artifact_byte_count <= MAX_FACTOR_RESEARCH_ARTIFACT_BYTES:
+                raise ValueError("original factor full receipt exceeds its original capacity")
+            file = os.open(name, _READ_FLAGS, dir_fd=descriptor)
+            try:
+                before = _require_named_regular(descriptor, name, file)
+                if before.st_size != completion.artifact_byte_count:
+                    raise ValueError("original factor full file byte count differs")
+                raw = bytearray()
+                while len(raw) <= completion.artifact_byte_count:
+                    part = os.read(file, min(1024 * 1024, completion.artifact_byte_count + 1 - len(raw)))
+                    if not part:
+                        break
+                    raw.extend(part)
+                full = strict_canonical_json_loads(bytes(raw))
+                if (len(raw) != completion.artifact_byte_count or not isinstance(full, dict)
+                        or type(full.get("schema_version")) is not int or full["schema_version"] != 1
+                        or full.get("code_revision") != record.spec.code_revision
+                        or full.get("content_sha256") != completion.artifact_sha256
+                        or _digest({key: value for key, value in full.items() if key != "content_sha256"}) != completion.artifact_sha256):
+                    raise ValueError("original factor full bytes differ from their sealed receipt")
+                after = _require_named_regular(descriptor, name, file)
+                if _file_identity(before) != _file_identity(after):
+                    raise ValueError("original factor full file changed during read")
+                identities[name] = _file_identity(after)
+            finally:
+                os.close(file)
+        files = {name: identity for name, identity in identities.items() if name}
+        _check_identities(root, descriptor, files)
+        if _file_identity(os.fstat(descriptor)) != identities[""]:
+            raise ValueError("original factor full root changed during read")
+        return tuple(sorted(identities.items()))
+    finally:
+        os.close(descriptor)
 
 
 def _digest(value: object) -> str:
@@ -385,6 +465,8 @@ def project_factor_result_projections(
     *,
     available_at: datetime,
     other_projections: tuple[ServingProjectionPayload, ...] = (),
+    collaboration_audit_reader: _ReadonlyPageControlAuditReader | None = None,
+    collaboration: PageControlRoleAuthority | None = None,
 ) -> tuple[ServingProjectionPayload, ...]:
     """Publish only pinned, twice-read jobs and verified compact files."""
     checked_identity = FactorLedgerIdentity.model_validate(identity)
@@ -394,9 +476,23 @@ def project_factor_result_projections(
         raise ValueError("factor result observation requires a timezone")
     observed = available_at.astimezone(UTC)
     ledger = FactorEvaluationJobLedger.open_existing(checked_identity)
-    records = ledger.list_recent_updated(limit=50)
+    all_records = ledger.list_recent_updated(limit=50)
+    role_state, bindings = None, None
+    if collaboration_audit_reader is not None or collaboration is not None:
+        from rquant.collaboration_commands import PageControlRoleAuthority
+        from rquant.serving_page_projection_source import _ReadonlyPageControlAuditReader
+        if (type(collaboration_audit_reader) is not _ReadonlyPageControlAuditReader
+                or type(collaboration) is not PageControlRoleAuthority):
+            raise PermissionError("factor publication requires the bound original journal and roles")
+        collaboration.require_outbox_path(collaboration_audit_reader.path)
+        role_state = collaboration.read_state()
+        bindings = collaboration_audit_reader.result_submission_bindings(collaboration, domain="factor",
+            factor_ledger_identity=checked_identity)
+    proven = None if bindings is None else {(proof.job_id, proof.spec_hash) for proof in bindings}
+    records = tuple(record for record in all_records if proven is None or (record.job_id, record.spec_sha256) in proven)
     index = tuple(_index_row(record) for record in records)
     loaded: dict[str, tuple[_Display, tuple[int, ...], tuple[int, ...]]] = {}
+    full_files: dict[str, tuple[tuple[str, tuple[int, ...]], ...]] = {}
     for record, row in zip(records, index, strict=True):
         completion = record.completion
         if completion is None or completion.display_status == "display_unavailable":
@@ -458,7 +554,9 @@ def project_factor_result_projections(
         ):
             raise ValueError("factor display processing differs from its original spec")
         loaded[record.job_id] = display, root_identity, file_identity
-    if ledger.list_recent_updated(limit=50) != records:
+        if bindings is not None:
+            full_files[record.job_id] = _sealed_full_files(record, artifact_root)
+    if ledger.list_recent_updated(limit=50) != all_records:
         raise ValueError("factor ledger changed during projection")
     for record in records:
         if record.job_id not in loaded:
@@ -469,6 +567,8 @@ def project_factor_result_projections(
         )
         if repeated != loaded[record.job_id]:
             raise ValueError("factor display file changed during projection")
+        if bindings is not None and _sealed_full_files(record, artifact_root) != full_files[record.job_id]:
+            raise ValueError("original factor full sealed files changed during projection")
 
     chunks: tuple[FactorResultDisplayChunk, ...] = ()
     selected_bytes = 0
@@ -522,6 +622,12 @@ def project_factor_result_projections(
         )
     )
     validate_factor_result_projections({item.table_name: item for item in result})
+    if bindings is not None and (
+        collaboration.read_state() != role_state
+        or collaboration_audit_reader.result_submission_bindings(collaboration, domain="factor",
+            factor_ledger_identity=checked_identity) != bindings
+    ):
+        raise PermissionError("current factor owner or role generation changed during publication")
     return result
 
 
@@ -569,9 +675,20 @@ def validate_factor_result_projections(
 class FactorResultProjectionReader:
     """Lab-only adapter holding the external ledger identity and private file root."""
 
-    def __init__(self, identity: FactorLedgerIdentity, artifact_root: Path) -> None:
+    def __init__(self, identity: FactorLedgerIdentity, artifact_root: Path, *,
+        collaboration_audit_reader: _ReadonlyPageControlAuditReader | None = None,
+        collaboration: PageControlRoleAuthority | None = None,
+    ) -> None:
         self.identity = FactorLedgerIdentity.model_validate(identity)
         self.artifact_root = Path(artifact_root)
+        if collaboration_audit_reader is not None or collaboration is not None:
+            from rquant.collaboration_commands import PageControlRoleAuthority
+            from rquant.serving_page_projection_source import _ReadonlyPageControlAuditReader
+            if (type(collaboration_audit_reader) is not _ReadonlyPageControlAuditReader
+                    or type(collaboration) is not PageControlRoleAuthority):
+                raise PermissionError("factor source requires the same original journal and roles")
+            collaboration.require_outbox_path(collaboration_audit_reader.path)
+        self.collaboration_audit_reader, self.collaboration = collaboration_audit_reader, collaboration
 
     def __call__(
         self,
@@ -584,4 +701,6 @@ class FactorResultProjectionReader:
             self.artifact_root,
             available_at=observed_at,
             other_projections=other_projections,
+            collaboration_audit_reader=self.collaboration_audit_reader,
+            collaboration=self.collaboration,
         )

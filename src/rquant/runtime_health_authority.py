@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import os
+import re
+import socket
 import stat
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
@@ -12,7 +14,19 @@ from pathlib import Path
 
 from pydantic import ValidationError, field_validator
 
+from rquant.ops_status import _bounded_proc_read, load_signed_ops_manifest
 from rquant.runtime_contracts import RuntimeContractModel, canonical_sha256, normalize_aware_utc
+from rquant.runtime_health_details import (
+    _IDLE_HEARTBEAT_FIELDS,
+    RuntimeHealthHeartbeatMaterial,
+    RuntimeHealthOpsBinding,
+    RuntimeHealthOpsContext,
+    RuntimeHealthOwnerProjection,
+    _validate_same_read,
+    _visible_metric,
+    build_runtime_health_detail_graph,
+    runtime_health_graph_from_projections,
+)
 from rquant.runtime_service_control import (
     RuntimeServiceHealth,
     RuntimeServiceHeartbeat,
@@ -21,11 +35,16 @@ from rquant.runtime_service_control import (
     project_heartbeat,
 )
 from rquant.runtime_serving_authority import (
+    ServingSourceAuthorityIntegrityError,
     ServingSourceAuthorityPublication,
     ServingSourceAuthorityPublisher,
+    ServingSourceAuthorityReader,
+    ServingSourceAuthorityUnavailableError,
 )
 from rquant.runtime_serving_snapshot import (
+    OPS_STATUS_DATASET_ID,
     RUNTIME_HEALTH_DATASET_ID,
+    OpsStatusPayload,
     RuntimeHealthPayload,
     SourceReadResult,
 )
@@ -130,6 +149,109 @@ def _dashboard_summary_projection(
 
 class RuntimeHealthAuthorityIntegrityError(RuntimeError):
     """A heartbeat authority cannot be trusted as a point-in-time source."""
+
+
+class RuntimeHealthTrustedOpsRead(RuntimeContractModel):
+    context: RuntimeHealthOpsContext
+    source: SourceReadResult
+
+    @field_validator("source")
+    @classmethod
+    def require_ops_owner(cls, source: SourceReadResult) -> SourceReadResult:
+        if source.dataset_id != OPS_STATUS_DATASET_ID or not isinstance(
+            source.payload, OpsStatusPayload
+        ):
+            raise ValueError("trusted read requires the original Ops owner")
+        return source
+
+
+class RuntimeHealthTrustedOpsProvider:
+    """Read the original signed Ops owner once for the locked service start."""
+
+    def __init__(
+        self,
+        binding: RuntimeHealthOpsBinding,
+        *,
+        host_name: Callable[[], str] = socket.gethostname,
+        proc_reader: Callable[[str, int], bytes] = _bounded_proc_read,
+    ) -> None:
+        self.binding = RuntimeHealthOpsBinding.model_validate(binding.model_dump(mode="python"))
+        self._host_name = host_name
+        self._proc_reader = proc_reader
+        self._reader = ServingSourceAuthorityReader(
+            root=self.binding.authority_root,
+            expected_producer_commit=self.binding.producer_commit,
+            expected_dataset_id=OPS_STATUS_DATASET_ID,
+            expected_payload_kind="ops_status",
+            max_bytes=512 * 1024,
+        )
+
+    def _boot_id(self) -> str:
+        raw = self._proc_reader("/proc/sys/kernel/random/boot_id", 128)
+        if len(raw) > 128:
+            raise ValueError("Ops boot read exceeded byte budget")
+        boot = raw.decode("ascii").strip()
+        if re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", boot) is None:
+            raise ValueError("Ops boot identity is invalid")
+        return boot
+
+    def __call__(self, cutoff: datetime, /) -> RuntimeHealthOpsContext | None:
+        captured = self.capture(cutoff)
+        return None if captured is None else captured.context
+
+    def read_source(self, cutoff: datetime, /) -> SourceReadResult:
+        captured = self.capture(cutoff)
+        if captured is None:
+            raise ServingSourceAuthorityUnavailableError(
+                "health referenced Ops source is unavailable"
+            )
+        return captured.source
+
+    def capture(self, cutoff: datetime, /) -> RuntimeHealthTrustedOpsRead | None:
+        observed_at = normalize_aware_utc(cutoff)
+        try:
+            host = self._host_name()
+            boot = self._boot_id()
+            _manifest, manifest_digest = load_signed_ops_manifest(
+                self.binding.install_manifest_path,
+                public_key_pem=self.binding.install_public_key_pem.encode("ascii"),
+                expected_host=host,
+            )
+            source = self._reader(observed_at)
+            if source.status is not FreshnessStatus.FRESH or not isinstance(
+                source.payload, OpsStatusPayload
+            ):
+                return None
+            sample = source.payload.snapshot
+            if sample is None or (
+                sample.host_name != host
+                or sample.boot_id != boot
+                or sample.manifest_digest != manifest_digest
+                or sample.sampled_at != source.event_time
+                or source.published_at > observed_at
+            ):
+                return None
+            age = (observed_at - sample.sampled_at).total_seconds()
+            if not 0 <= age < 120:
+                return None
+            if self._host_name() != host or self._boot_id() != boot:
+                return None
+            context = RuntimeHealthOpsContext(
+                host_name=host,
+                boot_id=boot,
+                manifest_digest=manifest_digest,
+                ops_source_generation_id=source.generation_id,
+                source_identity=canonical_sha256(source),
+                sampled_at=sample.sampled_at,
+            )
+            return RuntimeHealthTrustedOpsRead(context=context, source=source)
+        except (
+            OSError,
+            ValueError,
+            ServingSourceAuthorityIntegrityError,
+            ServingSourceAuthorityUnavailableError,
+        ):
+            return None
 
 
 class RuntimeHealthControlSource(RuntimeContractModel):
@@ -444,7 +566,15 @@ class RuntimeHealthSourceReader:
         serving_service_id: str,
         max_heartbeat_bytes: int = _DEFAULT_MAX_BYTES,
         previous_spec_identities: Mapping[str, Sequence[str]] | None = None,
+        details_enabled: bool = False,
+        ops_provider: RuntimeHealthTrustedOpsProvider | None = None,
     ) -> None:
+        if type(details_enabled) is not bool:
+            raise TypeError("health detail opt-in must be boolean")
+        if ops_provider is not None and type(ops_provider) is not RuntimeHealthTrustedOpsProvider:
+            raise TypeError("health detail requires the original trusted Ops provider")
+        self.details_enabled = details_enabled
+        self.ops_provider = ops_provider
         if not serving_service_id.strip():
             raise ValueError("serving_service_id cannot be empty")
         if max_heartbeat_bytes < 1:
@@ -478,6 +608,15 @@ class RuntimeHealthSourceReader:
         reasons: list[str] = []
         event_times: list[datetime] = []
         source_receipts: dict[str, str] = {}
+        materials: list[RuntimeHealthHeartbeatMaterial] = []
+        captured = (
+            self.ops_provider.capture(observed)
+            if self.details_enabled and self.ops_provider is not None
+            else None
+        )
+        from rquant.ops_status_serving import ops_runtime_health_metrics
+
+        ops_metrics = () if captured is None else ops_runtime_health_metrics(captured.source)
         for source in self.sources:
             # One source may not take the other twenty-four with it. Before #248 any
             # unsafe file, invalid document, mismatched fingerprint or inconsistent
@@ -517,6 +656,49 @@ class RuntimeHealthSourceReader:
                     "observed_at": observed,
                 }
             )
+            if self.details_enabled:
+                readable = isinstance(heartbeat, RuntimeServiceHeartbeat)
+                metrics = () if not readable else heartbeat.health_metrics or ()
+                binding = None if not readable else heartbeat.startup_witness
+                ops_source = None
+                if (
+                    readable
+                    and binding is not None
+                    and captured is not None
+                    and (
+                        binding.ops_context.host_name,
+                        binding.ops_context.boot_id,
+                        binding.ops_context.manifest_digest,
+                    )
+                    == (
+                        captured.context.host_name,
+                        captured.context.boot_id,
+                        captured.context.manifest_digest,
+                    )
+                ):
+                    metrics = (*metrics, *ops_metrics)
+                    if ops_metrics:
+                        ops_source = captured.source
+                    ops_metrics = ()
+                materials.append(
+                    RuntimeHealthHeartbeatMaterial.from_read(
+                        control_root=source.control_root,
+                        spec=source.spec,
+                        heartbeat=heartbeat if readable else None,
+                        observed_at=observed,
+                        read_kind="unreadable"
+                        if failure is not None
+                        else "superseded"
+                        if heartbeat is SUPERSEDED_HEARTBEAT
+                        else "readable"
+                        if readable
+                        else "missing",
+                        unreadable_error=failure,
+                        startup_witness=binding,
+                        metrics=metrics,
+                        ops_source=ops_source,
+                    )
+                )
             if failure is not None or heartbeat is SUPERSEDED_HEARTBEAT or heartbeat is None:
                 if failure is not None:
                     status = RuntimeServiceStatus.DEGRADED
@@ -540,8 +722,7 @@ class RuntimeHealthSourceReader:
                 continue
             if not isinstance(heartbeat, RuntimeServiceHeartbeat):  # pragma: no cover
                 raise RuntimeHealthAuthorityIntegrityError(
-                    f"runtime heartbeat read returned an unusable value: "
-                    f"{source.spec.service_id}"
+                    f"runtime heartbeat read returned an unusable value: {source.spec.service_id}"
                 )
             stale = observed - heartbeat.heartbeat_at > source.spec.stale_after
             status = RuntimeServiceStatus.DEGRADED if stale else heartbeat.status
@@ -584,6 +765,35 @@ class RuntimeHealthSourceReader:
                 dashboard_summary_source_receipts=source_receipts,
             ),
         }
+        if self.details_enabled:
+            graph = build_runtime_health_detail_graph(
+                materials=tuple(materials),
+                legacy_services=service_snapshot,
+                source_receipts=source_receipts,
+                context=None if captured is None else captured.context,
+                owner_generation_id="0" * 64,
+                observed_at=observed,
+                enabled=True,
+                existing_projections=(
+                    RuntimeHealthOwnerProjection(
+                        **dashboard_projection.model_dump(mode="python"),
+                        owner_generation_id="0" * 64,
+                    ),
+                ),
+            )
+            if graph is not None:
+                extension = tuple(
+                    ServingProjectionPayload(
+                        table_name=p.table_name,
+                        available_at=p.available_at,
+                        rows=tuple(row.model_dump(mode="json") for row in p.rows),
+                    )
+                    for p in graph.projections
+                )
+                values["payload"] = RuntimeHealthPayload(
+                    **values["payload"].model_dump(mode="python", exclude={"projections"}),
+                    projections=(dashboard_projection, *extension),
+                )
         values["generation_id"] = canonical_sha256(values)
         return SourceReadResult.model_validate(values)
 
@@ -695,6 +905,49 @@ def runtime_health_state_identity(result: SourceReadResult) -> str:
             if isinstance(heartbeat, dict):
                 for name in _HEARTBEAT_OBSERVATION_FIELDS:
                     heartbeat.pop(name, None)
+        graph = runtime_health_graph_from_projections(
+            result.payload.projections, owner_generation_id=result.generation_id
+        )
+        if graph is not None:
+            service_by_id = {item.service_id: item for item in result.payload.runtime_services}
+            for projection in payload.get("projections") or ():
+                if projection["table_name"] == "runtime_health_detail_context":
+                    for row in projection["rows"]:
+                        for key in (
+                            "sampled_at",
+                            "observed_at",
+                            "context_source_identity",
+                            "ops_source_generation_id",
+                        ):
+                            row.pop(key, None)
+                elif projection["table_name"] == "runtime_service_detail":
+                    stable = []
+                    for row in projection["rows"]:
+                        material = RuntimeHealthHeartbeatMaterial.model_validate_json(
+                            row["source_material_json"]
+                        )
+                        _validate_same_read(
+                            material, service_by_id[row["service_id"]], material.observed_at
+                        )
+                        raw = material.model_dump(mode="json")
+                        raw.pop("observed_at", None)
+                        hb = material.heartbeat
+                        if hb is not None:
+                            hb_json = hb.model_dump(mode="json")
+                            for key in _IDLE_HEARTBEAT_FIELDS:
+                                hb_json.pop(key, None)
+                            raw["heartbeat_json"] = hb_json
+                        raw["metrics"] = [
+                            value.model_dump(mode="json")
+                            for value in (
+                                _visible_metric(
+                                    metric, material.observed_at, "available", "available"
+                                )
+                                for metric in material.metrics
+                            )
+                        ]
+                        stable.append({"service_id": row["service_id"], "material": raw})
+                    projection["rows"] = stable
         for projection in payload.get("projections") or ():
             if not isinstance(projection, dict):
                 continue

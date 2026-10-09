@@ -9,7 +9,7 @@ import socket
 import sys
 import threading
 from collections.abc import Callable, Sequence
-from datetime import datetime
+from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -25,6 +25,7 @@ from rquant.canvas_publication_receipt import (
     Ed25519CanvasPublicationSigner,
     SecureCanvasPublicationSigningClient,
 )
+from rquant.collaboration_commands import CommandAuthorization, PageControlRoleAuthority
 from rquant.factor.page_control_backend import (
     FactorDefinitionPageControlBackend as RegistryFactorBackend,
 )
@@ -35,6 +36,7 @@ from rquant.formula_pool_definition import FormulaPoolDefinitionStore, FormulaPo
 from rquant.job_center_authority import resolve_current_job_center_authority_binding
 from rquant.lab_daemon import load_lab_job_center_authority_manifest
 from rquant.lab_page_control import build_lab_page_control_writer
+from rquant.minute_backtest_commands import MinutePageControlBackend
 from rquant.page_control import (
     DEFAULT_PAGE_CONTROL_SERVICE_ID,
     AckAlert,
@@ -45,6 +47,7 @@ from rquant.page_control import (
     FormulaMarketPageControlBackend,
     FormulaPoolPageControlBackend,
     LabPageControlBackend,
+    PortfolioPageControlBackend,
     PageControlCommandConflictError,
     PageControlConsumer,
     PageControlOutbox,
@@ -61,11 +64,16 @@ from rquant.web.condition_alert_commands import ConditionRuleScopeResolver, cond
 from rquant.web.models.screen import ScreenRunData
 
 if TYPE_CHECKING:
+    from rquant.minute_backtest_parameter_study_journal import MinuteParameterStudyCommandWriter
+    from rquant.minute_backtest_native_report_runtime import MinuteNativeReportCommandWriter
+    from rquant.ai_assistance import AIModelProvider, AIAssistanceContexts
+    from rquant.ai_assistance_admission import AIPrivateConfig
     from rquant.task_control import TaskControlPageControlBackend
     from rquant.config import Settings
     from rquant.experiment_platform_commands import ExperimentPageControlBackend
     from rquant.paper_portfolio_commands import PaperPortfolioPageControlBackend
     from rquant.strategy_authoring import StrategyAuthoringPageControlBackend
+    from rquant.strategy_promotion import StrategyPromotionPageControlBackend
 
 PRODUCTION_CANVAS_SIGNER_COMMAND = (
     "/usr/bin/sudo",
@@ -149,6 +157,14 @@ def build_page_control_service(
     log_dir: Path | None = None,
     allowed_lab_export_roots: tuple[Path, ...] | None = None,
     lab_backend: LabPageControlBackend | None = None,
+    portfolio_backend: PortfolioPageControlBackend | None = None,
+    minute_backend: MinutePageControlBackend | None = None,
+    minute_study_backend: MinuteParameterStudyCommandWriter | None = None,
+    minute_native_report_backend: MinuteNativeReportCommandWriter | None = None,
+    minute_native_report_path: Path | None = None,
+    minute_native_expected_code_sha: str | None = None,
+    minute_installation_path: Path | None = None,
+    minute_expected_code_sha: str | None = None,
     experiment_backend: ExperimentPageControlBackend | None = None,
     backfill_plan_backend: BackfillPlanPageControlBackend | None = None,
     data_audit_report_backend: DataAuditReportPageControlBackend | None = None,
@@ -157,9 +173,13 @@ def build_page_control_service(
     formula_pool_backend: FormulaPoolPageControlBackend | None = None,
     factor_definition_backend: FactorDefinitionPageControlBackend | None = None,
     strategy_authoring_backend: StrategyAuthoringPageControlBackend | None = None,
+    strategy_promotion_backend: StrategyPromotionPageControlBackend | None = None,
     paper_portfolio_backend: PaperPortfolioPageControlBackend | None = None,
     task_control_backend: TaskControlPageControlBackend | None = None,
     screen_query_executor: Callable[[ScreenQueryDefinition], ScreenRunData] | None = None,
+    ai_config: AIPrivateConfig | None = None,
+    ai_provider: AIModelProvider | None = None,
+    ai_contexts: AIAssistanceContexts | None = None,
     screen_query_cursor_key: bytes | None = None,
     condition_rule_scope: ConditionRuleScopeResolver | None = None,
     daily_writer_capability: Callable[[], DailyWriterCapability | None] | None = None,
@@ -171,6 +191,7 @@ def build_page_control_service(
     consumer_instance_id: str | None = None,
     canvas_publication_signer: CanvasPublicationSigner | None = None,
     canvas_publication_keyring: CanvasPublicationKeyring | None = None,
+    collaboration: PageControlRoleAuthority | None = None,
 ) -> PageControlService:
     return build_page_control_service_with_dependencies(
         outbox_path=outbox_path,
@@ -178,6 +199,14 @@ def build_page_control_service(
         log_dir=log_dir,
         allowed_lab_export_roots=allowed_lab_export_roots,
         lab_backend=lab_backend,
+        portfolio_backend=portfolio_backend,
+        minute_backend=minute_backend,
+        minute_study_backend=minute_study_backend,
+        minute_native_report_backend=minute_native_report_backend,
+        minute_native_report_path=minute_native_report_path,
+        minute_native_expected_code_sha=minute_native_expected_code_sha,
+        minute_installation_path=minute_installation_path,
+        minute_expected_code_sha=minute_expected_code_sha,
         experiment_backend=experiment_backend,
         backfill_plan_backend=backfill_plan_backend,
         data_audit_report_backend=data_audit_report_backend,
@@ -186,9 +215,13 @@ def build_page_control_service(
         formula_pool_backend=formula_pool_backend,
         factor_definition_backend=factor_definition_backend,
         strategy_authoring_backend=strategy_authoring_backend,
+        strategy_promotion_backend=strategy_promotion_backend,
         paper_portfolio_backend=paper_portfolio_backend,
         task_control_backend=task_control_backend,
         screen_query_executor=screen_query_executor,
+        ai_config=ai_config,
+        ai_provider=ai_provider,
+        ai_contexts=ai_contexts,
         screen_query_cursor_key=screen_query_cursor_key,
         condition_rule_scope=condition_rule_scope,
         daily_writer_capability=daily_writer_capability,
@@ -200,6 +233,7 @@ def build_page_control_service(
         consumer_instance_id=consumer_instance_id,
         canvas_publication_signer=canvas_publication_signer,
         canvas_publication_keyring=canvas_publication_keyring,
+        collaboration=collaboration,
     )
 
 
@@ -210,6 +244,14 @@ def build_page_control_service_with_dependencies(
     log_dir: Path | None = None,
     allowed_lab_export_roots: tuple[Path, ...] | None = None,
     lab_backend: LabPageControlBackend | None = None,
+    portfolio_backend: PortfolioPageControlBackend | None = None,
+    minute_backend: MinutePageControlBackend | None = None,
+    minute_study_backend: MinuteParameterStudyCommandWriter | None = None,
+    minute_native_report_backend: MinuteNativeReportCommandWriter | None = None,
+    minute_native_report_path: Path | None = None,
+    minute_native_expected_code_sha: str | None = None,
+    minute_installation_path: Path | None = None,
+    minute_expected_code_sha: str | None = None,
     experiment_backend: ExperimentPageControlBackend | None = None,
     backfill_plan_backend: BackfillPlanPageControlBackend | None = None,
     data_audit_report_backend: DataAuditReportPageControlBackend | None = None,
@@ -218,9 +260,13 @@ def build_page_control_service_with_dependencies(
     formula_pool_backend: FormulaPoolPageControlBackend | None = None,
     factor_definition_backend: FactorDefinitionPageControlBackend | None = None,
     strategy_authoring_backend: StrategyAuthoringPageControlBackend | None = None,
+    strategy_promotion_backend: StrategyPromotionPageControlBackend | None = None,
     paper_portfolio_backend: PaperPortfolioPageControlBackend | None = None,
     task_control_backend: TaskControlPageControlBackend | None = None,
     screen_query_executor: Callable[[ScreenQueryDefinition], ScreenRunData] | None = None,
+    ai_config: AIPrivateConfig | None = None,
+    ai_provider: AIModelProvider | None = None,
+    ai_contexts: AIAssistanceContexts | None = None,
     screen_query_cursor_key: bytes | None = None,
     condition_rule_scope: ConditionRuleScopeResolver | None = None,
     daily_writer_capability: Callable[[], DailyWriterCapability | None] | None = None,
@@ -232,11 +278,40 @@ def build_page_control_service_with_dependencies(
     consumer_instance_id: str | None = None,
     canvas_publication_signer: CanvasPublicationSigner | None = None,
     canvas_publication_keyring: CanvasPublicationKeyring | None = None,
+    collaboration: PageControlRoleAuthority | None = None,
 ) -> PageControlService:
     if (canvas_publication_signer is None) != (canvas_publication_keyring is None):
         raise ValueError(
             "CanvasPublicationReceipt signer and public keyring must be provided together"
         )
+    from rquant.minute_backtest_installation import MINUTE_INSTALLATION_ENV, load_minute_replay_installation
+    selected_minute_path = minute_installation_path or os.environ.get(MINUTE_INSTALLATION_ENV) or None
+    if selected_minute_path is not None:
+        if minute_backend is not None:
+            raise ValueError("minute backend and installed configuration cannot both be supplied")
+        from rquant.minute_backtest_commands import MinuteCommandWriter
+        installed = load_minute_replay_installation(Path(selected_minute_path),
+            expected_code_sha=minute_expected_code_sha or os.environ.get("RQUANT_RUNTIME_COMMIT"), writable=True, clock=clock)
+        minute_backend = MinuteCommandWriter(installed)
+    if minute_study_backend is None:
+        from rquant.minute_backtest_commands import MinuteCommandWriter
+
+        if type(minute_backend) is MinuteCommandWriter and minute_backend.installation.profile.parameter_catalog is not None:
+            from rquant.minute_backtest_parameter_study_journal import MinuteParameterStudyCommandWriter
+
+            minute_study_backend = MinuteParameterStudyCommandWriter(minute_backend)
+    native_report_path = minute_native_report_path or os.environ.get("RQUANT_MINUTE_NATIVE_REPORT_RUNTIME") or None
+    if native_report_path is not None:
+        if minute_native_report_backend is not None:
+            raise ValueError("native minute report locator and backend cannot both be supplied")
+        from rquant.minute_backtest_native_report_runtime import (
+            MinuteNativeReportCommandWriter, load_minute_native_report_runtime,
+        )
+
+        native_runtime = load_minute_native_report_runtime(Path(native_report_path),
+            expected_code_sha=minute_native_expected_code_sha or minute_expected_code_sha or os.environ.get("RQUANT_RUNTIME_COMMIT"),
+            writable=True, clock=clock or (lambda: datetime.now(UTC)))
+        minute_native_report_backend = MinuteNativeReportCommandWriter(native_runtime)
     if allowed_lab_export_roots is None:
         configured_roots = os.environ.get("RQUANT_PAGE_CONTROL_ALLOWED_EXPORT_ROOTS", "")
         allowed_roots = tuple(
@@ -277,8 +352,17 @@ def build_page_control_service_with_dependencies(
             backfill_plan_backend=build_data_center_plan_backend(profile_path,clock=clock)
         if data_audit_report_backend is None:
             data_audit_report_backend=build_data_center_audit_backend(profile_path,clock=clock)
-    return PageControlService(
+    ai_owner = None
+    if ai_config is not None:
+        from rquant.ai_assistance_admission import build_ai_owner
+        ai_owner = build_ai_owner(ai_config, outbox=outbox, screen=screen_query_executor,
+            provider=ai_provider, contexts=ai_contexts, clock=clock)
+    elif ai_provider is not None or ai_contexts is not None:
+        raise ValueError("AI dependencies require an explicit private configuration")
+    control = PageControlService(
         outbox=outbox,
+        collaboration=collaboration,
+        ai_assistance=ai_owner,
         consumer=PageControlConsumer(
             outbox=outbox,
             data_dir=_settings().data_dir if data_dir is None else data_dir,
@@ -289,6 +373,10 @@ def build_page_control_service_with_dependencies(
                 if lab_backend is not None or not load_default_lab_backend
                 else _build_lab_backend()
             ),
+            portfolio_backend=portfolio_backend,
+            minute_backend=minute_backend,
+            minute_study_backend=minute_study_backend,
+            minute_native_report_backend=minute_native_report_backend,
             backfill_plan_backend=backfill_plan_backend,
             experiment_backend=experiment_backend,
             data_audit_report_backend=data_audit_report_backend,
@@ -297,6 +385,7 @@ def build_page_control_service_with_dependencies(
             formula_pool_backend=formula_pool_backend,
             factor_definition_backend=factor_definition_backend,
             strategy_authoring_backend=strategy_authoring_backend,
+            strategy_promotion_backend=strategy_promotion_backend,
             paper_portfolio_backend=paper_portfolio_backend,
             task_control_backend=task_control_backend,
             screen_query_history=screen_history,
@@ -312,6 +401,68 @@ def build_page_control_service_with_dependencies(
             canvas_publication_keyring=canvas_publication_keyring,
         ),
     )
+    if ai_owner is not None:
+        ai_owner.control = control
+        if ai_config.historical_profile_file is not None:
+            from rquant.ai_screen_backtest_source import install_ai_screen_backtests
+            install_ai_screen_backtests(control, ai_config.historical_profile_file)
+        if ai_config.news_profile_file is not None:
+            from rquant.stock_news_sources import install_ai_news_runner
+            install_ai_news_runner(control,ai_config.news_profile_file,users=ai_config.allowed_users)
+    return control
+
+
+class MinuteCommandConsumerLoop:
+    """Consume only installed minute commands from the original outbox."""
+
+    def __init__(self, service: PageControlService) -> None:
+        self.service = service
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        from rquant.minute_backtest_commands import MinuteCommandWriter
+
+        backend = self.service.consumer.minute_backend
+        native = self.service.consumer.minute_native_report_backend
+        if backend is None and native is None:
+            raise PermissionError("background minute consumption requires the original installed writer")
+        if backend is not None:
+            if (type(backend) is not MinuteCommandWriter or backend.owner_authority is not self.service
+                    or not backend.installation.writable):
+                raise PermissionError("background minute consumption requires the original installed writer")
+            backend.installation.verify_current()
+        if native is not None:
+            from rquant.minute_backtest_native_report_runtime import MinuteNativeReportCommandWriter
+
+            if (type(native) is not MinuteNativeReportCommandWriter or native.owner_authority is not self.service
+                    or not native.runtime.writable):
+                raise PermissionError("background native reports require the original installed writer")
+            native.runtime.verify_current()
+        if self._thread is not None:
+            raise RuntimeError("original minute consumer is already started")
+        self._thread = threading.Thread(target=self._run, name="page-control-minute-consumer", daemon=False)
+        self.service._defer_minute_commands = True
+        try:
+            self._thread.start()
+        except BaseException:
+            self.service._defer_minute_commands = False
+            self._thread = None
+            raise
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self.service.consumer.drain_minute_commands(limit=1)
+            except Exception:
+                logger.exception("原分钟命令消费未完成，保留原日志恢复状态。")
+            self._stop.wait(0.25)
+
+    def close(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join()
+        self.service._defer_minute_commands = False
 
 
 def handler_for(service: PageControlService) -> type[BaseHTTPRequestHandler]:
@@ -325,7 +476,15 @@ def handler_for(service: PageControlService) -> type[BaseHTTPRequestHandler]:
                 if not 1 <= content_length <= 1024 * 1024:
                     raise ValueError("request body must be between 1 byte and 1 MiB")
                 payload = json.loads(self.rfile.read(content_length))
-                command = parse_page_control_command(payload)
+                proof = None
+                if service.collaboration.mode == "enforced":
+                    if not isinstance(payload, dict) or set(payload) != {"command", "authorization"}:
+                        raise PermissionError("original private authorization is required")
+                    proof = CommandAuthorization.model_validate_json(json.dumps(payload["authorization"]))
+                    command = parse_page_control_command(payload["command"])
+                    service.collaboration.verify_authorization(proof, command.model_dump(mode="json"))
+                else:
+                    command = parse_page_control_command(payload)
             except Exception as exc:
                 self._write_json(
                     400,
@@ -351,7 +510,7 @@ def handler_for(service: PageControlService) -> type[BaseHTTPRequestHandler]:
                 )
             else:
                 try:
-                    response = service.submit(command).model_dump(mode="json")
+                    response = (service.submit(command) if proof is None else service.submit_authorized(command, proof)).model_dump(mode="json")
                 except PageControlCommandConflictError:
                     self._write_json(409, {"error": "command conflict"})
                     return
@@ -430,12 +589,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="explicit owner-private screening config; absent means disabled",
     )
+    parser.add_argument("--ai-config", type=Path, help="explicit original-owner private AI config; default calls remain zero")
     parser.add_argument("--factor-archive-socket", type=Path)
     parser.add_argument("--factor-archive-registry", type=Path)
     parser.add_argument("--factor-archive-web-uid", type=int)
     parser.add_argument("--factor-archive-shared-gid", type=int)
     parser.add_argument("--factor-archive-editors")
     parser.add_argument("--factor-save-enabled", action="store_true")
+    parser.add_argument("--notifier-operator-config", type=Path,
+                        help="explicit original task operator config; absent means disabled")
     return parser
 
 
@@ -460,6 +622,8 @@ def main(
     condition_rule_serving_root: Path | None = None,
     condition_rule_activate: bool = False,
     screen_query_config_path: Path | None = None,
+    ai_config_path: Path | None = None,
+    notifier_operator_config_path: Path | None = None,
 ) -> None:
     """Entry point. `argv` is what the runtime wrapper derived; keywords are for tests."""
 
@@ -468,6 +632,12 @@ def main(
         if screen_query_config_path is not None and arguments.screen_query_config is not None:
             raise ValueError("screen private config was supplied twice")
         screen_query_config_path = screen_query_config_path or arguments.screen_query_config
+        if ai_config_path is not None and arguments.ai_config is not None:
+            raise ValueError("AI private config was supplied twice")
+        ai_config_path = ai_config_path or arguments.ai_config
+        if notifier_operator_config_path is not None and arguments.notifier_operator_config is not None:
+            raise ValueError("notifier operator configuration was supplied twice")
+        notifier_operator_config_path = notifier_operator_config_path or arguments.notifier_operator_config
         condition_rule_serving_root = (
             condition_rule_serving_root or arguments.condition_rule_serving_root
         )
@@ -529,6 +699,8 @@ def main(
         condition_rule_serving_root=condition_rule_serving_root,
         condition_rule_activate=condition_rule_activate,
         screen_query_config_path=screen_query_config_path,
+        ai_config_path=ai_config_path,
+        notifier_operator_config_path=notifier_operator_config_path,
     )
 
 
@@ -552,6 +724,8 @@ def _serve(
     condition_rule_serving_root: Path | None = None,
     condition_rule_activate: bool = False,
     screen_query_config_path: Path | None = None,
+    ai_config_path: Path | None = None,
+    notifier_operator_config_path: Path | None = None,
 ) -> None:
     from rquant.runtime_deployment_profile import (
         LINUX_PRODUCTION_RUNTIME_ROOT,
@@ -694,6 +868,30 @@ def _serve(
         ):
             raise ValueError("screen private endpoint requires a separate directory")
         screen_executor = ScreenQueryExecutor(screen_config)
+    ai_config = None
+    if ai_config_path is not None:
+        from rquant.ai_assistance_admission import read_private_config
+        ai_config = read_private_config(ai_config_path)
+        if screen_config is None or (ai_config.trusted_web_uid, ai_config.shared_gid) != (screen_config.trusted_web_uid, screen_config.shared_gid) or not ai_config.allowed_users <= screen_config.allowed_users:
+            raise ValueError("AI must share the installed original private screen peer and exact allowed users")
+        endpoints = (ack_socket_path, watchlist_socket_path, price_rule_socket_path, factor_archive_socket_path, screen_config.socket_path)
+        if any(path is not None and path.parent == ai_config.socket_path.parent for path in endpoints):
+            raise ValueError("AI requires a separate original-owner private directory")
+    ai_lab_backend = None
+    if ai_config is not None and ai_config.historical_profile_file is not None:
+        from rquant.ai_screen_backtest_source import build_installed_ai_lab_backend
+        ai_lab_backend = build_installed_ai_lab_backend(ai_config.historical_profile_file,
+            runtime_root=resolved_runtime_root, code_commit=resolved_commit)
+    task_backend = None
+    operator_config = None
+    if notifier_operator_config_path is not None:
+        from rquant.notifier_operator import build_notifier_operator_backend, read_notifier_operator_config
+
+        operator_config = read_notifier_operator_config(notifier_operator_config_path)
+        if operator_config.runtime_root != resolved_runtime_root:
+            raise ValueError("notifier operator must use this actual runtime root")
+        task_backend = build_notifier_operator_backend(operator_config, outbox_path=page_profile.outbox_path,
+                                                      expected_commit=resolved_commit)
     service = build_page_control_service(
         outbox_path=page_profile.outbox_path,
         data_dir=page_profile.data_dir,
@@ -705,12 +903,16 @@ def _serve(
         if condition_rule_serving_root is None
         else condition_scope_resolver(condition_rule_serving_root),
         screen_query_executor=screen_executor,
+        ai_config=ai_config,
+        lab_backend=ai_lab_backend,
+        minute_expected_code_sha=resolved_commit,
         daily_writer_capability=None
         if screen_executor is None
         else screen_executor.daily_writer_capability,
         daily_run_evidence=None if screen_executor is None else screen_executor.daily_run_evidence,
         screen_query_cursor_key=None if screen_executor is None else screen_executor.cursor_key,
         factor_definition_backend=factor_backend,
+        task_control_backend=task_backend,
         load_default_lab_backend=False,
         consumer_service_id=canvas_profile.consumer_service_id,
         consumer_instance_id=canvas_profile.consumer_instance_id,
@@ -792,6 +994,7 @@ def _serve(
         except Exception:
             logger.exception("Factor archive admission listener disabled during startup")
     screen_server = None
+    ai_server = None
     server_class = _server_class_for_host(host)
     try:
         if screen_config is not None:
@@ -804,8 +1007,23 @@ def _serve(
                 shared_gid=screen_config.shared_gid,
                 control=service,
             )
+        if ai_config is not None:
+            from rquant.ai_assistance_admission import AIAssistancePrivateServer
+            ai_server = AIAssistancePrivateServer(ai_config, control=service)
+        if task_backend is not None and operator_config.socket_path is not None:
+            from rquant.task_control_admission import TaskControlAdmission, build_task_control_admission_server
+
+            peers = (ack_socket_path, watchlist_socket_path, price_rule_socket_path, factor_archive_socket_path,
+                None if screen_config is None else screen_config.socket_path, None if ai_config is None else ai_config.socket_path)
+            if any(other is not None and operator_config.socket_path.parent == other.parent for other in peers):
+                raise ValueError("task private endpoint requires its separate original directory")
+            task_server = build_task_control_admission_server(TaskControlAdmission(service, backend=task_backend),
+                socket_path=operator_config.socket_path, trusted_web_uid=operator_config.trusted_web_uid,
+                shared_gid=operator_config.shared_gid)
         server = server_class((host, port), handler_for(service))
     except Exception:
+        if ai_server is not None:
+            ai_server.server_close()
         if screen_server is not None:
             screen_server.server_close()
         if ack_server is not None:
@@ -816,9 +1034,13 @@ def _serve(
             price_rule_server.server_close()
         if factor_archive_server is not None:
             factor_archive_server.server_close()
+        if task_server is not None:
+            task_server.server_close()
         raise
     screen_thread = None
     screen_started = False
+    ai_thread = None
+    ai_started = False
     ack_thread = None
     ack_started = False
     watchlist_thread = None
@@ -827,7 +1049,21 @@ def _serve(
     price_rule_started = False
     factor_archive_thread = None
     factor_archive_started = False
+    task_thread = None
+    task_started = False
+    minute_loop = None
     try:
+        from rquant.minute_backtest_commands import MinuteCommandWriter
+
+        if type(service.consumer.minute_backend) is MinuteCommandWriter or service.consumer.minute_native_report_backend is not None:
+            minute_loop = MinuteCommandConsumerLoop(service)
+            minute_loop.start()
+        if service.ai_assistance is not None and service.ai_assistance.nightly is not None:
+            service.ai_assistance.nightly.start()
+        if ai_server is not None:
+            ai_thread = threading.Thread(target=ai_server.serve_forever, daemon=False)
+            ai_thread.start()
+            ai_started = True
         if screen_server is not None:
             screen_thread = threading.Thread(target=screen_server.serve_forever, daemon=False)
             screen_thread.start()
@@ -852,9 +1088,33 @@ def _serve(
             )
             factor_archive_thread.start()
             factor_archive_started = True
+        if task_server is not None:
+            task_thread = threading.Thread(target=task_server.serve_forever, daemon=True)
+            task_thread.start()
+            task_started = True
         server.serve_forever()
     finally:
         server.server_close()
+        if minute_loop is not None:
+            minute_loop.close()
+        if service.consumer.minute_native_report_backend is not None:
+            service.consumer.minute_native_report_backend.close()
+        if task_server is not None:
+            if task_started and task_thread is not None:
+                task_server.shutdown()
+                task_thread.join()
+            task_server.server_close()
+        if service.ai_assistance is not None and service.ai_assistance.nightly is not None:
+            service.ai_assistance.nightly.close()
+        if ai_server is not None:
+            if ai_started and ai_thread is not None:
+                ai_server.shutdown()
+                ai_thread.join()
+            ai_server.server_close()
+        if service.ai_assistance is not None and service.ai_assistance.provider is not None:
+            close = getattr(service.ai_assistance.provider, "close", None)
+            if close is not None:
+                close()
         if screen_server is not None:
             if screen_started and screen_thread is not None:
                 screen_server.shutdown()

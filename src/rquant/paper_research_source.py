@@ -13,7 +13,8 @@ import duckdb
 
 from rquant.data_metadata import DataAuditRun, DataAuditRunFinalization, DatasetCoverage, DatasetSnapshot, DatasetSnapshotFinalization
 from rquant.paper_research import (FrozenPaperResearchInput, PAPER_RESEARCH_INPUT_CONTRACT, PAPER_RESEARCH_INPUT_TABLE,
-                                    PAPER_RESEARCH_TASKS, PaperResearchAdapterCatalog, PaperResearchRunParameters)
+                                    PAPER_RESEARCH_TASKS, PaperResearchCatalog, NativePaperResearchAdapterCatalog,
+                                    PaperResearchRunParameters)
 from rquant.paper_research_adapter import read_paper_research_input, write_paper_research_input
 from rquant.research_catalog import ResearchCatalog
 from rquant.research_gate import ResearchGateDecision, ResearchGateRequest
@@ -30,21 +31,30 @@ _CODE_FILES = ("paper_research.py", "paper_research_adapter.py", "paper_research
                "paper_research_submission.py", "paper_research_commands.py", "paper_research_artifact.py",
                "paper_backtest_source.py", "paper_portfolio_view_source.py", "paper_portfolio_exposure_source.py",
                "paper_portfolio_views.py", "paper_portfolio_state.py", "paper_portfolio_runtime.py")
+_NATIVE_EXTRA_CODE_FILES = ("strategy_promotion_contracts.py", "paper_research_runtime.py",
+    "strategy_live_service.py", "runtime_builder_strategy.py", "runtime_service_builtin.py", "strategy_runner.py", "runtime_paper_quote.py",
+    "paper_execution_constraints.py", "live_spool.py", "live_contracts.py", "minute_backtest_artifact.py",
+    "minute_backtest_formal.py", "minute_backtest_publication_contracts.py", "minute_backtest_contracts.py",
+    "strategy_promotion_evidence.py", "experiment_platform_evidence.py", "experiment_platform_projection.py",
+    "runtime_builder_paper.py", "minute_backtest_validation.py")
+_NATIVE_CODE_FILES = _CODE_FILES + _NATIVE_EXTRA_CODE_FILES
 
 
-def paper_research_code_identity() -> str:
+def paper_research_code_identity(*, native: bool = False) -> str:
     root = Path(__file__).resolve().parent
-    return canonical_sha256({name: hashlib.sha256((root/name).read_bytes()).hexdigest() for name in _CODE_FILES})
+    names = _NATIVE_CODE_FILES if native else _CODE_FILES
+    return canonical_sha256({name: hashlib.sha256((root/name).read_bytes()).hexdigest() for name in names})
 
 
 def verify_paper_snapshot_source(connection: duckdb.DuckDBPyConnection, *, task_name: str, code_sha: str,
                                  start_date: date, end_date: date, input_hash: str, as_of: datetime,
-                                 catalog: PaperResearchAdapterCatalog | None = None) -> FrozenPaperResearchInput:
+                                 catalog: PaperResearchCatalog | None = None) -> FrozenPaperResearchInput:
     if task_name not in PAPER_RESEARCH_TASKS:
         raise ValueError("paper source requires one of the two exact tasks")
     value = read_paper_research_input(connection, input_hash=input_hash)
     if (value.task_name, value.code_sha, value.dates, value.catalog.source_code_identity) != (
-            task_name, code_sha, (start_date, end_date), paper_research_code_identity()):
+            task_name, code_sha, (start_date, end_date),
+            paper_research_code_identity(native=isinstance(value.catalog, NativePaperResearchAdapterCatalog))):
         raise ValueError("paper complete source differs from its task, code or original dates")
     if value.available_at > as_of or (catalog is not None and value.catalog != catalog):
         raise ValueError("paper source is future or outside its exact metadata catalog")
@@ -108,7 +118,7 @@ def publish_paper_research_input(value: FrozenPaperResearchInput, *, metadata_st
                                        gate_decision=require_paper_gate(metadata_store, request, catalog=value.catalog))
 
 
-def require_paper_gate(store: DuckDBStore, request: ResearchGateRequest, *, catalog: PaperResearchAdapterCatalog) -> ResearchGateDecision:
+def require_paper_gate(store: DuckDBStore, request: ResearchGateRequest, *, catalog: PaperResearchCatalog) -> ResearchGateDecision:
     snapshot = store.get_dataset_snapshot(request.dataset_snapshot_id)
     audit = store.get_data_audit_run(request.audit_run_id)
     binding = store.get_dataset_snapshot_binding(request.dataset_snapshot_id)
@@ -149,7 +159,7 @@ def require_paper_gate(store: DuckDBStore, request: ResearchGateRequest, *, cata
 
 
 def verify_bound_paper_input(store: DuckDBStore, request: ResearchGateRequest, session: ResearchExecutionSession, *,
-                             catalog: PaperResearchAdapterCatalog) -> FrozenPaperResearchInput:
+                             catalog: PaperResearchCatalog) -> FrozenPaperResearchInput:
     snapshot = store.get_dataset_snapshot(request.dataset_snapshot_id)
     if snapshot is None or session.snapshot_id != snapshot.snapshot_id or session.binding_hash != request.dataset_binding_hash:
         raise PermissionError("paper bound execution source differs")
@@ -163,7 +173,7 @@ def verify_bound_paper_input(store: DuckDBStore, request: ResearchGateRequest, s
 
 @contextmanager
 def open_gated_paper_store(request: ResearchGateRequest, *, metadata_store_factory: Callable[[], AbstractContextManager[DuckDBStore]],
-                            lake_root: Path, catalog: PaperResearchAdapterCatalog) -> Iterator[ResearchExecutionSession]:
+                            lake_root: Path, catalog: PaperResearchCatalog) -> Iterator[ResearchExecutionSession]:
     with metadata_store_factory() as metadata:
         require_paper_gate(metadata, request, catalog=catalog)
         binding = metadata.get_dataset_snapshot_binding(request.dataset_snapshot_id)

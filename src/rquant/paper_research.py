@@ -10,8 +10,10 @@ from pydantic import Field, field_validator, model_validator
 
 from rquant.paper_portfolio_models import PaperPortfolioConfiguration, PaperPortfolioStateIdentity, Sha256
 from rquant.runtime_contracts import AwareUtcDatetime, RuntimeContractModel, canonical_sha256
-from rquant.paper_portfolio_band import PaperBacktestBandInput
+from rquant.paper_portfolio_band import PaperResearchBandInput, NativePaperBacktestBandInput
 from rquant.paper_reconcile import PaperReconcileInput
+from rquant.strategy_authoring_commands import StrategyAuthoringIdentity
+from rquant.strategy_promotion_contracts import NativeMinuteForwardConfiguration
 
 PAPER_RESEARCH_TASKS = frozenset({"paper_reconcile", "paper_backtest_band"})
 PAPER_RESEARCH_INPUT_TABLE = "paper_research_input"
@@ -28,6 +30,26 @@ class PaperResearchAdapterCatalog(RuntimeContractModel):
     @property
     def fingerprint(self) -> str:
         return canonical_sha256(self.model_dump(mode="python"))
+
+
+class NativePaperResearchAdapterCatalog(RuntimeContractModel):
+    contract: Literal["native-paper-research-catalog/v1"] = "native-paper-research-catalog/v1"
+    metadata_identity: StrategyAuthoringIdentity
+    configuration: NativeMinuteForwardConfiguration
+    source_code_identity: Sha256
+
+    @model_validator(mode="after")
+    def original_strategy_owner(self) -> Self:
+        if self.metadata_identity != self.configuration.metadata_identity:
+            raise ValueError("native catalog differs from its original strategy metadata owner")
+        return self
+
+    @property
+    def fingerprint(self) -> str:
+        return canonical_sha256(self.model_dump(mode="json"))
+
+
+PaperResearchCatalog = PaperResearchAdapterCatalog | NativePaperResearchAdapterCatalog
 
 
 class PaperResearchRunParameters(RuntimeContractModel):
@@ -51,7 +73,7 @@ class PaperResearchRunParameters(RuntimeContractModel):
             raise ValueError("paper research requires the original canonical request UUID")
         return value
 
-    def require_catalog(self, catalog: PaperResearchAdapterCatalog) -> None:
+    def require_catalog(self, catalog: PaperResearchCatalog) -> None:
         config, binding = catalog.configuration, catalog.configuration.binding
         if (self.owner_id, self.account_id, self.configuration_fingerprint, self.configuration_version,
                 self.strategy_id, self.strategy_version, self.parameter_fingerprint, self.cost_spec_id, self.source_code_identity) != (
@@ -74,11 +96,11 @@ class PaperResearchRunParameters(RuntimeContractModel):
 class FrozenPaperResearchInput(RuntimeContractModel):
     contract: Literal["frozen-paper-research/v1"] = "frozen-paper-research/v1"
     task_name: Literal["paper_reconcile", "paper_backtest_band"]
-    catalog: PaperResearchAdapterCatalog
+    catalog: PaperResearchCatalog
     code_sha: str = Field(pattern=r"^[0-9a-f]{40}$")
     available_at: AwareUtcDatetime
     reconcile: PaperReconcileInput | None = None
-    band: PaperBacktestBandInput | None = None
+    band: PaperResearchBandInput | None = None
 
     @model_validator(mode="after")
     def complete_exact_input(self) -> Self:
@@ -86,6 +108,8 @@ class FrozenPaperResearchInput(RuntimeContractModel):
                 or (self.task_name == "paper_backtest_band") != (self.band is not None)):
             raise ValueError("paper research requires one exact complete input")
         source = self.reconcile if self.reconcile is not None else self.band
+        if isinstance(self.catalog, NativePaperResearchAdapterCatalog) and not isinstance(self.band, NativePaperBacktestBandInput):
+            raise ValueError("native research requires its native band and original complete ledger reconciliation")
         if source.configuration != self.catalog.configuration or self.catalog.configuration.configured_at > self.available_at:
             raise ValueError("paper research input differs from its immutable configured source")
         if self.reconcile is not None and self.reconcile.as_of > self.available_at:
@@ -99,7 +123,7 @@ class FrozenPaperResearchInput(RuntimeContractModel):
 
     @property
     def fingerprint(self) -> str:
-        return canonical_sha256(self.model_dump(mode="python"))
+        return canonical_sha256(self.model_dump(mode="json" if isinstance(self.catalog, NativePaperResearchAdapterCatalog) else "python"))
 
     @property
     def dates(self) -> tuple[date, date]:

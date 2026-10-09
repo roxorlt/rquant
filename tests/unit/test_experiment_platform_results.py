@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import sqlite3
+from collections.abc import Iterator
+from contextlib import closing, contextmanager
 from datetime import timedelta
 from pathlib import Path
 from uuid import UUID
@@ -23,6 +26,7 @@ from rquant.lab_jobs import (
     ControlIntent,
     JobStatus,
     LabArtifactPreviewAuthority,
+    LabJobReader,
     LabJobRecord,
     LabResultState,
 )
@@ -39,7 +43,7 @@ def complete_family(tmp_path: Path):
         owner=record.owner, request_id=record.request_id, children=children
     )
     artifacts = LabJobArtifactStore(tmp_path / "artifacts")
-    authorities = {}
+    authorities: dict[UUID, LabArtifactPreviewAuthority] = {}
     for index, child in enumerate(children):
         prepared = store.preparation("alice", record.family_id, index).prepared
         store.admit_publication(child.intent, now=NOW)
@@ -94,11 +98,56 @@ def complete_family(tmp_path: Path):
             child.plan.spec.experiment_id, completed_at=NOW + timedelta(seconds=2)
         )
 
+    ledger_path = tmp_path / "sealed-ledger-fixture.sqlite3"
+    with closing(sqlite3.connect(ledger_path)) as connection:
+        connection.execute(
+            "CREATE TABLE lab_job (job_id TEXT PRIMARY KEY, authority_json TEXT NOT NULL)"
+        )
+        connection.executemany(
+            "INSERT INTO lab_job (job_id, authority_json) VALUES (?, ?)",
+            ((str(job_id), authority.model_dump_json()) for job_id, authority in authorities.items()),
+        )
+        connection.commit()
+
     class SealedLedgerFixture:
-        def get_job(self, job_id):
+        """Original synthetic authorities in SQLite, without a physical Lab graph."""
+
+        path = ledger_path
+        _storage_revision = LabJobReader._storage_revision
+
+        @contextmanager
+        def _read_snapshot(self, *, label: str) -> Iterator[sqlite3.Connection]:
+            with closing(
+                sqlite3.connect(f"{self.path.as_uri()}?mode=ro", uri=True, isolation_level=None)
+            ) as connection:
+                connection.row_factory = sqlite3.Row
+                connection.execute("PRAGMA query_only = ON")
+                connection.execute("BEGIN")
+                try:
+                    yield connection
+                finally:
+                    connection.rollback()
+
+        @staticmethod
+        def _job_from_row(row: sqlite3.Row) -> LabJobRecord:
+            return LabArtifactPreviewAuthority.model_validate_json(row["authority_json"]).job
+
+        def _validate_complete_result_graph(
+            self, connection: sqlite3.Connection, job: LabJobRecord
+        ) -> LabArtifactIndexEvidence:
+            row = connection.execute(
+                "SELECT authority_json FROM lab_job WHERE job_id = ?", (str(job.job_id),)
+            ).fetchone()
+            assert row is not None
+            authority = LabArtifactPreviewAuthority.model_validate_json(row["authority_json"])
+            if authority.job != job:
+                raise ValueError("synthetic sealed ledger job binding differs")
+            return authority.evidence
+
+        def get_job(self, job_id: UUID) -> LabJobRecord | None:
             return authorities.get(job_id).job if job_id in authorities else None
 
-        def get_artifact_preview_authority(self, job_id):
+        def get_artifact_preview_authority(self, job_id: UUID) -> LabArtifactPreviewAuthority | None:
             return authorities.get(job_id)
 
     ledger = SealedLedgerFixture()

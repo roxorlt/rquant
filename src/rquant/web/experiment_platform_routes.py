@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from typing import Annotated, TypeVar
+from uuid import UUID
 
 import anyio.to_thread
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
@@ -12,6 +13,7 @@ from pydantic import BaseModel
 
 from rquant.experiment_platform_commands import ExperimentCommand, ExperimentCommandResult
 from rquant.web.envelope import Envelope
+from rquant.web.collaboration_gateway import CollaborationGateway
 from rquant.web.experiment_platform_models import (
     ExperimentCapabilities,
     ExperimentComparisonData,
@@ -147,6 +149,44 @@ def result(
         lambda s, b, o: s.result(b, o, experiment_id, result_hash=result_hash),
         generation_id,
     )
+
+
+@router.get("/template-results/{job_id}/report.html", summary="下载策略封存报告")
+def template_report(
+    request: Request,
+    job_id: UUID,
+    owner: Annotated[str, Depends(require_current_user)],
+    result_hash: Annotated[str, Query(pattern=r"^[0-9a-f]{64}$")],
+) -> Response:
+    from rquant.sealed_result_html import render_strategy_html
+    from rquant.sealed_result_ownership import SealedArtifactFact
+
+    web = request.app.state.web
+    gateway = web.collaboration
+    service = _service(request)
+    if web.settings.collaboration_mode != "enforced" or type(gateway) is not CollaborationGateway or service.template_results is None:
+        raise HTTPException(503, "封存报告暂不可用。")
+    try:
+        sealed = service.template_results.read_owned(job_id, private_owner=owner,
+            expected_result_hash=result_hash, collaboration=gateway)
+        artifact = SealedArtifactFact(domain="strategy", job_id=str(job_id), spec_hash=sealed.spec_hash,
+            manifest_hash=sealed.manifest_hash, complete_result_hash=sealed.result_hash,
+            full_artifact_hash=sealed.result_hash, result_payload_hash=sealed.result.content_hash,
+            input_hash=sealed.result.input_hash, private_owner=sealed.result.owner_id, complete=True)
+        binding = gateway.bind_sealed_artifact(owner, artifact)
+        raw = render_strategy_html(sealed.result, binding=binding, current_artifact=artifact, requester=owner)
+        gateway.me(owner)
+    except (PermissionError, LookupError) as exc:
+        raise HTTPException(404, "找不到这份结果。") from exc
+    except ValueError as exc:
+        raise HTTPException(409, "报告资料待核对，请重新查看结果。") from exc
+    except Exception as exc:
+        raise HTTPException(503, "报告暂无法读取，请稍后重试。") from exc
+    return Response(raw, media_type="text/html; charset=utf-8", headers={
+        "Cache-Control": "no-store", "Content-Disposition": 'attachment; filename="strategy-report.html"',
+        "X-Content-Type-Options": "nosniff",
+        "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'",
+    })
 
 
 @router.get(

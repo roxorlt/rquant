@@ -2087,6 +2087,7 @@ class SignalBusStore:
         limit: int,
         include_price: bool,
         include_condition: bool = False,
+        include_builtin: bool = False,
     ) -> tuple[OutboxRecord, ...]:
         worker = worker_id.strip()
         claimed_at = _normalize_time(now)
@@ -2114,6 +2115,10 @@ class SignalBusStore:
                     now_text,
                 ),
             )
+            eligible = self._merge_claim_ids(
+                connection, now=claimed_at, limit=limit,
+                include_price=include_price, include_condition=include_condition, include_builtin=include_builtin,
+            )
             candidates = connection.execute(
                 (
                     "\n                SELECT *\n                FROM "
@@ -2125,8 +2130,10 @@ class SignalBusStore:
                     "WHERE json_extract(payload_json, '$.envelope_schema') = "
                     "'rquant.price-alert-event/v1'\n                  ))\n         "
                     "AND (? OR signal_id NOT IN (SELECT signal_id FROM signal_envelope "
-                    "WHERE json_extract(payload_json, '$.envelope_schema') = "
-                    "'rquant.condition-alert-event/v1')) "
+                    "WHERE json_extract(payload_json, '$.envelope_schema')='rquant.condition-alert-event/v1')) "
+                    "AND (? OR signal_id NOT IN (SELECT signal_id FROM signal_envelope "
+                    "WHERE json_extract(payload_json, '$.envelope_schema')='rquant.builtin-condition-alert-event/v1')) "
+                    "AND (? OR outbox_id IN (SELECT value FROM json_each(?))) "
                     "       ORDER BY COALESCE(next_attempt_at, created_at),\n     "
                     "                    global_sequence, created_at, outbox_id\n "
                     "               LIMIT ?\n                "
@@ -2138,6 +2145,9 @@ class SignalBusStore:
                     now_text,
                     include_price,
                     include_condition,
+                    include_builtin,
+                    eligible is None,
+                    json.dumps(eligible or ()),
                     limit,
                 ),
             ).fetchall()
@@ -2167,6 +2177,13 @@ class SignalBusStore:
                 self._before_commit(connection)
             rows = self._rows_for_outbox_ids(connection, claimed_ids)
             return tuple(self._outbox_from_row(row) for row in rows)
+
+    def _merge_claim_ids(
+        self, connection: sqlite3.Connection, *, now: datetime, limit: int,
+        include_price: bool, include_condition: bool, include_builtin: bool = False,
+    ) -> tuple[str, ...] | None:
+        del connection, now, limit, include_price, include_condition, include_builtin
+        return None
 
     def install_price_alert_route_v1(self, activation: PriceAlertRuntimeActivation) -> None:
         from rquant.price_alert_route import install_price_alert_route
@@ -2389,81 +2406,93 @@ class SignalBusStore:
         provider_receipt: str | None,
         error: str | None,
     ) -> OutboxRecord:
-        completed = _normalize_time(completed_at)
         with self._write_transaction() as connection:
-            row = connection.execute(
-                "SELECT * FROM delivery_outbox WHERE outbox_id = ?",
-                (outbox_id,),
-            ).fetchone()
-            if row is None:
-                raise KeyError(f"outbox {outbox_id!r} does not exist")
-            self._verify_lease(
-                row,
-                worker_id=worker_id,
-                attempt_no=attempt_no,
-                completed_at=completed,
+            return self._complete_in_transaction(
+                connection, outbox_id, worker_id=worker_id, attempt_no=attempt_no,
+                completed_at=completed_at, success=success,
+                provider_receipt=provider_receipt, error=error,
             )
-            started_at = _require_time(row["lease_started_at"])
-            connection.execute(
-                """
-                INSERT INTO delivery_attempt(
-                    outbox_id, attempt_no, started_at, completed_at,
-                    success, provider_receipt, error
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    outbox_id,
-                    attempt_no,
-                    _encode_time(started_at),
-                    _encode_time(completed),
-                    int(success),
-                    provider_receipt,
-                    error,
-                ),
-            )
-            if success:
-                status = OutboxStatus.SUCCEEDED
+
+    def _complete_in_transaction(
+        self, connection: sqlite3.Connection, outbox_id: str, *, worker_id: str,
+        attempt_no: int, completed_at: datetime, success: bool,
+        provider_receipt: str | None, error: str | None,
+    ) -> OutboxRecord:
+        completed = _normalize_time(completed_at)
+        row = connection.execute(
+            "SELECT * FROM delivery_outbox WHERE outbox_id = ?",
+            (outbox_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"outbox {outbox_id!r} does not exist")
+        self._verify_lease(
+            row,
+            worker_id=worker_id,
+            attempt_no=attempt_no,
+            completed_at=completed,
+        )
+        started_at = _require_time(row["lease_started_at"])
+        connection.execute(
+            """
+            INSERT INTO delivery_attempt(
+                outbox_id, attempt_no, started_at, completed_at,
+                success, provider_receipt, error
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                outbox_id,
+                attempt_no,
+                _encode_time(started_at),
+                _encode_time(completed),
+                int(success),
+                provider_receipt,
+                error,
+            ),
+        )
+        if success:
+            status = OutboxStatus.SUCCEEDED
+            next_attempt_at = None
+            last_error = None
+        else:
+            assert error is not None
+            expires_at = _require_time(row["expires_at"])
+            retry_at = completed + self._retry_delay(attempt_no)
+            if completed >= expires_at or retry_at >= expires_at:
+                status = OutboxStatus.EXPIRED
                 next_attempt_at = None
-                last_error = None
+                last_error = f"delivery window expired after failure: {error}"
+            elif attempt_no >= self.max_attempts:
+                status = OutboxStatus.DEAD_LETTER
+                next_attempt_at = None
+                last_error = error
             else:
-                assert error is not None
-                expires_at = _require_time(row["expires_at"])
-                retry_at = completed + self._retry_delay(attempt_no)
-                if completed >= expires_at or retry_at >= expires_at:
-                    status = OutboxStatus.EXPIRED
-                    next_attempt_at = None
-                    last_error = f"delivery window expired after failure: {error}"
-                elif attempt_no >= self.max_attempts:
-                    status = OutboxStatus.DEAD_LETTER
-                    next_attempt_at = None
-                    last_error = error
-                else:
-                    status = OutboxStatus.RETRY
-                    next_attempt_at = retry_at
-                    last_error = error
-            connection.execute(
-                """
-                UPDATE delivery_outbox
-                SET status = ?, next_attempt_at = ?, lease_owner = NULL,
-                    lease_started_at = NULL, lease_until = NULL,
-                    last_error = ?, updated_at = ?
-                WHERE outbox_id = ?
-                """,
-                (
-                    status.value,
-                    (_encode_time(next_attempt_at) if next_attempt_at is not None else None),
-                    last_error,
-                    _encode_time(completed),
-                    outbox_id,
-                ),
-            )
-            self._before_commit(connection)
-            updated = connection.execute(
-                "SELECT * FROM delivery_outbox WHERE outbox_id = ?",
-                (outbox_id,),
-            ).fetchone()
-            assert updated is not None
-            return self._outbox_from_row(updated)
+                status = OutboxStatus.RETRY
+                next_attempt_at = retry_at
+                last_error = error
+        connection.execute(
+            """
+            UPDATE delivery_outbox
+            SET status = ?, next_attempt_at = ?, lease_owner = NULL,
+                lease_started_at = NULL, lease_until = NULL,
+                last_error = ?, updated_at = ?
+            WHERE outbox_id = ?
+            """,
+            (
+                status.value,
+                (_encode_time(next_attempt_at) if next_attempt_at is not None else None),
+                last_error,
+                _encode_time(completed),
+                outbox_id,
+            ),
+        )
+        self._before_commit(connection)
+        updated = connection.execute(
+            "SELECT * FROM delivery_outbox WHERE outbox_id = ?",
+            (outbox_id,),
+        ).fetchone()
+        assert updated is not None
+        return self._outbox_from_row(updated)
+
 
     def _retry_delay(self, attempt_no: int) -> timedelta:
         multiplier = 1 << max(attempt_no - 1, 0)
@@ -2562,6 +2591,17 @@ class SignalBusStore:
     ) -> UnknownDeliveryEvidence:
         """Persist evidence when a provider outcome or its write-back is uncertain."""
 
+        with self._write_transaction() as connection:
+            return self._record_unknown_in_transaction(
+                connection, outbox_id, worker_id=worker_id, attempt_no=attempt_no,
+                observed_at=observed_at, reason=reason, provider_receipt=provider_receipt,
+            )
+
+    def _record_unknown_in_transaction(
+        self, connection: sqlite3.Connection, outbox_id: str, *, worker_id: str,
+        attempt_no: int, observed_at: datetime, reason: str,
+        provider_receipt: str | None,
+    ) -> UnknownDeliveryEvidence:
         reason = reason.strip()
         receipt = provider_receipt.strip() if provider_receipt is not None else None
         if not reason:
@@ -2577,64 +2617,64 @@ class SignalBusStore:
             reason=reason,
             provider_receipt=receipt,
         )
-        with self._write_transaction() as connection:
-            row = connection.execute(
-                "SELECT * FROM delivery_outbox WHERE outbox_id = ?",
-                (outbox_id,),
-            ).fetchone()
-            if row is None:
-                raise KeyError(f"outbox {outbox_id!r} does not exist")
-            if row["status"] != OutboxStatus.LEASED.value:
-                raise SignalBusLeaseError("outbox does not have an active lease")
-            if row["lease_owner"] != worker_id:
-                raise SignalBusLeaseError("lease owner does not match worker")
-            if row["attempt_count"] != attempt_no:
-                raise SignalBusLeaseError("attempt number does not match active lease")
-            started_at = _require_time(row["lease_started_at"])
-            if observed < started_at:
-                raise SignalBusLeaseError("unknown outcome precedes lease start")
-            existing = connection.execute(
-                """
-                SELECT * FROM delivery_unknown
-                WHERE outbox_id = ? AND attempt_no = ?
-                """,
-                (outbox_id, attempt_no),
-            ).fetchone()
-            if existing is not None:
-                restored = self._unknown_from_row(existing)
-                if restored != evidence:
-                    raise SignalBusLeaseError("unknown delivery evidence is immutable")
-                return restored
-            connection.execute(
-                """
-                INSERT INTO delivery_unknown(
-                    outbox_id, attempt_no, worker_id, observed_at,
-                    reason, provider_receipt
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    outbox_id,
-                    attempt_no,
-                    worker_id,
-                    _encode_time(observed),
-                    reason,
-                    receipt,
-                ),
-            )
-            connection.execute(
-                """
-                UPDATE delivery_outbox
-                SET last_error = ?, updated_at = ?
-                WHERE outbox_id = ?
-                """,
-                (
-                    f"delivery outcome unknown: {reason}",
-                    _encode_time(observed),
-                    outbox_id,
-                ),
-            )
-            self._before_commit(connection)
-            return evidence
+        row = connection.execute(
+            "SELECT * FROM delivery_outbox WHERE outbox_id = ?",
+            (outbox_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"outbox {outbox_id!r} does not exist")
+        if row["status"] != OutboxStatus.LEASED.value:
+            raise SignalBusLeaseError("outbox does not have an active lease")
+        if row["lease_owner"] != worker_id:
+            raise SignalBusLeaseError("lease owner does not match worker")
+        if row["attempt_count"] != attempt_no:
+            raise SignalBusLeaseError("attempt number does not match active lease")
+        started_at = _require_time(row["lease_started_at"])
+        if observed < started_at:
+            raise SignalBusLeaseError("unknown outcome precedes lease start")
+        existing = connection.execute(
+            """
+            SELECT * FROM delivery_unknown
+            WHERE outbox_id = ? AND attempt_no = ?
+            """,
+            (outbox_id, attempt_no),
+        ).fetchone()
+        if existing is not None:
+            restored = self._unknown_from_row(existing)
+            if restored != evidence:
+                raise SignalBusLeaseError("unknown delivery evidence is immutable")
+            return restored
+        connection.execute(
+            """
+            INSERT INTO delivery_unknown(
+                outbox_id, attempt_no, worker_id, observed_at,
+                reason, provider_receipt
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                outbox_id,
+                attempt_no,
+                worker_id,
+                _encode_time(observed),
+                reason,
+                receipt,
+            ),
+        )
+        connection.execute(
+            """
+            UPDATE delivery_outbox
+            SET last_error = ?, updated_at = ?
+            WHERE outbox_id = ?
+            """,
+            (
+                f"delivery outcome unknown: {reason}",
+                _encode_time(observed),
+                outbox_id,
+            ),
+        )
+        self._before_commit(connection)
+        return evidence
+
 
     def unknown_deliveries(
         self,

@@ -69,13 +69,14 @@ def diff_category(path: str) -> str:
     too: nothing in it is Python the declaration scan could read, and it reaches production
     only as static files. Anything else is unclassified on purpose: a new top-level entry
     must be categorized by a reviewer, not by a silent default.
+    The reviewed ``data/verification/`` archive is fixture data.
     """
 
     if path.startswith("src/"):
         if not path.startswith("src/rquant/"):
             raise ValueError(f"only src/rquant is a declared production surface: {path}")
         return "production"
-    if path.startswith("tests/fixtures/"):
+    if path.startswith(("tests/fixtures/", "data/verification/")):
         return "fixture"
     if path.startswith("tests/"):
         return "test"

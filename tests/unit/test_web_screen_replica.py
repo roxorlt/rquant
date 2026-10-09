@@ -100,25 +100,13 @@ def _client(root: Path, primary: Path, replica: Path) -> TestClient:
 
 
 def test_replica_nl_preview_stays_available_without_serving(tmp_path: Path) -> None:
-    class FakeParser:
-        def parse_new(self, instruction: str, trade_date: str) -> dict[str, object]:
-            assert instruction == "排除 ST"
-            assert trade_date == "2026-04-15"
-            return {
-                "trade_date": trade_date,
-                "stages": [{"label": "条件", "rules": [{"name": "not_st", "args": {}}]}],
-            }
+    from tests.support.ai_assistance_fixture import OfflineModelScenario, original_ai_test_app
+    scenario = OfflineModelScenario({"trade_date": "2026-04-15",
+        "stages": [{"label": "条件", "rules": [{"name": "not_st", "args": {}}]}]})
 
     primary, replica, _ = _replica_world(tmp_path)
-    app = create_app(
-        WebSettings(
-            serving_root=tmp_path / "absent",
-            screen_primary_path=primary,
-            screen_replica_path=replica,
-        ),
-        background=False,
-        nl_parser=FakeParser(),
-    )
+    app = original_ai_test_app(tmp_path / "absent", scenario,
+        clock=lambda: datetime.now(UTC), primary_path=primary, replica_path=replica)
     with TestClient(app) as client:
         catalog = client.get("/api/v1/screen/blocks").json()
         source = catalog["data"]["source"]
@@ -134,6 +122,7 @@ def test_replica_nl_preview_stays_available_without_serving(tmp_path: Path) -> N
                 "x-rquant-user": "researcher",
                 "x-rquant-csrf": "1",
                 "origin": "http://testserver",
+                "x-rquant-ai-request-id": "e28878d8-2d82-4c92-93ab-6c1e963f8530",
             },
         )
     assert catalog["serving"]["generation_id"] is None
@@ -145,6 +134,10 @@ def test_replica_nl_preview_stays_available_without_serving(tmp_path: Path) -> N
         "trade_date": "2026-04-15",
         "conditions": [{"key": "not_st", "args": {}}],
     }
+    assert scenario.calls == 1
+    request = json.loads(scenario.requests[0].content)
+    assert request["messages"][1]["content"] == "排除 ST"
+    assert "只使用当前目录的条件" in request["messages"][0]["content"]
 
 
 def _run(client: TestClient, *, conditions: list[dict] | None = None,

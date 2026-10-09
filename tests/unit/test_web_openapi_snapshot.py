@@ -28,11 +28,27 @@ def test_every_api_path_is_versioned_and_only_defined_mutations_use_post() -> No
         assert path.startswith("/api/v1/")
         assert set(operations) == (
             {"get", "post"}
-            if path == "/api/v1/backtests/portfolio/runs"
+            if path in {
+                "/api/v1/backtests/portfolio/runs",
+                "/api/v1/backtests/minute-runtime/runs",
+                "/api/v1/backtests/minute-runtime/studies",
+            }
             else {"post"}
             if path
             in {
+                "/api/v1/collaboration/roles/commands",
+                "/api/v1/collaboration/roles/lookup",
+                "/api/v1/collaboration/roles/prepare",
+                "/api/v1/strategy-promotions/commands",
+                "/api/v1/strategy-promotions/commands/lookup",
+                "/api/v1/strategy-promotions/commands/resume",
                 "/api/v1/screen/run",
+                "/api/v1/ai/backtests/confirm",
+                "/api/v1/ai/backtests/prepare",
+                "/api/v1/ai/backtests/prepare/lookup",
+                "/api/v1/ai/interpretations/read",
+                "/api/v1/ai/requests",
+                "/api/v1/ai/requests/lookup",
                 "/api/v1/screen/query/execute",
                 "/api/v1/screen/query/lookup",
                 "/api/v1/screen/query/resume",
@@ -49,6 +65,7 @@ def test_every_api_path_is_versioned_and_only_defined_mutations_use_post() -> No
                 "/api/v1/monitor/condition-rules/commands",
                 "/api/v1/monitor/condition-rules/commands/resume",
                 "/api/v1/backtests/portfolio/exports",
+                "/api/v1/backtests/minute-runtime/exports",
                 "/api/v1/watchlist/commands",
                 "/api/v1/data/backfill-plans/commands",
                 "/api/v1/data/audit-report/commands",
@@ -61,6 +78,9 @@ def test_every_api_path_is_versioned_and_only_defined_mutations_use_post() -> No
                 "/api/v1/tasks/scheduling/commands",
                 "/api/v1/tasks/units/{unit}/run",
                 "/api/v1/tasks/units/{unit}/run/prepare",
+                "/api/v1/tasks/notifications/mode/prepare",
+                "/api/v1/tasks/notifications/mode",
+                "/api/v1/tasks/monitor/builtins/commands",
                 "/api/v1/paper-portfolios/{account_id}/configuration",
                 "/api/v1/paper-portfolios/{account_id}/pause/prepare",
                 "/api/v1/paper-portfolios/{account_id}/pause/confirm",

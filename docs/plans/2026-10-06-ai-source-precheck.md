@@ -23,6 +23,7 @@
 4. 新闻第一页不代表完整历史或当天覆盖。页面显示实际更新时间和范围。
 5. 采集沿用原研究任务与数据发布路径，设定有限请求、页数和响应大小。不要在用户打开页面时全市场抓取。
 6. 研报元数据不能代替原文。第二次查询覆盖 2020-01-01 至 2026-09-30，只读取第一页 10 条；共 16 页，没有继续翻页。最新样本比 09-30 早 36 天。不能据此声明当天或完整历史覆盖。
+7. 已核对该样本的 [研报原文](https://pdf.dfcfw.com/pdf/H3_AP202608251828402313_1.pdf)：共 5 页，正文日期为 08-20，检索平台日期为 08-25。分别保存正文日期、平台日期和首次采集时间；不能倒填历史可见时间。原文中的实际值与预测值也须分开。
 
 以上按既定方案继续，无需用户新增采购决策。
 
@@ -34,5 +35,6 @@
 - `data/verification/ai-assistance-completion-20261006/eastmoney-source-root-01/`：两次成功请求、响应原件、SDK 前后摘要及进程收尾。
 - `data/verification/ai-assistance-completion-20261006/research-report-source-root-01/`：09 月零条响应。原记录的 `metadata_available` 仅表示接口返回 JSON，没有可验证的研报样本。
 - `data/verification/ai-assistance-completion-20261006/research-report-source-root-02/`：向前查询的 10 条元数据、响应原件及 SDK 前后摘要。未下载正文或调用模型。
+- `data/verification/ai-assistance-completion-20261006/research-report-document-root-01/`：原文页面核对记录。本次使用网页工具读取已缓存的 PDF 解析结果，尚未形成原采集器的 PDF 字节工件。
 
 本次证据只证明这六个实际请求的结果。完整来源采集、原文摘要、页面引用及正式安装继续列为未完成。

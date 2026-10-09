@@ -12,6 +12,7 @@ import subprocess
 import time
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
+from decimal import Decimal, localcontext
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Literal
@@ -19,8 +20,10 @@ from typing import TYPE_CHECKING, Literal
 from pydantic import (
     Field,
     StrictBool,
+    StrictFloat,
     StrictInt,
     StrictStr,
+    field_validator,
     model_validator,
 )
 
@@ -29,8 +32,8 @@ from rquant.runtime_contracts import AwareUtcDatetime, RuntimeContractModel, can
 from rquant.strict_json import canonical_json_bytes, strict_canonical_json_loads
 
 if TYPE_CHECKING:
-    from rquant.task_center_runtime import TaskUnitRunSource
     from rquant.task_center_projection import TaskOpsSample
+    from rquant.task_center_runtime import TaskUnitRunSource
     from rquant.task_cpu import LinuxTaskCpuReader, TaskCpuObservation
 
 STATIC_TIMER_STEMS = (
@@ -87,6 +90,9 @@ _PROPERTIES: Mapping[str, tuple[str, ...]] = MappingProxyType(
 )
 _BOOT_PATH = "/proc/sys/kernel/random/boot_id"
 _MEMINFO_PATH = "/proc/meminfo"
+_STAT_PATH = "/proc/stat"
+_MAX_CPU_STAT_BYTES = 32 * 1024
+_MAX_CPU_PAIR_BYTES = 4 * 1024
 _MAX_UNIT_COUNT = 32
 _MAX_COMMAND_BYTES = 4_096
 _MAX_MANIFEST_BYTES = 64 * 1024
@@ -198,7 +204,10 @@ def load_signed_ops_manifest(
         payload = os.read(descriptor, _MAX_MANIFEST_BYTES + 1)
         after = os.fstat(descriptor)
         if len(payload) > _MAX_MANIFEST_BYTES or (
-            before.st_dev, before.st_ino, before.st_mtime_ns, before.st_size
+            before.st_dev,
+            before.st_ino,
+            before.st_mtime_ns,
+            before.st_size,
         ) != (after.st_dev, after.st_ino, after.st_mtime_ns, after.st_size):
             raise ValueError("ops install manifest changed during read or exceeds byte budget")
     finally:
@@ -249,7 +258,7 @@ def _run_bounded(argv: tuple[str, ...], timeout_seconds: float, max_bytes: int) 
 
 
 def _bounded_proc_read(path: str, max_bytes: int) -> bytes:
-    if path not in (_BOOT_PATH, _MEMINFO_PATH):
+    if path not in (_BOOT_PATH, _MEMINFO_PATH, _STAT_PATH):
         raise ValueError("proc path is outside the ops allowlist")
     with open(path, "rb") as source:
         payload = source.read(max_bytes + 1)
@@ -280,9 +289,11 @@ def _timestamp(value: str | None) -> datetime | None:
     if match is None:
         return None
     try:
-        return datetime.fromisoformat(f"{match['date']}T{match['clock']}").replace(
-            tzinfo=UTC
-        ).astimezone(UTC)
+        return (
+            datetime.fromisoformat(f"{match['date']}T{match['clock']}")
+            .replace(tzinfo=UTC)
+            .astimezone(UTC)
+        )
     except ValueError:
         return None
 
@@ -347,6 +358,179 @@ class OpsResourceEvidence(RuntimeContractModel):
     memory_peak_bytes: StrictInt | None = Field(default=None, ge=0)
 
 
+class OpsHostCpuCounters(RuntimeContractModel):
+    user: StrictInt = Field(ge=0, le=2**64 - 1)
+    nice: StrictInt = Field(ge=0, le=2**64 - 1)
+    system: StrictInt = Field(ge=0, le=2**64 - 1)
+    idle: StrictInt = Field(ge=0, le=2**64 - 1)
+    iowait: StrictInt = Field(ge=0, le=2**64 - 1)
+    irq: StrictInt = Field(ge=0, le=2**64 - 1)
+    softirq: StrictInt = Field(ge=0, le=2**64 - 1)
+    steal: StrictInt = Field(ge=0, le=2**64 - 1)
+    guest: StrictInt | None = Field(default=None, ge=0, le=2**64 - 1)
+    guest_nice: StrictInt | None = Field(default=None, ge=0, le=2**64 - 1)
+
+    @model_validator(mode="after")
+    def validate_guest(self) -> OpsHostCpuCounters:
+        if self.guest is not None and self.guest > self.user:
+            raise ValueError("host CPU guest time exceeds its included user time")
+        if self.guest_nice is not None and (self.guest is None or self.guest_nice > self.nice):
+            raise ValueError("host CPU guest nice time exceeds its included nice time")
+        return self
+
+
+_CPU_COUNTER_FIELDS = ("user", "nice", "system", "idle", "iowait", "irq", "softirq", "steal")
+
+
+def _host_cpu_counters(payload: bytes) -> OpsHostCpuCounters:
+    if len(payload) > _MAX_CPU_STAT_BYTES:
+        raise ValueError("host CPU proc stat exceeds byte budget")
+    rows = [
+        line.split() for line in payload.decode("ascii").splitlines() if line.split()[:1] == ["cpu"]
+    ]
+    if len(rows) != 1 or not 9 <= len(rows[0]) <= 11:
+        raise ValueError("host CPU requires one exact aggregate counter row")
+    values = rows[0][1:]
+    if any(not re.fullmatch(r"[0-9]{1,20}", value) for value in values):
+        raise ValueError("host CPU counters must be bounded unsigned integers")
+    names = (*_CPU_COUNTER_FIELDS, "guest", "guest_nice")
+    return OpsHostCpuCounters.model_validate(
+        dict(zip(names[: len(values)], map(int, values), strict=True))
+    )
+
+
+class OpsHostCpuObservation(RuntimeContractModel):
+    host_name: StrictStr = Field(min_length=1, max_length=253)
+    boot_id: StrictStr = Field(
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    )
+    manifest_digest: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+    parser_contract: Literal["linux-proc-stat-aggregate/v1"] = "linux-proc-stat-aggregate/v1"
+    observed_at: AwareUtcDatetime
+    monotonic_seconds: StrictFloat = Field(ge=0, allow_inf_nan=False)
+    counters: OpsHostCpuCounters
+
+
+def _host_cpu_pair_result(
+    previous: OpsHostCpuObservation | None,
+    current: OpsHostCpuObservation | None,
+) -> tuple[str, int | None, int | None, Decimal | None]:
+    if previous is None or current is None:
+        return "incomplete_pair", None, None, None
+    if (
+        previous.host_name,
+        previous.boot_id,
+        previous.manifest_digest,
+        previous.parser_contract,
+    ) != (current.host_name, current.boot_id, current.manifest_digest, current.parser_contract):
+        return "identity_mismatch", None, None, None
+    wall = (current.observed_at - previous.observed_at).total_seconds()
+    monotonic = current.monotonic_seconds - previous.monotonic_seconds
+    if not (0 < wall <= _TOTAL_SECONDS and 0 < monotonic <= _TOTAL_SECONDS):
+        return "invalid_window", None, None, None
+    for field in ("guest", "guest_nice"):
+        old, new = getattr(previous.counters, field), getattr(current.counters, field)
+        if (old is None) != (new is None):
+            return "counter_contract_changed", None, None, None
+        if old is not None and new < old:
+            return "counter_regression", None, None, None
+    deltas = {
+        field: getattr(current.counters, field) - getattr(previous.counters, field)
+        for field in _CPU_COUNTER_FIELDS
+    }
+    if any(value < 0 for value in deltas.values()):
+        # iowait may regress in the kernel; its lost window remains unknown.
+        return "counter_regression", None, None, None
+    total = sum(deltas.values())
+    if total == 0:
+        return "no_counter_delta", None, None, None
+    busy = total - deltas["idle"] - deltas["iowait"]
+    # user/nice already contain guest; steal is declared non-idle host time.
+    with localcontext() as context:
+        context.prec = 28
+        fraction = Decimal(busy) / Decimal(total)
+    return "available", total, busy, fraction
+
+
+class OpsHostCpuEvidence(RuntimeContractModel):
+    previous: OpsHostCpuObservation | None = None
+    current: OpsHostCpuObservation | None = None
+    availability: Literal["available", "unavailable"]
+    reason_code: Literal[
+        "available",
+        "capture_unavailable",
+        "incomplete_pair",
+        "invalid_window",
+        "identity_mismatch",
+        "counter_regression",
+        "counter_contract_changed",
+        "no_counter_delta",
+    ]
+    total_delta: StrictInt | None = Field(default=None, gt=0)
+    busy_delta: StrictInt | None = Field(default=None, ge=0)
+    busy_fraction: Decimal | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
+
+    @field_validator("busy_fraction", mode="before")
+    @classmethod
+    def reject_bool(cls, value: object) -> object:
+        if isinstance(value, bool):
+            raise ValueError("host CPU fraction cannot be bool")
+        return value
+
+    @model_validator(mode="after")
+    def validate_pair(self) -> OpsHostCpuEvidence:
+        raw_pair = {
+            "previous": None if self.previous is None else self.previous.model_dump(mode="json"),
+            "current": None if self.current is None else self.current.model_dump(mode="json"),
+        }
+        if len(canonical_json_bytes(raw_pair)) > _MAX_CPU_PAIR_BYTES:
+            raise ValueError("host CPU raw pair exceeds original 4 KiB budget")
+        reason, total, busy, fraction = _host_cpu_pair_result(self.previous, self.current)
+        if reason == "available":
+            if (
+                self.availability,
+                self.reason_code,
+                self.total_delta,
+                self.busy_delta,
+                self.busy_fraction,
+            ) != ("available", reason, total, busy, fraction):
+                raise ValueError("host CPU result does not match its original raw pair")
+        elif (
+            self.availability != "unavailable"
+            or any(
+                value is not None
+                for value in (self.total_delta, self.busy_delta, self.busy_fraction)
+            )
+            or (
+                self.reason_code != reason
+                and not (reason == "incomplete_pair" and self.reason_code == "capture_unavailable")
+            )
+        ):
+            raise ValueError("unavailable host CPU pair cannot carry a value or a different reason")
+        return self
+
+    @classmethod
+    def from_samples(
+        cls,
+        previous: OpsHostCpuObservation | None,
+        current: OpsHostCpuObservation | None,
+        *,
+        capture_failed: bool = False,
+    ) -> OpsHostCpuEvidence:
+        reason, total, busy, fraction = _host_cpu_pair_result(previous, current)
+        if capture_failed and reason == "incomplete_pair":
+            reason = "capture_unavailable"
+        return cls(
+            previous=previous,
+            current=current,
+            availability="available" if reason == "available" else "unavailable",
+            reason_code=reason,
+            total_delta=total,
+            busy_delta=busy,
+            busy_fraction=fraction,
+        )
+
+
 class OpsSnapshot(RuntimeContractModel):
     sampled_at: AwareUtcDatetime
     host_name: StrictStr
@@ -356,6 +540,9 @@ class OpsSnapshot(RuntimeContractModel):
     host_memory_available_bytes: StrictInt | None = Field(default=None, ge=0)
     units: tuple[OpsUnitEvidence, ...] = Field(max_length=_MAX_UNIT_COUNT)
     resources: tuple[OpsResourceEvidence, ...] = Field(max_length=len(_SLICES))
+    host_cpu: OpsHostCpuEvidence | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
     @model_validator(mode="after")
     def validate_set(self) -> OpsSnapshot:
@@ -372,6 +559,14 @@ class OpsSnapshot(RuntimeContractModel):
                 raise ValueError("ops snapshot unit is outside the allowlist or mismatched")
         if tuple(item.slice_name for item in self.resources) != _SLICES:
             raise ValueError("ops snapshot requires fixed resource slices")
+        if self.host_cpu is not None:
+            for sample in (self.host_cpu.previous, self.host_cpu.current):
+                if sample is not None and (
+                    (sample.host_name, sample.boot_id, sample.manifest_digest)
+                    != (self.host_name, self.boot_id, self.manifest_digest)
+                    or sample.observed_at > self.sampled_at
+                ):
+                    raise ValueError("host CPU observation is detached from its Ops snapshot")
         return self
 
 
@@ -388,20 +583,28 @@ class OpsStatusCollector:
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         monotonic: Callable[[], float] = time.monotonic,
         host_name: Callable[[], str] = socket.gethostname,
+        observe_host_cpu: bool = False,
     ) -> None:
+        if type(observe_host_cpu) is not bool:
+            raise TypeError("host CPU opt-in must be an explicit boolean")
         self.command_runner = command_runner
         self.proc_reader = proc_reader
         self.clock = clock
         self.monotonic = monotonic
         self.host_name = host_name
+        self.observe_host_cpu = observe_host_cpu
 
     def collect_tasks(
-        self, manifest: OpsInstallManifest, *, previous: TaskCpuObservation | None,
-        cpu_reader: LinuxTaskCpuReader, run_source: TaskUnitRunSource | None = None,
+        self,
+        manifest: OpsInstallManifest,
+        *,
+        previous: TaskCpuObservation | None,
+        cpu_reader: LinuxTaskCpuReader,
+        run_source: TaskUnitRunSource | None = None,
     ) -> TaskOpsSample:
         from rquant.task_center_projection import TaskOpsEvidence, TaskOpsSample
-        from rquant.task_cpu import LinuxTaskCpuReader, TaskCpuPair, compute_task_cpu
         from rquant.task_center_runtime import TaskUnitRunSource
+        from rquant.task_cpu import LinuxTaskCpuReader, TaskCpuPair, compute_task_cpu
 
         if type(cpu_reader) is not LinuxTaskCpuReader:
             raise TypeError("task CPU collection requires the exact fixed kernel reader")
@@ -412,30 +615,49 @@ class OpsStatusCollector:
         runs = ()
         if run_source is not None:
             try:
-                runs = run_source.read(host_name=snapshot.host_name, boot_id=snapshot.boot_id, manifest_digest=snapshot.manifest_digest,
-                    units=tuple(unit.service for unit in snapshot.units), cutoff=self.clock())
+                runs = run_source.read(
+                    host_name=snapshot.host_name,
+                    boot_id=snapshot.boot_id,
+                    manifest_digest=snapshot.manifest_digest,
+                    units=tuple(unit.service for unit in snapshot.units),
+                    cutoff=self.clock(),
+                )
             except (OSError, ValueError, TimeoutError):
                 runs = ()
         try:
-            properties = {
-                name: self._show_task_cpu(name, start=started)
-                for name in _SLICES
-            }
+            properties = {name: self._show_task_cpu(name, start=started) for name in _SLICES}
             remaining = _TOTAL_SECONDS - (self.monotonic() - started)
-            current = cpu_reader.capture(host_name=snapshot.host_name, boot_id=snapshot.boot_id, manifest_digest=snapshot.manifest_digest, properties=properties, max_seconds=remaining, clock=self.clock)
+            current = cpu_reader.capture(
+                host_name=snapshot.host_name,
+                boot_id=snapshot.boot_id,
+                manifest_digest=snapshot.manifest_digest,
+                properties=properties,
+                max_seconds=remaining,
+                clock=self.clock,
+            )
             if self.monotonic() - started >= _TOTAL_SECONDS:
                 raise TimeoutError("task CPU exceeded original collection deadline")
-            if self.host_name() != snapshot.host_name or self.proc_reader(_BOOT_PATH, 128).decode("ascii").strip() != snapshot.boot_id:
+            if (
+                self.host_name() != snapshot.host_name
+                or self.proc_reader(_BOOT_PATH, 128).decode("ascii").strip() != snapshot.boot_id
+            ):
                 raise ValueError("ops host or boot changed during task collection")
             at = self.clock()
-            snapshot = OpsSnapshot.model_validate(snapshot.model_dump(mode="python") | {"sampled_at": at})
+            snapshot = OpsSnapshot.model_validate(
+                snapshot.model_dump(mode="python") | {"sampled_at": at}
+            )
             pair = TaskCpuPair(previous=previous, current=current)
             cpu = compute_task_cpu(pair, cutoff=at)
             return TaskOpsSample(snapshot=snapshot, evidence=TaskOpsEvidence(cpu=cpu, runs=runs))
         except (OSError, ValueError, TimeoutError, AttributeError) as exc:
             reason = "budget_exceeded" if isinstance(exc, TimeoutError) else "capture_unavailable"
-            snapshot = OpsSnapshot.model_validate(snapshot.model_dump() | {"sampled_at": self.clock()})
-            return TaskOpsSample(snapshot=snapshot, evidence=TaskOpsEvidence(cpu=None, cpu_unavailable_reason=reason, runs=runs))
+            snapshot = OpsSnapshot.model_validate(
+                snapshot.model_dump() | {"sampled_at": self.clock()}
+            )
+            return TaskOpsSample(
+                snapshot=snapshot,
+                evidence=TaskOpsEvidence(cpu=None, cpu_unavailable_reason=reason, runs=runs),
+            )
 
     def _show_task_cpu(self, unit: str, *, start: float) -> Mapping[str, str]:
         if unit not in _SLICES:
@@ -445,7 +667,9 @@ class OpsStatusCollector:
             raise TimeoutError("ops collection exceeded total time budget")
         allowed = ("LoadState", "ControlGroup", "InvocationID")
         argv = ("/usr/bin/systemctl", "show", unit, "--no-pager", "--property=" + ",".join(allowed))
-        payload = self.command_runner(argv, min(_PER_COMMAND_SECONDS, remaining), _MAX_COMMAND_BYTES)
+        payload = self.command_runner(
+            argv, min(_PER_COMMAND_SECONDS, remaining), _MAX_COMMAND_BYTES
+        )
         if len(payload) > _MAX_COMMAND_BYTES:
             raise ValueError("CPU systemctl show exceeded byte budget")
         result: dict[str, str] = {}
@@ -466,6 +690,13 @@ class OpsStatusCollector:
         first_boot = self.proc_reader(_BOOT_PATH, 128).decode("ascii").strip()
         if not re.fullmatch(r"[0-9a-f-]{36}", first_boot):
             raise ValueError("ops boot identity is invalid")
+        previous = current = None
+        capture_failed = False
+        if self.observe_host_cpu:
+            try:
+                previous = self._capture_host_cpu(manifest, first_boot, start=start)
+            except (OSError, ValueError, TimeoutError):
+                capture_failed = True
         meminfo = self.proc_reader(_MEMINFO_PATH, 128 * 1024)
         if len(meminfo) > 128 * 1024:
             raise ValueError("proc read exceeded byte budget")
@@ -505,6 +736,13 @@ class OpsStatusCollector:
             )
             for slice_name in _SLICES
         )
+        if self.observe_host_cpu:
+            try:
+                current = self._capture_host_cpu(manifest, first_boot, start=start)
+            except (OSError, ValueError, TimeoutError):
+                capture_failed = True
+            if self.host_name() != manifest.host_name:
+                raise ValueError("ops host identity changed during collection")
         last_boot = self.proc_reader(_BOOT_PATH, 128).decode("ascii").strip()
         if first_boot != last_boot:
             raise ValueError("ops boot identity changed during collection")
@@ -519,6 +757,33 @@ class OpsStatusCollector:
             host_memory_available_bytes=available,
             units=tuple(units),
             resources=resources,
+            host_cpu=OpsHostCpuEvidence.from_samples(
+                previous, current, capture_failed=capture_failed
+            )
+            if self.observe_host_cpu
+            else None,
+        )
+
+    def _capture_host_cpu(
+        self,
+        manifest: OpsInstallManifest,
+        boot_id: str,
+        *,
+        start: float,
+    ) -> OpsHostCpuObservation:
+        if self.monotonic() - start >= _TOTAL_SECONDS:
+            raise TimeoutError("host CPU exceeded original collection deadline")
+        counters = _host_cpu_counters(self.proc_reader(_STAT_PATH, _MAX_CPU_STAT_BYTES))
+        monotonic = self.monotonic()
+        if monotonic - start > _TOTAL_SECONDS:
+            raise TimeoutError("host CPU exceeded original collection deadline")
+        return OpsHostCpuObservation(
+            host_name=self.host_name(),
+            boot_id=boot_id,
+            manifest_digest=manifest.digest,
+            observed_at=self.clock(),
+            monotonic_seconds=monotonic,
+            counters=counters,
         )
 
     def _show(
@@ -552,6 +817,9 @@ class OpsStatusCollector:
 __all__ = [
     "STATIC_TIMER_STEMS",
     "OpsInstallManifest",
+    "OpsHostCpuCounters",
+    "OpsHostCpuObservation",
+    "OpsHostCpuEvidence",
     "OpsResourceEvidence",
     "OpsSnapshot",
     "OpsStatusCollector",

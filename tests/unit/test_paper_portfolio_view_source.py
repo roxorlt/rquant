@@ -1,8 +1,11 @@
 """The role publishes complete original history even when marks are unavailable."""
 
-from datetime import timedelta
+from __future__ import annotations
+
+from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -10,6 +13,13 @@ from rquant.paper_portfolio_source import PaperPortfolioMarketSnapshot, PaperPor
 from rquant.paper_signal_worker import PaperSignalQueueStore
 from tests.unit.test_paper_portfolio_ledger_views import close_material, filled
 from tests.unit.test_paper_signal_worker import EXECUTION_TIME, _policy
+
+if TYPE_CHECKING:
+    from uuid import UUID
+
+    from rquant.paper_portfolio_projection import PaperPortfolioPublishedAccount
+    from rquant.paper_portfolio_view_source import PaperPortfolioViewSource
+    from rquant.paper_research_artifact import PaperResearchSummary
 
 
 def market(runtime, *, at=EXECUTION_TIME, price="2", status="normal"):
@@ -87,3 +97,84 @@ def test_missing_close_is_published_as_gap_with_actual_order_history(tmp_path: P
     assert len(value.nav) == 1 and value.nav[0].status == "unavailable"
     assert value.nav[0].nav is None and value.nav[0].daily_return is None
     assert value.calendar == close.calendar
+
+
+def comparison_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, lower: str, upper: str
+) -> tuple[PaperPortfolioViewSource, PaperPortfolioPublishedAccount, datetime]:
+    """Original closed ledger with an explicit typed sealed-summary transport fixture."""
+    from rquant.lab_artifact_preview import ArtifactPreviewReader
+    from rquant.lab_job_center import LabCommandSubmissionFacade
+    from rquant.lab_job_protocol import LabCommandSpool
+    from rquant.lab_jobs import LabJobReader, LabJobStore
+    from rquant.paper_research_artifact import PaperResearchResultReader
+    from rquant.paper_research_submission import PaperResearchRunBackend, PaperResearchRunPreparer
+    from rquant.research_catalog import ResearchCatalog
+    from rquant.storage.duckdb import DuckDBStore
+    from tests.unit.test_runtime_health_owner_metrics import _closed_comparison
+
+    source, account, at = _closed_comparison(tmp_path, lower=lower, upper=upper)
+    jobs = LabJobStore(tmp_path / "comparison-jobs.sqlite")
+    jobs.initialize()
+    reader = LabJobReader(jobs.path)
+    facade = LabCommandSubmissionFacade(
+        reader=reader, spool=LabCommandSpool(tmp_path / "comparison-spool"), clock=lambda: at
+    )
+    inputs = tmp_path / "comparison-inputs"
+    inputs.mkdir(mode=0o700)
+    preparer = PaperResearchRunPreparer(
+        sources=(source,),
+        metadata_store_factory=lambda: DuckDBStore(tmp_path / "comparison-metadata.duckdb"),
+        research_catalog=ResearchCatalog(tmp_path / "comparison-catalog.duckdb"),
+        input_root=inputs,
+        lake_root=tmp_path / "comparison-lake",
+        code_sha="a" * 40,
+        clock=lambda: at,
+    )
+    backend = PaperResearchRunBackend(preparer=preparer, facade=facade)
+    summary = account.recent_research[0]
+    backend._table(source.runtime.state)
+    with source.runtime.state._connection(write=True) as connection:
+        connection.execute(
+            "INSERT INTO paper_research_admissions VALUES(?,?,?,?,NULL)",
+            (str(summary.job_id), "alice", "{}", '{"accepted_at":"' + at.isoformat() + '"}'),
+        )
+    result_reader = PaperResearchResultReader(
+        backend=backend,
+        reader=reader,
+        artifact_reader=ArtifactPreviewReader(reader=reader, artifact_root=tmp_path / "artifacts"),
+    )
+
+    def original_summary(
+        *, account_id: str, job_id: UUID, owner_id: str, as_of: datetime
+    ) -> PaperResearchSummary:
+        assert (account_id, job_id, owner_id, as_of) == (
+            summary.account_id, summary.job_id, account.configuration.binding.owner_id, at
+        )
+        return summary
+
+    monkeypatch.setattr(result_reader, "summary", original_summary)
+    source.research_results = result_reader
+    return source, account, at
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize(
+    "lower,upper,expected",
+    [("1", "2", "inside"), ("2", "3", "outside"), ("1.795", "1.795", "inside")],
+)
+def test_original_band_position_is_published_with_health_on_or_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, enabled: bool,
+    lower: str, upper: str, expected: str
+) -> None:
+    import sqlite3
+    from contextlib import closing
+
+    source, original, at = comparison_source(tmp_path, monkeypatch, lower=lower, upper=upper)
+    source.health_metrics_enabled = enabled
+    with closing(sqlite3.connect(source.broker.path)) as pinned:
+        pinned.execute("SELECT count(*) FROM paper_order").fetchone()
+        value = source.read(as_of=at)
+    assert value.band == original.band and value.nav == original.nav
+    assert value.complete_comparison_dates() == value.band.dates
+    assert value.band_position == expected

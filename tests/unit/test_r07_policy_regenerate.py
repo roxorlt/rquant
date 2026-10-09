@@ -34,6 +34,7 @@ def _head() -> str:
     (
         ("src/rquant/signal_bus.py", "production"),
         ("tests/fixtures/r07_differential_gate/policy-v1.json", "fixture"),
+        ("data/verification/goal-progress-root/result.json", "fixture"),
         ("tests/unit/test_signal_bus.py", "test"),
         ("deploy/systemd/rquant-monitor.service", "architecture"),
         ("scripts/r07_ci_evidence.py", "architecture"),
@@ -76,6 +77,13 @@ def test_unknown_top_level_paths_require_review_instead_of_a_silent_category() -
         regenerate.diff_category("webapp/index.html")
     with pytest.raises(ValueError, match="unclassified"):
         regenerate.diff_category("web")
+    for path in (
+        "data/other/result.json",
+        "data/verification-sibling/result.json",
+        "data/verification",
+    ):
+        with pytest.raises(ValueError, match="unclassified"):
+            regenerate.diff_category(path)
 
 
 def test_check_mode_passes_on_the_checked_in_policy() -> None:

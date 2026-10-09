@@ -23,6 +23,7 @@ from rquant.runtime_serving_snapshot import (
 )
 from rquant.serving_contracts import FreshnessStatus
 from rquant.serving_read_models import ServingProjectionPayload
+from rquant.strategy_promotion_projection import StrategyPromotionProjectionReader, validate_strategy_promotion_projections
 
 _EMPTY_EVENT_TIME = datetime(1970, 1, 1, tzinfo=UTC)
 
@@ -57,6 +58,7 @@ class PromotionsSourceReader:
         include_experiments: bool = False,
         private_experiment_reader: Callable[[datetime], tuple[ServingProjectionPayload, ...]]
         | None = None,
+        strategy_promotion_reader: StrategyPromotionProjectionReader | None = None,
     ) -> None:
         if not callable(getattr(registry, "read_promotion_decisions", None)):
             raise TypeError("registry must provide promotion decision reads")
@@ -70,6 +72,9 @@ class PromotionsSourceReader:
         self.limit = limit
         self.include_experiments = include_experiments
         self.private_experiment_reader = private_experiment_reader
+        if strategy_promotion_reader is not None and type(strategy_promotion_reader) is not StrategyPromotionProjectionReader:
+            raise TypeError("manual promotions require their original concrete metadata reader")
+        self.strategy_promotion_reader = strategy_promotion_reader
 
     def __call__(self, observed_at: datetime, /) -> SourceReadResult:
         observed = normalize_aware_utc(observed_at)
@@ -160,6 +165,13 @@ class PromotionsSourceReader:
             projections = (*projections, *private)
             if private:
                 source_time = observed
+        if self.strategy_promotion_reader is not None:
+            manual = self.strategy_promotion_reader(observed)
+            if manual != self.strategy_promotion_reader(observed):
+                raise ValueError("manual promotion source changed while publishing")
+            validate_strategy_promotion_projections({p.table_name: p for p in manual})
+            projections = (*projections, *manual)
+            source_time = observed
         values: dict[str, object] = {
             "dataset_id": PROMOTIONS_DATASET_ID,
             "sequence": sequence,

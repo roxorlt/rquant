@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from datetime import UTC, datetime, timedelta
@@ -22,6 +22,15 @@ from rquant.delivery_contracts import (
     DeliveryTarget,
     OutboxRecord,
     OutboxStatus,
+    NotificationMergeBinding,
+    NotificationMergeGroup,
+    NotificationChannelStatistics,
+    NotificationRuntimeWindow,
+    NotificationRuntimeChannelState,
+    NotificationRuntimeAttemptView,
+    NotificationRuntimeGroupView,
+    PhysicalPostBinding,
+    PhysicalPostObservation,
     RouterDisposition,
 )
 from rquant.price_alert_route import PriceAlertBusRoutedRecord
@@ -537,16 +546,632 @@ class NotificationStateStore(SignalBusStore):
         path: Path | str,
         *,
         source_id: str = "signal-route-spool/v1",
+        merge_binding: NotificationMergeBinding | None = None,
         **kwargs: object,
     ) -> None:
         normalized = source_id.strip()
         if not normalized:
             raise ValueError("notification source_id must not be empty")
         self.replication_source_id = normalized
+        if merge_binding is not None and (
+            type(merge_binding) is not NotificationMergeBinding
+            or merge_binding.source_id != normalized
+        ):
+            raise ValueError("merge binding must match the original notification source")
+        self.merge_binding = merge_binding
+        self.merge_binding_guard: Callable[[], bool] | None = None
+        self.runtime_available_targets: tuple[DeliveryTarget, ...] | None = None
+        self.runtime_capability_observed_at: datetime | None = None
         super().__init__(path, **kwargs)
+
+    def _merge_claim_ids(
+        self, connection: sqlite3.Connection, *, now: datetime, limit: int,
+        include_price: bool, include_condition: bool, include_builtin: bool = False,
+    ) -> tuple[str, ...] | None:
+        binding = self.merge_binding
+        if binding is None:
+            return None
+        if limit > 100:
+            raise ValueError("merged notification claim exceeds one hundred members")
+        current = normalize_aware_utc(now)
+        first = connection.execute("SELECT metadata_value FROM signal_bus_metadata WHERE metadata_key='notification_merge_observed_from'").fetchone()
+        if first is None:
+            connection.execute("INSERT INTO signal_bus_metadata VALUES('notification_merge_observed_from',?)", (current.isoformat(),))
+            connection.execute("UPDATE notification_state_revision SET revision=revision+1 WHERE singleton=1")
+        self._prune_merge_metadata(connection, now=current)
+        encoded = current.isoformat()
+        rows = connection.execute("""
+            SELECT d.*, s.payload_json, s.payload_hash FROM delivery_outbox d
+            JOIN signal_envelope s ON s.signal_id=d.signal_id
+            WHERE d.status IN ('pending','retry') AND d.expires_at>?
+              AND (d.next_attempt_at IS NULL OR d.next_attempt_at<=?)
+            ORDER BY COALESCE(d.next_attempt_at,d.created_at),d.global_sequence,d.outbox_id
+            LIMIT 10001
+        """, (encoded, encoded)).fetchall()
+        if len(rows) > 10000:
+            raise SignalBusIntegrityError("notification merge member capacity exceeded")
+        for row in rows:
+            payload = json.loads(row["payload_json"])
+            if hashlib.sha256(row["payload_json"].encode()).hexdigest() != row["payload_hash"]:
+                raise SignalBusIntegrityError("notification merge original payload changed")
+            tag = payload.get("envelope_schema")
+            family = {"rquant.price-alert-event/v1": "price",
+                      "rquant.condition-alert-event/v1": "condition",
+                      "rquant.builtin-condition-alert-event/v1": "builtin"}.get(tag, "signal")
+            if (family == "price" and not include_price) or (
+                family == "condition" and not include_condition
+            ) or (family == "builtin" and not include_builtin):
+                continue
+            member_binding = self._payload_merge_binding(payload)
+            if member_binding.owner_id != binding.owner_id:
+                if family == "price":
+                    from rquant.price_alert_runtime_projection import _head
+
+                    authority = _head(connection)
+                elif family in {"condition", "builtin"}:
+                    from rquant.condition_alert_runtime_projection import condition_delivery_authority
+
+                    authority = condition_delivery_authority(connection)
+                else:
+                    continue
+                if authority is None or member_binding.owner_id not in {row.owner_id for row in authority.policy.owners}:
+                    continue
+            existing = connection.execute(
+                "SELECT group_id FROM notification_merge_member WHERE outbox_id=?",
+                (row["outbox_id"],),
+            ).fetchone()
+            if existing is not None:
+                continue
+            from rquant.runtime_notification_providers import format_merged_member_payload
+
+            part_bytes = len(format_merged_member_payload(row["payload_json"]).encode())
+            if part_bytes + len("1条提醒".encode()) > 64 * 1024:
+                raise SignalBusIntegrityError("complete original notification exceeds merge request budget")
+            target = DeliveryTarget(recipient_id=row["recipient_id"], channel=row["channel"])
+            cohort = self._merge_cohort(connection, payload, target, family)
+            group_row = connection.execute("""
+                SELECT g.* FROM notification_merge_group g
+                WHERE g.cohort_sha256=? AND g.status='waiting' AND g.due_at>?
+                  AND (SELECT COUNT(*) FROM notification_merge_member m WHERE m.group_id=g.group_id)<?
+                ORDER BY g.opened_at,g.group_id LIMIT 1
+            """, (cohort, encoded, limit)).fetchone()
+            if group_row is not None:
+                sizes = connection.execute("SELECT COUNT(*),SUM(rendered_utf8_bytes) FROM notification_merge_member "
+                                           "WHERE group_id=?", (group_row["group_id"],)).fetchone()
+                count = int(sizes[0]) + 1
+                rendered_size = int(sizes[1]) + part_bytes + (count - 1) * len("\n\n---\n\n".encode()) + len(f"{count}条提醒".encode())
+                if rendered_size > 64 * 1024:
+                    group_row = None
+            if group_row is None:
+                group_id = canonical_sha256({"contract": "notification-merge-group/v1",
+                                            "cohort": cohort, "opened_at": current,
+                                            "first_outbox_id": row["outbox_id"]})
+                group = NotificationMergeGroup(
+                    group_id=group_id, binding=member_binding, cohort_sha256=cohort,
+                    target=target, family=family, opened_at=current,
+                    due_at=current + timedelta(seconds=30), status="waiting",
+                    members=(row["outbox_id"],),
+                )
+                material = group.model_dump_json(exclude={"members", "status"})
+                if len(material.encode()) > 16 * 1024:
+                    raise SignalBusIntegrityError("notification merge group capacity exceeded")
+                connection.execute("INSERT INTO notification_merge_group VALUES(?,?,?,?,?,?)",
+                                   (group_id, cohort, encoded, group.due_at.isoformat(), "waiting", material))
+            else:
+                group_id = str(group_row["group_id"])
+            ordinal = int(connection.execute(
+                "SELECT COUNT(*) FROM notification_merge_member WHERE group_id=?", (group_id,),
+            ).fetchone()[0])
+            connection.execute("INSERT INTO notification_merge_member VALUES(?,?,?,?,?,?)",
+                               (row["outbox_id"], group_id, row["signal_id"], row["payload_hash"], ordinal, part_bytes))
+        result: list[str] = []
+        self._check_merge_capacity(connection)
+        groups = self._merge_groups(connection)
+        for group in groups:
+            if not self.merge_binding_matches(group.binding) or group.status not in {"waiting", "failed"} or current < group.due_at:
+                continue
+            members = self._rows_for_outbox_ids(connection, group.members)
+            active = [row for row in members if row["status"] in {"pending", "retry"} and
+                      datetime.fromisoformat(row["expires_at"]) > current]
+            if any(row["status"] == "leased" for row in members):
+                continue
+            if any(row["next_attempt_at"] is not None and datetime.fromisoformat(row["next_attempt_at"]) > current
+                   for row in active):
+                continue
+            if len(result) + len(active) <= limit:
+                result.extend(str(row["outbox_id"]) for row in active)
+        self._check_merge_capacity(connection)
+        return tuple(result)
+
+    def _merge_cohort(
+        self, connection: sqlite3.Connection, payload: Mapping[str, object],
+        target: DeliveryTarget, family: str,
+    ) -> str:
+        keys = ("strategy_id", "strategy_version", "parameter_fingerprint",
+                "dataset_snapshot_id", "feature_snapshot_id", "producer_commit",
+                "owner_id", "rule_id", "rule_version", "rule_body_hash", "scope_version",
+                "member_digest", "source_identity", "evaluation_contract_sha256",
+                "frequency_policy_sha256", "producer_manifest_sha256", "source_epoch",
+                "rule_body_sha256", "membership_version", "member_binding_sha256",
+                "scope_generation_id", "scope_manifest_sha256", "calendar_content_sha256",
+                "quote_source_generation_id")
+        source_row = connection.execute("SELECT source_id,source_generation_id FROM notification_replication_source "
+                                        "WHERE singleton=1").fetchone()
+        local_generation = connection.execute("SELECT metadata_value FROM signal_bus_metadata "
+                                              "WHERE metadata_key='source_generation_id'").fetchone()
+        if local_generation is None:
+            raise SignalBusIntegrityError("merge original bus generation is unavailable")
+        return canonical_sha256({"binding": self._payload_merge_binding(payload), "target": target, "family": family,
+                                 "actual_bus_generation": local_generation[0],
+                                 "actual_replication_source": None if source_row is None else tuple(source_row),
+                                 "source": {key: payload[key] for key in keys if key in payload}})
+
+    def _payload_merge_binding(self, payload: Mapping[str, object]) -> NotificationMergeBinding:
+        if self.merge_binding is None:
+            raise ValueError("original merge installation is disabled")
+        values = self.merge_binding.model_dump(mode="python") | {"owner_id": payload.get("owner_id", self.merge_binding.owner_id)}
+        return NotificationMergeBinding.model_validate(values)
+
+    def merge_binding_matches(self, binding: NotificationMergeBinding) -> bool:
+        return (self.merge_binding is not None and type(binding) is NotificationMergeBinding
+            and binding.model_dump(exclude={"owner_id"}) == self.merge_binding.model_dump(exclude={"owner_id"})
+            and (self.merge_binding_guard is None or self.merge_binding_guard() is True))
+
+    def record_applied_notifier_mode(self, mode: object) -> None:
+        from rquant.notifier_operator import NotifierModeState
+
+        if type(mode) is not NotifierModeState or self.merge_binding is None or mode.mode != self.merge_binding.mode:
+            raise ValueError("notifier applied mode differs from its original installed owner")
+        with self._write_transaction() as connection:
+            if not self.merge_binding_matches(self.merge_binding):
+                raise ValueError("notifier original mode changed before application")
+            body = mode.model_dump_json()
+            row = connection.execute("SELECT metadata_value FROM signal_bus_metadata WHERE metadata_key='notification_notifier_mode'").fetchone()
+            if row is None or row[0] != body:
+                connection.execute("INSERT INTO signal_bus_metadata VALUES('notification_notifier_mode',?) "
+                    "ON CONFLICT(metadata_key) DO UPDATE SET metadata_value=excluded.metadata_value", (body,))
+                connection.execute("UPDATE notification_state_revision SET revision=revision+1 WHERE singleton=1")
+                self._before_commit(connection)
+
+    def validate_merge_cohort(
+        self, connection: sqlite3.Connection, group: NotificationMergeGroup, record: OutboxRecord,
+    ) -> None:
+        row = connection.execute("SELECT payload_json,payload_hash FROM signal_envelope WHERE signal_id=?",
+                                 (record.signal_id,)).fetchone()
+        member = connection.execute("SELECT * FROM notification_merge_member WHERE outbox_id=?", (record.outbox_id,)).fetchone()
+        if (row is None or member is None or member["group_id"] != group.group_id
+                or row["payload_hash"] != hashlib.sha256(row["payload_json"].encode()).hexdigest()
+                or member["payload_sha256"] != row["payload_hash"]
+                or group.cohort_sha256 != self._merge_cohort(connection, json.loads(row["payload_json"]), record.target, group.family)):
+            raise SignalBusIntegrityError("merge original source, generation or complete member payload changed")
+
+    def _merge_groups(self, connection: sqlite3.Connection) -> tuple[NotificationMergeGroup, ...]:
+        rows = connection.execute(
+            "SELECT g.* FROM notification_merge_group g ORDER BY "
+            "(SELECT MIN(COALESCE(d.next_attempt_at,d.created_at)) FROM notification_merge_member m "
+            "JOIN delivery_outbox d ON d.outbox_id=m.outbox_id WHERE m.group_id=g.group_id),"
+            "(SELECT MIN(d.global_sequence) FROM notification_merge_member m "
+            "JOIN delivery_outbox d ON d.outbox_id=m.outbox_id WHERE m.group_id=g.group_id),g.group_id"
+        ).fetchall()
+        result: list[NotificationMergeGroup] = []
+        for row in rows:
+            if len(row["material_json"].encode()) > 16 * 1024:
+                raise SignalBusIntegrityError("notification merge group capacity exceeded")
+            members = connection.execute(
+                "SELECT outbox_id FROM notification_merge_member WHERE group_id=? ORDER BY ordinal",
+                (row["group_id"],),
+            ).fetchall()
+            material = json.loads(row["material_json"])
+            group = NotificationMergeGroup(**material, status=row["status"],
+                                           members=tuple(str(item[0]) for item in members))
+            if (group.group_id != row["group_id"] or group.cohort_sha256 != row["cohort_sha256"]
+                    or group.opened_at.isoformat() != row["opened_at"] or group.due_at.isoformat() != row["due_at"]):
+                raise SignalBusIntegrityError("notification merge material differs from its same-ledger record")
+            result.append(group)
+        return tuple(result)
+
+    def merge_groups(self) -> tuple[NotificationMergeGroup, ...]:
+        if self.merge_binding is None:
+            return ()
+        with self._read_snapshot() as connection:
+            self._check_merge_capacity(connection)
+            return self._merge_groups(connection)
+
+    def _prune_merge_metadata(self, connection: sqlite3.Connection, *, now: datetime) -> int:
+        if self.merge_binding is None:
+            return 0
+        removed = 0
+        terminal = {OutboxStatus.SUCCEEDED.value, OutboxStatus.EXPIRED.value, OutboxStatus.DEAD_LETTER.value}
+        for group in self._merge_groups(connection):
+            if group.status in {"intent", "unknown"} or not group.due_at + timedelta(days=7) < now:
+                continue
+            members = self._rows_for_outbox_ids(connection, group.members)
+            if len(members) != len(group.members) or any(row["status"] not in terminal for row in members):
+                continue
+            if connection.execute("SELECT 1 FROM delivery_unknown WHERE outbox_id IN "
+                    "(SELECT value FROM json_each(?)) LIMIT 1", (json.dumps(group.members),)).fetchone() is not None:
+                continue
+            closed_at = max(datetime.fromisoformat(row["updated_at"]) for row in members)
+            calls = connection.execute("SELECT intent_json,observation_json FROM notification_physical_attempt WHERE group_id=?",
+                (group.group_id,)).fetchall()
+            unresolved = False
+            for raw_intent, raw_observation in calls:
+                intent = PhysicalPostBinding.model_validate_json(raw_intent)
+                observation = None if raw_observation is None else PhysicalPostObservation.model_validate_json(raw_observation)
+                if (observation is None or observation.binding != intent
+                        or observation.disposition == "unknown" or intent.group_id != group.group_id):
+                    unresolved = True
+                    break
+                closed_at = max(closed_at, observation.completed_at)
+            if unresolved or not closed_at + timedelta(days=7) < now:
+                continue
+            connection.execute("DELETE FROM notification_physical_attempt WHERE group_id=?", (group.group_id,))
+            connection.execute("DELETE FROM notification_merge_member WHERE group_id=?", (group.group_id,))
+            connection.execute("DELETE FROM notification_merge_group WHERE group_id=?", (group.group_id,))
+            removed += 1
+        if removed:
+            cutoff = (now - timedelta(days=7)).isoformat()
+            connection.execute("INSERT INTO signal_bus_metadata(metadata_key,metadata_value) VALUES('notification_merge_retained_after',?) "
+                "ON CONFLICT(metadata_key) DO UPDATE SET metadata_value=excluded.metadata_value", (cutoff,))
+        return removed
+
+    def prune_merge_metadata(self, *, now: datetime) -> int:
+        if self.merge_binding is None:
+            return 0
+        with self._write_transaction() as connection:
+            removed = self._prune_merge_metadata(connection, now=normalize_aware_utc(now))
+            if removed:
+                self._before_commit(connection)
+            return removed
+
+    def _check_merge_capacity(self, connection: sqlite3.Connection) -> None:
+        group_count, group_bytes = connection.execute(
+            "SELECT COUNT(*),COALESCE(SUM(length(CAST(material_json AS BLOB))),0) FROM notification_merge_group"
+        ).fetchone()
+        member_count = connection.execute("SELECT COUNT(*) FROM notification_merge_member").fetchone()[0]
+        call_count, call_bytes = connection.execute("""
+            SELECT COUNT(*), COALESCE(SUM(length(CAST(intent_json AS BLOB))+
+                   COALESCE(length(CAST(observation_json AS BLOB)),0)),0)
+            FROM notification_physical_attempt
+        """).fetchone()
+        if (group_count > 1024 or member_count > 10000 or call_count > 5120
+                or group_bytes + member_count * 264 + call_bytes > 8 * 1024 * 1024):
+            raise SignalBusIntegrityError("notification merge metadata capacity exceeded")
+
+    def commit_merge_intent(
+        self, group: NotificationMergeGroup, records: tuple[OutboxRecord, ...], *,
+        worker_id: str, now: datetime, request_sha256: str,
+        request_utf8_bytes: int,
+        consume: Callable[[], None] | None = None,
+    ) -> PhysicalPostBinding:
+        current = normalize_aware_utc(now)
+        if self.merge_binding is None or not self.merge_binding_matches(group.binding) or not records:
+            raise ValueError("merge intent does not match the current installed notifier")
+        binding = PhysicalPostBinding(
+            group_id=group.group_id, owner_id=group.binding.owner_id, target=group.target,
+            members=tuple({"outbox_id": row.outbox_id, "attempt_no": row.attempt_count}
+                          for row in records), request_sha256=request_sha256,
+            request_utf8_bytes=request_utf8_bytes, issued_at=current,
+        )
+        with self._write_transaction() as connection:
+            actual = next((item for item in self._merge_groups(connection) if item.group_id == group.group_id), None)
+            if actual != group or group.status not in {"waiting", "failed"} or current < group.due_at:
+                raise ValueError("merge group changed or is not due")
+            originals = self._rows_for_outbox_ids(connection, group.members)
+            expected = {str(r["outbox_id"]) for r in originals if r["status"] == "leased"}
+            if expected != {r.outbox_id for r in records}:
+                raise ValueError("merge intent omits a still-leased original group member")
+            for record in records:
+                if record.outbox_id not in group.members or record.target != group.target:
+                    raise ValueError("merge member belongs to another receiver or group")
+                row = connection.execute("SELECT d.*,s.payload_hash FROM delivery_outbox d JOIN signal_envelope s "
+                                         "ON s.signal_id=d.signal_id WHERE d.outbox_id=?", (record.outbox_id,)).fetchone()
+                member = connection.execute("SELECT * FROM notification_merge_member WHERE outbox_id=?",
+                                            (record.outbox_id,)).fetchone()
+                if (row is None or member is None or self._outbox_from_row(row) != record
+                        or member["payload_sha256"] != row["payload_hash"] or member["signal_id"] != record.signal_id):
+                    raise SignalBusIntegrityError("merge intent original member or sealed payload changed")
+                self._verify_lease(row, worker_id=worker_id, attempt_no=record.attempt_count, completed_at=current)
+                self.validate_merge_cohort(connection, group, record)
+                if current >= record.expires_at:
+                    raise ValueError("merge member original TTL expired")
+                self._validate_merge_member_authority(connection, group.family, record, current)
+            # Holding the original writer transaction fences concurrent authority and
+            # lease changes while the existing single-use admission rights are consumed.
+            if consume is not None:
+                consume()
+            if not self.merge_binding_matches(group.binding):
+                raise ValueError("notifier original mode changed before committed send permission")
+            if group.binding.mode == "live":
+                connection.execute("INSERT INTO notification_physical_attempt VALUES(?,?,?,?,?)",
+                                   (binding.physical_id(), group.group_id, binding.model_dump_json(), None, "intent"))
+            connection.execute("UPDATE notification_merge_group SET status='intent' WHERE group_id=?", (group.group_id,))
+            self._check_merge_capacity(connection)
+            self._before_commit(connection)
+        return binding
+
+    def _validate_merge_member_authority(
+        self, connection: sqlite3.Connection, family: str, record: OutboxRecord, now: datetime,
+    ) -> None:
+        if family == "price":
+            from rquant.price_alert_route import notification_record
+            from rquant.price_alert_runtime_projection import _admission, _head, _valid_current_event
+
+            head = _head(connection)
+            admission = _admission(connection, record.outbox_id, record.attempt_count)
+            if (head is None or admission is None or admission.authority_revision != head.authority_revision
+                    or _valid_current_event(head, notification_record(connection, record.signal_id), record.target, now) is not None):
+                raise ValueError("merge price source, rule, role or recipient changed")
+        elif family in {"condition", "builtin"}:
+            from rquant.condition_alert_route import notification_record
+            from rquant.condition_alert_runtime_projection import (
+                _invalid_condition_event, condition_delivery_authority,
+                condition_send_admission, fresh_condition_authority,
+            )
+
+            event = notification_record(connection, record.signal_id)
+            head = fresh_condition_authority(condition_delivery_authority(connection), now, event)
+            admission = condition_send_admission(connection, record.outbox_id, record.attempt_count)
+            if (admission is None or admission.authority_revision != head.authority_revision
+                    or _invalid_condition_event(head, event, record.target, now) is not None):
+                raise ValueError("merge condition source, rule, role or recipient changed")
+
+    def record_physical_post(self, observed: PhysicalPostObservation) -> None:
+        if type(observed) is not PhysicalPostObservation or observed.key_slot != 0:
+            raise TypeError("physical observation requires the original single-recipient POST")
+        binding = observed.binding
+        with self._write_transaction() as connection:
+            row = connection.execute("SELECT * FROM notification_physical_attempt WHERE physical_id=?",
+                                     (binding.physical_id(),)).fetchone()
+            if row is None or PhysicalPostBinding.model_validate_json(row["intent_json"]) != binding:
+                raise ValueError("physical observation differs from original committed intent")
+            encoded = observed.model_dump_json()
+            if row["observation_json"] is not None:
+                if row["observation_json"] != encoded:
+                    raise ValueError("physical observation already has a different actual reply")
+                return
+            connection.execute("UPDATE notification_physical_attempt SET observation_json=?,outcome=? WHERE physical_id=?",
+                               (encoded, observed.disposition, binding.physical_id()))
+            self._check_merge_capacity(connection)
+            self._before_commit(connection)
+
+    def physical_post(self, binding: PhysicalPostBinding) -> PhysicalPostObservation | None:
+        with self._read_snapshot() as connection:
+            row = connection.execute("SELECT * FROM notification_physical_attempt WHERE physical_id=?",
+                                     (binding.physical_id(),)).fetchone()
+            if row is None or PhysicalPostBinding.model_validate_json(row["intent_json"]) != binding:
+                raise ValueError("original physical intent is unavailable")
+            return None if row["observation_json"] is None else PhysicalPostObservation.model_validate_json(row["observation_json"])
+
+    def merge_preparation_committed(
+        self, group: NotificationMergeGroup, records: tuple[OutboxRecord, ...],
+    ) -> bool:
+        with self._read_snapshot() as connection:
+            actual = next(g for g in self._merge_groups(connection) if g.group_id == group.group_id)
+            if actual.status not in {"waiting", "failed"}:
+                return True
+            if group.family == "price":
+                from rquant.price_alert_runtime_projection import _admission
+
+                return any(_admission(connection, r.outbox_id, r.attempt_count) is not None for r in records)
+            if group.family in {"condition", "builtin"}:
+                from rquant.condition_alert_runtime_projection import condition_send_admission
+
+                return any(condition_send_admission(connection, r.outbox_id, r.attempt_count) is not None for r in records)
+            return False
+
+    def complete_merge(
+        self, binding: PhysicalPostBinding, records: tuple[OutboxRecord, ...], *,
+        worker_id: str, completed_at: datetime,
+    ) -> str:
+        if tuple((r.outbox_id, r.attempt_count) for r in records) != tuple(
+            (r.outbox_id, r.attempt_no) for r in binding.members
+        ):
+            raise ValueError("merge completion differs from original intent members")
+        with self._write_transaction() as connection:
+            group = next(g for g in self._merge_groups(connection) if g.group_id == binding.group_id)
+            if not self.merge_binding_matches(group.binding) or group.status != "intent":
+                raise ValueError("merge intent has already completed or changed")
+            shadow = group.binding.mode == "shadow"
+            observed = None
+            if not shadow:
+                row = connection.execute("SELECT * FROM notification_physical_attempt WHERE physical_id=?",
+                                         (binding.physical_id(),)).fetchone()
+                if row is None or PhysicalPostBinding.model_validate_json(row["intent_json"]) != binding:
+                    raise ValueError("merge completion lacks its original committed intent")
+                observed = None if row["observation_json"] is None else PhysicalPostObservation.model_validate_json(row["observation_json"])
+            disposition = "accepted" if shadow else "unknown" if observed is None else observed.disposition
+            if disposition == "unknown":
+                for record in records:
+                    self._record_unknown_in_transaction(
+                        connection, record.outbox_id, worker_id=worker_id,
+                        attempt_no=record.attempt_count, observed_at=completed_at,
+                        reason="merge physical request or result writeback is unresolved; no automatic resend",
+                        provider_receipt=None,
+                    )
+                connection.execute("UPDATE notification_merge_group SET status='unknown' WHERE group_id=?", (group.group_id,))
+                self._before_commit(connection)
+                return "unknown"
+            receipt = ("shadow:" if shadow else "channel:") + binding.physical_id()
+            for record in records:
+                self._complete_in_transaction(
+                    connection, record.outbox_id, worker_id=worker_id, attempt_no=record.attempt_count,
+                    completed_at=completed_at, success=disposition == "accepted",
+                    provider_receipt=receipt if disposition == "accepted" else None,
+                    error="channel definitely rejected group request" if disposition == "rejected" else None,
+                )
+            status = "shadow" if shadow else "succeeded" if disposition == "accepted" else "failed"
+            connection.execute("UPDATE notification_merge_group SET status=? WHERE group_id=?", (status, group.group_id))
+            self._check_merge_capacity(connection)
+            self._before_commit(connection)
+            return disposition
+
+    def merge_channel_stats(self) -> tuple[NotificationChannelStatistics, ...]:
+        if self.merge_binding is None:
+            return ()
+        with self._read_snapshot() as connection:
+            return self._merge_channel_stats(connection)
+
+    def _merge_channel_stats(self, connection: sqlite3.Connection, *,
+        observed_at: datetime | None = None, covered_from: datetime | None = None,
+    ) -> tuple[NotificationChannelStatistics, ...]:
+        self._check_merge_capacity(connection)
+        groups = self._merge_groups(connection)
+        if observed_at is not None and any(g.opened_at > observed_at for g in groups):
+            raise ValueError("notification groups are not visible at the original owner cutoff")
+        keys = {(g.binding.owner_id, g.target, g.binding.mode, canonical_sha256(g.binding)) for g in groups}
+        result: list[NotificationChannelStatistics] = []
+        for owner, target, mode, binding_sha in sorted(keys, key=lambda k: (k[0], k[1].channel, k[1].recipient_id, k[2], k[3])):
+            selected = [g for g in groups if (g.binding.owner_id, g.target, g.binding.mode, canonical_sha256(g.binding)) == (owner, target, mode, binding_sha)]
+            group_ids = tuple(g.group_id for g in selected)
+            members = tuple(item for g in selected for item in g.members)
+            original = connection.execute("SELECT outbox_id,attempt_no,started_at,completed_at FROM delivery_attempt "
+                "WHERE outbox_id IN (SELECT value FROM json_each(?))", (json.dumps(members),)).fetchall()
+            attempts = set()
+            for row in original:
+                started, completed = datetime.fromisoformat(row[2]), datetime.fromisoformat(row[3])
+                if observed_at is not None and completed > observed_at:
+                    raise ValueError("notification attempt is not yet visible")
+                if covered_from is None or started >= covered_from:
+                    attempts.add((row[0], row[1]))
+            leases = connection.execute("SELECT outbox_id,attempt_count,lease_started_at FROM delivery_outbox "
+                "WHERE lease_started_at IS NOT NULL AND outbox_id IN (SELECT value FROM json_each(?))", (json.dumps(members),)).fetchall()
+            # A lease proves a claim, so validate its cutoff without counting a send.
+            for row in leases:
+                started = datetime.fromisoformat(row[2])
+                if observed_at is not None and started > observed_at:
+                    raise ValueError("notification claim is not yet visible")
+            # A missing call receipt is possible, never an invented actual POST.
+            calls = connection.execute("SELECT observation_json,intent_json FROM notification_physical_attempt WHERE group_id IN "
+                "(SELECT value FROM json_each(?))", (json.dumps(group_ids),)).fetchall()
+            actual, possible = [], 0
+            for call in calls:
+                intent = PhysicalPostBinding.model_validate_json(call[1])
+                if observed_at is not None and intent.issued_at > observed_at:
+                    raise ValueError("notification physical intent is not yet visible")
+                if covered_from is None or intent.issued_at >= covered_from:
+                    attempts.update((m.outbox_id, m.attempt_no) for m in intent.members)
+                if call[0] is None:
+                    possible += int(covered_from is None or intent.issued_at >= covered_from)
+                    continue
+                observation = PhysicalPostObservation.model_validate_json(call[0])
+                if observation.binding != intent or observed_at is not None and observation.completed_at > observed_at:
+                    raise ValueError("notification physical result differs from the original same-read intent")
+                if covered_from is None or observation.called_at >= covered_from:
+                    actual.append(observation)
+            # Unresolved original delivery evidence still counts an original
+            # member attempt, without claiming any physical request occurred.
+            unknown = connection.execute("SELECT outbox_id,attempt_no,observed_at FROM delivery_unknown WHERE outbox_id IN "
+                "(SELECT value FROM json_each(?))", (json.dumps(members),)).fetchall()
+            for row in unknown:
+                at = datetime.fromisoformat(row[2])
+                if observed_at is not None and at > observed_at:
+                    raise ValueError("notification unknown result is not yet visible")
+                if covered_from is None or at >= covered_from:
+                    attempts.add((row[0], row[1]))
+            accepted = [o for o in actual if o.disposition == "accepted"]
+            logical = tuple(member for group in selected if covered_from is None or group.opened_at >= covered_from for member in group.members)
+            result.append(NotificationChannelStatistics(owner_id=owner, target=target, mode=mode,
+                binding_sha256=binding_sha, logical_count=len(logical), member_attempts=len(attempts),
+                member_retries=sum(attempt > 1 for _, attempt in attempts), physical_requests=len(actual),
+                accepted_count=len(accepted), rejected_count=sum(o.disposition == "rejected" for o in actual),
+                unknown_count=sum(o.disposition == "unknown" for o in actual), possible_requests=possible,
+                last_accepted_at=max((o.completed_at for o in accepted), default=None)))
+        return tuple(result)
+
+    def _monitor_runtime_projections(self, connection: sqlite3.Connection, *, observed_at: datetime,
+        history_limit: int, builtin_facts: object | None = None,
+    ) -> tuple[ServingProjectionPayload, ...]:
+        from rquant.monitor_builtin_runtime import builtin_serving_projections
+        from rquant.notifier_operator import NotifierModeState
+
+        self._check_merge_capacity(connection)
+        first = connection.execute("SELECT metadata_value FROM signal_bus_metadata WHERE metadata_key='notification_merge_observed_from'").fetchone()
+        retained = connection.execute("SELECT metadata_value FROM signal_bus_metadata WHERE metadata_key='notification_merge_retained_after'").fetchone()
+        start = None if first is None else datetime.fromisoformat(first[0])
+        if start is not None and retained is not None:
+            start = max(start, datetime.fromisoformat(retained[0]))
+        if start is not None and start > observed_at:
+            raise ValueError("notification observation coverage is future")
+        groups = self._merge_groups(connection)
+        if any(group.opened_at > observed_at for group in groups):
+            raise ValueError("notification group is future at its same-read cutoff")
+        physical = self.path.stat()
+        source_row = connection.execute("SELECT source_id,source_generation_id FROM notification_replication_source WHERE singleton=1").fetchone()
+        original_generation = connection.execute("SELECT metadata_value FROM signal_bus_metadata WHERE metadata_key='source_generation_id'").fetchone()
+        source_sha = canonical_sha256({"contract": "rquant.notification-runtime-source/v1", "binding": self.merge_binding,
+            "replication_source": None if source_row is None else tuple(source_row), "bus_generation": original_generation[0],
+            "ledger_path": str(self.path), "device": physical.st_dev, "inode": physical.st_ino,
+            "covered_from": start, "covered_through": observed_at})
+        mode_row = connection.execute("SELECT metadata_value FROM signal_bus_metadata WHERE metadata_key='notification_notifier_mode'").fetchone()
+        mode = None if mode_row is None else NotifierModeState.model_validate_json(mode_row[0])
+        if mode is not None and (self.merge_binding is None or mode.mode != self.merge_binding.mode or mode.accepted_at is not None and mode.accepted_at > observed_at):
+            raise ValueError("notification applied mode differs from its original owner cutoff/binding")
+        selected = tuple(sorted(groups, key=lambda row: (row.opened_at, row.group_id), reverse=True)[:min(history_limit, 512)])
+        header = NotificationRuntimeWindow(state="ready" if start is not None else "unavailable",
+            reason="observed_window" if start is not None else "no_observed_window", observed_at=observed_at,
+            binding=self.merge_binding, source_receipt_sha256=source_sha, covered_from=start, covered_through=observed_at,
+            complete=start is not None, history_count=len(groups), returned_history_count=len(selected), truncated=len(selected)<len(groups),
+            applied_revision=None if mode is None else mode.revision, applied_command_id=None if mode is None else mode.command_id,
+            monitor_installation_sha256=None if mode is None else mode.installation_sha256,
+            capability_observed_at=self.runtime_capability_observed_at, available_targets=self.runtime_available_targets)
+        states = [{"owner_id": "", "channel": "", "body_json": header.model_dump_json()}]
+        if start is not None:
+            statistics = self._merge_channel_stats(connection, observed_at=observed_at, covered_from=start)
+            for owner, channel in sorted({(row.owner_id, row.target.channel) for row in statistics}):
+                rows = tuple(row for row in statistics if row.owner_id == owner and row.target.channel == channel)
+                targets = tuple(sorted({row.target for row in rows}, key=lambda row: row.recipient_id))
+                body = NotificationRuntimeChannelState(owner_id=owner, channel=channel,
+                    recipient_scope_ref=canonical_sha256(targets), source_receipt_sha256=source_sha,
+                    mode=self.merge_binding.mode, observed_at=observed_at, covered_from=start, covered_through=observed_at,
+                    targets=targets, statistics=rows, logical_count=sum(row.logical_count for row in rows),
+                    member_attempts=sum(row.member_attempts for row in rows), member_retries=sum(row.member_retries for row in rows),
+                    physical_requests=sum(row.physical_requests for row in rows), accepted_count=sum(row.accepted_count for row in rows),
+                    rejected_count=sum(row.rejected_count for row in rows), physical_unknown_count=sum(row.unknown_count for row in rows),
+                    possible_requests=sum(row.possible_requests for row in rows),
+                    last_accepted_at=max((row.last_accepted_at for row in rows if row.last_accepted_at is not None), default=None),
+                    applied_revision=None if mode is None else mode.revision,
+                    accepted_pct=(round(100 * sum(row.accepted_count for row in rows) / sum(row.physical_requests for row in rows), 1)
+                        if sum(row.physical_requests for row in rows) and not any(row.unknown_count or row.possible_requests for row in rows)
+                        else None))
+                states.append({"owner_id": owner, "channel": channel.value, "body_json": body.model_dump_json()})
+        history = []
+        for group in selected:
+            rows = connection.execute("SELECT intent_json,observation_json FROM notification_physical_attempt WHERE group_id=? ORDER BY physical_id", (group.group_id,)).fetchall()
+            view = NotificationRuntimeGroupView(group=group, inspected_at=observed_at, source_receipt_sha256=source_sha,
+                attempts=tuple(NotificationRuntimeAttemptView(intent=PhysicalPostBinding.model_validate_json(row[0]),
+                    observation=None if row[1] is None else PhysicalPostObservation.model_validate_json(row[1])) for row in rows))
+            history.append({"group_id": group.group_id, "owner_id": group.binding.owner_id,
+                "channel": group.target.channel.value, "body_json": view.model_dump_json()})
+        return (ServingProjectionPayload(table_name="notification_runtime_state", available_at=observed_at, rows=tuple(states)),
+            ServingProjectionPayload(table_name="notification_runtime_delivery", available_at=observed_at, rows=tuple(history)),
+            *builtin_serving_projections(builtin_facts, observed_at=observed_at))
 
     def _initialize(self) -> None:
         super()._initialize()
+        if self.merge_binding is not None:
+            with self._connect() as connection:
+                connection.executescript("""
+                    CREATE TABLE IF NOT EXISTS notification_merge_group (
+                        group_id TEXT PRIMARY KEY, cohort_sha256 TEXT NOT NULL,
+                        opened_at TEXT NOT NULL, due_at TEXT NOT NULL,
+                        status TEXT NOT NULL, material_json TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS notification_merge_member (
+                        outbox_id TEXT PRIMARY KEY REFERENCES delivery_outbox(outbox_id),
+                        group_id TEXT NOT NULL REFERENCES notification_merge_group(group_id),
+                        signal_id TEXT NOT NULL REFERENCES signal_envelope(signal_id),
+                        payload_sha256 TEXT NOT NULL, ordinal INTEGER NOT NULL,
+                        rendered_utf8_bytes INTEGER NOT NULL CHECK(rendered_utf8_bytes BETWEEN 1 AND 65536),
+                        UNIQUE(group_id, ordinal)
+                    );
+                    CREATE TABLE IF NOT EXISTS notification_physical_attempt (
+                        physical_id TEXT PRIMARY KEY,
+                        group_id TEXT NOT NULL REFERENCES notification_merge_group(group_id),
+                        intent_json TEXT NOT NULL, observation_json TEXT,
+                        outcome TEXT NOT NULL
+                    );
+                """)
         with self._connect() as connection:
             connection.executescript(
                 """
@@ -1583,6 +2208,7 @@ class NotificationStateStore(SignalBusStore):
         activation: ConditionAlertRuntimeActivation,
         expected_revision: int,
         applied_at: datetime,
+        builtin_inspection: object | None = None,
     ) -> ConditionAlertDeliveryAuthoritySnapshot:
         from rquant.condition_alert_runtime_projection import (
             apply_condition_alert_delivery_authority,
@@ -1594,6 +2220,7 @@ class NotificationStateStore(SignalBusStore):
             activation=activation,
             expected_revision=expected_revision,
             applied_at=applied_at,
+            builtin_inspection=builtin_inspection,
         )
 
     def condition_alert_send_admission(
@@ -1657,10 +2284,11 @@ class NotificationStateStore(SignalBusStore):
             ConditionAlertAuthorityUnavailable,
             condition_delivery_authority,
             fresh_condition_authority,
+            builtin_condition_authority_ready,
         )
 
         binding = require_verified_condition_activation(activation, "notifier")
-        ready = False
+        ready, builtin_ready = False, False
         if binding.delivery_enabled:
             try:
                 with self._read_snapshot() as connection:
@@ -1670,6 +2298,8 @@ class NotificationStateStore(SignalBusStore):
                 ready = True
             except ConditionAlertAuthorityUnavailable:
                 pass
+            with self._read_snapshot() as connection:
+                builtin_ready = builtin_condition_authority_ready(condition_delivery_authority(connection), normalize_aware_utc(now))
         return self._claim_due(
             worker_id,
             now=now,
@@ -1677,6 +2307,7 @@ class NotificationStateStore(SignalBusStore):
             limit=limit,
             include_price=include_price,
             include_condition=ready,
+            include_builtin=builtin_ready,
         )
 
     def install_price_alert_delivery_v1(self, activation: object) -> None:
@@ -1801,6 +2432,16 @@ class NotificationStateStore(SignalBusStore):
             facts = condition_producer_snapshot(condition_producer, observed_at=observed_at)
         except (ValueError, OSError, sqlite3.Error):
             facts = None
+        builtin_facts = None
+        if self.merge_binding is not None:
+            from rquant.monitor_builtin_runtime import read_builtin_serving_facts, read_installed_builtin_captures
+
+            try:
+                captured = read_installed_builtin_captures(condition_producer, observed_at=observed_at)
+                builtin_facts = read_builtin_serving_facts(condition_producer, captured=captured,
+                    observed_at=observed_at, history_limit=history_limit)
+            except (ValueError, OSError, sqlite3.Error):
+                builtin_facts = None
         price_facts = None
         if price_producer is not None:
             from rquant.price_alert_runtime_contracts import require_verified_price_alert_activation
@@ -1818,6 +2459,7 @@ class NotificationStateStore(SignalBusStore):
             price_domain_unavailable=price_producer is not None and price_facts is None,
             condition_facts=facts,
             condition_domain_unavailable=facts is None,
+            builtin_facts=builtin_facts,
         )
 
     def serving_price_enabled_snapshot(
@@ -1858,6 +2500,7 @@ class NotificationStateStore(SignalBusStore):
         price_domain_unavailable: bool = False,
         condition_facts: ConditionProducerRuntimeSnapshot | None = None,
         condition_domain_unavailable: bool = False,
+        builtin_facts: object | None = None,
     ) -> NotificationServingSnapshot:
         from rquant.runtime_serving_snapshot import SignalDeliveryReadPayload
         from rquant.serving_read_models import (
@@ -2125,6 +2768,11 @@ class NotificationStateStore(SignalBusStore):
                         observed_at=observed
                     )
                     require_joint_projection_budget(price_projections + condition_projections)
+            monitor_projections = ()
+            if self.merge_binding is not None:
+                monitor_projections = self._monitor_runtime_projections(connection, observed_at=observed,
+                    history_limit=history_limit, builtin_facts=builtin_facts)
+                require_joint_projection_budget(price_projections + condition_projections + monitor_projections)
             connection.execute("COMMIT")
         except BaseException:
             if connection.in_transaction:
@@ -2145,7 +2793,8 @@ class NotificationStateStore(SignalBusStore):
             deliveries=coherent.deliveries,
             projections=(() if projection_snapshot is None else projection_snapshot.projections)
             + price_projections
-            + condition_projections,
+            + condition_projections
+            + monitor_projections,
         )
         return NotificationServingSnapshot(
             observed_at=observed,

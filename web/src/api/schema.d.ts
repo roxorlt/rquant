@@ -4,6 +4,159 @@
  */
 
 export interface paths {
+    "/api/v1/ai/backtests/confirm": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 确认默认策略并提交原组合回测任务 */
+        post: operations["confirm_backtest_api_v1_ai_backtests_confirm_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/ai/backtests/prepare": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 准备原选股条件的完整历史回测 */
+        post: operations["prepare_backtest_api_v1_ai_backtests_prepare_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/ai/backtests/prepare/lookup": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 恢复原历史准备请求 */
+        post: operations["lookup_backtest_api_v1_ai_backtests_prepare_lookup_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/ai/capabilities": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 助手状态与当日可用次数 */
+        get: operations["capabilities_api_v1_ai_capabilities_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/ai/interpretations/read": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 查看已绑定完整封存结果的解读 */
+        post: operations["interpretation_api_v1_ai_interpretations_read_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/ai/news/{stock_code}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 本人原文覆盖与新闻摘要 */
+        get: operations["stock_news_api_v1_ai_news__stock_code__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/ai/requests": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 生成已绑定原请求的建议 */
+        post: operations["generate_api_v1_ai_requests_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/ai/requests/lookup": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 查看原请求，不重复调用 */
+        post: operations["lookup_api_v1_ai_requests_lookup_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/ai/usage": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 本人实际模型用量 */
+        get: operations["usage_api_v1_ai_usage_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/backtests": {
         parameters: {
             query?: never;
@@ -13,6 +166,246 @@ export interface paths {
         };
         /** 最近分钟回放 */
         get: operations["list_backtests_api_v1_backtests_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/backtests/minute-runtime/capabilities": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 分钟回测操作权限 */
+        get: operations["capabilities_api_v1_backtests_minute_runtime_capabilities_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/backtests/minute-runtime/exports": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 准备分钟回测完整HTML及八表ZIP */
+        post: operations["submit_export_api_v1_backtests_minute_runtime_exports_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/backtests/minute-runtime/parameter-sources": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 完整分钟参数研究事实来源 */
+        get: operations["parameter_sources_api_v1_backtests_minute_runtime_parameter_sources_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/backtests/minute-runtime/runs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 原Lab分钟回测任务 */
+        get: operations["runs_api_v1_backtests_minute_runtime_runs_get"];
+        put?: never;
+        /** 提交原策略规范的分钟回测 */
+        post: operations["submit_run_api_v1_backtests_minute_runtime_runs_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/backtests/minute-runtime/runs/{job_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 完整封存的分钟回测摘要 */
+        get: operations["summary_api_v1_backtests_minute_runtime_runs__job_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/backtests/minute-runtime/runs/{job_id}/exports/{request_id}.zip": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 下载分钟回测完整八表ZIP */
+        get: operations["download_zip_api_v1_backtests_minute_runtime_runs__job_id__exports__request_id__zip_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/backtests/minute-runtime/runs/{job_id}/nav": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 15:00已确认行情的每日净值 */
+        get: operations["nav_api_v1_backtests_minute_runtime_runs__job_id__nav_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/backtests/minute-runtime/runs/{job_id}/report.html": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 下载分钟回测完整HTML报告 */
+        get: operations["report_html_api_v1_backtests_minute_runtime_runs__job_id__report_html_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/backtests/minute-runtime/runs/{job_id}/rows": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 原分钟结果八表明细 */
+        get: operations["rows_api_v1_backtests_minute_runtime_runs__job_id__rows_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/backtests/minute-runtime/sources": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 可验证的分钟输入与原策略版本 */
+        get: operations["sources_api_v1_backtests_minute_runtime_sources_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/backtests/minute-runtime/studies": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 原请求中的分钟参数研究 */
+        get: operations["studies_api_v1_backtests_minute_runtime_studies_get"];
+        put?: never;
+        /** 保存完整分钟参数研究请求 */
+        post: operations["submit_study_api_v1_backtests_minute_runtime_studies_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/backtests/minute-runtime/studies/capabilities": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 当前完整来源支持的分钟参数研究 */
+        get: operations["study_capabilities_api_v1_backtests_minute_runtime_studies_capabilities_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/backtests/minute-runtime/studies/{command_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 原分钟研究状态和三段完整结果 */
+        get: operations["study_result_api_v1_backtests_minute_runtime_studies__command_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/backtests/minute-runtime/studies/{command_id}/heatmap": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 原训练结果的两参数热图与周围一圈最低值 */
+        get: operations["study_heatmap_api_v1_backtests_minute_runtime_studies__command_id__heatmap_get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -167,6 +560,108 @@ export interface paths {
         };
         /** 分钟回放详情 */
         get: operations["get_backtest_api_v1_backtests__run_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/collaboration/audit": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 原命令操作记录 */
+        get: operations["audit_api_v1_collaboration_audit_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/collaboration/me": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 当前角色与协作能力 */
+        get: operations["me_api_v1_collaboration_me_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/collaboration/roles/commands": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 确认角色调整 */
+        post: operations["submit_api_v1_collaboration_roles_commands_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/collaboration/roles/lookup": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 查看原角色请求 */
+        post: operations["lookup_api_v1_collaboration_roles_lookup_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/collaboration/roles/prepare": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 准备角色调整 */
+        post: operations["prepare_api_v1_collaboration_roles_prepare_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/collaboration/users": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 已安装协作者与角色 */
+        get: operations["users_api_v1_collaboration_users_get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -583,6 +1078,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/experiments/template-results/{job_id}/report.html": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 下载策略封存报告 */
+        get: operations["template_report_api_v1_experiments_template_results__job_id__report_html_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/factors/capabilities": {
         parameters: {
             query?: never;
@@ -728,6 +1240,23 @@ export interface paths {
         };
         /** 因子检验详情 */
         get: operations["get_factor_result_api_v1_factors_results__job_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/factors/results/{job_id}/report": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 下载因子封存报告 */
+        get: operations["factor_report_api_v1_factors_results__job_id__report_get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -1102,6 +1631,23 @@ export interface paths {
         };
         /** 我的到价提醒运行状态 */
         get: operations["price_runtime_api_v1_monitor_price_rules_runtime_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/monitor/runtime": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 监控原运行事实 */
+        get: operations["get_runtime_api_v1_monitor_runtime_get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -2062,6 +2608,74 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/strategy-promotions/commands": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 评估或批准策略阶段 */
+        post: operations["commands_api_v1_strategy_promotions_commands_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/strategy-promotions/commands/lookup": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 查询原阶段操作 */
+        post: operations["lookup_api_v1_strategy_promotions_commands_lookup_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/strategy-promotions/commands/resume": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 恢复原阶段操作 */
+        post: operations["resume_api_v1_strategy_promotions_commands_resume_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/strategy-promotions/{strategy_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 策略阶段与评估 */
+        get: operations["detail_api_v1_strategy_promotions__strategy_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/strategy-templates": {
         parameters: {
             query?: never;
@@ -2317,6 +2931,57 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/tasks/monitor/builtins/commands": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 启用或关闭内置监控 */
+        post: operations["set_monitor_builtin_api_v1_tasks_monitor_builtins_commands_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tasks/notifications/mode": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 确认切换通知模式 */
+        post: operations["set_notifier_mode_api_v1_tasks_notifications_mode_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tasks/notifications/mode/prepare": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 准备切换通知模式 */
+        post: operations["prepare_notifier_mode_api_v1_tasks_notifications_mode_prepare_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/tasks/overview": {
         parameters: {
             query?: never;
@@ -2474,6 +3139,562 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /** AIBacktestConfirmRequest */
+        AIBacktestConfirmRequest: {
+            /**
+             * Command Id
+             * Format: uuid
+             */
+            command_id: string;
+            /** Config Sha256 */
+            config_sha256: string;
+            /**
+             * Prepared Request Id
+             * Format: uuid
+             */
+            prepared_request_id: string;
+            /** Proof Sha256 */
+            proof_sha256: string;
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+        };
+        /** AIBacktestConfirmation */
+        AIBacktestConfirmation: {
+            /**
+             * Job Id
+             * Format: uuid
+             */
+            job_id: string;
+            receipt: components["schemas"]["PageControlReceipt"];
+        };
+        /** AIBacktestPreparation */
+        AIBacktestPreparation: {
+            /** Candidate Count */
+            candidate_count: number;
+            /** Complete */
+            complete: boolean;
+            config: components["schemas"]["PortfolioBacktestConfig"];
+            /** Config Sha256 */
+            config_sha256: string;
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /** Execution Id */
+            execution_id: string;
+            /** Material Sha256 */
+            material_sha256: string;
+            /**
+             * Message
+             * @default 完整区间已准备。请核对默认策略，再确认回测。
+             */
+            message: string;
+            /** Proof Sha256 */
+            proof_sha256: string;
+            /**
+             * Request Id
+             * Format: uuid
+             */
+            request_id: string;
+            /** Trading Days */
+            trading_days: number;
+        };
+        /** AIBacktestPrepareRequest */
+        AIBacktestPrepareRequest: {
+            /**
+             * End Date
+             * Format: date
+             */
+            end_date: string;
+            /** Execution Id */
+            execution_id: string;
+            /**
+             * Request Id
+             * Format: uuid
+             */
+            request_id: string;
+            /**
+             * Start Date
+             * Format: date
+             */
+            start_date: string;
+        };
+        /** AICapabilities */
+        AICapabilities: {
+            /** Available */
+            available: boolean;
+            /** Can Generate */
+            can_generate: boolean;
+            /**
+             * Can Prepare Backtest
+             * @default false
+             */
+            can_prepare_backtest: boolean;
+            /** Daily Limit */
+            daily_limit?: number | null;
+            /** Message */
+            message?: string | null;
+            /** Remaining Calls */
+            remaining_calls?: number | null;
+        };
+        /** AICitedMetric */
+        AICitedMetric: {
+            /** Display Value */
+            display_value: string;
+            /** Fact Id */
+            fact_id: string;
+        };
+        /** AICitedText */
+        AICitedText: {
+            /**
+             * Citations
+             * @default []
+             */
+            citations: string[];
+            /** Text */
+            text: string;
+        };
+        /** AIInterpretationBinding */
+        AIInterpretationBinding: {
+            /** Facts Sha256 */
+            facts_sha256: string;
+            /** Model Id */
+            model_id: string;
+            result: components["schemas"]["AISealedResultBinding"];
+            /** Template Version */
+            template_version: string;
+        };
+        /** AIInterpretationContent */
+        AIInterpretationContent: {
+            interpretation: components["schemas"]["ValidatedInterpretation"];
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            purpose: "interpretation";
+        };
+        /** AIInterpretationContextRequest */
+        AIInterpretationContextRequest: {
+            /**
+             * Job Id
+             * Format: uuid
+             */
+            job_id: string;
+            /** Result Sha256 */
+            result_sha256: string;
+            /**
+             * Source Kind
+             * @enum {string}
+             */
+            source_kind: "portfolio" | "strategy_template";
+        };
+        /** AIInterpretationRequest */
+        AIInterpretationRequest: {
+            /**
+             * Job Id
+             * Format: uuid
+             */
+            job_id: string;
+            /** Manifest Sha256 */
+            manifest_sha256: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            purpose: "interpretation";
+            /**
+             * Request Id
+             * Format: uuid
+             */
+            request_id: string;
+            /** Result Sha256 */
+            result_sha256: string;
+            /**
+             * Source Kind
+             * @enum {string}
+             */
+            source_kind: "portfolio" | "strategy_template";
+            /** Spec Sha256 */
+            spec_sha256: string;
+        };
+        /** AIInterpretationView */
+        AIInterpretationView: {
+            binding: components["schemas"]["AISealedResultBinding"];
+            /** Cache Key */
+            cache_key: string;
+            content?: components["schemas"]["ValidatedInterpretation"] | null;
+            /**
+             * Facts
+             * @default []
+             */
+            facts: components["schemas"]["AISealedFact"][];
+            /** Message */
+            message?: string | null;
+        };
+        /** AINewsCitation */
+        AINewsCitation: {
+            /** Body End */
+            body_end: number;
+            /** Body Sha256 */
+            body_sha256: string;
+            /** Body Start */
+            body_start: number;
+            /** Document Id */
+            document_id: string;
+            /** Fact Id */
+            fact_id: string;
+            /**
+             * Nature
+             * @enum {string}
+             */
+            nature: "actual" | "forecast" | "context";
+            /** Period End */
+            period_end?: string | null;
+            /** Quote */
+            quote: string;
+            /** Source Path */
+            source_path: string;
+        };
+        /** AINewsContent */
+        AINewsContent: {
+            /** Citations */
+            citations: components["schemas"]["AINewsCitation"][];
+            /** Coverage */
+            coverage: components["schemas"]["StockNewsCoverage"][];
+            digest: components["schemas"]["ValidatedStockNewsDigest"];
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            purpose: "news_digest";
+            /** Sources */
+            sources: components["schemas"]["AINewsSource"][];
+        };
+        /** AINewsProgress */
+        AINewsProgress: {
+            /** Complete */
+            complete: boolean;
+            /** Completed */
+            completed: number;
+            /**
+             * End Date
+             * Format: date
+             */
+            end_date: string;
+            /** Pending */
+            pending: number;
+            /**
+             * Request Id
+             * Format: uuid
+             */
+            request_id: string;
+            /** Scope Sha256 */
+            scope_sha256: string;
+            /**
+             * Start Date
+             * Format: date
+             */
+            start_date: string;
+            /** Total */
+            total: number;
+            /** Unknown */
+            unknown: number;
+        };
+        /** AINewsRequest */
+        AINewsRequest: {
+            /** Context Sha256 */
+            context_sha256: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            purpose: "news_digest";
+            /**
+             * Request Id
+             * Format: uuid
+             */
+            request_id: string;
+            /** Stock Code */
+            stock_code: string;
+        };
+        /** AINewsSource */
+        AINewsSource: {
+            /** Body Date */
+            body_date: string | null;
+            /** Document Id */
+            document_id: string;
+            /**
+             * First Collected At
+             * Format: date-time
+             */
+            first_collected_at: string;
+            /** Provider */
+            provider: string;
+            /** Published At */
+            published_at: string | null;
+            /** Published Date */
+            published_date: string | null;
+            /** Source Kind */
+            source_kind: string;
+            /** Title */
+            title: string;
+            /** Url */
+            url: string;
+        };
+        /** AIPoolDraft */
+        AIPoolDraft: {
+            base: components["schemas"]["EditablePool"];
+            /** Base Generation Id */
+            base_generation_id: string;
+            /** Changes */
+            changes: components["schemas"]["PoolRuleChange"][];
+            /** Hit Count */
+            hit_count?: number | null;
+            /**
+             * Message
+             * @default 建议已生成。应用后请预览，再确认保存。
+             */
+            message: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            purpose: "pool_edit";
+            /** Rule Calls */
+            rule_calls: components["schemas"]["EditorRuleCall"][];
+        };
+        /** AIPoolRequest */
+        AIPoolRequest: {
+            /** Expected Version */
+            expected_version: string;
+            /** Generation Id */
+            generation_id: string;
+            /** Instruction */
+            instruction: string;
+            /** Pool Key */
+            pool_key: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            purpose: "pool_edit";
+            /**
+             * Request Id
+             * Format: uuid
+             */
+            request_id: string;
+        };
+        /** AIRequestView */
+        AIRequestView: {
+            /** Completed At */
+            completed_at?: string | null;
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /** Message */
+            message?: string | null;
+            /**
+             * Purpose
+             * @enum {string}
+             */
+            purpose: "screen" | "pool_edit" | "interpretation" | "news_digest";
+            /**
+             * Request Id
+             * Format: uuid
+             */
+            request_id: string;
+            /** Result */
+            result?: (components["schemas"]["AIScreenDraft"] | components["schemas"]["AIPoolDraft"] | components["schemas"]["AIInterpretationContent"] | components["schemas"]["AINewsContent"]) | null;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "reserved" | "dispatched" | "completed" | "unknown" | "not_dispatched";
+        };
+        /** AIScreenDraft */
+        AIScreenDraft: {
+            definition: components["schemas"]["ScreenQueryDefinition"];
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            purpose: "screen";
+        };
+        /** AIScreenRequest */
+        AIScreenRequest: {
+            /**
+             * Include Ranking
+             * @default true
+             */
+            include_ranking: boolean;
+            /** Instruction */
+            instruction: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            purpose: "screen";
+            /**
+             * Request Id
+             * Format: uuid
+             */
+            request_id: string;
+            /** Source Identity */
+            source_identity: string;
+            /**
+             * Source Kind
+             * @enum {string}
+             */
+            source_kind: "serving" | "replica";
+            /**
+             * Trade Date
+             * Format: date
+             */
+            trade_date: string;
+        };
+        /** AISealedFact */
+        AISealedFact: {
+            /**
+             * Decimals
+             * @default 2
+             */
+            decimals: number;
+            /** Derivation Sha256 */
+            derivation_sha256?: string | null;
+            /** Fact Id */
+            fact_id: string;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "number" | "date" | "text";
+            /** Label */
+            label: string;
+            /** Source Path */
+            source_path: string;
+            /** Source Sha256 */
+            source_sha256: string;
+            /**
+             * Unit
+             * @default
+             * @enum {string}
+             */
+            unit: "" | "%" | "元" | "天" | "次" | "倍" | "亿元" | "万元" | "股" | "年" | "条";
+            /** Value */
+            value: string | null;
+        };
+        /** AISealedResultBinding */
+        AISealedResultBinding: {
+            /**
+             * Job Id
+             * Format: uuid
+             */
+            job_id: string;
+            /** Manifest Sha256 */
+            manifest_sha256: string;
+            /** Owner Uid */
+            owner_uid: string;
+            /** Result Sha256 */
+            result_sha256: string;
+            /**
+             * Source Kind
+             * @enum {string}
+             */
+            source_kind: "portfolio" | "strategy_template";
+            /** Spec Sha256 */
+            spec_sha256: string;
+        };
+        /** AIStockNewsView */
+        AIStockNewsView: {
+            content?: components["schemas"]["AINewsContent"] | null;
+            /** Context Sha256 */
+            context_sha256?: string | null;
+            /**
+             * Coverage
+             * @default []
+             */
+            coverage: components["schemas"]["StockNewsCoverage"][];
+            /** Message */
+            message?: string | null;
+            /**
+             * Nightly Enabled
+             * @default false
+             */
+            nightly_enabled: boolean;
+            progress?: components["schemas"]["AINewsProgress"] | null;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "missing" | "collected" | "ready";
+            /** Stock Code */
+            stock_code: string;
+        };
+        /** AIUsageDay */
+        AIUsageDay: {
+            /** Calls */
+            calls: number;
+            /**
+             * Day
+             * Format: date
+             */
+            day: string;
+            /** Input Tokens */
+            input_tokens?: number | null;
+            /** Known Input Tokens */
+            known_input_tokens: number;
+            /** Known Output Tokens */
+            known_output_tokens: number;
+            /** Output Tokens */
+            output_tokens?: number | null;
+            /** Unknown Usage Calls */
+            unknown_usage_calls: number;
+        };
+        /** AIUsageSummary */
+        AIUsageSummary: {
+            /** Calls */
+            calls: number;
+            /** Days */
+            days: components["schemas"]["AIUsageDay"][];
+            /**
+             * End Date
+             * Format: date
+             */
+            end_date: string;
+            /** Input Tokens */
+            input_tokens?: number | null;
+            /** Known Input Tokens */
+            known_input_tokens: number;
+            /** Known Output Tokens */
+            known_output_tokens: number;
+            /** Output Tokens */
+            output_tokens?: number | null;
+            /**
+             * Start Date
+             * Format: date
+             */
+            start_date: string;
+            /** Unknown Usage Calls */
+            unknown_usage_calls: number;
+        };
+        /** AIUsageView */
+        AIUsageView: {
+            /** Available */
+            available: boolean;
+            /** Daily Limit */
+            daily_limit?: number | null;
+            /** Message */
+            message?: string | null;
+            /** Remaining Calls */
+            remaining_calls?: number | null;
+            summary?: components["schemas"]["AIUsageSummary"] | null;
+        };
         /** AckCommandConflict */
         AckCommandConflict: {
             /** Code */
@@ -2537,6 +3758,48 @@ export interface components {
              * @enum {string}
              */
             state: "unavailable" | "historical" | "unconfirmed" | "confirmed";
+        };
+        /** ApprovePromotion */
+        "ApprovePromotion-Input": {
+            /** Command Id */
+            command_id: string;
+            /** Entered Name */
+            entered_name: string;
+            /** Generation Id */
+            generation_id: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "approve_promotion";
+            preparation: components["schemas"]["PreparedPromotionApproval-Input"];
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+            target: components["schemas"]["StrategyPromotionTarget"];
+        };
+        /** ApprovePromotion */
+        "ApprovePromotion-Output": {
+            /** Command Id */
+            command_id: string;
+            /** Entered Name */
+            entered_name: string;
+            /** Generation Id */
+            generation_id: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "approve_promotion";
+            preparation: components["schemas"]["PreparedPromotionApproval-Output"];
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+            target: components["schemas"]["StrategyPromotionTarget"];
         };
         /** ArchiveStrategyTemplate */
         ArchiveStrategyTemplate: {
@@ -3904,6 +5167,51 @@ export interface components {
             /** Row Count */
             row_count: number;
         };
+        /** CollaborationMe */
+        CollaborationMe: {
+            /** Available */
+            available: boolean;
+            /**
+             * Can Manage Users
+             * @default false
+             */
+            can_manage_users: boolean;
+            /**
+             * Can Read Audit
+             * @default false
+             */
+            can_read_audit: boolean;
+            /**
+             * Can Research
+             * @default false
+             */
+            can_research: boolean;
+            /** Message */
+            message?: string | null;
+            /**
+             * Mode
+             * @enum {string}
+             */
+            mode: "legacy" | "enforced";
+            /** Revision */
+            revision?: number | null;
+            /** Role */
+            role?: ("admin" | "researcher" | "viewer") | null;
+            /** State Sha256 */
+            state_sha256?: string | null;
+            /** Username */
+            username?: string | null;
+        };
+        /** CollaborationRoleLookup */
+        CollaborationRoleLookup: {
+            command: components["schemas"]["SetUserRoleCommand"];
+        };
+        /** CollaborationRoleSubmit */
+        CollaborationRoleSubmit: {
+            command: components["schemas"]["SetUserRoleCommand"];
+            /** Issuance Proof */
+            issuance_proof: string;
+        };
         /** CollectionDatasetView */
         CollectionDatasetView: {
             /** Completed Through */
@@ -3921,6 +5229,94 @@ export interface components {
             status: "verified" | "partial" | "unconfirmed";
             /** Status Label */
             status_label: string;
+        };
+        /** CommandAuditItem */
+        CommandAuditItem: {
+            /** Actor Id */
+            actor_id: string | null;
+            /** Actor Label */
+            actor_label: string;
+            /** Command Hash */
+            command_hash: string;
+            /** Command Id */
+            command_id: string;
+            /** Command Kind */
+            command_kind: string;
+            /**
+             * Command Status
+             * @enum {string}
+             */
+            command_status: "pending" | "processing" | "succeeded" | "failed" | "ambiguous";
+            /** Completed At */
+            completed_at: string | null;
+            /** Effect Completed At */
+            effect_completed_at: string | null;
+            /** Effect Started At */
+            effect_started_at: string | null;
+            /** Effect Status */
+            effect_status: ("started" | "succeeded" | "failed" | "ambiguous") | null;
+            /**
+             * Enqueued At
+             * Format: date-time
+             */
+            enqueued_at: string;
+            /**
+             * Outcome
+             * @enum {string}
+             */
+            outcome: "pending" | "processing" | "accepted" | "processed" | "failed" | "ambiguous";
+            /**
+             * Schema Version
+             * @default 1
+             * @constant
+             */
+            schema_version: 1;
+            /** Summary */
+            summary: string;
+        };
+        /** CommandAuditPage */
+        CommandAuditPage: {
+            /** Items */
+            items: components["schemas"]["CommandAuditItem"][];
+            /** Next Cursor */
+            next_cursor: string | null;
+            /** Role Revision */
+            role_revision: number;
+            /**
+             * Schema Version
+             * @default 1
+             * @constant
+             */
+            schema_version: 1;
+            /** Source Generation */
+            source_generation: string;
+        };
+        /** CommandSubmissionReceipt */
+        CommandSubmissionReceipt: {
+            /**
+             * Command Type
+             * @enum {string}
+             */
+            command_type: "submit" | "pause" | "resume" | "cancel" | "retry";
+            /** Expected Version */
+            expected_version?: number | null;
+            /**
+             * Job Id
+             * Format: uuid
+             */
+            job_id: string;
+            /**
+             * Request Id
+             * Format: uuid
+             */
+            request_id: string;
+            /**
+             * Result
+             * @default submitted
+             * @constant
+             */
+            result: "submitted";
+            spool: components["schemas"]["SubmissionSpoolIdentity"];
         };
         /** ConditionAlertBarCloseFrequency */
         ConditionAlertBarCloseFrequency: {
@@ -5133,6 +6529,41 @@ export interface components {
             /** Name */
             name: string;
         };
+        /** Envelope[AIBacktestConfirmation] */
+        Envelope_AIBacktestConfirmation_: {
+            data: components["schemas"]["AIBacktestConfirmation"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[AIBacktestPreparation] */
+        Envelope_AIBacktestPreparation_: {
+            data: components["schemas"]["AIBacktestPreparation"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[AICapabilities] */
+        Envelope_AICapabilities_: {
+            data: components["schemas"]["AICapabilities"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[AIInterpretationView] */
+        Envelope_AIInterpretationView_: {
+            data: components["schemas"]["AIInterpretationView"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[AIRequestView] */
+        Envelope_AIRequestView_: {
+            data: components["schemas"]["AIRequestView"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[AIStockNewsView] */
+        Envelope_AIStockNewsView_: {
+            data: components["schemas"]["AIStockNewsView"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[AIUsageView] */
+        Envelope_AIUsageView_: {
+            data: components["schemas"]["AIUsageView"];
+            serving: components["schemas"]["ServingMeta"];
+        };
         /** Envelope[AuditReportCalendarData] */
         Envelope_AuditReportCalendarData_: {
             data: components["schemas"]["AuditReportCalendarData"];
@@ -5171,6 +6602,16 @@ export interface components {
         /** Envelope[CatalogList] */
         Envelope_CatalogList_: {
             data: components["schemas"]["CatalogList"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[CollaborationMe] */
+        Envelope_CollaborationMe_: {
+            data: components["schemas"]["CollaborationMe"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[CommandAuditPage] */
+        Envelope_CommandAuditPage_: {
+            data: components["schemas"]["CommandAuditPage"];
             serving: components["schemas"]["ServingMeta"];
         };
         /** Envelope[ConditionAlertRuleHeadData] */
@@ -5343,6 +6784,11 @@ export interface components {
             data: components["schemas"]["IntradayData"];
             serving: components["schemas"]["ServingMeta"];
         };
+        /** Envelope[IssuedRolePreparation] */
+        Envelope_IssuedRolePreparation_: {
+            data: components["schemas"]["IssuedRolePreparation"];
+            serving: components["schemas"]["ServingMeta"];
+        };
         /** Envelope[ManualWatchlistExactData] */
         Envelope_ManualWatchlistExactData_: {
             data: components["schemas"]["ManualWatchlistExactData"];
@@ -5363,9 +6809,69 @@ export interface components {
             data: components["schemas"]["MetaData"];
             serving: components["schemas"]["ServingMeta"];
         };
+        /** Envelope[MinuteCapabilities] */
+        Envelope_MinuteCapabilities_: {
+            data: components["schemas"]["MinuteCapabilities"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[MinuteJobsData] */
+        Envelope_MinuteJobsData_: {
+            data: components["schemas"]["MinuteJobsData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[MinuteNavData] */
+        Envelope_MinuteNavData_: {
+            data: components["schemas"]["MinuteNavData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[MinuteParameterSourcesData] */
+        Envelope_MinuteParameterSourcesData_: {
+            data: components["schemas"]["MinuteParameterSourcesData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[MinuteRowsData] */
+        Envelope_MinuteRowsData_: {
+            data: components["schemas"]["MinuteRowsData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[MinuteSourcesData] */
+        Envelope_MinuteSourcesData_: {
+            data: components["schemas"]["MinuteSourcesData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[MinuteStudiesData] */
+        Envelope_MinuteStudiesData_: {
+            data: components["schemas"]["MinuteStudiesData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[MinuteStudyCapabilitiesData] */
+        Envelope_MinuteStudyCapabilitiesData_: {
+            data: components["schemas"]["MinuteStudyCapabilitiesData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[MinuteStudyHeatmapData] */
+        Envelope_MinuteStudyHeatmapData_: {
+            data: components["schemas"]["MinuteStudyHeatmapData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[MinuteStudyResultData] */
+        Envelope_MinuteStudyResultData_: {
+            data: components["schemas"]["MinuteStudyResultData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[MinuteSummaryData] */
+        Envelope_MinuteSummaryData_: {
+            data: components["schemas"]["MinuteSummaryData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
         /** Envelope[MonitorChannelsData] */
         Envelope_MonitorChannelsData_: {
             data: components["schemas"]["MonitorChannelsData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[MonitorRuntimeData] */
+        Envelope_MonitorRuntimeData_: {
+            data: components["schemas"]["MonitorRuntimeData"];
             serving: components["schemas"]["ServingMeta"];
         };
         /** Envelope[MonitorTimelineData] */
@@ -5376,6 +6882,11 @@ export interface components {
         /** Envelope[OverviewData] */
         Envelope_OverviewData_: {
             data: components["schemas"]["OverviewData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[PageControlReceipt] */
+        Envelope_PageControlReceipt_: {
+            data: components["schemas"]["PageControlReceipt"];
             serving: components["schemas"]["ServingMeta"];
         };
         /** Envelope[PaperAccountsData] */
@@ -5498,6 +7009,16 @@ export interface components {
             data: components["schemas"]["ResearchJobsData"];
             serving: components["schemas"]["ServingMeta"];
         };
+        /** Envelope[RoleLookupData] */
+        Envelope_RoleLookupData_: {
+            data: components["schemas"]["RoleLookupData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[RoleState] */
+        Envelope_RoleState_: {
+            data: components["schemas"]["RoleState"];
+            serving: components["schemas"]["ServingMeta"];
+        };
         /** Envelope[ScreenCatalogData] */
         Envelope_ScreenCatalogData_: {
             data: components["schemas"]["ScreenCatalogData"];
@@ -5521,6 +7042,16 @@ export interface components {
         /** Envelope[StrategyCatalogData] */
         Envelope_StrategyCatalogData_: {
             data: components["schemas"]["StrategyCatalogData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[StrategyPromotionCommandData] */
+        Envelope_StrategyPromotionCommandData_: {
+            data: components["schemas"]["StrategyPromotionCommandData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[StrategyPromotionData] */
+        Envelope_StrategyPromotionData_: {
+            data: components["schemas"]["StrategyPromotionData"];
             serving: components["schemas"]["ServingMeta"];
         };
         /** Envelope[StrategyTemplateCatalogData] */
@@ -5923,7 +7454,8 @@ export interface components {
              * @default false
              */
             cancellation_pending: boolean;
-            configuration: components["schemas"]["PortfolioEditableConfig-Output"];
+            /** Configuration */
+            configuration: components["schemas"]["PortfolioEditableConfig-Output"] | components["schemas"]["NativeMinuteConfiguration"];
             /** Experiment Id */
             experiment_id: string;
             /** Family Id */
@@ -6131,7 +7663,8 @@ export interface components {
              * @default []
              */
             preparations: components["schemas"]["ExperimentPreparationRow"][];
-            protocol: components["schemas"]["PortfolioExperimentProtocol"];
+            /** Protocol */
+            protocol: components["schemas"]["PortfolioExperimentProtocol"] | components["schemas"]["MinuteExperimentProtocol"];
             /**
              * Registered At
              * Format: date-time
@@ -6271,6 +7804,46 @@ export interface components {
             /** Truncated */
             truncated: boolean;
         };
+        /** ExperimentNativeParameter */
+        ExperimentNativeParameter: {
+            /** Display Value */
+            display_value?: string | null;
+            /** Label */
+            label?: string | null;
+            /** Name */
+            name: string;
+            value: components["schemas"]["JsonValue"];
+        };
+        /** ExperimentNativeResultIdentity */
+        ExperimentNativeResultIdentity: {
+            /** Content Hash */
+            content_hash: string;
+            /** Core Input Hash */
+            core_input_hash: string;
+            /**
+             * Execution
+             * @default minute_runtime_replay@2
+             * @constant
+             */
+            execution: "minute_runtime_replay@2";
+            execution_costs: components["schemas"]["ExecutionCostSpec"];
+            execution_profile?: components["schemas"]["MinuteReplayExecutionProfile"] | null;
+            /**
+             * Parameters
+             * @default []
+             */
+            parameters: components["schemas"]["ExperimentNativeParameter"][];
+            /** Profile Hash */
+            profile_hash: string;
+            /** Seed Hash */
+            seed_hash: string;
+            /**
+             * Source Kind
+             * @enum {string}
+             */
+            source_kind: "captured" | "reconstructed";
+            target: components["schemas"]["StrategyPromotionTarget"];
+        };
         /** ExperimentNoteWrite */
         ExperimentNoteWrite: {
             /**
@@ -6371,7 +7944,8 @@ export interface components {
         };
         /** ExperimentPreparationRow */
         ExperimentPreparationRow: {
-            configuration: components["schemas"]["PortfolioEditableConfig-Output"];
+            /** Configuration */
+            configuration: components["schemas"]["PortfolioEditableConfig-Output"] | components["schemas"]["NativeMinuteConfiguration"];
             /**
              * Definition State
              * @enum {string}
@@ -6404,7 +7978,8 @@ export interface components {
         ExperimentResultData: {
             /** Basis Hash */
             basis_hash: string;
-            configuration: components["schemas"]["PortfolioEditableConfig-Output"];
+            /** Configuration */
+            configuration: components["schemas"]["PortfolioEditableConfig-Output"] | components["schemas"]["NativeMinuteConfiguration"];
             /** Curves */
             curves: components["schemas"]["ExperimentCurvePoint"][];
             /** Experiment Id */
@@ -6422,6 +7997,7 @@ export interface components {
             manifest_hash: string;
             /** Metrics */
             metrics: components["schemas"]["ExperimentMetric"][];
+            native?: components["schemas"]["ExperimentNativeResultIdentity"] | null;
             performance: components["schemas"]["PortfolioPerformance"];
             /**
              * Phase
@@ -6448,7 +8024,8 @@ export interface components {
              * @enum {string}
              */
             kind: "register_experiment_family";
-            request: components["schemas"]["ExperimentEditableRequest"];
+            /** Request */
+            request: components["schemas"]["ExperimentEditableRequest"] | components["schemas"]["NativeMinuteExperimentRequest"];
             /**
              * Requested At
              * Format: date-time
@@ -7572,6 +9149,11 @@ export interface components {
             availability: "unavailable" | "empty" | "not_found" | "ready";
             /** Available At */
             available_at: string | null;
+            /**
+             * Can Report
+             * @default false
+             */
+            can_report: boolean;
             /** Research */
             research: components["schemas"]["FactorResearchDisplay"] | components["schemas"]["FactorStreamResearchDisplay"] | null;
             result: components["schemas"]["FactorResultItem"] | null;
@@ -8774,9 +10356,154 @@ export interface components {
             errors: components["schemas"]["ErrorItem"][];
             /** Freshness */
             freshness: components["schemas"]["FreshnessItem"][];
+            /** Layers */
+            layers?: components["schemas"]["HealthLayer"][];
             page_data: components["schemas"]["PageDataStatus"];
             /** Services */
             services: components["schemas"]["ServiceItem"][];
+            /** Viewer Id */
+            viewer_id?: string | null;
+        };
+        /** HealthExposureItem */
+        HealthExposureItem: {
+            /** Benchmark Weight */
+            benchmark_weight: string;
+            /** Deviation */
+            deviation: string;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "industry" | "unknown" | "cash";
+            link: components["schemas"]["HealthLink"];
+            /** Name */
+            name: string;
+            /**
+             * Observed At
+             * Format: date-time
+             */
+            observed_at: string;
+            /** Portfolio Weight */
+            portfolio_weight: string;
+            /** Scope Detail */
+            scope_detail: string;
+            /** Scope Key */
+            scope_key: string;
+            /** Scope Label */
+            scope_label: string;
+            /** Source Generation Id */
+            source_generation_id: string;
+            /** Source Identity */
+            source_identity: string;
+            /** Source Name */
+            source_name: string;
+            /** Valid Until */
+            valid_until: string | null;
+        };
+        /** HealthLayer */
+        HealthLayer: {
+            /** Exposure */
+            exposure?: components["schemas"]["HealthExposureItem"][];
+            /**
+             * Key
+             * @enum {string}
+             */
+            key: "host" | "market" | "strategy" | "orders" | "risk" | "comparison";
+            /** Links */
+            links: components["schemas"]["HealthLink"][];
+            /** Metrics */
+            metrics: components["schemas"]["HealthMetricItem"][];
+            /** Name */
+            name: string;
+            /** Observed At */
+            observed_at: string | null;
+            status: components["schemas"]["StatusInfo"];
+        };
+        /** HealthLink */
+        HealthLink: {
+            /** Href */
+            href: string;
+            /** Label */
+            label: string;
+        };
+        /** HealthMetricItem */
+        HealthMetricItem: {
+            /** Available */
+            available: boolean;
+            /**
+             * Available At
+             * Format: date-time
+             */
+            available_at: string;
+            /**
+             * Event Time End
+             * Format: date-time
+             */
+            event_time_end: string;
+            /**
+             * Event Time Start
+             * Format: date-time
+             */
+            event_time_start: string;
+            /** Key */
+            key: string;
+            link: components["schemas"]["HealthLink"];
+            /** Name */
+            name: string;
+            /**
+             * Observed At
+             * Format: date-time
+             */
+            observed_at: string;
+            /** Scope Detail */
+            scope_detail: string;
+            /** Scope Label */
+            scope_label: string;
+            /** Source Generation Id */
+            source_generation_id: string;
+            /** Source Name */
+            source_name: string;
+            status: components["schemas"]["StatusInfo"];
+            /**
+             * Temporal Basis
+             * @enum {string}
+             */
+            temporal_basis: "realtime" | "as_of" | "unknown";
+            /** Unit */
+            unit: string;
+            /** Valid Until */
+            valid_until: string | null;
+            /** Value */
+            value: number | string | null;
+        };
+        /** HealthObservation */
+        HealthObservation: {
+            /** Key */
+            key: string;
+            /** Label */
+            label: string;
+            /** Value */
+            value: number;
+        };
+        /** HealthServiceDetail */
+        HealthServiceDetail: {
+            /** Available */
+            available: boolean;
+            /** Degraded Reason */
+            degraded_reason: string | null;
+            /** Observations */
+            observations: components["schemas"]["HealthObservation"][];
+            /**
+             * Observed At
+             * Format: date-time
+             */
+            observed_at: string;
+            /** Reason */
+            reason: string;
+            /** Source Name */
+            source_name: string;
+            /** Started At */
+            started_at: string | null;
         };
         /** HistogramBin */
         HistogramBin: {
@@ -8876,6 +10603,16 @@ export interface components {
             /** Selector Id */
             selector_id: string;
         };
+        /** InterpretationSection */
+        InterpretationSection: {
+            /**
+             * Key
+             * @enum {string}
+             */
+            key: "overview" | "annual" | "risk" | "suggestions";
+            /** Paragraphs */
+            paragraphs: components["schemas"]["AICitedText"][];
+        };
         /** IntradayData */
         IntradayData: {
             /** Bars */
@@ -8888,6 +10625,12 @@ export interface components {
             name: string | null;
             /** Ts Code */
             ts_code: string;
+        };
+        /** IssuedRolePreparation */
+        IssuedRolePreparation: {
+            /** Issuance Proof */
+            issuance_proof: string;
+            preparation: components["schemas"]["PreparedUserRoleChange"];
         };
         /** JobCounts */
         JobCounts: {
@@ -9169,6 +10912,7 @@ export interface components {
         };
         /** MetaData */
         MetaData: {
+            collaboration?: components["schemas"]["CollaborationMe"] | null;
             /** Datasets */
             datasets: components["schemas"]["DatasetWatermarkInfo"][];
             generation: components["schemas"]["GenerationInfo"] | null;
@@ -9201,6 +10945,131 @@ export interface components {
              */
             status: "reachable" | "unreachable";
         };
+        /** MinuteAuctionGapParameters */
+        MinuteAuctionGapParameters: {
+            /** End Date */
+            end_date: string;
+            /**
+             * Entry Mode
+             * @default vwap_push
+             * @constant
+             */
+            entry_mode: "vwap_push";
+            /**
+             * Entry Pullback Tolerance Pct
+             * @default 0.02
+             */
+            entry_pullback_tolerance_pct: number;
+            /**
+             * Entry Start Time
+             * Format: time
+             * @default 09:31:00
+             */
+            entry_start_time: string;
+            /**
+             * Entry Vwap Buffer Pct
+             * @default 0
+             */
+            entry_vwap_buffer_pct: number;
+            /** Factor Score Threshold */
+            factor_score_threshold?: number | null;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            family: "auction_gap";
+            /**
+             * Freq
+             * @default 1min
+             * @enum {string}
+             */
+            freq: "1min" | "5min" | "15min" | "30min" | "60min";
+            /**
+             * Gap Mode
+             * @default close
+             * @enum {string}
+             */
+            gap_mode: "close" | "strict_high";
+            /**
+             * Max Auction Vol Ratio 5D
+             * @default 5
+             */
+            max_auction_vol_ratio_5d: number;
+            /**
+             * Max Hold Days
+             * @default 1
+             */
+            max_hold_days: number;
+            /**
+             * Min Auction Vol Ratio 5D
+             * @default 0.15
+             */
+            min_auction_vol_ratio_5d: number;
+            /**
+             * Min Limit Progress Pct
+             * @default 0.2
+             */
+            min_limit_progress_pct: number;
+            /**
+             * Next Auction Weak Gap Pct
+             * @default -0.01
+             */
+            next_auction_weak_gap_pct: number;
+            /** Next Day Price Policy */
+            next_day_price_policy?: "keep_candidate_mark_unavailable" | null;
+            /**
+             * Next Morning Exit Until
+             * Format: time
+             * @default 10:00:00
+             */
+            next_morning_exit_until: string;
+            /**
+             * Next Morning Vwap Break Buffer Pct
+             * @default 0.003
+             */
+            next_morning_vwap_break_buffer_pct: number;
+            paper?: components["schemas"]["MinutePaperParameters"];
+            /**
+             * Price Tol
+             * @default 0.01
+             */
+            price_tol: number;
+            /**
+             * Seal Hold Enabled
+             * @default false
+             */
+            seal_hold_enabled: boolean;
+            /**
+             * Seal Hold Max Days
+             * @default 3
+             */
+            seal_hold_max_days: number;
+            /**
+             * Seal Hold Max Open Times
+             * @default 0
+             */
+            seal_hold_max_open_times: number;
+            /** Seal Hold Min Fd To Circ Pct */
+            seal_hold_min_fd_to_circ_pct?: number | null;
+            /**
+             * St Filter
+             * @default case_insensitive
+             * @enum {string}
+             */
+            st_filter: "case_insensitive" | "literal_lower" | "none";
+            /** Start Date */
+            start_date: string;
+            /**
+             * Strong Seal Min Close Minutes
+             * @default 3
+             */
+            strong_seal_min_close_minutes: number;
+            /**
+             * Strong Seal Weak Gap Pct
+             * @default -0.03
+             */
+            strong_seal_weak_gap_pct: number;
+        };
         /** MinuteBar */
         MinuteBar: {
             /** Avg Price */
@@ -9223,6 +11092,1883 @@ export interface components {
             t: string;
             /** Volume */
             volume: number | null;
+        };
+        /** MinuteCapabilities */
+        MinuteCapabilities: {
+            /** Available */
+            available: boolean;
+            /**
+             * Can Export
+             * @default false
+             */
+            can_export: boolean;
+            /** Can Run */
+            can_run: boolean;
+            /** Message */
+            message?: string | null;
+            /**
+             * Source Count
+             * @default 0
+             */
+            source_count: number;
+            /**
+             * Source Unavailable Count
+             * @default 0
+             */
+            source_unavailable_count: number;
+            /**
+             * Valuation Basis
+             * @default pit_asof_15:00
+             * @constant
+             */
+            valuation_basis: "pit_asof_15:00";
+        };
+        /** MinuteCommandReceipt */
+        MinuteCommandReceipt: {
+            /** Byte Size */
+            byte_size?: number | null;
+            /**
+             * Command Id
+             * Format: uuid
+             */
+            command_id: string;
+            /** Job Id */
+            job_id?: string | null;
+            /** Message */
+            message: string;
+            /** Result Hash */
+            result_hash?: string | null;
+            /** Sha256 */
+            sha256?: string | null;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "pending" | "processing" | "unknown" | "submitted" | "failed" | "conflict" | "exported";
+            /** Zip Request Id */
+            zip_request_id?: string | null;
+        };
+        /** MinuteCreateRequest */
+        MinuteCreateRequest: {
+            /**
+             * Command Id
+             * Format: uuid
+             */
+            command_id: string;
+            /** Config */
+            config: components["schemas"]["MinuteRunConfig"] | components["schemas"]["MinuteParameterRunConfig"];
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+        };
+        /** MinuteExperimentProtocol */
+        MinuteExperimentProtocol: {
+            frozen_outer_test_range: components["schemas"]["DateRange"];
+            train_range: components["schemas"]["DateRange"];
+            validation_range: components["schemas"]["DateRange"];
+        };
+        /** MinuteExportRequest */
+        MinuteExportRequest: {
+            /**
+             * Command Id
+             * Format: uuid
+             */
+            command_id: string;
+            /**
+             * Job Id
+             * Format: uuid
+             */
+            job_id: string;
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+            /** Result Hash */
+            result_hash: string;
+        };
+        /** MinuteGrowthParameters */
+        MinuteGrowthParameters: {
+            /**
+             * Board Hist Days
+             * @default 3
+             */
+            board_hist_days: number;
+            /**
+             * Enable Factor Confirm
+             * @default false
+             */
+            enable_factor_confirm: boolean;
+            /**
+             * Factor Score Threshold
+             * @default 45
+             */
+            factor_score_threshold: number;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            family: "growth_board_surge";
+            /**
+             * Freq
+             * @default 1min
+             * @enum {string}
+             */
+            freq: "1min" | "5min" | "15min" | "30min" | "60min";
+            /**
+             * Fresh Lookback Days
+             * @default 5
+             */
+            fresh_lookback_days: number;
+            /**
+             * Fresh Max Prior Volume Ratio
+             * @default 2
+             */
+            fresh_max_prior_volume_ratio: number;
+            /**
+             * Lookback Days
+             * @default 20
+             */
+            lookback_days: number;
+            /**
+             * Max Hold Days
+             * @default 3
+             */
+            max_hold_days: number;
+            /**
+             * Max Inner Outer Ratio
+             * @default 1
+             */
+            max_inner_outer_ratio: number;
+            /**
+             * Min Amount Accel 5M
+             * @default 2
+             */
+            min_amount_accel_5m: number;
+            /**
+             * Min Board Auction Amount Ratio
+             * @default 1
+             */
+            min_board_auction_amount_ratio: number;
+            /**
+             * Min Board Gap Up Ratio
+             * @default 0.5
+             */
+            min_board_gap_up_ratio: number;
+            /**
+             * Min Cum Amount Ratio
+             * @default 1.4
+             */
+            min_cum_amount_ratio: number;
+            /**
+             * Min Hist Days
+             * @default 10
+             */
+            min_hist_days: number;
+            /**
+             * Min Large Net Vol
+             * @default 0
+             */
+            min_large_net_vol: number;
+            /**
+             * Min Listing Trading Days
+             * @default 0
+             */
+            min_listing_trading_days: number;
+            /**
+             * Min Same Minute Amount Ratio
+             * @default 2
+             */
+            min_same_minute_amount_ratio: number;
+            /**
+             * Min Signal Time
+             * Format: time
+             * @default 09:30:00
+             */
+            min_signal_time: string;
+            paper?: components["schemas"]["MinutePaperParameters"];
+            /**
+             * Price Tol
+             * @default 0.01
+             */
+            price_tol: number;
+            /**
+             * Require Board Favor
+             * @default false
+             */
+            require_board_favor: boolean;
+            /**
+             * Require Fresh Surge
+             * @default false
+             */
+            require_fresh_surge: boolean;
+            /**
+             * Require Inner Outer
+             * @default false
+             */
+            require_inner_outer: boolean;
+            /**
+             * Require Large Net Vol
+             * @default false
+             */
+            require_large_net_vol: boolean;
+            /**
+             * Require Vwap Strength
+             * @default true
+             */
+            require_vwap_strength: boolean;
+            /**
+             * Use Accel Surge
+             * @default true
+             */
+            use_accel_surge: boolean;
+            /**
+             * Use Same Minute Surge
+             * @default true
+             */
+            use_same_minute_surge: boolean;
+            /**
+             * Vwap Buffer Pct
+             * @default 0
+             */
+            vwap_buffer_pct: number;
+        };
+        /** MinuteJob */
+        MinuteJob: {
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /**
+             * End Date
+             * Format: date
+             */
+            end_date: string;
+            /** Full Input Hash */
+            full_input_hash: string;
+            /**
+             * Job Id
+             * Format: uuid
+             */
+            job_id: string;
+            /**
+             * Native Id
+             * @enum {string}
+             */
+            native_id: "n_shape" | "auction_gap" | "growth_board_surge";
+            /** Native Name */
+            native_name: string;
+            /** Native Version */
+            native_version: number;
+            /** Result Hash */
+            result_hash: string | null;
+            /** Source Key */
+            source_key: string;
+            /** Source Version */
+            source_version: number;
+            /** Spec Hash */
+            spec_hash: string;
+            /**
+             * Start Date
+             * Format: date
+             */
+            start_date: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "queued" | "running" | "paused" | "cancelled" | "failed" | "sealing" | "completed";
+            /**
+             * Updated At
+             * Format: date-time
+             */
+            updated_at: string;
+            /** Version */
+            version: number;
+        };
+        /** MinuteJobsData */
+        MinuteJobsData: {
+            /** Available */
+            available: boolean;
+            /**
+             * Jobs
+             * @default []
+             */
+            jobs: (components["schemas"]["MinuteJob"] | components["schemas"]["MinuteParameterJob"])[];
+            /** Message */
+            message?: string | null;
+            /** Next Cursor */
+            next_cursor?: string | null;
+        };
+        /** MinuteMonthlyReturn */
+        MinuteMonthlyReturn: {
+            /** Daily Observations */
+            daily_observations: number;
+            /** Month */
+            month: number;
+            /** Return Value */
+            return_value: number | null;
+            /** Year */
+            year: number;
+        };
+        /** MinuteNShapeParameters */
+        MinuteNShapeParameters: {
+            /**
+             * Amount Surge Lookback
+             * @default 5
+             */
+            amount_surge_lookback: number;
+            /**
+             * Amount Surge Min Prior Minutes
+             * @default 2
+             */
+            amount_surge_min_prior_minutes: number;
+            /**
+             * Amount Surge Ratio
+             * @default 2
+             */
+            amount_surge_ratio: number;
+            /**
+             * Break High Ratio
+             * @default 1
+             */
+            break_high_ratio: number;
+            /**
+             * Carry Close Ratio
+             * @default 1
+             */
+            carry_close_ratio: number;
+            /**
+             * Carry Low Ratio
+             * @default 1
+             */
+            carry_low_ratio: number;
+            /**
+             * Entry Mode
+             * @default first_break
+             * @enum {string}
+             */
+            entry_mode: "first_break" | "break_retest" | "late_confirm" | "vwap_confirm" | "amount_surge" | "factor_confirm";
+            /**
+             * Factor Score Threshold
+             * @default 35
+             */
+            factor_score_threshold: number;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            family: "n_shape";
+            /**
+             * Freq
+             * @default 1min
+             * @enum {string}
+             */
+            freq: "1min" | "5min" | "15min" | "30min" | "60min";
+            /**
+             * Late Confirm At
+             * Format: time
+             * @default 10:30:00
+             */
+            late_confirm_at: string;
+            /**
+             * Max Hold Days
+             * @default 5
+             */
+            max_hold_days: number;
+            paper?: components["schemas"]["MinutePaperParameters"];
+            /**
+             * Preset Name
+             * @default n-shape-pool1
+             * @enum {string}
+             */
+            preset_name: "n-shape-pool1" | "n-shape-pool2" | "n-shape-combined";
+            /**
+             * Price Discontinuity Pct
+             * @default 0.01
+             */
+            price_discontinuity_pct: number;
+            /**
+             * Retest Tolerance Pct
+             * @default 0.005
+             */
+            retest_tolerance_pct: number;
+            volume_profile?: components["schemas"]["MinuteVolumeProfileParameters"];
+            /**
+             * Vwap Buffer Pct
+             * @default 0
+             */
+            vwap_buffer_pct: number;
+        };
+        /** MinuteNavData */
+        MinuteNavData: {
+            /**
+             * Basis
+             * @default pit_asof_15:00
+             * @constant
+             */
+            basis: "pit_asof_15:00";
+            /**
+             * Daily Status
+             * @enum {string}
+             */
+            daily_status: "complete" | "unavailable";
+            /**
+             * Job Id
+             * Format: uuid
+             */
+            job_id: string;
+            /** Message */
+            message?: string | null;
+            /** Points */
+            points: components["schemas"]["MinuteNavPoint"][];
+            /** Result Hash */
+            result_hash: string;
+        };
+        /** MinuteNavPoint */
+        MinuteNavPoint: {
+            /** Account Snapshot Id */
+            account_snapshot_id: string | null;
+            /**
+             * As Of
+             * Format: date-time
+             */
+            as_of: string;
+            /**
+             * Basis
+             * @constant
+             */
+            basis: "pit_asof_15:00";
+            /** Cash */
+            cash: string | null;
+            /** Nav */
+            nav: string | null;
+            /** Price Times */
+            price_times: components["schemas"]["MinutePriceTime"][];
+            /** Profile Hash */
+            profile_hash: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "complete" | "unavailable";
+            /**
+             * Trade Date
+             * Format: date
+             */
+            trade_date: string;
+            /** Unavailable Reasons */
+            unavailable_reasons: string[];
+        };
+        /** MinutePaperParameters */
+        MinutePaperParameters: {
+            /**
+             * Candidate Id
+             * @default baseline
+             */
+            candidate_id: string;
+            /**
+             * Entry Buffer Pct
+             * @default 0.005
+             */
+            entry_buffer_pct: number;
+            /**
+             * Entry Slippage Pct
+             * @default 0
+             */
+            entry_slippage_pct: number;
+            /**
+             * Stop Loss Pct
+             * @default 0.03
+             */
+            stop_loss_pct: number;
+            /**
+             * Take Profit Pct
+             * @default 0.05
+             */
+            take_profit_pct: number;
+            /**
+             * Trailing Stop Pct
+             * @default 0.025
+             */
+            trailing_stop_pct: number;
+        };
+        /** MinuteParameterCapability */
+        MinuteParameterCapability: {
+            default_parameters: components["schemas"]["MinuteParameterSet"];
+            /** Display Name */
+            display_name: string;
+            /**
+             * Family
+             * @enum {string}
+             */
+            family: "n_shape" | "auction_gap" | "growth_board_surge";
+            /** Supported Parameter Names */
+            supported_parameter_names: string[];
+            /**
+             * Unavailable Reasons
+             * @default []
+             */
+            unavailable_reasons: string[];
+        };
+        /** MinuteParameterFactSourceOption */
+        MinuteParameterFactSourceOption: {
+            /** Capabilities */
+            capabilities: components["schemas"]["MinuteParameterCapability"][];
+            /** Display Name */
+            display_name: string;
+            /**
+             * End Date
+             * Format: date
+             */
+            end_date: string;
+            /**
+             * Frequency
+             * @enum {string}
+             */
+            frequency: "1min" | "5min" | "15min" | "30min" | "60min";
+            /** Full Input Hash */
+            full_input_hash: string;
+            provenance: components["schemas"]["MinuteSourceProvenance"];
+            /** Source Key */
+            source_key: string;
+            /**
+             * Source Nature
+             * @enum {string}
+             */
+            source_nature: "real_retained" | "historical_reconstruction" | "synthetic_validation";
+            /** Source Version */
+            source_version: number;
+            /**
+             * Start Date
+             * Format: date
+             */
+            start_date: string;
+            /**
+             * Unavailable Reasons
+             * @default []
+             */
+            unavailable_reasons: string[];
+        };
+        /** MinuteParameterJob */
+        MinuteParameterJob: {
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /**
+             * End Date
+             * Format: date
+             */
+            end_date: string;
+            /**
+             * Evaluator Semantic Version
+             * @enum {string}
+             */
+            evaluator_semantic_version?: "2.0.0" | "2.1.0";
+            /**
+             * Family
+             * @enum {string}
+             */
+            family: "n_shape" | "auction_gap" | "growth_board_surge";
+            /** Full Input Hash */
+            full_input_hash: string;
+            /**
+             * Job Id
+             * Format: uuid
+             */
+            job_id: string;
+            /**
+             * Kind
+             * @default minute_parameter_replay
+             * @constant
+             */
+            kind: "minute_parameter_replay";
+            /** Native Id */
+            native_id: string;
+            /** Native Name */
+            native_name: string;
+            /** Native Version */
+            native_version: number;
+            /** Parameter Hash */
+            parameter_hash: string;
+            parameters: components["schemas"]["MinuteParameterSet"];
+            /** Result Hash */
+            result_hash: string | null;
+            /** Source Key */
+            source_key: string;
+            /** Source Version */
+            source_version: number;
+            /** Spec Hash */
+            spec_hash: string;
+            /**
+             * Start Date
+             * Format: date
+             */
+            start_date: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "queued" | "running" | "paused" | "cancelled" | "failed" | "sealing" | "completed";
+            /**
+             * Updated At
+             * Format: date-time
+             */
+            updated_at: string;
+            /** Version */
+            version: number;
+        };
+        /** MinuteParameterResultSource */
+        MinuteParameterResultSource: {
+            /** Baseline Full Input Hash */
+            baseline_full_input_hash: string;
+            /** Baseline Source Key */
+            baseline_source_key: string;
+            /** Baseline Source Version */
+            baseline_source_version: number;
+            /** Core Input Hash */
+            core_input_hash: string;
+            /** Dataset Snapshot Id */
+            dataset_snapshot_id: string;
+            /**
+             * End Date
+             * Format: date
+             */
+            end_date: string;
+            /**
+             * Evaluator Semantic Version
+             * @enum {string}
+             */
+            evaluator_semantic_version?: "2.0.0" | "2.1.0";
+            /**
+             * Family
+             * @enum {string}
+             */
+            family: "n_shape" | "auction_gap" | "growth_board_surge";
+            /** Full Input Hash */
+            full_input_hash: string;
+            /**
+             * Kind
+             * @default minute_parameter_replay
+             * @constant
+             */
+            kind: "minute_parameter_replay";
+            /** Native Executable Fingerprint */
+            native_executable_fingerprint: string;
+            /** Native Id */
+            native_id: string;
+            /** Native Name */
+            native_name: string;
+            /** Native Registration Hash */
+            native_registration_hash: string;
+            /** Native Version */
+            native_version: number;
+            /** Parameter Hash */
+            parameter_hash: string;
+            parameters: components["schemas"]["MinuteParameterSet"];
+            /** Profile Hash */
+            profile_hash: string;
+            provenance: components["schemas"]["MinuteSourceProvenance"];
+            /** Seed Hash */
+            seed_hash: string;
+            /** Source Key */
+            source_key: string;
+            /**
+             * Source Nature
+             * @enum {string}
+             */
+            source_nature: "real_retained" | "historical_reconstruction" | "synthetic_validation";
+            /** Source Version */
+            source_version: number;
+            /**
+             * Start Date
+             * Format: date
+             */
+            start_date: string;
+            /** Work Units */
+            work_units: number;
+            /** Wrapper Registration Hash */
+            wrapper_registration_hash: string;
+        };
+        /** MinuteParameterRunConfig */
+        MinuteParameterRunConfig: {
+            /**
+             * Deadline
+             * Format: date-time
+             */
+            deadline: string;
+            /** Full Input Hash */
+            full_input_hash: string;
+            /**
+             * Kind
+             * @default minute_parameter_replay
+             * @constant
+             */
+            kind: "minute_parameter_replay";
+            parameters: components["schemas"]["MinuteParameterSet"];
+            protocol: components["schemas"]["MinuteExperimentProtocol"];
+            /**
+             * Random Seed
+             * @default 0
+             */
+            random_seed: number;
+            /** Source Key */
+            source_key: string;
+            /** Source Version */
+            source_version: number;
+            study?: components["schemas"]["MinuteParameterStudySettings"] | null;
+        };
+        /** MinuteParameterSearchAxis */
+        MinuteParameterSearchAxis: {
+            /** Path */
+            path: string;
+            /** Values */
+            values: (boolean | number | number[] | null)[];
+        };
+        /** MinuteParameterSearchRequest */
+        MinuteParameterSearchRequest: {
+            /** Axes */
+            axes: components["schemas"]["MinuteParameterSearchAxis"][];
+            base: components["schemas"]["MinuteParameterSet"];
+            /**
+             * Mode
+             * @enum {string}
+             */
+            mode: "grid" | "random";
+            /** Requested Trials */
+            requested_trials?: number | null;
+            /** Seed */
+            seed: number;
+        };
+        /** MinuteParameterSet */
+        MinuteParameterSet: {
+            /**
+             * Kind
+             * @default minute-parameter-set
+             * @constant
+             */
+            kind: "minute-parameter-set";
+            /** Parameters */
+            parameters: components["schemas"]["MinuteNShapeParameters"] | components["schemas"]["MinuteAuctionGapParameters"] | components["schemas"]["MinuteGrowthParameters"];
+            /**
+             * Schema Version
+             * @default 1
+             * @enum {integer}
+             */
+            schema_version: 1 | 2;
+        };
+        /** MinuteParameterSourcesData */
+        MinuteParameterSourcesData: {
+            /** Available */
+            available: boolean;
+            /** Message */
+            message?: string | null;
+            /**
+             * Sources
+             * @default []
+             */
+            sources: components["schemas"]["MinuteParameterFactSourceOption"][];
+            /**
+             * Unavailable Count
+             * @default 0
+             */
+            unavailable_count: number;
+        };
+        /** MinuteParameterStudySettings */
+        MinuteParameterStudySettings: {
+            /** Min Trades */
+            min_trades: number;
+            /** Score Profile */
+            score_profile: string;
+            /** Top N */
+            top_n: number;
+        };
+        /** MinuteParameterStudyWindowSettings */
+        MinuteParameterStudyWindowSettings: {
+            /** Fold Count */
+            fold_count: number;
+            /** Min Training Dates */
+            min_training_dates: number;
+            /** Validation Date Count */
+            validation_date_count: number;
+        };
+        /** MinutePerformanceDay */
+        MinutePerformanceDay: {
+            /** Daily Return */
+            daily_return: string | null;
+            /** Drawdown */
+            drawdown: number | null;
+            /** Nav */
+            nav: string | null;
+            /** Normalized Nav */
+            normalized_nav: number | null;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "complete" | "unavailable";
+            /**
+             * Trade Date
+             * Format: date
+             */
+            trade_date: string;
+        };
+        /** MinutePriceTime */
+        MinutePriceTime: {
+            /**
+             * Available At
+             * Format: date-time
+             */
+            available_at: string;
+            /** Code */
+            code: string;
+            /**
+             * Event Time
+             * Format: date-time
+             */
+            event_time: string;
+            /** Quote Snapshot Id */
+            quote_snapshot_id: string | null;
+        };
+        /** MinuteReplayExecutionProfile */
+        MinuteReplayExecutionProfile: {
+            /**
+             * Candidate Max Age Seconds
+             * @default 604800
+             */
+            candidate_max_age_seconds: number;
+            execution_costs: components["schemas"]["ExecutionCostSpec"];
+            /** Initial Cash */
+            initial_cash: string;
+            /** Key */
+            key: string;
+            /**
+             * Max Finalize Scan Batches
+             * @default 32
+             */
+            max_finalize_scan_batches: number;
+            /**
+             * Max Visible Scan Batches
+             * @default 120
+             */
+            max_visible_scan_batches: number;
+            paper_policy: components["schemas"]["PaperSignalPolicy"];
+            /**
+             * Quote Max Age Seconds
+             * @default 90
+             */
+            quote_max_age_seconds: number;
+            /** Routing Policy Fingerprint */
+            routing_policy_fingerprint: string;
+            /**
+             * Timestamp Semantics
+             * @default provider_snapshot
+             * @enum {string}
+             */
+            timestamp_semantics: "bar_end" | "provider_snapshot";
+            /** Version */
+            version: number;
+        };
+        /** MinuteReplayPerformance */
+        MinuteReplayPerformance: {
+            /**
+             * Basis
+             * @default pit_asof_15:00
+             * @constant
+             */
+            basis: "pit_asof_15:00";
+            /**
+             * Benchmark Unavailable
+             * @default minute_source_has_no_benchmark_series
+             * @constant
+             */
+            benchmark_unavailable: "minute_source_has_no_benchmark_series";
+            /**
+             * Contract
+             * @default minute-replay-performance/v1
+             * @constant
+             */
+            contract: "minute-replay-performance/v1";
+            /** Daily */
+            daily: components["schemas"]["MinutePerformanceDay"][];
+            /** Input Hash */
+            input_hash: string;
+            metrics: components["schemas"]["PortfolioPerformance"] | null;
+            /**
+             * Monthly
+             * @default []
+             */
+            monthly: components["schemas"]["MinuteMonthlyReturn"][];
+            /** Open Quantity */
+            open_quantity?: {
+                [key: string]: number;
+            };
+            /** Profile Hash */
+            profile_hash: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "complete" | "unavailable";
+            /**
+             * Unavailable Reasons
+             * @default []
+             */
+            unavailable_reasons: string[];
+        };
+        /** MinuteResultRow */
+        MinuteResultRow: {
+            payload: components["schemas"]["JsonValue"];
+            /** Sequence */
+            sequence: number;
+        };
+        /** MinuteRowsData */
+        MinuteRowsData: {
+            /**
+             * Job Id
+             * Format: uuid
+             */
+            job_id: string;
+            /** Next Offset */
+            next_offset: number | null;
+            /** Result Hash */
+            result_hash: string;
+            /** Rows */
+            rows: components["schemas"]["MinuteResultRow"][];
+            /**
+             * Table
+             * @enum {string}
+             */
+            table: "signals" | "orders" | "fills" | "paper_queue" | "account" | "daily_valuations" | "execution_profile" | "replay_summary";
+            /** Total */
+            total: number;
+        };
+        /** MinuteRunConfig */
+        MinuteRunConfig: {
+            /**
+             * Deadline
+             * Format: date-time
+             */
+            deadline: string;
+            /** Full Input Hash */
+            full_input_hash: string;
+            /**
+             * Native Id
+             * @enum {string}
+             */
+            native_id: "n_shape" | "auction_gap" | "growth_board_surge";
+            /** Native Version */
+            native_version: number;
+            protocol: components["schemas"]["MinuteExperimentProtocol"];
+            /**
+             * Random Seed
+             * @default 0
+             */
+            random_seed: number;
+            /** Source Key */
+            source_key: string;
+            /** Source Version */
+            source_version: number;
+        };
+        /** MinuteSourceOption */
+        MinuteSourceOption: {
+            /** Core Input Hash */
+            core_input_hash: string;
+            /** Dataset Snapshot Id */
+            dataset_snapshot_id: string;
+            /**
+             * End Date
+             * Format: date
+             */
+            end_date: string;
+            /** Full Input Hash */
+            full_input_hash: string;
+            /** Native Executable Fingerprint */
+            native_executable_fingerprint: string;
+            /**
+             * Native Id
+             * @enum {string}
+             */
+            native_id: "n_shape" | "auction_gap" | "growth_board_surge";
+            /** Native Name */
+            native_name: string;
+            /** Native Registration Hash */
+            native_registration_hash: string;
+            /** Native Version */
+            native_version: number;
+            /** Profile Hash */
+            profile_hash: string;
+            provenance: components["schemas"]["MinuteSourceProvenance"];
+            /** Seed Hash */
+            seed_hash: string;
+            /** Source Key */
+            source_key: string;
+            /** Source Version */
+            source_version: number;
+            /**
+             * Start Date
+             * Format: date
+             */
+            start_date: string;
+            /** Work Units */
+            work_units: number;
+            /** Wrapper Registration Hash */
+            wrapper_registration_hash: string;
+        };
+        /** MinuteSourceProvenance */
+        MinuteSourceProvenance: {
+            /** Acquisition Commits */
+            acquisition_commits: string[];
+            /**
+             * Extracted At
+             * Format: date-time
+             */
+            extracted_at: string;
+            /**
+             * Published At
+             * Format: date-time
+             */
+            published_at: string;
+            /** Real Capture Times */
+            real_capture_times: string[];
+            /**
+             * Replay End
+             * Format: date-time
+             */
+            replay_end: string;
+            /**
+             * Replay Start
+             * Format: date-time
+             */
+            replay_start: string;
+            /** Research Code Commit */
+            research_code_commit: string;
+            /**
+             * Source Kind
+             * @enum {string}
+             */
+            source_kind: "captured" | "reconstructed";
+            /** Visibility Limitations */
+            visibility_limitations: string | null;
+            /** Visibility Policy Id */
+            visibility_policy_id: string | null;
+            /** Visibility Policy Version */
+            visibility_policy_version: number | null;
+        };
+        /** MinuteSourcesData */
+        MinuteSourcesData: {
+            /** Available */
+            available: boolean;
+            /** Message */
+            message?: string | null;
+            /**
+             * Sources
+             * @default []
+             */
+            sources: components["schemas"]["MinuteSourceOption"][];
+            /**
+             * Unavailable Count
+             * @default 0
+             */
+            unavailable_count: number;
+        };
+        /** MinuteStudiesData */
+        MinuteStudiesData: {
+            /** Available */
+            available: boolean;
+            /** Message */
+            message?: string | null;
+            /** Next Cursor */
+            next_cursor?: string | null;
+            /**
+             * Studies
+             * @default []
+             */
+            studies: components["schemas"]["MinuteStudyListItem"][];
+        };
+        /** MinuteStudyCapabilitiesData */
+        MinuteStudyCapabilitiesData: {
+            /** Available */
+            available: boolean;
+            /** Can Run */
+            can_run: boolean;
+            /** Message */
+            message?: string | null;
+            /**
+             * Source Unavailable Count
+             * @default 0
+             */
+            source_unavailable_count: number;
+            /**
+             * Sources
+             * @default []
+             */
+            sources: components["schemas"]["MinuteStudySourceCapability"][];
+        };
+        /** MinuteStudyCommandReceipt */
+        MinuteStudyCommandReceipt: {
+            /**
+             * Command Id
+             * Format: uuid
+             */
+            command_id: string;
+            /**
+             * Jobs
+             * @default []
+             */
+            jobs: components["schemas"]["MinuteStudySubmittedJob"][];
+            /** Message */
+            message: string;
+            /** Plan Id */
+            plan_id?: string | null;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "pending" | "processing" | "unknown" | "submitted" | "unavailable" | "failed" | "conflict";
+            /**
+             * Unavailable Reasons
+             * @default []
+             */
+            unavailable_reasons: string[];
+        };
+        /**
+         * MinuteStudyCreateRequest
+         * @description A browser choice; actor, registration, publication and preparation stay private.
+         */
+        MinuteStudyCreateRequest: {
+            /**
+             * Command Id
+             * Format: uuid
+             */
+            command_id: string;
+            /**
+             * Deadline
+             * Format: date-time
+             */
+            deadline: string;
+            /** Full Input Hash */
+            full_input_hash: string;
+            /**
+             * Mode
+             * @enum {string}
+             */
+            mode: "single" | "grid" | "random" | "ablation" | "walk_forward";
+            parameters: components["schemas"]["MinuteParameterSet"];
+            protocol: components["schemas"]["MinuteExperimentProtocol"];
+            /** Random Seed */
+            random_seed: number;
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+            search?: components["schemas"]["MinuteParameterSearchRequest"] | null;
+            /** Settings */
+            settings: components["schemas"]["MinuteParameterStudySettings"][];
+            /** Source Key */
+            source_key: string;
+            /** Source Version */
+            source_version: number;
+            walk_forward?: components["schemas"]["MinuteParameterStudyWindowSettings"] | null;
+        };
+        /** MinuteStudyHead */
+        MinuteStudyHead: {
+            /** Definition Id */
+            definition_id: string;
+            /** Definition Version */
+            definition_version: number;
+            /** Evaluator Semantic Version */
+            evaluator_semantic_version: string;
+            /** Executable Fingerprint */
+            executable_fingerprint: string;
+            /** Parameter Fingerprint */
+            parameter_fingerprint: string;
+            /** Producer Commit */
+            producer_commit: string;
+            /** Registration Fingerprint */
+            registration_fingerprint: string;
+            /** Spec Fingerprint */
+            spec_fingerprint: string;
+        };
+        /** MinuteStudyHeatmap */
+        MinuteStudyHeatmap: {
+            /** Cells */
+            cells: components["schemas"]["MinuteStudyHeatmapCell"][];
+            /** Current Study Id */
+            current_study_id: string;
+            /**
+             * Selection Cutoff
+             * Format: date-time
+             */
+            selection_cutoff: string;
+            /** Trial Set Hash */
+            trial_set_hash: string;
+            x_axis: components["schemas"]["MinuteStudyHeatmapAxis"];
+            y_axis: components["schemas"]["MinuteStudyHeatmapAxis"];
+        };
+        /** MinuteStudyHeatmapAxis */
+        MinuteStudyHeatmapAxis: {
+            /** Parameter Name */
+            parameter_name: string;
+            /** Values */
+            values: (boolean | number)[];
+        };
+        /** MinuteStudyHeatmapCell */
+        MinuteStudyHeatmapCell: {
+            /** Is Current */
+            is_current: boolean;
+            neighborhood: components["schemas"]["MinuteStudyHeatmapNeighborhood"];
+            observation: components["schemas"]["MinuteStudyTrainingObservation"] | null;
+            protocol: components["schemas"]["MinuteStudyProtocol"] | null;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "available" | "insufficient_trades" | "missing_trial" | "invalid_parameters";
+            /** Study Id */
+            study_id: string | null;
+            training_rank: components["schemas"]["MinuteStudyTrainingRank"] | null;
+            /** Training Score */
+            training_score: number | null;
+            /** X Index */
+            x_index: number;
+            /** X Value */
+            x_value: boolean | number;
+            /** Y Index */
+            y_index: number;
+            /** Y Value */
+            y_value: boolean | number;
+        };
+        /** MinuteStudyHeatmapData */
+        MinuteStudyHeatmapData: {
+            /**
+             * Command Id
+             * Format: uuid
+             */
+            command_id: string;
+            heatmap: components["schemas"]["MinuteStudyHeatmap"];
+            /** Plan Id */
+            plan_id: string;
+            /**
+             * Read At
+             * Format: date-time
+             */
+            read_at: string;
+        };
+        /** MinuteStudyHeatmapNeighborhood */
+        MinuteStudyHeatmapNeighborhood: {
+            /** Coordinates */
+            coordinates: [
+                number,
+                number
+            ][];
+            /** Minimum Score */
+            minimum_score: number | null;
+            /**
+             * Reason
+             * @enum {string}
+             */
+            reason: "complete" | "center_unavailable" | "missing_neighbors" | "no_neighbors";
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "available" | "unavailable";
+            /** Unavailable Coordinates */
+            unavailable_coordinates: [
+                number,
+                number
+            ][];
+        };
+        /** MinuteStudyListItem */
+        MinuteStudyListItem: {
+            /**
+             * Command Id
+             * Format: uuid
+             */
+            command_id: string;
+            /** Completed At */
+            completed_at: string | null;
+            /** Display Name */
+            display_name: string;
+            /**
+             * Family
+             * @enum {string}
+             */
+            family: "n_shape" | "auction_gap" | "growth_board_surge";
+            /** Full Input Hash */
+            full_input_hash: string;
+            /**
+             * Mode
+             * @enum {string}
+             */
+            mode: "single" | "grid" | "random" | "ablation" | "walk_forward";
+            /** Plan Id */
+            plan_id?: string | null;
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+            /** Source Key */
+            source_key: string;
+            /** Source Version */
+            source_version: number;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "pending" | "processing" | "unknown" | "submitted" | "unavailable" | "failed";
+            /**
+             * Submitted Count
+             * @default 0
+             */
+            submitted_count: number;
+            /** Trial Count */
+            trial_count?: number | null;
+        };
+        /** MinuteStudyProtocol */
+        MinuteStudyProtocol: {
+            head: components["schemas"]["MinuteStudyHead"];
+            /** Min Trades */
+            min_trades: number;
+            parameters: components["schemas"]["MinuteParameterSet"];
+            /** Random Seed */
+            random_seed: number;
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+            /** Score Profile */
+            score_profile: string;
+            source: components["schemas"]["MinuteStudySource"];
+            split: components["schemas"]["MinuteStudySplit"];
+            /** Top N */
+            top_n: number;
+        };
+        /** MinuteStudyResultData */
+        MinuteStudyResultData: {
+            /**
+             * Command Id
+             * Format: uuid
+             */
+            command_id: string;
+            /** Message */
+            message?: string | null;
+            /**
+             * Missing Trial Indices
+             * @default []
+             */
+            missing_trial_indices: number[];
+            /** Plan Id */
+            plan_id?: string | null;
+            /** Read At */
+            read_at?: string | null;
+            request: components["schemas"]["MinuteStudyCreateRequest"];
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "pending" | "processing" | "unknown" | "submitted" | "complete" | "unavailable" | "failed" | "conflict";
+            /** Trial Count */
+            trial_count?: number | null;
+            /**
+             * Trials
+             * @default []
+             */
+            trials: components["schemas"]["MinuteStudyTrialData"][];
+            /**
+             * Unavailable Reasons
+             * @default []
+             */
+            unavailable_reasons: string[];
+        };
+        /** MinuteStudyScoreProfile */
+        MinuteStudyScoreProfile: {
+            /** Available */
+            available: boolean;
+            /** Label */
+            label: string;
+            /**
+             * Missing Features
+             * @default []
+             */
+            missing_features: string[];
+            /** Name */
+            name: string;
+        };
+        /**
+         * MinuteStudySource
+         * @description Verified archive identity; published_at is not an event's PIT clock.
+         */
+        MinuteStudySource: {
+            /** Dataset Snapshot Id */
+            dataset_snapshot_id: string;
+            /**
+             * End Date
+             * Format: date
+             */
+            end_date: string;
+            /**
+             * Frequency
+             * @enum {string}
+             */
+            frequency: "1min" | "5min" | "15min" | "30min" | "60min";
+            /** Full Input Hash */
+            full_input_hash: string;
+            /** Owner Id */
+            owner_id: string;
+            /**
+             * Published At
+             * Format: date-time
+             */
+            published_at: string;
+            /** Source Key */
+            source_key: string;
+            /** Source Version */
+            source_version: number;
+            /**
+             * Start Date
+             * Format: date
+             */
+            start_date: string;
+        };
+        /** MinuteStudySourceCapability */
+        MinuteStudySourceCapability: {
+            /** Heatmap Parameter Names */
+            heatmap_parameter_names: string[];
+            /** Modes */
+            modes: ("single" | "grid" | "random" | "ablation" | "walk_forward")[];
+            /** Score Profiles */
+            score_profiles: components["schemas"]["MinuteStudyScoreProfile"][];
+            /** Searchable Parameter Names */
+            searchable_parameter_names: string[];
+            source: components["schemas"]["MinuteParameterFactSourceOption"];
+            /**
+             * Unavailable Reasons
+             * @default []
+             */
+            unavailable_reasons: string[];
+        };
+        /** MinuteStudySplit */
+        MinuteStudySplit: {
+            /**
+             * Test End
+             * Format: date
+             */
+            test_end: string;
+            /**
+             * Test Start
+             * Format: date
+             */
+            test_start: string;
+            /**
+             * Train End
+             * Format: date
+             */
+            train_end: string;
+            /**
+             * Train Start
+             * Format: date
+             */
+            train_start: string;
+        };
+        /** MinuteStudySubmittedJob */
+        MinuteStudySubmittedJob: {
+            /** Index */
+            index: number;
+            /**
+             * Job Id
+             * Format: uuid
+             */
+            job_id: string;
+        };
+        /** MinuteStudyTrainingObservation */
+        MinuteStudyTrainingObservation: {
+            /**
+             * Available At
+             * Format: date-time
+             */
+            available_at: string;
+            head: components["schemas"]["MinuteStudyHead"];
+            /** Parameter Fingerprint */
+            parameter_fingerprint: string;
+            /** Result Hash */
+            result_hash: string;
+            source: components["schemas"]["MinuteStudySource"];
+            /** Study Id */
+            study_id: string;
+            summary: components["schemas"]["MinuteStudyTrainingSummary"];
+            /**
+             * Train End
+             * Format: date
+             */
+            train_end: string;
+            /**
+             * Train Start
+             * Format: date
+             */
+            train_start: string;
+        };
+        /** MinuteStudyTrainingRank */
+        MinuteStudyTrainingRank: {
+            /**
+             * Available At
+             * Format: date-time
+             */
+            available_at: string;
+            /** Rank */
+            rank: number;
+            /** Result Hash */
+            result_hash: string;
+            /**
+             * Selection Cutoff
+             * Format: date-time
+             */
+            selection_cutoff: string;
+            /** Study Id */
+            study_id: string;
+            /** Training Score */
+            training_score: number;
+        };
+        /** MinuteStudyTrainingSummary */
+        MinuteStudyTrainingSummary: {
+            /** Gap Stop Rate Pct */
+            gap_stop_rate_pct: number | null;
+            /** Mean Ret Pct */
+            mean_ret_pct: number | null;
+            /** Trades */
+            trades: number;
+            /** Win Rate Pct */
+            win_rate_pct: number | null;
+            /** Worst Ret Pct */
+            worst_ret_pct: number | null;
+        };
+        /** MinuteStudyTrialData */
+        MinuteStudyTrialData: {
+            /** Complete Result Hash */
+            complete_result_hash?: string | null;
+            /** Completed At */
+            completed_at?: string | null;
+            /** Core Input Hash */
+            core_input_hash?: string | null;
+            /** Fold */
+            fold?: number | null;
+            /** Full Input Hash */
+            full_input_hash?: string | null;
+            /** Index */
+            index: number;
+            /**
+             * Job Id
+             * Format: uuid
+             */
+            job_id: string;
+            /** Label */
+            label: string;
+            /** Manifest Hash */
+            manifest_hash?: string | null;
+            out_of_sample?: components["schemas"]["MinuteStudyWindowData"] | null;
+            parameters: components["schemas"]["MinuteParameterSet"];
+            /** Profile Hash */
+            profile_hash?: string | null;
+            protocol: components["schemas"]["MinuteExperimentProtocol"];
+            /** Request Hash */
+            request_hash: string;
+            /** Result Hash */
+            result_hash?: string | null;
+            /** Seed Hash */
+            seed_hash?: string | null;
+            settings: components["schemas"]["MinuteParameterStudySettings"];
+            /** Spec Hash */
+            spec_hash?: string | null;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "not_prepared" | "awaiting_submission_receipt" | "pending" | "queued" | "running" | "checkpointed" | "pending_seal" | "sealed" | "failed" | "cancelled" | "rejected" | "unknown";
+            /** Study Id */
+            study_id?: string | null;
+            training?: components["schemas"]["MinuteStudyWindowData"] | null;
+            training_rank?: components["schemas"]["MinuteStudyTrainingRank"] | null;
+            /**
+             * Unavailable Reasons
+             * @default []
+             */
+            unavailable_reasons: string[];
+            validation?: components["schemas"]["MinuteStudyWindowData"] | null;
+        };
+        /** MinuteStudyWindowData */
+        MinuteStudyWindowData: {
+            /** Cross Window Trades */
+            cross_window_trades: number;
+            /** Daily */
+            daily: components["schemas"]["MinutePerformanceDay"][];
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "complete" | "unavailable";
+            summary: components["schemas"]["MinuteStudyTrainingSummary"] | null;
+            /**
+             * Unavailable Reasons
+             * @default []
+             */
+            unavailable_reasons: string[];
+            window: components["schemas"]["DateRange"];
+        };
+        /** MinuteSummaryData */
+        MinuteSummaryData: {
+            /**
+             * Can Report
+             * @default false
+             */
+            can_report: boolean;
+            /** Daily Status */
+            daily_status?: ("complete" | "unavailable") | null;
+            execution_profile?: components["schemas"]["MinuteReplayExecutionProfile"] | null;
+            /** Fill Count */
+            fill_count?: number | null;
+            /** Job */
+            job: components["schemas"]["MinuteJob"] | components["schemas"]["MinuteParameterJob"];
+            /** Message */
+            message?: string | null;
+            /** Order Count */
+            order_count?: number | null;
+            performance?: components["schemas"]["MinuteReplayPerformance"] | null;
+            /** Queue Count */
+            queue_count?: number | null;
+            /** Result Hash */
+            result_hash?: string | null;
+            /** Signal Count */
+            signal_count?: number | null;
+            /** Source */
+            source: components["schemas"]["MinuteSourceOption"] | components["schemas"]["MinuteParameterResultSource"];
+            /**
+             * Tables
+             * @default []
+             */
+            tables: ("signals" | "orders" | "fills" | "paper_queue" | "account" | "daily_valuations" | "execution_profile" | "replay_summary")[];
+        };
+        /** MinuteVolumeProfileParameters */
+        MinuteVolumeProfileParameters: {
+            /**
+             * Bin Ratio
+             * @description 自适应分桶相对宽度；None/0 表示沿用历史 bin_pct 口径，不改变现有行为
+             */
+            bin_ratio?: number | null;
+            /**
+             * Enabled
+             * @default false
+             */
+            enabled: boolean;
+            /**
+             * Fallback Take Profit Pct
+             * @default 0.05
+             */
+            fallback_take_profit_pct: number;
+            /**
+             * Filter Entry
+             * @default true
+             */
+            filter_entry: boolean;
+            /**
+             * Lookback Days
+             * @default [
+             *       90
+             *     ]
+             */
+            lookback_days: number[];
+            /**
+             * Max Stop Distance Pct
+             * @default 0.045
+             */
+            max_stop_distance_pct: number;
+            /**
+             * Min Reclaimed Poc Count
+             * @default 1
+             */
+            min_reclaimed_poc_count: number;
+            /**
+             * Min Reward Risk
+             * @default 1.2
+             */
+            min_reward_risk: number;
+            /**
+             * Min Take Profit Pct
+             * @default 0.03
+             */
+            min_take_profit_pct: number;
+            /**
+             * Require Profile
+             * @default true
+             */
+            require_profile: boolean;
+            /**
+             * Resistance Buffer Pct
+             * @default 0.002
+             */
+            resistance_buffer_pct: number;
+            /**
+             * Support Buffer Pct
+             * @default 0.003
+             */
+            support_buffer_pct: number;
+            /**
+             * Trailing Stop Pct
+             * @default 0.02
+             */
+            trailing_stop_pct: number;
+        };
+        /** MonitorBuiltinControlView */
+        MonitorBuiltinControlView: {
+            /**
+             * Builtin Id
+             * @enum {string}
+             */
+            builtin_id: "pool2_levels" | "pool_attack" | "surge" | "pulse";
+            /**
+             * Can Request
+             * @default false
+             */
+            can_request: boolean;
+            /** Enabled */
+            enabled: boolean;
+            /** Installation Sha256 */
+            installation_sha256?: string | null;
+            /** Label */
+            label: string;
+            /** Revision */
+            revision: number;
+        };
+        /** MonitorBuiltinStatus */
+        MonitorBuiltinStatus: {
+            /** Applied Command Id */
+            applied_command_id?: string | null;
+            /** Applied Revision */
+            applied_revision?: number | null;
+            /**
+             * Builtin Id
+             * @enum {string}
+             */
+            builtin_id: "pool2_levels" | "pool_attack" | "surge" | "pulse";
+            /** Channels */
+            channels: ("pushdeer" | "pushplus")[];
+            /** Enabled */
+            enabled: boolean;
+            /**
+             * Evaluated At
+             * Format: date-time
+             */
+            evaluated_at: string;
+            /** Label */
+            label: string;
+            /** Last Triggered At */
+            last_triggered_at: string | null;
+            /** Matched Count */
+            matched_count: number | null;
+            /** Monitor Installation Sha256 */
+            monitor_installation_sha256?: string | null;
+            /** Observed At */
+            observed_at: string | null;
+            /** Source Note */
+            source_note: string;
+            /** Source Valid Until */
+            source_valid_until: string | null;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "ready" | "waiting" | "stale" | "disconnected" | "unknown" | "disabled";
+            /** State Label */
+            state_label: string;
+        };
+        /** MonitorBuiltinTrigger */
+        MonitorBuiltinTrigger: {
+            acknowledgment: components["schemas"]["AlertAcknowledgmentView"];
+            /** After */
+            after?: number | null;
+            /**
+             * At
+             * Format: date-time
+             */
+            at: string;
+            /** Before */
+            before?: number | null;
+            /**
+             * Builtin Id
+             * @enum {string}
+             */
+            builtin_id: "pool2_levels" | "pool_attack" | "surge" | "pulse";
+            /** Code */
+            code: string | null;
+            /** Comparison Unit */
+            comparison_unit?: ("count" | "percent") | null;
+            /** Event Key */
+            event_key: string;
+            /** Event Label */
+            event_label: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "builtin";
+            /** Name */
+            name: string | null;
+            /** Price */
+            price?: number | null;
+            /** Source Note */
+            source_note: string;
+            /**
+             * Subject
+             * @enum {string}
+             */
+            subject: "stock" | "market";
+            /** Threshold */
+            threshold?: number | null;
+            /** Threshold Unit */
+            threshold_unit?: ("CNY" | "multiple") | null;
+        };
+        /** MonitorChannelAttempt */
+        MonitorChannelAttempt: {
+            /**
+             * At
+             * Format: date-time
+             */
+            at: string;
+            /** Attempt No */
+            attempt_no?: number | null;
+            /** Channel Label */
+            channel_label: string;
+            /** Event Key */
+            event_key: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "channel_attempt";
+            /** Logical Count */
+            logical_count: number;
+            /**
+             * Mode
+             * @enum {string}
+             */
+            mode: "shadow" | "live";
+            /** Source Note */
+            source_note: string;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "waiting" | "sending" | "shadow" | "accepted" | "rejected" | "unknown" | "possible";
+            /** State Label */
+            state_label: string;
         };
         /** MonitorChannelSubmission */
         MonitorChannelSubmission: {
@@ -9253,6 +12999,32 @@ export interface components {
              * @enum {string}
              */
             state: "ready" | "unavailable";
+        };
+        /** MonitorConditionTrigger */
+        MonitorConditionTrigger: {
+            acknowledgment?: components["schemas"]["AlertAcknowledgmentView"];
+            /**
+             * At
+             * Format: date-time
+             */
+            at: string;
+            /** Code */
+            code: string;
+            /** Event Key */
+            event_key: string;
+            /** Event Label */
+            event_label: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "condition";
+            /** Name */
+            name: string | null;
+            /** Source Note */
+            source_note: string;
+            /** Status Label */
+            status_label: string;
         };
         /** MonitorNotification */
         MonitorNotification: {
@@ -9298,6 +13070,86 @@ export interface components {
              * Format: date-time
              */
             updated_at: string;
+        };
+        /** MonitorRuntimeChannel */
+        MonitorRuntimeChannel: {
+            /** Accepted Count */
+            accepted_count: number;
+            /** Accepted Pct */
+            accepted_pct: number | null;
+            /**
+             * Channel
+             * @enum {string}
+             */
+            channel: "pushdeer" | "pushplus";
+            /** Channel Label */
+            channel_label: string;
+            /**
+             * Covered From
+             * Format: date-time
+             */
+            covered_from: string;
+            /**
+             * Covered Through
+             * Format: date-time
+             */
+            covered_through: string;
+            /** Last Accepted At */
+            last_accepted_at: string | null;
+            /** Logical Count */
+            logical_count: number;
+            /** Member Attempts */
+            member_attempts: number;
+            /** Member Retries */
+            member_retries: number;
+            /**
+             * Mode
+             * @enum {string}
+             */
+            mode: "shadow" | "live";
+            /** Physical Requests */
+            physical_requests: number;
+            /** Physical Unknown Count */
+            physical_unknown_count: number;
+            /** Possible Requests */
+            possible_requests: number;
+            /** Rejected Count */
+            rejected_count: number;
+        };
+        /** MonitorRuntimeData */
+        MonitorRuntimeData: {
+            /** Applied Command Id */
+            applied_command_id?: string | null;
+            /** Applied Revision */
+            applied_revision?: number | null;
+            /** Builtins */
+            builtins?: components["schemas"]["MonitorBuiltinStatus"][];
+            /** Channels */
+            channels?: components["schemas"]["MonitorRuntimeChannel"][];
+            /**
+             * Mode
+             * @default unknown
+             * @enum {string}
+             */
+            mode: "shadow" | "live" | "unknown";
+            /**
+             * Mode Label
+             * @default 未确认
+             */
+            mode_label: string;
+            /** Monitor Installation Sha256 */
+            monitor_installation_sha256?: string | null;
+            /** Observed At */
+            observed_at?: string | null;
+            /** Source Label */
+            source_label: string;
+            /** Source Note */
+            source_note: string;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "ready" | "unavailable";
         };
         /** MonitorSignal */
         MonitorSignal: {
@@ -9374,8 +13226,9 @@ export interface components {
         };
         /** MonitorTimelineData */
         MonitorTimelineData: {
+            builtin_unacknowledged?: components["schemas"]["UnacknowledgedSummary"];
             /** Items */
-            items: (components["schemas"]["MonitorSignal"] | components["schemas"]["MonitorTrigger"] | components["schemas"]["MonitorSurge"] | components["schemas"]["MonitorNotification"])[];
+            items: (components["schemas"]["MonitorSignal"] | components["schemas"]["MonitorTrigger"] | components["schemas"]["MonitorSurge"] | components["schemas"]["MonitorNotification"] | components["schemas"]["MonitorBuiltinTrigger"] | components["schemas"]["MonitorConditionTrigger"] | components["schemas"]["MonitorChannelAttempt"])[];
             /** Market Note */
             market_note: string | null;
             /**
@@ -9509,6 +13362,147 @@ export interface components {
              * @constant
              */
             verification_scope: "named_partitions_current_observation_not_full_authority_chain_or_pit";
+        };
+        /** NativeMinuteConfiguration */
+        NativeMinuteConfiguration: {
+            /**
+             * End Date
+             * Format: date
+             */
+            end_date: string;
+            /**
+             * Kind
+             * @default native_minute
+             * @constant
+             */
+            kind: "native_minute";
+            selection: components["schemas"]["NativeMinuteSelection"];
+            /**
+             * Start Date
+             * Format: date
+             */
+            start_date: string;
+        };
+        /** NativeMinuteExperimentRequest */
+        NativeMinuteExperimentRequest: {
+            /**
+             * Confidence
+             * @default 0.95
+             */
+            confidence: number | string;
+            /** Configurations */
+            configurations: components["schemas"]["NativeMinuteConfiguration"][];
+            /**
+             * Kind
+             * @default native_minute_experiment
+             * @constant
+             */
+            kind: "native_minute_experiment";
+            /** Name */
+            name: string;
+            /**
+             * Pbo Slices
+             * @default 4
+             * @enum {integer}
+             */
+            pbo_slices: 4 | 6 | 8 | 10;
+            protocol: components["schemas"]["MinuteExperimentProtocol"];
+            /**
+             * Seed
+             * @default 0
+             */
+            seed: number;
+            /**
+             * Target Period Sharpe
+             * @default 0
+             */
+            target_period_sharpe: number | string;
+            /** Walk Forward Command Id */
+            walk_forward_command_id?: string | null;
+            /** Walk Forward Plan Hash */
+            walk_forward_plan_hash?: string | null;
+        };
+        /**
+         * NativeMinuteSelection
+         * @description Native definition and fixed execution profile; the Lab wrapper is separate.
+         */
+        NativeMinuteSelection: {
+            /** Profile Hash */
+            profile_hash: string;
+            /** Source Key */
+            source_key: string;
+            /** Source Version */
+            source_version: number;
+            target: components["schemas"]["StrategyPromotionTarget"];
+        };
+        /** NativeStrategyPromotionWalkForwardSubmission */
+        NativeStrategyPromotionWalkForwardSubmission: {
+            /**
+             * Command Id
+             * Format: uuid
+             */
+            command_id: string;
+            /** Plan Hash */
+            plan_hash: string;
+            /** Receipts */
+            receipts: components["schemas"]["CommandSubmissionReceipt"][];
+        };
+        /** NewsDigestStatement */
+        NewsDigestStatement: {
+            content: components["schemas"]["AICitedText"];
+            /**
+             * Nature
+             * @enum {string}
+             */
+            nature: "actual" | "forecast" | "context";
+        };
+        /** NotifierModeControlView */
+        NotifierModeControlView: {
+            /**
+             * Available
+             * @default false
+             */
+            available: boolean;
+            /**
+             * Can Request
+             * @default false
+             */
+            can_request: boolean;
+            /**
+             * Can Set Live
+             * @default false
+             */
+            can_set_live: boolean;
+            /** Installation Sha256 */
+            installation_sha256?: string | null;
+            /** Mode */
+            mode?: ("shadow" | "live") | null;
+            /**
+             * Note
+             * @default 通知模式暂无法核验。
+             */
+            note: string;
+            /** Revision */
+            revision?: number | null;
+        };
+        /** NotifierModeDraft */
+        NotifierModeDraft: {
+            /** Command Id */
+            command_id: string;
+            /** Expected Revision */
+            expected_revision: number;
+            /** Generation Id */
+            generation_id: string;
+            /**
+             * Mode
+             * @enum {string}
+             */
+            mode: "shadow" | "live";
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
         };
         /** NumberExpr */
         NumberExpr: {
@@ -10466,6 +14460,22 @@ export interface components {
          * @enum {string}
          */
         PaperSide: "BUY" | "SELL";
+        /** PaperSignalPolicy */
+        PaperSignalPolicy: {
+            /** Account Id */
+            account_id: string;
+            /** Action Quantities */
+            action_quantities: {
+                [key: string]: number;
+            };
+            /**
+             * Execution Lag
+             * Format: duration
+             */
+            execution_lag: string;
+            /** Producer Commit */
+            producer_commit: string;
+        };
         /** PaperSummary */
         PaperSummary: {
             /** Account Id */
@@ -10779,6 +14789,40 @@ export interface components {
              * @enum {string}
              */
             state: "ready" | "no_data" | "unavailable";
+        };
+        /** PortfolioBacktestConfig */
+        PortfolioBacktestConfig: {
+            /**
+             * Benchmark Code
+             * @default 000300.SH
+             */
+            benchmark_code: string;
+            drawdown_rule?: components["schemas"]["DrawdownRule-Output"] | null;
+            /**
+             * End Date
+             * Format: date
+             */
+            end_date: string;
+            execution_cost_spec: components["schemas"]["ExecutionCostSpec"];
+            /** Initial Cash */
+            initial_cash: string;
+            rebalance_rule: components["schemas"]["RebalanceRule"];
+            /**
+             * Source Key
+             * @default verified-screen
+             */
+            source_key: string;
+            /**
+             * Source Version
+             * @default 1
+             */
+            source_version: number;
+            /**
+             * Start Date
+             * Format: date
+             */
+            start_date: string;
+            weight_rule: components["schemas"]["PortfolioWeightRule-Output"];
         };
         /** PortfolioCapabilities */
         PortfolioCapabilities: {
@@ -11492,6 +15536,44 @@ export interface components {
              */
             start_date: string;
         };
+        /** PrepareNotifierDeliveryMode */
+        PrepareNotifierDeliveryMode: {
+            /** Command Id */
+            command_id: string;
+            /** Generation Id */
+            generation_id: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "prepare_notifier_delivery_mode";
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+            run: components["schemas"]["NotifierModeDraft"];
+        };
+        /** PreparePromotionApproval */
+        PreparePromotionApproval: {
+            /** Command Id */
+            command_id: string;
+            /** Generation Id */
+            generation_id: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "prepare_promotion_approval";
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+            /** Review Id */
+            review_id: string;
+            target: components["schemas"]["StrategyPromotionTarget"];
+        };
         /** PrepareUnitRun */
         PrepareUnitRun: {
             /** Command Id */
@@ -11509,6 +15591,72 @@ export interface components {
              */
             requested_at: string;
             run: components["schemas"]["TaskUnitRunDraft"];
+        };
+        /** PreparedPromotionApproval */
+        "PreparedPromotionApproval-Input": {
+            /** Actor Id */
+            actor_id: string;
+            /**
+             * Expires At
+             * Format: date-time
+             */
+            expires_at: string;
+            /** Issuance Proof */
+            issuance_proof: string;
+            /**
+             * Issued At
+             * Format: date-time
+             */
+            issued_at: string;
+            /**
+             * Preparation Id
+             * Format: uuid
+             */
+            preparation_id: string;
+            review: components["schemas"]["StrategyPromotionReview-Input"];
+            /** Role Revision */
+            role_revision: number;
+            /** Role State Hash */
+            role_state_hash: string;
+        };
+        /** PreparedPromotionApproval */
+        "PreparedPromotionApproval-Output": {
+            /** Actor Id */
+            actor_id: string;
+            /**
+             * Expires At
+             * Format: date-time
+             */
+            expires_at: string;
+            /** Issuance Proof */
+            issuance_proof: string;
+            /**
+             * Issued At
+             * Format: date-time
+             */
+            issued_at: string;
+            /**
+             * Preparation Id
+             * Format: uuid
+             */
+            preparation_id: string;
+            review: components["schemas"]["StrategyPromotionReview-Output"];
+            /** Role Revision */
+            role_revision: number;
+            /** Role State Hash */
+            role_state_hash: string;
+        };
+        /** PreparedUserRoleChange */
+        PreparedUserRoleChange: {
+            confirmation: components["schemas"]["RoleChangeConfirmation"];
+            request: components["schemas"]["SetUserRoleRequest"];
+            /** Request Sha256 */
+            request_sha256: string;
+            /**
+             * Schema Version
+             * @constant
+             */
+            schema_version: 1;
         };
         /** PriceAlertNotificationFact */
         PriceAlertNotificationFact: {
@@ -11854,6 +16002,52 @@ export interface components {
             /** Table Name */
             table_name: string;
         };
+        /** PromotionEvidenceSelection */
+        PromotionEvidenceSelection: {
+            /** Band Job Id */
+            band_job_id?: string | null;
+            /** Experiment Id */
+            experiment_id: string;
+            /** Family Id */
+            family_id: string;
+            /** Paper Account Id */
+            paper_account_id?: string | null;
+            /** Walk Forward Id */
+            walk_forward_id?: string | null;
+        };
+        /** PromotionGate */
+        "PromotionGate-Input": {
+            /** Key */
+            key: string;
+            /** Message */
+            message: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "satisfied" | "failed" | "missing";
+            /** Value */
+            value?: number | string | null;
+        };
+        /** PromotionGate */
+        "PromotionGate-Output": {
+            /** Key */
+            key: string;
+            /** Message */
+            message: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "satisfied" | "failed" | "missing";
+            /** Value */
+            value?: string | null;
+        };
+        /**
+         * PromotionStage
+         * @enum {string}
+         */
+        PromotionStage: "exploratory" | "comparable" | "paper_candidate" | "monitor_approved";
         /** PublishedDailyScreenEvidence */
         PublishedDailyScreenEvidence: {
             /** Canonical Generation Id */
@@ -12154,6 +16348,27 @@ export interface components {
             /** Tracking Error */
             tracking_error: number | null;
         };
+        /** RequestPromotionReview */
+        RequestPromotionReview: {
+            /** Command Id */
+            command_id: string;
+            /** Expected Revision */
+            expected_revision: number;
+            /** Generation Id */
+            generation_id: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "request_promotion_review";
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+            selection: components["schemas"]["PromotionEvidenceSelection"];
+            target: components["schemas"]["StrategyPromotionTarget"];
+        };
         /** RequestUnitRun */
         RequestUnitRun: {
             /** Command Id */
@@ -12340,6 +16555,86 @@ export interface components {
              */
             reason: "window_unfinished" | "visibility_pending" | "missing_price" | "suspended" | "source_unavailable";
         };
+        /**
+         * RoleChangeConfirmation
+         * @description Pure binding content; the original service must protect issuance and lookup.
+         */
+        RoleChangeConfirmation: {
+            /** Actor Id */
+            actor_id: string;
+            /** Command Id */
+            command_id: string;
+            /** Content Sha256 */
+            content_sha256: string;
+            /** Expected Revision */
+            expected_revision: number;
+            /** Expected State Sha256 */
+            expected_state_sha256: string;
+            /**
+             * Expires At
+             * Format: date-time
+             */
+            expires_at: string;
+            /**
+             * Issued At
+             * Format: date-time
+             */
+            issued_at: string;
+            /**
+             * New Role
+             * @enum {string}
+             */
+            new_role: "admin" | "researcher" | "viewer";
+            /**
+             * Old Role
+             * @enum {string}
+             */
+            old_role: "admin" | "researcher" | "viewer";
+            /** Request Sha256 */
+            request_sha256: string;
+            /**
+             * Schema Version
+             * @default 1
+             * @constant
+             */
+            schema_version: 1;
+            /** Target Id */
+            target_id: string;
+        };
+        /** RoleEntry */
+        RoleEntry: {
+            /**
+             * Role
+             * @enum {string}
+             */
+            role: "admin" | "researcher" | "viewer";
+            /** Username */
+            username: string;
+        };
+        /** RoleLookupData */
+        RoleLookupData: {
+            /** Found */
+            found: boolean;
+            /** Receipt */
+            receipt?: {
+                [key: string]: components["schemas"]["JsonValue"];
+            } | null;
+        };
+        /** RoleState */
+        RoleState: {
+            /** Content Sha256 */
+            content_sha256: string;
+            /** Revision */
+            revision: number;
+            /**
+             * Schema Version
+             * @default 1
+             * @constant
+             */
+            schema_version: 1;
+            /** Users */
+            users: components["schemas"]["RoleEntry"][];
+        };
         /** RoundTrip */
         RoundTrip: {
             /**
@@ -12475,6 +16770,27 @@ export interface components {
             start_date: string;
             /** Strategy Id */
             strategy_id: string;
+        };
+        /** RunStrategyWalkForward */
+        RunStrategyWalkForward: {
+            /** Command Id */
+            command_id: string;
+            /** Fold Count */
+            fold_count: number;
+            /** Generation Id */
+            generation_id: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "run_strategy_walk_forward";
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+            selection: components["schemas"]["PromotionEvidenceSelection"];
+            target: components["schemas"]["StrategyPromotionTarget"];
         };
         /** RuntimeServiceItem */
         RuntimeServiceItem: {
@@ -13281,6 +17597,7 @@ export interface components {
             backlog_count: number;
             /** Consecutive Failures */
             consecutive_failures: number;
+            detail?: components["schemas"]["HealthServiceDetail"] | null;
             /** Heartbeat At */
             heartbeat_at: string | null;
             /** Input Sequence */
@@ -13366,6 +17683,58 @@ export interface components {
              */
             requested_at: string;
         };
+        /** SetMonitorBuiltinEnabled */
+        SetMonitorBuiltinEnabled: {
+            /**
+             * Builtin Id
+             * @enum {string}
+             */
+            builtin_id: "pool2_levels" | "pool_attack" | "surge" | "pulse";
+            /** Command Id */
+            command_id: string;
+            /** Enabled */
+            enabled: boolean;
+            /** Expected Revision */
+            expected_revision: number;
+            /** Generation Id */
+            generation_id: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "set_monitor_builtin_enabled";
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+        };
+        /** SetNotifierDeliveryMode */
+        SetNotifierDeliveryMode: {
+            /** Command Id */
+            command_id: string;
+            /** Confirmation Id */
+            confirmation_id: string;
+            /** Expected Revision */
+            expected_revision: number;
+            /** Generation Id */
+            generation_id: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "set_notifier_delivery_mode";
+            /**
+             * Mode
+             * @enum {string}
+             */
+            mode: "shadow" | "live";
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+        };
         /** SetPaperAccountPaused */
         SetPaperAccountPaused: {
             /** Account Id */
@@ -13393,6 +17762,80 @@ export interface components {
              */
             requested_at: string;
         };
+        /** SetUserRoleCommand */
+        SetUserRoleCommand: {
+            /** Actor Id */
+            actor_id: string;
+            /** Command Id */
+            command_id: string;
+            /** Entered Target */
+            entered_target: string;
+            /** Expected Revision */
+            expected_revision: number;
+            /** Expected State Sha256 */
+            expected_state_sha256: string;
+            /**
+             * Kind
+             * @constant
+             */
+            kind: "set_user_role";
+            /**
+             * New Role
+             * @enum {string}
+             */
+            new_role: "admin" | "researcher" | "viewer";
+            preparation: components["schemas"]["PreparedUserRoleChange"];
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+            /**
+             * Schema Version
+             * @constant
+             */
+            schema_version: 1;
+            /** Target Id */
+            target_id: string;
+        };
+        /** SetUserRoleRequest */
+        SetUserRoleRequest: {
+            /** Actor Id */
+            actor_id: string;
+            /** Command Id */
+            command_id: string;
+            /** Expected Revision */
+            expected_revision: number;
+            /** Expected State Sha256 */
+            expected_state_sha256: string;
+            /**
+             * Kind
+             * @constant
+             */
+            kind: "set_user_role";
+            /**
+             * New Role
+             * @enum {string}
+             */
+            new_role: "admin" | "researcher" | "viewer";
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+            /**
+             * Schema Version
+             * @constant
+             */
+            schema_version: 1;
+            /** Target Id */
+            target_id: string;
+        };
+        /**
+         * SignalAction
+         * @enum {string}
+         */
+        SignalAction: "watch" | "b_intent" | "reduce" | "s_intent" | "cancel";
         /** SignalItem */
         SignalItem: {
             /** Action */
@@ -13509,6 +17952,52 @@ export interface components {
             reason: string;
             state: components["schemas"]["UserState"];
         };
+        /** StockNewsCoverage */
+        StockNewsCoverage: {
+            /**
+             * Collected At
+             * Format: date-time
+             */
+            collected_at: string;
+            /** Collected Pages */
+            collected_pages: number[];
+            /**
+             * Complete
+             * @default false
+             */
+            complete: boolean;
+            /**
+             * End Date
+             * Format: date
+             */
+            end_date: string;
+            /**
+             * Provider
+             * @enum {string}
+             */
+            provider: "eastmoney" | "tushare";
+            /** Requested Pages */
+            requested_pages: number[];
+            /** Returned Documents */
+            returned_documents?: number | null;
+            /**
+             * Source Kind
+             * @enum {string}
+             */
+            source_kind: "announcement" | "news" | "research";
+            /**
+             * Start Date
+             * Format: date
+             */
+            start_date: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "available" | "unavailable" | "permission_denied";
+            /** Total Pages */
+            total_pages?: number | null;
+        };
         /** StockSearchData */
         StockSearchData: {
             /** Available */
@@ -13539,6 +18028,17 @@ export interface components {
             price: number | null;
             /** Ts Code */
             ts_code: string;
+        };
+        /** StrategyAuthoringIdentity */
+        StrategyAuthoringIdentity: {
+            /** Instance Id */
+            instance_id: string;
+            /** Path */
+            path: string;
+            /** St Dev */
+            st_dev: number;
+            /** St Ino */
+            st_ino: number;
         };
         /** StrategyCatalogData */
         StrategyCatalogData: {
@@ -13571,6 +18071,288 @@ export interface components {
             key: string;
             /** Label */
             label: string;
+        };
+        /** StrategyPromotionApproval */
+        StrategyPromotionApproval: {
+            /** Actor Id */
+            actor_id: string;
+            after: components["schemas"]["StrategyPromotionState"];
+            /**
+             * Applied At
+             * Format: date-time
+             */
+            applied_at: string;
+            /** Approval Id */
+            approval_id?: string | null;
+            /**
+             * Command Id
+             * Format: uuid
+             */
+            command_id: string;
+            /**
+             * Effect Id
+             * Format: uuid
+             */
+            effect_id: string;
+            /** Original Request Hash */
+            original_request_hash: string;
+            review: components["schemas"]["StrategyPromotionReview-Output"];
+        };
+        /** StrategyPromotionCandidateReference */
+        StrategyPromotionCandidateReference: {
+            /** Family Name */
+            family_name: string;
+            /** Has Sealed Reference */
+            has_sealed_reference: boolean;
+            /** Input Hash */
+            input_hash: string;
+            /** Is Current */
+            is_current: boolean;
+            /**
+             * Job Id
+             * Format: uuid
+             */
+            job_id: string;
+            /** Manifest Hash */
+            manifest_hash: string | null;
+            /** Parent Count */
+            parent_count: number;
+            /** Result Hash */
+            result_hash: string | null;
+            selection: components["schemas"]["PromotionEvidenceSelection"];
+            /** Spec Hash */
+            spec_hash: string;
+            target: components["schemas"]["StrategyPromotionTarget"];
+            template_parent?: components["schemas"]["ExperimentTemplateSelection"] | null;
+            train_window: components["schemas"]["DateRange"];
+            validation_window: components["schemas"]["DateRange"];
+        };
+        /** StrategyPromotionCommandData */
+        StrategyPromotionCommandData: {
+            approval?: components["schemas"]["StrategyPromotionApproval"] | null;
+            /** Message */
+            message: string;
+            /** Original Request */
+            original_request: components["schemas"]["RequestPromotionReview"] | components["schemas"]["PreparePromotionApproval"] | components["schemas"]["ApprovePromotion-Output"] | components["schemas"]["RunStrategyWalkForward"];
+            preparation?: components["schemas"]["PreparedPromotionApproval-Output"] | null;
+            receipt?: components["schemas"]["PageControlReceipt"] | null;
+            review?: components["schemas"]["StrategyPromotionReview-Output"] | null;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "not_registered" | "pending" | "uncertain" | "rejected" | "completed" | "completed_waiting_publication" | "published";
+            /** Walk Forward */
+            walk_forward?: components["schemas"]["StrategyPromotionWalkForwardSubmission"] | components["schemas"]["NativeStrategyPromotionWalkForwardSubmission"] | null;
+        };
+        /** StrategyPromotionData */
+        StrategyPromotionData: {
+            /**
+             * Availability
+             * @enum {string}
+             */
+            availability: "unavailable" | "empty" | "populated";
+            /** Available At */
+            available_at: string | null;
+            /**
+             * Can Evaluate
+             * @default false
+             */
+            can_evaluate: boolean;
+            /**
+             * Can Prepare Approval
+             * @default false
+             */
+            can_prepare_approval: boolean;
+            /**
+             * Can Run Walk Forward
+             * @default false
+             */
+            can_run_walk_forward: boolean;
+            /**
+             * Candidates
+             * @default []
+             */
+            candidates: components["schemas"]["StrategyPromotionCandidateReference"][];
+            /** Next Offset */
+            next_offset?: number | null;
+            /**
+             * Paper Accounts
+             * @default []
+             */
+            paper_accounts: components["schemas"]["StrategyPromotionPaperReference"][];
+            /**
+             * Reason
+             * @default
+             */
+            reason: string;
+            /**
+             * Reviews
+             * @default []
+             */
+            reviews: components["schemas"]["StrategyPromotionReview-Output"][];
+            /**
+             * Source Kind
+             * @enum {string}
+             */
+            source_kind: "template" | "builtin";
+            /**
+             * States
+             * @default []
+             */
+            states: components["schemas"]["StrategyPromotionStateFact"][];
+            /** Strategy Id */
+            strategy_id: string;
+            /**
+             * Walk Forward
+             * @default []
+             */
+            walk_forward: components["schemas"]["StrategyPromotionWalkForwardReference"][];
+        };
+        /** StrategyPromotionPaperReference */
+        StrategyPromotionPaperReference: {
+            /** Account Id */
+            account_id: string;
+            /** Band Jobs */
+            band_jobs: string[];
+            /** Target Key */
+            target_key: string;
+        };
+        /** StrategyPromotionReview */
+        "StrategyPromotionReview-Input": {
+            /** Actor Id */
+            actor_id: string;
+            /**
+             * Command Id
+             * Format: uuid
+             */
+            command_id: string;
+            /** Evidence Hash */
+            evidence_hash: string;
+            /** Expected Revision */
+            expected_revision: number;
+            from_stage: components["schemas"]["PromotionStage"];
+            /** Gates */
+            gates: components["schemas"]["PromotionGate-Input"][];
+            metadata_identity: components["schemas"]["StrategyAuthoringIdentity"];
+            /**
+             * Observed At
+             * Format: date-time
+             */
+            observed_at: string;
+            /** Policy Hash */
+            policy_hash: string;
+            /** Review Id */
+            review_id?: string | null;
+            selection: components["schemas"]["PromotionEvidenceSelection"];
+            target: components["schemas"]["StrategyPromotionTarget"];
+            to_stage: components["schemas"]["PromotionStage"];
+        };
+        /** StrategyPromotionReview */
+        "StrategyPromotionReview-Output": {
+            /** Actor Id */
+            actor_id: string;
+            /**
+             * Command Id
+             * Format: uuid
+             */
+            command_id: string;
+            /** Evidence Hash */
+            evidence_hash: string;
+            /** Expected Revision */
+            expected_revision: number;
+            from_stage: components["schemas"]["PromotionStage"];
+            /** Gates */
+            gates: components["schemas"]["PromotionGate-Output"][];
+            metadata_identity: components["schemas"]["StrategyAuthoringIdentity"];
+            /**
+             * Observed At
+             * Format: date-time
+             */
+            observed_at: string;
+            /** Policy Hash */
+            policy_hash: string;
+            /** Review Id */
+            review_id?: string | null;
+            selection: components["schemas"]["PromotionEvidenceSelection"];
+            target: components["schemas"]["StrategyPromotionTarget"];
+            to_stage: components["schemas"]["PromotionStage"];
+        };
+        /** StrategyPromotionState */
+        StrategyPromotionState: {
+            /** Latest Approval Hash */
+            latest_approval_hash?: string | null;
+            /** Paper Approval Hash */
+            paper_approval_hash?: string | null;
+            /** Paper Approved At */
+            paper_approved_at?: string | null;
+            /**
+             * Revision
+             * @default 0
+             */
+            revision: number;
+            /** @default exploratory */
+            stage: components["schemas"]["PromotionStage"];
+            target: components["schemas"]["StrategyPromotionTarget"];
+        };
+        /** StrategyPromotionStateFact */
+        StrategyPromotionStateFact: {
+            /** Applied At */
+            applied_at?: string | null;
+            /** Owner Id */
+            owner_id: string;
+            state: components["schemas"]["StrategyPromotionState"];
+            /** Target Key */
+            target_key: string;
+        };
+        /** StrategyPromotionTarget */
+        StrategyPromotionTarget: {
+            /** Cost Fingerprint */
+            cost_fingerprint: string;
+            head: components["schemas"]["StrategyTemplateHead"];
+            /** Name */
+            name: string;
+            /** Owner Id */
+            owner_id: string;
+            /** Parameter Fingerprint */
+            parameter_fingerprint: string;
+            /**
+             * Source Kind
+             * @enum {string}
+             */
+            source_kind: "template" | "builtin";
+            /** Strategy Id */
+            strategy_id: string;
+        };
+        /** StrategyPromotionWalkForwardReference */
+        StrategyPromotionWalkForwardReference: {
+            /**
+             * Command Id
+             * Format: uuid
+             */
+            command_id: string;
+            /** Experiment Id */
+            experiment_id: string;
+            /** Family Id */
+            family_id: string;
+            /** Fold Count */
+            fold_count: number;
+            /** Submitted */
+            submitted: boolean;
+            /** Target Key */
+            target_key: string;
+        };
+        /** StrategyPromotionWalkForwardSubmission */
+        StrategyPromotionWalkForwardSubmission: {
+            /**
+             * Command Id
+             * Format: uuid
+             */
+            command_id: string;
+            /** Plan Hash */
+            plan_hash: string;
+            /** Receipts */
+            receipts: components["schemas"]["StrategyTemplateRunReceipt"][];
         };
         /** StrategyTemplate */
         "StrategyTemplate-Input": {
@@ -13771,6 +18553,43 @@ export interface components {
              */
             status: "rejected" | "pending" | "submitted" | "uncertain";
         };
+        /** StrategyTemplateRunReceipt */
+        StrategyTemplateRunReceipt: {
+            /**
+             * Action
+             * @default run
+             * @constant
+             */
+            action: "run";
+            /** Command Id */
+            command_id: string;
+            /**
+             * Completed At
+             * Format: date-time
+             */
+            completed_at: string;
+            head: components["schemas"]["StrategyTemplateHead"];
+            /**
+             * Job Id
+             * Format: uuid
+             */
+            job_id: string;
+            /** Lab Content Hash */
+            lab_content_hash: string;
+            /**
+             * Lab Request Id
+             * Format: uuid
+             */
+            lab_request_id: string;
+            /** Original Request Hash */
+            original_request_hash: string;
+            /** Owner Id */
+            owner_id: string;
+            /** Spec Hash */
+            spec_hash: string;
+            /** Strategy Id */
+            strategy_id: string;
+        };
         /** StrategyTemplateSourcesData */
         StrategyTemplateSourcesData: {
             /**
@@ -13826,6 +18645,25 @@ export interface components {
             longest_loss: number;
             /** Longest Win */
             longest_win: number;
+        };
+        /** SubmissionSpoolIdentity */
+        SubmissionSpoolIdentity: {
+            /** Content Hash */
+            content_hash: string;
+            /** Device */
+            device: number;
+            /** Inode */
+            inode: number;
+            /**
+             * Path
+             * Format: path
+             */
+            path: string;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "pending" | "acknowledged";
         };
         /** SurgeConfig */
         SurgeConfig: {
@@ -13932,10 +18770,24 @@ export interface components {
             /** Generation Id */
             generation_id?: string | null;
             /**
+             * Monitor Builtins
+             * @default []
+             */
+            monitor_builtins: components["schemas"]["MonitorBuiltinControlView"][];
+            /**
              * Note
              * @default 任务操作尚未开放。
              */
             note: string;
+            /**
+             * @default {
+             *       "available": false,
+             *       "can_request": false,
+             *       "can_set_live": false,
+             *       "note": "通知模式暂无法核验。"
+             *     }
+             */
+            notifier_mode: components["schemas"]["NotifierModeControlView"];
             /**
              * @default {
              *       "available": false,
@@ -13962,6 +18814,10 @@ export interface components {
             confirmation_expires_at?: string | null;
             /** Confirmation Id */
             confirmation_id?: string | null;
+            /** Desired Installation Sha256 */
+            desired_installation_sha256?: string | null;
+            /** Desired Revision */
+            desired_revision?: number | null;
             /** Desired Version */
             desired_version?: number | null;
             /** Duration Seconds */
@@ -13973,7 +18829,7 @@ export interface components {
             /** Message */
             message: string;
             /** Original Request */
-            original_request: components["schemas"]["PrepareUnitRun"] | components["schemas"]["RequestUnitRun"] | components["schemas"]["SetLabSchedulingPaused"];
+            original_request: components["schemas"]["PrepareUnitRun"] | components["schemas"]["RequestUnitRun"] | components["schemas"]["SetLabSchedulingPaused"] | components["schemas"]["PrepareNotifierDeliveryMode"] | components["schemas"]["SetNotifierDeliveryMode"] | components["schemas"]["SetMonitorBuiltinEnabled"];
             /** Started At */
             started_at?: string | null;
             /**
@@ -14037,6 +18893,8 @@ export interface components {
         TaskUnitControlChoice: {
             /** Can Request */
             can_request: boolean;
+            /** Next Allowed At */
+            next_allowed_at?: string | null;
             /** Reason */
             reason: string;
             /** Requires Confirmation */
@@ -14305,6 +19163,36 @@ export interface components {
          * @enum {string}
          */
         UserState: "ok" | "warn" | "crit" | "idle" | "waiting";
+        /** ValidatedInterpretation */
+        ValidatedInterpretation: {
+            binding: components["schemas"]["AIInterpretationBinding"];
+            /** Content Sha256 */
+            content_sha256?: string | null;
+            /** Metrics */
+            metrics: components["schemas"]["AICitedMetric"][];
+            /** Sections */
+            sections: components["schemas"]["InterpretationSection"][];
+        };
+        /** ValidatedStockNewsDigest */
+        ValidatedStockNewsDigest: {
+            /** Content Sha256 */
+            content_sha256?: string | null;
+            /** Context Sha256 */
+            context_sha256: string;
+            /** Coverage Complete */
+            coverage_complete: boolean;
+            /** Owner Uid */
+            owner_uid: string;
+            /** Statements */
+            statements: components["schemas"]["NewsDigestStatement"][];
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "complete" | "limited" | "empty" | "unavailable";
+            /** Stock Code */
+            stock_code: string;
+        };
         /** ValidationError */
         ValidationError: {
             /** Context */
@@ -14338,6 +19226,287 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    confirm_backtest_api_v1_ai_backtests_confirm_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AIBacktestConfirmRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_AIBacktestConfirmation_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    prepare_backtest_api_v1_ai_backtests_prepare_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AIBacktestPrepareRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_AIBacktestPreparation_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    lookup_backtest_api_v1_ai_backtests_prepare_lookup_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AIBacktestPrepareRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_AIBacktestPreparation_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    capabilities_api_v1_ai_capabilities_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_AICapabilities_"];
+                };
+            };
+        };
+    };
+    interpretation_api_v1_ai_interpretations_read_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AIInterpretationRequest"] | components["schemas"]["AIInterpretationContextRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_AIInterpretationView_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    stock_news_api_v1_ai_news__stock_code__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                stock_code: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_AIStockNewsView_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    generate_api_v1_ai_requests_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AIScreenRequest"] | components["schemas"]["AIPoolRequest"] | components["schemas"]["AIInterpretationRequest"] | components["schemas"]["AINewsRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_AIRequestView_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    lookup_api_v1_ai_requests_lookup_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AIScreenRequest"] | components["schemas"]["AIPoolRequest"] | components["schemas"]["AIInterpretationRequest"] | components["schemas"]["AINewsRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_AIRequestView_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    usage_api_v1_ai_usage_get: {
+        parameters: {
+            query: {
+                start_date: string;
+                end_date: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_AIUsageView_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     list_backtests_api_v1_backtests_get: {
         parameters: {
             query?: {
@@ -14358,6 +19527,505 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_BacktestListData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    capabilities_api_v1_backtests_minute_runtime_capabilities_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_MinuteCapabilities_"];
+                };
+            };
+        };
+    };
+    submit_export_api_v1_backtests_minute_runtime_exports_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MinuteExportRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MinuteCommandReceipt"];
+                };
+            };
+            /** @description Conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MinuteCommandReceipt"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    parameter_sources_api_v1_backtests_minute_runtime_parameter_sources_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_MinuteParameterSourcesData_"];
+                };
+            };
+        };
+    };
+    runs_api_v1_backtests_minute_runtime_runs_get: {
+        parameters: {
+            query?: {
+                limit?: number;
+                cursor?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_MinuteJobsData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    submit_run_api_v1_backtests_minute_runtime_runs_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MinuteCreateRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MinuteCommandReceipt"];
+                };
+            };
+            /** @description Conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MinuteCommandReceipt"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    summary_api_v1_backtests_minute_runtime_runs__job_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                job_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_MinuteSummaryData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    download_zip_api_v1_backtests_minute_runtime_runs__job_id__exports__request_id__zip_get: {
+        parameters: {
+            query: {
+                result_hash: string;
+            };
+            header?: never;
+            path: {
+                job_id: string;
+                request_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    nav_api_v1_backtests_minute_runtime_runs__job_id__nav_get: {
+        parameters: {
+            query: {
+                result_hash: string;
+            };
+            header?: never;
+            path: {
+                job_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_MinuteNavData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    report_html_api_v1_backtests_minute_runtime_runs__job_id__report_html_get: {
+        parameters: {
+            query: {
+                result_hash: string;
+            };
+            header?: never;
+            path: {
+                job_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    rows_api_v1_backtests_minute_runtime_runs__job_id__rows_get: {
+        parameters: {
+            query: {
+                result_hash: string;
+                table: "signals" | "orders" | "fills" | "paper_queue" | "account" | "daily_valuations" | "execution_profile" | "replay_summary";
+                offset?: number;
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                job_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_MinuteRowsData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    sources_api_v1_backtests_minute_runtime_sources_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_MinuteSourcesData_"];
+                };
+            };
+        };
+    };
+    studies_api_v1_backtests_minute_runtime_studies_get: {
+        parameters: {
+            query?: {
+                limit?: number;
+                cursor?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_MinuteStudiesData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    submit_study_api_v1_backtests_minute_runtime_studies_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MinuteStudyCreateRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MinuteStudyCommandReceipt"];
+                };
+            };
+            /** @description Conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MinuteStudyCommandReceipt"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    study_capabilities_api_v1_backtests_minute_runtime_studies_capabilities_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_MinuteStudyCapabilitiesData_"];
+                };
+            };
+        };
+    };
+    study_result_api_v1_backtests_minute_runtime_studies__command_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                command_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_MinuteStudyResultData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    study_heatmap_api_v1_backtests_minute_runtime_studies__command_id__heatmap_get: {
+        parameters: {
+            query: {
+                current_trial_index: number;
+                x_parameter: string;
+                y_parameter: string;
+            };
+            header?: never;
+            path: {
+                command_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_MinuteStudyHeatmapData_"];
                 };
             };
             /** @description Validation Error */
@@ -14703,6 +20371,181 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    audit_api_v1_collaboration_audit_get: {
+        parameters: {
+            query?: {
+                limit?: number;
+                actor_id?: string | null;
+                command_kind?: string | null;
+                time_from?: string | null;
+                time_until?: string | null;
+                cursor?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_CommandAuditPage_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    me_api_v1_collaboration_me_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_CollaborationMe_"];
+                };
+            };
+        };
+    };
+    submit_api_v1_collaboration_roles_commands_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CollaborationRoleSubmit"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_PageControlReceipt_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    lookup_api_v1_collaboration_roles_lookup_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CollaborationRoleLookup"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_RoleLookupData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    prepare_api_v1_collaboration_roles_prepare_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetUserRoleRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_IssuedRolePreparation_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    users_api_v1_collaboration_users_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_RoleState_"];
                 };
             };
         };
@@ -15451,6 +21294,39 @@ export interface operations {
             };
         };
     };
+    template_report_api_v1_experiments_template_results__job_id__report_html_get: {
+        parameters: {
+            query: {
+                result_hash: string;
+            };
+            header?: never;
+            path: {
+                job_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     factor_capabilities_api_v1_factors_capabilities_get: {
         parameters: {
             query?: never;
@@ -15722,6 +21598,39 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_FactorResultDetailData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    factor_report_api_v1_factors_results__job_id__report_get: {
+        parameters: {
+            query: {
+                generation_id: string;
+            };
+            header?: never;
+            path: {
+                job_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
                 };
             };
             /** @description Validation Error */
@@ -16358,6 +22267,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_PriceAlertRuntimeData_"];
+                };
+            };
+        };
+    };
+    get_runtime_api_v1_monitor_runtime_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_MonitorRuntimeData_"];
                 };
             };
         };
@@ -18077,6 +24006,142 @@ export interface operations {
             };
         };
     };
+    commands_api_v1_strategy_promotions_commands_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RequestPromotionReview"] | components["schemas"]["PreparePromotionApproval"] | components["schemas"]["ApprovePromotion-Input"] | components["schemas"]["RunStrategyWalkForward"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_StrategyPromotionCommandData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    lookup_api_v1_strategy_promotions_commands_lookup_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RequestPromotionReview"] | components["schemas"]["PreparePromotionApproval"] | components["schemas"]["ApprovePromotion-Input"] | components["schemas"]["RunStrategyWalkForward"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_StrategyPromotionCommandData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    resume_api_v1_strategy_promotions_commands_resume_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RequestPromotionReview"] | components["schemas"]["PreparePromotionApproval"] | components["schemas"]["ApprovePromotion-Input"] | components["schemas"]["RunStrategyWalkForward"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_StrategyPromotionCommandData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    detail_api_v1_strategy_promotions__strategy_id__get: {
+        parameters: {
+            query?: {
+                source_kind?: "template" | "builtin";
+                version?: number | null;
+                generation_id?: string | null;
+                offset?: number;
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                strategy_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_StrategyPromotionData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     templates_api_v1_strategy_templates_get: {
         parameters: {
             query?: {
@@ -18384,7 +24449,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["PrepareUnitRun"] | components["schemas"]["RequestUnitRun"] | components["schemas"]["SetLabSchedulingPaused"];
+                "application/json": components["schemas"]["PrepareUnitRun"] | components["schemas"]["RequestUnitRun"] | components["schemas"]["SetLabSchedulingPaused"] | components["schemas"]["PrepareNotifierDeliveryMode"] | components["schemas"]["SetNotifierDeliveryMode"] | components["schemas"]["SetMonitorBuiltinEnabled"];
             };
         };
         responses: {
@@ -18417,7 +24482,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["PrepareUnitRun"] | components["schemas"]["RequestUnitRun"] | components["schemas"]["SetLabSchedulingPaused"];
+                "application/json": components["schemas"]["PrepareUnitRun"] | components["schemas"]["RequestUnitRun"] | components["schemas"]["SetLabSchedulingPaused"] | components["schemas"]["PrepareNotifierDeliveryMode"] | components["schemas"]["SetNotifierDeliveryMode"] | components["schemas"]["SetMonitorBuiltinEnabled"];
             };
         };
         responses: {
@@ -18555,6 +24620,105 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ResearchTaskEventsData"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    set_monitor_builtin_api_v1_tasks_monitor_builtins_commands_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetMonitorBuiltinEnabled"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskControlCommandData"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    set_notifier_mode_api_v1_tasks_notifications_mode_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetNotifierDeliveryMode"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskControlCommandData"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    prepare_notifier_mode_api_v1_tasks_notifications_mode_prepare_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PrepareNotifierDeliveryMode"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskControlCommandData"];
                 };
             };
             /** @description Validation Error */

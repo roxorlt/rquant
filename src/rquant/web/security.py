@@ -12,11 +12,15 @@ from __future__ import annotations
 
 import re
 from typing import Annotated
+from collections.abc import AsyncIterator
 from urllib.parse import urlsplit
 
 from fastapi import Depends, HTTPException, Request, status
 
 from rquant.web.proxy_identity import PROXY_PROOF_HEADER, ProxyIdentityVerifier
+from rquant.collaboration_commands import COLLABORATION_POLICY
+from rquant.web.collaboration_gateway import COLLABORATION_ACTOR, CollaborationGateway, CollaborationUnavailableError
+from rquant.web.models.collaboration import CollaborationMe
 
 USER_HEADER = "x-rquant-user"
 CSRF_HEADER = "x-rquant-csrf"
@@ -48,6 +52,54 @@ def require_current_user(viewer: Annotated[str | None, Depends(current_user)]) -
     if viewer is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="请先登录")
     return viewer
+
+
+def collaboration_me(request: Request, actor: str) -> CollaborationMe:
+    web = request.app.state.web
+    if web.settings.collaboration_mode != "enforced":
+        return CollaborationMe(available=False, mode="legacy", username=actor,
+            message="协作权限尚未启用。")
+    gateway = web.collaboration
+    if not isinstance(gateway, CollaborationGateway):
+        raise HTTPException(503, "权限服务暂不可用。")
+    try:
+        return gateway.me(actor)
+    except PermissionError as exc:
+        raise HTTPException(403, "当前账号没有访问权限。") from exc
+    except (ValueError, OSError, CollaborationUnavailableError) as exc:
+        raise HTTPException(503, "权限服务暂不可用。") from exc
+
+
+async def require_collaboration_access(request: Request) -> AsyncIterator[None]:
+    """Match the original APIRoute descriptor; unknown operations fail closed."""
+    web = request.app.state.web
+    if web.settings.collaboration_mode != "enforced":
+        yield
+        return
+    actor = current_user(request)
+    if actor is None:
+        raise HTTPException(401, "请先登录。")
+    import anyio.to_thread
+    me = await anyio.to_thread.run_sync(collaboration_me, request, actor)
+    route = request.scope.get("route")
+    descriptor = getattr(route, "path", None)
+    # FastAPI's included routers keep the original child APIRoute in scope.
+    # Its server-created effective context carries the actual prefixed template.
+    effective = request.scope.get("fastapi", {}).get("effective_route_context")
+    if effective is not None and getattr(effective, "original_route", None) is route:
+        descriptor = getattr(effective, "path", None)
+    allowed = next((rule.roles for rule in COLLABORATION_POLICY.entries
+        if (rule.method, rule.path, rule.command_kind) == (request.method, descriptor, None)), ())
+    if me.role not in allowed:
+        raise HTTPException(403, "当前角色不能执行此操作。")
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+        require_csrf(request)
+    request.state.collaboration = me
+    token = COLLABORATION_ACTOR.set(actor)
+    try:
+        yield
+    finally:
+        COLLABORATION_ACTOR.reset(token)
 
 
 _DEFAULT_PORTS = {"http": 80, "https": 443}

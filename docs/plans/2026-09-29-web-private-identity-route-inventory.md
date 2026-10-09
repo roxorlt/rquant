@@ -1,6 +1,6 @@
 # Web `current_user` 路由清单
 
-对应 [私有身份边界](2026-09-29-web-private-identity-boundary.md)。以下为当前代码中的全部 145 个 `current_user` 依赖路由；`/api/v1` 前缀已包含。公开类即使收到裸用户头，也只得到 `viewer=None`，不能据此取得身份。私有类统一使用已验证的代理身份；已有 CSRF、角色和业务条件仍单独检查。
+对应 [私有身份边界](2026-09-29-web-private-identity-boundary.md)。以下为当前代码中的全部 162 个 `current_user` 依赖路由；`/api/v1` 前缀已包含。公开类即使收到裸用户头，也只得到 `viewer=None`，不能据此取得身份。私有类统一使用已验证的代理身份；已有 CSRF、角色和业务条件仍单独检查。
 
 ## 公开读取（20）
 
@@ -27,10 +27,15 @@
 | GET | `/api/v1/data/issues` |
 | GET | `/api/v1/data/fundamentals/summary` |
 
-## 私有读取（70）
+## 私有读取（78）
 
 | 方法 | 路径 |
 |---|---|
+| GET | `/api/v1/collaboration/me` |
+| GET | `/api/v1/collaboration/users` |
+| GET | `/api/v1/collaboration/audit` |
+| GET | `/api/v1/factors/results/{job_id}/report` |
+| GET | `/api/v1/experiments/template-results/{job_id}/report.html` |
 | GET | `/api/v1/pools/editor` |
 | GET | `/api/v1/paper/accounts` |
 | GET | `/api/v1/paper-portfolios` |
@@ -101,13 +106,19 @@
 | GET | `/api/v1/screen/query/alert-drafts/{draft_id}` |
 | GET | `/api/v1/monitor/condition-rules` |
 | GET | `/api/v1/monitor/condition-rules/head` |
+| GET | `/api/v1/ai/capabilities` |
+| GET | `/api/v1/ai/news/{stock_code}` |
+| GET | `/api/v1/ai/usage` |
 
 名单按认证 owner 过滤。服务日志能力在未登录时只返回空列表，日志正文仍拒绝；普通任务、池子、监控、研究和审计页面则直接返回 401。公开的 `meta` 在没有有效证明时不显示 viewer。
 
-## 受保护操作（55）
+## 受保护操作（64）
 
 | 方法 | 路径 |
 |---|---|
+| POST | `/api/v1/collaboration/roles/commands` |
+| POST | `/api/v1/collaboration/roles/lookup` |
+| POST | `/api/v1/collaboration/roles/prepare` |
 | POST | `/api/v1/screen/tdx/parse` |
 | POST | `/api/v1/screen/tdx/preview` |
 | POST | `/api/v1/screen/run` |
@@ -163,6 +174,12 @@
 | POST | `/api/v1/screen/query/alert-draft` |
 | POST | `/api/v1/monitor/condition-rules/commands` |
 | POST | `/api/v1/monitor/condition-rules/commands/resume` |
+| POST | `/api/v1/ai/backtests/confirm` |
+| POST | `/api/v1/ai/backtests/prepare` |
+| POST | `/api/v1/ai/backtests/prepare/lookup` |
+| POST | `/api/v1/ai/interpretations/read` |
+| POST | `/api/v1/ai/requests` |
+| POST | `/api/v1/ai/requests/lookup` |
 
 公式检查、单股预览、运行选股及自然语言预览不持久写入，但会消耗计算或付费模型资源，所以按受保护操作处理。其余操作由现有 CSRF 与命令准入继续约束；代理证明不替代这些条件。
 

@@ -1,7 +1,12 @@
 import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import { submitAlertAckCommand } from "@/api/alertAckCommand";
 import { ApiError } from "@/api/client";
-import { type MonitorTimelineItem, useMonitorChannels, useMonitorTimeline } from "@/api/endpoints";
+import {
+  type MonitorTimelineItem,
+  useMonitorChannels,
+  useMonitorRuntime,
+  useMonitorTimeline,
+} from "@/api/endpoints";
 import { type ManualWatchlistItem, useManualWatchlist } from "@/api/manualWatchlist";
 import {
   publishedSuperseded,
@@ -10,7 +15,7 @@ import {
 } from "@/api/manualWatchlistCommand";
 import { useCurrentMeta } from "@/api/useMeta";
 import { StockDrawer } from "@/app/StockDrawer";
-import { formatCount, formatPrice } from "@/format/number";
+import { formatCount, formatNumber, formatPercent, formatPrice } from "@/format/number";
 import { formatShanghaiDateTime } from "@/format/time";
 import {
   Button,
@@ -31,6 +36,7 @@ import { StockCell } from "../shared/StockCell";
 import { type AckCommandSnapshot, AlertAckCommandSession } from "./alertAckCommandSession";
 import { ChannelStatus } from "./ChannelStatus";
 import { ConditionAlertRules } from "./ConditionAlertRules";
+import { MonitorControls } from "./MonitorControls";
 import { PriceAlertRules } from "./PriceAlertRules";
 import "./monitor.css";
 
@@ -298,6 +304,114 @@ function TimelineEntry({
       </li>
     );
   }
+  if (row.kind === "channel_attempt") {
+    return (
+      <li className="monitor-event monitor-notification">
+        <span className="monitor-event-time">
+          <RelativeTime at={row.at} />
+        </span>
+        <div className="monitor-event-body">
+          <div className="monitor-event-head">
+            <strong className="monitor-notification-title">{row.channel_label}</strong>
+            <Pill kind={row.state === "rejected" ? "warn" : "idle"}>{row.state_label}</Pill>
+            <Tip content={row.source_note}>
+              <span className="monitor-strategy">
+                {row.mode === "shadow" ? "仅记录" : "正式推送"}
+              </span>
+            </Tip>
+          </div>
+          <p className="monitor-reasons">
+            逻辑通知 <span className="num">{formatCount(row.logical_count)}</span>
+            {row.attempt_no != null ? (
+              <>
+                <span className="monitor-detail-separator">·</span>成员尝试{" "}
+                <span className="num">{row.attempt_no}</span>
+              </>
+            ) : null}
+          </p>
+        </div>
+      </li>
+    );
+  }
+  if (row.kind === "builtin" || row.kind === "condition") {
+    const market = row.kind === "builtin" && row.subject === "market";
+    return (
+      <li className="monitor-event">
+        <span className="monitor-event-time">
+          <RelativeTime at={row.at} />
+        </span>
+        <div className="monitor-event-body">
+          <div className="monitor-event-head">
+            {!market && row.code !== null ? (
+              <button
+                className="monitor-stock"
+                type="button"
+                aria-label={`查看${row.name ?? row.code}详情`}
+                onClick={() => {
+                  if (row.code !== null) onStock(row.code);
+                }}
+              >
+                <StockCell code={row.code} name={row.name} />
+              </button>
+            ) : (
+              <strong>{market ? "全市场" : "个股未确认"}</strong>
+            )}
+            <Tip content={row.source_note}>
+              <span className="monitor-strategy">{row.event_label}</span>
+            </Tip>
+            <AckAction
+              acknowledgment={row.acknowledgment}
+              commandSession={commandSession}
+              command={command}
+              canConfirm={canConfirm}
+              canResume={canResume}
+              generationId={generationId}
+            />
+          </div>
+          {row.kind === "builtin" && market ? (
+            <p className="monitor-reasons">
+              <span className="num">
+                {row.comparison_unit === "percent"
+                  ? formatPercent(row.before)
+                  : row.comparison_unit === "count"
+                    ? formatCount(row.before)
+                    : formatNumber(row.before)}
+                {" → "}
+                {row.comparison_unit === "percent"
+                  ? formatPercent(row.after)
+                  : row.comparison_unit === "count"
+                    ? formatCount(row.after)
+                    : formatNumber(row.after)}
+                {row.comparison_unit === "count" ? " 家" : null}
+              </span>
+            </p>
+          ) : row.kind === "builtin" ? (
+            <p className="monitor-reasons">
+              触发价 <span className="num">{formatPrice(row.price)}</span>
+              {row.threshold != null ? (
+                <>
+                  <span className="monitor-detail-separator">·</span>
+                  {row.threshold_unit === "CNY"
+                    ? "参考价"
+                    : row.threshold_unit === "multiple"
+                      ? "相对量"
+                      : "阈值"}{" "}
+                  <span className="num">
+                    {formatNumber(row.threshold)}
+                    {row.threshold_unit === "multiple" ? "倍" : null}
+                  </span>
+                </>
+              ) : null}
+            </p>
+          ) : (
+            <Tip content={row.source_note}>
+              <span className="monitor-strategy">{row.status_label}</span>
+            </Tip>
+          )}
+        </div>
+      </li>
+    );
+  }
   return (
     <li className="monitor-event">
       <span className="monitor-event-time">
@@ -376,7 +490,10 @@ function TimelineEntry({
   );
 }
 
-type Acknowledgment = Exclude<MonitorTimelineItem, { kind: "notification" }>["acknowledgment"];
+type Acknowledgment = Exclude<
+  MonitorTimelineItem,
+  { kind: "notification" | "channel_attempt" }
+>["acknowledgment"];
 
 function AckAction({
   acknowledgment,
@@ -500,16 +617,27 @@ export default function MonitorPage() {
   const [cursors, setCursors] = useState<(string | null)[]>([null]);
   const [refreshKey, setRefreshKey] = useState(0);
   const [selectedStock, setSelectedStock] = useState<string | null>(null);
-  const pageIndex = cursors.length - 1;
-  const result = useMonitorTimeline(cursors[pageIndex] ?? null, refreshKey);
-  const channelResult = useMonitorChannels(refreshKey);
+  const [cursorScope, setCursorScope] = useState<string | null>(null);
+  const [selectedScope, setSelectedScope] = useState<string | null>(null);
   const meta = useCurrentMeta();
   useEffect(() => {
     void meta.refetch();
   }, [meta.refetch]);
   const currentGeneration = meta.data?.data.generation?.generation_id;
-  const viewer =
-    meta.isFetchedAfterMount && !meta.isError ? (meta.data?.data.viewer ?? null) : null;
+  const identityKnown = meta.isFetchedAfterMount && !meta.isError && meta.data !== undefined;
+  const viewer = identityKnown ? (meta.data?.data.viewer ?? null) : null;
+  const scope = `${viewer}:${currentGeneration}`;
+  const liveCursors = cursorScope === scope ? cursors : [null];
+  const pageIndex = liveCursors.length - 1;
+  const result = useMonitorTimeline(liveCursors[pageIndex] ?? null, refreshKey);
+  const channelResult = useMonitorChannels(refreshKey);
+  const runtimeResult = useMonitorRuntime(refreshKey);
+  useEffect(() => {
+    setCursors([null]);
+    setCursorScope(scope);
+    setSelectedStock(null);
+    setSelectedScope(null);
+  }, [scope]);
   const commandSession = useMemo(
     () =>
       new AlertAckCommandSession(
@@ -542,13 +670,23 @@ export default function MonitorPage() {
     currentGeneration !== undefined && channelResult.serving?.generation_id !== currentGeneration;
   const channelLoading = channelResult.isLoading || (!meta.isFetchedAfterMount && !meta.isError);
   const channelData =
+    !identityKnown ||
     meta.isError ||
     oldChannelGeneration ||
     channelResult.error ||
     channelResult.serving?.state === "unavailable"
       ? undefined
       : channelResult.data;
-  const data = oldGeneration || result.error ? undefined : result.data;
+  const runtimeData =
+    !identityKnown ||
+    !viewer ||
+    meta.isError ||
+    runtimeResult.error ||
+    runtimeResult.serving?.state !== "ready" ||
+    runtimeResult.serving.generation_id !== currentGeneration
+      ? undefined
+      : runtimeResult.data;
+  const data = !identityKnown || oldGeneration || result.error ? undefined : result.data;
   const changed = result.error instanceof ApiError && result.error.status === 409;
   const pageFresh =
     meta.isFetchedAfterMount &&
@@ -567,10 +705,24 @@ export default function MonitorPage() {
     data.unacknowledged.count !== null &&
     data.unacknowledged.count_as_of !== null;
   const canResume = !!viewer && !meta.isError && command.storageAvailable;
+  const canConfirmBuiltin =
+    pageFresh &&
+    !!viewer &&
+    command.storageAvailable &&
+    data?.builtin_unacknowledged?.state === "ready" &&
+    data.builtin_unacknowledged.count != null &&
+    data.builtin_unacknowledged.count_as_of != null;
 
   function refresh() {
     setCursors([null]);
+    setCursorScope(scope);
     setRefreshKey((value) => value + 1);
+    void meta.refetch();
+  }
+
+  function openStock(code: string) {
+    setSelectedStock(code);
+    setSelectedScope(scope);
   }
 
   const metrics: Kpi[] = data
@@ -583,6 +735,20 @@ export default function MonitorPage() {
           sub: data.source_state === "ready" && data.next_cursor ? "可向前翻看历史" : undefined,
         },
         unacknowledgedKpi(pageFresh ? data.unacknowledged : undefined),
+        ...(data.builtin_unacknowledged
+          ? [
+              {
+                key: "builtin-unacknowledged",
+                label: "内置待确认",
+                value: formatCount(
+                  pageFresh && data.builtin_unacknowledged.state === "ready"
+                    ? data.builtin_unacknowledged.count
+                    : null,
+                ),
+                tip: data.builtin_unacknowledged.note ?? "只统计当前账号已核对的完整内置告警窗口。",
+              },
+            ]
+          : []),
         {
           key: "mode",
           label: "新信号通知",
@@ -611,8 +777,24 @@ export default function MonitorPage() {
           </Button>
         }
       />
-      <ChannelStatus data={channelData} loading={channelLoading} retry={channelResult.refetch} />
-      <ManualWatchlistPanel onStock={setSelectedStock} />
+      <ChannelStatus
+        data={channelData}
+        loading={channelLoading}
+        retry={channelResult.refetch}
+        runtime={runtimeData}
+        runtimeLoading={runtimeResult.isLoading}
+        retryRuntime={runtimeResult.refetch}
+      />
+      <MonitorControls
+        viewer={viewer}
+        identityKnown={identityKnown}
+        generationId={currentGeneration ?? null}
+        refreshKey={refreshKey}
+        data={runtimeData}
+        loading={runtimeResult.isLoading}
+        onRefresh={refresh}
+      />
+      <ManualWatchlistPanel onStock={openStock} />
       <PriceAlertRules />
       <ConditionAlertRules />
       {result.isLoading || (oldGeneration && !result.error) ? (
@@ -643,7 +825,10 @@ export default function MonitorPage() {
             {meta.data &&
             !viewer &&
             data.items.some(
-              (item) => item.kind !== "notification" && item.acknowledgment?.eligible,
+              (item) =>
+                item.kind !== "notification" &&
+                item.kind !== "channel_attempt" &&
+                item.acknowledgment?.eligible,
             ) ? (
               <p className="monitor-notice" role="status">
                 请先登录，才能确认告警。
@@ -659,7 +844,7 @@ export default function MonitorPage() {
                 浏览器记录不可用，暂时无法安全确认。
               </p>
             ) : null}
-            {data.source_state !== "ready" ? (
+            {data.source_state !== "ready" && data.items.length === 0 ? (
               <EmptyState
                 title={data.source_label}
                 hint={
@@ -681,10 +866,10 @@ export default function MonitorPage() {
                     <TimelineEntry
                       key={row.event_key}
                       row={row}
-                      onStock={setSelectedStock}
+                      onStock={openStock}
                       commandSession={commandSession}
                       command={command}
-                      canConfirm={canConfirm}
+                      canConfirm={row.kind === "builtin" ? canConfirmBuiltin : canConfirm}
                       canResume={canResume}
                       generationId={result.serving?.generation_id}
                     />
@@ -695,18 +880,22 @@ export default function MonitorPage() {
                   <Button
                     size="sm"
                     disabled={pageIndex === 0 || result.isFetching}
-                    onClick={() => setCursors((current) => current.slice(0, -1))}
+                    onClick={() => {
+                      setCursorScope(scope);
+                      setCursors(liveCursors.slice(0, -1));
+                    }}
                   >
                     上一页
                   </Button>
                   <Button
                     size="sm"
                     disabled={data.next_cursor === null || result.isFetching}
-                    onClick={() =>
-                      setCursors((current) =>
-                        data.next_cursor ? [...current, data.next_cursor] : current,
-                      )
-                    }
+                    onClick={() => {
+                      setCursorScope(scope);
+                      setCursors(
+                        data.next_cursor ? [...liveCursors, data.next_cursor] : liveCursors,
+                      );
+                    }}
                   >
                     下一页
                   </Button>
@@ -716,7 +905,10 @@ export default function MonitorPage() {
           </Panel>
         </div>
       ) : null}
-      <StockDrawer tsCode={selectedStock} onClose={() => setSelectedStock(null)} />
+      <StockDrawer
+        tsCode={selectedScope === scope ? selectedStock : null}
+        onClose={() => setSelectedStock(null)}
+      />
     </>
   );
 }

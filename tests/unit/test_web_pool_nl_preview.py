@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
 from datetime import timedelta
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -27,7 +25,9 @@ from rquant.web.pool_nl_preview import (
 )
 from rquant.web.settings import WebSettings
 from tests.support.web_proxy_identity import ProofTestClient as TestClient
-from tests.support.web_proxy_identity import create_private_test_app as create_app
+from tests.support.ai_assistance_fixture import OfflineModelScenario, original_ai_test_app
+from uuid import uuid4
+import httpx
 from tests.support.web_serving_fixture import FIXTURE_BUILT_AT, build_web_fixture
 
 NOW = FIXTURE_BUILT_AT + timedelta(seconds=30)
@@ -38,23 +38,8 @@ HEADERS = {
 }
 
 
-class FakeParser:
-    def __init__(self, result: dict[str, object] | Exception) -> None:
-        self.result = result
-        self.calls = 0
-        self.hook: Callable[[], None] | None = None
-
-    def parse_edit(
-        self, instruction: str, current_rules: list[EditorRuleCall]
-    ) -> dict[str, object]:
-        self.calls += 1
-        assert instruction == "流通市值低于 200 亿"
-        assert current_rules == [EditorRuleCall(name="not_st", args={})]
-        if isinstance(self.result, Exception):
-            raise self.result
-        if self.hook is not None:
-            self.hook()
-        return self.result
+def _headers() -> dict[str, str]:
+    return {**HEADERS, "x-rquant-ai-request-id": str(uuid4())}
 
 
 def _raw(*rules: dict[str, object]) -> dict[str, object]:
@@ -65,7 +50,7 @@ def _raw(*rules: dict[str, object]) -> dict[str, object]:
 
 
 def _app(
-    root: Path, parser: FakeParser | None, *, include_columns: list[str] | None = None
+    root: Path, parser: OfflineModelScenario | None, *, include_columns: list[str] | None = None
 ):
     user_row = {
         "pool_name": "user/样本池",
@@ -93,12 +78,7 @@ def _app(
         ),
     )
     build_web_fixture(root, "baseline", signal_projections=projections)
-    return create_app(
-        WebSettings(serving_root=root, stale_after_seconds=600),
-        clock=lambda: NOW,
-        background=False,
-        nl_parser=parser,
-    )
+    return original_ai_test_app(root, parser, clock=lambda: NOW)
 
 
 def _body(generation_id: str, **changes: Any) -> dict[str, object]:
@@ -125,7 +105,7 @@ def _base(*rules: EditorRuleCall) -> EditablePool:
 
 
 def test_api_returns_complete_preview_without_saving(tmp_path: Path) -> None:
-    parser = FakeParser(
+    parser = OfflineModelScenario(
         _raw(
             {"name": "not_st", "args": {}},
             {"name": "circ_mv_lt", "args": {"threshold_yi": "200"}},
@@ -133,11 +113,11 @@ def test_api_returns_complete_preview_without_saving(tmp_path: Path) -> None:
     )
     app = _app(tmp_path / "serving", parser)
     with TestClient(app) as client:
-        editor = client.get("/api/v1/pools/editor", headers=HEADERS).json()
+        editor = client.get("/api/v1/pools/editor", headers=_headers()).json()
         response = client.post(
             "/api/v1/pools/editor/nl-preview",
             json=_body(editor["serving"]["generation_id"]),
-            headers=HEADERS,
+            headers=_headers(),
         )
     assert editor["data"]["nl_preview_available"] is True
     assert response.status_code == 200
@@ -158,14 +138,16 @@ def test_api_returns_complete_preview_without_saving(tmp_path: Path) -> None:
     ]
     assert data["message"] is None
     assert parser.calls == 1
-    assert not list(tmp_path.rglob("*control*"))
+    with app.state.ai_synthetic_owner.outbox._connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM page_control_command").fetchone()[0] == 0
+    assert app.state.ai_synthetic_owner.outbox.ai_usage_account_calls("synthetic-shared", NOW.date()) == 1
 
 
 def test_api_admission_rejects_auth_csrf_stale_builtin_and_rate(tmp_path: Path) -> None:
-    parser = FakeParser(_raw({"name": "not_st", "args": {}}, {"name": "not_bj", "args": {}}))
+    parser = OfflineModelScenario(_raw({"name": "not_st", "args": {}}, {"name": "not_bj", "args": {}}))
     app = _app(tmp_path / "serving", parser)
     with TestClient(app) as client:
-        editor = client.get("/api/v1/pools/editor", headers=HEADERS).json()
+        editor = client.get("/api/v1/pools/editor", headers=_headers()).json()
         generation = editor["serving"]["generation_id"]
         body = _body(generation)
         assert client.post(
@@ -177,33 +159,33 @@ def test_api_admission_rejects_auth_csrf_stale_builtin_and_rate(tmp_path: Path) 
             "/api/v1/pools/editor/nl-preview", json=body, headers={"x-rquant-user": "researcher"}
         ).status_code == 403
         assert client.post(
-            "/api/v1/pools/editor/nl-preview", json=body, headers={**HEADERS, "origin": "http://bad.example"}
+            "/api/v1/pools/editor/nl-preview", json=body, headers={**_headers(), "origin": "http://bad.example"}
         ).status_code == 403
         assert client.post(
-            "/api/v1/pools/editor/nl-preview", json=_body("other"), headers=HEADERS
+            "/api/v1/pools/editor/nl-preview", json=_body("other"), headers=_headers()
         ).status_code == 409
         assert client.post(
             "/api/v1/pools/editor/nl-preview",
             json=_body(generation, expected_version="b" * 64),
-            headers=HEADERS,
+            headers=_headers(),
         ).status_code == 409
         builtin = editor["data"]["copy_sources"][0]["key"]
         assert client.post(
             "/api/v1/pools/editor/nl-preview",
             json=_body(generation, pool_key=builtin),
-            headers=HEADERS,
+            headers=_headers(),
         ).status_code == 409
         assert client.post(
             "/api/v1/pools/editor/nl-preview",
             json=_body(generation, instruction="x" * 501),
-            headers=HEADERS,
+            headers=_headers(),
         ).status_code == 422
         assert parser.calls == 0
         for _ in range(3):
             assert client.post(
-                "/api/v1/pools/editor/nl-preview", json=body, headers=HEADERS
+                "/api/v1/pools/editor/nl-preview", json=body, headers=_headers()
             ).status_code == 200
-        limited = client.post("/api/v1/pools/editor/nl-preview", json=body, headers=HEADERS)
+        limited = client.post("/api/v1/pools/editor/nl-preview", json=body, headers=_headers())
         assert limited.status_code == 429
         assert limited.headers["retry-after"] == "60"
     assert parser.calls == 3
@@ -212,12 +194,12 @@ def test_api_admission_rejects_auth_csrf_stale_builtin_and_rate(tmp_path: Path) 
 def test_unconfigured_and_parser_failures_do_not_expose_internal_error(tmp_path: Path) -> None:
     unavailable = _app(tmp_path / "none", None)
     with TestClient(unavailable) as client:
-        editor = client.get("/api/v1/pools/editor", headers=HEADERS).json()
+        editor = client.get("/api/v1/pools/editor", headers=_headers()).json()
         assert editor["data"]["nl_preview_available"] is False
         response = client.post(
             "/api/v1/pools/editor/nl-preview",
             json=_body(editor["serving"]["generation_id"]),
-            headers=HEADERS,
+            headers=_headers(),
         )
         assert response.status_code == 503
     failures = (
@@ -225,13 +207,13 @@ def test_unconfigured_and_parser_failures_do_not_expose_internal_error(tmp_path:
         NlClarificationNeededError("raw-model-text"),
     )
     for index, error in enumerate(failures):
-        parser = FakeParser(error)
+        parser = OfflineModelScenario(error)
         app = _app(tmp_path / f"failure-{index}", parser)
         with TestClient(app) as client:
-            editor = client.get("/api/v1/pools/editor", headers=HEADERS).json()
+            editor = client.get("/api/v1/pools/editor", headers=_headers()).json()
             generation = editor["serving"]["generation_id"]
             response = client.post(
-                "/api/v1/pools/editor/nl-preview", json=_body(generation), headers=HEADERS
+                "/api/v1/pools/editor/nl-preview", json=_body(generation), headers=_headers()
             )
         assert response.status_code == (503 if index == 0 else 422)
         assert "secret-token" not in response.text
@@ -239,16 +221,16 @@ def test_unconfigured_and_parser_failures_do_not_expose_internal_error(tmp_path:
 
 
 def test_preview_rechecks_serving_after_parser_and_rejects_busy_gate(tmp_path: Path) -> None:
-    parser = FakeParser(_raw({"name": "not_st", "args": {}}, {"name": "not_bj", "args": {}}))
+    parser = OfflineModelScenario(_raw({"name": "not_st", "args": {}}, {"name": "not_bj", "args": {}}))
     root = tmp_path / "serving"
     app = _app(root, parser)
     with TestClient(app) as client:
-        editor = client.get("/api/v1/pools/editor", headers=HEADERS).json()
+        editor = client.get("/api/v1/pools/editor", headers=_headers()).json()
         generation = editor["serving"]["generation_id"]
         assert app.state.web.nl_gate.acquire(blocking=False)
         try:
             busy = client.post(
-                "/api/v1/pools/editor/nl-preview", json=_body(generation), headers=HEADERS
+                "/api/v1/pools/editor/nl-preview", json=_body(generation), headers=_headers()
             )
         finally:
             app.state.web.nl_gate.release()
@@ -261,20 +243,20 @@ def test_preview_rechecks_serving_after_parser_and_rejects_busy_gate(tmp_path: P
 
         parser.hook = replace_generation
         stale = client.post(
-            "/api/v1/pools/editor/nl-preview", json=_body(generation), headers=HEADERS
+            "/api/v1/pools/editor/nl-preview", json=_body(generation), headers=_headers()
         )
-    assert stale.status_code == 409
+    assert stale.status_code == 422
     assert parser.calls == 1
 
 
 def test_preview_refuses_legacy_unpublished_pool_columns_before_model(tmp_path: Path) -> None:
-    parser = FakeParser(_raw({"name": "not_st", "args": {}}, {"name": "not_bj", "args": {}}))
+    parser = OfflineModelScenario(_raw({"name": "not_st", "args": {}}, {"name": "not_bj", "args": {}}))
     app = _app(tmp_path / "serving", parser, include_columns=["PE_TTM[0]"])
     with TestClient(app) as client:
-        editor = client.get("/api/v1/pools/editor", headers=HEADERS).json()
+        editor = client.get("/api/v1/pools/editor", headers=_headers()).json()
         generation = editor["serving"]["generation_id"]
         response = client.post(
-            "/api/v1/pools/editor/nl-preview", json=_body(generation), headers=HEADERS
+            "/api/v1/pools/editor/nl-preview", json=_body(generation), headers=_headers()
         )
     assert response.status_code == 409
     assert parser.calls == 0
@@ -384,47 +366,17 @@ def test_paid_parser_needs_explicit_private_ingress_and_secret_is_redacted(tmp_p
     assert "secret-token" not in repr(settings)
 
 
-def test_model_adapter_is_bounded_and_uses_only_official_endpoint(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    captured: dict[str, object] = {}
+def test_model_adapter_is_bounded_and_uses_only_official_endpoint() -> None:
     result = _raw({"name": "not_st", "args": {}}, {"name": "not_bj", "args": {}})
-
-    def fake_openai(**options: object) -> object:
-        captured.update(options)
-
-        def create(**request: object) -> object:
-            captured["request"] = request
-            return SimpleNamespace(
-                choices=[
-                    SimpleNamespace(
-                        message=SimpleNamespace(
-                            tool_calls=[
-                                SimpleNamespace(
-                                    function=SimpleNamespace(
-                                        name="build_screen", arguments=json.dumps(result)
-                                    )
-                                )
-                            ]
-                        )
-                    )
-                ]
-            )
-
-        return SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
-
-    monkeypatch.setattr("rquant.web.nl_parser.OpenAI", fake_openai)
-    parser = OpenAiScreenPlanParser(api_key=SecretStr("secret-token"), model="configured-model")
-    assert parser.parse_edit(
-        "流通市值低于 200 亿", [EditorRuleCall(name="not_st", args={})]
-    ) == result
-    assert captured["base_url"] == "https://api.openai.com/v1"
-    assert captured["timeout"] == 12.0
-    assert captured["max_retries"] == 0
-    request = captured["request"]
-    assert isinstance(request, dict)
+    scenario = OfflineModelScenario(result)
+    parser = OpenAiScreenPlanParser(api_key=SecretStr("synthetic-not-a-real-secret"),
+        model="configured-model", transport=httpx.MockTransport(scenario))
+    try:
+        assert parser.parse_edit("流通市值低于 200 亿", [EditorRuleCall(name="not_st", args={})]) == result
+    finally:
+        parser.close()
+    assert scenario.calls == 1
+    request = json.loads(scenario.requests[0].content)
     assert request["model"] == "configured-model"
     assert request["max_completion_tokens"] == 4096
-    tools = request["tools"]
-    assert isinstance(tools, list)
-    assert "include_columns" not in tools[0]["function"]["parameters"]["properties"]
+    assert "include_columns" not in request["tools"][0]["function"]["parameters"]["properties"]

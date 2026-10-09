@@ -1,0 +1,1 @@
+import{r as e}from"./Panel-BtqC84P_.js";var t=e();function n({checked:e,onChange:n,label:r,disabled:i}){return(0,t.jsx)(`button`,{type:`button`,role:`switch`,className:`sw`,"aria-checked":e,"aria-label":r,disabled:i,onClick:()=>n(!e)})}export{n as t};

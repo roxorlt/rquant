@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import re
 from enum import StrEnum
-from typing import Annotated, Self
+from typing import Annotated, Literal, Self
 
-from pydantic import Field, StringConstraints, model_validator
+from pydantic import Field, StrictInt, StringConstraints, model_validator
 
 from rquant.runtime_contracts import (
     AwareUtcDatetime,
@@ -167,4 +167,220 @@ class OutboxAttempt(RuntimeContractModel):
                 raise ValueError("successful attempts require provider_receipt and forbid error")
         elif self.error is None or self.provider_receipt is not None:
             raise ValueError("failed attempts require error and forbid provider_receipt")
+        return self
+
+
+class PhysicalPostMember(RuntimeContractModel):
+    outbox_id: Sha256
+    attempt_no: StrictInt = Field(ge=1, le=5)
+
+
+class PhysicalPostBinding(RuntimeContractModel):
+    group_id: Sha256
+    owner_id: str = Field(min_length=1, max_length=128)
+    target: DeliveryTarget
+    members: tuple[PhysicalPostMember, ...] = Field(min_length=1, max_length=100)
+    request_sha256: Sha256
+    request_utf8_bytes: StrictInt = Field(ge=1, le=64 * 1024)
+    issued_at: AwareUtcDatetime
+
+    @model_validator(mode="after")
+    def unique_members(self) -> Self:
+        if len(self.target.recipient_id) > 128:
+            raise ValueError("physical recipient exceeds the bounded identity")
+        if len({item.outbox_id for item in self.members}) != len(self.members):
+            raise ValueError("physical request repeats a logical member")
+        return self
+
+    def physical_id(self, key_slot: int = 0) -> str:
+        return canonical_sha256({"contract": "notification-physical-post/v1",
+                                 "binding": self, "key_slot": key_slot})
+
+
+class PhysicalPostObservation(RuntimeContractModel):
+    binding: PhysicalPostBinding
+    key_slot: StrictInt = Field(ge=0, le=99)
+    called_at: AwareUtcDatetime
+    completed_at: AwareUtcDatetime
+    disposition: Literal["accepted", "rejected", "unknown"]
+    reason: Literal["channel_accepted", "channel_rejected", "post_exception", "invalid_reply"]
+
+    @model_validator(mode="after")
+    def call_order(self) -> Self:
+        if self.called_at < self.binding.issued_at or self.completed_at < self.called_at:
+            raise ValueError("physical call precedes its original intent or completion")
+        expected = {"accepted": "channel_accepted", "rejected": "channel_rejected"}
+        if self.disposition != "unknown" and self.reason != expected[self.disposition]:
+            raise ValueError("physical disposition does not match the actual reply")
+        if self.disposition == "unknown" and self.reason not in {"post_exception", "invalid_reply"}:
+            raise ValueError("unknown physical call requires a missing definitive reply")
+        return self
+
+
+class NotificationMergeBinding(RuntimeContractModel):
+    owner_id: str = Field(min_length=1, max_length=128)
+    source_id: str = Field(min_length=1, max_length=128)
+    installation_sha256: Sha256
+    role_revision: Sha256
+    generation_id: str = Field(min_length=1, max_length=128)
+    mode: Literal["shadow", "live"]
+
+
+class NotificationMergeGroup(RuntimeContractModel):
+    group_id: Sha256
+    binding: NotificationMergeBinding
+    cohort_sha256: Sha256
+    target: DeliveryTarget
+    family: Literal["signal", "price", "condition", "builtin"]
+    opened_at: AwareUtcDatetime
+    due_at: AwareUtcDatetime
+    status: Literal["waiting", "intent", "succeeded", "failed", "unknown", "shadow"]
+    members: tuple[Sha256, ...] = Field(min_length=1, max_length=100)
+
+    @model_validator(mode="after")
+    def fixed_window(self) -> Self:
+        from datetime import timedelta
+
+        if self.due_at - self.opened_at != timedelta(seconds=30):
+            raise ValueError("notification merge window must be exactly thirty seconds")
+        if len(set(self.members)) != len(self.members):
+            raise ValueError("notification group repeats a logical member")
+        if len(self.target.recipient_id) > 128:
+            raise ValueError("merge recipient exceeds the bounded identity")
+        return self
+
+
+class NotificationChannelStatistics(RuntimeContractModel):
+    owner_id: str = Field(min_length=1, max_length=128)
+    target: DeliveryTarget
+    mode: Literal["shadow", "live"]
+    logical_count: StrictInt = Field(ge=0)
+    member_attempts: StrictInt = Field(ge=0)
+    member_retries: StrictInt = Field(ge=0)
+    physical_requests: StrictInt = Field(ge=0)
+    accepted_count: StrictInt = Field(ge=0)
+    rejected_count: StrictInt = Field(ge=0)
+    unknown_count: StrictInt = Field(ge=0)
+    possible_requests: StrictInt = Field(ge=0)
+    last_accepted_at: AwareUtcDatetime | None = None
+    binding_sha256: Sha256 | None = None
+
+    @model_validator(mode="after")
+    def observed_counts(self) -> Self:
+        if self.physical_requests != self.accepted_count + self.rejected_count + self.unknown_count:
+            raise ValueError("physical request counts must equal actual POST observations")
+        if self.mode == "shadow" and (self.physical_requests or self.possible_requests):
+            raise ValueError("shadow notification has no physical request")
+        if (self.last_accepted_at is not None) != (self.accepted_count > 0):
+            raise ValueError("last accepted time requires an actual channel accepted reply")
+        return self
+
+
+class NotificationRuntimeWindow(RuntimeContractModel):
+    protocol: Literal["rquant.notification-runtime-window/v1"] = "rquant.notification-runtime-window/v1"
+    state: Literal["ready", "unavailable"]
+    reason: str = Field(min_length=1, max_length=80)
+    observed_at: AwareUtcDatetime
+    binding: NotificationMergeBinding | None
+    source_receipt_sha256: Sha256 | None
+    covered_from: AwareUtcDatetime | None
+    covered_through: AwareUtcDatetime
+    complete: bool
+    history_count: StrictInt = Field(ge=0, le=1024)
+    returned_history_count: StrictInt = Field(ge=0, le=512)
+    truncated: bool
+    applied_revision: StrictInt | None = Field(default=None, ge=0)
+    applied_command_id: str | None = Field(default=None, max_length=128)
+    monitor_installation_sha256: Sha256 | None = None
+    capability_observed_at: AwareUtcDatetime | None = None
+    available_targets: tuple[DeliveryTarget, ...] | None = Field(default=None, max_length=64)
+
+    @model_validator(mode="after")
+    def actual_coverage(self) -> Self:
+        if self.covered_through != self.observed_at or self.covered_from is not None and self.covered_from > self.observed_at:
+            raise ValueError("notification statistics have a future or different owner cutoff")
+        if self.complete != (self.state == "ready") or self.complete and (self.binding is None or self.source_receipt_sha256 is None or self.covered_from is None):
+            raise ValueError("complete notification statistics need their original observation window")
+        if self.returned_history_count > self.history_count or self.truncated != (self.returned_history_count < self.history_count):
+            raise ValueError("notification history coverage differs from the retained original groups")
+        if self.capability_observed_at is not None and self.capability_observed_at > self.observed_at:
+            raise ValueError("notification capability was not yet observed by its original owner")
+        if (self.available_targets is None) != (self.capability_observed_at is None):
+            raise ValueError("notification capability needs the actual original loader observation")
+        return self
+
+
+class NotificationRuntimeChannelState(RuntimeContractModel):
+    protocol: Literal["rquant.notification-runtime-channel/v1"] = "rquant.notification-runtime-channel/v1"
+    owner_id: str = Field(min_length=1, max_length=128)
+    channel: DeliveryChannel
+    recipient_scope_ref: Sha256
+    source_receipt_sha256: Sha256
+    mode: Literal["shadow", "live"]
+    observed_at: AwareUtcDatetime
+    covered_from: AwareUtcDatetime
+    covered_through: AwareUtcDatetime
+    complete: Literal[True] = True
+    targets: tuple[DeliveryTarget, ...] = Field(min_length=1, max_length=64)
+    statistics: tuple[NotificationChannelStatistics, ...] = Field(min_length=1, max_length=1024)
+    logical_count: StrictInt = Field(ge=0)
+    member_attempts: StrictInt = Field(ge=0)
+    member_retries: StrictInt = Field(ge=0)
+    physical_requests: StrictInt = Field(ge=0)
+    accepted_count: StrictInt = Field(ge=0)
+    rejected_count: StrictInt = Field(ge=0)
+    physical_unknown_count: StrictInt = Field(ge=0)
+    possible_requests: StrictInt = Field(ge=0)
+    last_accepted_at: AwareUtcDatetime | None
+    applied_revision: StrictInt | None = Field(default=None, ge=0)
+    accepted_pct: float | None = Field(default=None, ge=0, le=100)
+
+    @model_validator(mode="after")
+    def original_totals(self) -> Self:
+        if self.covered_from > self.covered_through or self.covered_through != self.observed_at:
+            raise ValueError("notification channel statistics changed their original window")
+        if any(row.owner_id != self.owner_id or row.target.channel != self.channel for row in self.statistics):
+            raise ValueError("notification channel statistics mix owners or channels")
+        targets = tuple(sorted({row.target for row in self.statistics}, key=lambda row: row.recipient_id))
+        if targets != self.targets or canonical_sha256(targets) != self.recipient_scope_ref:
+            raise ValueError("notification channel scope omits a real receiver")
+        for field in ("logical_count", "member_attempts", "member_retries", "physical_requests", "accepted_count", "rejected_count", "possible_requests"):
+            if getattr(self, field) != sum(getattr(row, field) for row in self.statistics):
+                raise ValueError("notification totals differ from the exact owner records")
+        if self.physical_unknown_count != sum(row.unknown_count for row in self.statistics) or self.last_accepted_at != max((row.last_accepted_at for row in self.statistics if row.last_accepted_at is not None), default=None):
+            raise ValueError("notification actual POST results differ from the original observations")
+        if self.accepted_pct is not None and (not self.physical_requests or self.physical_unknown_count
+                or self.possible_requests or self.accepted_pct != round(100 * self.accepted_count / self.physical_requests, 1)):
+            raise ValueError("notification acceptance rate needs definitive original POST results")
+        return self
+
+
+class NotificationRuntimeAttemptView(RuntimeContractModel):
+    intent: PhysicalPostBinding
+    observation: PhysicalPostObservation | None
+
+    @model_validator(mode="after")
+    def exact_attempt(self) -> Self:
+        if self.observation is not None and self.observation.binding != self.intent:
+            raise ValueError("notification timeline changed its original physical attempt")
+        return self
+
+
+class NotificationRuntimeGroupView(RuntimeContractModel):
+    protocol: Literal["rquant.notification-runtime-group/v1"] = "rquant.notification-runtime-group/v1"
+    group: NotificationMergeGroup
+    inspected_at: AwareUtcDatetime
+    source_receipt_sha256: Sha256
+    attempts: tuple[NotificationRuntimeAttemptView, ...] = Field(max_length=5)
+
+    @model_validator(mode="after")
+    def actual_group(self) -> Self:
+        if self.group.opened_at > self.inspected_at:
+            raise ValueError("notification history contains a future original group")
+        if any(row.intent.group_id != self.group.group_id or row.intent.owner_id != self.group.binding.owner_id
+                or row.intent.target != self.group.target or row.intent.issued_at > self.inspected_at
+                or row.observation is not None and row.observation.completed_at > self.inspected_at
+                or not {member.outbox_id for member in row.intent.members} <= set(self.group.members)
+                for row in self.attempts):
+            raise ValueError("notification timeline omits or mixes original member attempts")
         return self

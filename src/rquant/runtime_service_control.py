@@ -15,7 +15,7 @@ from enum import StrEnum
 from pathlib import Path
 from threading import Event
 from types import MappingProxyType
-from typing import Annotated, Self
+from typing import TYPE_CHECKING, Annotated, Self
 
 from pydantic import Field, StringConstraints, field_serializer, field_validator, model_validator
 
@@ -25,7 +25,15 @@ from rquant.runtime_contracts import (
     canonical_sha256,
     normalize_aware_utc,
 )
+from rquant.runtime_health_details import (
+    RuntimeHealthMetric,
+    RuntimeHealthStartupWitness,
+    startup_witness_for_run,
+)
 from rquant.runtime_read_interrupt import READ_INTERRUPT_STOP_REASON, is_read_interrupt
+
+if TYPE_CHECKING:
+    from rquant.runtime_health_authority import RuntimeHealthTrustedOpsProvider
 
 CommitSha = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{40}$")]
 Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
@@ -111,6 +119,16 @@ class RuntimeStepResult(RuntimeContractModel):
     #: publisher reduced every refusal to `auction_gap_input_unavailable`, and a day of
     #: "exactly one row for every prior-five session" was invisible on the host.
     degraded_detail: str | None = Field(default=None, min_length=1)
+    health_metrics: tuple[RuntimeHealthMetric, ...] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+
+    @field_validator("health_metrics")
+    @classmethod
+    def validate_health_metrics(
+        cls, value: tuple[RuntimeHealthMetric, ...] | None
+    ) -> tuple[RuntimeHealthMetric, ...] | None:
+        return _validated_health_metrics(value)
 
     @field_validator("source_generations")
     @classmethod
@@ -145,7 +163,30 @@ class RuntimeStepResult(RuntimeContractModel):
     def validate_degraded_detail(self) -> Self:
         if self.degraded_detail is not None and not self.degraded_reasons:
             raise ValueError("degraded_detail explains degraded_reasons and needs one")
+        if self.health_metrics is not None and any(
+            self.source_generations.get(item.owner_dataset_id) != item.source_generation_id
+            for item in self.health_metrics
+        ):
+            raise ValueError("health metric must bind its actual owner generation")
         return self
+
+
+def _validated_health_metrics(
+    value: tuple[RuntimeHealthMetric, ...] | None,
+) -> tuple[RuntimeHealthMetric, ...] | None:
+    if value is None:
+        return None
+    identities = tuple(
+        (item.metric_id, item.owner_dataset_id, canonical_sha256(item.scope)) for item in value
+    )
+    if len(identities) != len(set(identities)):
+        raise ValueError("health metrics duplicate an original object scope")
+    raw = json.dumps(
+        [item.model_dump(mode="json") for item in value], ensure_ascii=False, separators=(",", ":")
+    ).encode()
+    if len(raw) > 64 * 1024:
+        raise ValueError("health metric input exceeds its original detail cell budget")
+    return value
 
 
 def _frozen_observations(value: Mapping[str, int]) -> Mapping[str, int]:
@@ -160,6 +201,17 @@ def _frozen_observations(value: Mapping[str, int]) -> Mapping[str, int]:
 class RuntimeServiceHeartbeat(RuntimeContractModel):
     service_id: str = Field(min_length=1)
     spec_fingerprint: Sha256
+    health_metrics: tuple[RuntimeHealthMetric, ...] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+
+    @field_validator("health_metrics")
+    @classmethod
+    def validate_health_metrics(
+        cls, value: tuple[RuntimeHealthMetric, ...] | None
+    ) -> tuple[RuntimeHealthMetric, ...] | None:
+        return _validated_health_metrics(value)
+
     run_id: Sha256
     generation: int = Field(ge=1)
     status: RuntimeServiceStatus
@@ -269,6 +321,34 @@ class RuntimeServiceHeartbeat(RuntimeContractModel):
     #: is `last_error`. *File* fields, for the reason `generation_events` gives above.
     observations: Mapping[str, ObservationCount] = Field(default_factory=dict)
     degraded_detail: str | None = Field(default=None, min_length=1)
+
+    startup_witness: RuntimeHealthStartupWitness | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+
+    @model_validator(mode="after")
+    def validate_startup_witness(self) -> Self:
+        if self.health_metrics is not None and any(
+            item.observed_at > self.heartbeat_at for item in self.health_metrics
+        ):
+            raise ValueError("health metric exceeds the actual heartbeat cutoff")
+        if self.startup_witness is not None:
+            witness = self.startup_witness
+            if (
+                witness.service_id,
+                witness.spec_fingerprint,
+                witness.run_id,
+                witness.generation,
+                witness.started_at,
+            ) != (
+                self.service_id,
+                self.spec_fingerprint,
+                self.run_id,
+                self.generation,
+                self.started_at,
+            ):
+                raise ValueError("startup witness does not match the exact heartbeat run")
+        return self
 
     @field_validator("observations")
     @classmethod
@@ -605,10 +685,17 @@ class RuntimeServiceControl:
         *,
         spec: RuntimeServiceSpec,
         clock: Clock | None = None,
+        ops_context_provider: RuntimeHealthTrustedOpsProvider | None = None,
     ) -> None:
+        if ops_context_provider is not None:
+            from rquant.runtime_health_authority import RuntimeHealthTrustedOpsProvider
+
+            if type(ops_context_provider) is not RuntimeHealthTrustedOpsProvider:
+                raise TypeError("runtime startup requires the original trusted Ops provider")
         self.root = Path(root).resolve()
         self.spec = spec
         self._clock = clock or (lambda: datetime.now(UTC))
+        self._ops_context_provider = ops_context_provider
         identity = canonical_sha256({"service_id": spec.service_id})
         self._heartbeat_path = self.root / "heartbeats" / f"{identity}.json"
         self._lock_path = self.root / "locks" / f"{identity}.lock"
@@ -744,6 +831,16 @@ class RuntimeServiceControl:
             heartbeat_at=now,
             generation_events=generation_events,
         )
+        if self._ops_context_provider is not None:
+            witness = startup_witness_for_run(
+                context=self._ops_context_provider(now),
+                spec=self.spec,
+                run_id=heartbeat.run_id,
+                generation=heartbeat.generation,
+                started_at=heartbeat.started_at,
+            )
+            if witness is not None:
+                heartbeat = self._validated_update(heartbeat, startup_witness=witness)
         return self._publish(heartbeat)
 
     def _require_active(self) -> RuntimeServiceHeartbeat:
@@ -797,6 +894,11 @@ class RuntimeServiceControl:
                 writer_lease_acquired=result.writer_lease_acquired,
                 observations=result.observations,
                 degraded_detail=result.degraded_detail,
+                health_metrics=(
+                    current.health_metrics
+                    if result.health_metrics is None
+                    else result.health_metrics
+                ),
                 **_duration_updates(current, duration_seconds),
             )
         )

@@ -7,7 +7,6 @@ from datetime import date
 from pathlib import Path
 from typing import Literal, Self
 
-import duckdb
 import pandas as pd
 from pydantic import Field, model_validator
 
@@ -108,6 +107,8 @@ def _required_dates(calendar: SSECalendar, result: BacktestResult) -> tuple[date
 def _read_closes(
     frozen_path: Path, ts_code: str, start: date, end: date
 ) -> list[tuple[date, float | None]]:
+    import duckdb
+
     if not frozen_path.is_file():
         raise BenchmarkSourceError("an existing frozen DuckDB file is required")
     try:

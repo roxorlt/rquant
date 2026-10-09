@@ -3,11 +3,86 @@
 from __future__ import annotations
 
 from datetime import date, datetime
+from decimal import Decimal
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from rquant.web.models.common import StateCounts, StatusInfo
+
+
+class HealthLink(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    href: str
+    label: str
+
+
+class HealthObservation(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    key: str
+    label: str
+    value: int
+
+
+class HealthMetricItem(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    key: str
+    name: str
+    value: int | Decimal | str | None
+    unit: str
+    status: StatusInfo
+    available: bool
+    observed_at: datetime
+    valid_until: datetime | None
+    temporal_basis: Literal["realtime", "as_of", "unknown"]
+    scope_label: str
+    scope_detail: str
+    source_name: str
+    source_generation_id: str
+    event_time_start: datetime
+    event_time_end: datetime
+    available_at: datetime
+    link: HealthLink
+
+
+class HealthExposureItem(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    kind: Literal["industry", "unknown", "cash"]
+    name: str
+    portfolio_weight: Decimal
+    benchmark_weight: Decimal
+    deviation: Decimal
+    observed_at: datetime
+    scope_key: str
+    scope_label: str
+    scope_detail: str
+    source_name: str
+    source_generation_id: str
+    source_identity: str
+    valid_until: datetime | None
+    link: HealthLink
+
+
+class HealthLayer(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    key: Literal["host", "market", "strategy", "orders", "risk", "comparison"]
+    name: str
+    status: StatusInfo
+    observed_at: datetime | None
+    metrics: list[HealthMetricItem]
+    exposure: list[HealthExposureItem] = Field(default_factory=list)
+    links: list[HealthLink]
+
+
+class HealthServiceDetail(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    available: bool
+    reason: str
+    observed_at: datetime
+    source_name: str
+    started_at: datetime | None
+    observations: list[HealthObservation]
+    degraded_reason: str | None
 
 
 class ServiceItem(BaseModel):
@@ -29,6 +104,7 @@ class ServiceItem(BaseModel):
     backlog_count: int
     consecutive_failures: int
     last_error: str | None
+    detail: HealthServiceDetail | None = None
 
 
 class FreshnessItem(BaseModel):
@@ -85,3 +161,5 @@ class HealthData(BaseModel):
     freshness: list[FreshnessItem]
     page_data: PageDataStatus
     errors: list[ErrorItem]
+    layers: list[HealthLayer] = Field(default_factory=list)
+    viewer_id: str | None = None

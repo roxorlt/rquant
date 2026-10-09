@@ -9,6 +9,7 @@ import type {
   ScreenRunData,
   ScreenRunRequest,
 } from "@/api/screen";
+import { readOriginal, saveOriginal } from "@/app/aiAssistanceSession";
 import { metaEnvelope } from "@/test/fixtures";
 import { findJargon } from "@/test/jargon";
 import { renderApp } from "@/test/render";
@@ -23,6 +24,53 @@ const source: ScreenRunData["source"] = {
 const PRIVATE_SCOPE = "1".repeat(64);
 const RECENT_DESCRIPTIONS_KEY = `rquant.screen.recent-descriptions.v1:${PRIVATE_SCOPE}`;
 type RunResolver = Parameters<typeof http.post>[1];
+const aiReplies = new Map<string, Schemas["AIRequestView"]>();
+function screenAiDraftHandler(resolver: RunResolver) {
+  return http.post("*/api/v1/ai/requests", async (context) => {
+    const body = (await context.request.clone().json()) as Schemas["AIScreenRequest"];
+    const response = await resolver(context);
+    if (!(response instanceof Response))
+      throw new Error("Synthetic draft resolver must return an actual HTTP response");
+    const raw = await response.json();
+    const view: Schemas["AIRequestView"] = {
+      request_id: body.request_id,
+      purpose: "screen",
+      state: "completed",
+      created_at: "2026-10-06T06:00:00Z",
+      message: response.ok
+        ? null
+        : String(raw.detail).includes("日期")
+          ? raw.detail
+          : "没能确定条件，请说清筛选范围和数值。",
+      result: response.ok
+        ? {
+            purpose: "screen",
+            definition: {
+              schema_version: 1,
+              mode: "daily",
+              description: body.instruction,
+              source_kind: raw.source_kind,
+              source_identity: raw.source_identity,
+              trade_date: raw.trade_date,
+              conditions: raw.conditions.map((row: Schemas["ScreenCondition"]) => ({
+                name: row.key,
+                args: row.args,
+              })),
+              ranking: null,
+            },
+          }
+        : null,
+    };
+    aiReplies.set(body.request_id, view);
+    return HttpResponse.json({ data: view, serving });
+  });
+}
+async function generateSuggestion(user: ReturnType<typeof userEvent.setup>) {
+  const reset = screen.queryByRole("button", { name: "新建描述" });
+  if (reset) await user.click(reset);
+  await user.click(screen.getByRole("button", { name: "生成建议" }));
+}
+
 let recorded = new Map<
   string,
   {
@@ -114,6 +162,7 @@ it("模式首次加载时保留同一盘中入口和页标题", async () => {
 });
 
 it("重开待确认原请求显示查询和恢复入口，并保留同一 UUID 和完整正文", async () => {
+  catalog();
   const command: ExecuteScreenQuery = {
     kind: "execute_screen_query",
     command_id: "reload-original-command",
@@ -250,7 +299,41 @@ function screenRunHandler(resolver: RunResolver) {
 beforeEach(() => {
   drawerLifecycle.clear();
   recorded = new Map();
+  aiReplies.clear();
   server.use(
+    http.get("*/api/v1/ai/capabilities", () =>
+      HttpResponse.json({
+        serving,
+        data: {
+          available: true,
+          can_generate: true,
+          can_prepare_backtest: false,
+          daily_limit: 20,
+          remaining_calls: 20,
+        },
+      }),
+    ),
+    http.post("*/api/v1/ai/requests/lookup", async ({ request }) => {
+      const body = (await request.json()) as Schemas["AIScreenRequest"];
+      const view = aiReplies.get(body.request_id);
+      return view
+        ? HttpResponse.json({ serving, data: view })
+        : HttpResponse.json({ detail: "找不到原请求。" }, { status: 404 });
+    }),
+    http.get("*/api/v1/ai/news/:code", ({ params }) =>
+      HttpResponse.json({
+        serving,
+        data: {
+          stock_code: params.code,
+          state: "missing",
+          content: null,
+          coverage: [],
+          message: "原文尚未采集。",
+          nightly_enabled: false,
+          progress: null,
+        },
+      }),
+    ),
     http.get("*/api/v1/screen/query/history", () =>
       HttpResponse.json({
         available: true,
@@ -363,6 +446,143 @@ function catalog(available = true, nlAvailable = false) {
   );
 }
 
+it("继续生成只用于已证明未发出的原选股请求，未知结果只查原 UUID", async () => {
+  catalog(true, true);
+  const original: Schemas["AIScreenRequest"] = {
+    purpose: "screen",
+    request_id: "685cf99f-e774-4bb9-a21b-dfe01b859ac3",
+    instruction: "排除 ST",
+    source_kind: "replica",
+    source_identity: source.identity,
+    trade_date: "2026-09-24",
+    include_ranking: true,
+  };
+  saveOriginal(PRIVATE_SCOPE, "screen", original);
+  const generated: unknown[] = [];
+  const looked: unknown[] = [];
+  server.use(
+    http.get("*/api/v1/ai/capabilities", () =>
+      HttpResponse.json({
+        serving,
+        data: { available: true, can_generate: false, remaining_calls: 0 },
+      }),
+    ),
+    http.post("*/api/v1/ai/requests/lookup", async ({ request }) => {
+      looked.push(await request.json());
+      return HttpResponse.json({
+        serving,
+        data: {
+          request_id: original.request_id,
+          purpose: "screen",
+          state: generated.length ? "unknown" : "reserved",
+          created_at: "2026-10-06T00:00:00Z",
+          result: null,
+        },
+      });
+    }),
+    http.post("*/api/v1/ai/requests", async ({ request }) => {
+      generated.push(await request.json());
+      return HttpResponse.json({
+        serving,
+        data: {
+          request_id: original.request_id,
+          purpose: "screen",
+          state: "unknown",
+          created_at: "2026-10-06T00:00:00Z",
+          result: null,
+        },
+      });
+    }),
+  );
+  const user = userEvent.setup();
+  renderApp("/screener");
+  await user.click(await screen.findByRole("button", { name: "继续查看原请求" }));
+  expect(generated).toEqual([]);
+  await user.click(await screen.findByRole("button", { name: "继续生成原请求" }));
+  await waitFor(() => expect(generated).toEqual([original]));
+  await user.click(await screen.findByRole("button", { name: "继续查看原请求" }));
+  await waitFor(() => expect(looked).toEqual([original, original]));
+  expect(generated).toEqual([original]);
+});
+
+it.each(["not_dispatched", "completed"] as const)(
+  "FCR-001 screen preserves a missing original until confirmed %s",
+  async (terminal) => {
+    catalog(true, true);
+    const original: Schemas["AIScreenRequest"] = {
+      purpose: "screen",
+      request_id: "685cf99f-e774-4bb9-a21b-dfe01b859ac3",
+      instruction: "排除 ST",
+      source_kind: "replica",
+      source_identity: source.identity,
+      trade_date: "2026-09-24",
+      include_ranking: true,
+    };
+    saveOriginal(PRIVATE_SCOPE, "screen", original);
+    const generated: unknown[] = [];
+    const looked: unknown[] = [];
+    server.use(
+      http.get("*/api/v1/ai/capabilities", () =>
+        HttpResponse.json({
+          serving,
+          data: { available: true, can_generate: false, remaining_calls: 0 },
+        }),
+      ),
+      http.post("*/api/v1/ai/requests/lookup", async ({ request }) => {
+        looked.push(await request.json());
+        if (looked.length === 1) {
+          return HttpResponse.json({ detail: "找不到原请求。" }, { status: 404 });
+        }
+        return HttpResponse.json({
+          serving,
+          data: {
+            request_id: original.request_id,
+            purpose: "screen",
+            state: terminal,
+            created_at: "2026-10-06T00:00:00Z",
+            result: null,
+          },
+        });
+      }),
+      http.post("*/api/v1/ai/requests", async ({ request }) => {
+        generated.push(await request.json());
+        return HttpResponse.json({
+          serving,
+          data: {
+            request_id: original.request_id,
+            purpose: "screen",
+            state: "unknown",
+            created_at: "2026-10-06T00:00:00Z",
+            result: null,
+          },
+        });
+      }),
+    );
+    const user = userEvent.setup();
+    renderApp("/screener");
+    await user.click(await screen.findByRole("button", { name: "继续查看原请求" }));
+    await screen.findByText("暂未查到原请求，请继续原请求。");
+    const newDescription = screen.getByRole("button", { name: "新建描述" });
+    expect(newDescription).toBeDisabled();
+    await user.click(newDescription);
+    expect(readOriginal(PRIVATE_SCOPE, "screen")).toEqual(original);
+    expect(generated).toEqual([]);
+    expect(screen.queryByText("调用未发出。")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "继续生成原请求" }));
+    await screen.findByRole("button", { name: "继续查看原请求" });
+    expect(generated).toEqual([original]);
+    expect(readOriginal(PRIVATE_SCOPE, "screen")).toEqual(original);
+    expect(screen.getByRole("button", { name: "新建描述" })).toBeDisabled();
+    await user.click(screen.getByRole("button", { name: "继续查看原请求" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "新建描述" })).toBeEnabled());
+    expect(looked).toEqual([original, original]);
+    await user.click(screen.getByRole("button", { name: "新建描述" }));
+    expect(readOriginal(PRIVATE_SCOPE, "screen")).toBeNull();
+    expect(screen.getByRole("button", { name: "生成建议" })).toBeInTheDocument();
+    expect(generated).toEqual([original]);
+  },
+);
+
 function stockDrawer() {
   server.use(
     http.get("*/api/v1/stocks/600001.SH/summary", () =>
@@ -473,7 +693,7 @@ describe("选股器", () => {
     catalog(true, true);
     let fail = false;
     server.use(
-      http.post("*/api/v1/screen/nl-preview", () =>
+      screenAiDraftHandler(() =>
         fail
           ? HttpResponse.json({ detail: "说法不够明确" }, { status: 422 })
           : HttpResponse.json({
@@ -491,7 +711,7 @@ describe("选股器", () => {
     for (const description of ["描述一", "描述二", "描述三", "描述四", "描述五", "描述六"]) {
       await user.clear(input);
       await user.type(input, description);
-      await user.click(screen.getByRole("button", { name: "生成条件" }));
+      await generateSuggestion(user);
       expect(await screen.findByRole("region", { name: "建议条件" })).toBeInTheDocument();
     }
     expect(JSON.parse(sessionStorage.getItem(RECENT_DESCRIPTIONS_KEY) ?? "null")).toEqual([
@@ -504,7 +724,7 @@ describe("选股器", () => {
     fail = true;
     await user.clear(input);
     await user.type(input, "含糊描述");
-    await user.click(screen.getByRole("button", { name: "生成条件" }));
+    await generateSuggestion(user);
     expect(await screen.findByRole("alert")).toHaveTextContent("没能确定条件");
     expect(screen.queryByRole("button", { name: "含糊描述" })).toBeNull();
     expect(JSON.parse(sessionStorage.getItem(RECENT_DESCRIPTIONS_KEY) ?? "null")).toEqual([
@@ -517,7 +737,7 @@ describe("选股器", () => {
     fail = false;
     await user.clear(input);
     await user.type(input, "描述三");
-    await user.click(screen.getByRole("button", { name: "生成条件" }));
+    await generateSuggestion(user);
     expect(await screen.findByRole("region", { name: "建议条件" })).toBeInTheDocument();
     expect(JSON.parse(sessionStorage.getItem(RECENT_DESCRIPTIONS_KEY) ?? "null")).toEqual([
       "描述三",
@@ -534,7 +754,7 @@ describe("选股器", () => {
     let previews = 0;
     let runs = 0;
     server.use(
-      http.post("*/api/v1/screen/nl-preview", () => {
+      screenAiDraftHandler(() => {
         previews += 1;
         return HttpResponse.json({
           source_kind: "replica",
@@ -566,11 +786,11 @@ describe("选股器", () => {
     expect(await screen.findByText("命中 27 只")).toBeInTheDocument();
     const input = screen.getByRole("textbox", { name: "选股描述" });
     await user.type(input, "排除 ST");
-    await user.click(screen.getByRole("button", { name: "生成条件" }));
+    await generateSuggestion(user);
     expect(await screen.findByRole("region", { name: "建议条件" })).toBeInTheDocument();
     await user.clear(input);
     await user.type(input, "排除风险股");
-    await user.click(screen.getByRole("button", { name: "生成条件" }));
+    await generateSuggestion(user);
     expect(await screen.findByRole("region", { name: "建议条件" })).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "排除 ST" }));
     expect(input).toHaveValue("排除 ST");
@@ -586,7 +806,7 @@ describe("选股器", () => {
     expect(screen.getByRole("button", { name: "排除 ST" })).toBeInTheDocument();
   });
 
-  it("损坏或不可写的会话记录不影响生成条件", async () => {
+  it("不可写的会话记录会阻止付费调用，并保留手动编辑", async () => {
     sessionStorage.setItem(RECENT_DESCRIPTIONS_KEY, "{损坏");
     const setItem = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
       throw new DOMException("blocked", "QuotaExceededError");
@@ -594,7 +814,7 @@ describe("选股器", () => {
     try {
       catalog(true, true);
       server.use(
-        http.post("*/api/v1/screen/nl-preview", () =>
+        screenAiDraftHandler(() =>
           HttpResponse.json({
             source_kind: "replica",
             source_identity: source.identity,
@@ -606,9 +826,10 @@ describe("选股器", () => {
       const user = userEvent.setup();
       renderApp("/screener");
       await user.type(await screen.findByRole("textbox", { name: "选股描述" }), "排除 ST");
-      await user.click(screen.getByRole("button", { name: "生成条件" }));
-      expect(await screen.findByRole("region", { name: "建议条件" })).toBeInTheDocument();
-      expect(screen.getByRole("button", { name: "排除 ST" })).toBeInTheDocument();
+      await generateSuggestion(user);
+      expect(await screen.findByRole("alert")).toHaveTextContent("无法保存原请求");
+      expect(screen.queryByRole("region", { name: "建议条件" })).toBeNull();
+      expect(screen.getByRole("button", { name: "添加条件" })).toBeEnabled();
       expect(sessionStorage.getItem(RECENT_DESCRIPTIONS_KEY)).toBe("{损坏");
     } finally {
       setItem.mockRestore();
@@ -620,7 +841,7 @@ describe("选股器", () => {
     const previews: unknown[] = [];
     const runs: Schemas["ScreenRunRequest"][] = [];
     server.use(
-      http.post("*/api/v1/screen/nl-preview", async ({ request }) => {
+      screenAiDraftHandler(async ({ request }) => {
         expect(request.headers.get("X-Rquant-Csrf")).toBe("1");
         previews.push(await request.json());
         return HttpResponse.json({
@@ -656,14 +877,14 @@ describe("选股器", () => {
     await user.click(await screen.findByRole("button", { name: "运行筛选" }));
     expect(await screen.findByText("命中 27 只")).toBeInTheDocument();
     await user.type(screen.getByRole("textbox", { name: "选股描述" }), "排除 ST，市值低于 80 亿");
-    await user.click(screen.getByRole("button", { name: "生成条件" }));
+    await generateSuggestion(user);
     const preview = await screen.findByRole("region", { name: "建议条件" });
     expect(preview).toHaveTextContent("排除 ST");
     expect(preview).toHaveTextContent("流通市值低于");
     expect(preview).toHaveTextContent("市值上限（亿元） 80");
     expect(screen.queryByRole("spinbutton", { name: "市值上限（亿元）" })).toBeNull();
     expect(runs).toHaveLength(1);
-    expect(previews).toEqual([
+    expect(previews).toMatchObject([
       {
         source_kind: "replica",
         source_identity: source.identity,
@@ -703,7 +924,7 @@ describe("选股器", () => {
   it("应用建议后可以撤销，恢复原条件和仍有效的旧结果", async () => {
     catalog(true, true);
     server.use(
-      http.post("*/api/v1/screen/nl-preview", () =>
+      screenAiDraftHandler(() =>
         HttpResponse.json({
           source_kind: "replica",
           source_identity: source.identity,
@@ -732,7 +953,7 @@ describe("选股器", () => {
     await user.click(await screen.findByRole("button", { name: "运行筛选" }));
     expect(await screen.findByText("命中 27 只")).toBeInTheDocument();
     await user.type(screen.getByRole("textbox", { name: "选股描述" }), "市值低于 80 亿");
-    await user.click(screen.getByRole("button", { name: "生成条件" }));
+    await generateSuggestion(user);
     await user.click(await screen.findByRole("button", { name: "应用到条件" }));
     expect(screen.getByRole("spinbutton", { name: "市值上限（亿元）" })).toHaveValue(80);
     expect(screen.getByText(/条件已改，请重新运行/)).toBeInTheDocument();
@@ -749,7 +970,7 @@ describe("选股器", () => {
       release = resolve;
     });
     server.use(
-      http.post("*/api/v1/screen/nl-preview", () =>
+      screenAiDraftHandler(() =>
         HttpResponse.json({
           source_kind: "replica",
           source_identity: source.identity,
@@ -778,7 +999,7 @@ describe("选股器", () => {
     renderApp("/screener");
     await user.click(await screen.findByRole("button", { name: "运行筛选" }));
     await user.type(screen.getByRole("textbox", { name: "选股描述" }), "排除 ST");
-    await user.click(screen.getByRole("button", { name: "生成条件" }));
+    await generateSuggestion(user);
     await user.click(await screen.findByRole("button", { name: "应用到条件" }));
     release?.();
     expect(await screen.findByText("命中 27 只")).toBeInTheDocument();
@@ -790,7 +1011,7 @@ describe("选股器", () => {
     let previews = 0;
     let runs = 0;
     server.use(
-      http.post("*/api/v1/screen/nl-preview", () => {
+      screenAiDraftHandler(() => {
         previews += 1;
         return HttpResponse.json({
           source_kind: "replica",
@@ -820,7 +1041,7 @@ describe("选股器", () => {
     renderApp("/screener");
     const description = await screen.findByRole("textbox", { name: "选股描述" });
     await user.type(description, "市值低于 80 亿");
-    await user.click(screen.getByRole("button", { name: "生成条件" }));
+    await generateSuggestion(user);
     await user.click(await screen.findByRole("button", { name: "应用到条件" }));
     expect(screen.getByText("已加入条件，请核对后运行筛选。")).toBeInTheDocument();
     expect(screen.queryByText(/选股数据已更新，请重新筛选/)).toBeNull();
@@ -830,7 +1051,7 @@ describe("选股器", () => {
     expect(screen.queryByRole("button", { name: "撤销应用" })).toBeNull();
     await user.clear(description);
     await user.type(description, "市值低于 60 亿");
-    await user.click(screen.getByRole("button", { name: "生成条件" }));
+    await generateSuggestion(user);
     expect(await screen.findByRole("region", { name: "建议条件" })).toHaveTextContent(
       "市值上限（亿元） 60",
     );
@@ -850,7 +1071,7 @@ describe("选股器", () => {
     });
     let calls = 0;
     server.use(
-      http.post("*/api/v1/screen/nl-preview", async () => {
+      screenAiDraftHandler(async () => {
         calls += 1;
         if (calls === 1) {
           await pending;
@@ -867,15 +1088,15 @@ describe("选股器", () => {
     const user = userEvent.setup();
     renderApp("/screener");
     await user.type(await screen.findByRole("textbox", { name: "选股描述" }), "找一些股票");
-    await user.click(screen.getByRole("button", { name: "生成条件" }));
-    expect(await screen.findByText("正在生成条件…")).toBeInTheDocument();
+    await generateSuggestion(user);
+    expect(await screen.findByText("正在生成建议…")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "添加条件" }));
     release?.();
-    await waitFor(() => expect(screen.queryByText("正在生成条件…")).toBeNull());
+    await waitFor(() => expect(screen.queryByText("正在生成建议…")).toBeNull());
     expect(screen.queryByRole("region", { name: "建议条件" })).toBeNull();
     expect(sessionStorage.getItem(RECENT_DESCRIPTIONS_KEY)).toBeNull();
     expect(screen.getAllByText("排除 ST").length).toBeGreaterThanOrEqual(1);
-    await user.click(screen.getByRole("button", { name: "生成条件" }));
+    await generateSuggestion(user);
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "没能确定条件，请说清筛选范围和数值。",
     );
@@ -887,14 +1108,14 @@ describe("选股器", () => {
   it("生成建议要求换日期时给出明确下一步且保留手工条件", async () => {
     catalog(true, true);
     server.use(
-      http.post("*/api/v1/screen/nl-preview", () =>
+      screenAiDraftHandler(() =>
         HttpResponse.json({ detail: "请先选择想筛选的日期。" }, { status: 422 }),
       ),
     );
     const user = userEvent.setup();
     renderApp("/screener");
     await user.type(await screen.findByRole("textbox", { name: "选股描述" }), "筛上周的股票");
-    await user.click(screen.getByRole("button", { name: "生成条件" }));
+    await generateSuggestion(user);
     expect(await screen.findByRole("alert")).toHaveTextContent("请先选择想筛选的日期。");
     expect(screen.queryByRole("region", { name: "建议条件" })).toBeNull();
     expect(screen.getAllByRole("button", { name: /删除第/ })).toHaveLength(1);
@@ -961,7 +1182,7 @@ describe("选股器", () => {
           serving,
         }),
       ),
-      http.post("*/api/v1/screen/nl-preview", async ({ request }) => {
+      screenAiDraftHandler(async ({ request }) => {
         const body = (await request.json()) as Schemas["ScreenNlPreviewRequest"];
         return HttpResponse.json({
           source_kind: body.source_kind,
@@ -974,11 +1195,11 @@ describe("选股器", () => {
     const user = userEvent.setup();
     renderApp("/screener");
     await user.type(await screen.findByRole("textbox", { name: "选股描述" }), "市值低于 80 亿");
-    await user.click(screen.getByRole("button", { name: "生成条件" }));
+    await generateSuggestion(user);
     expect(await screen.findByRole("region", { name: "建议条件" })).toBeInTheDocument();
     await user.selectOptions(screen.getByRole("combobox", { name: "数据日期" }), "2026-09-23");
     expect(screen.queryByRole("region", { name: "建议条件" })).toBeNull();
-    await user.click(screen.getByRole("button", { name: "生成条件" }));
+    await generateSuggestion(user);
     expect(await screen.findByRole("region", { name: "建议条件" })).toBeInTheDocument();
     identity = "b".repeat(64);
     await user.click(screen.getByRole("button", { name: "刷新选股数据" }));
@@ -1037,7 +1258,7 @@ describe("选股器", () => {
           serving,
         }),
       ),
-      http.post("*/api/v1/screen/nl-preview", () =>
+      screenAiDraftHandler(() =>
         HttpResponse.json({
           source_kind: "replica",
           source_identity: source.identity,
@@ -1049,7 +1270,7 @@ describe("选股器", () => {
     const user = userEvent.setup();
     renderApp("/screener");
     await user.type(await screen.findByRole("textbox", { name: "选股描述" }), "RSI 7 日低位");
-    await user.click(screen.getByRole("button", { name: "生成条件" }));
+    await generateSuggestion(user);
     expect(await screen.findByRole("region", { name: "建议条件" })).toHaveTextContent(
       "RSI 周期（日） 7",
     );
@@ -1288,7 +1509,10 @@ describe("选股器", () => {
     renderApp("/screener");
 
     expect(await screen.findByRole("heading", { level: 1, name: "选股器" })).toBeInTheDocument();
-    await user.selectOptions(screen.getByRole("combobox", { name: "条件目录" }), "circ_mv_lt");
+    await user.selectOptions(
+      await screen.findByRole("combobox", { name: "条件目录" }),
+      "circ_mv_lt",
+    );
     await user.click(screen.getByRole("button", { name: "添加条件" }));
     const amount = screen.getByRole("spinbutton", { name: "市值上限（亿元）" });
     await user.clear(amount);

@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from types import MappingProxyType
-from typing import Annotated, Literal, Protocol
+from typing import Annotated, Literal, Protocol, Self
 
 from loguru import logger
 from pydantic import (
@@ -21,9 +21,8 @@ from pydantic import (
 from rquant.delivery_contracts import OutboxRecord
 from rquant.experiment_registry import PromotionDecision
 from rquant.lab_jobs import JobStatus
-from rquant.ops_status import OpsSnapshot
-from rquant.task_center_projection import TaskOpsEvidence, TaskOpsSample, validate_scheduling_projection
 from rquant.lab_scheduling_control import LabSchedulingControlState
+from rquant.ops_status import OpsSnapshot
 from rquant.paper_contracts import PaperAccountSnapshot
 from rquant.runtime_builder_serving import (
     DEFAULT_OPTIONAL_SOURCE_DATASETS,
@@ -50,6 +49,7 @@ from rquant.serving_read_models import (
     ServingSignalRegistryRecord,
 )
 from rquant.signal_bus import SignalRouteReceipt, require_legacy_signal_write
+from rquant.task_center_projection import TaskOpsEvidence, TaskOpsSample, read_scheduling_projection
 
 SIGNALS_DATASET_ID = "signals"
 PAPER_ACCOUNTS_DATASET_ID = "paper_accounts"
@@ -121,6 +121,15 @@ class SignalDeliveryReadPayload(RuntimeContractModel):
     deliveries: tuple[OutboxRecord, ...] = ()
     projections: tuple[ServingProjectionPayload, ...] = ()
 
+    @model_validator(mode="after")
+    def original_monitor_projection_set(self) -> Self:
+        from rquant.condition_alert_runtime_projection import validate_monitor_runtime_projections
+
+        if len({row.table_name for row in self.projections}) != len(self.projections):
+            raise ValueError("signal read projections repeat an original owner table")
+        validate_monitor_runtime_projections({row.table_name: row for row in self.projections})
+        return self
+
 
 class PaperAccountsPayload(RuntimeContractModel):
     payload_kind: Literal["paper_accounts"] = "paper_accounts"
@@ -134,9 +143,13 @@ class PaperAccountsPayload(RuntimeContractModel):
         if any(p.table_name in PAPER_PORTFOLIO_PROJECTION_TABLES for p in self.projections):
             from rquant.paper_portfolio_projection import validate_paper_portfolio_projections
 
-            graph = validate_paper_portfolio_projections({p.table_name: p for p in self.projections})
+            graph = validate_paper_portfolio_projections(
+                {p.table_name: p for p in self.projections}
+            )
             account_ids = {account.account_id for account in self.paper_accounts}
-            if graph is None or any(item.configuration.binding.account_id not in account_ids for item in graph.accounts):
+            if graph is None or any(
+                item.configuration.binding.account_id not in account_ids for item in graph.accounts
+            ):
                 raise ValueError("paper portfolio owner payload contains a different account")
         return self
 
@@ -241,11 +254,15 @@ class LabJobsPayload(RuntimeContractModel):
     payload_kind: Literal["lab_jobs"] = "lab_jobs"
     lab_jobs: tuple[ServingLabJobRecord, ...] = ()
     projections: tuple[ServingProjectionPayload, ...] = ()
-    scheduling_control: LabSchedulingControlState | None = Field(default=None, exclude_if=lambda value: value is None)
+
+    @property
+    def scheduling_control(self) -> LabSchedulingControlState | None:
+        # The published wire must not embed the evolving scheduler model.
+        return read_scheduling_projection(self.projections)
 
     @model_validator(mode="after")
     def validate_event_windows(self) -> LabJobsPayload:
-        validate_scheduling_projection(self.scheduling_control, self.projections)
+        read_scheduling_projection(self.projections)
         from rquant.factor.result_serving import (
             FACTOR_RESULT_PROJECTION_TABLES,
             validate_factor_result_projections,
@@ -286,9 +303,10 @@ class LabJobsPayload(RuntimeContractModel):
         }
         if not event_tables:
             return self  # Older Lab authority generations have no event publication.
-        if len(event_tables) != 2 or sum(
-            item.table_name in event_tables for item in self.projections
-        ) != 2:
+        if (
+            len(event_tables) != 2
+            or sum(item.table_name in event_tables for item in self.projections) != 2
+        ):
             raise ValueError("lab event projections require one complete table pair")
         windows = event_tables["lab_job_event_window"]
         events = event_tables["lab_job_event"]
@@ -351,11 +369,25 @@ class PromotionsPayload(RuntimeContractModel):
     promotions: tuple[PromotionDecision, ...] = ()
     projections: tuple[ServingProjectionPayload, ...] = ()
 
+    @model_validator(mode="after")
+    def validate_manual_projection(self) -> PromotionsPayload:
+        from rquant.strategy_promotion_projection import validate_strategy_promotion_projections
+        from rquant.strategy_promotion_projection_contract import PRIVATE_TABLES
+
+        selected = {p.table_name: p for p in self.projections if p.table_name in PRIVATE_TABLES}
+        if selected:
+            if len(selected) != sum(p.table_name in PRIVATE_TABLES for p in self.projections):
+                raise ValueError("manual private projection has repeated tables")
+            validate_strategy_promotion_projections(selected)
+        return self
+
 
 class OpsStatusPayload(RuntimeContractModel):
     payload_kind: Literal["ops_status"] = "ops_status"
     snapshot: OpsSnapshot | None = None
-    task_evidence: TaskOpsEvidence | None = Field(default=None, exclude_if=lambda value: value is None)
+    task_evidence: TaskOpsEvidence | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     projections: tuple[ServingProjectionPayload, ...] = ()
 
     @model_validator(mode="after")
@@ -372,7 +404,11 @@ class OpsStatusPayload(RuntimeContractModel):
         else:
             from rquant.ops_status_serving import ops_status_projections
 
-            sample = self.snapshot if self.task_evidence is None else TaskOpsSample(snapshot=self.snapshot, evidence=self.task_evidence)
+            sample = (
+                self.snapshot
+                if self.task_evidence is None
+                else TaskOpsSample(snapshot=self.snapshot, evidence=self.task_evidence)
+            )
             if self.projections != ops_status_projections(sample):
                 raise ValueError("ops projections must match sample evidence")
         return self
@@ -394,9 +430,12 @@ class StrategyCatalogPayload(RuntimeContractModel):
         names = tuple(projection.table_name for projection in self.projections)
         if self.source_digest is None and self.runtime_generation_id is None and not names:
             return self
-        if self.source_digest is None or self.runtime_generation_id is None or set(names) != {
-            "strategy_catalog", "strategy_catalog_parameter"
-        } or len(names) != 2:
+        if (
+            self.source_digest is None
+            or self.runtime_generation_id is None
+            or set(names) != {"strategy_catalog", "strategy_catalog_parameter"}
+            or len(names) != 2
+        ):
             raise ValueError("strategy catalog requires a complete source and projection pair")
         return self
 
@@ -532,6 +571,7 @@ class ServingSnapshotAssembler:
         ops_status_reader: OpsStatusReader | None = None,
         strategy_catalog_reader: SourceReader | None = None,
         expected_ops_manifest_digest: GenerationId | None = None,
+        health_ops_reference_reader: SourceReader | None = None,
         optional_datasets: frozenset[str] = DEFAULT_OPTIONAL_SOURCE_DATASETS,
     ) -> None:
         selected_ops_reader = (
@@ -577,6 +617,7 @@ class ServingSnapshotAssembler:
         self.ops_status_reader = selected_ops_reader
         self.strategy_catalog_reader = selected_catalog_reader
         self.expected_ops_manifest_digest = expected_ops_manifest_digest
+        self.health_ops_reference_reader = health_ops_reference_reader
         self.reference_slow_reader = reference_slow_reader
         self.optional_datasets = optional_datasets
         self._last_ops_security_reason: str | None = None
@@ -668,8 +709,82 @@ class ServingSnapshotAssembler:
             )
         )
 
+        from rquant.runtime_health_details import (
+            RuntimeHealthOpsContext,
+            RuntimeHealthOwnerProjection,
+            runtime_health_graph_from_projections,
+            validate_runtime_health_detail_graph,
+        )
+
+        health_read = by_dataset[RUNTIME_HEALTH_DATASET_ID]
+        graph = runtime_health_graph_from_projections(
+            runtime_payload.projections, owner_generation_id=health_read.generation_id
+        )
+        verified_details = None
+        if graph is not None:
+            if self.health_ops_reference_reader is None:
+                raise ValueError(
+                    "present health details require the original installed Ops reference"
+                )
+            if self.expected_ops_manifest_digest is None:
+                from rquant.runtime_health_authority import RuntimeHealthTrustedOpsProvider
+
+                reference = self.health_ops_reference_reader
+                if (
+                    type(getattr(reference, "__self__", None))
+                    is not RuntimeHealthTrustedOpsProvider
+                    or getattr(reference, "__func__", None)
+                    is not RuntimeHealthTrustedOpsProvider.read_source
+                ):
+                    raise ValueError(
+                        "health reference requires the original installed Ops verifier"
+                    )
+            # The reference belongs to the health owner's original cutoff.
+            ops_reference = self.health_ops_reference_reader(health_read.published_at)
+            if (
+                not isinstance(ops_reference.payload, OpsStatusPayload)
+                or ops_reference.payload.snapshot is None
+                or ops_reference.status is not FreshnessStatus.FRESH
+            ):
+                raise ValueError("health detail referenced Ops source is unavailable")
+            sample = ops_reference.payload.snapshot
+            if (
+                (
+                    self.expected_ops_manifest_digest is not None
+                    and sample.manifest_digest != self.expected_ops_manifest_digest
+                )
+                or not 0 <= (health_read.published_at - sample.sampled_at).total_seconds() < 120
+                or sample.sampled_at != ops_reference.event_time
+            ):
+                raise ValueError("health detail installation or original Ops freshness is invalid")
+            context = RuntimeHealthOpsContext(
+                host_name=sample.host_name,
+                boot_id=sample.boot_id,
+                manifest_digest=sample.manifest_digest,
+                ops_source_generation_id=ops_reference.generation_id,
+                source_identity=canonical_sha256(ops_reference),
+                sampled_at=sample.sampled_at,
+            )
+            verified_details = validate_runtime_health_detail_graph(
+                graph,
+                legacy_services=runtime_payload.runtime_services,
+                source_receipts=runtime_payload.dashboard_summary_source_receipts,
+                context=context,
+                owner_generation_id=health_read.generation_id,
+                observed_at=health_read.published_at,
+                existing_projections=tuple(
+                    RuntimeHealthOwnerProjection(
+                        **p.model_dump(mode="python"), owner_generation_id=health_read.generation_id
+                    )
+                    for p in runtime_payload.projections
+                    if p.table_name
+                    not in {"runtime_health_detail_context", "runtime_service_detail"}
+                ),
+            )
+
         base_read_model = ServingReadModelInput(
             observed_at=observed_at,
+            runtime_health_details=verified_details,
             signals=tuple(sorted(signal_payload.signals, key=lambda item: item.global_sequence)),
             routes=tuple(
                 sorted(
@@ -822,10 +937,7 @@ class ServingSnapshotAssembler:
             ):
                 raise RuntimeError(f"{dataset_id} reader failed: {_error_text(error)}") from error
             reason = _error_text(error)
-            if (
-                dataset_id == OPS_STATUS_DATASET_ID
-                and reason != self._last_ops_security_reason
-            ):
+            if dataset_id == OPS_STATUS_DATASET_ID and reason != self._last_ops_security_reason:
                 self._last_ops_security_reason = reason
                 logger.bind(
                     ops_status_security_event={"dataset_id": dataset_id, "reason": reason}

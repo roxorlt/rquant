@@ -3,6 +3,92 @@
   gap: 14px;
 }
 
+.monitor-controls {
+  display: grid;
+  gap: 14px;
+  margin-bottom: 14px;
+}
+
+.monitor-control-bar,
+.monitor-control-pending,
+.monitor-controls .tasks-unit-actions,
+.monitor-controls .tasks-control-pending {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 10px;
+}
+
+.monitor-control-pending {
+  margin-top: 10px;
+}
+
+.monitor-mode {
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.monitor-mode strong {
+  color: var(--text);
+}
+
+.monitor-builtin-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.monitor-builtin-card {
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  background: var(--surface-2);
+  display: grid;
+  gap: 12px;
+}
+
+.monitor-builtin-card header,
+.monitor-builtin-card footer {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.monitor-builtin-card header strong {
+  margin-right: auto;
+  font-size: 13px;
+}
+
+.monitor-builtin-facts {
+  display: grid;
+  gap: 8px;
+}
+
+.monitor-builtin-facts > div {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+
+.monitor-builtin-facts dt {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.monitor-builtin-facts dd {
+  margin: 0;
+  font-size: 12px;
+}
+
+.monitor-controls button,
+.monitor-builtin-card button {
+  min-height: 36px;
+}
+
 .manual-watchlist-unavailable {
   display: flex;
   align-items: center;
@@ -101,6 +187,11 @@
   color: var(--text);
   font-size: 14px;
   line-height: 1.3;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
 }
 
 .monitor-channel-main {
@@ -264,6 +355,19 @@
 }
 
 @media (max-width: 640px) {
+  .monitor-builtin-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+  }
+
+  .monitor-builtin-card {
+    padding: 10px;
+  }
+
+  .monitor-controls button,
+  .monitor-builtin-card button {
+    min-height: 40px;
+  }
   .manual-watchlist {
     grid-template-columns: 1fr;
   }

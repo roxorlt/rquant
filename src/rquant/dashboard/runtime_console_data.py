@@ -24,12 +24,14 @@ from rquant.dashboard.serving_only_page_data import (
     ServingFreshness as ConsoleFreshness,
 )
 from rquant.runtime_contracts import AwareUtcDatetime, RuntimeContractModel, normalize_aware_utc
+from rquant.runtime_health_details import RuntimeHealthServiceView
 from rquant.serving_contracts import ServingGenerationManifest
 from rquant.serving_publisher import (
     ServingReader,
     quote_serving_column_identifier,
     quote_serving_table_identifier,
 )
+from rquant.strict_json import strict_canonical_json_loads
 
 
 class ConsoleLoadState(StrEnum):
@@ -59,6 +61,9 @@ class RuntimeServiceRow(RuntimeContractModel):
     backlog_count: int = Field(ge=0)
     consecutive_failures: int = Field(ge=0)
     last_error: str | None
+    observations: Mapping[str, int] | None = None
+    degraded_detail: str | None = None
+    details: RuntimeHealthServiceView | None = None
 
 
 class SignalRow(RuntimeContractModel):
@@ -115,7 +120,7 @@ class LabJobRow(RuntimeContractModel):
     resource_class: str
     status: str
     progress_fraction: float = Field(ge=0, le=1)
-    phase: str
+    phase: str | None
     terminal_shards: int = Field(ge=0)
     total_shards: int = Field(ge=0)
     eta_status: str | None
@@ -329,6 +334,50 @@ class RuntimeConsoleSections(RuntimeContractModel):
     promotions: tuple[PromotionRow, ...] = ()
 
 
+def read_runtime_health_service_details(
+    connection: _ReadonlyConnection, services: tuple[RuntimeServiceRow, ...]
+) -> tuple[RuntimeServiceRow, ...]:
+    """Read the optional verified view through the caller's existing cursor."""
+    rows = connection.execute(
+        "SELECT service_id, observations_json, degraded_detail, detail_json, spec_fingerprint "
+        'FROM "runtime_services" ORDER BY service_id LIMIT ?',
+        (501,),
+    ).fetchall()
+    if (
+        len(rows) > 500
+        or {row[0] for row in rows} != {item.service_id for item in services}
+        or len(rows) != len(services)
+    ):
+        raise ValueError("health view must contain the original complete service set")
+    by_id = {item.service_id: item for item in services}
+    result: list[RuntimeServiceRow] = []
+    for service_id, observations, degraded_detail, raw, fingerprint in rows:
+        if not isinstance(raw, str) or len(raw.encode()) > 64 * 1024:
+            raise ValueError("present health view is missing or exceeds its cell budget")
+        strict_canonical_json_loads(raw)
+        view = RuntimeHealthServiceView.model_validate_json(raw)
+        item = by_id[service_id]
+        if view.service_id != service_id or view.observed_at != item.observed_at:
+            raise ValueError("health view differs from original service or observation")
+        binding = view.startup_witness
+        if binding is not None and binding.spec_fingerprint != fingerprint:
+            raise ValueError("health view differs from original service spec")
+        counts = None if observations is None else strict_canonical_json_loads(observations)
+        if counts != view.observations:
+            raise ValueError("health observations differ from verified view")
+        result.append(
+            RuntimeServiceRow.model_validate(
+                item.model_dump(mode="python")
+                | {
+                    "observations": counts,
+                    "degraded_detail": degraded_detail,
+                    "details": view,
+                }
+            )
+        )
+    return tuple(sorted(result, key=lambda item: (item.plane, item.service_id)))
+
+
 def read_runtime_console_sections(
     connection: _ReadonlyConnection,
     *,
@@ -439,10 +488,22 @@ def load_runtime_console(
                 age=age,
                 stale_after=stale_after,
             )
+            has_details = (
+                getattr(manifest, "row_counts", {}).get("runtime_health_detail_context", 0) > 0
+            )
             sections = read_runtime_console_sections(
                 acquired.connection,
-                limits=query_limits,
+                limits=query_limits.model_copy(update={"services": 500})
+                if has_details
+                else query_limits,
             )
+            if has_details:
+                services = read_runtime_health_service_details(
+                    acquired.connection, sections.services
+                )
+                sections = sections.model_copy(
+                    update={"services": services[: query_limits.services]}
+                )
     except Exception as error:
         if manifest is None:
             return _unavailable(error)

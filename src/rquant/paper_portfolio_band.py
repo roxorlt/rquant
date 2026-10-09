@@ -8,12 +8,13 @@ from decimal import ROUND_HALF_EVEN, Decimal, localcontext
 from typing import Literal, Self
 from uuid import UUID
 
-from pydantic import Field, model_validator
+from pydantic import Field, TypeAdapter, model_validator
 
 from rquant.backtest.contracts import SSECalendar
 from rquant.paper_portfolio_models import PaperPortfolioConfiguration, Sha256
 from rquant.research_run_spec import _parse_decimal
 from rquant.runtime_contracts import RuntimeContractModel, canonical_sha256
+from rquant.strategy_promotion_contracts import NativeMinuteForwardConfiguration
 
 BOOTSTRAP_ALGORITHM = "paper-bootstrap-splitmix64-day-major-nearest-rank-v1"
 BOOTSTRAP_SEED = 20261005
@@ -138,6 +139,41 @@ class PaperBacktestBandInput(RuntimeContractModel):
         return canonical_sha256(self.model_dump(mode="python"))
 
 
+class NativeSealedPaperBacktestReturns(SealedPaperBacktestReturns):
+    contract: Literal["native-sealed-backtest-returns/v1"] = "native-sealed-backtest-returns/v1"
+    native_spec_fingerprint: Sha256
+    profile_hash: Sha256
+    full_input_hash: Sha256
+    source_kind: Literal["captured", "reconstructed"]
+
+
+class NativePaperBacktestBandInput(PaperBacktestBandInput):
+    contract: Literal["native-paper-backtest-band-input/v1"] = "native-paper-backtest-band-input/v1"
+    configuration: NativeMinuteForwardConfiguration
+    backtest: NativeSealedPaperBacktestReturns
+
+    @model_validator(mode="after")
+    def exact_native_source_and_forward_start(self) -> Self:
+        source, config = self.backtest, self.configuration
+        if (source.definition_fingerprint, source.definition_record_hash,
+            source.native_spec_fingerprint, source.profile_hash) != (
+            config.target.head.registration_fingerprint, config.target.head.record_hash,
+            config.target.head.spec_fingerprint, config.execution_profile.profile_hash
+        ):
+            raise ValueError("native band differs from the complete original native head/profile")
+        from zoneinfo import ZoneInfo
+        if self.comparison_dates[0] <= config.paper_approved_at.astimezone(ZoneInfo("Asia/Shanghai")).date():
+            raise ValueError("native forward comparison cannot reuse a day before manual paper approval")
+        return self
+
+    @property
+    def fingerprint(self) -> str:
+        return canonical_sha256(self.model_dump(mode="json"))
+
+
+PaperResearchBandInput = PaperBacktestBandInput | NativePaperBacktestBandInput
+
+
 class PaperBacktestBandResult(RuntimeContractModel):
     contract: Literal["paper-backtest-band-result/v1"] = "paper-backtest-band-result/v1"
     input_hash: Sha256
@@ -160,8 +196,8 @@ class PaperBacktestBandResult(RuntimeContractModel):
         return canonical_sha256(self.model_dump(mode="python"))
 
 
-def execute_paper_backtest_band(value: PaperBacktestBandInput) -> PaperBacktestBandResult:
-    value = PaperBacktestBandInput.model_validate(value.model_dump(mode="python"))
+def execute_paper_backtest_band(value: PaperResearchBandInput) -> PaperBacktestBandResult:
+    value = TypeAdapter(PaperResearchBandInput).validate_python(value.model_dump(mode="python"))
     points = bootstrap_daily_band(tuple(item.daily_return for item in value.backtest.returns), days=len(value.comparison_dates))
     return PaperBacktestBandResult(input_hash=value.fingerprint, configuration_fingerprint=value.configuration.fingerprint,
                                   backtest_source_hash=value.backtest.fingerprint, dates=value.comparison_dates, points=points)

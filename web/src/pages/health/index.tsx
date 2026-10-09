@@ -1,6 +1,14 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { Link } from "react-router";
 import { type FreshnessItem, type HealthData, type ServiceItem, useHealth } from "@/api/endpoints";
-import { EMPTY, formatCount } from "@/format/number";
+import { useCurrentMeta } from "@/api/useMeta";
+import {
+  EMPTY,
+  formatCount,
+  formatNumber,
+  formatPercent,
+  formatSignedPercent,
+} from "@/format/number";
 import { formatAge, formatShanghaiDateTime, formatTradeDate } from "@/format/time";
 import { type DataColumn, DataTable } from "@/table/DataTable";
 import {
@@ -18,9 +26,225 @@ import {
   Tip,
 } from "@/ui";
 import { NamedKey } from "../shared/StockCell";
+import "./health.css";
 
 type StateFilter = "all" | "attention";
 type PlaneFilter = "all" | "live" | "serving" | "research";
+type HealthLayer = NonNullable<HealthData["layers"]>[number];
+type HealthMetric = HealthLayer["metrics"][number];
+type HealthExposure = NonNullable<HealthLayer["exposure"]>[number];
+
+function metricValue(item: HealthMetric): string {
+  if (!item.available || item.value === null) return EMPTY;
+  if (item.unit === "band_position") return item.value === "inside" ? "区间内" : "区间外";
+  if (item.unit === "risk_state") return item.value === "clear" ? "未触线" : "已触线";
+  const value = Number(item.value);
+  if (!Number.isFinite(value)) return EMPTY;
+  if (item.unit === "ratio" || item.unit === "fraction") return formatPercent(value * 100);
+  if (item.unit === "count") return formatCount(value);
+  if (item.unit === "seconds") return `${formatNumber(value)} 秒`;
+  if (item.unit === "bytes") {
+    if (value >= 1024 ** 3) return `${formatNumber(value / 1024 ** 3)} GB`;
+    if (value >= 1024 ** 2) return `${formatNumber(value / 1024 ** 2)} MB`;
+    if (value >= 1024) return `${formatNumber(value / 1024)} KB`;
+    return `${formatCount(value)} B`;
+  }
+  return formatNumber(value);
+}
+
+function MetricTip({ item }: { item: HealthMetric }) {
+  return (
+    <dl className="health-tip kv">
+      <dt>范围</dt>
+      <dd>
+        {item.scope_label}
+        <br />
+        {item.scope_detail}
+      </dd>
+      <dt>来源</dt>
+      <dd>
+        {item.source_name}
+        <br />
+        {item.source_generation_id}
+      </dd>
+      <dt>观测</dt>
+      <dd>{formatShanghaiDateTime(item.observed_at)}</dd>
+      <dt>窗口</dt>
+      <dd>
+        {formatShanghaiDateTime(item.event_time_start)} 至{" "}
+        {formatShanghaiDateTime(item.event_time_end)}
+      </dd>
+      <dt>可读取时间</dt>
+      <dd>{formatShanghaiDateTime(item.available_at)}</dd>
+      <dt>有效性</dt>
+      <dd>
+        {item.temporal_basis === "as_of"
+          ? "已核验截至该窗口"
+          : item.temporal_basis === "realtime"
+            ? "实时观测"
+            : "尚无可核验观测"}
+      </dd>
+      {item.valid_until ? (
+        <>
+          <dt>有效至</dt>
+          <dd>{formatShanghaiDateTime(item.valid_until)}</dd>
+        </>
+      ) : null}
+      <dt>原因</dt>
+      <dd>{item.status.reason}</dd>
+    </dl>
+  );
+}
+
+function ExposureTip({ item }: { item: HealthExposure }) {
+  return (
+    <dl className="health-tip kv">
+      <dt>范围</dt>
+      <dd>
+        {item.scope_label}
+        <br />
+        {item.scope_detail}
+      </dd>
+      <dt>来源</dt>
+      <dd>
+        {item.source_name}
+        <br />
+        {item.source_generation_id}
+        <br />
+        {item.source_identity}
+      </dd>
+      <dt>观测</dt>
+      <dd>{formatShanghaiDateTime(item.observed_at)}</dd>
+      {item.valid_until ? (
+        <>
+          <dt>有效至</dt>
+          <dd>{formatShanghaiDateTime(item.valid_until)}</dd>
+        </>
+      ) : null}
+      <dt>组合权重</dt>
+      <dd>{formatPercent(Number(item.portfolio_weight) * 100)}</dd>
+      <dt>基准权重</dt>
+      <dd>{formatPercent(Number(item.benchmark_weight) * 100)}</dd>
+      <dt>偏离</dt>
+      <dd>{formatSignedPercent(Number(item.deviation) * 100)}</dd>
+    </dl>
+  );
+}
+
+const EXPOSURE_COLUMNS: DataColumn<HealthExposure>[] = [
+  {
+    id: "name",
+    header: "类别",
+    value: (row) => row.name,
+    cell: (row) => (
+      <Tip content={<ExposureTip item={row} />}>
+        <span>{row.name}</span>
+      </Tip>
+    ),
+  },
+  {
+    id: "weight",
+    header: "组合权重",
+    value: (row) => Number(row.portfolio_weight),
+    numeric: true,
+    cell: (row) => formatPercent(Number(row.portfolio_weight) * 100),
+  },
+  {
+    id: "benchmark",
+    header: "基准",
+    value: (row) => Number(row.benchmark_weight),
+    numeric: true,
+    secondary: true,
+    cell: (row) => formatPercent(Number(row.benchmark_weight) * 100),
+  },
+  {
+    id: "deviation",
+    header: "偏离",
+    value: (row) => Number(row.deviation),
+    numeric: true,
+    secondary: true,
+    cell: (row) => formatSignedPercent(Number(row.deviation) * 100),
+  },
+];
+
+function LayerCard({ layer }: { layer: HealthLayer }) {
+  const accountScope = ["orders", "risk", "comparison"].includes(layer.key);
+  const exposure = new Map<string, HealthExposure[]>();
+  for (const item of layer.exposure ?? []) {
+    const rows = exposure.get(item.scope_key) ?? [];
+    rows.push(item);
+    exposure.set(item.scope_key, rows);
+  }
+  return (
+    <Panel
+      title={layer.name}
+      label={layer.name}
+      actions={
+        <StatusBadge
+          state={layer.status.state}
+          label={layer.status.label}
+          reason={layer.status.reason}
+        />
+      }
+    >
+      <div className="health-layer-body">
+        {layer.metrics.length ? (
+          <ul className="health-metrics">
+            {layer.metrics.map((item) => (
+              <li key={item.key}>
+                <span className="health-metric-name">
+                  {accountScope ? (
+                    <span className="health-metric-scope muted">{item.scope_label}</span>
+                  ) : null}
+                  {item.name}
+                </span>
+                <strong className="num">{metricValue(item)}</strong>
+                <Tip content={<MetricTip item={item} />} interactive>
+                  <Button
+                    className="health-detail-btn"
+                    size="sm"
+                    variant="ghost"
+                    aria-label={`${accountScope ? item.scope_label : ""}${item.name}详情`}
+                  >
+                    详情
+                  </Button>
+                </Tip>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <span className="muted">暂无观测</span>
+        )}
+        {[...exposure].map(([key, rows]) => {
+          const first = rows[0];
+          return first ? (
+            <div className="health-exposure" key={key}>
+              <h3>{first.scope_label}</h3>
+              <DataTable
+                label={`${first.scope_label}暴露`}
+                rows={rows}
+                columns={EXPOSURE_COLUMNS}
+                rowKey={(row) => `${row.kind}:${row.name}`}
+              />
+            </div>
+          ) : null;
+        })}
+        <div className="health-layer-footer">
+          <span className="muted">
+            <RelativeTime at={layer.observed_at} />
+          </span>
+          <div className="health-layer-links">
+            {layer.links.map((link) => (
+              <Link key={link.href} to={link.href}>
+                {link.label}
+              </Link>
+            ))}
+          </div>
+        </div>
+      </div>
+    </Panel>
+  );
+}
 
 const STATE_OPTIONS = [
   { value: "all", label: "全部" },
@@ -182,6 +406,30 @@ function ServiceDetail({ item, onClose }: { item: ServiceItem | null; onClose: (
             <dd className="num">{formatCount(item.consecutive_failures)}</dd>
             <dt>最近错误</dt>
             <dd className="mono small">{item.last_error ?? EMPTY}</dd>
+            {item.detail ? (
+              <>
+                <dt>观测来源</dt>
+                <dd>{item.detail.source_name}</dd>
+                <dt>观测状态</dt>
+                <dd>{item.detail.reason}</dd>
+                <dt>本次启动</dt>
+                <dd>
+                  {item.detail.started_at ? formatShanghaiDateTime(item.detail.started_at) : EMPTY}
+                </dd>
+                {item.detail.observations.map((observation) => (
+                  <div className="health-observation" key={observation.key}>
+                    <dt>{observation.label}</dt>
+                    <dd className="num">{formatCount(observation.value)}</dd>
+                  </div>
+                ))}
+                {item.detail.degraded_reason ? (
+                  <>
+                    <dt>功能情况</dt>
+                    <dd>{item.detail.degraded_reason}</dd>
+                  </>
+                ) : null}
+              </>
+            ) : null}
           </dl>
         </div>
       ) : null}
@@ -247,11 +495,26 @@ function Errors({ data }: { data: HealthData }) {
 }
 
 export default function HealthPage() {
-  const { data, isLoading, isFetching, error, refetch } = useHealth();
+  const { data, serving, isLoading, isFetching, error, refetch } = useHealth();
+  const meta = useCurrentMeta();
   const [stateFilter, setStateFilter] = useState<StateFilter>("all");
   const [plane, setPlane] = useState<PlaneFilter>("all");
-  const [selected, setSelected] = useState<ServiceItem | null>(null);
+  const [selected, setSelected] = useState<{ serviceId: string; boundary: string } | null>(null);
+  const viewer = meta.data?.data.viewer ?? null;
+  const generation = meta.data?.data.generation?.generation_id ?? null;
+  const boundary = JSON.stringify([viewer, generation, serving?.generation_id, data?.viewer_id]);
+  const detailVisible =
+    meta.data !== undefined && viewer === data?.viewer_id && generation === serving?.generation_id;
+  useEffect(() => {
+    setSelected((current) => (current?.boundary === boundary ? current : null));
+  }, [boundary]);
   const services = data?.services ?? [];
+  const selectedRow =
+    selected?.boundary === boundary
+      ? (services.find((item) => item.service_id === selected.serviceId) ?? null)
+      : null;
+  const selectedItem =
+    selectedRow && !detailVisible ? { ...selectedRow, detail: null } : selectedRow;
   const planes = useMemo(() => planeOptions(services), [services]);
   const rows = services.filter(
     (item) =>
@@ -283,6 +546,13 @@ export default function HealthPage() {
     <>
       <PageHeader eyebrow="运维" title="系统健康" actions={refresh} />
       <KpiStrip label="服务与数据" items={kpis(data)} />
+      {detailVisible && data.layers?.length ? (
+        <div className="health-layers">
+          {data.layers.map((layer) => (
+            <LayerCard key={layer.key} layer={layer} />
+          ))}
+        </div>
+      ) : null}
       <Panel
         title="运行服务"
         sub={`${rows.length} 个`}
@@ -306,8 +576,8 @@ export default function HealthPage() {
           rows={rows}
           columns={SERVICE_COLUMNS}
           rowKey={(row) => row.service_id}
-          onSelect={setSelected}
-          selectedKey={selected?.service_id ?? null}
+          onSelect={(row) => setSelected({ serviceId: row.service_id, boundary })}
+          selectedKey={selectedItem?.service_id ?? null}
           emptyText={
             stateFilter === "attention" ? (
               <EmptyState title="没有异常的服务" />
@@ -332,7 +602,7 @@ export default function HealthPage() {
           <Errors data={data} />
         </div>
       </div>
-      <ServiceDetail item={selected} onClose={() => setSelected(null)} />
+      <ServiceDetail item={selectedItem} onClose={() => setSelected(null)} />
     </>
   );
 }

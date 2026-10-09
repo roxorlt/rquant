@@ -157,8 +157,130 @@ def test_exp23_typed_web_fixture_from_original_synthetic_sealed_results(
             ).status_code
             == 409
         )
-    output = Path(__file__).resolve().parents[2] / (
-        "data/verification/experiment-platform-20261005/implementation/final-repair-01/typed-web-fixture-04.json"
-    )
+    output = tmp_path / "typed-web-fixture-04.json"
     assert not output.exists(), "retain the preceding actual fixture"
     output.write_text(json.dumps(fixture, ensure_ascii=False, indent=2) + "\n")
+
+
+def _native_public_family_request() -> dict[str, object]:
+    return {
+        "command_id": "5a1fe4a6-6a1d-4e05-96ed-ec9da5e063e4",
+        "requested_at": "2026-10-07T20:40:35.280523Z",
+        "kind": "register_experiment_family",
+        "request": {
+            "kind": "native_minute_experiment",
+            "name": "原生分钟请求类型验证",
+            "configurations": [
+                {
+                    "kind": "native_minute",
+                    "selection": {
+                        "target": {
+                            "source_kind": "builtin",
+                            "owner_id": "researcher",
+                            "strategy_id": "n_shape",
+                            "name": "N 字形态",
+                            "head": {
+                                "version": 1,
+                                "registration_fingerprint": "a" * 64,
+                                "record_hash": "b" * 64,
+                                "spec_fingerprint": "c" * 64,
+                            },
+                            "parameter_fingerprint": "d" * 64,
+                            "cost_fingerprint": "e" * 64,
+                        },
+                        "source_key": "synthetic-public-type-only",
+                        "source_version": 1,
+                        "profile_hash": "f" * 64,
+                    },
+                    "start_date": "2026-01-05",
+                    "end_date": "2026-01-06",
+                }
+            ],
+            "protocol": {
+                "train_range": {"start_date": "2026-01-05", "end_date": "2026-01-05"},
+                "validation_range": {"start_date": "2026-01-06", "end_date": "2026-01-06"},
+                "frozen_outer_test_range": {"start_date": "2026-01-07", "end_date": "2026-01-07"},
+            },
+        },
+    }
+
+
+def test_exp_native_public_request_preserves_the_exact_original_domain_command() -> None:
+    from pydantic import TypeAdapter
+
+    from rquant.experiment_platform import NativeMinuteExperimentRequest
+    from rquant.experiment_platform_commands import RegisterExperimentFamily
+    from rquant.runtime_contracts import canonical_sha256
+    from rquant.web.experiment_platform_models import ExperimentWrite
+
+    raw = _native_public_family_request()
+    parsed = TypeAdapter(ExperimentWrite).validate_python(raw)
+    assert type(parsed.request) is NativeMinuteExperimentRequest
+    actor_payload = parsed.model_dump(mode="json") | {"actor_id": "researcher"}
+    original = RegisterExperimentFamily.model_validate(raw | {"actor_id": "researcher"})
+    converted = RegisterExperimentFamily.model_validate(actor_payload)
+    assert converted == original
+    assert canonical_sha256(converted) == canonical_sha256(original)
+
+
+def test_exp_native_public_union_preserves_the_original_daily_request_json() -> None:
+    from pydantic import TypeAdapter
+
+    from rquant.backtest import RebalanceRule
+    from rquant.experiment_platform import SearchDimension
+    from rquant.portfolio.weights import PortfolioWeightRule
+    from rquant.web.experiment_platform_models import ExperimentEditableRequest, ExperimentWrite
+    from rquant.web.models.backtests import PortfolioEditableConfig
+    from tests.paper_cost_fixtures import paper_execution_cost_spec
+
+    original = ExperimentEditableRequest(
+        name="日线原格式",
+        base_config=PortfolioEditableConfig(
+            start_date="2026-01-05",
+            end_date="2026-01-06",
+            initial_cash="1000000",
+            weight_rule=PortfolioWeightRule(max_positions=2),
+            rebalance_rule=RebalanceRule(kind="daily"),
+            execution_cost_spec=paper_execution_cost_spec().model_dump(mode="python"),
+        ),
+        protocol=_native_public_family_request()["request"]["protocol"],
+        dimensions=(SearchDimension(parameter="weight_rule.max_positions", values=(1, 2)),),
+    )
+    raw = _native_public_family_request() | {"request": original.model_dump(mode="json")}
+    parsed = TypeAdapter(ExperimentWrite).validate_python(raw)
+    assert type(parsed.request) is ExperimentEditableRequest
+    assert parsed.request.model_dump(mode="json") == original.model_dump(mode="json")
+
+
+def test_exp_native_public_union_does_not_accept_an_actor_or_unknown_native_fields() -> None:
+    import pytest
+    from pydantic import TypeAdapter, ValidationError
+
+    from rquant.web.experiment_platform_models import ExperimentWrite
+
+    raw = _native_public_family_request()
+    with pytest.raises(ValidationError):
+        TypeAdapter(ExperimentWrite).validate_python(raw | {"actor_id": "foreign"})
+    request = raw["request"]
+    with pytest.raises(ValidationError):
+        TypeAdapter(ExperimentWrite).validate_python(raw | {"request": request | {"trusted": True}})
+    with pytest.raises(ValidationError):
+        TypeAdapter(ExperimentWrite).validate_python(
+            raw | {"request": request | {"kind": "unknown"}}
+        )
+
+
+def test_exp_native_public_union_keeps_the_original_dates_and_head_rejections() -> None:
+    import pytest
+    from pydantic import TypeAdapter, ValidationError
+
+    from rquant.web.experiment_platform_models import ExperimentWrite
+
+    raw = _native_public_family_request()
+    raw["request"]["protocol"]["validation_range"] = raw["request"]["protocol"]["train_range"]
+    with pytest.raises(ValidationError):
+        TypeAdapter(ExperimentWrite).validate_python(raw)
+    raw = _native_public_family_request()
+    raw["request"]["configurations"][0]["selection"]["target"]["head"]["record_hash"] = "not-a-hash"
+    with pytest.raises(ValidationError):
+        TypeAdapter(ExperimentWrite).validate_python(raw)

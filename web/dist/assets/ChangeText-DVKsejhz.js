@@ -1,0 +1,1 @@
+import{r as e}from"./Panel-BtqC84P_.js";import{n as t,t as n}from"./color-Cv3IYI4H.js";import{h as r}from"./RelativeTime-DnM0ok75.js";var i=e();function a({value:e,digits:a=2}){let o=t(e),s=[`num`,n(o)].filter(Boolean).join(` `);return(0,i.jsx)(`span`,{className:s,"data-tone":o,children:r(e,a)})}export{a as t};

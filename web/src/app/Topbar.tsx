@@ -1,5 +1,6 @@
 import { Link } from "react-router";
 import type { MetaEnvelope } from "@/api/client";
+import { useCollaboration } from "@/api/collaboration";
 import { phaseTone } from "@/format/session";
 import { formatTradeDate, shanghaiDate, weekdayOf } from "@/format/time";
 import { THEME_LABELS, useTheme } from "@/theme/ThemeProvider";
@@ -14,6 +15,8 @@ export interface TopbarProps {
   meta: MetaEnvelope | undefined;
   metaReceivedAt: number;
   metaFailed: boolean;
+  onAssistant?: () => void;
+  onAiUsage?: () => void;
 }
 
 function TradeDay({ meta }: { meta: MetaEnvelope | undefined }) {
@@ -51,8 +54,9 @@ function PhasePill({ meta }: { meta: MetaEnvelope | undefined }) {
   );
 }
 
-export function Topbar({ meta, metaReceivedAt, metaFailed }: TopbarProps) {
+export function Topbar({ meta, metaReceivedAt, metaFailed, onAssistant, onAiUsage }: TopbarProps) {
   const { mode, cycle } = useTheme();
+  const collaboration = useCollaboration();
   return (
     <header className="topbar">
       <Link className="brand" to={HOME_PATH}>
@@ -67,7 +71,18 @@ export function Topbar({ meta, metaReceivedAt, metaFailed }: TopbarProps) {
         <GenerationBadge meta={meta} failed={metaFailed} receivedAt={metaReceivedAt} />
       </div>
       <StockSearch />
-      <Button className="ai-btn" disabledReason="AI 助手即将上线">
+      <Button
+        className="ai-btn"
+        aria-label="AI 助手"
+        onClick={onAssistant}
+        disabledReason={
+          collaboration.error
+            ? "权限暂未确认"
+            : collaboration.current && !collaboration.me?.can_research
+              ? "当前账号只读"
+              : undefined
+        }
+      >
         <SparkIcon />
         <span className="lbl">AI 助手</span>
       </Button>
@@ -80,7 +95,7 @@ export function Topbar({ meta, metaReceivedAt, metaFailed }: TopbarProps) {
       >
         <ThemeIcon mode={mode} />
       </button>
-      <UserMenu viewer={meta?.data.viewer} />
+      <UserMenu viewer={meta?.data.viewer} onAiUsage={onAiUsage} collaboration={collaboration.me} />
     </header>
   );
 }

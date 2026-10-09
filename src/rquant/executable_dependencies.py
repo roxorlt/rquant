@@ -13,11 +13,13 @@ import re
 import sys
 import textwrap
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import dataclass, fields, is_dataclass, replace
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
-from types import CellType, CodeType, GetSetDescriptorType, MemberDescriptorType, ModuleType
+from types import (
+    CellType, CodeType, GetSetDescriptorType, MappingProxyType, MemberDescriptorType, ModuleType,
+)
 from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel
@@ -104,6 +106,33 @@ class ExecutableDependencyGuard:
     include_global_dependencies: bool
     binding_probes: tuple[_CapturedBindingProbe, ...]
     function_probes: tuple[_CapturedFunctionProbe, ...]
+    code_plan: _CompiledExecutableCodePlan | None = None
+
+    @property
+    def code_plan_retained_bytes(self) -> int:
+        return 0 if self.code_plan is None else self.code_plan.retained_bytes
+
+    def with_compiled_code_plan(self, *, max_retained_bytes: int) -> ExecutableDependencyGuard:
+        if self.code_plan is not None:
+            if self.code_plan.retained_bytes <= max_retained_bytes:
+                return self
+            return replace(
+                self, code_plan=None,
+                binding_probes=tuple(
+                    replace(probe, code_plan=None) for probe in self.binding_probes
+                ),
+                function_probes=tuple(
+                    replace(probe, code_plan=None) for probe in self.function_probes
+                ),
+            )
+        plan = _compile_guard_code_plan(self, max_retained_bytes=max_retained_bytes)
+        if plan is None:
+            return self
+        return replace(
+            self, code_plan=plan,
+            binding_probes=tuple(replace(probe, code_plan=plan) for probe in self.binding_probes),
+            function_probes=tuple(replace(probe, code_plan=plan) for probe in self.function_probes),
+        )
 
     def current_fingerprint(self) -> str:
         return fingerprint_executable_bindings(
@@ -133,6 +162,7 @@ class _CapturedBindingProbe:
     identity_required: bool
     recursive_package_roots: frozenset[str]
     limits: DependencyFingerprintLimits
+    code_plan: _CompiledExecutableCodePlan | None = None
 
     @property
     def key(self) -> tuple[str, str, tuple[str, ...]]:
@@ -163,6 +193,7 @@ class _CapturedBindingProbe:
                 current,
                 recursive_package_roots=self.recursive_package_roots,
                 limits=self.limits,
+                code_plan=self.code_plan,
             )
             != self.content_fingerprint
         ):
@@ -181,6 +212,7 @@ class _CapturedFunctionProbe:
     closure_fingerprints: tuple[str, ...] | None
     recursive_package_roots: frozenset[str]
     limits: DependencyFingerprintLimits
+    code_plan: _CompiledExecutableCodePlan | None = None
 
     def assert_unchanged(self) -> None:
         if (
@@ -195,6 +227,7 @@ class _CapturedFunctionProbe:
                 self.defaults,
                 recursive_package_roots=self.recursive_package_roots,
                 limits=self.limits,
+                code_plan=self.code_plan,
             )
             != self.defaults_fingerprint
         ):
@@ -204,6 +237,7 @@ class _CapturedFunctionProbe:
                 self.keyword_defaults,
                 recursive_package_roots=self.recursive_package_roots,
                 limits=self.limits,
+                code_plan=self.code_plan,
             )
             != self.keyword_defaults_fingerprint
         ):
@@ -216,6 +250,7 @@ class _CapturedFunctionProbe:
                     _closure_cell_value(cell),
                     recursive_package_roots=self.recursive_package_roots,
                     limits=self.limits,
+                    code_plan=self.code_plan,
                 )
                 for cell in self.closure
             )
@@ -251,6 +286,7 @@ class _SnapshotState:
     include_global_dependencies: bool
     binding_probes: dict[tuple[str, str, tuple[str, ...]], _CapturedBindingProbe]
     function_probes: dict[str, _CapturedFunctionProbe]
+    code_plan: _CompiledExecutableCodePlan | None = None
 
 
 def capture_executable_dependency_guard(
@@ -383,6 +419,7 @@ def fingerprint_dependency_value(
     contract: str,
     limits: DependencyFingerprintLimits | None = None,
     _recursive_package_roots: frozenset[str] | None = None,
+    _code_plan: _CompiledExecutableCodePlan | None = None,
 ) -> str:
     if not contract or contract != contract.strip():
         raise ExecutableDependencyError("dependency value fingerprint contract is invalid")
@@ -401,6 +438,7 @@ def fingerprint_dependency_value(
         include_global_dependencies=True,
         binding_probes={},
         function_probes={},
+        code_plan=_code_plan,
     )
     payload = {
         "contract": contract,
@@ -533,7 +571,7 @@ def _snapshot_function_dependencies(
     state: _SnapshotState,
     depth: int,
 ) -> dict[str, object]:
-    paths = _referenced_global_paths(function.__code__)
+    paths = _referenced_global_paths(function.__code__, code_plan=state.code_plan)
     dependency_module = sys.modules.get(str(function.__globals__.get("__name__", "")))
     if not isinstance(dependency_module, ModuleType):
         raise ExecutableDependencyError(
@@ -638,27 +676,167 @@ def _snapshot_function_dependencies(
     return dependencies
 
 
-def _referenced_global_paths(code: CodeType) -> dict[str, set[tuple[str, ...]]]:
+@dataclass(frozen=True, slots=True)
+class _ImmutableCodeDescriptor:
+    code: CodeType
+    bytecode: bytes
+    names: tuple[str, ...]
+    instructions: tuple[tuple[str, int | None], ...]
+    global_paths: tuple[tuple[str, tuple[tuple[str, ...], ...]], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _CompiledExecutableCodePlan:
+    descriptors: Mapping[int, _ImmutableCodeDescriptor]
+    retained_bytes: int
+
+    def lookup(self, code: CodeType) -> _ImmutableCodeDescriptor | None:
+        descriptor = self.descriptors.get(id(code))
+        # A strong exact CodeType reference rules out recycled ids. Only its
+        # immutable instruction/name fields are reused; constants remain live.
+        if (
+            descriptor is None or descriptor.code is not code
+            or descriptor.bytecode != code.co_code or descriptor.names != code.co_names
+        ):
+            return None
+        return descriptor
+
+
+def _compiled_code_retained_bytes(value: object) -> int | None:
+    seen: set[int] = set()
+
+    def retained(item: object) -> int | None:
+        if id(item) in seen:
+            return 0
+        seen.add(id(item))
+        if type(item) in (str, bytes, int, float, complex, bool, type(None)):
+            return sys.getsizeof(item)
+        if type(item) in (tuple, list, set, frozenset):
+            children = tuple(item)
+        elif type(item) is dict:
+            children = tuple(child for pair in item.items() for child in pair)
+        elif type(item) is CodeType:
+            children = (
+                item.co_code, item.co_consts, item.co_names, item.co_varnames,
+                item.co_freevars, item.co_cellvars, item.co_filename, item.co_name,
+                item.co_qualname, item.co_linetable, item.co_exceptiontable,
+            )
+        elif type(item) is _ImmutableCodeDescriptor:
+            children = tuple(getattr(item, name) for name in item.__slots__)
+        else:
+            return None
+        size = sys.getsizeof(item)
+        for child in children:
+            charge = retained(child)
+            if charge is None:
+                return None
+            size += charge
+        return size
+
+    return retained(value)
+
+
+def _compile_guard_code_plan(
+    guard: ExecutableDependencyGuard, *, max_retained_bytes: int,
+) -> _CompiledExecutableCodePlan | None:
+    if type(max_retained_bytes) is not int or max_retained_bytes <= 0:
+        return None
+    descriptors: dict[int, _ImmutableCodeDescriptor] = {}
+    empty = _CompiledExecutableCodePlan(MappingProxyType(descriptors), 0)
+    # Charge both the complete descriptor references and the adopted guard/probe
+    # objects. Conservative duplicate charging cannot enlarge the caller's pool.
+    charge = (
+        sys.getsizeof(empty) + sys.getsizeof(empty.descriptors) + sys.getsizeof(0)
+        + sys.getsizeof(descriptors) + sys.getsizeof(guard)
+        + sys.getsizeof(guard.binding_probes) + sys.getsizeof(guard.function_probes)
+        + sum(sys.getsizeof(probe) for probe in (*guard.binding_probes, *guard.function_probes))
+    )
+    if charge >= max_retained_bytes:
+        return None
+    pending = [probe.code for probe in guard.function_probes]
+    seen: set[int] = set()
+    while pending:
+        code = pending.pop()
+        identity = id(code)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        pending.extend(constant for constant in code.co_consts if isinstance(constant, CodeType))
+        # Opaque constants keep the original path. Ordinary mutable constants
+        # are charged here and are still snapshotted anew on every check.
+        if _compiled_code_retained_bytes(code) is None:
+            continue
+        instructions = tuple(dis.get_instructions(code, adaptive=False, show_caches=False))
+        try:
+            paths = _direct_global_paths(instructions)
+        except ExecutableDependencyError:
+            continue
+        descriptor = _ImmutableCodeDescriptor(
+            code=code, bytecode=code.co_code, names=code.co_names,
+            instructions=tuple(
+                (instruction.opname, instruction.arg) for instruction in instructions
+            ),
+            global_paths=tuple((name, tuple(sorted(values))) for name, values in paths.items()),
+        )
+        descriptor_bytes = _compiled_code_retained_bytes(descriptor)
+        if descriptor_bytes is None:
+            continue
+        previous_dict_bytes = sys.getsizeof(descriptors)
+        descriptors[identity] = descriptor
+        updated = (
+            charge + descriptor_bytes + sys.getsizeof(identity)
+            + sys.getsizeof(descriptors) - previous_dict_bytes
+        )
+        if updated > max_retained_bytes:
+            del descriptors[identity]
+            # A removed entry may leave allocated table capacity behind.
+            charge += sys.getsizeof(descriptors) - previous_dict_bytes
+            if charge > max_retained_bytes:
+                return None
+            continue
+        charge = updated
+    if not descriptors:
+        return None
+    return _CompiledExecutableCodePlan(MappingProxyType(descriptors), charge)
+
+
+def _direct_global_paths(
+    instructions: tuple[dis.Instruction, ...],
+) -> dict[str, set[tuple[str, ...]]]:
+    result: dict[str, set[tuple[str, ...]]] = {}
+    for index, instruction in enumerate(instructions):
+        if instruction.opname not in {"LOAD_GLOBAL", "LOAD_NAME"}:
+            continue
+        name = instruction.argval
+        if not isinstance(name, str):
+            raise ExecutableDependencyError("executable global bytecode name is invalid")
+        attribute_path: list[str] = []
+        for following in instructions[index + 1 :]:
+            if following.opname not in {"LOAD_ATTR", "LOAD_METHOD"}:
+                break
+            attribute = following.argval
+            if not isinstance(attribute, str):
+                raise ExecutableDependencyError("executable attribute bytecode name is invalid")
+            attribute_path.append(attribute)
+        result.setdefault(name, set()).add(tuple(attribute_path))
+    return result
+
+
+def _referenced_global_paths(
+    code: CodeType, *, code_plan: _CompiledExecutableCodePlan | None = None,
+) -> dict[str, set[tuple[str, ...]]]:
     result: dict[str, set[tuple[str, ...]]] = {}
     pending = [code]
     while pending:
         current = pending.pop()
-        instructions = tuple(dis.get_instructions(current, adaptive=False, show_caches=False))
-        for index, instruction in enumerate(instructions):
-            if instruction.opname not in {"LOAD_GLOBAL", "LOAD_NAME"}:
-                continue
-            name = instruction.argval
-            if not isinstance(name, str):
-                raise ExecutableDependencyError("executable global bytecode name is invalid")
-            attribute_path: list[str] = []
-            for following in instructions[index + 1 :]:
-                if following.opname not in {"LOAD_ATTR", "LOAD_METHOD"}:
-                    break
-                attribute = following.argval
-                if not isinstance(attribute, str):
-                    raise ExecutableDependencyError("executable attribute bytecode name is invalid")
-                attribute_path.append(attribute)
-            result.setdefault(name, set()).add(tuple(attribute_path))
+        descriptor = None if code_plan is None else code_plan.lookup(current)
+        if descriptor is None:
+            instructions = tuple(dis.get_instructions(current, adaptive=False, show_caches=False))
+            paths = _direct_global_paths(instructions).items()
+        else:
+            paths = descriptor.global_paths
+        for name, values in paths:
+            result.setdefault(name, set()).update(values)
         pending.extend(constant for constant in current.co_consts if isinstance(constant, CodeType))
     return result
 
@@ -764,6 +942,7 @@ def _record_binding_probe(
             value,
             recursive_package_roots=state.recursive_package_roots,
             limits=state.budget.limits,
+            code_plan=state.code_plan,
         )
         if _requires_content_probe(value)
         else None
@@ -777,6 +956,7 @@ def _record_binding_probe(
         identity_required=identity_required,
         recursive_package_roots=state.recursive_package_roots,
         limits=state.budget.limits,
+        code_plan=state.code_plan,
     )
     existing = state.binding_probes.get(probe.key)
     if (
@@ -815,12 +995,14 @@ def _fingerprint_probe_content(
     *,
     recursive_package_roots: frozenset[str],
     limits: DependencyFingerprintLimits,
+    code_plan: _CompiledExecutableCodePlan | None = None,
 ) -> str:
     return fingerprint_dependency_value(
         value,
         contract="executable-dependency-content-probe/v1",
         limits=limits,
         _recursive_package_roots=recursive_package_roots,
+        _code_plan=code_plan,
     )
 
 
@@ -839,6 +1021,7 @@ def _record_function_probe(
                 value.__defaults__,
                 recursive_package_roots=state.recursive_package_roots,
                 limits=state.budget.limits,
+                code_plan=state.code_plan,
             )
             if value.__defaults__ is not None
             else None
@@ -849,6 +1032,7 @@ def _record_function_probe(
                 value.__kwdefaults__,
                 recursive_package_roots=state.recursive_package_roots,
                 limits=state.budget.limits,
+                code_plan=state.code_plan,
             )
             if value.__kwdefaults__ is not None
             else None
@@ -860,6 +1044,7 @@ def _record_function_probe(
                     _closure_cell_value(cell),
                     recursive_package_roots=state.recursive_package_roots,
                     limits=state.budget.limits,
+                    code_plan=state.code_plan,
                 )
                 for cell in closure
             )
@@ -868,6 +1053,7 @@ def _record_function_probe(
         ),
         recursive_package_roots=state.recursive_package_roots,
         limits=state.budget.limits,
+        code_plan=state.code_plan,
     )
     existing = state.function_probes.get(identity)
     if existing is not None and existing.implementation is not value:
@@ -1338,10 +1524,13 @@ def _snapshot_code(
     depth: int,
 ) -> dict[str, object]:
     state.budget.consume(depth=depth, byte_count=len(code.co_code) + len(code.co_exceptiontable))
-    instructions = [
-        {"opname": instruction.opname, "arg": instruction.arg}
-        for instruction in dis.get_instructions(code, adaptive=False, show_caches=False)
-    ]
+    descriptor = None if state.code_plan is None else state.code_plan.lookup(code)
+    instructions = (
+        [{"opname": instruction.opname, "arg": instruction.arg}
+         for instruction in dis.get_instructions(code, adaptive=False, show_caches=False)]
+        if descriptor is None
+        else [{"opname": opname, "arg": argument} for opname, argument in descriptor.instructions]
+    )
     return {
         "argcount": code.co_argcount,
         "posonlyargcount": code.co_posonlyargcount,

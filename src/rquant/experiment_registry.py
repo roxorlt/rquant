@@ -11,7 +11,7 @@ from decimal import Decimal
 from enum import StrEnum
 from pathlib import Path
 from types import TracebackType
-from typing import Annotated, Literal, Self
+from typing import TYPE_CHECKING, Annotated, Literal, Self
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
@@ -38,6 +38,11 @@ FiniteDecimal = Annotated[Decimal, Field(allow_inf_nan=False)]
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 EXPERIMENT_ATTEMPT_PAGE_SIZE_MAX = 100
 EXPERIMENT_SERVING_ATTEMPT_LIMIT = 500
+
+if TYPE_CHECKING:
+    from rquant.strategy_promotion_contracts import SealedFamilyOutcomeReceipt
+    from rquant.strategy_promotion_commands import RunStrategyWalkForward
+    from rquant.strategy_promotion_walk_forward import PromotionWalkForwardPlan
 
 
 class ExperimentStatus(StrEnum):
@@ -852,6 +857,26 @@ class ExperimentRegistryReadonlyReader:
         with self._read_snapshot() as connection:
             row = ExperimentRegistry._required_attempt_row(connection, experiment_id)
             return ExperimentRegistry._attempt_from_row(connection, row)
+
+    def get_submission_intent_for_job(
+        self,
+        job_id: UUID,
+    ) -> ExperimentSubmissionIntent | None:
+        """Read the original prepared ownership without opening its writer."""
+
+        with self._read_snapshot() as connection:
+            row = connection.execute(
+                """
+                SELECT intent_json FROM experiment_submission_outbox
+                WHERE job_id = ?
+                """,
+                (str(job_id),),
+            ).fetchone()
+        return (
+            ExperimentSubmissionIntent.model_validate_json(row["intent_json"])
+            if row is not None
+            else None
+        )
 
     def list_attempts_page(
         self,
@@ -2234,6 +2259,290 @@ class ExperimentRegistry:
                 connection.rollback()
                 raise
         return self.get_attempt(experiment_id)
+
+    def record_sealed_family_outcomes(
+        self, receipt: SealedFamilyOutcomeReceipt, *, recorded_at: datetime
+    ) -> SealedFamilyOutcomeReceipt:
+        """Attach actual validation statistics after original execution completion.
+
+        The internal producer verifies full original sealed readers. This entry
+        preserves execution timing; it is not the RUNNING success API.
+        """
+        from rquant.strategy_promotion_contracts import SealedFamilyOutcomeReceipt
+
+        receipt = SealedFamilyOutcomeReceipt.model_validate(receipt.model_dump(mode="python"))
+        if normalize_aware_utc(recorded_at) != receipt.recorded_at:
+            raise ExperimentIdentityConflictError("original statistical recording time differs")
+        payload = receipt.model_dump_json()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                connection.execute(
+                    "CREATE TABLE IF NOT EXISTS sealed_family_validation_outcome("
+                    "hypothesis_family TEXT PRIMARY KEY, receipt_hash TEXT NOT NULL,"
+                    "recorded_at TEXT NOT NULL, receipt_json TEXT NOT NULL)"
+                )
+                existing = connection.execute(
+                    "SELECT receipt_hash,receipt_json FROM sealed_family_validation_outcome "
+                    "WHERE hypothesis_family=?",
+                    (receipt.manifest.hypothesis_family,),
+                ).fetchone()
+                if existing is not None:
+                    if (existing[0], existing[1]) != (receipt.fingerprint, payload):
+                        raise TerminalExperimentError(
+                            "sealed family statistical receipt is immutable"
+                        )
+                    # Still verify current immutable outcomes and their original completion.
+                manifest = self._required_manifest(connection, receipt.manifest.hypothesis_family)
+                if manifest != receipt.manifest:
+                    raise ExperimentIdentityConflictError("original parent manifest differs")
+                rows = connection.execute(
+                    "SELECT * FROM experiment_attempt WHERE hypothesis_family=?",
+                    (manifest.hypothesis_family,),
+                ).fetchall()
+                if {row["experiment_id"] for row in rows} != set(manifest.experiment_ids):
+                    raise IncompleteHypothesisFamilyError("complete parent attempt set differs")
+                indexed = {row["experiment_id"]: row for row in rows}
+                for item in receipt.attempts:
+                    row = indexed[item.spec.experiment_id]
+                    if (
+                        ExperimentSpec.model_validate_json(row["spec_json"]) != item.spec
+                        or _parse_utc(row["completed_at"]) != item.execution_completed_at
+                    ):
+                        raise ExperimentIdentityConflictError(
+                            "original spec or execution completion differs"
+                        )
+                    status = ExperimentStatus(row["status"])
+                    old = connection.execute(
+                        "SELECT outcome_json FROM experiment_outcome WHERE experiment_id=?",
+                        (item.spec.experiment_id,),
+                    ).fetchone()
+                    if item.outcome is None:
+                        if status != item.original_status or old is not None:
+                            raise TerminalExperimentError(
+                                "original unsuccessful terminal fact differs"
+                            )
+                        continue
+                    outcome_payload = _json_payload(item.outcome)
+                    if status is ExperimentStatus.SUCCEEDED:
+                        if old is None or old[0] != outcome_payload:
+                            raise TerminalExperimentError(
+                                "original successful outcome is immutable"
+                            )
+                        continue
+                    if (
+                        status is not ExperimentStatus.EXECUTED
+                        or item.original_status is not status
+                    ):
+                        raise TerminalExperimentError(
+                            "sealed statistics require original EXECUTED completion"
+                        )
+                    if old is not None or existing is not None:
+                        raise ExperimentIdentityConflictError(
+                            "statistical receipt is partially applied"
+                        )
+                    rank_owner = connection.execute(
+                        "SELECT o.experiment_id FROM experiment_outcome o JOIN experiment_attempt a "
+                        "USING(experiment_id) WHERE a.hypothesis_family=? AND o.selected_rank=?",
+                        (manifest.hypothesis_family, item.outcome.selected_rank),
+                    ).fetchone()
+                    if rank_owner is not None:
+                        raise ExperimentIdentityConflictError("original family rank conflicts")
+                    connection.execute(
+                        "INSERT INTO experiment_outcome(experiment_id,outcome_json,"
+                        "attempted_configuration_count,selected_rank,raw_p_value) VALUES(?,?,?,?,?)",
+                        (
+                            item.spec.experiment_id,
+                            outcome_payload,
+                            manifest.hypothesis_count,
+                            item.outcome.selected_rank,
+                            format(item.outcome.raw_p_value, "f"),
+                        ),
+                    )
+                    connection.execute(
+                        "UPDATE experiment_attempt SET status=? WHERE experiment_id=? AND status=?",
+                        (
+                            ExperimentStatus.SUCCEEDED.value,
+                            item.spec.experiment_id,
+                            ExperimentStatus.EXECUTED.value,
+                        ),
+                    )
+                if existing is None:
+                    connection.execute(
+                        "INSERT INTO sealed_family_validation_outcome VALUES(?,?,?,?)",
+                        (
+                            manifest.hypothesis_family,
+                            receipt.fingerprint,
+                            _utc_iso(receipt.recorded_at),
+                            payload,
+                        ),
+                    )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+        return receipt
+
+    def sealed_family_outcome_receipt(
+        self, hypothesis_family: str
+    ) -> SealedFamilyOutcomeReceipt | None:
+        from rquant.strategy_promotion_contracts import SealedFamilyOutcomeReceipt
+
+        with self._connect() as connection:
+            if (
+                connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sealed_family_validation_outcome'"
+                ).fetchone()
+                is None
+            ):
+                return None
+            row = connection.execute(
+                "SELECT receipt_hash,recorded_at,receipt_json FROM sealed_family_validation_outcome WHERE hypothesis_family=?",
+                (hypothesis_family,),
+            ).fetchone()
+            if row is None:
+                return None
+            value = SealedFamilyOutcomeReceipt.model_validate_json(row[2])
+            if (
+                value.manifest.hypothesis_family,
+                value.fingerprint,
+                _utc_iso(value.recorded_at),
+            ) != (hypothesis_family, row[0], row[1]):
+                raise ExperimentIdentityConflictError("sealed family attached receipt was replaced")
+            return value
+
+    def walk_forward_plan(
+        self, request: RunStrategyWalkForward, *, actor_id: str
+    ) -> PromotionWalkForwardPlan | None:
+        from rquant.strategy_promotion_walk_forward import PromotionWalkForwardPlan
+        from pydantic import TypeAdapter
+
+        with self._connect() as connection:
+            if (
+                connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='strategy_walk_forward_plan'"
+                ).fetchone()
+                is None
+            ):
+                return None
+            row = connection.execute(
+                "SELECT actor_id,request_hash,plan_hash,plan_json FROM strategy_walk_forward_plan WHERE request_id=?",
+                (request.command_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            if row[0] != actor_id:
+                raise PermissionError("original WF request belongs to another actor")
+            if row[1] != request.request_hash:
+                raise ExperimentIdentityConflictError("original WF request body conflicts")
+            plan = TypeAdapter(PromotionWalkForwardPlan).validate_json(row[3])
+            if (plan.request, plan.request.target.owner_id, plan.fingerprint) != (
+                request,
+                actor_id,
+                row[2],
+            ):
+                raise ExperimentIdentityConflictError("original WF reference plan was replaced")
+            return plan
+
+    def walk_forward_plan_by_id(
+        self, request_id: UUID, *, actor_id: str
+    ) -> PromotionWalkForwardPlan | None:
+        from rquant.strategy_promotion_walk_forward import PromotionWalkForwardPlan
+        from pydantic import TypeAdapter
+
+        with self._connect() as connection:
+            if (
+                connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='strategy_walk_forward_plan'"
+                ).fetchone()
+                is None
+            ):
+                return None
+            row = connection.execute(
+                "SELECT actor_id,request_hash,plan_hash,plan_json FROM strategy_walk_forward_plan WHERE request_id=?",
+                (str(request_id),),
+            ).fetchone()
+            if row is None:
+                return None
+            if row[0] != actor_id:
+                raise PermissionError("WF evidence belongs to another actor")
+            plan = TypeAdapter(PromotionWalkForwardPlan).validate_json(row[3])
+            if (
+                plan.request.command_id,
+                plan.request.target.owner_id,
+                plan.request.request_hash,
+                plan.fingerprint,
+            ) != (str(request_id), actor_id, row[1], row[2]):
+                raise ExperimentIdentityConflictError(
+                    "WF original reference body or index was replaced"
+                )
+            return plan
+
+    def walk_forward_plans_for_strategy(self, strategy_id: str, *, actor_id: str) -> tuple[PromotionWalkForwardPlan, ...]:
+        with self._connect() as connection:
+            if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='strategy_walk_forward_plan'").fetchone() is None:
+                return ()
+            rows = connection.execute("SELECT request_id FROM strategy_walk_forward_plan WHERE actor_id=? AND json_extract(plan_json,'$.request.target.strategy_id')=? ORDER BY request_id LIMIT 65", (actor_id, strategy_id)).fetchall()
+        if len(rows) > 64:
+            raise ExperimentRegistryError("original strategy WF references exceed read capacity")
+        plans = tuple(self.walk_forward_plan_by_id(UUID(row[0]), actor_id=actor_id) for row in rows)
+        if any(plan is None or plan.request.target.strategy_id != strategy_id for plan in plans):
+            raise ExperimentIdentityConflictError("original WF strategy reference changed")
+        return plans
+
+    def record_walk_forward_plan(
+        self, plan: PromotionWalkForwardPlan, *, actor_id: str
+    ) -> PromotionWalkForwardPlan:
+        from rquant.strategy_promotion_walk_forward import PromotionWalkForwardPlan
+        from pydantic import TypeAdapter
+
+        plan = TypeAdapter(PromotionWalkForwardPlan).validate_python(plan.model_dump(mode="python"))
+        if plan.request.target.owner_id != actor_id:
+            raise PermissionError("WF target belongs to another actor")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                connection.execute(
+                    "CREATE TABLE IF NOT EXISTS strategy_walk_forward_plan(request_id TEXT PRIMARY KEY,actor_id TEXT NOT NULL,request_hash TEXT NOT NULL,plan_hash TEXT NOT NULL,plan_json TEXT NOT NULL)"
+                )
+                row = connection.execute(
+                    "SELECT actor_id,request_hash,plan_hash,plan_json FROM strategy_walk_forward_plan WHERE request_id=?",
+                    (plan.request.command_id,),
+                ).fetchone()
+                if row is not None:
+                    if row[0] != actor_id:
+                        raise PermissionError("original WF request belongs to another actor")
+                    if tuple(row[1:]) != (
+                        plan.request.request_hash,
+                        plan.fingerprint,
+                        plan.model_dump_json(),
+                    ):
+                        raise ExperimentIdentityConflictError(
+                            "original WF reference plan is immutable and conflicts"
+                        )
+                else:
+                    if (
+                        connection.execute(
+                            "SELECT COUNT(*) FROM strategy_walk_forward_plan"
+                        ).fetchone()[0]
+                        >= 4096
+                    ):
+                        raise ExperimentRegistryError("WF reference capacity reached")
+                    connection.execute(
+                        "INSERT INTO strategy_walk_forward_plan VALUES(?,?,?,?,?)",
+                        (
+                            plan.request.command_id,
+                            actor_id,
+                            plan.request.request_hash,
+                            plan.fingerprint,
+                            plan.model_dump_json(),
+                        ),
+                    )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+        return plan
 
     def record_failure(
         self,

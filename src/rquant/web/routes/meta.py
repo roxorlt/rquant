@@ -17,7 +17,8 @@ from rquant.web.envelope import Envelope
 from rquant.web.labels import dataset_label
 from rquant.web.market import PHASE_LABELS, MarketPhase, market_phase, shanghai_trade_date
 from rquant.web.models.common import StatusInfo
-from rquant.web.security import current_user
+from rquant.web.security import current_user, collaboration_me
+from rquant.web.models.collaboration import CollaborationMe
 from rquant.web.serving import BorrowedGeneration, serving_meta
 from rquant.web.status import watermark_status
 
@@ -84,6 +85,7 @@ class MetaData(BaseModel):
     datasets: list[DatasetWatermarkInfo]
     projections: list[ProjectionInfo]
     market: MarketInfo
+    collaboration: CollaborationMe | None = None
 
 
 def _utc(value: Any) -> datetime | None:
@@ -186,6 +188,8 @@ def get_meta(
     now = context.clock()
     with context.tracker.borrow() as borrowed:
         data = build_meta(borrowed, now=now, viewer=viewer)
+        if viewer is not None:
+            data = data.model_copy(update={"collaboration": collaboration_me(request, viewer)})
         meta = serving_meta(
             borrowed,
             now=now,

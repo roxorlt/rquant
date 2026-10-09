@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import json
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import ModuleType
@@ -20,6 +21,8 @@ from rquant.serving_read_models import ServingProjectionPayload
 from tests.unit.test_task_cpu import NOW, SLICES, _observation
 
 if TYPE_CHECKING:
+    from rquant.lab_scheduling_control import LabSchedulingControlState
+    from rquant.runtime_serving_snapshot import SourceReadResult
     from rquant.task_center_projection import TaskOpsSample
 
 
@@ -409,3 +412,124 @@ def test_tsc_12_original_ops_tables_must_share_their_full_owner_generation_and_c
                 memory.execute("UPDATE projection_status SET owner_dataset_id='ops_status',owner_generation_id=? WHERE table_name='ops_unit_status'", (mark.generation_id,))
         finally:
             memory.close()
+
+
+def _scheduler_wire_source(
+    tmp_path: Path, *, resume: bool = False
+) -> tuple[SourceReadResult, LabSchedulingControlState]:
+    from rquant.lab_jobs import LabJobReader
+    from rquant.lab_jobs_serving_authority import LabJobsServingSourceReader
+    from tests.unit.test_lab_scheduling_control import NOW as CONTROL_NOW, command, store_and_port
+
+    store, port = store_and_port(tmp_path)
+    lease = store.acquire_scheduler_lease(owner_id="scheduler-wire", lease_seconds=120, now=CONTROL_NOW)
+    store.enable_scheduling_control(lease=lease, barrier_port=port, now=CONTROL_NOW)
+    port.apply_command(command(store, paused=True, expected_version=0), lease=lease, now=CONTROL_NOW + timedelta(seconds=1))
+    state = port.reconcile(lease=lease, now=CONTROL_NOW + timedelta(seconds=2))
+    if resume:
+        port.apply_command(command(store, paused=False, expected_version=1), lease=lease, now=CONTROL_NOW + timedelta(seconds=3))
+        state = port.reconcile(lease=lease, now=CONTROL_NOW + timedelta(seconds=4))
+    source = LabJobsServingSourceReader(reader=LabJobReader(store.path))(CONTROL_NOW + timedelta(seconds=5))
+    return source, state
+
+
+@pytest.mark.parametrize("resume", [False, True], ids=["paused", "resumed"])
+def test_original_scheduler_state_roundtrips_through_frozen_lab_wire(tmp_path: Path, resume: bool) -> None:
+    from rquant.runtime_serving_snapshot import SourceReadResult
+
+    source, state = _scheduler_wire_source(tmp_path, resume=resume)
+    body = json.loads(source.model_dump_json())
+    assert set(body["payload"]) == {"payload_kind", "lab_jobs", "projections"}
+    restored = SourceReadResult.model_validate_json(source.model_dump_json())
+    assert restored == source
+    assert restored.payload.scheduling_control == state
+    assert state.request_id is not None
+    assert state.applied_paused is not resume
+
+
+def test_scheduler_state_is_read_from_the_complete_original_projection_only(tmp_path: Path) -> None:
+    from rquant.runtime_serving_snapshot import LabJobsPayload
+
+    source, state = _scheduler_wire_source(tmp_path)
+    control = next(table for table in source.payload.projections if table.table_name == "lab_scheduler_control")
+    payload = LabJobsPayload(projections=(control,))
+    assert payload.scheduling_control == state
+    restored = LabJobsPayload.model_validate_json(payload.model_dump_json())
+    assert restored.scheduling_control == state
+
+
+def test_legacy_lab_payload_keeps_its_three_fields_and_no_scheduler_state() -> None:
+    from rquant.runtime_serving_snapshot import LabJobsPayload
+
+    payload = LabJobsPayload()
+    assert set(LabJobsPayload.model_fields) == {"payload_kind", "lab_jobs", "projections"}
+    assert set(payload.model_dump(mode="json")) == {"payload_kind", "lab_jobs", "projections"}
+    assert payload.scheduling_control is None
+    assert LabJobsPayload.model_validate_json(payload.model_dump_json()) == payload
+
+
+@pytest.mark.parametrize("damage", [
+    "duplicate_table", "empty_rows", "extra_row", "bad_json", "noncanonical_json",
+    "control_key", "material_hash", "observed_at", "future_state",
+])
+def test_lab_scheduler_wire_rejects_incomplete_or_changed_projection(tmp_path: Path, damage: str) -> None:
+    from rquant.runtime_serving_snapshot import LabJobsPayload
+
+    source, state = _scheduler_wire_source(tmp_path)
+    control = next(table for table in source.payload.projections if table.table_name == "lab_scheduler_control")
+    wire = control.model_dump(mode="json")
+    row = wire["rows"][0]
+    projections = [wire]
+    if damage == "duplicate_table":
+        projections.append(control.model_dump(mode="json"))
+    elif damage == "empty_rows":
+        wire["rows"] = []
+    elif damage == "extra_row":
+        wire["rows"].append(dict(row) | {"control_key": "other"})
+    elif damage == "bad_json":
+        row["state_json"] = "{"
+    elif damage == "noncanonical_json":
+        row["state_json"] = json.dumps(json.loads(row["state_json"]), indent=1)
+    elif damage == "control_key":
+        row["control_key"] = "other"
+    elif damage == "material_hash":
+        row["material_hash"] = "0" * 64
+    elif damage == "observed_at":
+        row["observed_at"] = (state.observed_at - timedelta(microseconds=1)).isoformat()
+    elif damage == "future_state":
+        future = type(state).model_validate(state.model_dump() | {"observed_at": control.available_at + timedelta(seconds=1)})
+        row["state_json"] = future.model_dump_json()
+        row["material_hash"] = future.state_hash
+    with pytest.raises(ValueError):
+        LabJobsPayload.model_validate({"projections": projections})
+
+
+def test_complete_scheduler_wire_is_read_from_the_original_serving_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rquant.serving_read_models import ServingProjectionInput
+    from rquant.task_control_admission import TaskCenterServingSource
+    from tests.support import web_serving_fixture as fixture
+
+    original_root = tmp_path / "original-scheduler"
+    original_root.mkdir(mode=0o700)
+    source, state = _scheduler_wire_source(original_root)
+    control = next(table for table in source.payload.projections if table.table_name == "lab_scheduler_control")
+    original = fixture._projections
+
+    def with_control(*args: object, **kwargs: object) -> tuple[ServingProjectionInput, ...]:
+        return original(*args, **kwargs) + (
+            ServingProjectionInput.bind(
+                control,
+                owner_dataset_id="lab_jobs",
+                owner_generation_id=kwargs["generations"]["lab_jobs"],
+            ),
+        )
+
+    monkeypatch.setattr(fixture, "_projections", with_control)
+    root = tmp_path / "serving"
+    root.mkdir(mode=0o700)
+    generation = _publish_task_center(root, monkeypatch)
+    view = TaskCenterServingSource(root, clock=lambda: NOW + timedelta(seconds=42)).read(generation_id=generation)
+    assert view.generation_id == generation
+    assert view.scheduling_control == state

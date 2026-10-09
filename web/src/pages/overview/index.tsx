@@ -6,7 +6,8 @@ import {
   type SignalItem,
   useOverview,
 } from "@/api/endpoints";
-import { useCurrentGeneration } from "@/api/useMeta";
+import { useCurrentGeneration, useCurrentMeta } from "@/api/useMeta";
+import { StockNewsDigest } from "@/app/StockNewsDigest";
 import { toneClass, toneOf } from "@/format/color";
 import { EMPTY, formatCount, formatNumber, formatPrice, formatSignedNumber } from "@/format/number";
 import { formatShanghaiTime, formatTradeDate } from "@/format/time";
@@ -393,9 +394,40 @@ function Holdings({ data }: { data: OverviewData }) {
   );
 }
 
+function CandidateNews({ data, viewer }: { data: OverviewData; viewer: string | null }) {
+  const [selected, setSelected] = useState<string | null>(null);
+  const stocks = [...new Map(data.candidates.items.map((item) => [item.code, item])).values()];
+  const code = stocks.some((item) => item.code === selected) ? selected : null;
+  return (
+    <Panel title="研究摘要">
+      <label className="field">
+        <span className="lbl">选择候选股票</span>
+        <select
+          className="inp"
+          value={code ?? ""}
+          onChange={(event) => setSelected(event.target.value || null)}
+        >
+          <option value="">先选择一只股票</option>
+          {stocks.map((stock) => (
+            <option key={stock.code} value={stock.code}>
+              {stock.name ?? stock.code} · {stock.code}
+            </option>
+          ))}
+        </select>
+      </label>
+      {stocks.length ? (
+        <StockNewsDigest viewer={viewer} stockCode={code} />
+      ) : (
+        <EmptyState title="还没有候选股票" hint="候选出现后，可在这里核对公告、新闻和研报原文。" />
+      )}
+    </Panel>
+  );
+}
+
 export default function OverviewPage() {
   const { data, serving, isLoading, isFetching, error, refetch } = useOverview();
   const currentGeneration = useCurrentGeneration();
+  const viewer = useCurrentMeta().data?.data.viewer ?? null;
   const oldGeneration =
     currentGeneration !== undefined && serving?.generation_id !== currentGeneration;
   const refresh = (
@@ -448,6 +480,7 @@ export default function OverviewPage() {
         <Candidates data={data} />
         <Holdings data={data} />
       </div>
+      <CandidateNews key={`${viewer}:${serving?.generation_id}`} data={data} viewer={viewer} />
     </>
   );
 }

@@ -36,6 +36,14 @@ from rquant.lab_jobs import LabJobSummary
 from rquant.paper_contracts import PaperAccountSnapshot
 from rquant.paper_portfolio_projection_contract import PAPER_PORTFOLIO_PROJECTION_LAYOUTS
 from rquant.runtime_contracts import AwareUtcDatetime, RuntimeContractModel, canonical_sha256
+from rquant.runtime_health_details import (
+    RuntimeHealthOwnerProjection,
+    RuntimeHealthServiceView,
+    RuntimeHealthValidatedDetails,
+    RuntimeHealthValidatedServiceDetail,
+    runtime_health_graph_from_projections,
+    validate_runtime_health_detail_graph,
+)
 from rquant.runtime_service_control import RuntimeServiceHealth
 from rquant.screen.ranking import RankingCondition, rank_screen_results
 from rquant.serving_publisher import (
@@ -51,6 +59,7 @@ from rquant.signal_contracts import (
     parse_signal_envelope,
 )
 from rquant.strategy_authoring_projection_contract import STRATEGY_TEMPLATE_PROJECTION_LAYOUTS
+from rquant.strategy_promotion_projection_contract import STRATEGY_PROMOTION_PROJECTION_LAYOUTS
 from rquant.strict_json import canonical_json_bytes, strict_canonical_json_loads
 from rquant.task_center_projection import CPU_COLUMNS, RUN_COLUMNS, SCHEDULING_COLUMNS
 
@@ -170,6 +179,92 @@ def _contract(
 
 PAGE_PROJECTION_CONTRACTS: Mapping[str, ServingProjectionContract] = MappingProxyType(
     {
+        "notification_runtime_state": _contract("signals",
+            (("owner_id", "string"), ("channel", "string"), ("body_json", "string")),
+            ("owner_id", "channel"), max_rows=64, max_bytes=64 * 1024),
+        "notification_runtime_delivery": _contract("signals",
+            (("group_id", "string"), ("owner_id", "string"), ("channel", "string"), ("body_json", "string")),
+            ("group_id",), max_rows=512, max_bytes=256 * 1024),
+        "monitor_builtin_state": _contract("signals",
+            (("owner_id", "string"), ("builtin_id", "string"), ("body_json", "string")),
+            ("owner_id", "builtin_id"), max_rows=160, max_bytes=64 * 1024),
+        "monitor_builtin_event": _contract("signals",
+            (("event_id", "string"), ("sequence", "int"), ("owner_id", "string"), ("builtin_id", "string"), ("body_json", "string")),
+            ("event_id",), max_rows=1000, max_bytes=512 * 1024),
+        "collaboration_role": _contract(
+            "lab_jobs",
+            (("username", "string"), ("role", "string"), ("ordinal", "int"), ("revision", "int"), ("state_sha256", "string")),
+            ("username",), max_rows=256, max_bytes=64 * 1024,
+        ),
+        "command_audit_window": _contract(
+            "lab_jobs",
+            (("window_key", "string"), ("source_generation", "string"), ("journal_identity", "string"),
+             ("role_revision", "int"), ("role_state_sha256", "string"),
+             ("row_count", "int"), ("has_more", "bool")),
+            ("window_key",), max_rows=1, max_bytes=4096,
+        ),
+        "command_audit": _contract(
+            "lab_jobs",
+            (("command_id", "string"), ("command_kind", "string"), ("command_hash", "string"),
+             ("actor_id", "string"), ("actor_label", "string"), ("command_status", "string"),
+             ("effect_status", "string"), ("enqueued_at", "timestamp"), ("completed_at", "timestamp"),
+             ("effect_started_at", "timestamp"), ("effect_completed_at", "timestamp"),
+             ("outcome", "string"), ("summary", "string")),
+            ("command_id",), max_rows=512, max_bytes=1024 * 1024,
+            event_time_columns=("enqueued_at", "completed_at", "effect_started_at", "effect_completed_at"),
+        ),
+        "sealed_result_owner": _contract(
+            "lab_jobs",
+            (("domain", "string"), ("job_id", "string"), ("spec_hash", "string"), ("owner_id", "string"),
+             ("command_id", "string"), ("command_sha256", "string"), ("effect_sha256", "string"),
+             ("worker_owner_id", "string"), ("manifest_sha256", "string"),
+             ("complete_result_sha256", "string")),
+            ("domain", "job_id"), max_rows=256, max_bytes=512 * 1024,
+        ),
+        "ai_news_digest": _contract(
+            "signals",
+            (
+                ("owner_uid", "string"),
+                ("stock_code", "string"),
+                ("model_id", "string"),
+                ("template_version", "string"),
+                ("context_sha256", "string"),
+                ("content_sha256", "string"),
+                ("payload_json", "string"),
+                ("collected_at", "timestamp"),
+            ),
+            ("owner_uid", "stock_code", "model_id", "template_version"),
+            max_rows=8192,
+            max_bytes=4 * 1024 * 1024,
+            event_time_columns=("collected_at",),
+        ),
+        "ai_interpretation": _contract(
+            "signals",
+            (
+                ("owner_uid", "string"),
+                ("job_id", "string"),
+                ("cache_key", "string"),
+                ("source_kind", "string"),
+                ("result_sha256", "string"),
+                ("payload_json", "string"),
+            ),
+            ("owner_uid", "cache_key"),
+            max_rows=256,
+            max_bytes=1024 * 1024,
+        ),
+        "ai_usage_day": _contract(
+            "signals",
+            (
+                ("owner_uid", "string"),
+                ("account_id", "string"),
+                ("day", "date"),
+                ("payload_json", "string"),
+            ),
+            ("owner_uid", "account_id", "day"),
+            max_rows=8192,
+            max_bytes=1024 * 1024,
+            event_date_columns=("day",),
+        ),
         "experiment_private_attempt": _contract(
             "promotions",
             (
@@ -206,8 +301,26 @@ PAGE_PROJECTION_CONTRACTS: Mapping[str, ServingProjectionContract] = MappingProx
             event_time_columns=("oldest_registered_at",),
         ),
         **{
-            name: _contract("paper_accounts", columns, keys, max_rows=max_rows, max_bytes=max_bytes, event_time_columns=times)
-            for name, (columns, keys, max_rows, max_bytes, times) in PAPER_PORTFOLIO_PROJECTION_LAYOUTS.items()
+            name: _contract("promotions",columns,keys,max_rows=max_rows,max_bytes=max_bytes,
+                event_time_columns=times)
+            for name,(columns,keys,max_rows,max_bytes,times) in STRATEGY_PROMOTION_PROJECTION_LAYOUTS.items()
+        },
+        **{
+            name: _contract(
+                "paper_accounts",
+                columns,
+                keys,
+                max_rows=max_rows,
+                max_bytes=max_bytes,
+                event_time_columns=times,
+            )
+            for name, (
+                columns,
+                keys,
+                max_rows,
+                max_bytes,
+                times,
+            ) in PAPER_PORTFOLIO_PROJECTION_LAYOUTS.items()
         },
         **{
             name: _contract(
@@ -436,16 +549,57 @@ PAGE_PROJECTION_CONTRACTS: Mapping[str, ServingProjectionContract] = MappingProx
             max_bytes=8 * 1024,
         ),
         "ops_task_cpu": _contract(
-            "ops_status", CPU_COLUMNS, ("slice_name",), max_rows=5,
-            max_bytes=32 * 1024, event_time_columns=("observed_at",),
+            "ops_status",
+            CPU_COLUMNS,
+            ("slice_name",),
+            max_rows=5,
+            max_bytes=32 * 1024,
+            event_time_columns=("observed_at",),
         ),
         "ops_task_runs": _contract(
-            "ops_status", RUN_COLUMNS, ("service",), max_rows=32,
-            max_bytes=64 * 1024, event_time_columns=("started_at", "ended_at", "observed_at"),
+            "ops_status",
+            RUN_COLUMNS,
+            ("service",),
+            max_rows=32,
+            max_bytes=64 * 1024,
+            event_time_columns=("started_at", "ended_at", "observed_at"),
         ),
         "lab_scheduler_control": _contract(
-            "lab_jobs", SCHEDULING_COLUMNS, ("control_key",), max_rows=1,
-            max_bytes=16 * 1024, event_time_columns=("observed_at",),
+            "lab_jobs",
+            SCHEDULING_COLUMNS,
+            ("control_key",),
+            max_rows=1,
+            max_bytes=16 * 1024,
+            event_time_columns=("observed_at",),
+        ),
+        "runtime_health_detail_context": _contract(
+            "runtime_health",
+            (
+                ("host_name", "string"),
+                ("boot_id", "string"),
+                ("sampled_at", "timestamp"),
+                ("context_source_identity", "string"),
+                ("ops_source_generation_id", "string"),
+                ("observed_at", "timestamp"),
+            ),
+            ("host_name",),
+            max_rows=1,
+            max_bytes=4 * 1024,
+            event_time_columns=("sampled_at", "observed_at"),
+        ),
+        "runtime_service_detail": _contract(
+            "runtime_health",
+            (
+                ("service_id", "string"),
+                ("source_receipt", "string"),
+                ("source_material_json", "string"),
+                ("context_source_identity", "string"),
+                ("observed_at", "timestamp"),
+            ),
+            ("service_id",),
+            max_rows=500,
+            max_bytes=7 * 1024 * 1024,
+            event_time_columns=("observed_at",),
         ),
         "dashboard_summary": _contract(
             "runtime_health",
@@ -1299,17 +1453,62 @@ PAGE_PROJECTION_CONTRACTS: Mapping[str, ServingProjectionContract] = MappingProx
             max_rows=256,
             max_bytes=128 * 1024,
         ),
-        "data_center_execution": _contract("lab_jobs",(("execution_id","string"),("owner","string"),("status_json","string")),
-            ("execution_id",),max_rows=50,max_bytes=416*1024),
-        "data_center_execution_event": _contract("lab_jobs",(("event_id","string"),("execution_id","string"),("owner","string"),
-            ("event_type","string"),("occurred_at","timestamp"),("task_id","string"),("task_status","string"),
-            ("attempts","int"),("control_sequence","int"),("failure_code","string")),("event_id",),max_rows=20,max_bytes=32*1024,
-            event_time_columns=("occurred_at",)),
-        "data_center_execution_state": _contract("lab_jobs",(("configured","bool"),("backfill_enabled","bool"),
-            ("financial_enabled","bool"),("may_start","bool"),("observed_at","timestamp")),("observed_at",),max_rows=1,max_bytes=1024),
-        "data_center_financial_source": _contract("lab_jobs",(("api_name","string"),("permission_status","string"),
-            ("evidence_source","string"),("scope_start","string"),("scope_end","string"),("expires_at","string"),
-            ("remaining_units","int"),("total_units","int"),("resets_at","string")),("api_name",),max_rows=7,max_bytes=32*1024),
+        "data_center_execution": _contract(
+            "lab_jobs",
+            (("execution_id", "string"), ("owner", "string"), ("status_json", "string")),
+            ("execution_id",),
+            max_rows=50,
+            max_bytes=416 * 1024,
+        ),
+        "data_center_execution_event": _contract(
+            "lab_jobs",
+            (
+                ("event_id", "string"),
+                ("execution_id", "string"),
+                ("owner", "string"),
+                ("event_type", "string"),
+                ("occurred_at", "timestamp"),
+                ("task_id", "string"),
+                ("task_status", "string"),
+                ("attempts", "int"),
+                ("control_sequence", "int"),
+                ("failure_code", "string"),
+            ),
+            ("event_id",),
+            max_rows=20,
+            max_bytes=32 * 1024,
+            event_time_columns=("occurred_at",),
+        ),
+        "data_center_execution_state": _contract(
+            "lab_jobs",
+            (
+                ("configured", "bool"),
+                ("backfill_enabled", "bool"),
+                ("financial_enabled", "bool"),
+                ("may_start", "bool"),
+                ("observed_at", "timestamp"),
+            ),
+            ("observed_at",),
+            max_rows=1,
+            max_bytes=1024,
+        ),
+        "data_center_financial_source": _contract(
+            "lab_jobs",
+            (
+                ("api_name", "string"),
+                ("permission_status", "string"),
+                ("evidence_source", "string"),
+                ("scope_start", "string"),
+                ("scope_end", "string"),
+                ("expires_at", "string"),
+                ("remaining_units", "int"),
+                ("total_units", "int"),
+                ("resets_at", "string"),
+            ),
+            ("api_name",),
+            max_rows=7,
+            max_bytes=32 * 1024,
+        ),
         "audit_report_overview": _contract(
             "lab_jobs",
             (
@@ -1409,8 +1608,15 @@ PAGE_PROJECTION_CONTRACTS: Mapping[str, ServingProjectionContract] = MappingProx
         ),
         "data_collection_dataset": _contract(
             "lab_jobs",
-            (("report_hash","string"),("dataset_id","string"),("source_binding_sha256","string"),("evidence_json","string")),
-            ("report_hash","dataset_id"),max_rows=24,max_bytes=192*1024,
+            (
+                ("report_hash", "string"),
+                ("dataset_id", "string"),
+                ("source_binding_sha256", "string"),
+                ("evidence_json", "string"),
+            ),
+            ("report_hash", "dataset_id"),
+            max_rows=24,
+            max_bytes=192 * 1024,
         ),
         "audit_report_job": _contract(
             "lab_jobs",
@@ -2030,6 +2236,55 @@ class ServingOwnerProjectionCapacityError(ValueError):
         )
 
 
+def validate_collaboration_projections(
+    projections: Mapping[str, ServingProjectionPayload],
+) -> None:
+    from rquant.collaboration_roles import RoleEntry, RoleState
+    from rquant.command_audit_projection import CommandAuditItem, CommandAuditSourceWindow
+    from rquant.web.models.collaboration import ResultOwnerProof
+
+    required = {"collaboration_role", "command_audit", "command_audit_window"}
+    present = required.intersection(projections)
+    if not present:
+        if "sealed_result_owner" in projections:
+            raise ValueError("sealed owner projection lacks original role and audit graph")
+        return
+    if present != required:
+        raise ValueError("collaboration projection is partial")
+    role_rows = tuple(sorted(projections["collaboration_role"].rows, key=lambda row: row["ordinal"]))
+    if not role_rows or tuple(row["ordinal"] for row in role_rows) != tuple(range(len(role_rows))):
+        raise ValueError("original role order is incomplete")
+    revision = role_rows[0]["revision"]
+    state = RoleState.create(revision=revision, users=tuple(
+        RoleEntry(username=row["username"], role=row["role"]) for row in role_rows))
+    if any(row["revision"] != revision or row["state_sha256"] != state.content_sha256 for row in role_rows):
+        raise ValueError("original role projection state differs")
+    window_rows = projections["command_audit_window"].rows
+    if len(window_rows) != 1:
+        raise ValueError("original audit window is unavailable")
+    window = window_rows[0]
+    rows = projections["command_audit"].rows
+    items = tuple(CommandAuditItem.model_validate_json(json.dumps(dict(row))) for row in rows)
+    source = CommandAuditSourceWindow(items=tuple(sorted(items,
+        key=lambda item: (item.enqueued_at, item.command_id), reverse=True)), has_more=window["has_more"])
+    if (window["window_key"] != "current" or window["row_count"] != len(items)
+            or window["role_revision"] != revision or window["role_state_sha256"] != state.content_sha256
+            or TypeAdapter(GenerationId).validate_python(window["journal_identity"]) != window["journal_identity"]
+            or canonical_sha256({"journal_identity": window["journal_identity"],
+                "role_state_sha256": state.content_sha256, "window": source}) != window["source_generation"]):
+        raise ValueError("original audit window and role state differ")
+    owners = projections.get("sealed_result_owner")
+    if owners is not None:
+        users = {entry.username for entry in state.users}
+        for row in owners.rows:
+            proof = ResultOwnerProof.model_validate_json(json.dumps({key: value for key, value in row.items()
+                if key not in {"manifest_sha256", "complete_result_sha256"}}))
+            if proof.owner_id not in users:
+                raise ValueError("sealed owner has no current registered role")
+            for key in ("manifest_sha256", "complete_result_sha256"):
+                TypeAdapter(GenerationId).validate_python(row[key])
+
+
 def require_projection_owner_budget(projections: tuple[ServingProjectionInput, ...]) -> None:
     owner_sizes: dict[str, int] = {}
     for projection in projections:
@@ -2056,6 +2311,7 @@ def require_projection_owner_budget(projections: tuple[ServingProjectionInput, .
     )
     if oversized:
         raise ServingOwnerProjectionCapacityError(oversized)
+
 
 class ServingSignalRecord(RuntimeContractModel):
     global_sequence: int = Field(ge=1)
@@ -2091,6 +2347,20 @@ class ServingLabJobRecord(RuntimeContractModel):
         return self
 
 
+def _health_view_cells(
+    item: RuntimeHealthValidatedServiceDetail, detail: RuntimeHealthValidatedDetails
+) -> dict[str, str | None]:
+    view = RuntimeHealthServiceView.from_verified(item, detail.context)
+    heartbeat = item.heartbeat
+    return {
+        "observations_json": None
+        if view.observations is None
+        else canonical_json_bytes(dict(view.observations)).decode(),
+        "degraded_detail": None if heartbeat is None else heartbeat.degraded_detail,
+        "detail_json": canonical_json_bytes(view.model_dump(mode="json")).decode(),
+    }
+
+
 class ServingReadModelInput(RuntimeContractModel):
     observed_at: AwareUtcDatetime
     signals: tuple[ServingSignalRecord, ...] = ()
@@ -2098,12 +2368,58 @@ class ServingReadModelInput(RuntimeContractModel):
     deliveries: tuple[OutboxRecord, ...] = ()
     paper_accounts: tuple[PaperAccountSnapshot, ...] = ()
     runtime_services: tuple[RuntimeServiceHealth, ...] = ()
+    runtime_health_details: RuntimeHealthValidatedDetails | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     lab_jobs: tuple[ServingLabJobRecord, ...] = ()
     promotions: tuple[PromotionDecision, ...] = ()
     projections: tuple[ServingProjectionInput, ...] = ()
 
     @model_validator(mode="after")
     def validate_snapshot(self) -> ServingReadModelInput:
+        validate_collaboration_projections({p.table_name: p for p in self.projections})
+        health_projections = tuple(
+            p for p in self.projections if p.owner_dataset_id == "runtime_health"
+        )
+        detail = self.runtime_health_details
+        has_details = any(
+            p.table_name in {"runtime_service_detail", "runtime_health_detail_context"}
+            for p in health_projections
+        )
+        if has_details != (detail is not None):
+            raise ValueError("present health extension requires its verified complete graph")
+        if detail is not None:
+            graph = runtime_health_graph_from_projections(
+                health_projections, owner_generation_id=detail.owner_generation_id
+            )
+            receipts = {item.service_id: item.source_receipt for item in detail.services}
+            checked = validate_runtime_health_detail_graph(
+                graph,
+                legacy_services=self.runtime_services,
+                source_receipts=receipts,
+                context=detail.context,
+                owner_generation_id=detail.owner_generation_id,
+                observed_at=detail.observed_at,
+                existing_projections=tuple(
+                    RuntimeHealthOwnerProjection(**p.model_dump(mode="python"))
+                    for p in health_projections
+                    if p.table_name
+                    not in {"runtime_health_detail_context", "runtime_service_detail"}
+                ),
+            )
+            if checked != detail or detail.observed_at > self.observed_at:
+                raise ValueError("health verified view differs from original bound material")
+            health_bytes = sum(_projection_json_bytes(p) for p in health_projections)
+            for item in detail.services:
+                cells = _health_view_cells(item, detail)
+                if any(
+                    _projection_json_bytes(cell) > _MAX_PROJECTION_CELL_BYTES
+                    for cell in cells.values()
+                ):
+                    raise ValueError("health view exceeds its original 64 KiB cell budget")
+                health_bytes += _projection_json_bytes({"service_id": item.service_id, **cells})
+            if health_bytes > _MAX_OWNER_PROJECTION_BYTES:
+                raise ValueError("health projections and views exceed the original 7 MiB budget")
         self._require_unique(
             (record.global_sequence for record in self.signals),
             "signal global_sequence",
@@ -2204,10 +2520,12 @@ class ServingReadModelInput(RuntimeContractModel):
         from rquant.condition_alert_runtime_projection import (
             validate_condition_rule_projections,
             validate_condition_runtime_projections,
+            validate_monitor_runtime_projections,
         )
 
         validate_condition_rule_projections({p.table_name: p for p in self.projections})
         validate_condition_runtime_projections({p.table_name: p for p in self.projections})
+        validate_monitor_runtime_projections({p.table_name: p for p in self.projections})
 
         if any(
             projection.table_name in {"factor_definition_state", "factor_definition"}
@@ -2246,6 +2564,10 @@ class ServingReadModelInput(RuntimeContractModel):
             from rquant.strategy_authoring_projection import validate_strategy_authoring_projections
 
             validate_strategy_authoring_projections({p.table_name: p for p in self.projections})
+        if any(p.table_name in STRATEGY_PROMOTION_PROJECTION_LAYOUTS for p in self.projections):
+            from rquant.strategy_promotion_projection import validate_strategy_promotion_projections
+
+            validate_strategy_promotion_projections({p.table_name:p for p in self.projections})
         if any(record.signal_id not in signal_ids for record in self.routes):
             raise ValueError("route references a signal outside the serving snapshot")
         routes = {record.signal_id: record for record in self.routes}
@@ -2619,10 +2941,21 @@ def build_serving_read_models(
             "decided_at",
         ),
     )
+    health_views = (
+        {}
+        if source.runtime_health_details is None
+        else {
+            item.service_id: _health_view_cells(item, source.runtime_health_details)
+            for item in source.runtime_health_details.services
+        }
+    )
     runtime_services = _frame(
         [
             {
                 "service_id": record.service_id,
+                **health_views.get(record.service_id, {
+                    "observations_json": None, "degraded_detail": None, "detail_json": None
+                }),
                 "plane": record.plane.value,
                 "status": record.status.value,
                 "stale": record.stale,
@@ -2653,6 +2986,9 @@ def build_serving_read_models(
         ],
         (
             "service_id",
+            "observations_json",
+            "degraded_detail",
+            "detail_json",
             "plane",
             "status",
             "stale",

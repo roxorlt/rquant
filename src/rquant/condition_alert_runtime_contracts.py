@@ -13,9 +13,13 @@ from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, Strict
 
 from rquant.delivery_contracts import DeliveryChannel
 from rquant.manual_watchlist import OwnerId, TsCode
+from rquant.monitor_builtin_contracts import (
+    BuiltinConditionAlertEventEnvelope,
+    parse_builtin_condition_alert_event,
+)
 from rquant.price_alert_runtime_contracts import PriceCommit, PriceSha256, _activation_bytes
 from rquant.runtime_contracts import AwareUtcDatetime
-from rquant.strict_json import canonical_json_bytes, strict_canonical_json_loads
+from rquant.strict_json import canonical_json_bytes, strict_canonical_json_loads, strict_json_loads
 
 
 class ConditionRuntimeModel(BaseModel):
@@ -100,7 +104,9 @@ class ConditionAlertEventEnvelope(ConditionAlertEventFacts):
         return cls(**validated.model_dump(mode="python"), event_id=validated.sha256)
 
 
-def parse_condition_alert_event(value: object) -> ConditionAlertEventEnvelope:
+def parse_condition_alert_event(value: object) -> ConditionAlertEventEnvelope | BuiltinConditionAlertEventEnvelope:
+    if type(value) is BuiltinConditionAlertEventEnvelope:
+        return parse_builtin_condition_alert_event(value)
     if type(value) is ConditionAlertEventEnvelope:
         payload = value.wire_bytes()
     elif type(value) is bytes:
@@ -111,7 +117,9 @@ def parse_condition_alert_event(value: object) -> ConditionAlertEventEnvelope:
         raise TypeError("condition event requires exact event or canonical bytes")
     if len(payload) > 16 * 1024:
         raise ValueError("condition event exceeds its input budget")
-    strict_canonical_json_loads(payload)
+    raw = strict_canonical_json_loads(payload)
+    if isinstance(raw, dict) and raw.get("envelope_schema") == "rquant.builtin-condition-alert-event/v1":
+        return parse_builtin_condition_alert_event(payload)
     event = ConditionAlertEventEnvelope.model_validate_json(payload)
     if event.wire_bytes() != payload:
         raise ValueError("condition event bytes are not canonical")
@@ -241,14 +249,14 @@ def require_condition_alert_activation(
 
 class ConditionAlertProducerEventRecord(ConditionRuntimeModel):
     sequence: StrictInt = Field(ge=1)
-    event: ConditionAlertEventEnvelope
+    event: ConditionAlertEventEnvelope | BuiltinConditionAlertEventEnvelope
     payload_json: StrictStr = Field(min_length=1, max_length=16 * 1024)
     payload_sha256: PriceSha256
 
     @model_validator(mode="after")
     def exact_payload(self) -> Self:
         if (
-            type(self.event) is not ConditionAlertEventEnvelope
+            type(self.event) not in {ConditionAlertEventEnvelope, BuiltinConditionAlertEventEnvelope}
             or parse_condition_alert_event(self.payload_json) != self.event
             or self.payload_sha256 != self.event.sha256
         ):
@@ -265,3 +273,24 @@ def require_verified_condition_activation(
     if binding.service_kind != role or _activation_bytes(path, root) != original:
         raise ValueError("condition actual role or manifest changed")
     return binding
+
+
+def read_condition_activation_setting(value: object, name: str) -> object:
+    """Read an additive setting from the same original verified manifest bytes."""
+    if type(value) is not ConditionAlertRuntimeActivation or value not in _ACTIVATIONS:
+        raise TypeError("condition settings require the actual original activation")
+    _, path, root, original = _ACTIVATIONS[value]
+    if _activation_bytes(path, root) != original:
+        raise ValueError("condition activation changed before reading its settings")
+    raw = strict_json_loads(original)
+    # Original manifests may be formatted JSON; their verifier pins exact bytes.
+    return raw["settings"].get(name)
+
+
+def condition_activation_runtime_root(value: object) -> Path:
+    if type(value) is not ConditionAlertRuntimeActivation or value not in _ACTIVATIONS:
+        raise TypeError("condition runtime root requires the original actual verifier")
+    _, path, root, original = _ACTIVATIONS[value]
+    if _activation_bytes(path, root) != original:
+        raise ValueError("condition original installation changed")
+    return root

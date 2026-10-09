@@ -16,6 +16,7 @@ import {
   usePortfolioSummary,
 } from "@/api/backtests";
 import { ApiError, apiBaseUrl } from "@/api/client";
+import { useCollaboration } from "@/api/collaboration";
 import { type LabControlRequest, submitLabControl } from "@/api/endpoints";
 import { useCurrentMeta } from "@/api/useMeta";
 import { type DataColumn, DataTable } from "@/table/DataTable";
@@ -33,9 +34,11 @@ import {
   Tabs,
   Tip,
 } from "@/ui";
+import { AiInterpretation } from "./AiInterpretation";
 import { PortfolioCharts, type PortfolioRange } from "./PortfolioCharts";
 import { PortfolioConfiguration } from "./PortfolioConfig";
 import { PortfolioMetrics } from "./PortfolioMetrics";
+import { PortfolioMonthlyHeatmap } from "./PortfolioMonthlyHeatmap";
 import {
   type PortfolioDetail,
   PortfolioDetailDrawer,
@@ -79,6 +82,11 @@ const activeStatus = (job: PortfolioJob | undefined) =>
 export default function PortfolioPage() {
   const meta = useCurrentMeta();
   const viewer = meta.data?.data.viewer;
+  const collaboration = useCollaboration();
+  const readAllowed = collaboration.me?.mode === "legacy" || collaboration.current;
+  const exportAllowed =
+    collaboration.me?.mode === "legacy" ||
+    (collaboration.current && collaboration.me?.can_research);
   const [sessionOwner, setSessionOwner] = useState<{ viewer: string | null } | null>(null);
   const viewerChanged =
     sessionOwner !== null && viewer !== undefined && sessionOwner.viewer !== viewer;
@@ -87,9 +95,12 @@ export default function PortfolioPage() {
   const [previousCursors, setPreviousCursors] = useState<(string | null)[]>([]);
   const [refresh, setRefresh] = useState(0);
   const jobs = usePortfolioJobs(cursor, refresh);
-  const [jobId, setJobId] = useState<string | null>(null);
+  const [jobId, setJobId] = useState<string | null>(() => {
+    const id = new URLSearchParams(window.location.hash.split("?")[1] ?? "").get("job");
+    return id && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(id) ? id : null;
+  });
   const [poll, setPoll] = useState(true);
-  const selection = useRef({ revision: 0, jobId: null as string | null });
+  const selection = useRef({ revision: 0, jobId });
   const summary = usePortfolioSummary(jobId, poll);
   const current = summary.data?.job.job_id === jobId ? summary.data : undefined;
   const verifiedResult =
@@ -236,7 +247,7 @@ export default function PortfolioPage() {
   }
 
   async function exportZip() {
-    if (resultJobId === null || resultHash === null || busyExport) return;
+    if (resultJobId === null || resultHash === null || busyExport || !exportAllowed) return;
     const body = exportRequest ?? {
       command_id: crypto.randomUUID(),
       requested_at: new Date().toISOString(),
@@ -603,11 +614,17 @@ export default function PortfolioPage() {
                       ]}
                     />
                   </div>
+                  <AiInterpretation
+                    viewer={viewerChanged ? null : (viewer ?? null)}
+                    sourceKind="portfolio"
+                    jobId={resultJobId}
+                    resultHash={resultHash}
+                  />
                   <div className="pb-report-actions">
                     <Button size="sm" onClick={() => setMetricsOpen(true)}>
                       绩效详情
                     </Button>
-                    {displayedResult.can_report && htmlUrl ? (
+                    {readAllowed && displayedResult.can_report && htmlUrl ? (
                       <a className="btn sm" href={htmlUrl} download>
                         HTML 报告
                       </a>
@@ -616,17 +633,19 @@ export default function PortfolioPage() {
                       size="sm"
                       disabled={busyExport}
                       disabledReason={
-                        !displayedResult.can_report
-                          ? "完整结果生成后才能导出报告。"
-                          : !capabilities.data?.can_export
-                            ? "报告导出暂不可用。"
-                            : undefined
+                        !exportAllowed
+                          ? "当前账号不能准备报告。"
+                          : !displayedResult.can_report
+                            ? "完整结果生成后才能导出报告。"
+                            : !capabilities.data?.can_export
+                              ? "报告导出暂不可用。"
+                              : undefined
                       }
                       onClick={() => void exportZip()}
                     >
                       {exportRequest ? "重试原导出" : busyExport ? "正在准备报告" : "导出 ZIP"}
                     </Button>
-                    {zipUrl ? (
+                    {readAllowed && zipUrl ? (
                       <a className="btn sm primary" href={zipUrl} download>
                         下载 ZIP
                       </a>
@@ -687,6 +706,15 @@ export default function PortfolioPage() {
                       />
                     ) : actualRows ? (
                       <>
+                        {view === "monthly" && displayedResult ? (
+                          <PortfolioMonthlyHeatmap
+                            key={`${viewer}:${resultJobId}:${resultHash}`}
+                            jobId={resultJobId}
+                            resultHash={resultHash}
+                            startDate={displayedResult.job.start_date}
+                            endDate={displayedResult.job.end_date}
+                          />
+                        ) : null}
                         <PortfolioTable rows={actualRows} onDetail={setDetail} />
                         <div className="pb-pagination">
                           <span className="hint">

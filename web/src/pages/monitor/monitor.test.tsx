@@ -1,6 +1,7 @@
 import { act, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { HttpResponse, http } from "msw";
+import type { Schemas } from "@/api/client";
 import { channelsEnvelope, metaEnvelope, monitorEnvelope } from "@/test/fixtures";
 import { findJargon } from "@/test/jargon";
 import { renderApp } from "@/test/render";
@@ -28,6 +29,307 @@ const publishedChannels = channelsEnvelope({
       last_success_at: null,
     },
   ],
+});
+
+const unavailableRuntime: Schemas["MonitorRuntimeData"] = {
+  state: "unavailable",
+  source_label: "暂不可用",
+  source_note: "通知来源尚未发布。",
+  mode: "unknown",
+  mode_label: "未确认",
+  builtins: [],
+  channels: [],
+};
+
+function runtimeHandler(data: Schemas["MonitorRuntimeData"], meta = metaEnvelope()) {
+  return http.get("*/api/v1/monitor/runtime", () =>
+    HttpResponse.json({ serving: meta.serving, data }),
+  );
+}
+
+beforeEach(() => {
+  server.use(
+    runtimeHandler(unavailableRuntime),
+    ...["price-rules", "price-rules/runtime", "price-rules/events"].map((path) =>
+      http.get(`*/api/v1/monitor/${path}`, () => new HttpResponse(null, { status: 503 })),
+    ),
+    http.get("*/api/v1/tasks/control-capabilities", () =>
+      HttpResponse.json({
+        generation_id: metaEnvelope().data.generation?.generation_id,
+        units: [],
+        can_control_scheduling: false,
+        can_recover_units: false,
+        can_recover_scheduling: false,
+        scheduling: { available: false, note: "尚未配置" },
+        notifier_mode: {
+          available: false,
+          can_request: false,
+          can_set_live: false,
+          note: "尚未配置",
+        },
+        monitor_builtins: [],
+        note: "尚未配置",
+      } satisfies Schemas["TaskControlCapabilitiesData"]),
+    ),
+  );
+});
+
+const currentRuntime: Schemas["MonitorRuntimeData"] = {
+  ...unavailableRuntime,
+  state: "ready",
+  source_label: "已核对",
+  source_note: "当前完整范围",
+  mode: "live",
+  mode_label: "正式推送",
+  applied_revision: 2,
+  channels: [
+    {
+      channel: "pushdeer",
+      channel_label: "PushDeer",
+      mode: "live",
+      covered_from: "2026-09-24T02:00:00Z",
+      covered_through: "2026-09-24T03:00:00Z",
+      logical_count: 7,
+      member_attempts: 8,
+      member_retries: 1,
+      physical_requests: 3,
+      accepted_count: 1,
+      rejected_count: 1,
+      physical_unknown_count: 1,
+      possible_requests: 1,
+      accepted_pct: null,
+      last_accepted_at: null,
+    },
+  ],
+};
+
+describe("盯盘当前来源", () => {
+  it("keeps logical, member, physical and unknown facts separate from legacy channel percentages", async () => {
+    server.use(runtimeHandler(currentRuntime), channelsHandler(publishedChannels));
+    const user = userEvent.setup();
+    renderApp("/monitor");
+    const current = await screen.findByRole("region", { name: "当前通道尝试" });
+    await within(current).findByRole("article", { name: "PushDeer当前通知" });
+    expect(current).toHaveTextContent("逻辑通知7");
+    expect(current).toHaveTextContent("成员尝试8");
+    expect(current).toHaveTextContent("实际请求3");
+    expect(current).toHaveTextContent("成员重试1");
+    expect(current).toHaveTextContent("结果未明1");
+    expect(current).toHaveTextContent("可能已请求1");
+    expect(current).not.toHaveTextContent("33.3%");
+    expect(await screen.findByText("66.7%")).toBeInTheDocument();
+    await user.hover(within(current).getByText("窗口提交成功率"));
+    expect(await screen.findByRole("tooltip")).toHaveTextContent("不代表手机送达");
+  });
+
+  it("renders market events without a fake stock and independently permits eligible builtin ACK", async () => {
+    server.use(
+      runtimeHandler(currentRuntime),
+      monitorHandler(
+        monitorEnvelope({
+          total: null,
+          unacknowledged: {
+            state: "unavailable",
+            label: "暂不可用",
+            count: null,
+            count_as_of: null,
+            note: "旧范围未核对",
+          },
+          builtin_unacknowledged: {
+            state: "ready",
+            label: "已核对",
+            count: 1,
+            count_as_of: "2026-09-24T02:00:00Z",
+            note: null,
+          },
+          items: [
+            {
+              kind: "builtin",
+              event_key: "sealed-market",
+              at: "2026-09-24T02:00:00Z",
+              builtin_id: "pulse",
+              event_label: "市场异动",
+              subject: "market",
+              code: null,
+              name: null,
+              before: 12,
+              after: 18,
+              threshold: null,
+              comparison_unit: "count",
+              source_note: "原全市场聚合",
+              acknowledgment: {
+                state: "unconfirmed",
+                eligible: true,
+                alert_id: "f".repeat(64),
+                label: "待确认",
+              },
+            },
+            {
+              kind: "channel_attempt",
+              event_key: "possible-request",
+              at: "2026-09-24T01:59:00Z",
+              channel_label: "PushDeer",
+              mode: "live",
+              state: "possible",
+              state_label: "可能已请求",
+              logical_count: 7,
+              attempt_no: 1,
+              source_note: "可能已请求，不能自动重发。",
+            },
+          ],
+        }),
+      ),
+    );
+    renderApp("/monitor");
+    const timeline = await screen.findByRole("list", { name: "告警时间线" });
+    expect(timeline).toHaveTextContent("全市场");
+    expect(timeline).toHaveTextContent("12 → 18");
+    expect(timeline).toHaveTextContent("可能已请求");
+    expect(within(timeline).queryByRole("button", { name: /^查看.*详情$/ })).toBeNull();
+    expect(within(timeline).getByRole("button", { name: "确认" })).toBeEnabled();
+    expect(findJargon(document.body.textContent ?? "")).toEqual([]);
+  });
+
+  it("uses the supplied percent, multiplier and price units without inventing old missing units", async () => {
+    const unavailable = {
+      state: "unavailable",
+      eligible: false,
+      label: "暂不可确认",
+    } satisfies Schemas["AlertAcknowledgmentView"];
+    server.use(
+      runtimeHandler(currentRuntime),
+      monitorHandler(
+        monitorEnvelope({
+          items: [
+            {
+              kind: "builtin",
+              event_key: "original-ratio",
+              at: "2026-09-24T02:00:00Z",
+              builtin_id: "pulse",
+              event_label: "涨跌占比突变",
+              subject: "market",
+              code: null,
+              name: null,
+              before: 38.75,
+              after: 54.125,
+              comparison_unit: "percent",
+              source_note: "原市场占比",
+              acknowledgment: unavailable,
+            },
+            {
+              kind: "builtin",
+              event_key: "original-multiple",
+              at: "2026-09-24T01:59:00Z",
+              builtin_id: "surge",
+              event_label: "爆量",
+              subject: "stock",
+              code: "300001.SZ",
+              name: "量能样本",
+              price: 100.11,
+              threshold: 8.25,
+              threshold_unit: "multiple",
+              source_note: "原相对量",
+              acknowledgment: unavailable,
+            },
+            {
+              kind: "builtin",
+              event_key: "original-price",
+              at: "2026-09-24T01:58:00Z",
+              builtin_id: "pool2_levels",
+              event_label: "档位提醒",
+              subject: "stock",
+              code: "600001.SH",
+              name: "档位样本",
+              price: 10.21,
+              threshold: 10.4,
+              threshold_unit: "CNY",
+              source_note: "原档位价格",
+              acknowledgment: unavailable,
+            },
+            {
+              kind: "builtin",
+              event_key: "old-no-unit",
+              at: "2026-09-24T01:57:00Z",
+              builtin_id: "pool2_levels",
+              event_label: "旧原值",
+              subject: "stock",
+              code: "600002.SH",
+              name: "旧样本",
+              price: 11.33,
+              threshold: 2.75,
+              source_note: "旧记录没有单位",
+              acknowledgment: unavailable,
+            },
+          ],
+        }),
+      ),
+    );
+    renderApp("/monitor");
+    const timeline = await screen.findByRole("list", { name: "告警时间线" });
+    const rows = within(timeline).getAllByRole("listitem");
+    expect(rows[0]).toHaveTextContent("38.75% → 54.13%");
+    expect(rows[0]).not.toHaveTextContent("3,875");
+    expect(rows[1]).toHaveTextContent("相对量 8.25倍");
+    expect(rows[1]).not.toHaveTextContent("参考价");
+    expect(rows[2]).toHaveTextContent("参考价 10.40");
+    expect(rows[3]).toHaveTextContent("阈值 2.75");
+    expect(rows[3]).not.toHaveTextContent("参考价");
+  });
+
+  it("removes private rows and counts immediately when the viewer and generation change", async () => {
+    server.use(runtimeHandler(currentRuntime));
+    const view = renderApp("/monitor");
+    const current = await screen.findByRole("region", { name: "当前通道尝试" });
+    await within(current).findByRole("article", { name: "PushDeer当前通知" });
+    expect(current).toHaveTextContent("逻辑通知7");
+    const next = metaEnvelope({ generationId: "b".repeat(64), viewer: "bob" });
+    server.use(metaHandler(next), runtimeHandler(unavailableRuntime, next));
+    act(() => {
+      view.queryClient.setQueryData(["meta"], next);
+    });
+    await waitFor(() => expect(screen.queryByText("逻辑通知7")).toBeNull());
+    expect(
+      view.queryClient.getQueryCache().findAll({ queryKey: ["monitor", "runtime", "tester"] }),
+    ).toHaveLength(0);
+    expect(
+      view.queryClient.getQueryCache().findAll({ queryKey: ["monitor", "timeline", "tester"] }),
+    ).toHaveLength(0);
+    expect(
+      view.queryClient
+        .getQueryCache()
+        .findAll({ queryKey: ["monitor", "runtime", "bob", "b".repeat(64)] }).length,
+    ).toBeGreaterThan(0);
+  });
+
+  it.each([null, "failed"] as const)(
+    "does not fetch or write private controls when identity is %s",
+    async (identity) => {
+      let privateReads = 0,
+        writes = 0;
+      server.use(
+        identity === null
+          ? metaHandler(metaEnvelope({ viewer: null }))
+          : http.get("*/api/v1/meta", () => new HttpResponse(null, { status: 503 })),
+        http.get("*/api/v1/monitor/runtime", () => {
+          privateReads += 1;
+          return HttpResponse.json({ serving: metaEnvelope().serving, data: currentRuntime });
+        }),
+        http.post("*/api/v1/tasks/notifications/*", () => {
+          writes += 1;
+          return new HttpResponse(null, { status: 403 });
+        }),
+      );
+      const user = userEvent.setup();
+      renderApp("/monitor");
+      const switchMode = await screen.findByRole("button", { name: "切换通知模式" });
+      expect(switchMode).toBeDisabled();
+      await user.click(switchMode);
+      expect(screen.queryByRole("button", { name: "立即运行测试推送" })).toBeNull();
+      expect(screen.queryByRole("article", { name: "PushDeer当前通知" })).toBeNull();
+      expect(privateReads).toBe(0);
+      expect(writes).toBe(0);
+    },
+  );
 });
 
 describe("盯盘与告警", () => {
@@ -193,9 +495,7 @@ describe("盯盘与告警", () => {
     expect(screen.getByText("今天休市，显示历史告警")).toBeInTheDocument();
     expect(screen.getByText("新信号通知")).toBeInTheDocument();
     expect(screen.queryByText("已送达")).not.toBeInTheDocument();
-    expect(
-      screen.queryByRole("button", { name: /确认|新建规则|发测试推送/ }),
-    ).not.toBeInTheDocument();
+    expect(within(timeline).queryByRole("button", { name: /确认/ })).not.toBeInTheDocument();
     expect(findJargon(document.body.textContent ?? "")).toEqual([]);
 
     await user.click(within(timeline).getByRole("button", { name: "查看天威视讯详情" }));

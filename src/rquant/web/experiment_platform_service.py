@@ -6,9 +6,10 @@ import hashlib
 import hmac
 from base64 import b64decode, urlsafe_b64encode
 from datetime import datetime
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
+from uuid import UUID, uuid5
 
-from rquant.experiment_platform import ExperimentSourceProfile, HoldoutPolicy, stable_experiment_job
+from rquant.experiment_platform import ExperimentSourceProfile, HoldoutPolicy, stable_experiment_job, NativeMinuteExperimentRequest, ExperimentConfiguration
 from rquant.experiment_platform_commands import (
     ExperimentCommand,
     ExperimentCommandResult,
@@ -42,8 +43,17 @@ from rquant.web.experiment_platform_models import (
     ExperimentStatisticsData,
 )
 from rquant.web.lab_control_gateway import LabControlGateway
+from rquant.web.collaboration_gateway import CollaborationGateway
 from rquant.web.models.backtests import PortfolioEditableConfig
 from rquant.web.serving import BorrowedGeneration
+from rquant.strategy_promotion_contracts import NativeMinuteConfiguration
+
+if TYPE_CHECKING:
+    from rquant.minute_backtest_artifact import MinuteSealedReplayReader
+
+
+def _editable_configuration(configuration: ExperimentConfiguration) -> PortfolioEditableConfig | NativeMinuteConfiguration:
+    return configuration if isinstance(configuration, NativeMinuteConfiguration) else PortfolioEditableConfig.from_domain(configuration)
 
 
 class _Cursor(RuntimeContractModel):
@@ -94,6 +104,7 @@ class ExperimentWebService:
         administrators: frozenset[str] = frozenset(),
         enabled: bool = False,
         template_available: bool = False,
+        native_results: MinuteSealedReplayReader | None = None,
     ) -> None:
         if not administrators <= owners:
             raise ValueError("experiment administrators need owner permission")
@@ -108,14 +119,20 @@ class ExperimentWebService:
             raise ValueError("default experiment config has no trusted source")
         self.results, self.private_authority = results, private_authority
         self.template_results = template_results
+        self.native_results = native_results
         self.gateway = gateway or LabControlGateway()
         self.profiles, self.default_config = profiles, default_config
         self.owners, self.administrators, self.enabled = owners, administrators, enabled
         self.template_available = template_available
+        self.collaboration: CollaborationGateway | None = None
 
     def can_submit(self, owner: str, *, policy: bool = False) -> bool:
         # The writer performs original-request lookup before applying its current switch.
-        return owner in (self.administrators if policy else self.owners)
+        original = owner in (self.administrators if policy else self.owners)
+        if self.collaboration is None:
+            return original
+        me = self.collaboration.me(owner)
+        return original and (me.can_manage_users if policy else me.can_research)
 
     @staticmethod
     def _published(borrowed: BorrowedGeneration | None) -> bool:
@@ -155,7 +172,7 @@ class ExperimentWebService:
             ).fetchone()
             if row is not None:
                 policy = HoldoutPolicy.model_validate_json(row[0])
-        ready = published and self.enabled and owner in self.owners
+        ready = published and self.enabled and self.can_submit(owner)
         sources = tuple(
             ExperimentSourceOption(
                 key=p.source_key,
@@ -173,7 +190,7 @@ class ExperimentWebService:
             available=published,
             can_search=ready and any(p.phase_slice_available for p in self.profiles),
             can_unseal=ready and self.results is not None and self.private_authority is not None,
-            can_edit_policy=ready and owner in self.administrators,
+            can_edit_policy=ready and self.can_submit(owner, policy=True),
             message=None if ready and sources else "正式实验尚未启用，请先准备受限来源。",
             sources=sources,
             default_config=None
@@ -255,8 +272,11 @@ class ExperimentWebService:
 
     @staticmethod
     def _strategy(
-        family: ExperimentFamilyFact, configuration: PortfolioBacktestConfig
+        family: ExperimentFamilyFact, configuration: ExperimentConfiguration
     ) -> tuple[str, int, StrategyTemplate | None]:
+        if isinstance(configuration, NativeMinuteConfiguration):
+            target = configuration.selection.target
+            return target.name, target.head.version, None
         if family.request.template is None:
             return "组合回测", 1, None
         if family.template_name is None or family.template_rules is None:
@@ -278,7 +298,7 @@ class ExperimentWebService:
         strategy_name, strategy_version, rules = self._strategy(family, slot.configuration)
         return ExperimentPreparationRow(
             index=slot.index,
-            configuration=PortfolioEditableConfig.from_domain(slot.configuration),
+            configuration=_editable_configuration(slot.configuration),
             definition_state=slot.definition_state,
             input_prepared=slot.input_prepared,
             failure=slot.failure,
@@ -319,7 +339,10 @@ class ExperimentWebService:
         metrics = unavailable_experiment_metrics()
         strategy_name, strategy_version, rules = self._strategy(family, fact.configuration)
         if status in ("executed", "succeeded") and fact.result_hash is not None:
-            if self.results is None or self.private_authority is None:
+            if self.private_authority is None or (
+                self.native_results is None if isinstance(fact.configuration, NativeMinuteConfiguration)
+                else self.results is None
+            ):
                 message = "完整指标暂时无法读取，请稍后重试。"
             else:
                 result = read_experiment_result(
@@ -328,6 +351,7 @@ class ExperimentWebService:
                     results=self.results,
                     authority=self.private_authority,
                     template_results=self.template_results,
+                    native_results=self.native_results,
                 )
                 if rules is not None and (
                     result.template is None or result.template.rules != rules
@@ -345,7 +369,7 @@ class ExperimentWebService:
             status=status,
             label=labels[status],
             index=fact.index,
-            configuration=PortfolioEditableConfig.from_domain(fact.configuration),
+            configuration=_editable_configuration(fact.configuration),
             job_id=fact.child.job_id,
             result_hash=fact.result_hash,
             message=message,
@@ -506,7 +530,7 @@ class ExperimentWebService:
         fact = self._fact(borrowed, owner, experiment_id)
         family = self._family(borrowed, owner, fact.family_id)
         if (
-            self.results is None
+            (self.native_results is None if isinstance(fact.configuration, NativeMinuteConfiguration) else self.results is None)
             or self.private_authority is None
             or fact.result_hash != result_hash
         ):
@@ -517,6 +541,7 @@ class ExperimentWebService:
             results=self.results,
             authority=self.private_authority,
             template_results=self.template_results,
+            native_results=self.native_results,
         )
 
     def compare(
@@ -618,7 +643,9 @@ class ExperimentWebService:
                 or result.planned_count != count
                 or result.job_ids
                 != tuple(
-                    stable_experiment_job(command.actor_id, result.command_id, i)
+                    (uuid5(UUID(command.command_id), f"strategy-fixed-wf:{i + 1}")
+                     if isinstance(command.request, NativeMinuteExperimentRequest) and command.request.walk_forward_command_id is not None
+                     else stable_experiment_job(command.actor_id, result.command_id, i))
                     for i in range(count)
                 )
             ):

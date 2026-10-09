@@ -88,7 +88,11 @@ function ResultBody({
   return (
     <DataTable
       rows={data.rows}
-      columns={(data.ranked_count == null ? COLUMNS : RANKED_COLUMNS).map((column) => column.id==="close" && data.source?.mode==="intraday" ? {...column,header:"最新价"} : column)}
+      columns={(data.ranked_count == null ? COLUMNS : RANKED_COLUMNS).map((column) =>
+        column.id === "close" && data.source?.mode === "intraday"
+          ? { ...column, header: "最新价" }
+          : column,
+      )}
       rowKey={(row) => row.ts_code}
       label="选股结果"
       onSelect={(row) => onStock(row.ts_code)}
@@ -176,7 +180,7 @@ export function ScreenResults({
                 <span>按排名分展示前 {formatCount(data.ranked_count)} 只</span>
               )}
               {data.ranked_count == null ? null : " · "}
-              {data.trade_date} {data.source?.mode==="intraday" ? "盘中" : "收盘"}
+              {data.trade_date} {data.source?.mode === "intraday" ? "盘中" : "收盘"}
             </>
           ) : undefined
         }

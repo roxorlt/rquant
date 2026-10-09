@@ -26,6 +26,8 @@
 
 ## 来源与关联约定
 
+2026-10-07 用户已确认[历史重建与新旧成交对比口径](2026-10-07-historical-research-policy.md)：保留原件，重建结果明确标识，缺少当时可见资料时保持不可用；新旧引擎按各自冻结规则比较，未解释差异必须为零。同口径的原数值标准继续执行。
+
 - 可点击原型（本机 CC 工作文件，不复制进公开仓库）：`/Users/roxor/.claude/jobs/67487964/tmp/rquant-platform-prototype.html`
 - 新前端计划 v2：`/Users/roxor/.claude/jobs/67487964/tmp/frontend-plan-v2.md`（§4 能力清单、§4.17 按钮、§8 里程碑；其中「里程碑 M1」与 §4.1「数据中心 M1」是不同编号）
 - 差距表：`/Users/roxor/.claude/jobs/67487964/tmp/rquant-gap.md`

@@ -6,10 +6,18 @@ from datetime import date, datetime
 from typing import Annotated, Literal
 from uuid import UUID
 
-from pydantic import Field
+from pydantic import Field, JsonValue
 
-from rquant.experiment_platform import ExperimentSearchRequest, HoldoutPolicy, Parameter
+from rquant.experiment_platform import (
+    ExperimentSearchRequest,
+    HoldoutPolicy,
+    NativeMinuteExperimentRequest,
+    Parameter,
+)
 from rquant.experiment_registry import DateRange
+from rquant.research_run_spec import ExecutionCostSpec
+from rquant.minute_backtest_formal import MinuteExperimentProtocol
+from rquant.minute_backtest_contracts import MinuteReplayExecutionProfile
 from rquant.overfit import (
     DeflatedSharpeResult,
     MinimumTrackRecordLengthResult,
@@ -22,6 +30,7 @@ from rquant.portfolio_backtest_source import PortfolioExperimentProtocol
 from rquant.runtime_contracts import RuntimeContractModel
 from rquant.strategy_authoring_commands import StrategyTemplateHead
 from rquant.strategy_template import StrategyTemplate
+from rquant.strategy_promotion_contracts import NativeMinuteConfiguration, StrategyPromotionTarget
 from rquant.web.models.backtests import PortfolioEditableConfig
 
 
@@ -68,7 +77,7 @@ class ExperimentAttemptRow(RuntimeContractModel):
     status: Literal["registered", "running", "executed", "succeeded", "failed", "cancelled"]
     label: str
     index: int
-    configuration: PortfolioEditableConfig
+    configuration: PortfolioEditableConfig | NativeMinuteConfiguration
     job_id: UUID
     result_hash: str | None = None
     message: str | None = None
@@ -104,7 +113,7 @@ class ExperimentMineData(RuntimeContractModel):
 
 class ExperimentPreparationRow(RuntimeContractModel):
     index: int = Field(ge=0, le=63)
-    configuration: PortfolioEditableConfig
+    configuration: PortfolioEditableConfig | NativeMinuteConfiguration
     definition_state: Literal["pending", "saved", "failed", "cancelled"]
     input_prepared: bool
     failure: Literal["capacity", "source_changed", "invalid_definition"] | None = None
@@ -120,7 +129,7 @@ class ExperimentFamilyData(RuntimeContractModel):
     phase: Literal["search", "outer"]
     parent_family_id: str | None = None
     registered_at: datetime
-    protocol: PortfolioExperimentProtocol
+    protocol: PortfolioExperimentProtocol | MinuteExperimentProtocol
     planned_count: int
     potential_count: int
     failed_count: int
@@ -158,12 +167,32 @@ class ExperimentTemplateResultIdentity(RuntimeContractModel):
     content_hash: str
 
 
+class ExperimentNativeParameter(RuntimeContractModel):
+    name: str = Field(min_length=1, max_length=128)
+    value: JsonValue
+    label: str | None = Field(default=None, max_length=80)
+    display_value: str | None = Field(default=None, max_length=96)
+
+
+class ExperimentNativeResultIdentity(RuntimeContractModel):
+    target: StrategyPromotionTarget
+    profile_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    core_input_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    seed_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    content_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_kind: Literal["captured", "reconstructed"]
+    execution_costs: ExecutionCostSpec
+    parameters: tuple[ExperimentNativeParameter, ...] = ()
+    execution_profile: MinuteReplayExecutionProfile | None = None
+    execution: Literal["minute_runtime_replay@2"] = "minute_runtime_replay@2"
+
+
 class ExperimentResultData(RuntimeContractModel):
     experiment_id: str
     family_id: str
     job_id: UUID
     phase: Literal["search", "outer"]
-    configuration: PortfolioEditableConfig
+    configuration: PortfolioEditableConfig | NativeMinuteConfiguration
     result_hash: str
     input_hash: str
     spec_hash: str
@@ -174,6 +203,7 @@ class ExperimentResultData(RuntimeContractModel):
     metrics: tuple[ExperimentMetric, ...]
     curves: tuple[ExperimentCurvePoint, ...]
     template: ExperimentTemplateResultIdentity | None = None
+    native: ExperimentNativeResultIdentity | None = None
 
 
 class ExperimentParameterDifference(RuntimeContractModel):
@@ -238,7 +268,7 @@ class _WriteRequest(RuntimeContractModel):
 
 class ExperimentSearchWrite(_WriteRequest):
     kind: Literal["register_experiment_family"] = "register_experiment_family"
-    request: ExperimentEditableRequest
+    request: ExperimentEditableRequest | NativeMinuteExperimentRequest
 
 
 class ExperimentCancelWrite(_WriteRequest):

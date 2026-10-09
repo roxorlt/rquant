@@ -196,6 +196,125 @@
   font-size: 12px;
   text-decoration: underline dotted;
 }
+.promotion-panel {
+  display: grid;
+  gap: 16px;
+  min-width: 0;
+}
+.promotion-stages {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  padding: 0;
+  margin: 0;
+  list-style: none;
+  gap: 6px;
+}
+.promotion-stages li {
+  padding: 0 0 12px;
+  border-bottom: 2px solid var(--rule);
+  color: var(--faint);
+  font-size: 12px;
+}
+.promotion-stages li[aria-current="step"] {
+  color: var(--ink);
+  border-color: var(--accent);
+  font-weight: 600;
+}
+.promotion-heading,
+.promotion-review-heading {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: center;
+}
+.promotion-heading .field {
+  min-width: 160px;
+  flex: 1;
+}
+.promotion-heading .inp,
+.promotion-evidence-selects .inp {
+  width: 100%;
+  min-width: 0;
+}
+.promotion-current {
+  color: var(--accent);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.promotion-source {
+  margin: 0;
+  display: grid;
+  grid-template-columns: minmax(80px, 0.7fr) minmax(0, 2fr);
+  gap: 8px 12px;
+  font-size: 12px;
+}
+.promotion-source dt {
+  color: var(--muted);
+}
+.promotion-source dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.promotion-evidence-selects {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+.promotion-actions,
+.promotion-receipt {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.promotion-receipt {
+  padding: 12px 0;
+  border-block: 1px solid var(--rule);
+}
+.promotion-receipt p {
+  width: 100%;
+  margin: 0;
+  font-size: 13px;
+}
+.promotion-note {
+  margin: 0;
+  font-size: 12px;
+}
+.promotion-review,
+.promotion-history {
+  display: grid;
+  min-width: 0;
+  gap: 12px;
+}
+.promotion-review-heading h3,
+.promotion-history h3 {
+  margin: 0;
+  font-size: 13px;
+}
+.promotion-gate-satisfied {
+  color: var(--accent);
+}
+.promotion-gate-failed {
+  color: var(--crit);
+}
+.promotion-gate-missing {
+  color: var(--muted);
+}
+.promotion-history ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.promotion-history li {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 8px;
+  border-top: 1px solid var(--rule);
+  padding-block: 10px;
+  font-size: 12px;
+}
 @media (max-width: 440px) {
   .template-workspace {
     gap: 12px;
@@ -215,5 +334,15 @@
   }
   .template-steps li {
     font-size: 11px;
+  }
+  .promotion-stages li {
+    font-size: 11px;
+  }
+  .promotion-source {
+    grid-template-columns: minmax(64px, 0.5fr) minmax(0, 2fr);
+    gap: 8px;
+  }
+  .promotion-current {
+    width: 100%;
   }
 }

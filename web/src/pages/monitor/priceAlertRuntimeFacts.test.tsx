@@ -238,11 +238,13 @@ function editableListing() {
 it("closes the drawer after the confirmation lifecycle, then restores the original focus", async () => {
   editableListing();
   renderApp("/monitor");
-  const edit = await screen.findByRole("button", { name: "编辑 到价提醒" });
+  await screen.findByRole("button", { name: "编辑 到价提醒" });
+  const edit = screen.getByRole("button", { name: "编辑 到价提醒" });
   fireEvent.click(edit);
   fireEvent.change(await screen.findByLabelText("规则名称"), { target: { value: "未保存的草稿" } });
   fireEvent.click(screen.getByRole("button", { name: "取消编辑" }));
-  fireEvent.click(await screen.findByRole("button", { name: "放弃修改" }));
+  await screen.findByRole("button", { name: "放弃修改" });
+  fireEvent.click(screen.getByRole("button", { name: "放弃修改" }));
   expect(screen.getByLabelText("规则名称")).toHaveValue("未保存的草稿");
   act(() => closeLifecycle.release());
   await waitFor(() => expect(screen.queryByLabelText("规则名称")).toBeNull());
@@ -252,10 +254,12 @@ it("closes the drawer after the confirmation lifecycle, then restores the origin
 it("a delayed confirmation close cannot discard the next owner's new draft", async () => {
   editableListing();
   const app = renderApp("/monitor");
-  fireEvent.click(await screen.findByRole("button", { name: "编辑 到价提醒" }));
+  await screen.findByRole("button", { name: "编辑 到价提醒" });
+  fireEvent.click(screen.getByRole("button", { name: "编辑 到价提醒" }));
   fireEvent.change(await screen.findByLabelText("规则名称"), { target: { value: "旧账号的草稿" } });
   fireEvent.click(screen.getByRole("button", { name: "取消编辑" }));
-  fireEvent.click(await screen.findByRole("button", { name: "放弃修改" }));
+  await screen.findByRole("button", { name: "放弃修改" });
+  fireEvent.click(screen.getByRole("button", { name: "放弃修改" }));
   expect(screen.getByLabelText("规则名称")).toHaveValue("旧账号的草稿");
   const release = closeLifecycle.release;
   server.use(metaHandler(metaEnvelope({ viewer: "bob" })));

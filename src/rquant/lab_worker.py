@@ -130,6 +130,8 @@ from rquant.strict_json import (
 )
 
 if TYPE_CHECKING:
+    from rquant.minute_backtest_producer import MinuteReplayCatalog
+    from rquant.minute_backtest_parameter_producer import MinuteParameterReplayCatalog
     from rquant.paper_research import PaperResearchAdapterCatalog
     from rquant.paper_research_runtime import PaperResearchRuntimeDirectory
     from rquant.strategy_template_adapter import StrategyTemplateAdapterCatalog
@@ -501,6 +503,9 @@ def build_builtin_shard_runtime_manifest(
     research_lake_root: Path,
     template_catalog: StrategyTemplateAdapterCatalog | None = None,
     paper_catalog: PaperResearchAdapterCatalog | None = None,
+    minute_catalog: MinuteReplayCatalog | None = None,
+    minute_registry_mode: Literal["isolated", "installed"] = "isolated",
+    parameter_catalog: MinuteParameterReplayCatalog | None = None,
 ) -> LabShardRuntimeManifest:
     from rquant.lab_worker_registry import builtin_lab_shard_configuration
 
@@ -511,6 +516,9 @@ def build_builtin_shard_runtime_manifest(
         research_lake_root=research_lake_root,
         template_catalog=template_catalog,
         paper_catalog=paper_catalog,
+        minute_catalog=minute_catalog,
+        minute_registry_mode=minute_registry_mode,
+        parameter_catalog=parameter_catalog,
     )
     return LabShardRuntimeManifest(
         registry=LabClosedRegistryBinding(

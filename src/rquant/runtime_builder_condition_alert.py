@@ -6,6 +6,7 @@ from collections.abc import Callable
 from datetime import datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
+import sqlite3
 from typing import TYPE_CHECKING
 
 from pydantic import Field, StrictBool, field_validator, model_validator
@@ -177,6 +178,9 @@ def build_borrowed_condition_step(
     )
     rsi = None if settings.rsi_root is None else VerifiedDynamicRsiProjection(settings.rsi_root)
     reader = ServingReader(settings.scope_serving_root)
+    from rquant.monitor_builtin_runtime import read_installed_builtin_settings
+
+    builtin_settings = read_installed_builtin_settings(activation)
 
     def evaluate_step() -> RuntimeStepResult:
         now = normalize_aware_utc(clock())
@@ -247,7 +251,7 @@ def build_borrowed_condition_step(
             finally:
                 cursor.close()
 
-    def step() -> RuntimeStepResult:
+    def generic_step() -> RuntimeStepResult:
         try:
             return evaluate_step()
         except Exception:
@@ -258,6 +262,44 @@ def build_borrowed_condition_step(
                 output_sequence=receipt.source_high_watermark,
                 degraded_reasons=("condition_alert:source_unknown",),
             )
+
+    def step() -> RuntimeStepResult:
+        result = generic_step()
+        if builtin_settings is None or not builtin_settings.enabled:
+            return result
+        from rquant.monitor_builtin_runtime import commit_original_builtin_round, read_effective_builtin_settings, read_original_builtin_capture, require_builtin_capture_authority, verify_builtin_capture_authority
+
+        now = normalize_aware_utc(clock())
+        current_settings = read_effective_builtin_settings(activation, now=now)
+        refs = {item.origin: item for item in current_settings.sources}
+        required = set()
+        for definition in current_settings.definitions:
+            required.add("watchlist_quote" if definition.builtin_id in {"pool2_levels", "pool_attack"} else "original_" + definition.builtin_id)
+        if "watchlist_quote" in required and "original_monitor" in refs:
+            required.remove("watchlist_quote")
+            required.add("original_monitor")
+        processed, reasons = 0, set(result.degraded_reasons)
+        for origin in sorted(required):
+            reference = refs.get(origin)
+            try:
+                if reference is None:
+                    raise ValueError("original builtin source has no configured role")
+                authority = verify_builtin_capture_authority(reference.manifest_path, runtime_root=reference.runtime_root,
+                    expected_sha256=reference.manifest_sha256, expected_commit=reference.producer_commit)
+                _, actual = require_builtin_capture_authority(authority)
+                if actual.origin != origin or reference.producer_commit != manifest.producer_commit:
+                    raise ValueError("original builtin source role differs from its configured reference")
+                captured = read_original_builtin_capture(authority, read_at=now)
+                receipt = commit_original_builtin_round(store, captured=captured, definitions=current_settings.definitions, evaluated_at=now)
+                processed += len(receipt.events)
+            except Exception:
+                store.record_builtin_unavailable(definitions=current_settings.definitions, origin=origin,
+                    evaluated_at=now, reason="capture_unavailable")
+                reasons.add("monitor_builtin:source_unknown")
+        if any(row.source_state in {"unknown", "disconnected", "stale"} for row in store.builtin_heads()):
+            reasons.add("monitor_builtin:source_unknown")
+        return result.model_copy(update={"output_sequence": store.source_descriptor().high_watermark,
+            "processed_count": result.processed_count + processed, "degraded_reasons": tuple(sorted(reasons))})
 
     step.condition_store = store
     return step
@@ -286,11 +328,14 @@ def open_condition_role_peer(
     *,
     runtime_root: Path | None,
     borrowed: ReadonlyPriceAlertRuntimeStore | None = None,
+    borrowed_condition: ConditionAlertRuntimeStore | None = None,
+    source_connection: sqlite3.Connection | None = None,
 ) -> tuple[
     ConditionAlertRuntimeActivation, ConditionAlertRuntimeStore, ConditionAlertRecipientPolicy
 ]:
     from rquant.condition_alert_route import ConditionAlertRecipientPolicy
-    from rquant.price_alert_runtime_store import ReadonlyPriceAlertRuntimeStore
+    from rquant.price_alert_runtime_store import PriceAlertRuntimeStore, ReadonlyPriceAlertRuntimeStore
+    from rquant.price_alert_runtime_contracts import require_verified_price_alert_activation
     from rquant.runtime_builder_price_alert import verify_price_role_manifest
 
     if runtime_root is None or manifest.service_kind not in {
@@ -327,6 +372,25 @@ def open_condition_role_peer(
     )
     if policy.sha256 != own.recipient_policy_sha256:
         raise ValueError("condition actual recipient policy differs")
+    if borrowed_condition is not None or source_connection is not None:
+        if (borrowed is not None or type(borrowed_condition) is not ConditionAlertRuntimeStore
+                or type(source_connection) is not sqlite3.Connection
+                or type(borrowed_condition.ledger) is not PriceAlertRuntimeStore
+                or not source_connection.in_transaction):
+            raise ValueError("condition borrowed transaction requires its actual original writer")
+        ledger = borrowed_condition.ledger
+        databases = source_connection.execute("PRAGMA database_list").fetchall()
+        if (ledger.path != settings.ledger_path or ledger._closed
+                or ledger._file_identity() != ledger._identity
+                or len(databases) != 1 or databases[0][1:] != ("main", str(ledger.path))):
+            raise ValueError("condition borrowed transaction differs from the physical original ledger")
+        if (require_verified_condition_activation(borrowed_condition.activation, producer_manifest.service_kind.value) != producer
+                or require_verified_price_alert_activation(
+                    verify_price_role_manifest(producer_manifest, runtime_root=runtime_root),
+                    producer_manifest.service_kind.value) != ledger._binding):
+            raise ValueError("condition borrowed owner differs from its verified composed producer")
+        ledger._verify_installation(source_connection)
+        return activation, borrowed_condition, policy
     if borrowed is not None:
         if borrowed.path != settings.ledger_path:
             raise ValueError("condition peer cannot borrow another original ledger")
@@ -466,6 +530,34 @@ def apply_condition_role_scope(
         # A generation race cannot preserve a partially read set of live heads.
         authority = None
         scopes = []
+    builtin, builtin_inspection = None, None
+    try:
+        from rquant.monitor_builtin_runtime import (
+            inspect_original_builtin_delivery, read_installed_builtin_settings,
+            read_original_builtin_capture, require_builtin_delivery_inspection,
+            verify_builtin_capture_authority,
+        )
+
+        installed = read_installed_builtin_settings(peer.activation)
+        if installed is not None and installed.enabled:
+            if (source.evaluation_contract_sha256 != condition_evaluation_contract_sha256()
+                    or source.routing_policy_sha256 != condition_routing_contract_sha256()):
+                raise ValueError("builtin original owner code changed")
+            captures = []
+            for reference in installed.sources:
+                try:
+                    if reference.producer_commit != peer.binding.producer_commit:
+                        raise ValueError("builtin capture has a different installed producer")
+                    capture_authority = verify_builtin_capture_authority(reference.manifest_path,
+                        runtime_root=reference.runtime_root, expected_sha256=reference.manifest_sha256,
+                        expected_commit=reference.producer_commit)
+                    captures.append(read_original_builtin_capture(capture_authority, read_at=now))
+                except (OSError, ValueError, RuntimeError):
+                    pass
+            builtin_inspection = inspect_original_builtin_delivery(peer, captured=tuple(captures), inspected_at=now)
+            builtin = require_builtin_delivery_inspection(builtin_inspection)
+    except (OSError, ValueError, RuntimeError):
+        builtin, builtin_inspection = None, None
     value = ConditionAlertDeliveryAuthorityInput(
         rules=authority,
         scopes=tuple(scopes),
@@ -474,6 +566,7 @@ def apply_condition_role_scope(
         notifier_manifest_sha256=own.producer_manifest_sha256,
         delivery_enabled=own.delivery_enabled,
         inspected_at=now,
+        builtin=builtin,
     )
     current = store.condition_alert_delivery_authority()
     store.apply_condition_alert_delivery_authority(
@@ -481,4 +574,5 @@ def apply_condition_role_scope(
         activation=activation,
         expected_revision=0 if current is None else current.authority_revision,
         applied_at=now,
+        builtin_inspection=builtin_inspection,
     )

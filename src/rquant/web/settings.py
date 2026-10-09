@@ -14,7 +14,7 @@ import re
 from collections.abc import Mapping
 from datetime import timedelta
 from pathlib import Path
-from typing import Self
+from typing import Literal, Self
 
 from pydantic import (
     BaseModel,
@@ -100,6 +100,7 @@ def parse_bind(value: str) -> tuple[str, int]:
 
 class WebSettings(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
+    collaboration_mode: Literal["legacy", "enforced"] = "legacy"
 
     serving_root: Path
     bind: str = DEFAULT_BIND
@@ -120,6 +121,10 @@ class WebSettings(BaseModel):
     catalog_samples_file: Path | None = None
     nl_openai_api_key: SecretStr | None = None
     nl_openai_model: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
+    ai_users: frozenset[str] = frozenset()
+    ai_socket_path: Path | None = None
+    ai_service_uid: StrictInt | None = Field(default=None, ge=0)
+    ai_shared_gid: StrictInt | None = Field(default=None, ge=0)
     ack_admission_socket_path: Path | None = None
     watchlist_admission_socket_path: Path | None = None
     price_alert_admission_socket_path: Path | None = None
@@ -140,6 +145,8 @@ class WebSettings(BaseModel):
     strategy_authoring_socket_path: Path | None = None
     strategy_authoring_service_uid: StrictInt | None = Field(default=None, ge=0)
     strategy_authoring_shared_gid: StrictInt | None = Field(default=None, ge=0)
+    strategy_promotion_enabled: bool = False
+    strategy_promotion_users: frozenset[str] = frozenset()
     paper_portfolio_enabled: bool = False
     paper_portfolio_users: frozenset[str] = frozenset()
     paper_portfolio_socket_path: Path | None = None
@@ -170,6 +177,12 @@ class WebSettings(BaseModel):
     proxy_proof_file: Path | None = None
     log_admin_users: frozenset[str] = frozenset()
     lab_control_users: frozenset[str] = frozenset()
+    minute_replay_installation: Path | None = None
+    minute_replay_expected_code_sha: str | None = Field(default=None, pattern=r"^[0-9a-f]{40}$")
+    minute_study_projection_authority: Path | None = None
+    minute_study_projection_expected_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    minute_native_report_runtime: Path | None = None
+    minute_native_report_expected_code_sha: str | None = Field(default=None, pattern=r"^[0-9a-f]{40}$")
     unit_log_socket_path: Path | None = None
     unit_log_service_uid: StrictInt | None = None
     unit_log_web_group_gid: StrictInt | None = None
@@ -181,6 +194,41 @@ class WebSettings(BaseModel):
 
     @model_validator(mode="after")
     def validate_sources_and_ingress(self) -> Self:
+        if (self.minute_study_projection_authority is None) != (self.minute_study_projection_expected_sha256 is None):
+            raise ValueError("minute study projection requires its privately pinned complete authority SHA")
+        if self.minute_study_projection_authority is not None:
+            if self.minute_replay_installation is None:
+                raise ValueError("minute study projection requires the original minute installation")
+            path = self.minute_study_projection_authority
+            if not path.is_absolute() or path != Path(os.path.abspath(path)):
+                raise ValueError("minute study projection authority must be absolute and normalized")
+        if (self.minute_native_report_runtime is None) != (self.minute_native_report_expected_code_sha is None):
+            raise ValueError("native minute reports and actual runtime code must be configured together")
+        if self.minute_native_report_runtime is not None:
+            path = self.minute_native_report_runtime
+            if not path.is_absolute() or path != Path(os.path.abspath(path)):
+                raise ValueError("native minute report locator must be absolute and normalized")
+        if (self.minute_replay_installation is None) != (self.minute_replay_expected_code_sha is None):
+            raise ValueError("minute installation and actual runtime code must be configured together")
+        if self.minute_replay_installation is not None:
+            path = self.minute_replay_installation
+            if not path.is_absolute() or path != Path(os.path.abspath(path)):
+                raise ValueError("minute installation path must be absolute and normalized")
+        ai_fields = (self.ai_socket_path, self.ai_service_uid, self.ai_shared_gid)
+        if self.ai_users or any(value is not None for value in ai_fields):
+            if not self.ai_users or self.ingress_socket_path is None or self.proxy_proof_file is None:
+                raise ValueError("AI requires the original private ingress, proof and exact users")
+            if any(value is not None for value in ai_fields):
+                if not all(value is not None for value in ai_fields):
+                    raise ValueError("AI private socket and IDs must be complete")
+                path = self.ai_socket_path
+                if not path.is_absolute() or Path(os.path.abspath(path)) != path or len(os.fsencode(path)) >= 100:
+                    raise ValueError("AI socket must be short and canonical")
+                if self.ai_service_uid == os.geteuid():
+                    raise ValueError("AI service UID must differ from Web UID")
+                others = (self.ingress_socket_path, self.screen_query_socket_path, self.task_control_socket_path, self.price_alert_admission_socket_path, self.paper_portfolio_socket_path, self.research_query_socket_path, self.research_query_save_socket_path, self.factor_admission_socket_path, self.factor_run_admission_socket_path, self.factor_tracking_admission_socket_path, self.strategy_authoring_socket_path, self.unit_log_socket_path, self.watchlist_admission_socket_path, self.ack_admission_socket_path)
+                if any(other is not None and path.parent == other.parent for other in others):
+                    raise ValueError("AI socket requires a separate original-owner directory")
         task_fields = (self.task_control_socket_path, self.task_control_service_uid, self.task_control_web_group_gid)
         if self.task_control_enabled or self.task_unit_run_users or self.task_scheduling_admin_users or any(value is not None for value in task_fields):
             if self.ingress_socket_path is None or self.proxy_proof_file is None or not (self.task_unit_run_users or self.task_scheduling_admin_users):
@@ -256,6 +304,9 @@ class WebSettings(BaseModel):
             self.strategy_authoring_service_uid,
             self.strategy_authoring_shared_gid,
         )
+        if self.strategy_promotion_enabled or self.strategy_promotion_users:
+            if self.collaboration_mode != "enforced" or self.ingress_socket_path is None or self.proxy_proof_file is None or not self.strategy_promotion_users:
+                raise ValueError("manual promotion requires original enforced roles, private identity and exact operators")
         if (
             self.strategy_authoring_enabled
             or self.strategy_authoring_users
@@ -561,6 +612,7 @@ class WebSettings(BaseModel):
 
     @field_validator(
         "log_admin_users",
+        "ai_users",
         "lab_control_users",
         "factor_editor_users",
         "factor_run_users",
@@ -568,6 +620,7 @@ class WebSettings(BaseModel):
         "research_query_users",
         "screen_query_users",
         "strategy_authoring_users",
+        "strategy_promotion_users",
         "paper_portfolio_users",
         "task_unit_run_users",
         "task_scheduling_admin_users",
@@ -668,6 +721,36 @@ class WebSettings(BaseModel):
     def from_env(cls, environ: Mapping[str, str] | None = None, *, bind: str | None = None) -> Self:
         source = os.environ if environ is None else environ
         values: dict[str, object] = {"serving_root": Path(serving_root_from_env(source))}
+        native_reports = source.get("RQUANT_MINUTE_NATIVE_REPORT_RUNTIME", "").strip()
+        if native_reports:
+            values["minute_native_report_runtime"] = Path(native_reports)
+            values["minute_native_report_expected_code_sha"] = source.get("RQUANT_RUNTIME_COMMIT", "").strip() or None
+        minute_installation = source.get("RQUANT_MINUTE_REPLAY_INSTALLATION", "").strip()
+        if minute_installation:
+            values["minute_replay_installation"] = Path(minute_installation)
+            values["minute_replay_expected_code_sha"] = source.get("RQUANT_RUNTIME_COMMIT", "").strip() or None
+        projection = source.get("RQUANT_MINUTE_STUDY_PROJECTION_AUTHORITY", "").strip()
+        if projection:
+            values["minute_study_projection_authority"] = Path(projection)
+        projection_sha = source.get("RQUANT_MINUTE_STUDY_PROJECTION_SHA256", "").strip()
+        if projection_sha:
+            values["minute_study_projection_expected_sha256"] = projection_sha
+        values["collaboration_mode"] = source.get("RQUANT_WEB_COLLABORATION_MODE", "legacy")
+        raw_ai_users = source.get("RQUANT_WEB_AI_USERS", "").strip()
+        if raw_ai_users:
+            names = tuple(name.strip() for name in raw_ai_users.split(","))
+            if any(not name for name in names) or len(set(names)) != len(names):
+                raise ValueError("AI users must be exact distinct names")
+            values["ai_users"] = frozenset(names)
+        raw_ai_socket = source.get("RQUANT_WEB_AI_SOCKET", "").strip()
+        if raw_ai_socket:
+            values["ai_socket_path"] = Path(raw_ai_socket)
+        for suffix, field in (("SERVICE_UID", "ai_service_uid"), ("SHARED_GID", "ai_shared_gid")):
+            raw_ai_id = source.get("RQUANT_WEB_AI_" + suffix, "").strip()
+            if raw_ai_id:
+                if re.fullmatch(r"[0-9]{1,10}", raw_ai_id) is None:
+                    raise ValueError("AI peer IDs require bounded nonnegative integers")
+                values[field] = int(raw_ai_id)
         raw = source.get("RQUANT_WEB_TASK_CONTROL_ENABLED", "").strip().lower()
         if raw:
             if raw not in {"true", "false"}:
@@ -719,6 +802,17 @@ class WebSettings(BaseModel):
                 raise ValueError("strategy authoring users must be exact distinct names")
             values["strategy_authoring_users"] = frozenset(names)
         raw = source.get("RQUANT_WEB_STRATEGY_AUTHORING_SOCKET", "").strip()
+        promotion_enabled = source.get("RQUANT_WEB_STRATEGY_PROMOTION_ENABLED", "").strip()
+        if promotion_enabled:
+            if promotion_enabled not in {"true", "false"}:
+                raise ValueError("strategy promotion enabled must be true or false")
+            values["strategy_promotion_enabled"] = promotion_enabled == "true"
+        promotion_users = source.get("RQUANT_WEB_STRATEGY_PROMOTION_USERS", "").strip()
+        if promotion_users:
+            names = tuple(name.strip() for name in promotion_users.split(","))
+            if any(not name for name in names) or len(set(names)) != len(names):
+                raise ValueError("strategy promotion users must be exact distinct names")
+            values["strategy_promotion_users"] = frozenset(names)
         if raw:
             values["strategy_authoring_socket_path"] = Path(raw)
         for suffix, field in (

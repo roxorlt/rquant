@@ -819,6 +819,28 @@ def build_dataset_snapshot_binding(
             end_date=end_date,
             input_hash=snapshot.table_watermarks.get("portfolio_input_hash", ""),
         )
+    if snapshot.strategy_name == "minute_runtime_replay":
+        from rquant.minute_backtest_producer import verify_minute_snapshot_source
+
+        if selected_dependencies != strategy_execution_dependencies("minute_runtime_replay"):
+            raise ValueError("minute requires its exact single-table source contract")
+        if eligibility_resolution is not None or lake_artifacts is not None or ts_codes is not None:
+            raise ValueError("minute source cannot include filters or unrelated source artifacts")
+        verify_minute_snapshot_source(source_connection, code_sha=snapshot.code_commit,
+            start_date=start_date, end_date=end_date, full_input_hash=snapshot.table_watermarks.get("minute_full_input_hash", ""),
+            seed_hash=snapshot.table_watermarks.get("minute_seed_hash", ""),
+            core_input_hash=snapshot.table_watermarks.get("minute_core_input_hash", ""), as_of=snapshot.as_of_time)
+    if snapshot.strategy_name == "minute_parameter_replay":
+        from rquant.minute_backtest_parameter_producer import verify_minute_parameter_snapshot_source
+
+        if selected_dependencies != strategy_execution_dependencies("minute_parameter_replay"):
+            raise ValueError("parameter minute requires its exact single-table source contract")
+        if eligibility_resolution is not None or lake_artifacts is not None or ts_codes is not None:
+            raise ValueError("parameter minute source cannot include filters or unrelated artifacts")
+        verify_minute_parameter_snapshot_source(source_connection, code_sha=snapshot.code_commit,
+            start_date=start_date, end_date=end_date, full_input_hash=snapshot.table_watermarks.get("minute_full_input_hash", ""),
+            seed_hash=snapshot.table_watermarks.get("minute_seed_hash", ""),
+            core_input_hash=snapshot.table_watermarks.get("minute_core_input_hash", ""), as_of=snapshot.as_of_time)
     artifacts: list[DatasetSnapshotArtifact] = []
     if eligibility_resolution is not None:
         if eligibility_resolution.strategy_id != snapshot.strategy_name:
@@ -1269,7 +1291,7 @@ class ResearchExecutionSession:
                 )
             )
             session_path = self._session_dir / f"{index:06d}-{artifact.file_hash}.parquet"
-            if published.strategy_name in {"factor_eval", "portfolio_backtest", "paper_reconcile", "paper_backtest_band"}:
+            if published.strategy_name in {"factor_eval", "portfolio_backtest", "paper_reconcile", "paper_backtest_band", "minute_runtime_replay", "minute_parameter_replay"}:
                 # Factor reads need an independent inode throughout one lease.
                 shutil.copyfile(path, session_path)
             else:
@@ -1285,6 +1307,42 @@ class ResearchExecutionSession:
 
         for table_name, paths in by_table.items():
             readers = ", ".join(_quoted_literal(str(path)) for path in paths)
+            if published.strategy_name == "minute_runtime_replay":
+                from rquant.minute_backtest_producer import read_minute_formal_input_table
+                from rquant.minute_backtest_publication_contracts import MINUTE_FORMAL_CONTRACT, MINUTE_FORMAL_TABLE
+
+                if (published.dependency_contract_version != MINUTE_FORMAL_CONTRACT or len(published.artifacts) != 1
+                    or table_name != MINUTE_FORMAL_TABLE or len(paths) != 1
+                    or published.artifacts[0].primary_key != ("input_hash",)
+                    or published.artifacts[0].row_count != 1
+                    or published.eligibility_resolution_hash is not None):
+                    raise ValueError("minute execution session requires its exact verified single artifact")
+                columns = tuple((row[0], row[1]) for row in self._conn.execute(
+                    f"DESCRIBE SELECT * FROM read_parquet([{readers}], hive_partitioning=false)").fetchall())
+                if columns != (("input_hash", "VARCHAR"), ("payload", "VARCHAR")):
+                    raise ValueError("minute verified artifact requires exact typed columns")
+                self._conn.execute("CREATE TABLE minute_runtime_replay_input (input_hash VARCHAR PRIMARY KEY, payload VARCHAR NOT NULL)")
+                self._conn.execute(f"INSERT INTO minute_runtime_replay_input SELECT * FROM read_parquet([{readers}], hive_partitioning=false)")
+                read_minute_formal_input_table(self._conn)
+                continue
+            if published.strategy_name == "minute_parameter_replay":
+                from rquant.minute_backtest_parameter_contracts import PARAMETER_SOURCE_CONTRACT, PARAMETER_SOURCE_TABLE
+                from rquant.minute_backtest_parameter_source import read_minute_parameter_input_table
+
+                if (published.dependency_contract_version != PARAMETER_SOURCE_CONTRACT or len(published.artifacts) != 1
+                    or table_name != PARAMETER_SOURCE_TABLE or len(paths) != 1
+                    or published.artifacts[0].primary_key != ("input_hash",)
+                    or published.artifacts[0].row_count != 1
+                    or published.eligibility_resolution_hash is not None):
+                    raise ValueError("parameter minute session requires its exact verified single artifact")
+                columns = tuple((row[0], row[1]) for row in self._conn.execute(
+                    f"DESCRIBE SELECT * FROM read_parquet([{readers}], hive_partitioning=false)").fetchall())
+                if columns != (("input_hash", "VARCHAR"), ("payload", "VARCHAR")):
+                    raise ValueError("parameter minute artifact requires exact typed columns")
+                self._conn.execute("CREATE TABLE minute_parameter_replay_input (input_hash VARCHAR PRIMARY KEY, payload VARCHAR NOT NULL)")
+                self._conn.execute(f"INSERT INTO minute_parameter_replay_input SELECT * FROM read_parquet([{readers}], hive_partitioning=false)")
+                read_minute_parameter_input_table(self._conn)
+                continue
             self._conn.execute(
                 f"""
                 CREATE VIEW {_quoted_identifier(table_name)} AS

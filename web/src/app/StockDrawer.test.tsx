@@ -10,6 +10,32 @@ import { metaHandler, server } from "@/test/server";
 import { StockDrawer } from "./StockDrawer";
 
 beforeEach(() => {
+  server.use(
+    http.get("*/api/v1/ai/capabilities", () =>
+      HttpResponse.json({
+        serving: metaEnvelope().serving,
+        data: {
+          available: false,
+          can_generate: false,
+          can_prepare_backtest: false,
+          message: "调用尚未启用。",
+        },
+      }),
+    ),
+    http.get("*/api/v1/ai/news/:code", ({ params }) =>
+      HttpResponse.json({
+        serving: metaEnvelope().serving,
+        data: {
+          stock_code: params.code,
+          state: "missing",
+          content: null,
+          coverage: [],
+          nightly_enabled: false,
+          message: "原文尚未采集。",
+        },
+      }),
+    ),
+  );
   Object.defineProperty(navigator, "locks", {
     configurable: true,
     value: {

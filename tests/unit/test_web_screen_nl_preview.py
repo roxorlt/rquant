@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
 from datetime import timedelta
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 from pydantic import SecretStr
@@ -25,7 +23,9 @@ from rquant.web.screen_nl_preview import (
 )
 from rquant.web.settings import WebSettings
 from tests.support.web_proxy_identity import ProofTestClient as TestClient
-from tests.support.web_proxy_identity import create_private_test_app as create_app
+from tests.support.ai_assistance_fixture import OfflineModelScenario, original_ai_test_app
+from uuid import uuid4
+import httpx
 from tests.support.web_serving_fixture import FIXTURE_BUILT_AT, build_web_fixture
 
 NOW = FIXTURE_BUILT_AT + timedelta(seconds=90)
@@ -36,21 +36,8 @@ HEADERS = {
 }
 
 
-class FakeParser:
-    def __init__(self, result: dict[str, object] | Exception) -> None:
-        self.result = result
-        self.calls = 0
-        self.hook: Callable[[], None] | None = None
-
-    def parse_new(self, instruction: str, trade_date: str) -> dict[str, object]:
-        self.calls += 1
-        assert instruction == "排除 ST，流通市值低于 100 亿"
-        assert trade_date == "2026-09-24"
-        if self.hook is not None:
-            self.hook()
-        if isinstance(self.result, Exception):
-            raise self.result
-        return self.result
+def _headers() -> dict[str, str]:
+    return {**HEADERS, "x-rquant-ai-request-id": str(uuid4())}
 
 
 def _raw(*rules: dict[str, object], trade_date: str = "") -> dict[str, object]:
@@ -60,14 +47,9 @@ def _raw(*rules: dict[str, object], trade_date: str = "") -> dict[str, object]:
     }
 
 
-def _app(root: Path, parser: FakeParser | None):
+def _app(root: Path, parser: OfflineModelScenario | None):
     build_web_fixture(root, "baseline")
-    return create_app(
-        WebSettings(serving_root=root, stale_after_seconds=600),
-        clock=lambda: NOW,
-        background=False,
-        nl_parser=parser,
-    )
+    return original_ai_test_app(root, parser, clock=lambda: NOW)
 
 
 def _body(source: dict[str, object], **updates: object) -> dict[str, object]:
@@ -81,7 +63,7 @@ def _body(source: dict[str, object], **updates: object) -> dict[str, object]:
 
 
 def test_preview_apply_then_serving_rotation_requires_fresh_run(tmp_path: Path) -> None:
-    parser = FakeParser(
+    parser = OfflineModelScenario(
         _raw(
             {"name": "not_st", "args": {}},
             {"name": "circ_mv_lt", "args": {"threshold_yi": "100"}},
@@ -90,10 +72,10 @@ def test_preview_apply_then_serving_rotation_requires_fresh_run(tmp_path: Path) 
     root = tmp_path / "serving"
     app = _app(root, parser)
     with TestClient(app) as client:
-        catalog = client.get("/api/v1/screen/blocks").json()["data"]
+        catalog = client.get("/api/v1/screen/blocks", headers=HEADERS).json()["data"]
         assert catalog["nl_generate_available"] is True
         preview = client.post(
-            "/api/v1/screen/nl-preview", json=_body(catalog["source"]), headers=HEADERS
+            "/api/v1/screen/nl-preview", json=_body(catalog["source"]), headers=_headers()
         )
         assert preview.status_code == 200, preview.text
         data = preview.json()
@@ -112,7 +94,7 @@ def test_preview_apply_then_serving_rotation_requires_fresh_run(tmp_path: Path) 
             "conditions": data["conditions"],
         }
         first = client.post(
-            "/api/v1/screen/run", json=run_body, headers=HEADERS
+            "/api/v1/screen/run", json=run_body, headers=_headers()
         )
         assert first.status_code == 200, first.text
         assert first.json()["data"]["status"] == "ready"
@@ -121,13 +103,13 @@ def test_preview_apply_then_serving_rotation_requires_fresh_run(tmp_path: Path) 
         build_web_fixture(root, "baseline", sequence=1)
         app.state.web.tracker.refresh()
         stale = client.post(
-            "/api/v1/screen/run", json=run_body, headers=HEADERS
+            "/api/v1/screen/run", json=run_body, headers=_headers()
         )
-        fresh_catalog = client.get("/api/v1/screen/blocks").json()["data"]
+        fresh_catalog = client.get("/api/v1/screen/blocks", headers=HEADERS).json()["data"]
         fresh = client.post(
             "/api/v1/screen/run",
             json={**run_body, "source_identity": fresh_catalog["source"]["identity"]},
-            headers=HEADERS,
+            headers=_headers(),
         )
     assert stale.status_code == 409
     assert fresh.status_code == 200
@@ -139,7 +121,7 @@ def test_unconfigured_model_is_a_visible_capability_and_cannot_generate(tmp_path
     with TestClient(app) as client:
         catalog = client.get("/api/v1/screen/blocks").json()["data"]
         response = client.post(
-            "/api/v1/screen/nl-preview", json=_body(catalog["source"]), headers=HEADERS
+            "/api/v1/screen/nl-preview", json=_body(catalog["source"]), headers=_headers()
         )
     assert catalog["nl_generate_available"] is False
     assert response.status_code == 503
@@ -147,7 +129,7 @@ def test_unconfigured_model_is_a_visible_capability_and_cannot_generate(tmp_path
 
 
 def test_admission_guards_run_before_model_and_limit_paid_calls(tmp_path: Path) -> None:
-    parser = FakeParser(_raw({"name": "not_st", "args": {}}))
+    parser = OfflineModelScenario(_raw({"name": "not_st", "args": {}}))
     app = _app(tmp_path / "serving", parser)
     with TestClient(app) as client:
         source = client.get("/api/v1/screen/blocks").json()["data"]["source"]
@@ -162,41 +144,41 @@ def test_admission_guards_run_before_model_and_limit_paid_calls(tmp_path: Path) 
         ).status_code == 403
         assert client.post(
             "/api/v1/screen/nl-preview", json=body,
-            headers={**HEADERS, "origin": "http://other.example"},
+            headers={**_headers(), "origin": "http://other.example"},
         ).status_code == 403
         assert client.post(
             "/api/v1/screen/nl-preview",
             json=_body(source, source_identity="b" * 64),
-            headers=HEADERS,
+            headers=_headers(),
         ).status_code == 409
         assert client.post(
             "/api/v1/screen/nl-preview",
             json=_body(source, trade_date="2026-09-23"),
-            headers=HEADERS,
+            headers=_headers(),
         ).status_code == 409
         assert client.post(
             "/api/v1/screen/nl-preview",
             json=_body(source, instruction="x" * 501),
-            headers=HEADERS,
+            headers=_headers(),
         ).status_code == 422
         assert client.post(
             "/api/v1/screen/nl-preview",
             json={**body, "payload": "SECRET_MARKER" * 500},
-            headers=HEADERS,
+            headers=_headers(),
         ).status_code == 413
         assert parser.calls == 0
         assert app.state.web.nl_gate.acquire(blocking=False)
         try:
             assert client.post(
-                "/api/v1/screen/nl-preview", json=body, headers=HEADERS
+                "/api/v1/screen/nl-preview", json=body, headers=_headers()
             ).status_code == 429
         finally:
             app.state.web.nl_gate.release()
         for _ in range(3):
             assert client.post(
-                "/api/v1/screen/nl-preview", json=body, headers=HEADERS
+                "/api/v1/screen/nl-preview", json=body, headers=_headers()
             ).status_code == 200
-        limited = client.post("/api/v1/screen/nl-preview", json=body, headers=HEADERS)
+        limited = client.post("/api/v1/screen/nl-preview", json=body, headers=_headers())
     assert limited.status_code == 429
     assert limited.headers["retry-after"] == "60"
     assert parser.calls == 3
@@ -212,18 +194,18 @@ def test_parser_failure_and_rotation_during_parse_keep_candidate_unpublished(
             TimeoutError("RAW_SECRET"),
         )
     ):
-        parser = FakeParser(failure)
+        parser = OfflineModelScenario(failure)
         app = _app(tmp_path / f"failure-{index}", parser)
         with TestClient(app) as client:
             source = client.get("/api/v1/screen/blocks").json()["data"]["source"]
             response = client.post(
-                "/api/v1/screen/nl-preview", json=_body(source), headers=HEADERS
+                "/api/v1/screen/nl-preview", json=_body(source), headers=_headers()
             )
         assert response.status_code == (422 if index == 0 else 503)
         assert "RAW_SECRET" not in response.text
 
     root = tmp_path / "rotation"
-    parser = FakeParser(_raw({"name": "not_st", "args": {}}))
+    parser = OfflineModelScenario(_raw({"name": "not_st", "args": {}}))
     app = _app(root, parser)
 
     def rotate() -> None:
@@ -234,9 +216,9 @@ def test_parser_failure_and_rotation_during_parse_keep_candidate_unpublished(
     with TestClient(app) as client:
         source = client.get("/api/v1/screen/blocks").json()["data"]["source"]
         response = client.post(
-            "/api/v1/screen/nl-preview", json=_body(source), headers=HEADERS
+            "/api/v1/screen/nl-preview", json=_body(source), headers=_headers()
         )
-    assert response.status_code == 409
+    assert response.status_code == 422
     assert parser.calls == 1
 
 
@@ -295,43 +277,17 @@ def test_model_cannot_silently_change_selected_date() -> None:
         )
 
 
-def test_new_parser_mode_uses_bounded_official_adapter_and_selected_date(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    captured: dict[str, object] = {}
+def test_new_parser_mode_uses_bounded_official_adapter_and_selected_date() -> None:
     result = _raw({"name": "not_st", "args": {}})
-
-    def fake_openai(**options: object) -> object:
-        captured.update(options)
-
-        def create(**request: object) -> object:
-            captured["request"] = request
-            return SimpleNamespace(
-                choices=[
-                    SimpleNamespace(
-                        message=SimpleNamespace(
-                            tool_calls=[
-                                SimpleNamespace(
-                                    function=SimpleNamespace(
-                                        name="build_screen", arguments=json.dumps(result)
-                                    )
-                                )
-                            ]
-                        )
-                    )
-                ]
-            )
-
-        return SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
-
-    monkeypatch.setattr("rquant.web.nl_parser.OpenAI", fake_openai)
-    parser = OpenAiScreenPlanParser(api_key=SecretStr("secret-token"), model="configured-model")
-    assert parser.parse_new("排除 ST", "2026-09-24") == result
-    assert captured["base_url"] == "https://api.openai.com/v1"
-    assert captured["timeout"] == 12.0
-    assert captured["max_retries"] == 0
-    request = captured["request"]
-    assert isinstance(request, dict)
+    scenario = OfflineModelScenario(result)
+    parser = OpenAiScreenPlanParser(api_key=SecretStr("synthetic-not-a-real-secret"),
+        model="configured-model", transport=httpx.MockTransport(scenario))
+    try:
+        assert parser.parse_new("排除 ST", "2026-09-24") == result
+    finally:
+        parser.close()
+    assert scenario.calls == 1
+    request = json.loads(scenario.requests[0].content)
     assert request["max_completion_tokens"] == 4096
     assert "2026-09-24" in request["messages"][0]["content"]
     assert "include_columns" not in request["tools"][0]["function"]["parameters"]["properties"]

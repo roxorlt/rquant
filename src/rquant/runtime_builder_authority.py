@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
-from pydantic import Field, StrictInt, field_validator, model_validator
+from pydantic import Field, StrictBool, StrictInt, field_validator, model_validator
 
 from rquant.live_contracts import BatchQualityStatus, LiveChannel
 from rquant.live_spool import LiveBatchSpool
@@ -20,6 +20,7 @@ from rquant.paper_execution_constraint_producer import (
 from rquant.paper_execution_constraints import PaperExecutionConstraintPublisher
 from rquant.reference_data_registry import ReadonlyReferenceRegistry
 from rquant.runtime_contracts import RuntimeContractModel
+from rquant.runtime_health_authority import RuntimeHealthOpsBinding
 from rquant.runtime_service_control import (
     RuntimeServicePlane,
     RuntimeServiceSpec,
@@ -37,6 +38,7 @@ if TYPE_CHECKING:
     from rquant.runtime_artifact_terminal_lifecycle import ProductionArtifactTerminalLifecycle
     from rquant.runtime_health_authority import RuntimeHealthControlSource
     from rquant.serving_read_models import ServingProjectionPayload
+    from rquant.strategy_promotion_projection import StrategyPromotionProjectionReader
 
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 
@@ -86,6 +88,16 @@ class RuntimeHealthSourceSettings(RuntimeContractModel):
 class RuntimeHealthPublisherSettings(RuntimeContractModel):
     authority_root: Path
     sources: tuple[RuntimeHealthSourceSettings, ...] = Field(min_length=1)
+    ops_binding: RuntimeHealthOpsBinding | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    details_enabled: StrictBool = Field(default=False, exclude_if=lambda value: value is False)
+
+    @model_validator(mode="after")
+    def require_detail_binding(self) -> RuntimeHealthPublisherSettings:
+        if self.details_enabled and self.ops_binding is None:
+            raise ValueError("enabled health details require the original signed Ops binding")
+        return self
 
     @field_validator("authority_root")
     @classmethod
@@ -105,6 +117,8 @@ class LabJobsPublisherSettings(RuntimeContractModel):
     backfill_plan_job_state_path: Path | None = None
     data_center_state_path: Path | None = None
     data_center_policy_path: Path | None = None
+    collaboration_outbox_path: Path | None = Field(default=None, exclude_if=lambda value: value is None)
+    collaboration_roles_path: Path | None = Field(default=None, exclude_if=lambda value: value is None)
     authority_root: Path
     max_jobs: StrictInt = Field(default=100, gt=0, le=100)
     eta_completed_limit: StrictInt = Field(default=256, ge=3, le=256)
@@ -119,6 +133,8 @@ class LabJobsPublisherSettings(RuntimeContractModel):
         "backfill_plan_job_state_path",
         "data_center_state_path",
         "data_center_policy_path",
+        "collaboration_outbox_path",
+        "collaboration_roles_path",
         "authority_root",
     )
     @classmethod
@@ -131,10 +147,17 @@ class LabJobsPublisherSettings(RuntimeContractModel):
 
     @model_validator(mode="after")
     def require_page_reader(self) -> LabJobsPublisherSettings:
-        if (self.data_center_state_path is None)!=(self.data_center_policy_path is None):
-            raise ValueError('data center paths require paired settings')
+        if (self.collaboration_outbox_path is None) != (self.collaboration_roles_path is None):
+            raise ValueError("collaboration requires paired original journal and role paths")
+        if self.collaboration_roles_path is not None and (
+            self.collaboration_roles_path.name != "roles.json"
+            or self.collaboration_roles_path.parent != self.collaboration_outbox_path.parent
+        ):
+            raise ValueError("roles must be beside the original private PageControl journal")
+        if (self.data_center_state_path is None) != (self.data_center_policy_path is None):
+            raise ValueError("data center paths require paired settings")
         if self.data_center_state_path is not None and self.research_metadata_path is None:
-            raise ValueError('data center state requires original research metadata')
+            raise ValueError("data center state requires original research metadata")
         if self.audit_report_path is not None and self.research_metadata_path is None:
             raise ValueError("audit_report_path requires research_metadata_path")
         if (self.audit_report_job_state_path is None) != (self.audit_report_job_directory is None):
@@ -272,6 +295,7 @@ def runtime_health_publisher_builder(
         from rquant.runtime_generation_lineage import previous_spec_identities
         from rquant.runtime_health_authority import (
             RuntimeHealthSourceReader,
+            RuntimeHealthTrustedOpsProvider,
             runtime_health_state_identity,
         )
         from rquant.runtime_serving_authority import ServingSourceAuthorityPublisher
@@ -281,6 +305,10 @@ def runtime_health_publisher_builder(
         reader = RuntimeHealthSourceReader(
             sources=sources,
             serving_service_id=manifest.service_id,
+            details_enabled=settings.details_enabled,
+            ops_provider=None
+            if not settings.details_enabled
+            else RuntimeHealthTrustedOpsProvider(settings.ops_binding),
             # A role that exits under #217 leaves a stopped heartbeat carrying the spec
             # fingerprint of the generation it ran under. These are the fingerprints our
             # own earlier generations published, so such a heartbeat can be superseded
@@ -376,11 +404,23 @@ def lab_jobs_publisher_builder(
                 ) -> tuple[ServingProjectionPayload, ...]:
                     return page_source(observed_at).projections
 
+            collaboration, collaboration_audit_reader = None, None
+            if settings.collaboration_outbox_path is not None:
+                from rquant.collaboration_commands import PageControlRoleAuthority
+                from rquant.serving_page_projection_source import _ReadonlyPageControlAuditReader
+
+                collaboration = PageControlRoleAuthority(mode="enforced",
+                    roles_path=settings.collaboration_roles_path, clock=clock)
+                collaboration.bind_outbox(settings.collaboration_outbox_path)
+                collaboration.read_state()
+                collaboration_audit_reader = _ReadonlyPageControlAuditReader(settings.collaboration_outbox_path)
             reader = LabJobsServingSourceReader(
                 reader=lab_job_reader,
                 max_jobs=settings.max_jobs,
                 eta_completed_limit=settings.eta_completed_limit,
                 page_projection_reader=page_projection_reader,
+                collaboration_audit_reader=collaboration_audit_reader,
+                collaboration=collaboration,
             )
 
             def step() -> RuntimeStepResult:
@@ -418,6 +458,7 @@ def promotions_publisher_builder(
     ) = None,
     private_experiment_reader: Callable[[datetime], tuple[ServingProjectionPayload, ...]]
     | None = None,
+    strategy_promotion_reader: StrategyPromotionProjectionReader | None = None,
 ) -> RuntimeServiceBuilder:
     def build(manifest: RuntimeServiceManifest) -> RuntimeServiceStep:
         if manifest.service_kind is not RuntimeServiceKind.PROMOTIONS_PUBLISHER:
@@ -442,6 +483,7 @@ def promotions_publisher_builder(
                 limit=settings.max_decisions,
                 include_experiments=True,
                 private_experiment_reader=private_experiment_reader,
+                strategy_promotion_reader=strategy_promotion_reader,
             )
             publisher = ServingSourceAuthorityPublisher(
                 root=settings.authority_root,

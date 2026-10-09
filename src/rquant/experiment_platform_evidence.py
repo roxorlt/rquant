@@ -7,6 +7,9 @@ from collections.abc import Callable
 from datetime import date, datetime
 from decimal import Decimal
 from statistics import mean, stdev
+from typing import TYPE_CHECKING
+from uuid import UUID
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 from pydantic import Field
@@ -29,12 +32,13 @@ from rquant.overfit import (
     probabilistic_sharpe_ratio_per_period,
 )
 from rquant.overfit_pbo import CSCVInput, CSCVPBOResult, calculate_cscv_pbo
-from rquant.perf import annualized_turnover, performance_summary, relative_metrics
-from rquant.perf.trades import summarize_round_trips
+from rquant.perf import annualized_turnover, performance_summary, relative_metrics, return_distribution, rolling_metrics, streaks
+from rquant.perf.trades import Fill, build_round_trips, summarize_round_trips
 from rquant.portfolio_backtest_artifact import PortfolioReadResult, PortfolioResultReader
 from rquant.portfolio_backtest_models import (
     PortfolioBacktestConfig,
     PortfolioPerformance,
+    PortfolioRollingMetric,
     PortfolioSourceManifest,
 )
 from rquant.runtime_contracts import RuntimeContractModel, canonical_sha256
@@ -50,8 +54,18 @@ from rquant.web.experiment_platform_models import (
     ExperimentResultData,
     ExperimentStatisticsData,
     ExperimentTemplateResultIdentity,
+    ExperimentNativeResultIdentity,
+    ExperimentNativeParameter,
 )
 from rquant.web.models.backtests import PortfolioEditableConfig
+from rquant.minute_backtest_formal import PreparedMinuteRequest
+from rquant.minute_backtest_runner import MinuteRuntimeReplayResult
+from rquant.paper_contracts import PaperCostProvenanceState
+from rquant.strategy_promotion_contracts import NativeMinuteConfiguration
+
+if TYPE_CHECKING:
+    from rquant.minute_backtest_artifact import MinuteSealedReplayReader, MinuteSealedReplayResult
+    from rquant.strategy_spec import StrategySpec
 
 _SUMMARY = (
     ("total_return", "净收益", "percent"),
@@ -65,6 +79,37 @@ _SUMMARY = (
     ("win_rate", "胜率", "percent"),
     ("payoff_ratio", "盈亏比", "number"),
 )
+
+
+def verify_native_preparation(
+    prepared: PreparedMinuteRequest, configuration: NativeMinuteConfiguration
+) -> None:
+    """Bind the original full C6 preparation to the native target, never its wrapper."""
+    frozen, selection = prepared.frozen, configuration.selection
+    target, native, runtime = selection.target, frozen.native_registration, frozen.runtime
+    if (
+        native.logical_id, native.version, native.fingerprint, native.record_hash,
+        native.spec.spec_fingerprint, native.spec.parameter_fingerprint,
+        runtime.owner_id, runtime.strategy.strategy_id, runtime.strategy.strategy_version,
+        runtime.strategy.registration_fingerprint, runtime.strategy.executable_fingerprint,
+        runtime.strategy.candidate_schema_fingerprint,
+        runtime.execution_profile.profile_hash, runtime.start_date, runtime.end_date,
+    ) != (
+        target.strategy_id, target.head.version, target.head.registration_fingerprint,
+        target.head.record_hash, target.head.spec_fingerprint, target.parameter_fingerprint,
+        target.owner_id, target.strategy_id, target.head.version,
+        native.fingerprint, native.executable_fingerprint, native.candidate_schema_fingerprint,
+        selection.profile_hash, configuration.start_date, configuration.end_date,
+    ):
+        raise PermissionError("native preparation differs from its exact owner/definition/profile/interval")
+    if (
+        frozen != prepared.published.receipt.frozen
+        or prepared.registration != frozen.wrapper_registration
+        or prepared.registration.logical_id != "minute_runtime_replay"
+        or prepared.formal_plan.preregistered_at < frozen.provenance.published_at
+        or prepared.formal_plan.spec.cost_model_fingerprint != target.cost_fingerprint
+    ):
+        raise PermissionError("native original wrapper/publication/cost binding differs")
 
 
 def unavailable_experiment_metrics() -> tuple[ExperimentMetric, ...]:
@@ -152,6 +197,153 @@ def result_from_sealed(
         sealed=sealed,
         execution="portfolio-backtest@1",
     )
+
+
+def native_curve_and_performance(
+    replay: MinuteRuntimeReplayResult, dates: tuple[date, ...],
+) -> tuple[tuple[ExperimentCurvePoint, ...], PortfolioPerformance, dict[date, tuple[float, float, float]]]:
+    """Adapt actual close NAV and broker fills using the original statistics."""
+    if replay.status != "complete" or replay.daily_status != "complete":
+        raise ValueError("native original result is incomplete")
+    if not dates or tuple(day.trade_date for day in replay.daily_valuations) != dates:
+        raise ValueError("native complete original calendar differs")
+    profile = replay.execution_profile
+    orders = {order.order_id: order for order in replay.orders}
+    fills = []
+    notional = {day: [0.0, 0.0] for day in dates}
+    for original in replay.fills:
+        order = orders.get(original.order_id)
+        day = original.executed_at.astimezone(ZoneInfo("Asia/Shanghai")).date()
+        if (
+            order is None or day not in notional
+            or original.cost_provenance_state is PaperCostProvenanceState.LEGACY_UNKNOWN
+            or original.total_fees is None
+            or original.cost_spec_id != profile.execution_costs.cost_spec_id
+        ):
+            raise ValueError("native fill lost its original order/date/full cost provenance")
+        side = order.side.value.lower()
+        fills.append(Fill(day, order.ts_code, "未分类", side,
+            original.quantity, float(original.price), float(original.total_fees)))
+        notional[day][0 if side == "buy" else 1] += float(original.quantity * original.price)
+    previous = profile.initial_cash
+    curves, turnover_rows = [], {}
+    for day in replay.daily_valuations:
+        if day.status != "complete" or day.account is None or previous <= 0:
+            raise ValueError("native complete original NAV is unavailable")
+        curves.append(ExperimentCurvePoint(trade_date=day.trade_date,
+            nav=float(day.account.nav / profile.initial_cash), daily_return=float(day.account.nav / previous - 1)))
+        turnover_rows[day.trade_date] = (*notional[day.trade_date], float(previous))
+        previous = day.account.nav
+    points = tuple(curves)
+    daily = _series(points)
+    ledger = build_round_trips(fills)
+    rolling = rolling_metrics(daily, window=20)
+    turnover = annualized_turnover(*(
+        pd.Series([turnover_rows[day][i] for day in dates], index=pd.to_datetime(dates), dtype=float)
+        for i in range(3)))
+    performance = PortfolioPerformance(summary=performance_summary(daily), benchmark_summary=None,
+        relative=None, annualized_turnover=turnover,
+        rolling=tuple(PortfolioRollingMetric(trade_date=day,
+            volatility=None if pd.isna(rolling.iloc[i].volatility) else float(rolling.iloc[i].volatility),
+            sharpe=None if pd.isna(rolling.iloc[i].sharpe) else float(rolling.iloc[i].sharpe)) for i, day in enumerate(dates)),
+        round_trips=ledger.closed, round_trip_analysis=summarize_round_trips(ledger.closed),
+        distribution=return_distribution(daily, edges=(min(-1.0, float(daily.min())), 0.0, max(1.0, float(daily.max())))),
+        streaks=streaks(daily))
+    return points, performance, turnover_rows
+
+
+def native_parameter_projection(spec: StrategySpec) -> tuple[ExperimentNativeParameter, ...]:
+    from rquant.strategy_catalog_source import _PARAMETER_LABELS, _display_parameter
+
+    parameters = spec.model_dump(mode="json")["parameters"]
+    return tuple(ExperimentNativeParameter(name=name, value=value, label=_PARAMETER_LABELS[name],
+        display_value=_display_parameter(name, tuple(value) if name == "allowed_boards" and isinstance(value, list) else value))
+        for name, value in sorted(parameters.items()))
+
+
+def result_from_native(
+    fact: ExperimentAttemptFact, family: ExperimentFamilyFact,
+    sealed: MinuteSealedReplayResult, prepared: PreparedMinuteRequest,
+) -> ExperimentResultData:
+    config = fact.configuration
+    if not isinstance(config, NativeMinuteConfiguration):
+        raise ValueError("native sealed result needs its native configuration")
+    verify_native_preparation(prepared, config)
+    if (
+        (sealed.job_id, sealed.spec_hash, sealed.manifest_hash, sealed.complete_result_hash)
+        != (fact.child.job_id, fact.spec_hash, fact.manifest_hash, fact.result_hash)
+        or sealed.formal_plan != prepared.formal_plan
+        or sealed.result.publication != prepared.published.receipt
+        or sealed.full_input_hash != fact.input_hash
+        or (fact.owner, fact.family_id, fact.child.owner, fact.child.family_id,
+            fact.attempt.spec.hypothesis_family)
+        != (family.owner, family.family_id, family.owner, family.family_id, family.family_id)
+    ):
+        raise PermissionError("native full seal differs from its original owner/family/spec/source")
+    protocol = family.request.protocol
+    window = protocol.frozen_outer_test_range if family.phase == "outer" else None
+    expected_window = window or type(protocol.train_range)(start_date=protocol.train_range.start_date,
+        end_date=protocol.validation_range.end_date)
+    if (config.start_date, config.end_date) != (expected_window.start_date, expected_window.end_date):
+        raise ValueError("native full result includes a forbidden phase")
+    runtime = prepared.frozen.runtime
+    dates = tuple(day for day in runtime.market_calendar.open_dates if config.start_date <= day <= config.end_date)
+    points, performance, turnover_rows = native_curve_and_performance(sealed.result.replay, dates)
+    phases = (("outer", window),) if window else (("training", protocol.train_range), ("validation", protocol.validation_range))
+    projected = []
+    for name, interval in phases:
+        selected = tuple(point for point in points if interval.start_date <= point.trade_date <= interval.end_date)
+        expected = tuple(day for day in dates if interval.start_date <= day <= interval.end_date)
+        if not expected or tuple(point.trade_date for point in selected) != expected:
+            raise ValueError("native phase lacks its complete original calendar")
+        summary = performance_summary(_series(selected))
+        trips = tuple(trip for trip in performance.round_trips
+            if interval.start_date <= trip.entry_date <= trip.exit_date <= interval.end_date)
+        stats = summarize_round_trips(trips).overall
+        turnover = annualized_turnover(*(
+            pd.Series([turnover_rows[day][i] for day in expected], index=pd.to_datetime(expected), dtype=float)
+            for i in range(3)))
+        projected.append(ExperimentPhasePerformance(phase=name, window=interval, summary=summary,
+            metrics=_metrics(summary, trade_count=stats.count, turnover=turnover,
+                win_rate=stats.win_rate, payoff_ratio=stats.payoff_ratio), curves=selected,
+            message="验证承接训练末账户。" if name == "validation" else None))
+    stats = performance.round_trip_analysis.overall
+    return ExperimentResultData(experiment_id=fact.attempt.spec.experiment_id, family_id=family.family_id,
+        job_id=sealed.job_id, phase=family.phase, configuration=config,
+        result_hash=sealed.complete_result_hash, input_hash=sealed.full_input_hash,
+        spec_hash=sealed.spec_hash, manifest_hash=sealed.manifest_hash,
+        basis_hash=canonical_sha256({"window": expected_window, "phase": family.phase,
+            "execution": "minute_runtime_replay@2", "profile": runtime.execution_profile.model_dump(mode="json"),
+            "source": (config.source_key, config.source_version), "calendar": runtime.market_calendar.content_sha256,
+            "code": runtime.producer_commit}), performance=performance, phases=tuple(projected),
+        curves=points, metrics=_metrics(performance.summary, trade_count=stats.count,
+            turnover=performance.annualized_turnover, win_rate=stats.win_rate, payoff_ratio=stats.payoff_ratio),
+        native=ExperimentNativeResultIdentity(target=config.selection.target, profile_hash=config.selection.profile_hash,
+            core_input_hash=sealed.core_input_hash, seed_hash=sealed.seed_hash, content_hash=sealed.result_hash,
+            source_kind=sealed.source_kind, execution_costs=runtime.execution_profile.execution_costs,
+            parameters=native_parameter_projection(prepared.frozen.native_registration.spec),
+            execution_profile=runtime.execution_profile))
+
+
+def read_native_preparation_result(
+    reader: MinuteSealedReplayReader, prepared: PreparedMinuteRequest, *,
+    job_id: UUID, configuration: NativeMinuteConfiguration, as_of: datetime,
+) -> MinuteSealedReplayResult | None:
+    from rquant.minute_backtest_artifact import MinuteSealedReplayReader
+    from rquant.minute_backtest_producer import MinuteReplayCatalog
+
+    if type(reader) is not MinuteSealedReplayReader:
+        raise TypeError("native result needs the original complete C6 reader")
+    verify_native_preparation(prepared, configuration)
+    # The original private preparation supplies the full physical reference. Policy
+    # permission comes from the installed reader, never from that preparation.
+    catalog = MinuteReplayCatalog(entries=(prepared.published.reference,),
+        installed_policies=reader.catalog.installed_policies)
+    current = MinuteSealedReplayReader(reader=reader.reader, artifact_reader=reader.artifact_reader,
+        submission_facade=reader.submission_facade, catalog=catalog)
+    target = configuration.selection.target
+    return current.read(job_id, owner_id=target.owner_id, native_id=target.strategy_id,
+        native_version=target.head.version, as_of=as_of)
 
 
 def _project_complete_result(
@@ -343,12 +535,30 @@ def read_experiment_result(
     fact: ExperimentAttemptFact,
     family: ExperimentFamilyFact,
     *,
-    results: PortfolioResultReader,
+    results: PortfolioResultReader | None,
     authority: ExperimentPrivateResultAuthority,
     template_results: StrategyTemplateSealedResultReader | None = None,
+    native_results: MinuteSealedReplayReader | None = None,
 ) -> ExperimentResultData:
     if fact.result_hash is None or fact.attempt.status.value not in ("executed", "succeeded"):
         raise ValueError("selected experiment has no completed sealed result")
+    if isinstance(fact.configuration, NativeMinuteConfiguration):
+        from rquant.minute_backtest_artifact import MinuteSealedReplayReader
+
+        if type(native_results) is not MinuteSealedReplayReader:
+            raise ValueError("original complete native result reader is unavailable")
+        job = native_results.reader.get_job(fact.child.job_id)
+        if job is None:
+            raise ValueError("native original job is unavailable")
+        original = authority.authorize(job, fact.owner).prepared
+        if not isinstance(original, PreparedMinuteRequest):
+            raise PermissionError("native result lost its original prepared request")
+        sealed_native = read_native_preparation_result(native_results, original,
+            job_id=fact.child.job_id, configuration=fact.configuration,
+            as_of=max(job.updated_at, fact.attempt.completed_at or job.updated_at))
+        if sealed_native is None:
+            raise ValueError("native original complete seal is unavailable")
+        return result_from_native(fact, family, sealed_native, original)
     if family.request.template is not None:
         if template_results is None:
             raise ValueError("original private template result reader is unavailable")
@@ -363,6 +573,8 @@ def read_experiment_result(
         job = template_results.reader.get_job(fact.child.job_id)
         prepared = authority.authorize(job, fact.owner).prepared
         return result_from_template(fact, family, sealed_template, prepared)
+    if results is None:
+        raise ValueError("original portfolio result reader is unavailable")
     sealed = results.read(
         fact.child.job_id,
         expected_result_hash=fact.result_hash,

@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     )
     from rquant.lab_daemon import AttestedLabRuntimeGuard
     from rquant.lab_worker import LabResourceAuthorityManifest
+    from rquant.minute_backtest_installation import InstalledMinuteReplay
     from rquant.runtime_code_attestation import CodeTrustEvidence
     from rquant.runtime_deployment_bundle import RuntimeDeploymentReceipt
     from rquant.runtime_deployment_profile import LabHighWaterRuntimeProfile
@@ -1324,6 +1325,15 @@ def cmd_monitor(args: argparse.Namespace) -> int:
     """启动盘中实时监控。"""
     from rquant.monitor import run_monitor
 
+    binding = getattr(args, "monitor_builtin_binding", None)
+    if binding is not None:
+        from rquant.monitor_builtin_runtime import load_original_builtin_source_outlet
+
+        outlet = load_original_builtin_source_outlet(Path(binding))
+        if not outlet.captures("original_monitor"):
+            raise ValueError("monitor source binding does not cover its actual source")
+        setup_logging()
+        return run_monitor(interval=args.interval, builtin_outlet=outlet)
     setup_logging()
     return run_monitor(interval=args.interval)
 
@@ -3345,6 +3355,16 @@ def cmd_surge_watch(args: argparse.Namespace) -> int:
 
     from rquant.surge_watch import SurgeConfig, run_simulate, run_surge_watch
 
+    outlet = None
+    binding = getattr(args, "monitor_builtin_binding", None)
+    if binding is not None:
+        from rquant.monitor_builtin_runtime import load_original_builtin_source_outlet
+
+        if args.simulate:
+            raise ValueError("historical simulation cannot publish a live builtin source")
+        outlet = load_original_builtin_source_outlet(_Path(binding))
+        if not outlet.captures("original_surge") or not outlet.captures("original_pulse"):
+            raise ValueError("surge source binding must retain its same-batch Surge and Pulse sources")
     setup_logging()
     config = SurgeConfig(
         k_cum=args.k_cum,
@@ -3356,6 +3376,9 @@ def cmd_surge_watch(args: argparse.Namespace) -> int:
     )
     if args.simulate:
         return run_simulate(_Path(args.simulate), dry_run=args.dry_run, config=config)
+    if outlet is not None:
+        return run_surge_watch(dry_run=args.dry_run, force_session=args.force_session, config=config,
+            max_ticks=args.max_ticks, builtin_outlet=outlet)
     return run_surge_watch(
         dry_run=args.dry_run,
         force_session=args.force_session,
@@ -5178,12 +5201,32 @@ def cmd_lab_launchd_uninstall(args: argparse.Namespace) -> int:
     return 0
 
 
+def _load_installed_minute_runtime(args: argparse.Namespace, settings: Settings, code_sha: str) -> InstalledMinuteReplay | None:
+    from rquant.minute_backtest_installation import MINUTE_INSTALLATION_ENV, load_minute_replay_installation
+
+    selected = getattr(args, "minute_replay_installation", None) or os.environ.get(MINUTE_INSTALLATION_ENV)
+    if not selected:
+        return None
+    installed = load_minute_replay_installation(Path(selected), expected_code_sha=code_sha)
+    profile = installed.profile
+    if (profile.runtime_root, profile.lab_jobs_path, profile.command_spool_path, profile.final_artifact_root,
+        profile.metadata_identity.source_path, profile.research_lake_root) != (
+        settings.lab_runtime_dir_resolved, settings.lab_jobs_path_resolved, settings.lab_job_command_dir_resolved,
+        settings.lab_final_artifact_dir_resolved, settings.research_readonly_db_path_resolved,
+        settings.research_lake_dir_resolved):
+        raise ValueError("minute installed paths differ from original daemon settings")
+    return installed
+
+
 def cmd_lab_scheduler(args: argparse.Namespace) -> int:
     """Run the durable Strategy Lab control-plane scheduler."""
     code_sha, runtime_guard, runtime_identity, runtime_identity_guard = (
         _establish_lab_runtime_identity(args)
     )
     from rquant.config import settings
+    minute_installation = _load_installed_minute_runtime(args, settings, code_sha)
+    if minute_installation is not None:
+        runtime_identity_guard = minute_installation.guard(runtime_identity_guard)
     from rquant.job_center_authority import resolve_current_job_center_authority_binding
     from rquant.lab_artifact_protocol import LabArtifactCommitSpool
     from rquant.lab_artifacts import LabJobArtifactStore
@@ -5349,6 +5392,8 @@ def cmd_lab_scheduler(args: argparse.Namespace) -> int:
                     artifact_commit_root=settings.lab_artifact_commit_dir_resolved, final_artifact_root=settings.lab_final_artifact_dir_resolved)
                     if getattr(args, "task_center_profile", None) is not None else None,
                 production_mode=settings.app_env == "prod")
+            from rquant.lab_job_center import ExperimentLifecycleCoordinator
+
             scheduler = LabScheduler(
                 store=store,
                 spool=LabCommandSpool(
@@ -5365,7 +5410,8 @@ def cmd_lab_scheduler(args: argparse.Namespace) -> int:
                 claim_worker_ids=settings.lab_scheduler_worker_id_list,
                 shard_lease_seconds=settings.lab_scheduler_shard_lease_seconds,
                 max_reports_per_tick=settings.lab_scheduler_max_reports_per_tick,
-                adapter_registry=default_strategy_job_adapter_registry(),
+                adapter_registry=default_strategy_job_adapter_registry() if minute_installation is None else minute_installation.registry,
+                lifecycle_synchronizer=None if minute_installation is None else ExperimentLifecycleCoordinator(minute_installation.commands),
                 max_plans_per_tick=settings.lab_scheduler_max_plans_per_tick,
                 max_claims_per_tick=settings.lab_scheduler_max_claims_per_tick,
                 max_claim_authority_per_tick=(settings.lab_scheduler_max_claim_authority_per_tick),
@@ -5706,6 +5752,9 @@ def cmd_lab_worker(args: argparse.Namespace) -> int:
         _establish_lab_runtime_identity(args)
     )
     from rquant.config import settings
+    minute_installation = _load_installed_minute_runtime(args, settings, code_sha)
+    if minute_installation is not None:
+        runtime_identity_guard = minute_installation.guard(runtime_identity_guard)
     from rquant.lab_claim_finalizer_runtime import FinalizerRolloutPhase, FinalizerRolloutStore
     from rquant.lab_daemon import (
         LabDaemonConfigurationError,
@@ -5745,7 +5794,7 @@ def cmd_lab_worker(args: argparse.Namespace) -> int:
         settings=settings,
         resource_admission=resource_admission,
     )
-    shard_runtime_manifest = build_builtin_shard_runtime_manifest(
+    shard_runtime_manifest = minute_installation.shard_manifest if minute_installation is not None else build_builtin_shard_runtime_manifest(
         catalog_path=settings.research_readonly_db_path_resolved,
         forbidden_paths=(
             settings.duckdb_path,
@@ -5863,6 +5912,9 @@ def cmd_lab_finalizer(args: argparse.Namespace) -> int:
         _establish_lab_runtime_identity(args)
     )
     from rquant.config import settings
+    minute_installation = _load_installed_minute_runtime(args, settings, code_sha)
+    if minute_installation is not None:
+        runtime_identity_guard = minute_installation.guard(runtime_identity_guard)
     from rquant.lab_artifact_protocol import LabArtifactCommitSpool
     from rquant.lab_artifacts import LabJobArtifactStore
     from rquant.lab_daemon import (
@@ -5944,7 +5996,7 @@ def cmd_lab_finalizer(args: argparse.Namespace) -> int:
                 verified_code_sha_provider=runtime_identity_guard,
                 finalizer_authority_key_provider=keyring.signing_key,
                 finalizer_authority_verification_key_provider=keyring.verification_key,
-                adapter_registry=default_strategy_job_adapter_registry(),
+                adapter_registry=default_strategy_job_adapter_registry() if minute_installation is None else minute_installation.registry,
             )
             daemon = LabFinalizerDaemon(
                 reader=reader,
@@ -6736,6 +6788,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     monitor_p = sub.add_parser("monitor", help="启动盘中实时监控")
+    monitor_p.add_argument("--monitor-builtin-binding", type=Path, default=None,
+        help="已冻结的原盯盘事件来源绑定（默认关闭）")
     monitor_p.add_argument(
         "--interval",
         type=int,
@@ -8197,6 +8251,8 @@ def build_parser() -> argparse.ArgumentParser:
         "surge-watch",
         help="每分钟爆量推送（云端 systemd timer 09:25 拉起，15:02 自退）",
     )
+    sw_p.add_argument("--monitor-builtin-binding", type=Path, default=None,
+        help="已冻结的原爆量和异动来源绑定（默认关闭）")
     sw_p.add_argument(
         "--dry-run",
         action="store_true",
@@ -8477,6 +8533,9 @@ def build_parser() -> argparse.ArgumentParser:
     task_snapshot_p.add_argument("--authority-root", type=Path, required=True)
     task_snapshot_p.add_argument("--producer-commit", type=_parse_commit_sha, required=True)
     task_snapshot_p.add_argument("--task-center-profile", type=Path, default=None)
+    task_snapshot_p.add_argument(
+        "--observe-host-cpu", action="store_true", help="沿原采集窗口记录全主机 CPU"
+    )
 
     lab_run_p = sub.add_parser(
         "lab-run",
@@ -8554,6 +8613,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_formal_runtime_bootstrap_arguments(lab_scheduler_p)
     lab_scheduler_p.add_argument("--runtime-deployment-root", type=Path, required=True)
     lab_scheduler_p.add_argument("--task-center-profile", type=Path, default=None)
+    lab_scheduler_p.add_argument("--minute-replay-installation", type=Path, default=None)
     _add_formal_runtime_deployment_arguments(lab_scheduler_p)
     lab_scheduler_p.add_argument(
         "--once",
@@ -8572,6 +8632,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_formal_runtime_bootstrap_arguments(lab_worker_p)
     lab_worker_p.add_argument("--task-center-profile", type=Path, default=None)
+    lab_worker_p.add_argument("--minute-replay-installation", type=Path, default=None)
     _add_formal_runtime_deployment_arguments(lab_worker_p)
     lab_worker_p.add_argument(
         "--worker-id",
@@ -8672,6 +8733,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="只读聚合已完成分片并发布完整结果 commit",
     )
     _add_formal_runtime_bootstrap_arguments(lab_finalizer_p)
+    lab_finalizer_p.add_argument("--minute-replay-installation", type=Path, default=None)
     _add_formal_runtime_deployment_arguments(lab_finalizer_p)
     lab_finalizer_p.add_argument(
         "--once",
@@ -8736,7 +8798,9 @@ def cmd_ops_task_snapshot(args: argparse.Namespace) -> int:
             raise ValueError("task snapshot profile has no exact original unit journal identity")
         source = TaskUnitRunSource(identity=profile.unit_journal_identity)
     pointer = collect_and_publish_ops_tasks(manifest_path=args.manifest, manifest_public_key_pem=key,
-        authority_root=args.authority_root, producer_commit=args.producer_commit, collector=OpsStatusCollector(), run_source=source)
+        authority_root=args.authority_root, producer_commit=args.producer_commit,
+        collector=OpsStatusCollector(observe_host_cpu=getattr(args, "observe_host_cpu", False)),
+        run_source=source)
     print(pointer.model_dump_json())
     return 0
 
@@ -8774,6 +8838,11 @@ def main() -> int:
 
     # The web API reads only the Serving root and never `.env` (its unit hides the file), so
     # `web-serve` / `web-openapi` are handed to `rquant.web.cli` the same way.
+    if sys.argv[1:2] == ["minute-historical"]:
+        from rquant.minute_historical_cli import main as historical_main
+
+        return historical_main(sys.argv[2:])
+
     if sys.argv[1:2] == ["research-query"]:
         from rquant.research_query.cli import main as query_main
 

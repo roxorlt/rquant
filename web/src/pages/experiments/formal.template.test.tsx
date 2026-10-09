@@ -78,16 +78,16 @@ it("实验选择原模板精确版本，保留完整规则且只提交有型身�
   await userEvent.type(screen.getByLabelText("实验名称"), "规则参数研究");
   await userEvent.click(screen.getByRole("button", { name: "开始搜索" }));
   await waitFor(() => expect(bodies).toHaveLength(1));
-  expect(bodies[0]?.request.template).toEqual({
+  const request = bodies[0]?.request;
+  if (!request || !("base_config" in request)) {
+    throw new Error("期望组合策略实验请求");
+  }
+  expect(request.template).toEqual({
     strategy_id: template.detail.data.strategy_id,
     head: template.detail.data.head,
   });
-  expect(bodies[0]?.request.base_config.weight_rule).toEqual(
-    template.detail.data.rules.weight_rule,
-  );
-  expect(bodies[0]?.request.base_config.rebalance_rule).toEqual(
-    template.detail.data.rules.rebalance_rule,
-  );
+  expect(request.base_config.weight_rule).toEqual(template.detail.data.rules.weight_rule);
+  expect(request.base_config.rebalance_rule).toEqual(template.detail.data.rules.rebalance_rule);
   expect(JSON.stringify(bodies[0])).not.toContain("owner_id");
   expect(JSON.stringify(bodies[0])).not.toContain("metadata_identity");
 });

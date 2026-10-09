@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from typing import Literal, Self
+from collections.abc import Mapping
 from uuid import UUID
 
 from pydantic import Field, field_validator, model_validator
 
 from rquant.paper_portfolio_models import PaperPortfolioStateIdentity, Sha256
-from rquant.paper_research import PaperResearchAdapterCatalog, PaperResearchRunParameters
+from rquant.paper_research import PaperResearchAdapterCatalog, NativePaperResearchAdapterCatalog, PaperResearchCatalog, PaperResearchRunParameters
+from rquant.strategy_authoring_commands import StrategyAuthoringIdentity
 from rquant.research_run_spec import ResearchRunSpec
 from rquant.runtime_contracts import AwareUtcDatetime, RuntimeContractModel
 
@@ -39,11 +41,25 @@ class RunPaperPortfolioResearch(RuntimeContractModel):
 
 class OwnedRunPaperPortfolioResearch(RunPaperPortfolioResearch):
     owner_id: str
-    metadata_identity: PaperPortfolioStateIdentity
+    metadata_identity: PaperPortfolioStateIdentity | StrategyAuthoringIdentity
     accepted_at: AwareUtcDatetime
-    catalog: PaperResearchAdapterCatalog
+    catalog: PaperResearchCatalog
     spec: ResearchRunSpec
     plan_hash: Sha256
+
+    @model_validator(mode="before")
+    @classmethod
+    def original_source_identity(cls, value: object) -> object:
+        if isinstance(value, Mapping):
+            catalog = value.get("catalog")
+            native = isinstance(catalog, NativePaperResearchAdapterCatalog) or (
+                isinstance(catalog, Mapping) and catalog.get("contract") == "native-paper-research-catalog/v1")
+            identity = value.get("metadata_identity")
+            if identity is not None:
+                raw = identity.model_dump(mode="python") if isinstance(identity, RuntimeContractModel) else identity
+                kind = StrategyAuthoringIdentity if native else PaperPortfolioStateIdentity
+                return {**value, "metadata_identity": kind.model_validate(raw)}
+        return value
 
     def original(self) -> RunPaperPortfolioResearch:
         return RunPaperPortfolioResearch.model_validate(self.model_dump(mode="python", exclude={"owner_id", "metadata_identity", "accepted_at", "catalog", "spec", "plan_hash"}))
@@ -54,6 +70,8 @@ class OwnedRunPaperPortfolioResearch(RunPaperPortfolioResearch):
         from rquant.runtime_contracts import canonical_sha256
 
         parameters = PaperResearchRunParameters.model_validate({item.name: item.value for item in self.spec.parameters.arguments})
+        if isinstance(self.catalog, NativePaperResearchAdapterCatalog) and type(self.metadata_identity) is not StrategyAuthoringIdentity:
+            raise ValueError("native owned analysis requires its original strategy owner metadata")
         if (self.spec.parameters.strategy_name, parameters.request_id, parameters.owner_id, parameters.account_id,
                 parameters.configuration_fingerprint, self.catalog.metadata_identity) != (
                 self.task_name, self.command_id, self.owner_id, self.account_id, self.configuration_fingerprint, self.metadata_identity):

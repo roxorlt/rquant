@@ -83,12 +83,12 @@ class AckAdmission:
                     serving_ready=serving_ready,
                     now=now,
                     stale_after=self.stale_after,
+                    actor_id=command.actor_id,
                 )
             finally:
                 cursor.close()
             if (
-                alerts.summary.state != "ready"
-                or alerts.activated_at is None
+                alerts.activated_at is None
                 or not any(
                     event.alert_id == command.alert_id
                     and alerts.is_eligible(event.source, event.alert_id)
@@ -117,6 +117,7 @@ class _AdmissionGeneration:
     def __init__(self, manifest: Any, cursor: Any) -> None:
         self.manifest = manifest
         self.cursor = cursor
+        self.fallback_detail = None
 
 
 def _peer_uid(connection: socket.socket) -> int:

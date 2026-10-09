@@ -38,6 +38,15 @@ _PAPER_TABLE_DEPENDENCIES = (
     StrategyTableDependency(dataset_id="paper_research_input", table_name="paper_research_input"),
 )
 
+MINUTE_FORMAL_CONTRACT_VERSION = "minute-runtime-replay-input/v2"
+_MINUTE_FORMAL_TABLE_DEPENDENCIES = (
+    StrategyTableDependency(dataset_id="minute_runtime_replay_input", table_name="minute_runtime_replay_input"),
+)
+MINUTE_PARAMETER_CONTRACT_VERSION = "minute-parameter-replay-input/v1"
+_MINUTE_PARAMETER_TABLE_DEPENDENCIES = (
+    StrategyTableDependency(dataset_id="minute_parameter_replay_input", table_name="minute_parameter_replay_input"),
+)
+
 
 _FACTOR_TABLE_DEPENDENCIES = (
     StrategyTableDependency(
@@ -139,6 +148,14 @@ class StrategyExecutionDependencies(_DependencyModel):
             self.strategy_id in {"paper_reconcile", "paper_backtest_band"}
             and self.contract_version == "paper-research-input/v1"
             and self.materialized_tables == _PAPER_TABLE_DEPENDENCIES
+        ) or (
+            self.strategy_id == "minute_runtime_replay"
+            and self.contract_version == MINUTE_FORMAL_CONTRACT_VERSION
+            and self.materialized_tables == _MINUTE_FORMAL_TABLE_DEPENDENCIES
+        ) or (
+            self.strategy_id == "minute_parameter_replay"
+            and self.contract_version == MINUTE_PARAMETER_CONTRACT_VERSION
+            and self.materialized_tables == _MINUTE_PARAMETER_TABLE_DEPENDENCIES
         ) or self.template_definition is not None
         if not self.lake_datasets and not materialized_only:
             raise ValueError(
@@ -198,6 +215,12 @@ _COMMON_DAILY_TABLES = (
 
 
 STRATEGY_EXECUTION_DEPENDENCIES: dict[str, StrategyExecutionDependencies] = {
+    "minute_parameter_replay": StrategyExecutionDependencies(strategy_id="minute_parameter_replay",
+        contract_version=MINUTE_PARAMETER_CONTRACT_VERSION, lake_datasets=(),
+        materialized_tables=_MINUTE_PARAMETER_TABLE_DEPENDENCIES),
+    "minute_runtime_replay": StrategyExecutionDependencies(strategy_id="minute_runtime_replay",
+        contract_version=MINUTE_FORMAL_CONTRACT_VERSION, lake_datasets=(),
+        materialized_tables=_MINUTE_FORMAL_TABLE_DEPENDENCIES),
     "paper_reconcile": StrategyExecutionDependencies(strategy_id="paper_reconcile", contract_version="paper-research-input/v1",
                                                       lake_datasets=(), materialized_tables=_PAPER_TABLE_DEPENDENCIES),
     "paper_backtest_band": StrategyExecutionDependencies(strategy_id="paper_backtest_band", contract_version="paper-research-input/v1",

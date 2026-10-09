@@ -142,6 +142,13 @@ describe("任务中心原请求和全局调度", () => {
       can_control_scheduling: true,
       can_recover_units: true,
       can_recover_scheduling: true,
+      monitor_builtins: [],
+      notifier_mode: {
+        available: false,
+        can_request: false,
+        can_set_live: false,
+        note: "通知模式暂无法核验。",
+      },
       scheduling: {
         available: true,
         desired_version: 0,

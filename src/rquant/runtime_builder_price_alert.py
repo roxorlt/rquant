@@ -13,6 +13,8 @@ from pydantic import Field, ValidationError, field_validator
 from rquant.condition_alert_runtime_contracts import ConditionAlertActivationSettings
 from rquant.live_contracts import CurrentPointer, LiveChannel
 from rquant.live_spool import LiveBatchSpool, _secure_read_regular_file
+from rquant.monitor_builtin_runtime import MonitorBuiltinCaptureSettings, MonitorBuiltinOwnerSettings
+from rquant.notifier_operator import MonitorControlReadSettings
 from rquant.price_alert_runtime import evaluate_price_alert_round
 from rquant.price_alert_runtime_contracts import (
     PriceAlertActivationSettings,
@@ -112,6 +114,9 @@ def verify_price_role_manifest(
 
 
 class PriceAlertRuntimeSettings(RuntimeContractModel):
+    monitor_control: MonitorControlReadSettings | None = None
+    monitor_builtin: MonitorBuiltinOwnerSettings | None = None
+    monitor_builtin_capture: MonitorBuiltinCaptureSettings | None = None
     condition_alert_runtime: ConditionAlertActivationSettings | None = None
     condition_alert_runtime_manifest_path: Path | None = None
     condition_alert: ConditionEvaluationSettings | None = None
@@ -179,9 +184,7 @@ def price_alert_runtime_builder(
             raise ValueError("price runtime requires the five-second actual live role")
         activation = verify_price_role_manifest(manifest, runtime_root=runtime_root)
         binding = require_price_alert_activation(activation, "evaluation")
-        settings = PriceAlertRuntimeSettings.model_validate(
-            manifest.model_dump(mode="python")["settings"]
-        )
+        settings = PriceAlertRuntimeSettings.model_validate_json(canonical_json_bytes(manifest.model_dump(mode="json")["settings"]))
         if settings.frequency_policy.sha256 != binding.frequency_policy_sha256:
             raise ValueError("price runtime cooldown policy differs from its actual contract")
         for path in (
@@ -329,7 +332,7 @@ def price_alert_runtime_builder(
                 if "price_alert:waiting_cadence" in result.degraded_reasons:
                     return result
                 try:
-                    condition_step()
+                    condition_result = condition_step()
                 except Exception:
                     return result.model_copy(
                         update={
@@ -343,6 +346,12 @@ def price_alert_runtime_builder(
                             )
                         }
                     )
+                if settings.monitor_builtin is not None and settings.monitor_builtin.enabled:
+                    return result.model_copy(update={
+                        "processed_count": result.processed_count + condition_result.processed_count,
+                        "source_generations": {**dict(result.source_generations), **dict(condition_result.source_generations)},
+                        "degraded_reasons": tuple(sorted(set(result.degraded_reasons + condition_result.degraded_reasons))),
+                    })
                 return result
 
             combined_step.condition_store = condition_step.condition_store

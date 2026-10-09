@@ -10,8 +10,8 @@ import {
   isFundamentalScreenField,
   type ScreenBlock,
   type ScreenOption,
-  type ScreenRunRequest,
   type ScreenQueryReadData,
+  type ScreenRunRequest,
 } from "@/api/screen";
 import { useCurrentMeta } from "@/api/useMeta";
 import { Button, SideDrawer, Tip } from "@/ui";
@@ -125,14 +125,36 @@ function ScreenPoolPublication({
   const editor = usePoolEditor();
   const pools = usePools();
   const stage = publicationStatus(journal, editor, pools, meta.data?.serving.generation_id);
-  const proof = evidence?.find((item) => item.preset_name === `user/${journal.body.base_name}` && item.definition_version === journal.version);
+  const proof = evidence?.find(
+    (item) =>
+      item.preset_name === `user/${journal.body.base_name}` &&
+      item.definition_version === journal.version,
+  );
   const published = pools.data?.pools.find((item) => item.key === `user/${journal.body.base_name}`);
-  const confirmed = stage === "result" && proof != null && proof.unknown_count === 0 && published?.result.trade_date === proof.trade_date && published.result.hit_count === proof.hit_count;
+  const confirmed =
+    stage === "result" &&
+    proof != null &&
+    proof.unknown_count === 0 &&
+    published?.result.trade_date === proof.trade_date &&
+    published.result.hit_count === proof.hit_count;
   return (
     <div className="screen-save-publication">
       <p>{stage === "request" ? "等待规则发布" : "规则已发布"}</p>
       <p>{confirmed ? "结果已按新规则更新" : "等待日终结果确认"}</p>
-      {proof ? <div><p>{proof.trade_date} · 命中 {proof.hit_count} 只 · 待确认 {proof.unknown_count} 只</p><Tip content={`输入 ${proof.content_digest}；结果 ${proof.result_version}；排名 ${proof.member_rank_digest}`}><span tabIndex={0}>结果出处</span></Tip></div> : null}
+      {proof ? (
+        <div>
+          <p>
+            {proof.trade_date} · 命中 {proof.hit_count} 只 · 待确认 {proof.unknown_count} 只
+          </p>
+          <Tip
+            content={`输入 ${proof.content_digest}；结果 ${proof.result_version}；排名 ${proof.member_rank_digest}`}
+          >
+            <Button size="sm" variant="ghost">
+              结果出处
+            </Button>
+          </Tip>
+        </div>
+      ) : null}
       {!confirmed ? (
         <Button
           size="sm"
@@ -190,7 +212,9 @@ export function ScreenPoolSave({
       : null;
   });
   const ranking = saveableRanking(candidate?.ranking);
-  const writerReady = dailyWriterCapability?.contract === "daily-screen-writer/v1" && dailyWriterCapability.serving_generation_id === meta.data?.serving.generation_id;
+  const writerReady =
+    dailyWriterCapability?.contract === "daily-screen-writer/v1" &&
+    dailyWriterCapability.serving_generation_id === meta.data?.serving.generation_id;
   const dailyReason = candidate ? dailyLimitReason(candidate, writerReady) : null;
   const rankingReason =
     candidate?.ranking && ranking === null ? "这项排名暂不能保存为每日池子。" : null;
@@ -330,7 +354,13 @@ export function ScreenPoolSave({
               </strong>
               <span>{journal.body.display_name}</span>
               {journal.message ? <p>{journal.message}</p> : null}
-              {journal.status === "succeeded" ? <ScreenPoolPublication journal={journal} evidence={dailyRunEvidence} onCheck={onCheckEvidence} /> : null}
+              {journal.status === "succeeded" ? (
+                <ScreenPoolPublication
+                  journal={journal}
+                  evidence={dailyRunEvidence}
+                  onCheck={onCheckEvidence}
+                />
+              ) : null}
             </div>
           ) : (
             <>

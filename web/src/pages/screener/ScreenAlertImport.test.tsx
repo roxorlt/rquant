@@ -38,7 +38,11 @@ const execution: ScreenExecutionView = {
     definition,
   },
   definition,
-  source: { mode: "daily", identity: definition.source_identity, updated_at: "2026-10-01T01:00:00Z" },
+  source: {
+    mode: "daily",
+    identity: definition.source_identity,
+    updated_at: "2026-10-01T01:00:00Z",
+  },
   status: "succeeded",
   completed_at: "2026-10-01T01:00:01Z",
   base_count: 21,

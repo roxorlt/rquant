@@ -9,13 +9,18 @@ from decimal import Decimal, localcontext
 from typing import Literal, Self
 from zoneinfo import ZoneInfo
 
-from pydantic import Field, model_validator
+from pydantic import Field, TypeAdapter, model_validator
 
 from rquant.backtest.contracts import SSECalendar
 from rquant.paper_contracts import PaperAccountSnapshot
 from rquant.paper_portfolio_ledger import PaperMissingClosePrices, PaperPortfolioLedgerSource
 from rquant.paper_portfolio_models import PaperPortfolioConfiguration, Sha256
 from rquant.paper_portfolio_state import PaperPortfolioStateStore
+from rquant.strategy_promotion_contracts import NativeMinuteForwardConfiguration, NativeMinuteForwardValuation
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from rquant.paper_research_runtime import NativeMinuteForwardState
 from rquant.research_run_spec import _parse_decimal
 from rquant.runtime_contracts import AwareUtcDatetime, RuntimeContractModel, canonical_sha256, normalize_aware_utc
 
@@ -99,9 +104,53 @@ class PaperDailyNav(RuntimeContractModel):
         return canonical_sha256(self.model_dump(mode="python"))
 
 
+class NativePaperCloseMaterials(PaperCloseMaterials):
+    contract: Literal["native-forward-close-materials/v1"] = "native-forward-close-materials/v1"
+    configuration: NativeMinuteForwardConfiguration
+    trade_calendar_sha256: Sha256
+    valuation: NativeMinuteForwardValuation
+
+    @model_validator(mode="after")
+    def full_original_native_valuation(self) -> Self:
+        value, configuration = self.valuation, self.configuration
+        if (value.input_hash, value.profile_hash, value.calendar_sha256, value.trade_date, value.as_of) != (
+            configuration.fingerprint, configuration.execution_profile.profile_hash,
+            self.trade_calendar_sha256, self.trade_date, self.close_at
+        ) or self.trade_date <= configuration.paper_approved_at.astimezone(_SHANGHAI).date():
+            raise ValueError("native close differs from its original profile, raw calendar or manual paper start")
+        if value.observed_at > self.available_at:
+            raise ValueError("native close cannot publish before its actual observation")
+        expected = tuple((item.quote.ts_code, item.quote.context.executable_price,
+            item.quote.snapshot_id, item.quote.available_at) for item in value.price_proofs)
+        if tuple((item.ts_code, item.close_price, item.source_snapshot_id, item.available_at) for item in self.prices) != expected:
+            raise ValueError("native close marks differ from full original PIT quote proofs")
+        if value.status == "complete" and self.close_at - value.market_pointer.published_at > timedelta(
+            seconds=configuration.execution_profile.quote_max_age_seconds):
+            raise ValueError("native close market publication is stale")
+        if len(self.model_dump_json().encode()) > 5 * 1024 * 1024:
+            raise ValueError("native close exceeds the original published material budget")
+        return self
+
+    @property
+    def fingerprint(self) -> str:
+        return canonical_sha256(self.model_dump(mode="json"))
+
+
+PaperCloseInput = PaperCloseMaterials | NativePaperCloseMaterials
+
+
 class PaperPortfolioViewStore:
-    def __init__(self, state: PaperPortfolioStateStore) -> None:
+    def __init__(self, state: PaperPortfolioStateStore | NativeMinuteForwardState) -> None:
         self.state = state
+        from rquant.paper_research_runtime import NativeMinuteForwardState
+
+        if type(state) is NativeMinuteForwardState:
+            with state._connection() as connection:
+                tables = frozenset(row[0] for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name IN "
+                    "('portfolio_daily_nav','portfolio_close_material')"))
+            if tables == {"portfolio_daily_nav", "portfolio_close_material"}:
+                return
         with state._connection(write=True) as connection:
             connection.execute("CREATE TABLE IF NOT EXISTS portfolio_daily_nav(configuration TEXT NOT NULL,trade_date TEXT NOT NULL,material TEXT NOT NULL,body TEXT NOT NULL,PRIMARY KEY(configuration,trade_date))")
             connection.execute("CREATE TABLE IF NOT EXISTS portfolio_close_material(configuration TEXT NOT NULL,trade_date TEXT NOT NULL,body TEXT NOT NULL,PRIMARY KEY(configuration,trade_date))")
@@ -119,7 +168,7 @@ class PaperPortfolioViewStore:
         if any(row[1] is None for row in rows):
             raise ValueError("paper NAV is missing its original close calendar material")
         records = tuple(PaperDailyNav.model_validate_json(row[0]) for row in rows)
-        materials = tuple(PaperCloseMaterials.model_validate_json(row[1]) for row in rows)
+        materials = tuple(TypeAdapter(PaperCloseInput).validate_json(row[1]) for row in rows)
         calendar = materials[-1].calendar
         if any(material.calendar != calendar or material.configuration != self.state.configuration
                or (record.material_fingerprint, record.calendar_source_identity, record.trade_date, record.close_at) !=
@@ -153,8 +202,8 @@ class PaperPortfolioViewStore:
                 status="unavailable", reason="该交易日净值未发布。"))
         return tuple(result)
 
-    def record_close(self, source: PaperPortfolioLedgerSource, material: PaperCloseMaterials, *, published_at: datetime) -> PaperDailyNav:
-        material = PaperCloseMaterials.model_validate(material.model_dump(mode="python"))
+    def record_close(self, source: PaperPortfolioLedgerSource, material: PaperCloseInput, *, published_at: datetime) -> PaperDailyNav:
+        material = TypeAdapter(PaperCloseInput).validate_python(material.model_dump(mode="python"))
         configuration = self.state.refresh_configuration()
         if material.configuration != configuration or type(source) is not PaperPortfolioLedgerSource:
             raise ValueError("paper close belongs to a different immutable configuration")
@@ -183,6 +232,12 @@ class PaperPortfolioViewStore:
                     raise ValueError("缺少收盘估值：" + ", ".join(sorted(missing)))
                 account = frame.account
                 reason = None
+                if type(material) is NativePaperCloseMaterials:
+                    if material.valuation.status != "complete":
+                        account = None
+                        reason = "; ".join(material.valuation.unavailable_reasons)
+                    elif account != material.valuation.account:
+                        raise ValueError("native close account differs from its full original financial transaction")
             except PaperMissingClosePrices as exc:
                 gap = exc.gap
                 account = None

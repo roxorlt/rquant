@@ -57,6 +57,22 @@ def validate_scheduling_projection(state: LabSchedulingControlState | None, proj
         raise ValueError("scheduler projection does not match complete original state")
 
 
+def read_scheduling_projection(
+    projections: tuple[ServingProjectionPayload, ...],
+) -> LabSchedulingControlState | None:
+    selected = tuple(p for p in projections if p.table_name == "lab_scheduler_control")
+    if not selected:
+        return None
+    if len(selected) != 1 or len(selected[0].rows) != 1:
+        raise ValueError("scheduler projection requires one complete original control row")
+    payload = selected[0].rows[0]["state_json"]
+    if not isinstance(payload, str):
+        raise ValueError("scheduler projection state JSON must be a string")
+    state = LabSchedulingControlState.model_validate_json(payload)
+    validate_scheduling_projection(state, projections)
+    return state
+
+
 class TaskOpsEvidence(RuntimeContractModel):
     cpu: TaskCpuEvidence | None = None
     cpu_unavailable_reason: Literal["capture_unavailable", "budget_exceeded"] | None = None

@@ -29,6 +29,8 @@ from rquant.screen.formula_history_projection import VerifiedFormulaHistoryProje
 from rquant.screen.replica_source import VerifiedReplicaScreenSource
 from rquant.unit_log_service import UnitLogClient
 from rquant.web import portfolio_backtest_routes, experiment_platform_routes
+from rquant.web import minute_backtest_routes
+from rquant.web.minute_backtest_service import LazyMinuteWebService, MinuteWebService
 from rquant.web.alert_ack_gateway import AckLookupGateway, AckLookupTransport
 from rquant.web.backfill_plan_command_gateway import (
     BackfillPlanCommandGateway,
@@ -43,7 +45,9 @@ from rquant.web.formula_market_command_gateway import (
     FormulaMarketCommandTransport,
 )
 from rquant.web.lab_control_gateway import LabControlGateway, LabControlTransport
-from rquant.web.nl_parser import OpenAiScreenPlanParser, ScreenPlanParser
+from rquant.web.nl_parser import ScreenPlanParser
+from rquant.web.ai_assistance_gateway import AIAssistanceGateway
+from rquant.web.routes import ai_assistance
 from rquant.web.pool_editor_gateway import PoolCommandGateway, PoolCommandTransport
 from rquant.web.pool_nl_preview import PoolNlRateLimiter
 from rquant.web.proxy_identity import ProxyIdentityVerifier
@@ -87,6 +91,7 @@ from rquant.web.routes import (
     stocks,
     strategies,
     strategy_authoring,
+    strategy_promotion,
     tasks,
     tasks_controls,
 )
@@ -94,11 +99,13 @@ from rquant.web.routes import condition_alert_rules as condition_alert_rules_rou
 from rquant.web.routes import screen_history as screen_history_routes
 from rquant.web.routes import screen_alert_draft as screen_alert_draft_routes
 from rquant.web.screen_service import ScreenApplicationService
-from rquant.web.security import require_current_user
+from rquant.web.security import require_current_user, require_collaboration_access
+from rquant.web.collaboration_gateway import CollaborationGateway
+from rquant.web.routes import collaboration as collaboration_routes
 from rquant.web.service_log_access_audit import ServiceLogAccessAudit
 from rquant.web.serving import GenerationTracker
 from rquant.web.settings import WebSettings
-from rquant.web.strategy_authoring_gateway import StrategyAuthoringGateway
+from rquant.web.strategy_authoring_gateway import StrategyAuthoringGateway, StrategyPromotionGateway
 from rquant.web.paper_portfolio_gateway import PaperPortfolioGateway
 from rquant.web.task_control_gateway import TaskControlGateway
 from rquant.web.routes import task_center_controls
@@ -120,6 +127,12 @@ API_TITLE = "rQuant Web API"
 #: release that does not touch the API leaves the OpenAPI snapshot unchanged.
 API_VERSION = "1"
 _WRITE_BODY_LIMITS = {
+    "/api/v1/ai/requests": ai_assistance.MAX_REQUEST_BYTES,
+    "/api/v1/ai/requests/lookup": ai_assistance.MAX_REQUEST_BYTES,
+    "/api/v1/ai/backtests/prepare": 1024,
+    "/api/v1/ai/backtests/prepare/lookup": 1024,
+    "/api/v1/ai/backtests/confirm": 2048,
+    "/api/v1/ai/interpretations/read": 1024,
     "/api/v1/data/executions/commands": backfill_execution.MAX_REQUEST_BYTES,
     "/api/v1/monitor/condition-rules/commands": condition_alert_rules_routes.MAX_COMMAND_REQUEST_BYTES,
     "/api/v1/monitor/condition-rules/commands/resume": condition_alert_rules_routes.MAX_COMMAND_REQUEST_BYTES,
@@ -148,7 +161,12 @@ _WRITE_BODY_LIMITS = {
     "/api/v1/research/queries/resume": research_query.MAX_REQUEST_BYTES,
     "/api/v1/strategy-templates/commands": strategy_authoring.MAX_TEMPLATE_REQUEST_BYTES,
     "/api/v1/strategy-templates/commands/resume": strategy_authoring.MAX_TEMPLATE_REQUEST_BYTES,
+    "/api/v1/strategy-promotions/commands": strategy_promotion.MAX_PROMOTION_REQUEST_BYTES,
+    "/api/v1/strategy-promotions/commands/lookup": strategy_promotion.MAX_PROMOTION_REQUEST_BYTES,
+    "/api/v1/strategy-promotions/commands/resume": strategy_promotion.MAX_PROMOTION_REQUEST_BYTES,
     "/api/v1/backtests/portfolio/runs": portfolio_backtest_routes.MAX_RUN_REQUEST_BYTES,
+    "/api/v1/backtests/minute-runtime/runs": minute_backtest_routes.MAX_RUN_REQUEST_BYTES,
+    "/api/v1/backtests/minute-runtime/exports": minute_backtest_routes.MAX_EXPORT_REQUEST_BYTES,
     "/api/v1/backtests/portfolio/exports": portfolio_backtest_routes.MAX_EXPORT_REQUEST_BYTES,
     "/api/v1/experiments/commands": experiment_platform_routes.MAX_REQUEST_BYTES,
 }
@@ -174,6 +192,7 @@ class WebContext:
     screen_service: ScreenApplicationService
     pool_commands: PoolCommandGateway
     nl_parser: ScreenPlanParser | None
+    ai_assistance_gateway: AIAssistanceGateway | None
     nl_gate: threading.BoundedSemaphore
     nl_rate_limiter: PoolNlRateLimiter
     ack_lookup: AckLookupGateway
@@ -184,6 +203,7 @@ class WebContext:
     factor_run_admission: FactorRunAdmissionClient | None
     factor_tracking_admission: FactorTrackingAdmissionClient | None
     strategy_authoring_gateway: StrategyAuthoringGateway | None
+    strategy_promotion_gateway: StrategyPromotionGateway | None
     paper_portfolio_gateway: PaperPortfolioGateway | None
     task_control_gateway: TaskControlGateway | None
     unit_log_client: UnitLogClient | None
@@ -197,7 +217,9 @@ class WebContext:
     research_query_client: QueryPrivateClient | None
     research_query_save_client: QueryPrivateClient | None
     portfolio_backtests: PortfolioWebService | None
+    minute_backtests: MinuteWebService | LazyMinuteWebService | None
     experiment_platform: ExperimentWebService | None
+    collaboration: CollaborationGateway | None
 
 
 def create_app(
@@ -208,6 +230,7 @@ def create_app(
     background: bool = True,
     pool_command_transport: PoolCommandTransport | None = None,
     nl_parser: ScreenPlanParser | None = None,
+    ai_assistance_gateway: AIAssistanceGateway | None = None,
     ack_lookup_transport: AckLookupTransport | None = None,
     ack_admission_client: AckAdmissionClient | None = None,
     watchlist_admission_client: WatchlistAdmissionClient | None = None,
@@ -216,6 +239,7 @@ def create_app(
     factor_run_admission_client: FactorRunAdmissionClient | None = None,
     factor_tracking_admission_client: FactorTrackingAdmissionClient | None = None,
     strategy_authoring_gateway: StrategyAuthoringGateway | None = None,
+    strategy_promotion_gateway: StrategyPromotionGateway | None = None,
     paper_portfolio_gateway: PaperPortfolioGateway | None = None,
     task_control_gateway: TaskControlGateway | None = None,
     unit_log_client: UnitLogClient | None = None,
@@ -228,9 +252,22 @@ def create_app(
     research_query_client: QueryPrivateClient | None = None,
     research_query_save_client: QueryPrivateClient | None = None,
     portfolio_backtests: PortfolioWebService | None = None,
+    minute_backtests: MinuteWebService | None = None,
+    collaboration_gateway: CollaborationGateway | None = None,
     experiment_platform: ExperimentWebService | None = None,
 ) -> FastAPI:
     """Build the app. Nothing is opened until the first request or startup."""
+
+    configured_minute = minute_backtests
+    if settings.minute_replay_installation is not None or settings.minute_native_report_runtime is not None:
+        if configured_minute is not None:
+            raise ValueError("minute service and private installation cannot both be supplied")
+        configured_minute = LazyMinuteWebService(settings.minute_replay_installation,
+            expected_code_sha=settings.minute_replay_expected_code_sha, clock=clock,
+            native_report_path=settings.minute_native_report_runtime,
+            native_expected_code_sha=settings.minute_native_report_expected_code_sha,
+            study_projection_authority=settings.minute_study_projection_authority,
+            study_projection_expected_sha256=settings.minute_study_projection_expected_sha256)
 
     generation_tracker = tracker or GenerationTracker(
         settings.serving_root,
@@ -255,9 +292,16 @@ def create_app(
         redoc_url=None,
         openapi_url=None,
         lifespan=lifespan,
+        dependencies=[Depends(require_collaboration_access)],
     )
     cursor_key = secrets.token_bytes(32)
     configured_screen_query = screen_query_client
+    configured_ai = ai_assistance_gateway
+    if configured_ai is not None and not isinstance(configured_ai, AIAssistanceGateway):
+        raise TypeError("AI requires a typed original-owner private gateway")
+    if configured_ai is None and settings.ai_socket_path is not None:
+        from rquant.ai_assistance_admission import AIAssistancePrivateClient
+        configured_ai = AIAssistancePrivateClient(settings.ai_socket_path, expected_service_uid=settings.ai_service_uid, shared_gid=settings.ai_shared_gid)
     if settings.screen_query_socket_path is not None:
         from rquant.screen.query_admission import ScreenQueryPrivateClient
 
@@ -377,7 +421,9 @@ def create_app(
                 web_group_gid=settings.unit_log_web_group_gid,
             )
         )
-    configured_nl_parser = nl_parser
+    if nl_parser is not None:
+        raise TypeError("Web model calls require the persisted original AI owner gateway")
+    configured_nl_parser = None
     configured_task_control = task_control_gateway
     if configured_task_control is not None and not isinstance(configured_task_control, TaskControlGateway):
         raise TypeError("task controls require the typed private gateway")
@@ -400,7 +446,7 @@ def create_app(
         raise TypeError("strategy templates require a typed private gateway")
     if (
         configured_strategy_authoring is None
-        and settings.strategy_authoring_enabled
+        and (settings.strategy_authoring_enabled or settings.strategy_promotion_enabled or settings.strategy_promotion_users)
         and settings.strategy_authoring_socket_path is not None
     ):
         from rquant.strategy_authoring_admission import StrategyAuthoringAdmissionClient
@@ -410,12 +456,17 @@ def create_app(
             expected_service_uid=settings.strategy_authoring_service_uid,
             shared_gid=settings.strategy_authoring_shared_gid,
         )
-    if configured_nl_parser is None and settings.nl_openai_api_key is not None:
-        assert settings.nl_openai_model is not None
-        configured_nl_parser = OpenAiScreenPlanParser(
-            api_key=settings.nl_openai_api_key,
-            model=settings.nl_openai_model,
-        )
+    configured_strategy_promotion = strategy_promotion_gateway
+    if configured_strategy_promotion is None and isinstance(configured_strategy_authoring, StrategyPromotionGateway):
+        configured_strategy_promotion = configured_strategy_authoring
+    if configured_strategy_promotion is not None and not isinstance(configured_strategy_promotion, StrategyPromotionGateway):
+        raise TypeError("manual promotion requires the original typed private gateway")
+    configured_collaboration = collaboration_gateway
+    if configured_collaboration is not None and type(configured_collaboration) is not CollaborationGateway:
+        raise TypeError("C15 requires the original private peer gateway")
+    if configured_collaboration is None and settings.collaboration_mode == "enforced" and settings.factor_admission_socket_path is not None:
+        configured_collaboration = CollaborationGateway(settings.factor_admission_socket_path,
+            expected_service_uid=settings.factor_admission_service_uid, shared_gid=settings.factor_admission_shared_gid)
     app.state.web = WebContext(
         settings=settings,
         proxy_identity=(
@@ -439,6 +490,7 @@ def create_app(
             transport=pool_command_transport,
         ),
         nl_parser=configured_nl_parser,
+        ai_assistance_gateway=configured_ai,
         nl_gate=threading.BoundedSemaphore(1),
         nl_rate_limiter=PoolNlRateLimiter(),
         ack_lookup=AckLookupGateway(
@@ -452,6 +504,7 @@ def create_app(
         factor_run_admission=configured_factor_run,
         factor_tracking_admission=configured_factor_tracking,
         strategy_authoring_gateway=configured_strategy_authoring,
+        strategy_promotion_gateway=configured_strategy_promotion,
         paper_portfolio_gateway=configured_paper_portfolio,
         task_control_gateway=configured_task_control,
         unit_log_client=configured_unit_log,
@@ -470,7 +523,9 @@ def create_app(
             transport=formula_market_command_transport,
         ),
         portfolio_backtests=portfolio_backtests,
+        minute_backtests=configured_minute,
         experiment_platform=experiment_platform,
+        collaboration=configured_collaboration,
         lab_controls=LabControlGateway(
             endpoint=settings.page_control_url,
             transport=lab_control_command_transport,
@@ -479,6 +534,16 @@ def create_app(
         research_query_client=configured_research_query,
         research_query_save_client=configured_research_query_save,
     )
+    if settings.collaboration_mode == "enforced" and configured_collaboration is not None:
+        if portfolio_backtests is not None:
+            portfolio_backtests.collaboration = configured_collaboration
+        if experiment_platform is not None:
+            experiment_platform.collaboration = configured_collaboration
+        for original in (app.state.web.pool_commands, app.state.web.backfill_plan_commands,
+                         app.state.web.audit_report_commands, app.state.web.formula_market_commands,
+                         app.state.web.lab_controls,
+                         *((experiment_platform.gateway,) if experiment_platform is not None else ())):
+            original.transport = configured_collaboration.authorized_transport(original.transport)
     app.add_middleware(GZipMiddleware, minimum_size=1024)
 
     @app.middleware("http")
@@ -547,6 +612,8 @@ def create_app(
             )
         if request.url.path.startswith("/api/v1/strategy-templates"):
             return JSONResponse(status_code=422, content={"detail": "策略内容有误，请检查后重试。"})
+        if request.url.path.startswith("/api/v1/strategy-promotions"):
+            return JSONResponse(status_code=422, content={"detail": "评估请求有误，请检查后重试。"}, headers={"Cache-Control": "no-store"})
         if request.url.path.startswith("/api/v1/research/"):
             return JSONResponse(
                 status_code=422, content={"detail": "查询或保存内容有误，请检查 SQL 和名称。"}
@@ -587,6 +654,8 @@ def create_app(
             return JSONResponse(
                 status_code=422, content={"detail": "回测请求有误，请检查来源、日期和配置。"}
             )
+        if request.url.path.startswith("/api/v1/backtests/minute-runtime/"):
+            return JSONResponse(status_code=422, content={"detail": "分钟回测请求有误，请检查来源、策略版本和正式登记区间。"})
         if request.url.path == "/api/v1/tasks/jobs/commands":
             return JSONResponse(
                 status_code=422, content={"detail": "任务操作请求有误，请刷新后重试。"}
@@ -600,6 +669,8 @@ def create_app(
     app.include_router(overview.router, prefix="/api/v1", tags=["overview"])
     app.include_router(pools.router, prefix="/api/v1", tags=["pools"])
     private = [Depends(require_current_user)]
+    app.include_router(collaboration_routes.router, prefix="/api/v1", tags=["collaboration"])
+    app.include_router(strategy_promotion.router, prefix="/api/v1", tags=["strategies"], dependencies=private)
     app.include_router(pool_editor.router, prefix="/api/v1", tags=["pools"], dependencies=private)
     app.include_router(paper.router, prefix="/api/v1", tags=["paper"], dependencies=private)
     app.include_router(paper_portfolio.router, prefix="/api/v1", tags=["paper"], dependencies=private)
@@ -617,6 +688,8 @@ def create_app(
     app.include_router(
         portfolio_backtest_routes.router, prefix="/api/v1", tags=["backtests"], dependencies=private
     )
+    app.include_router(minute_backtest_routes.router, prefix="/api/v1", tags=["backtests"], dependencies=private)
+    app.include_router(ai_assistance.router, prefix="/api/v1", tags=["ai"], dependencies=private)
     app.include_router(backtests.router, prefix="/api/v1", tags=["backtests"], dependencies=private)
     app.include_router(
         experiments.router, prefix="/api/v1", tags=["experiments"], dependencies=private

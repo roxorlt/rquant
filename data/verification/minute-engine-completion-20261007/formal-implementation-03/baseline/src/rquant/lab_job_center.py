@@ -1,0 +1,1558 @@
+"""Typed Strategy Lab job creation and command-submission boundaries."""
+
+from __future__ import annotations
+
+from rquant.paper_research import PaperResearchAdapterCatalog
+
+import re
+import stat
+from collections.abc import Callable
+from datetime import UTC, date, datetime
+from decimal import Decimal
+from pathlib import Path
+from typing import TYPE_CHECKING, Annotated, Literal, TypeAlias
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
+
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+
+from rquant.definition_registry import ImmutableDefinitionRegistry, StrategySpecRegistration
+from rquant.experiment_registry import (
+    ExperimentAttempt,
+    ExperimentRegistry,
+    ExperimentSubmissionIntent,
+    FormalExperimentPlan,
+    IncompleteHypothesisFamilyError,
+)
+from rquant.lab_job_protocol import (
+    CancelJobCommand,
+    LabAcknowledgedCommand,
+    LabCommand,
+    LabCommandEnvelope,
+    LabCommandSpool,
+    LabSpoolEntry,
+    PauseJobCommand,
+    RequestContentConflictError,
+    ResumeJobCommand,
+    RetryJobCommand,
+    SubmitJobCommand,
+)
+from rquant.lab_jobs import (
+    MAX_JOB_SHARDS,
+    FormalSubmissionAuthorityError,
+    JobStatus,
+    LabJobReader,
+)
+from rquant.lab_scheduling_control import LabSchedulingCommandEnvelope, LabSchedulingCommandReceipt, LabSchedulingSubmission
+from rquant.portfolio_backtest_adapter import PortfolioBacktestRunInput
+from rquant.research_gate import ResearchGateDecision
+from rquant.research_run_spec import (
+    DatasetSnapshotIdentity,
+    ExecutionCostSpec,
+    FeatureContractIdentity,
+    ParameterKind,
+    ResearchExperimentIdentity,
+    ResearchJobType,
+    ResearchParameter,
+    ResearchRunParameters,
+    ResearchRunSpec,
+    ResourceClass,
+    StrategyExecutionIdentity,
+)
+from rquant.runtime_contracts import canonical_sha256, normalize_aware_utc
+from rquant.strategy_job_adapters import (
+    AuctionGapParameters,
+    GrowthBoardSurgeParameters,
+    NShapeCompareParameters,
+    NShapeOptimizeParameters,
+    build_adapter_execution_contract,
+    default_strategy_job_adapter_registry,
+)
+from rquant.strategy_template_adapter import (
+    StrategyTemplateAdapterCatalog,
+    StrategyTemplateRunInput,
+    strategy_template_adapter_registry,
+    template_adapter_id,
+)
+from rquant.strict_json import canonical_json_bytes
+
+_CLEAN_CODE_SHA = re.compile(r"^[0-9a-f]{40}$")
+_MAX_RESEARCH_DATE_SPAN_DAYS = 5 * 366
+_MAX_WALK_FORWARD_FOLDS = 64
+
+if TYPE_CHECKING:
+    from rquant.experiment_platform import ExperimentChildAdmission, ExperimentPlatformStore
+
+ResearchJobSubmissionErrorCode: TypeAlias = Literal[
+    "input_bounds",
+    "adapter_plan",
+    "shard_budget",
+    "resource_budget",
+]
+
+
+class ResearchJobSubmissionError(ValueError):
+    """Typed deterministic failure before a create command can be published."""
+
+    def __init__(self, code: ResearchJobSubmissionErrorCode, message: str) -> None:
+        self.code = code
+        super().__init__(f"research submission preflight [{code}]: {message}")
+
+
+class JobCenterModel(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        revalidate_instances="always",
+        str_strip_whitespace=True,
+        strict=True,
+    )
+
+
+class _RunInputBase(JobCenterModel):
+    start_date: date
+    end_date: date
+
+    @model_validator(mode="after")
+    def validate_date_range(self) -> _RunInputBase:
+        if self.start_date > self.end_date:
+            raise ValueError("research start_date cannot be after end_date")
+        return self
+
+
+class NShapeComparisonRunInput(_RunInputBase):
+    kind: Literal["n_shape_comparison"] = "n_shape_comparison"
+    parameters: NShapeCompareParameters
+
+
+class NShapeOptimizationRunInput(_RunInputBase):
+    kind: Literal["n_shape_optimization"] = "n_shape_optimization"
+    parameters: NShapeOptimizeParameters
+
+
+class AuctionGapRunInput(_RunInputBase):
+    kind: Literal["auction_gap"] = "auction_gap"
+    parameters: AuctionGapParameters
+
+
+class GrowthBoardSurgeRunInput(_RunInputBase):
+    kind: Literal["growth_board_surge"] = "growth_board_surge"
+    parameters: GrowthBoardSurgeParameters
+
+
+ResearchRunInput: TypeAlias = Annotated[
+    NShapeComparisonRunInput
+    | NShapeOptimizationRunInput
+    | AuctionGapRunInput
+    | GrowthBoardSurgeRunInput
+    | StrategyTemplateRunInput
+    | PortfolioBacktestRunInput,
+    Field(discriminator="kind"),
+]
+
+
+class ResearchJobSubmission(JobCenterModel):
+    spec: ResearchRunSpec
+    command: SubmitJobCommand
+
+    @model_validator(mode="after")
+    def validate_command_spec(self) -> ResearchJobSubmission:
+        if self.command.spec != self.spec:
+            raise ValueError("create-job command does not contain the canonical run spec")
+        return self
+
+
+class _ResearchPlanBudget(JobCenterModel):
+    max_shards: int = Field(ge=1, le=MAX_JOB_SHARDS)
+    max_work_units: int = Field(ge=1)
+    max_static_duration_ms: int = Field(ge=1)
+
+
+_RESEARCH_PLAN_BUDGETS: dict[ResourceClass, _ResearchPlanBudget] = {
+    ResourceClass.INTERACTIVE: _ResearchPlanBudget(
+        max_shards=16,
+        max_work_units=2_000,
+        max_static_duration_ms=60 * 60 * 1_000,
+    ),
+    ResourceClass.STANDARD: _ResearchPlanBudget(
+        max_shards=64,
+        max_work_units=100_000,
+        max_static_duration_ms=24 * 60 * 60 * 1_000,
+    ),
+    ResourceClass.HEAVY: _ResearchPlanBudget(
+        max_shards=MAX_JOB_SHARDS,
+        max_work_units=1_000_000,
+        max_static_duration_ms=7 * 24 * 60 * 60 * 1_000,
+    ),
+}
+
+
+def _research_parameter(name: str, value: object) -> ResearchParameter:
+    if type(value) is bool:
+        kind = ParameterKind.BOOLEAN
+    elif type(value) is int:
+        kind = ParameterKind.INTEGER
+    elif isinstance(value, Decimal):
+        kind = ParameterKind.DECIMAL
+    elif type(value) is str:
+        kind = ParameterKind.TEXT
+    elif isinstance(value, tuple) and value and all(type(item) is int for item in value):
+        kind = ParameterKind.INTEGER_LIST
+    elif isinstance(value, tuple) and value and all(type(item) is str for item in value):
+        kind = ParameterKind.TEXT_LIST
+    else:
+        raise TypeError(f"unsupported typed strategy parameter {name}: {type(value).__name__}")
+    return ResearchParameter(name=name, kind=kind, value=value)
+
+
+def _run_identity(
+    run_input: ResearchRunInput,
+) -> tuple[str, ResearchJobType, str, BaseModel]:
+    if isinstance(run_input, NShapeComparisonRunInput):
+        return (
+            "n_shape",
+            ResearchJobType.STRATEGY_REPLAY,
+            "nshape-compare",
+            run_input.parameters,
+        )
+    if isinstance(run_input, NShapeOptimizationRunInput):
+        return (
+            "n_shape",
+            ResearchJobType.PARAMETER_SEARCH,
+            "nshape-optimize",
+            run_input.parameters,
+        )
+    if isinstance(run_input, AuctionGapRunInput):
+        return (
+            "auction_gap",
+            ResearchJobType.STRATEGY_REPLAY,
+            "auction-gap",
+            run_input.parameters,
+        )
+    if isinstance(run_input, GrowthBoardSurgeRunInput):
+        return (
+            "growth_board_surge",
+            ResearchJobType.STRATEGY_REPLAY,
+            "growth-board-surge",
+            run_input.parameters,
+        )
+    if isinstance(run_input, StrategyTemplateRunInput):
+        return (
+            run_input.parameters.strategy_id,
+            ResearchJobType.STRATEGY_REPLAY,
+            template_adapter_id(run_input.parameters.strategy_id),
+            run_input.parameters,
+        )
+    if isinstance(run_input, PortfolioBacktestRunInput):
+        return (
+            "portfolio_backtest",
+            ResearchJobType.STRATEGY_REPLAY,
+            "portfolio-backtest",
+            run_input.parameters,
+        )
+    raise TypeError(f"unsupported research run input: {type(run_input).__name__}")
+
+
+def _validate_gate_snapshot(
+    decision: ResearchGateDecision,
+    snapshot: DatasetSnapshotIdentity | None,
+) -> None:
+    if decision.research_status == "exploratory":
+        return
+    if decision.audit_run_id is None:
+        raise ValueError("formal research gate is missing audit evidence")
+    if snapshot is None:
+        raise ValueError("formal research requires an immutable dataset snapshot")
+    if snapshot.audit_run_id is None or snapshot.audit_run_id != decision.audit_run_id:
+        raise ValueError("formal snapshot audit identity conflicts with the research gate")
+    if snapshot.snapshot_id != decision.dataset_snapshot_id:
+        raise ValueError("formal snapshot identity conflicts with the research gate")
+    if snapshot.binding_hash != decision.dataset_binding_hash:
+        raise ValueError("formal snapshot binding conflicts with the research gate")
+
+
+def _validate_run_input_bounds(run_input: ResearchRunInput) -> None:
+    span_days = (run_input.end_date - run_input.start_date).days + 1
+    if span_days > _MAX_RESEARCH_DATE_SPAN_DAYS:
+        raise ResearchJobSubmissionError(
+            "input_bounds",
+            f"research date span exceeds {_MAX_RESEARCH_DATE_SPAN_DAYS} days",
+        )
+    parameters = run_input.parameters
+    if isinstance(parameters, NShapeCompareParameters):
+        lengths = (
+            ("hold_days", len(parameters.hold_days), 20),
+            ("entry_modes", len(parameters.entry_modes), 6),
+            ("profile_variants", len(parameters.profile_variants), 3),
+        )
+    elif isinstance(parameters, NShapeOptimizeParameters):
+        lengths = (
+            ("hold_days", len(parameters.hold_days), 20),
+            ("entry_modes", len(parameters.entry_modes), 6),
+            ("profile_variants", len(parameters.profile_variants), 3),
+            ("top_n_options", len(parameters.top_n_options), 32),
+            ("score_profile_names", len(parameters.score_profile_names), 11),
+        )
+        if parameters.walk_forward_folds > _MAX_WALK_FORWARD_FOLDS:
+            raise ResearchJobSubmissionError(
+                "input_bounds",
+                f"walk_forward_folds exceeds {_MAX_WALK_FORWARD_FOLDS}",
+            )
+        if any(value > 1_000 for value in parameters.top_n_options):
+            raise ResearchJobSubmissionError(
+                "input_bounds",
+                "top_n_options values cannot exceed 1000",
+            )
+    elif isinstance(parameters, GrowthBoardSurgeParameters):
+        lengths = (("variants", len(parameters.variants), 5),)
+    else:
+        lengths = ()
+    for field_name, observed, maximum in lengths:
+        if observed > maximum:
+            raise ResearchJobSubmissionError(
+                "input_bounds",
+                f"{field_name} cannot contain more than {maximum} values",
+            )
+
+
+def _preflight_research_plan(
+    spec: ResearchRunSpec,
+    *,
+    template_catalog: StrategyTemplateAdapterCatalog | None = None,
+    paper_catalog: PaperResearchAdapterCatalog | None = None,
+) -> None:
+    try:
+        from rquant.paper_research_adapter import paper_research_adapter_registry
+        if template_catalog is not None and paper_catalog is not None:
+            raise ValueError("one original plan requires one exact owned catalog")
+        registry = (
+            (default_strategy_job_adapter_registry() if paper_catalog is None else paper_research_adapter_registry(paper_catalog))
+            if template_catalog is None
+            else strategy_template_adapter_registry(template_catalog)
+        )
+        definitions = registry.plan(spec)
+    except (OverflowError, TypeError, ValueError, ValidationError) as exc:
+        raise ResearchJobSubmissionError("adapter_plan", str(exc)) from exc
+    if len(definitions) > MAX_JOB_SHARDS:
+        raise ResearchJobSubmissionError(
+            "shard_budget",
+            f"adapter plan exceeds authoritative {MAX_JOB_SHARDS} shard limit",
+        )
+    budget = _RESEARCH_PLAN_BUDGETS[spec.resource_class]
+    if len(definitions) > budget.max_shards:
+        raise ResearchJobSubmissionError(
+            "resource_budget",
+            f"{spec.resource_class.value} plan exceeds {budget.max_shards} shard budget",
+        )
+    work_units = 0
+    static_duration_ms = 0
+    for definition in definitions:
+        work_plan = definition.work_plan
+        if work_plan is None:
+            raise ResearchJobSubmissionError(
+                "adapter_plan",
+                "adapter preflight requires an explicit work plan for every shard",
+            )
+        work_units += work_plan.work_units
+        static_duration_ms += work_plan.static_duration_ms
+        if work_units > budget.max_work_units or static_duration_ms > budget.max_static_duration_ms:
+            raise ResearchJobSubmissionError(
+                "resource_budget",
+                f"{spec.resource_class.value} plan exceeds work-unit or duration budget",
+            )
+
+
+def build_research_job_submission(
+    run_input: ResearchRunInput,
+    *,
+    gate_decision: ResearchGateDecision,
+    code_sha: str,
+    dataset_snapshot: DatasetSnapshotIdentity | None,
+    feature_contract: FeatureContractIdentity,
+    execution_costs: ExecutionCostSpec,
+    random_seed: int,
+    resource_class: ResourceClass,
+    deadline: datetime,
+    job_id: UUID,
+    max_attempts: int = 1,
+    trusted_strategy_registration: StrategySpecRegistration | None = None,
+    formal_experiment_plan: FormalExperimentPlan | None = None,
+    template_catalog: StrategyTemplateAdapterCatalog | None = None,
+) -> ResearchJobSubmission:
+    decision = ResearchGateDecision.model_validate(gate_decision)
+    if not decision.allowed:
+        failure_codes = ",".join(item.code for item in decision.failures) or "unspecified"
+        raise ValueError(f"research gate rejected the run: {failure_codes}")
+    if not isinstance(code_sha, str) or _CLEAN_CODE_SHA.fullmatch(code_sha) is None:
+        raise ValueError("code SHA must be an exact clean 40-character lowercase hex commit")
+    _validate_gate_snapshot(decision, dataset_snapshot)
+    strategy_name, job_type, adapter_id, typed_parameters = _run_identity(run_input)
+    _validate_run_input_bounds(run_input)
+    expected_contract = build_adapter_execution_contract(adapter_id, "1", code_sha)
+    if feature_contract != expected_contract:
+        raise ValueError("feature contract does not match the typed adapter and code SHA")
+    try:
+        arguments = tuple(
+            _research_parameter(name, getattr(typed_parameters, name))
+            for name in type(typed_parameters).model_fields
+        )
+        parameters = ResearchRunParameters(
+            strategy_name=strategy_name,
+            start_date=run_input.start_date,
+            end_date=run_input.end_date,
+            arguments=arguments,
+        )
+        ownership_values = _validated_research_ownership(
+            decision=decision,
+            strategy_name=strategy_name,
+            adapter_id=adapter_id,
+            adapter_version="1",
+            code_sha=code_sha,
+            deadline=deadline,
+            dataset_snapshot=dataset_snapshot,
+            feature_contract=feature_contract,
+            execution_costs=execution_costs,
+            parameters=parameters,
+            random_seed=random_seed,
+            trusted_strategy_registration=trusted_strategy_registration,
+            formal_experiment_plan=formal_experiment_plan,
+        )
+        spec = ResearchRunSpec(
+            schema_version=ownership_values[0],
+            job_type=job_type,
+            parameters=parameters,
+            code_sha=code_sha,
+            dataset_snapshot=dataset_snapshot,
+            feature_contract=feature_contract,
+            execution_costs=execution_costs,
+            random_seed=random_seed,
+            resource_class=resource_class,
+            deadline=deadline,
+            research_status=decision.research_status,
+            strategy_execution=ownership_values[1],
+            experiment=ownership_values[2],
+        )
+    except (TypeError, ValueError, ValidationError) as exc:
+        raise ResearchJobSubmissionError("input_bounds", str(exc)) from exc
+    _preflight_research_plan(spec, template_catalog=template_catalog)
+    command = SubmitJobCommand(
+        job_id=job_id,
+        spec=spec,
+        max_attempts=max_attempts,
+    )
+    return ResearchJobSubmission(spec=spec, command=command)
+
+
+def _validated_research_ownership(
+    *,
+    decision: ResearchGateDecision,
+    strategy_name: str,
+    adapter_id: str,
+    adapter_version: str,
+    code_sha: str,
+    deadline: datetime,
+    dataset_snapshot: DatasetSnapshotIdentity | None,
+    feature_contract: FeatureContractIdentity,
+    execution_costs: ExecutionCostSpec,
+    parameters: ResearchRunParameters,
+    random_seed: int,
+    trusted_strategy_registration: StrategySpecRegistration | None,
+    formal_experiment_plan: FormalExperimentPlan | None,
+) -> tuple[
+    Literal[2, 3],
+    StrategyExecutionIdentity | None,
+    ResearchExperimentIdentity | None,
+]:
+    supplied = (
+        trusted_strategy_registration is not None,
+        formal_experiment_plan is not None,
+    )
+    if not any(supplied):
+        if decision.research_status != "exploratory":
+            raise ValueError(
+                "formal research submission requires a trusted strategy registration, "
+                "and exact formal experiment plan"
+            )
+        return 2, None, None
+    if not all(supplied):
+        raise ValueError(
+            "trusted strategy registration and exact formal experiment plan "
+            "must be supplied together"
+        )
+    assert trusted_strategy_registration is not None
+    assert formal_experiment_plan is not None
+    registration = StrategySpecRegistration.model_validate(
+        trusted_strategy_registration.model_dump(mode="python")
+    )
+    plan = FormalExperimentPlan.model_validate(formal_experiment_plan.model_dump(mode="python"))
+    if plan.schema_version != 2:
+        raise ValueError("formal research requires a current FormalExperimentPlan")
+    experiment = plan.spec
+    if registration.logical_id != strategy_name or registration.spec.strategy_id != strategy_name:
+        raise ValueError("trusted strategy registration does not match strategy_name")
+    if registration.producer_commit != code_sha or registration.spec.producer_commit != code_sha:
+        raise ValueError("trusted strategy registration does not match code SHA")
+    if registration.available_at > deadline:
+        raise ValueError("trusted strategy registration is not visible by the run deadline")
+    if plan.preregistered_at > deadline:
+        raise ValueError("formal experiment plan is not visible by the run deadline")
+    if (
+        plan.strategy_definition_fingerprint != registration.fingerprint
+        or plan.definition_registration_record_hash != registration.record_hash
+    ):
+        raise ValueError("formal experiment plan does not match Definition Registry receipts")
+    execution = StrategyExecutionIdentity(
+        strategy_id=registration.logical_id,
+        strategy_version=registration.version,
+        adapter_id=adapter_id,
+        adapter_version=adapter_version,
+        strategy_spec_fingerprint=registration.spec.spec_fingerprint,
+        strategy_definition_fingerprint=registration.fingerprint,
+        strategy_executable_fingerprint=registration.executable_fingerprint,
+        candidate_schema_fingerprint=registration.candidate_schema_fingerprint,
+        definition_registration_record_hash=registration.record_hash,
+        definition_registered_at=registration.registered_at,
+        definition_available_at=registration.available_at,
+        producer_code_commit=registration.producer_commit,
+    )
+    if dataset_snapshot is None:
+        raise ValueError("catalog-bound experiment requires an immutable dataset snapshot")
+    expected = (
+        registration.spec.spec_fingerprint,
+        registration.executable_fingerprint,
+        registration.candidate_schema_fingerprint,
+        dataset_snapshot.snapshot_id,
+        code_sha,
+        canonical_sha256(parameters),
+        canonical_sha256(execution_costs),
+        canonical_sha256(
+            {
+                "contract": "lab-adapter-execution/v1",
+                "adapter_id": adapter_id,
+                "adapter_version": adapter_version,
+                "feature_contract": feature_contract,
+            }
+        ),
+        random_seed,
+    )
+    actual = (
+        experiment.strategy_spec_fingerprint,
+        experiment.strategy_executable_fingerprint,
+        experiment.candidate_schema_fingerprint,
+        experiment.dataset_snapshot_id,
+        experiment.code_commit,
+        experiment.parameter_fingerprint,
+        experiment.cost_model_fingerprint,
+        experiment.execution_model_fingerprint,
+        experiment.seed,
+    )
+    if actual != expected:
+        raise ValueError("experiment spec does not exactly match the trusted research run")
+    return (
+        3,
+        execution,
+        ResearchExperimentIdentity(
+            schema_version=2,
+            spec=experiment,
+            experiment_id=experiment.experiment_id,
+            hypothesis_family=experiment.hypothesis_family,
+            hypothesis_variant=plan.hypothesis_variant,
+            formal_plan_id=plan.plan_id,
+        ),
+    )
+
+
+class SubmissionSpoolIdentity(JobCenterModel):
+    path: Path
+    state: Literal["pending", "acknowledged"]
+    device: int = Field(ge=0)
+    inode: int = Field(ge=1)
+    content_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class CommandSubmissionReceipt(JobCenterModel):
+    result: Literal["submitted"] = "submitted"
+    request_id: UUID
+    command_type: Literal["submit", "pause", "resume", "cancel", "retry"]
+    job_id: UUID
+    expected_version: int | None = Field(default=None, ge=0)
+    spool: SubmissionSpoolIdentity
+
+
+class CommandSubmissionStale(JobCenterModel):
+    result: Literal["stale"] = "stale"
+    request_id: UUID
+    job_id: UUID
+    expected_version: int = Field(ge=0)
+    authoritative_version: int = Field(ge=0)
+    authoritative_status: JobStatus
+    scheduler_reason: str | None = None
+
+
+class CommandSubmissionConflict(JobCenterModel):
+    result: Literal["conflict"] = "conflict"
+    request_id: UUID
+    job_id: UUID
+    reason: Literal[
+        "interaction_content_conflict",
+        "job_not_found",
+        "job_id_exists",
+        "scheduler_rejected",
+    ]
+    scheduler_reason: str | None = None
+
+
+class CommandSubmissionUnavailable(JobCenterModel):
+    result: Literal["unavailable"] = "unavailable"
+    request_id: UUID
+    job_id: UUID
+    command_type: Literal["pause", "resume", "cancel", "retry"]
+    authoritative_version: int = Field(ge=0)
+    authoritative_status: JobStatus
+    scheduler_reason: str | None = None
+
+
+CommandSubmissionResult: TypeAlias = Annotated[
+    CommandSubmissionReceipt
+    | CommandSubmissionStale
+    | CommandSubmissionConflict
+    | CommandSubmissionUnavailable,
+    Field(discriminator="result"),
+]
+
+
+if TYPE_CHECKING:
+    from rquant.strategy_template_runtime import StrategyTemplateRuntimeDirectory
+    from rquant.experiment_platform_templates import ExperimentTemplateRuntimeBinding
+
+
+class LabCommandSubmissionFacade:
+    """Read scheduler state and publish commands without opening a writable ledger."""
+
+    def __init__(
+        self,
+        *,
+        reader: LabJobReader,
+        spool: LabCommandSpool,
+        experiment_registry: ExperimentRegistry | None = None,
+        definition_registry: ImmutableDefinitionRegistry | None = None,
+        clock: Callable[[], datetime] | None = None,
+        template_directory: StrategyTemplateRuntimeDirectory | None = None,
+        experiment_template_binding: ExperimentTemplateRuntimeBinding | None = None,
+    ) -> None:
+        self.reader = reader
+        self.spool = spool
+        self.experiment_registry = experiment_registry
+        self.definition_registry = definition_registry
+        self.clock = clock or (lambda: datetime.now(UTC))
+        from rquant.strategy_template_runtime import require_template_runtime_directory
+
+        self.template_directory = require_template_runtime_directory(template_directory)
+        from rquant.experiment_platform_templates import require_experiment_template_runtime_binding
+        self.experiment_template_binding = require_experiment_template_runtime_binding(experiment_template_binding)
+        if self.experiment_template_binding is not None and self.experiment_template_binding.store.registry is not experiment_registry:
+            raise ValueError("private template directory needs the same original experiment registry")
+
+    def submit_scheduling_control(self, envelope: LabSchedulingCommandEnvelope) -> LabSchedulingSubmission:
+        envelope = LabSchedulingCommandEnvelope.model_validate(envelope)
+        existing = self.spool.find(envelope.request_id)
+        if existing is not None:
+            saved = existing.envelope if isinstance(existing, LabSpoolEntry) else existing.receipt
+            if type(saved) not in (LabSchedulingCommandEnvelope, LabSchedulingCommandReceipt) or saved.content_hash != envelope.content_hash:
+                raise RequestContentConflictError("scheduler original UUID has different content or scope")
+        else:
+            current = self.reader.scheduling_state()
+            if current is None or current.queue_identity != envelope.command.queue_identity:
+                raise ValueError("global scheduling is unavailable for the original queue")
+            existing = self.spool.publish(envelope)
+        if isinstance(existing, LabSpoolEntry):
+            if existing.envelope != envelope:
+                raise RequestContentConflictError("scheduler original request differs")
+            receipt = None
+            status = "pending"
+            generation = (existing.device, existing.inode)
+        else:
+            receipt = LabSchedulingCommandReceipt.model_validate(existing.receipt)
+            status = receipt.status
+            observed = existing.path.lstat()
+            generation = (observed.st_dev, observed.st_ino)
+        return LabSchedulingSubmission(request_id=envelope.request_id, content_hash=envelope.content_hash, queue_identity=envelope.command.queue_identity, expected_version=envelope.command.expected_version, status=status, spool_path=existing.path, spool_generation=generation, receipt=receipt)
+
+    @staticmethod
+    def _experiment_submission_intent(
+        envelope: LabCommandEnvelope,
+    ) -> ExperimentSubmissionIntent | None:
+        command = envelope.command
+        if not isinstance(command, SubmitJobCommand):
+            return None
+        spec = command.spec
+        if spec.schema_version < 3:
+            return None
+        if spec.experiment is None or not spec.catalog_owner_eligible:
+            raise ValueError("v3 research job is missing experiment ownership")
+        envelope_json = canonical_json_bytes(envelope.model_dump(mode="json")).decode("utf-8")
+        return ExperimentSubmissionIntent(
+            schema_version=2,
+            request_id=envelope.request_id,
+            job_id=command.job_id,
+            experiment_id=spec.experiment.experiment_id,
+            attempt_identity=spec.experiment.attempt_identity,
+            hypothesis_variant=spec.experiment.hypothesis_variant,
+            formal_plan_id=spec.experiment.formal_plan_id,
+            strategy_definition_fingerprint=(
+                spec.strategy_execution.strategy_definition_fingerprint
+            ),
+            definition_registration_record_hash=(
+                spec.strategy_execution.definition_registration_record_hash
+            ),
+            command_content_hash=envelope.content_hash,
+            envelope_json=envelope_json,
+            envelope_sha256=canonical_sha256({"canonical_envelope_json": envelope_json}),
+        )
+
+    def _validate_formal_submission_authorities(
+        self,
+        envelope: LabCommandEnvelope,
+        *,
+        observed_at: datetime,
+    ) -> tuple[ExperimentSubmissionIntent, ResearchExperimentIdentity]:
+        intent = self._experiment_submission_intent(envelope)
+        if intent is None:
+            raise FormalSubmissionAuthorityError("formal v3 submission identity is required")
+        if self.experiment_registry is None:
+            raise FormalSubmissionAuthorityError(
+                "v3 research submission requires an authoritative ExperimentRegistry"
+            )
+        command = envelope.command
+        assert isinstance(command, SubmitJobCommand)
+        assert command.spec.experiment is not None
+        assert command.spec.strategy_execution is not None
+        experiment = command.spec.experiment
+        execution = command.spec.strategy_execution
+        assert experiment.formal_plan_id is not None
+        try:
+            plan = self.experiment_registry.resolve_formal_plan_by_id(
+                experiment.formal_plan_id,
+                as_of=observed_at,
+            )
+        except IncompleteHypothesisFamilyError as exc:
+            raise FormalSubmissionAuthorityError("exact formal plan is unavailable") from exc
+        if (
+            plan.schema_version != 2
+            or plan.spec != experiment.spec
+            or plan.hypothesis_variant != experiment.hypothesis_variant
+            or plan.strategy_definition_fingerprint != execution.strategy_definition_fingerprint
+            or plan.definition_registration_record_hash
+            != execution.definition_registration_record_hash
+        ):
+            raise FormalSubmissionAuthorityError(
+                "formal plan receipts do not exactly match the research job"
+            )
+        directory = self.template_directory
+        if self.experiment_template_binding is not None:
+            directory = self.experiment_template_binding.directory_for_job(command.job_id, command.spec) or directory
+        template_catalog = None if directory is None else directory.catalog_for_spec(command.spec)
+        definitions = self.definition_registry
+        if template_catalog is not None:
+            definitions = directory.store.definition_registry(execution.strategy_id)
+        if definitions is None:
+            raise FormalSubmissionAuthorityError(
+                "v3 research submission requires an authoritative Definition Registry"
+            )
+        registration = definitions.read_strategy_spec(
+            execution.strategy_definition_fingerprint,
+            as_of=observed_at,
+        )
+        if registration is None:
+            raise FormalSubmissionAuthorityError("trusted strategy registration is not visible")
+        exact_registration = (
+            registration.logical_id,
+            registration.version,
+            registration.spec.spec_fingerprint,
+            registration.fingerprint,
+            registration.executable_fingerprint,
+            registration.candidate_schema_fingerprint,
+            registration.record_hash,
+            registration.registered_at,
+            registration.available_at,
+            registration.producer_commit,
+        )
+        submitted_registration = (
+            execution.strategy_id,
+            execution.strategy_version,
+            execution.strategy_spec_fingerprint,
+            execution.strategy_definition_fingerprint,
+            execution.strategy_executable_fingerprint,
+            execution.candidate_schema_fingerprint,
+            execution.definition_registration_record_hash,
+            execution.definition_registered_at,
+            execution.definition_available_at,
+            execution.producer_code_commit,
+        )
+        if exact_registration != submitted_registration:
+            raise FormalSubmissionAuthorityError(
+                "strategy execution identity conflicts with authoritative Definition Registry"
+            )
+        return intent, experiment
+
+    def _prepare_experiment_submission(self, envelope: LabCommandEnvelope) -> None:
+        if self._experiment_submission_intent(envelope) is None:
+            return
+        observed_at = self.clock()
+        intent, experiment = self._validate_formal_submission_authorities(
+            envelope,
+            observed_at=observed_at,
+        )
+        assert self.experiment_registry is not None
+        platform = self._private_experiment_platform(envelope)
+        if platform is not None:
+            stored = self.experiment_registry.get_submission_intent_for_job(intent.job_id)
+            if stored != intent or platform.child(intent.job_id) is None:
+                raise FormalSubmissionAuthorityError("private formal family is not fully ready")
+            return
+        self.experiment_registry.register_attempt(
+            experiment.spec,
+            registered_at=observed_at,
+            submission=intent,
+        )
+
+    def _private_experiment_platform(
+        self, envelope: LabCommandEnvelope
+    ) -> ExperimentPlatformStore | None:
+        command = envelope.command
+        if not isinstance(command, SubmitJobCommand) or command.spec.experiment is None:
+            return None
+        from rquant.experiment_platform import ExperimentPlatformStore, PRIVATE_FAMILY_PREFIXES
+
+        if not command.spec.experiment.hypothesis_family.startswith(PRIVATE_FAMILY_PREFIXES):
+            return None
+        if self.experiment_registry is None:
+            raise FormalSubmissionAuthorityError("private experiment registry is unavailable")
+        return ExperimentPlatformStore(self.experiment_registry)
+
+    def _admit_private_publication(self, envelope: LabCommandEnvelope) -> None:
+        platform = self._private_experiment_platform(envelope)
+        if platform is not None:
+            intent = self._experiment_submission_intent(envelope)
+            assert intent is not None
+            platform.admit_publication(intent, now=self.clock())
+
+    def validate_prepared_experiment_submission(
+        self,
+        envelope: LabCommandEnvelope,
+        *,
+        observed_at: datetime,
+    ) -> None:
+        """Re-read exact immutable ownership before the Job Center transaction writes."""
+
+        intent, experiment = self._validate_formal_submission_authorities(
+            envelope,
+            observed_at=observed_at,
+        )
+        assert self.experiment_registry is not None
+        stored_intent = self.experiment_registry.get_submission_intent_for_job(
+            envelope.command.job_id
+        )
+        if stored_intent != intent:
+            raise FormalSubmissionAuthorityError(
+                "formal submission has no exact prepared Experiment ownership intent"
+            )
+        try:
+            attempt = self.experiment_registry.get_attempt(experiment.experiment_id)
+        except KeyError as exc:
+            raise FormalSubmissionAuthorityError(
+                "formal submission has no registered Experiment attempt"
+            ) from exc
+        if attempt.spec != experiment.spec:
+            raise FormalSubmissionAuthorityError(
+                "formal submission Experiment attempt identity conflicts with its plan"
+            )
+        platform = self._private_experiment_platform(envelope)
+        if platform is not None:
+            platform.validate_publication(intent)
+
+    def _mark_experiment_submission_published(self, envelope: LabCommandEnvelope) -> None:
+        intent = self._experiment_submission_intent(envelope)
+        if intent is None:
+            return
+        if self.experiment_registry is None:  # pragma: no cover - guarded by prepare
+            raise RuntimeError("v3 research submission requires an ExperimentRegistry")
+        self.experiment_registry.mark_submission_published(
+            envelope.request_id,
+            command_content_hash=envelope.content_hash,
+            published_at=self.clock(),
+        )
+
+    def recover_pending_experiment_submissions(
+        self,
+        *,
+        limit: int = 100,
+    ) -> tuple[CommandSubmissionReceipt, ...]:
+        if self.experiment_registry is None:
+            return ()
+        recovered: list[CommandSubmissionReceipt] = []
+        for intent in self.experiment_registry.list_pending_submissions(limit=limit):
+            envelope = LabCommandEnvelope.model_validate_json(intent.envelope_json)
+            if (
+                envelope.request_id != intent.request_id
+                or envelope.command.job_id != intent.job_id
+                or envelope.content_hash != intent.command_content_hash
+            ):
+                raise RuntimeError("experiment submission outbox conflicts with command envelope")
+            self._admit_private_publication(envelope)
+            published = self._publish(envelope)
+            if isinstance(published, CommandSubmissionConflict):
+                raise RuntimeError("experiment submission recovery hit a command conflict")
+            self._mark_experiment_submission_published(envelope)
+            recovered.append(published)
+        return tuple(recovered)
+
+    def recover_private_experiment_cancellations(
+        self,
+        *,
+        observed_at: datetime,
+    ) -> tuple[ExperimentChildAdmission, ...]:
+        """Resume original cancel requests; a transport receipt is not cancellation."""
+        if self.experiment_registry is None:
+            return ()
+        from rquant.experiment_platform import ExperimentPlatformStore
+        from rquant.experiment_registry import _private_platform_schema
+
+        with self.experiment_registry._connect() as connection:
+            if not _private_platform_schema(connection):
+                return ()
+        platform = ExperimentPlatformStore(self.experiment_registry)
+        observed = normalize_aware_utc(observed_at)
+        progress = []
+        for child in platform.pending_cancellations():
+            job = self.reader.get_job(child.job_id)
+            if job is None:
+                progress.append(child)
+                continue
+            if job.updated_at > observed:
+                raise ValueError("cancellation job fact is from the future")
+            self._validate_private_cancel_binding(child, observed_at=observed)
+            terminal = {
+                JobStatus.SUCCEEDED: "already_completed",
+                JobStatus.CANCELLED: "confirmed",
+            }.get(job.status)
+            if job.status is JobStatus.FAILED and not job.recoverable:
+                terminal = "failed"
+            if terminal is not None:
+                self.synchronize_experiment_lifecycle(child.job_id, observed_at=observed)
+                child = child.model_copy(update={"cancel_state": terminal})
+                platform.record_cancel_progress(child)
+                progress.append(child)
+                continue
+            if not child.cancel_request_chain:
+                key = f"experiment.cancel:{child.job_id}:{job.version}:0"
+                child = child.model_copy(
+                    update={
+                        "cancel_job_version": job.version,
+                        "cancel_request_chain": (self._request_id(key),),
+                    }
+                )
+                platform.record_cancel_progress(child)
+            index = len(child.cancel_request_chain) - 1
+            key = f"experiment.cancel:{child.job_id}:{child.cancel_job_version}:{index}"
+            if self._request_id(key) != child.cancel_request_chain[-1]:
+                raise ValueError("original cancel request binding changed")
+            result = self._submit_control(
+                CancelJobCommand(
+                    job_id=child.job_id,
+                    expected_version=child.cancel_job_version,
+                    reason="experiment family cancellation",
+                ),
+                interaction_key=key,
+                private_cancellation=child,
+            )
+            stale = isinstance(result, CommandSubmissionStale) or (
+                isinstance(result, CommandSubmissionConflict)
+                and result.reason == "scheduler_rejected"
+                and (result.scheduler_reason or "").startswith("stale_version:")
+            )
+            if stale:
+                # Both branches prove the old request did not apply. Re-read the
+                # actual version and persist its successor before any transport.
+                context = self.reader.get_command_context(child.job_id)
+                if context is not None and context.job.version != child.cancel_job_version:
+                    version = context.job.version
+                    key = f"experiment.cancel:{child.job_id}:{version}:{index + 1}"
+                    child = child.model_copy(
+                        update={
+                            "cancel_job_version": version,
+                            "cancel_request_chain": (
+                                *child.cancel_request_chain,
+                                self._request_id(key),
+                            ),
+                        }
+                    )
+                    platform.record_cancel_progress(child)
+            progress.append(child)
+        return tuple(progress)
+
+    def _validate_private_cancel_binding(
+        self, child: ExperimentChildAdmission, *, observed_at: datetime
+    ) -> None:
+        from rquant.experiment_platform import ExperimentPlatformStore
+
+        if self.experiment_registry is None:
+            raise FormalSubmissionAuthorityError("private cancellation registry is unavailable")
+        platform = ExperimentPlatformStore(self.experiment_registry)
+        persisted = platform.child(child.job_id)
+        if (
+            persisted != child
+            or child.cancel_state != "pending"
+            or child.publish_grant_seq is None
+            or child.cancel_seq is None
+            or child.cancel_seq <= child.publish_grant_seq
+        ):
+            raise FormalSubmissionAuthorityError("private cancellation has no persisted admission")
+        family = platform.get_family(child.owner, child.family_id)
+        intent = self.experiment_registry.get_submission_intent_for_job(child.job_id)
+        if (
+            family.state != "ready"
+            or intent is None
+            or (
+                intent.job_id,
+                intent.request_id,
+                intent.experiment_id,
+                intent.command_content_hash,
+            )
+            != (child.job_id, child.request_id, child.experiment_id, child.command_content_hash)
+        ):
+            raise FormalSubmissionAuthorityError("private cancellation ownership changed")
+        original = LabCommandEnvelope.model_validate_json(intent.envelope_json)
+        self.validate_prepared_experiment_submission(original, observed_at=observed_at)
+        job = self.reader.get_job(child.job_id)
+        if (
+            not isinstance(original.command, SubmitJobCommand)
+            or job is None
+            or job.spec != original.command.spec
+            or job.spec.experiment is None
+            or job.spec.experiment.hypothesis_family != child.family_id
+            or job.spec.experiment.experiment_id != child.experiment_id
+        ):
+            raise FormalSubmissionAuthorityError(
+                "private cancellation job or immutable spec changed"
+            )
+
+    @staticmethod
+    def _private_control_spec(spec: ResearchRunSpec) -> bool:
+        from rquant.experiment_platform import PRIVATE_FAMILY_PREFIXES
+
+        return spec.experiment is not None and spec.experiment.hypothesis_family.startswith(
+            PRIVATE_FAMILY_PREFIXES
+        )
+
+    def synchronize_experiment_lifecycle(
+        self,
+        job_id: UUID,
+        *,
+        observed_at: datetime,
+    ) -> ExperimentAttempt:
+        """Recover one experiment attempt from the authoritative job state."""
+
+        if self.experiment_registry is None:
+            raise RuntimeError("experiment lifecycle synchronization requires ExperimentRegistry")
+        return ExperimentJobLifecycleSynchronizer(
+            reader=self.reader,
+            registry=self.experiment_registry,
+        ).synchronize(job_id, observed_at=observed_at)
+
+    @staticmethod
+    def _request_id(interaction_key: str | None) -> UUID:
+        if interaction_key is None:
+            return uuid4()
+        if (
+            not isinstance(interaction_key, str)
+            or not interaction_key
+            or interaction_key != interaction_key.strip()
+            or len(interaction_key) > 256
+        ):
+            raise ValueError("interaction_key must be 1-256 stable non-whitespace characters")
+        return uuid5(NAMESPACE_URL, f"rquant.lab-job-center.interaction:{interaction_key}")
+
+    @staticmethod
+    def _spool_identity(
+        value: LabSpoolEntry | LabAcknowledgedCommand,
+    ) -> SubmissionSpoolIdentity:
+        if isinstance(value, LabSpoolEntry):
+            return SubmissionSpoolIdentity(
+                path=value.path,
+                state="pending",
+                device=value.device,
+                inode=value.inode,
+                content_hash=value.envelope.content_hash,
+            )
+        observed = value.path.lstat()
+        if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
+            raise RuntimeError("acknowledged command spool identity is unsafe")
+        return SubmissionSpoolIdentity(
+            path=value.path,
+            state="acknowledged",
+            device=observed.st_dev,
+            inode=observed.st_ino,
+            content_hash=value.receipt.content_hash,
+        )
+
+    @classmethod
+    def _receipt(
+        cls,
+        envelope: LabCommandEnvelope,
+        published: LabSpoolEntry | LabAcknowledgedCommand,
+    ) -> CommandSubmissionReceipt:
+        command = envelope.command
+        return CommandSubmissionReceipt(
+            request_id=envelope.request_id,
+            command_type=command.command_type,
+            job_id=command.job_id,
+            expected_version=(
+                command.expected_version if not isinstance(command, SubmitJobCommand) else None
+            ),
+            spool=cls._spool_identity(published),
+        )
+
+    def _existing(
+        self,
+        envelope: LabCommandEnvelope,
+    ) -> CommandSubmissionResult | None:
+        try:
+            existing = self.spool.find(envelope.request_id)
+        except RequestContentConflictError:
+            return CommandSubmissionConflict(
+                request_id=envelope.request_id,
+                job_id=envelope.command.job_id,
+                reason="interaction_content_conflict",
+            )
+        if existing is None:
+            return None
+        saved = existing.envelope if isinstance(existing, LabSpoolEntry) else existing.receipt
+        if isinstance(saved, (LabSchedulingCommandEnvelope, LabSchedulingCommandReceipt)):
+            return CommandSubmissionConflict(
+                request_id=envelope.request_id,
+                job_id=envelope.command.job_id,
+                reason="interaction_content_conflict",
+            )
+        content_hash = (
+            existing.envelope.content_hash
+            if isinstance(existing, LabSpoolEntry)
+            else existing.receipt.content_hash
+        )
+        existing_job_id = (
+            existing.envelope.command.job_id
+            if isinstance(existing, LabSpoolEntry)
+            else existing.receipt.job_id
+        )
+        if content_hash != envelope.content_hash or existing_job_id != envelope.command.job_id:
+            return CommandSubmissionConflict(
+                request_id=envelope.request_id,
+                job_id=envelope.command.job_id,
+                reason="interaction_content_conflict",
+            )
+        if isinstance(existing, LabAcknowledgedCommand) and existing.receipt.status == "rejected":
+            return self._scheduler_rejection(envelope, existing)
+        return self._receipt(envelope, existing)
+
+    def _scheduler_rejection(
+        self,
+        envelope: LabCommandEnvelope,
+        acknowledged: LabAcknowledgedCommand,
+    ) -> CommandSubmissionResult:
+        command = envelope.command
+        scheduler_reason = acknowledged.receipt.reason
+        if scheduler_reason == "job_not_found":
+            return CommandSubmissionConflict(
+                request_id=envelope.request_id,
+                job_id=command.job_id,
+                reason="job_not_found",
+                scheduler_reason=scheduler_reason,
+            )
+        if isinstance(command, SubmitJobCommand):
+            return CommandSubmissionConflict(
+                request_id=envelope.request_id,
+                job_id=command.job_id,
+                reason=(
+                    "job_id_exists" if scheduler_reason == "job_id_reused" else "scheduler_rejected"
+                ),
+                scheduler_reason=scheduler_reason,
+            )
+        context = self.reader.get_command_context(command.job_id)
+        if context is None:
+            return CommandSubmissionConflict(
+                request_id=envelope.request_id,
+                job_id=command.job_id,
+                reason="job_not_found",
+                scheduler_reason=scheduler_reason,
+            )
+        if scheduler_reason.startswith("stale_version:"):
+            return CommandSubmissionStale(
+                request_id=envelope.request_id,
+                job_id=command.job_id,
+                expected_version=command.expected_version,
+                authoritative_version=context.job.version,
+                authoritative_status=context.job.status,
+                scheduler_reason=scheduler_reason,
+            )
+        if scheduler_reason.startswith("invalid_state:"):
+            return CommandSubmissionUnavailable(
+                request_id=envelope.request_id,
+                job_id=command.job_id,
+                command_type=command.command_type,
+                authoritative_version=context.job.version,
+                authoritative_status=context.job.status,
+                scheduler_reason=scheduler_reason,
+            )
+        return CommandSubmissionConflict(
+            request_id=envelope.request_id,
+            job_id=command.job_id,
+            reason="scheduler_rejected",
+            scheduler_reason=scheduler_reason,
+        )
+
+    def _publish(
+        self,
+        envelope: LabCommandEnvelope,
+    ) -> CommandSubmissionReceipt | CommandSubmissionConflict:
+        try:
+            published = self.spool.publish(envelope)
+        except RequestContentConflictError:
+            return CommandSubmissionConflict(
+                request_id=envelope.request_id,
+                job_id=envelope.command.job_id,
+                reason="interaction_content_conflict",
+            )
+        return self._receipt(envelope, published)
+
+    def submit_create(
+        self,
+        command: SubmitJobCommand,
+        *,
+        interaction_key: str | None = None,
+    ) -> CommandSubmissionResult:
+        validated = SubmitJobCommand.model_validate(command)
+        if validated.spec.schema_version < 3 and validated.spec.research_status != "exploratory":
+            raise ValueError("v2 comparable/formal jobs are not executable; migrate as exploratory")
+        envelope = LabCommandEnvelope(
+            request_id=self._request_id(interaction_key),
+            command=validated,
+        )
+        existing = self._existing(envelope)
+        if existing is not None:
+            if isinstance(existing, CommandSubmissionReceipt):
+                platform = self._private_experiment_platform(envelope)
+                if platform is None:
+                    self._prepare_experiment_submission(envelope)
+                else:
+                    intent = self._experiment_submission_intent(envelope)
+                    assert intent is not None
+                    platform.validate_publication(intent)
+                self._mark_experiment_submission_published(envelope)
+            return existing
+        if self.reader.get_job(validated.job_id) is not None:
+            return CommandSubmissionConflict(
+                request_id=envelope.request_id,
+                job_id=validated.job_id,
+                reason="job_id_exists",
+            )
+        self._prepare_experiment_submission(envelope)
+        self._admit_private_publication(envelope)
+        published = self._publish(envelope)
+        if isinstance(published, CommandSubmissionReceipt):
+            self._mark_experiment_submission_published(envelope)
+        return published
+
+    def submit_rerun(
+        self,
+        source_job_id: UUID,
+        *,
+        new_job_id: UUID,
+        max_attempts: int,
+        interaction_key: str | None = None,
+    ) -> CommandSubmissionResult:
+        source = self.reader.get_job(source_job_id)
+        if source is None or self._private_control_spec(source.spec):
+            return CommandSubmissionConflict(
+                request_id=self._request_id(interaction_key),
+                job_id=new_job_id,
+                reason="job_not_found",
+            )
+        return self.submit_create(
+            SubmitJobCommand(
+                job_id=new_job_id,
+                spec=source.spec,
+                max_attempts=max_attempts,
+            ),
+            interaction_key=interaction_key,
+        )
+
+    def _submit_control(
+        self,
+        command: LabCommand,
+        *,
+        interaction_key: str | None,
+        private_cancellation: ExperimentChildAdmission | None = None,
+    ) -> CommandSubmissionResult:
+        if isinstance(command, SubmitJobCommand):
+            raise TypeError("control submission cannot contain a create command")
+        envelope = LabCommandEnvelope(
+            request_id=self._request_id(interaction_key),
+            command=command,
+        )
+        existing = self._existing(envelope)
+        job = self.reader.get_job(command.job_id)
+        if job is not None and self._private_control_spec(job.spec):
+            if private_cancellation is None:
+                return CommandSubmissionConflict(
+                    request_id=envelope.request_id,
+                    job_id=command.job_id,
+                    reason="job_not_found",
+                )
+            self._validate_private_cancel_binding(private_cancellation, observed_at=self.clock())
+            if (
+                not isinstance(command, CancelJobCommand)
+                or command.job_id != private_cancellation.job_id
+                or command.expected_version != private_cancellation.cancel_job_version
+                or not private_cancellation.cancel_request_chain
+                or envelope.request_id != private_cancellation.cancel_request_chain[-1]
+                or command.reason != "experiment family cancellation"
+            ):
+                raise FormalSubmissionAuthorityError("original private cancel request changed")
+        elif private_cancellation is not None:
+            raise FormalSubmissionAuthorityError("private cancellation has no matching private job")
+        if existing is not None:
+            return existing
+        context = self.reader.get_command_context(command.job_id)
+        if context is None:
+            return CommandSubmissionConflict(
+                request_id=envelope.request_id,
+                job_id=command.job_id,
+                reason="job_not_found",
+            )
+        job = context.job
+        if command.expected_version != job.version:
+            return CommandSubmissionStale(
+                request_id=envelope.request_id,
+                job_id=command.job_id,
+                expected_version=command.expected_version,
+                authoritative_version=job.version,
+                authoritative_status=job.status,
+            )
+        if not getattr(context.availability, command.command_type):
+            return CommandSubmissionUnavailable(
+                request_id=envelope.request_id,
+                job_id=command.job_id,
+                command_type=command.command_type,
+                authoritative_version=job.version,
+                authoritative_status=job.status,
+            )
+        return self._publish(envelope)
+
+    def submit_pause(
+        self,
+        job_id: UUID,
+        *,
+        expected_version: int,
+        reason: str,
+        interaction_key: str | None = None,
+    ) -> CommandSubmissionResult:
+        return self._submit_control(
+            PauseJobCommand(
+                job_id=job_id,
+                expected_version=expected_version,
+                reason=reason,
+            ),
+            interaction_key=interaction_key,
+        )
+
+    def submit_resume(
+        self,
+        job_id: UUID,
+        *,
+        expected_version: int,
+        reason: str,
+        interaction_key: str | None = None,
+    ) -> CommandSubmissionResult:
+        return self._submit_control(
+            ResumeJobCommand(
+                job_id=job_id,
+                expected_version=expected_version,
+                reason=reason,
+            ),
+            interaction_key=interaction_key,
+        )
+
+    def submit_cancel(
+        self,
+        job_id: UUID,
+        *,
+        expected_version: int,
+        reason: str,
+        interaction_key: str | None = None,
+    ) -> CommandSubmissionResult:
+        return self._submit_control(
+            CancelJobCommand(
+                job_id=job_id,
+                expected_version=expected_version,
+                reason=reason,
+            ),
+            interaction_key=interaction_key,
+        )
+
+    def submit_retry(
+        self,
+        job_id: UUID,
+        *,
+        expected_version: int,
+        reason: str,
+        interaction_key: str | None = None,
+    ) -> CommandSubmissionResult:
+        return self._submit_control(
+            RetryJobCommand(
+                job_id=job_id,
+                expected_version=expected_version,
+                reason=reason,
+            ),
+            interaction_key=interaction_key,
+        )
+
+
+class ExperimentJobLifecycleSynchronizer:
+    """Map authoritative Job Center states onto one stable experiment attempt."""
+
+    def __init__(self, *, reader: LabJobReader, registry: ExperimentRegistry) -> None:
+        self.reader = reader
+        self.registry = registry
+
+    def synchronize(self, job_id: UUID, *, observed_at: datetime) -> ExperimentAttempt:
+        job = self.reader.get_job(job_id)
+        if job is None:
+            raise KeyError(f"unknown lab job: {job_id}")
+        if job.updated_at > observed_at:
+            raise ValueError("job lifecycle evidence is from the future")
+        experiment = job.spec.experiment
+        if job.spec.schema_version != 3 or experiment is None:
+            raise ValueError("legacy lab jobs cannot mutate experiment lifecycle")
+        experiment_id = experiment.experiment_id
+        if job.status in {JobStatus.RUNNING, JobStatus.CHECKPOINTED, JobStatus.SUCCEEDED}:
+            attempt = self.registry.ensure_attempt_started(
+                experiment_id,
+                started_at=job.updated_at,
+            )
+            if job.status is JobStatus.SUCCEEDED:
+                return self.registry.record_execution_completed(
+                    experiment_id,
+                    completed_at=job.updated_at,
+                )
+            return attempt
+        if job.status is JobStatus.FAILED and not job.recoverable:
+            return self.registry.record_failure(
+                experiment_id,
+                first_error=(
+                    f"lab job failed after {job.attempt_count}/{job.max_attempts} attempts"
+                ),
+                completed_at=job.updated_at,
+            )
+        if job.status is JobStatus.CANCELLED:
+            return self.registry.cancel_attempt(
+                experiment_id,
+                first_error="lab job cancelled",
+                completed_at=job.updated_at,
+            )
+        return self.registry.get_attempt(experiment_id)
+
+
+class ExperimentLifecycleRecoveryResult(JobCenterModel):
+    recovered_submission_count: int = Field(ge=0)
+    synchronized_job_ids: tuple[UUID, ...]
+
+
+class ExperimentLifecycleCoordinator:
+    """Recover the durable submission outbox and converge every owned job attempt."""
+
+    _MAX_RECOVERY_JOBS = 999
+
+    def __init__(
+        self,
+        facade: LabCommandSubmissionFacade,
+        *,
+        evidence_sink: Callable[[datetime], object] | None = None,
+    ) -> None:
+        if facade.experiment_registry is None:
+            raise RuntimeError("experiment lifecycle coordinator requires ExperimentRegistry")
+        self.facade = facade
+        self.registry = facade.experiment_registry
+        self.evidence_sink = evidence_sink
+
+    def validate_submission(
+        self,
+        envelope: LabCommandEnvelope,
+        *,
+        observed_at: datetime,
+    ) -> None:
+        command = envelope.command
+        if not isinstance(command, SubmitJobCommand):
+            return
+        if command.spec.schema_version == 2:
+            if command.spec.research_status != "exploratory":
+                raise FormalSubmissionAuthorityError(
+                    "new v2 comparable submissions require explicit exploratory migration"
+                )
+            return
+        if command.spec.schema_version != 3:
+            return
+        self.facade.validate_prepared_experiment_submission(
+            envelope,
+            observed_at=observed_at,
+        )
+
+    def synchronize(
+        self,
+        job_id: UUID,
+        *,
+        observed_at: datetime,
+    ) -> ExperimentAttempt | None:
+        intent = self.registry.get_submission_intent_for_job(job_id)
+        job = self.facade.reader.get_job(job_id)
+        if job is None:
+            if intent is None:
+                return None
+            raise RuntimeError("experiment-owned job is missing from Job Center authority")
+        if intent is None:
+            if job.spec.schema_version == 3:
+                raise RuntimeError("v3 job is missing Experiment Registry submission ownership")
+            return None
+        experiment = job.spec.experiment
+        if (
+            job.spec.schema_version != 3
+            or experiment is None
+            or experiment.experiment_id != intent.experiment_id
+            or experiment.attempt_identity != intent.attempt_identity
+        ):
+            raise RuntimeError("Job Center and Experiment Registry ownership conflict")
+        return self.facade.synchronize_experiment_lifecycle(
+            job_id,
+            observed_at=observed_at,
+        )
+
+    def recover(self, *, observed_at: datetime) -> ExperimentLifecycleRecoveryResult:
+        recovered = self.facade.recover_pending_experiment_submissions(
+            limit=self._MAX_RECOVERY_JOBS
+        )
+        intents = self.registry.list_recoverable_submission_intents(
+            limit=self._MAX_RECOVERY_JOBS + 1
+        )
+        if len(intents) > self._MAX_RECOVERY_JOBS:
+            raise RuntimeError("experiment lifecycle recovery exceeds its bounded job budget")
+        synchronized: list[UUID] = []
+        for intent in intents:
+            if self.facade.reader.get_job(intent.job_id) is None:
+                continue
+            self.synchronize(intent.job_id, observed_at=observed_at)
+            synchronized.append(intent.job_id)
+        self.facade.recover_private_experiment_cancellations(observed_at=observed_at)
+        if self.evidence_sink is not None:
+            self.evidence_sink(observed_at)
+        return ExperimentLifecycleRecoveryResult(
+            recovered_submission_count=len(recovered),
+            synchronized_job_ids=tuple(synchronized),
+        )

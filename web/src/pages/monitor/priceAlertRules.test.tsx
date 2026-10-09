@@ -99,7 +99,8 @@ beforeEach(() => {
 
 it("opens an editor with exact original price and seconds, and guards unsaved drafts", async () => {
   renderApp("/monitor");
-  const trigger = await screen.findByRole("button", { name: "编辑 突破提醒" });
+  await screen.findByRole("button", { name: "编辑 突破提醒" });
+  const trigger = screen.getByRole("button", { name: "编辑 突破提醒" });
   trigger.focus();
   fireEvent.click(trigger);
   expect(await screen.findByLabelText("阈值价格")).toHaveValue("10.123456");
@@ -162,7 +163,8 @@ it("runs enable and delete through the original actions and precise versions", a
     }),
   );
   renderApp("/monitor");
-  fireEvent.click(await screen.findByRole("switch", { name: "启停 突破提醒" }));
+  await screen.findByRole("switch", { name: "启停 突破提醒" });
+  fireEvent.click(screen.getByRole("switch", { name: "启停 突破提醒" }));
   await waitFor(() => expect(seen).toHaveLength(1));
   expect(seen[0]).toMatchObject({ action: "set_enabled", expected_version: 1, enabled: false });
   fireEvent.click(screen.getByRole("button", { name: "删除 突破提醒" }));
@@ -193,8 +195,10 @@ it("a late save cannot overwrite another draft or show current success", async (
     }),
   );
   renderApp("/monitor");
-  fireEvent.click(await screen.findByRole("button", { name: "编辑 突破提醒" }));
-  fireEvent.click(await screen.findByRole("button", { name: "保存规则" }));
+  await screen.findByRole("button", { name: "编辑 突破提醒" });
+  fireEvent.click(screen.getByRole("button", { name: "编辑 突破提醒" }));
+  await screen.findByRole("button", { name: "保存规则" });
+  fireEvent.click(screen.getByRole("button", { name: "保存规则" }));
   fireEvent.click(screen.getByRole("button", { name: "取消编辑" }));
   await waitFor(() => expect(screen.queryByLabelText("规则名称")).toBeNull());
   fireEvent.click(screen.getByRole("button", { name: "新建规则" }));
@@ -211,7 +215,8 @@ it("a late save cannot overwrite another draft or show current success", async (
 
 it("owner change hides the previous drawer and original records", async () => {
   const app = renderApp("/monitor");
-  fireEvent.click(await screen.findByRole("button", { name: "编辑 突破提醒" }));
+  await screen.findByRole("button", { name: "编辑 突破提醒" });
+  fireEvent.click(screen.getByRole("button", { name: "编辑 突破提醒" }));
   expect(await screen.findByLabelText("规则名称")).toHaveValue("突破提醒");
   server.use(metaHandler(metaEnvelope({ viewer: "bob" })));
   act(() => app.queryClient.setQueryData(["meta"], metaEnvelope({ viewer: "bob" })));
@@ -227,7 +232,8 @@ it("invalid time keeps the draft and sends no configuration command", async () =
     }),
   );
   renderApp("/monitor");
-  fireEvent.click(await screen.findByRole("button", { name: "编辑 突破提醒" }));
+  await screen.findByRole("button", { name: "编辑 突破提醒" });
+  fireEvent.click(screen.getByRole("button", { name: "编辑 突破提醒" }));
   fireEvent.change(await screen.findByLabelText("开始时间"), { target: { value: "15:00" } });
   fireEvent.click(screen.getByRole("button", { name: "保存规则" }));
   expect(await screen.findByText("请填写有效时间，开始须早于结束。")).toBeInTheDocument();

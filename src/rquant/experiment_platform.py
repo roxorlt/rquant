@@ -15,7 +15,7 @@ from typing import Annotated, Literal, Self
 from uuid import NAMESPACE_URL, UUID, uuid5
 from zoneinfo import ZoneInfo
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, TypeAdapter, field_validator, model_validator
 
 from rquant.backtest.contracts import SSECalendar
 from rquant.experiment_platform_template_models import (
@@ -44,6 +44,11 @@ from rquant.portfolio_backtest_source import (
 from rquant.runtime_contracts import AwareUtcDatetime, RuntimeContractModel, canonical_sha256
 from rquant.strategy_authoring_commands import SaveStrategyTemplate, StrategyTemplateReceipt
 from rquant.strategy_template import StrategyTemplate
+from rquant.minute_backtest_contracts import MinuteReplayExecutionProfile
+from rquant.minute_backtest_formal import MinuteExperimentProtocol, PreparedMinuteRequest
+from rquant.minute_backtest_producer import PublishedMinuteInput
+from rquant.runtime_market_session import MarketCalendarAuthority
+from rquant.strategy_promotion_contracts import NativeMinuteConfiguration, NativeMinuteSelection
 
 Sha256 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 Owner = Annotated[str, Field(pattern=r"^[A-Za-z0-9._@-]{1,64}$")]
@@ -133,7 +138,53 @@ class ExperimentSearchRequest(RuntimeContractModel):
         return self
 
 
-def enumerate_search(request: ExperimentSearchRequest) -> tuple[PortfolioBacktestConfig, ...]:
+class NativeMinuteExperimentRequest(RuntimeContractModel):
+    kind: Literal["native_minute_experiment"] = "native_minute_experiment"
+    name: str = Field(min_length=1, max_length=60)
+    configurations: tuple[NativeMinuteConfiguration, ...] = Field(min_length=1, max_length=64)
+    protocol: MinuteExperimentProtocol
+    seed: int = Field(default=0, strict=True, ge=0, le=2**32 - 1)
+    confidence: Decimal = Field(default=Decimal("0.95"), gt=Decimal("0.5"), lt=1, allow_inf_nan=False)
+    target_period_sharpe: Decimal = Field(default=Decimal("0"), allow_inf_nan=False)
+    pbo_slices: Literal[4, 6, 8, 10] = 4
+    walk_forward_plan_hash: Sha256 | None = None
+    walk_forward_command_id: UUID | None = None
+
+    @model_validator(mode="after")
+    def fixed_complete_array(self) -> Self:
+        if (self.walk_forward_plan_hash is None) != (self.walk_forward_command_id is None):
+            raise ValueError("native WF requires its paired original UUID and reference plan")
+        if len({c.selection.target.owner_id for c in self.configurations}) != 1:
+            raise PermissionError("native family contains another owner")
+        if len({c.selection.profile_hash for c in self.configurations}) != 1:
+            raise ValueError("native family must use one fixed full execution profile")
+        for cfg in self.configurations:
+            if not self.protocol.train_range.start_date <= cfg.start_date <= cfg.end_date <= self.protocol.validation_range.end_date:
+                raise ValueError("native family inputs exceed the protected train/validation phase")
+            if self.walk_forward_plan_hash is None and (cfg.start_date, cfg.end_date) != (
+                self.protocol.train_range.start_date, self.protocol.validation_range.end_date
+            ):
+                raise ValueError("native parent requires the complete train/validation interval")
+        if len(self.model_dump_json().encode()) > 32 * 1024:
+            raise ValueError("native family request exceeds byte budget")
+        return self
+
+    @property
+    def base_config(self) -> NativeMinuteConfiguration:
+        return self.configurations[0]
+
+    @property
+    def template(self) -> None:
+        return None
+
+
+ExperimentConfiguration = PortfolioBacktestConfig | NativeMinuteConfiguration
+ExperimentFamilyRequest = ExperimentSearchRequest | NativeMinuteExperimentRequest
+
+
+def enumerate_search(request: ExperimentFamilyRequest) -> tuple[ExperimentConfiguration, ...]:
+    if isinstance(request, NativeMinuteExperimentRequest):
+        return NativeMinuteExperimentRequest.model_validate(request.model_dump(mode="python")).configurations
     checked = ExperimentSearchRequest.model_validate(request.model_dump(mode="python"))
     dimensions = tuple(sorted(checked.dimensions, key=lambda d: d.parameter))
     size = 1
@@ -162,7 +213,7 @@ def enumerate_search(request: ExperimentSearchRequest) -> tuple[PortfolioBacktes
 
 
 def validate_experiment_dates(
-    request: ExperimentSearchRequest, *, calendar: tuple[date, ...], latest_complete: date
+    request: ExperimentFamilyRequest, *, calendar: tuple[date, ...], latest_complete: date
 ) -> None:
     if not calendar or tuple(sorted(set(calendar))) != calendar:
         raise ValueError("actual SSE calendar is missing or invalid")
@@ -219,8 +270,8 @@ class ExperimentFamilyRecord(RuntimeContractModel):
     request_id: UUID
     body_hash: Sha256
     family_id: str
-    request: ExperimentSearchRequest
-    actual_configurations: tuple[PortfolioBacktestConfig, ...] = Field(min_length=1, max_length=64)
+    request: ExperimentFamilyRequest
+    actual_configurations: tuple[ExperimentConfiguration, ...] = Field(min_length=1, max_length=64)
     enumeration_version: Literal["ordered-product-python-random-sample/v1"] = (
         "ordered-product-python-random-sample/v1"
     )
@@ -233,6 +284,11 @@ class ExperimentFamilyRecord(RuntimeContractModel):
 
     @model_validator(mode="after")
     def bind_template_baseline(self) -> Self:
+        if isinstance(self.request, NativeMinuteExperimentRequest) and (
+            any(not isinstance(c, NativeMinuteConfiguration) or c.selection.target.owner_id != self.owner for c in self.actual_configurations)
+            or (self.phase == "search" and self.actual_configurations != self.request.configurations)
+        ):
+            raise PermissionError("native family differs from its exact owner or fixed array")
         selection, baseline = self.request.template, self.template_baseline
         if (selection is None) != (baseline is None):
             raise ValueError("template selection needs its original server baseline")
@@ -246,10 +302,10 @@ class ExperimentFamilyRecord(RuntimeContractModel):
 
 
 class ExperimentChildRegistration(RuntimeContractModel):
-    config: PortfolioBacktestConfig
+    config: ExperimentConfiguration
     plan: FormalExperimentPlan
     intent: ExperimentSubmissionIntent
-    published: PublishedPortfolioInput | ExperimentTemplatePublication
+    published: PublishedPortfolioInput | ExperimentTemplatePublication | PublishedMinuteInput
 
 
 class ExperimentSourceProfile(RuntimeContractModel):
@@ -295,6 +351,42 @@ class ExperimentPhaseRead(RuntimeContractModel):
         return self
 
 
+class NativeMinuteSourceProfile(RuntimeContractModel):
+    selection: NativeMinuteSelection
+    execution_profile: MinuteReplayExecutionProfile
+    producer_commit: str = Field(pattern=r"^[0-9a-f]{40}$")
+    calendar: MarketCalendarAuthority
+    coverage: DateRange
+    latest_complete: date
+    phase_slice_available: bool = Field(default=False, strict=True)
+    source_identity: Sha256 | None = None
+
+    @model_validator(mode="after")
+    def bind_complete_profile(self) -> Self:
+        if (self.selection.profile_hash, self.selection.target.cost_fingerprint) != (
+            self.execution_profile.profile_hash, canonical_sha256(self.execution_profile.execution_costs)
+        ):
+            raise ValueError("native installed profile/cost differs from its fixed selection")
+        if self.latest_complete > self.coverage.end_date:
+            raise ValueError("native source completion exceeds actual coverage")
+        expected = canonical_sha256(self.model_dump(mode="json", exclude={"source_identity"}))
+        if self.source_identity is None:
+            object.__setattr__(self, "source_identity", expected)
+        elif self.source_identity != expected:
+            raise ValueError("native protected source identity differs")
+        return self
+
+
+class NativeMinutePhaseRead(ExperimentPhaseRead):
+    index: int = Field(strict=True, ge=0, le=63)
+    configuration: NativeMinuteConfiguration
+
+    @property
+    def publication_source_key(self) -> str:
+        # Each actual private phase publication gets its own original catalog key.
+        return "native-phase:" + canonical_sha256(self)
+
+
 class ExperimentPreparationReceipt(RuntimeContractModel):
     family_id: str
     owner: Owner
@@ -303,10 +395,24 @@ class ExperimentPreparationReceipt(RuntimeContractModel):
     source_path: str = Field(max_length=1024)
     file_identity: tuple[int, int, int, int]
     file_sha256: Sha256
-    prepared: PreparedPortfolioRequest | PreparedExperimentTemplate
+    prepared: PreparedPortfolioRequest | PreparedExperimentTemplate | PreparedMinuteRequest
+    native_configuration: NativeMinuteConfiguration | None = None
+
+    @model_validator(mode="after")
+    def bind_native_preparation(self) -> Self:
+        if isinstance(self.prepared, PreparedMinuteRequest):
+            if self.native_configuration is None or self.native_configuration.selection.target.owner_id != self.owner:
+                raise PermissionError("native preparation requires its exact owner/configuration")
+            from rquant.experiment_platform_evidence import verify_native_preparation
+            verify_native_preparation(self.prepared, self.native_configuration)
+        elif self.native_configuration is not None:
+            raise ValueError("native configuration cannot relabel a daily or template preparation")
+        return self
 
     @property
-    def configuration(self) -> PortfolioBacktestConfig:
+    def configuration(self) -> ExperimentConfiguration:
+        if isinstance(self.prepared, PreparedMinuteRequest):
+            return self.native_configuration
         return (
             self.prepared.configuration
             if isinstance(self.prepared, PreparedExperimentTemplate)
@@ -341,6 +447,19 @@ class ExperimentChildAdmission(RuntimeContractModel):
     cancel_job_version: int | None = None
 
 
+def validate_experiment_publication_grant(
+    child: ExperimentChildAdmission | None, intent: ExperimentSubmissionIntent
+) -> None:
+    if (
+        child is None
+        or child.publish_grant_seq is None
+        or child.cancel_state == "before_publication"
+        or (child.request_id, child.experiment_id, child.command_content_hash)
+        != (intent.request_id, intent.experiment_id, intent.command_content_hash)
+    ):
+        raise PermissionError("formal publication has no exact persisted grant")
+
+
 class ExperimentNote(RuntimeContractModel):
     family_id: str
     owner: Owner
@@ -362,7 +481,7 @@ class ExperimentOuterGrant(RuntimeContractModel):
     request_id: UUID
     family_id: str
     experiment_id: Sha256
-    config: PortfolioBacktestConfig
+    config: ExperimentConfiguration
     outer_range: DateRange
     policy: HoldoutPolicy
     admitted_at: AwareUtcDatetime
@@ -371,6 +490,18 @@ class ExperimentOuterGrant(RuntimeContractModel):
     body_hash: Sha256
     result_hash: Sha256
     source_identity: Sha256
+
+    @model_validator(mode="after")
+    def exact_native_selected_source(self) -> Self:
+        if isinstance(self.config, NativeMinuteConfiguration) and (
+            self.owner, self.source_key, self.source_version
+        ) != (
+            self.config.selection.target.owner_id,
+            self.config.source_key,
+            self.config.source_version,
+        ):
+            raise ValueError("native outer grant differs from the selected owner/source")
+        return self
 
 
 _SCHEMA = (
@@ -511,10 +642,21 @@ class ExperimentPlatformStore:
         owner: str,
         request_id: UUID,
         body_hash: str,
-        request: ExperimentSearchRequest,
+        request: ExperimentFamilyRequest,
         registered_at: datetime,
         template_baseline: ExperimentTemplateBaseline | None = None,
     ) -> ExperimentFamilyRecord:
+        if isinstance(request, NativeMinuteExperimentRequest) and request.walk_forward_command_id is not None:
+            from rquant.strategy_promotion_walk_forward import NativeStrategyPromotionWalkForwardPlan
+
+            plan = self.registry.walk_forward_plan_by_id(request.walk_forward_command_id, actor_id=owner)
+            if (
+                not isinstance(plan, NativeStrategyPromotionWalkForwardPlan)
+                or request.walk_forward_command_id != request_id
+                or plan.fingerprint != request.walk_forward_plan_hash
+                or plan.family_request() != request
+            ):
+                raise ValueError("native WF differs from its immutable original reference plan")
         with self.transaction() as connection:
             row = connection.execute(
                 "SELECT * FROM experiment_family_request WHERE request_id=?", (str(request_id),)
@@ -750,7 +892,7 @@ class ExperimentPlatformStore:
         return checked
 
     def save_preparation(self, receipt: ExperimentPreparationReceipt) -> None:
-        checked = ExperimentPreparationReceipt.model_validate(receipt.model_dump(mode="python"))
+        checked = ExperimentPreparationReceipt.model_validate(receipt.model_dump(mode="python", exclude_computed_fields=isinstance(receipt.prepared, PreparedMinuteRequest)))
         with self.transaction() as connection:
             record = self._record(connection, checked.owner, checked.family_id)
             if (
@@ -766,7 +908,7 @@ class ExperimentPlatformStore:
                 ),
                 (checked.family_id, checked.index),
             ).fetchone()
-            raw = _json_payload(checked)
+            raw = json.dumps(checked.model_dump(mode="json", exclude_computed_fields=True), ensure_ascii=True, separators=(",", ":"), sort_keys=True) if isinstance(checked.prepared, PreparedMinuteRequest) else _json_payload(checked)
             if previous is not None:
                 if previous[0] != raw:
                     raise ValueError("original prepared child is immutable")
@@ -833,7 +975,7 @@ class ExperimentPlatformStore:
             if actual is None or ExperimentOuterGrant.model_validate_json(actual[0]) != grant:
                 raise PermissionError("outer preparation requires the actual persisted grant")
             parent = self._record(connection, grant.owner, grant.family_id)
-            cfg = PortfolioBacktestConfig.model_validate(
+            cfg = type(grant.config).model_validate(
                 grant.config.model_dump(mode="python")
                 | {
                     "start_date": grant.outer_range.start_date,
@@ -933,7 +1075,7 @@ class ExperimentPlatformStore:
                 ):
                     raise ValueError("child formal identity differs from its family")
                 if (
-                    child.config.config_hash != child.published.config_hash
+                    (not isinstance(child.published, PublishedMinuteInput) and child.config.config_hash != child.published.config_hash)
                     or spec.dataset_snapshot_id != child.published.identity.snapshot_id
                 ):
                     raise ValueError("child actual input binding differs")
@@ -948,7 +1090,7 @@ class ExperimentPlatformStore:
                 if prepared_row is None:
                     raise ValueError("formal child has no original preparation")
                 prepared = ExperimentPreparationReceipt.model_validate_json(prepared_row[0])
-                expected_job = stable_experiment_job(owner, request_id, index)
+                expected_job = experiment_family_job(record, index)
                 from rquant.lab_job_center import LabCommandSubmissionFacade
                 from rquant.lab_job_protocol import LabCommandEnvelope
 
@@ -991,7 +1133,7 @@ class ExperimentPlatformStore:
                 self.registry._insert_attempt(
                     connection,
                     child.plan.spec,
-                    registered_at=record.registered_at,
+                    registered_at=child.plan.preregistered_at if isinstance(child.published, PublishedMinuteInput) else record.registered_at,
                     submission=child.intent,
                 )
                 key = "config:" + child.intent.experiment_id
@@ -1116,15 +1258,7 @@ class ExperimentPlatformStore:
         return child
 
     def validate_publication(self, intent: ExperimentSubmissionIntent) -> None:
-        child = self.child(intent.job_id)
-        if (
-            child is None
-            or child.publish_grant_seq is None
-            or child.cancel_state == "before_publication"
-            or (child.request_id, child.experiment_id, child.command_content_hash)
-            != (intent.request_id, intent.experiment_id, intent.command_content_hash)
-        ):
-            raise PermissionError("formal publication has no exact persisted grant")
+        validate_experiment_publication_grant(self.child(intent.job_id), intent)
 
     def cancel_family(
         self, *, owner: str, family_id: str, request_id: UUID, now: datetime
@@ -1366,8 +1500,12 @@ class ExperimentPlatformStore:
                 outer_range=window,
                 policy=policy,
                 admitted_at=now,
-                source_key=record.request.base_config.source_key,
-                source_version=record.request.base_config.source_version,
+                source_key=record.actual_configurations[index].source_key
+                if isinstance(record.request, NativeMinuteExperimentRequest)
+                else record.request.base_config.source_key,
+                source_version=record.actual_configurations[index].source_version
+                if isinstance(record.request, NativeMinuteExperimentRequest)
+                else record.request.base_config.source_version,
                 body_hash=body_hash,
                 result_hash=result_hash,
                 source_identity=source_identity,
@@ -1388,14 +1526,14 @@ class ExperimentPlatformStore:
     @staticmethod
     def _config_for_experiment(
         connection: sqlite3.Connection, family_id: str, experiment_id: str
-    ) -> PortfolioBacktestConfig:
+    ) -> ExperimentConfiguration:
         row = connection.execute(
             "SELECT value FROM experiment_platform_metadata WHERE key=?",
             ("config:" + experiment_id,),
         ).fetchone()
         if row is None:
             raise ValueError("actual candidate config is unavailable")
-        return PortfolioBacktestConfig.model_validate_json(row[0])
+        return TypeAdapter(ExperimentConfiguration).validate_json(row[0])
 
     def set_note(
         self,
@@ -1481,6 +1619,16 @@ class ExperimentPlatformStore:
 
 def stable_experiment_job(owner: str, request_id: UUID, index: int) -> UUID:
     return uuid5(NAMESPACE_URL, f"rquant.experiment-job:{owner}:{request_id}:{index}")
+
+
+def experiment_family_job(record: ExperimentFamilyRecord, index: int) -> UUID:
+    if not 0 <= index < len(record.actual_configurations):
+        raise ValueError("original family child index is outside the fixed array")
+    if record.phase == "search" and isinstance(record.request, NativeMinuteExperimentRequest):
+        original = record.request.walk_forward_command_id
+        if original is not None:
+            return uuid5(original, f"strategy-fixed-wf:{index + 1}")
+    return stable_experiment_job(record.owner, record.request_id, index)
 
 
 def stable_experiment_interaction(owner: str, request_id: UUID, index: int) -> str:

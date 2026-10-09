@@ -24,6 +24,7 @@ from rquant.runtime_contracts import (
     canonical_sha256,
     normalize_aware_utc,
 )
+from rquant.runtime_health_details import RuntimeHealthOpsBinding
 from rquant.runtime_service_control import RuntimeServicePlane, RuntimeStepResult
 from rquant.runtime_service_entrypoint import (
     RuntimeServiceBuilder,
@@ -80,6 +81,9 @@ class ServingRuntimeSettings(RuntimeContractModel):
     schema_version: StrictInt = Field(ge=1)
     source_authorities: tuple[ServingSourceAuthoritySettings, ...] = ()
     ops_manifest_digest: GenerationId | None = None
+    health_ops_binding: RuntimeHealthOpsBinding | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     #: The legacy six-owner production manifest keeps its explicit optional set; the
     #: missing ops owner is separately forced unavailable at build. The reverse does not hold:
     #: `RuntimeContractModel` forbids extra keys, so
@@ -329,6 +333,24 @@ def serving_publisher_builder(
                     reader=readers["strategy_catalog"],
                     runtime_root=runtime_root,
                 )
+            health_ops_reference_reader = None
+            if settings.health_ops_binding is not None:
+                from rquant.runtime_health_authority import RuntimeHealthTrustedOpsProvider
+
+                if settings.health_ops_binding.producer_commit != manifest.producer_commit:
+                    raise ValueError("health Ops binding does not name this exact producer")
+                health_ops_reference_reader = RuntimeHealthTrustedOpsProvider(
+                    settings.health_ops_binding
+                ).read_source
+            elif "ops_status" in readers:
+                health_ops_reference_reader = ServingSourceAuthorityReader(
+                    root=readers["ops_status"].root,
+                    expected_producer_commit=manifest.producer_commit,
+                    expected_dataset_id="ops_status",
+                    expected_payload_kind="ops_status",
+                    max_bytes=512 * 1024,
+                    previous_generation_of_producer_commit=previous_generation_of_producer_commit,
+                )
             assembler = ServingSnapshotAssembler(
                 signal_reader=readers["signals"],
                 paper_accounts_reader=readers["paper_accounts"],
@@ -338,6 +360,7 @@ def serving_publisher_builder(
                 ops_status_reader=readers.get("ops_status"),
                 strategy_catalog_reader=readers.get("strategy_catalog"),
                 expected_ops_manifest_digest=settings.ops_manifest_digest,
+                health_ops_reference_reader=health_ops_reference_reader,
                 reference_slow_reader=readers[_REFERENCE_SLOW_AUTHORITY_DATASET_ID],
                 #: The legacy six-owner shape has no ops authority yet. Other sources
                 #: follow the manifest; only classified ops integrity is also optional.

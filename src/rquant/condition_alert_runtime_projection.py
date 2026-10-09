@@ -29,7 +29,15 @@ from rquant.condition_alert_runtime_contracts import (
     require_condition_alert_activation,
     require_verified_condition_activation,
 )
-from rquant.delivery_contracts import DeliveryTarget, OutboxRecord, OutboxStatus
+from rquant.delivery_contracts import (
+    DeliveryTarget, NotificationRuntimeChannelState, NotificationRuntimeGroupView,
+    NotificationRuntimeWindow, OutboxRecord, OutboxStatus,
+)
+from rquant.monitor_builtin_contracts import BuiltinConditionAlertEventEnvelope
+from rquant.monitor_builtin_runtime import (
+    MonitorBuiltinDeliveryState, MonitorBuiltinServingEvent, MonitorBuiltinServingHead,
+    MonitorBuiltinServingSnapshot, MonitorBuiltinServingWindow,
+)
 from rquant.runtime_contracts import AwareUtcDatetime, canonical_sha256, normalize_aware_utc
 from rquant.serving_read_models import PAGE_PROJECTION_CONTRACTS, ServingProjectionPayload
 from rquant.signal_bus import _encode_time, _require_time
@@ -217,6 +225,116 @@ def condition_table_rows(
     if len(rows) > contract.max_rows or len(rows) != expected_count:
         raise ValueError("condition source full row count differs")
     return tuple(dict(zip(contract.column_names, item, strict=True)) for item in rows)
+
+
+_MONITOR_RUNTIME_TABLES = (
+    "notification_runtime_state", "notification_runtime_delivery",
+    "monitor_builtin_state", "monitor_builtin_event",
+)
+
+
+class MonitorRuntimeProjectionSnapshot(ConditionRuntimeModel):
+    notification_window: NotificationRuntimeWindow
+    channels: tuple[NotificationRuntimeChannelState, ...] = Field(max_length=63)
+    groups: tuple[NotificationRuntimeGroupView, ...] = Field(max_length=512)
+    builtin_window: MonitorBuiltinServingWindow
+    builtin_heads: tuple[MonitorBuiltinServingHead, ...] = Field(max_length=128)
+    builtin_events: tuple[MonitorBuiltinServingEvent, ...] = Field(max_length=1000)
+
+    @model_validator(mode="after")
+    def same_owner_read(self) -> Self:
+        window = self.notification_window
+        if self.builtin_window.observed_at != window.observed_at:
+            raise ValueError("monitor runtime tables mix owner cutoffs")
+        if window.returned_history_count != len(self.groups):
+            raise ValueError("notification runtime history is incomplete")
+        if not window.complete and self.channels:
+            raise ValueError("unavailable notification runtime cannot claim statistics")
+        for row in self.channels:
+            if (row.observed_at, row.covered_from, row.covered_through, row.source_receipt_sha256,
+                row.mode, row.applied_revision) != (window.observed_at, window.covered_from,
+                    window.covered_through, window.source_receipt_sha256, window.binding.mode,
+                    window.applied_revision):
+                raise ValueError("notification channel mixes original receipts or cutoffs")
+        if any((row.inspected_at, row.source_receipt_sha256) !=
+               (window.observed_at, window.source_receipt_sha256) for row in self.groups):
+            raise ValueError("notification history mixes original receipts or cutoffs")
+        if self.builtin_window.state == "ready":
+            MonitorBuiltinServingSnapshot(window=self.builtin_window,
+                heads=self.builtin_heads, events=self.builtin_events)
+        elif self.builtin_heads or self.builtin_events:
+            raise ValueError("unavailable builtin runtime cannot claim original rows")
+        return self
+
+
+def validate_monitor_runtime_projections(
+    projections: Mapping[str, ServingProjectionPayload],
+) -> MonitorRuntimeProjectionSnapshot | None:
+    selected = {name: projections[name] for name in _MONITOR_RUNTIME_TABLES if name in projections}
+    if not selected:
+        return None
+    if len(selected) != len(_MONITOR_RUNTIME_TABLES):
+        raise ValueError("monitor runtime extension must be complete")
+    notification_rows = selected["notification_runtime_state"].rows
+    builtin_rows = selected["monitor_builtin_state"].rows
+    markers = tuple(row for row in notification_rows if (row["owner_id"], row["channel"]) == ("", ""))
+    builtin_markers = tuple(row for row in builtin_rows if (row["owner_id"], row["builtin_id"]) == ("", ""))
+    if len(markers) != 1 or len(builtin_markers) != 1:
+        raise ValueError("monitor runtime extension needs its complete owner markers")
+    window = NotificationRuntimeWindow.model_validate_json(markers[0]["body_json"])
+    builtin_window = MonitorBuiltinServingWindow.model_validate_json(builtin_markers[0]["body_json"])
+    if any(projection.available_at != window.observed_at for projection in selected.values()):
+        raise ValueError("monitor runtime extension has a different owner cutoff")
+    channels, groups, heads, events = [], [], [], []
+    for row in notification_rows:
+        if row is markers[0]:
+            continue
+        body = NotificationRuntimeChannelState.model_validate_json(row["body_json"])
+        if (row["owner_id"], row["channel"]) != (body.owner_id, body.channel.value):
+            raise ValueError("notification channel physical identity differs")
+        channels.append(body)
+    for row in selected["notification_runtime_delivery"].rows:
+        body = NotificationRuntimeGroupView.model_validate_json(row["body_json"])
+        if (row["group_id"], row["owner_id"], row["channel"]) != (
+                body.group.group_id, body.group.binding.owner_id, body.group.target.channel.value):
+            raise ValueError("notification history physical identity differs")
+        groups.append(body)
+    for row in builtin_rows:
+        if row is builtin_markers[0]:
+            continue
+        body = MonitorBuiltinServingHead.model_validate_json(row["body_json"])
+        if (row["owner_id"], row["builtin_id"]) != (body.head.owner_id, body.head.builtin_id):
+            raise ValueError("builtin state physical identity differs")
+        heads.append(body)
+    for row in selected["monitor_builtin_event"].rows:
+        body = MonitorBuiltinServingEvent.model_validate_json(row["body_json"])
+        if (row["event_id"], row["sequence"], row["owner_id"], row["builtin_id"]) != (
+                body.event.event_id, body.sequence, body.event.owner_id, body.event.builtin_id):
+            raise ValueError("builtin event physical identity differs")
+        events.append(body)
+    return MonitorRuntimeProjectionSnapshot(notification_window=window, channels=tuple(channels),
+        groups=tuple(groups), builtin_window=builtin_window, builtin_heads=tuple(heads), builtin_events=tuple(events))
+
+
+def read_monitor_runtime(
+    borrowed: BorrowedGeneration, *, now: datetime,
+) -> MonitorRuntimeProjectionSnapshot | None:
+    statuses = borrowed.cursor.execute(
+        "SELECT table_name,available FROM projection_status WHERE table_name IN (?,?,?,?)",
+        list(_MONITOR_RUNTIME_TABLES),
+    ).fetchall()
+    if not any(available for _name, available in statuses):
+        return None
+    if len(statuses) != len(_MONITOR_RUNTIME_TABLES) or any(available is not True for _name, available in statuses):
+        raise ValueError("monitor runtime generation is incomplete")
+    projections = {}
+    for name in _MONITOR_RUNTIME_TABLES:
+        available_at = borrowed.cursor.execute(
+            "SELECT available_at FROM projection_status WHERE table_name=?", [name],
+        ).fetchone()[0]
+        projections[name] = ServingProjectionPayload(table_name=name, available_at=available_at,
+            rows=condition_table_rows(borrowed, name, now=now))
+    return validate_monitor_runtime_projections(projections)
 
 
 def read_condition_rule_authority(
@@ -453,6 +571,12 @@ class ConditionAlertDeliveryAuthorityInput(ConditionRuntimeModel):
     notifier_manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     delivery_enabled: bool
     inspected_at: AwareUtcDatetime
+    builtin: MonitorBuiltinDeliveryState | None = None
+
+    def wire_bytes(self) -> bytes:
+        from rquant.strict_json import canonical_json_bytes
+
+        return canonical_json_bytes(self.model_dump(mode="json", exclude={"builtin"} if self.builtin is None else set()))
 
     @model_validator(mode="after")
     def complete_authority(self) -> Self:
@@ -479,6 +603,8 @@ class ConditionAlertDeliveryAuthorityInput(ConditionRuntimeModel):
                 raise ValueError("condition scope was not visible")
         if self.producer is not None and self.producer.inspected_at > self.inspected_at:
             raise ValueError("condition producer proof is future")
+        if self.builtin is not None and self.builtin.inspected_at != self.inspected_at:
+            raise ValueError("builtin authority differs from its actual same-read cutoff")
         if len(self.wire_bytes()) > 8 * 1024 * 1024:
             raise ValueError("condition full delivery authority exceeds capacity")
         return self
@@ -651,6 +777,7 @@ def apply_condition_alert_delivery_authority(
     activation: ConditionAlertRuntimeActivation,
     expected_revision: int,
     applied_at: datetime,
+    builtin_inspection: object | None = None,
 ) -> ConditionAlertDeliveryAuthoritySnapshot:
     binding = require_verified_condition_activation(activation, "notifier")
     if (
@@ -660,6 +787,16 @@ def apply_condition_alert_delivery_authority(
     ):
         raise TypeError("condition authority requires exact input and revision")
     value = ConditionAlertDeliveryAuthorityInput.model_validate_json(value.wire_bytes())
+    if value.builtin is not None:
+        from rquant.monitor_builtin_runtime import require_builtin_delivery_inspection
+
+        if require_builtin_delivery_inspection(builtin_inspection) != value.builtin:
+            raise ValueError("builtin authority differs from its original owner inspection")
+        if (value.builtin.source.evaluation_contract_sha256, value.builtin.source.routing_policy_sha256,
+                value.builtin.source.frequency_policy_sha256, value.builtin.source.source_epoch) != (
+                binding.evaluation_contract_sha256, binding.routing_policy_sha256,
+                binding.frequency_policy_sha256, binding.source_epoch):
+            raise ValueError("builtin actual producer contract differs from its notifier")
     if (value.notifier_manifest_sha256, value.policy.sha256, value.delivery_enabled) != (
         binding.producer_manifest_sha256,
         binding.recipient_policy_sha256,
@@ -726,14 +863,21 @@ def apply_condition_alert_delivery_authority(
             (head.wire_bytes(), None if last_ready is None else last_ready.wire_bytes()),
         )
         store._condition_alert_failpoint("before_authority_commit")
+        if value.builtin is not None and require_builtin_delivery_inspection(builtin_inspection) != value.builtin:
+            raise ValueError("builtin original owner changed before authority commit")
         store._before_commit(connection)
     store._condition_alert_failpoint("after_authority_commit")
     return head
 
 
 def fresh_condition_authority(
-    head: ConditionAlertDeliveryAuthoritySnapshot | None, now: datetime
+    head: ConditionAlertDeliveryAuthoritySnapshot | None, now: datetime,
+    event: ConditionAlertBusEventRecord | None = None,
 ) -> ConditionAlertDeliveryAuthoritySnapshot:
+    if event is not None and type(event.event) is BuiltinConditionAlertEventEnvelope:
+        if not builtin_condition_authority_ready(head, now):
+            raise ConditionAlertAuthorityUnavailable("builtin original source or consumer is unavailable")
+        return head
     if (
         head is None
         or head.rules is None
@@ -751,15 +895,44 @@ def fresh_condition_authority(
     return head
 
 
+def builtin_condition_authority_ready(head: ConditionAlertDeliveryAuthoritySnapshot | None, now: datetime) -> bool:
+    return (head is not None and head.builtin is not None and head.delivery_enabled
+        and head.applied_at <= now and head.inspected_at <= now <= head.inspected_at + timedelta(seconds=30)
+        and any(row.current_source_ready and row.head.source_state == "ready" and row.head.definition.enabled
+            and row.head.available_at is not None and row.head.available_at <= now
+            and now - row.head.available_at <= timedelta(seconds=15 if row.head.builtin_id in {"pool2_levels", "pool_attack"} else 90)
+            for row in head.builtin.heads))
+
+
 def _invalid_condition_event(
     head: ConditionAlertDeliveryAuthoritySnapshot,
     event: ConditionAlertBusEventRecord,
     target: DeliveryTarget,
     now: datetime,
 ) -> Literal["rule_changed", "membership_changed", "recipient_revoked"] | None:
+    envelope = event.event
+    if type(envelope) is BuiltinConditionAlertEventEnvelope:
+        if head.builtin is None:
+            raise ConditionAlertAuthorityUnavailable("builtin original owner inspection is missing")
+        current = next((row for row in head.builtin.heads
+            if (row.head.owner_id, row.head.builtin_id) == (envelope.owner_id, envelope.builtin_id)), None)
+        if current is None or not current.head.definition.enabled or current.head.definition != envelope.definition:
+            return "rule_changed"
+        if not current.current_source_ready or current.head.source_state != "ready" or current.head.available_at is None:
+            raise ConditionAlertAuthorityUnavailable("builtin current source is unknown")
+        if now - current.head.available_at > timedelta(seconds=15 if envelope.builtin_id in {"pool2_levels", "pool_attack"} else 90):
+            raise ConditionAlertAuthorityUnavailable("builtin current source is stale")
+        proof = next((row for row in head.builtin.events if row.event_id == envelope.event_id), None)
+        if (proof is None or proof.payload_sha256 != event.payload_hash or proof.material_sha256 != envelope.material_sha256
+                or (proof.scope_version, proof.member_digest, proof.expires_at)
+                != (envelope.scope_version, envelope.member_digest, envelope.expires_at)
+                or current.head.member_digest != envelope.member_digest):
+            return "membership_changed"
+        if target not in head.policy.targets_for(envelope.owner_id) or target.channel not in current.head.definition.channels:
+            return "recipient_revoked"
+        return None
     if head.rules is None:
         raise ConditionAlertAuthorityUnavailable("condition rule source is unknown")
-    envelope = event.event
     current = next(
         (
             r
@@ -827,9 +1000,6 @@ def admit_condition_alert_delivery(
         head = condition_delivery_authority(connection)
         if head is None or head.authority_revision != expected_revision:
             raise ConditionAlertAuthorityConflict("condition revision changed before admission")
-        head = fresh_condition_authority(head, now)
-        if head.policy.sha256 != binding.recipient_policy_sha256:
-            raise ConditionAlertAuthorityConflict("condition actual recipients changed")
         event = notification_record(connection, record.signal_id)
         if (
             type(event) is not ConditionAlertBusEventRecord
@@ -838,6 +1008,9 @@ def admit_condition_alert_delivery(
             or event.event.available_at > now
         ):
             raise ConditionAlertDeliveryRejected("condition exact event is missing or expired")
+        head = fresh_condition_authority(head, now, event)
+        if head.policy.sha256 != binding.recipient_policy_sha256:
+            raise ConditionAlertAuthorityConflict("condition actual recipients changed")
         invalid = _invalid_condition_event(head, event, record.target, now)
         if invalid is not None:
             raise ConditionAlertDeliveryRejected(invalid)
@@ -902,7 +1075,7 @@ def consume_condition_alert_admitted_delivery(
             or current < receipt.admitted_at
         ):
             raise ValueError("condition transport original event expired")
-        head = fresh_condition_authority(condition_delivery_authority(connection), current)
+        head = fresh_condition_authority(condition_delivery_authority(connection), current, event)
         if (
             head.authority_revision != receipt.authority_revision
             or _invalid_condition_event(head, event, record.target, current) is not None
@@ -1042,6 +1215,8 @@ def condition_runtime_projections(
     ).fetchall()
     for row in rows:
         routed = _condition_route_record(connection, row[0])
+        if type(routed.event) is BuiltinConditionAlertEventEnvelope:
+            continue
         if max(routed.event.available_at, routed.received_at, routed.receipt.routed_at) > now:
             continue
         leases = connection.execute(

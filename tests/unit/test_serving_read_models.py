@@ -53,7 +53,52 @@ def test_serving_physical_table_specs_have_a_canonical_fingerprint() -> None:
     second = serving_physical_table_specs_fingerprint()
 
     assert first == second
-    assert first == "00f0f57e6797738991801f5261c4d3bc8e204d067199b0836a93ec1106d0807e"
+    assert first == "425c33beea0ccfb20c48117973fd64dd2730de27be11866ed761168cc83fef89"
+
+
+@pytest.mark.parametrize(
+    "table_name,max_rows,max_bytes",
+    [
+        ("notification_runtime_state", 64, 64 * 1024),
+        ("notification_runtime_delivery", 512, 256 * 1024),
+        ("monitor_builtin_state", 160, 64 * 1024),
+        ("monitor_builtin_event", 1000, 512 * 1024),
+    ],
+)
+def test_monitor_optional_tables_keep_owner_row_and_cell_bounds(
+    table_name: str, max_rows: int, max_bytes: int,
+) -> None:
+    contract = PAGE_PROJECTION_CONTRACTS[table_name]
+    assert (contract.owner_dataset_id, contract.max_rows, contract.max_bytes) == (
+        "signals", max_rows, max_bytes,
+    )
+    assert not contract.allow_dynamic_columns
+    with pytest.raises(ValueError, match="owner"):
+        _projection(table_name, (), owner_dataset_id="runtime_health")
+    row = {name: 0 if kind == "int" else "current" for name, kind in contract.columns}
+    with pytest.raises(ValueError, match="row budget"):
+        ServingProjectionPayload(
+            table_name=table_name, available_at=NOW, rows=tuple(row for _ in range(max_rows + 1)),
+        )
+    with pytest.raises(ValueError, match="cell.*byte budget"):
+        ServingProjectionPayload(
+            table_name=table_name, available_at=NOW, rows=(row | {"body_json": "x" * (64 * 1024)},),
+        )
+
+
+def test_monitor_optional_tables_absent_keeps_old_projection_availability() -> None:
+    tables = build_serving_read_models(ServingReadModelInput(observed_at=NOW))
+    assert set(tables) == set(SERVING_TABLE_SPECS)
+    states = tables["projection_status"].set_index("table_name")
+    for table_name in (
+        "notification_runtime_state", "notification_runtime_delivery",
+        "monitor_builtin_state", "monitor_builtin_event",
+        "pulse_history", "pulse_alert", "surge_runtime_config",
+    ):
+        assert not bool(states.loc[table_name, "available"])
+        assert states.loc[table_name, "owner_dataset_id"] == "signals"
+        assert states.loc[table_name, "reason"] == "projection_not_published"
+        assert tables[table_name].empty
 
 
 def _signal() -> SignalEnvelope:
@@ -858,3 +903,107 @@ def test_nl_projection_rejects_duplicate_snapshot_keys_and_has_no_phantom_page()
 
     with pytest.raises(NlScreenPageError, match="duplicate"):
         paginate_nl_screen_projection(pd.concat([universe, universe]), **kwargs)
+
+
+def _health_read_input(*, services: int = 1) -> ServingReadModelInput:
+    """Synthetic rule graph; installation trust is tested by the original provider."""
+    from rquant.runtime_health_details import (
+        build_runtime_health_detail_graph,
+        validate_runtime_health_detail_graph,
+    )
+    from tests.unit.test_runtime_health_details import (
+        AT,
+        GENERATION,
+        as_of_validity,
+        context,
+        heartbeat,
+        legacy,
+        material,
+        metric,
+        spec,
+        witness,
+    )
+
+    facts = ()
+    if services > 1:
+        days = tuple(date(2025, 1, 1) + timedelta(days=i) for i in range(300))
+        fact = metric(
+            metric_id="return_comparison",
+            owner_dataset_id="paper_accounts",
+            scope={
+                "kind": "backtest_comparison",
+                "account_id": "fixture-account",
+                "strategy_version": "1",
+                "parameter_fingerprint": "a" * 64,
+                "cost_identity": "b" * 64,
+                "calendar_identity": "c" * 64,
+                "baseline_identity": "d" * 64,
+                "comparison_dates": days,
+                "baseline_dates": days,
+                "complete": True,
+            },
+            event_time_start=datetime(2025, 1, 1, tzinfo=UTC),
+            unit="band_position",
+            value="inside",
+        )
+        fact = type(fact).model_validate(
+            fact.model_dump(mode="python") | {"validity": as_of_validity(fact, "sealed_comparison")}
+        )
+        facts = (fact,)
+    heartbeats = tuple(
+        heartbeat(
+            service_id=f"fixture-health-{i}", spec_fingerprint=spec(f"fixture-health-{i}").identity
+        )
+        for i in range(services)
+    )
+    heartbeats = tuple(
+        type(hb).model_validate(
+            hb.model_dump(mode="python")
+            | {"startup_witness": witness(hb), "health_metrics": facts}
+        )
+        for hb in heartbeats
+    )
+    sources = tuple(material(hb, startup_witness=witness(hb), metrics=facts) for hb in heartbeats)
+    values = {
+        "legacy_services": tuple(legacy(hb) for hb in heartbeats),
+        "source_receipts": {
+            hb.service_id: source.source_receipt
+            for hb, source in zip(heartbeats, sources, strict=True)
+        },
+        "context": context(),
+        "owner_generation_id": GENERATION,
+        "observed_at": AT,
+    }
+    graph = build_runtime_health_detail_graph(materials=sources, enabled=True, **values)
+    verified = validate_runtime_health_detail_graph(graph, **values)
+    return ServingReadModelInput(
+        observed_at=AT,
+        runtime_services=values["legacy_services"],
+        runtime_health_details=verified,
+        projections=tuple(
+            ServingProjectionInput(**projection.model_dump(mode="python"))
+            for projection in graph.projections
+        ),
+    )
+
+
+def test_optional_health_tables_require_the_verified_complete_graph() -> None:
+    original = _health_read_input()
+    raw = original.model_dump(mode="python")
+    with pytest.raises(ValueError, match="verified complete graph"):
+        ServingReadModelInput.model_validate(raw | {"runtime_health_details": None})
+    with pytest.raises(ValueError, match="both complete tables"):
+        ServingReadModelInput.model_validate(raw | {"projections": raw["projections"][:1]})
+    table = build_serving_read_models(original)["runtime_services"].iloc[0]
+    assert json.loads(table["observations_json"]) == {"processed_candidates": 7}
+    assert (
+        json.loads(table["detail_json"])["source_receipt"]
+        == original.runtime_health_details.services[0].source_receipt
+    )
+    old = build_serving_read_models(ServingReadModelInput(observed_at=NOW))["runtime_services"]
+    assert old.empty
+
+
+def test_health_views_share_the_original_combined_owner_byte_budget() -> None:
+    with pytest.raises(ValueError, match="health.*7 MiB"):
+        _health_read_input(services=400)

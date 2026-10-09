@@ -150,7 +150,13 @@ for (const viewport of [
                   : mixedMinuteResearch;
         return route.fulfill({
           json: {
-            data: { availability: "ready", available_at: serving().built_at, result, research },
+            data: {
+              can_report: false,
+              availability: "ready",
+              available_at: serving().built_at,
+              result,
+              research,
+            },
             serving: serving(),
           } satisfies Schemas["Envelope_FactorResultDetailData_"],
         });

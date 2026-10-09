@@ -87,7 +87,8 @@ describe("策略目录", () => {
     expect(findJargon(container.querySelector("main")?.textContent ?? "")).toEqual([]);
     expect(container.querySelector("main")?.textContent).not.toContain("n_shape");
     expect(container.querySelector("main")?.textContent).not.toContain("年化");
-    expect(container.querySelector("main")?.textContent).not.toContain("晋级");
+    expect(screen.getByRole("region", { name: "阶段评估" })).toHaveTextContent("人工晋级暂不可用");
+    expect(screen.queryByRole("button", { name: "批准晋级" })).not.toBeInTheDocument();
   });
 
   it("等待网页的数据代核验完成后才请求并展示策略", async () => {

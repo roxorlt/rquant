@@ -17,6 +17,7 @@ from rquant.paper_broker import (
 from rquant.paper_contracts import PaperAccountSnapshot, PaperOrder, PaperOrderIntent, PaperOrderStatus
 from rquant.paper_ledger_anchor import Ed25519PaperLedgerAnchorVerifier
 from rquant.paper_portfolio_models import PaperPortfolioConfiguration, Sha256
+from rquant.strategy_promotion_contracts import NativeMinuteForwardConfiguration
 from rquant.portfolio_backtest_models import PortfolioBacktestConfig
 from rquant.research_run_spec import _parse_decimal
 from rquant.runtime_contracts import AwareUtcDatetime, RuntimeContractModel, canonical_sha256, normalize_aware_utc
@@ -111,11 +112,13 @@ class PaperPortfolioLedgerSource:
                                             ledger_anchor_verifier=self.anchor_verifier) as broker:
             yield broker
 
-    def read(self, *, configuration: PaperPortfolioConfiguration, as_of: datetime,
+    def read(self, *, configuration: PaperPortfolioConfiguration | NativeMinuteForwardConfiguration, as_of: datetime,
              prices: Mapping[str, Decimal], allow_missing_prices: bool = False) -> PaperPortfolioLedgerFrame:
         if type(allow_missing_prices) is not bool:
             raise TypeError("paper missing-price admission must be an explicit server choice")
-        configuration = PaperPortfolioConfiguration.model_validate(configuration.model_dump(mode="python"))
+        native = type(configuration) is NativeMinuteForwardConfiguration
+        configuration = (NativeMinuteForwardConfiguration.model_validate_json(configuration.model_dump_json())
+            if native else PaperPortfolioConfiguration.model_validate(configuration.model_dump(mode="python")))
         if (configuration.binding.account_id != self.account_id or configuration.execution_cost_spec != self.cost_policy.execution_cost_spec
                 or (self.ledger_id is not None and self.ledger_id != configuration.binding.ledger_id)):
             raise ValueError("paper ledger source belongs to a different account or configuration")
@@ -137,6 +140,9 @@ class PaperPortfolioLedgerSource:
             reconciliation = broker.reconcile()
             _, latest = broker._attestation_head(connection)
             head = connection.execute("SELECT * FROM paper_ledger_head_marker WHERE revision=?", (latest["revision"],)).fetchone()
+            if native and (configuration.execution_profile.initial_cash != self.initial_cash
+                or configuration.binding.ledger_id != (self.ledger_id or head["ledger_generation"])):
+                raise ValueError("native forward differs from its actual original financial ledger generation")
             latest_order = connection.execute("SELECT MAX(updated_at) FROM paper_order WHERE account_id=?", (self.account_id,)).fetchone()[0]
             if latest_order is not None and broker._required_ledger_timestamp(latest_order, label="paper latest order") > cutoff:
                 raise ValueError("paper cutoff cannot precede its latest ledger event")

@@ -10,8 +10,9 @@ from pydantic import Field, model_validator
 
 from rquant.backtest.contracts import Sha256
 from rquant.lab_artifact_preview import ArtifactPreviewReader
-from rquant.lab_jobs import LabJobReader
+from rquant.lab_jobs import LabArtifactPreviewAuthority, LabJobReader
 from rquant.portfolio_backtest_models import MAX_BUNDLE_BYTES
+from rquant.research_run_spec import ResearchRunSpec
 from rquant.runtime_contracts import RuntimeContractModel
 from rquant.strategy_authoring import StrategyAuthoringStore
 from rquant.strategy_authoring_commands import StrategyAuthoringIdentity, StrategyTemplateHead
@@ -202,6 +203,136 @@ class StrategyTemplateSealedResultReader:
             result_hash=preview.complete_result_hash,
             result=result,
         )
+
+    def read_owned(self, job_id: UUID, *, private_owner: str, expected_result_hash: str,
+                   collaboration: object) -> TemplateReadResult:
+        """Read the ordinary accepted run through its original complete previews."""
+        from rquant.web.collaboration_gateway import CollaborationGateway
+        if type(collaboration) is not CollaborationGateway:
+            raise PermissionError("original private ownership gateway is required")
+        authority = self.reader.get_artifact_preview_authority(job_id)
+        if authority is None or authority.evidence.complete_result_hash != expected_result_hash:
+            raise ValueError("ordinary strategy sealed authority is unavailable or changed")
+        original = collaboration.result_owner(private_owner, domain="strategy", job_id=str(job_id),
+            spec_hash=authority.job.spec_hash)
+        result = self._read_ordinary_payload(job_id, authority=authority,
+            private_owner=private_owner, original_command_id=original.command_id,
+            expected_result_hash=expected_result_hash)
+        if collaboration.result_owner(private_owner, domain="strategy", job_id=str(job_id),
+                spec_hash=result.spec_hash) != original:
+            raise ValueError("ordinary strategy original owner changed during read")
+        return result
+
+    def read_run(
+        self, job_id: UUID, *, store: StrategyAuthoringStore,
+        expected_identity: StrategyAuthoringIdentity, private_owner: str,
+        expected_result_hash: str,
+    ) -> TemplateReadResult:
+        """Internal domain read of the exact original admitted and sealed run."""
+        if type(store) is not StrategyAuthoringStore or type(expected_identity) is not StrategyAuthoringIdentity:
+            raise TypeError("template run requires the concrete original metadata authority")
+        authority = self.reader.get_artifact_preview_authority(job_id)
+        if authority is None or authority.evidence.complete_result_hash != expected_result_hash:
+            raise ValueError("ordinary strategy sealed authority is unavailable or changed")
+        parameters, admission = self._run_parameters(job_id, store=store,
+            expected_identity=expected_identity, private_owner=private_owner,
+            spec=authority.job.spec)
+        result = self._read_ordinary_payload(job_id, authority=authority,
+            private_owner=private_owner, original_command_id=str(job_id),
+            expected_result_hash=expected_result_hash, parameters=parameters)
+        if self._run_parameters(job_id, store=store, expected_identity=expected_identity,
+                private_owner=private_owner, spec=authority.job.spec) != (parameters, admission):
+            raise ValueError("ordinary strategy run admission changed during full read")
+        return result
+
+    @staticmethod
+    def _run_parameters(job_id: UUID, *, store: StrategyAuthoringStore,
+                        expected_identity: StrategyAuthoringIdentity, private_owner: str,
+                        spec: ResearchRunSpec) -> tuple[StrategyTemplateRunParameters, tuple[object, ...]]:
+        from rquant.strategy_template_run_commands import (
+            AcceptedStrategyTemplateRun,
+            StrategyTemplateRunReceipt,
+        )
+
+        with store._connection(expected_identity=expected_identity) as connection:
+            lengths = connection.execute("SELECT length(CAST(frozen AS BLOB)), length(CAST(receipt AS BLOB)) FROM run_admissions WHERE command_id=?", (str(job_id),)).fetchone()
+            if lengths is None or lengths[0] is None or lengths[1] is None or lengths[0] > 32 * 1024 or lengths[1] > 4096:
+                raise ValueError("template run lacks its bounded original completed admission")
+            row = connection.execute("SELECT * FROM run_admissions WHERE command_id=?", (str(job_id),)).fetchone()
+            if row["owner_id"] != private_owner:
+                raise PermissionError("ordinary strategy run belongs to another owner")
+            accepted = AcceptedStrategyTemplateRun.model_validate_json(row["frozen"])
+            receipt = StrategyTemplateRunReceipt.model_validate_json(row["receipt"])
+            head = StrategyTemplateHead.model_validate_json(row["head"])
+            metadata = store._version(connection, row["strategy_id"], head.version, private_owner)
+            if (accepted.metadata_identity != expected_identity or accepted.spec != spec
+                    or (accepted.owner_id, accepted.request.command_id, accepted.request.request_hash,
+                        accepted.request.strategy_id, accepted.request.head, accepted.spec.spec_hash) !=
+                        (private_owner, str(job_id), row["request_hash"], row["strategy_id"], head, row["spec_hash"])
+                    or metadata.head != head or
+                    (receipt.owner_id, receipt.command_id, receipt.strategy_id, receipt.head,
+                        receipt.original_request_hash, receipt.job_id, receipt.spec_hash) !=
+                        (private_owner, str(job_id), row["strategy_id"], head, row["request_hash"], job_id, row["spec_hash"])):
+                raise ValueError("ordinary strategy original run, owner or submitted spec differs")
+            definition = store.definition_registry(metadata.strategy_id).read_strategy_spec(head.registration_fingerprint)
+            if definition is None:
+                raise ValueError("template run lost its immutable original definition")
+            catalog = StrategyTemplateAdapterCatalog(metadata_identity=expected_identity,
+                source_code_identity=template_source_code_identity(), versions=(
+                    StrategyTemplateExecutionVersion(owner_id=metadata.owner_id,
+                        strategy_id=metadata.strategy_id, head=metadata.head, rules=metadata.rules,
+                        definition=definition),))
+            parameters = StrategyTemplateAdapter(metadata.strategy_id, catalog=catalog).parameters(spec)
+            admission = tuple(row)
+        if store.identity() != expected_identity:
+            raise ValueError("template original metadata identity changed during full read")
+        return parameters, admission
+
+    def _read_ordinary_payload(self, job_id: UUID, *, authority: LabArtifactPreviewAuthority,
+                               private_owner: str, original_command_id: str,
+                               expected_result_hash: str,
+                               parameters: StrategyTemplateRunParameters | None = None) -> TemplateReadResult:
+        reference_preview = self.full_previews.preview(job_id, table_name="template_reference",
+            row_limit=1, column_limit=len(REFERENCE_COLUMNS))
+        reference_table = reference_preview.table
+        if (reference_table is None or reference_table.columns != REFERENCE_COLUMNS
+                or reference_table.total_rows != 1 or reference_table.total_columns != len(REFERENCE_COLUMNS)
+                or reference_table.rows_truncated or reference_table.columns_truncated or len(reference_table.rows) != 1):
+            raise ValueError("ordinary strategy reference is incomplete")
+        reference = TemplateSealedResultReference.model_validate(dict(zip(REFERENCE_COLUMNS, reference_table.rows[0], strict=True)))
+        arguments = {item.name: item.value for item in authority.job.spec.parameters.arguments}
+        for name in ("owner_id", "strategy_id", "version", "registration_fingerprint", "record_hash", "spec_fingerprint", "input_hash", "rules_hash", "request_id", "source_code_identity"):
+            if arguments.get(name) != getattr(reference, name):
+                raise ValueError("ordinary strategy reference differs from original submitted spec")
+        if parameters is not None:
+            reference.bind_parameters(parameters)
+        if (reference.owner_id != private_owner or reference.request_id != original_command_id
+                or reference.request_id != str(job_id) or not reference.complete):
+            raise PermissionError("ordinary strategy reference has another owner or original run")
+        preview = self.full_previews.preview(job_id, table_name="template_result", row_limit=1, column_limit=2)
+        table = preview.table
+        if (set(preview.available_tables) != {"template_reference", "template_result", "equity", "orders", "exits", "summary"}
+                or table is None or table.columns != ("result_hash", "payload") or table.total_rows != 1
+                or table.total_columns != 2 or table.rows_truncated or table.columns_truncated
+                or len(table.rows) != 1 or any(not isinstance(v, str) for v in table.rows[0])
+                or len(table.rows[0][1].encode()) > MAX_BUNDLE_BYTES):
+            raise ValueError("ordinary strategy full payload exceeds its original bounds")
+        result = StrategyTemplateResult.model_validate_json(table.rows[0][1])
+        if (result.content_hash != table.rows[0][0] or result.content_hash != reference.result_hash
+                or (result.owner_id, result.strategy_id, result.version, result.input_hash,
+                    result.definition_fingerprint, result.definition_record_hash) !=
+                    (reference.owner_id, reference.strategy_id, reference.version, reference.input_hash,
+                    reference.registration_fingerprint, reference.record_hash)
+                or result.status != "complete" or any(day.account is None or day.daily_return is None for day in result.days)):
+            raise ValueError("ordinary strategy complete payload/reference binding differs")
+        after = self.reader.get_artifact_preview_authority(job_id)
+        if (after != authority or (preview.spec_hash, preview.manifest_hash, preview.complete_result_hash) !=
+                (authority.job.spec_hash, authority.evidence.manifest_hash, expected_result_hash)
+                or (reference_preview.spec_hash, reference_preview.manifest_hash, reference_preview.complete_result_hash) !=
+                    (preview.spec_hash, preview.manifest_hash, preview.complete_result_hash)):
+            raise ValueError("ordinary strategy original authority changed during read")
+        return TemplateReadResult(job_id=job_id, spec_hash=preview.spec_hash, manifest_hash=preview.manifest_hash,
+            result_hash=preview.complete_result_hash, result=result)
 
     def recent_runs(
         self,

@@ -12,10 +12,12 @@ from rquant.lab_scheduling_control import LabSchedulingControlState
 from rquant.page_control import PageControlCommandConflictError, PageControlStatus
 from rquant.task_control_admission import (TaskControlAdmissionResult, TaskControlAdmissionRejectedError, TaskControlAdmissionUnavailableError,
     TaskControlAdmissionNotFoundError, read_task_center_view)
-from rquant.task_control_commands import PrepareUnitRun, RequestUnitRun, SetLabSchedulingPaused, TaskControlRequest
+from rquant.task_control_commands import (PrepareUnitRun, RequestUnitRun, SetLabSchedulingPaused, TaskControlRequest,
+    PrepareNotifierDeliveryMode, SetNotifierDeliveryMode, SetMonitorBuiltinEnabled)
 from rquant.serving_publisher import ServingReader
 from rquant.strict_json import strict_json_loads
-from rquant.web.models.task_controls import TaskControlCapabilitiesData, TaskControlCommandData, TaskUnitControlChoice, TaskSchedulingView
+from rquant.web.models.task_controls import (TaskControlCapabilitiesData, TaskControlCommandData, TaskUnitControlChoice, TaskSchedulingView,
+    NotifierModeControlView, MonitorBuiltinControlView)
 from rquant.web.security import current_user, require_csrf
 
 router = APIRouter(prefix="/tasks")
@@ -25,7 +27,7 @@ _Unit = Annotated[str, Path(min_length=1, max_length=128)]
 _Command = Annotated[TaskControlRequest, Body(discriminator="kind")]
 MAX_TASK_COMMAND_BYTES = 4096
 MAX_SCHEDULING_COMMAND_BYTES = 1024
-_REASONS = {"available": "执行前会再次核验。", "disabled": "任务操作尚未开放。", "busy": "任务正在运行。", "window_closed": "盘中仅可运行只读任务。", "source_unavailable": "任务状态暂无法核验。"}
+_REASONS = {"available": "执行前会再次核验。", "disabled": "任务操作尚未开放。", "busy": "任务正在运行。", "window_closed": "盘中仅可运行只读任务。", "source_unavailable": "任务状态暂无法核验。", "cooldown": "测试频繁，请稍后重试。"}
 
 
 def scheduling_view(state: LabSchedulingControlState | None) -> TaskSchedulingView:
@@ -42,7 +44,8 @@ def _actor(request: Request, viewer: str | None, body: TaskControlRequest | None
     web = request.app.state.web
     if viewer is None:
         raise HTTPException(401, detail="请先登录。")
-    allowed = web.settings.task_scheduling_admin_users if type(body) is SetLabSchedulingPaused else web.settings.task_unit_run_users
+    allowed = ({viewer} if type(body) is SetMonitorBuiltinEnabled else web.settings.task_scheduling_admin_users
+        if type(body) in (SetLabSchedulingPaused, PrepareNotifierDeliveryMode, SetNotifierDeliveryMode) else web.settings.task_unit_run_users)
     if web.settings.ingress_socket_path is None or web.proxy_identity is None or viewer not in allowed:
         raise HTTPException(403, detail="当前账号不能执行此操作。")
     if web.task_control_gateway is None:
@@ -67,6 +70,14 @@ def _public(request: TaskControlRequest, result: TaskControlAdmissionResult | No
         submission = result.scheduling_submission
         rejected = submission is not None and submission.status == "rejected"
         return TaskControlCommandData(**values, status="rejected" if rejected else "submitted", message="版本已变化，请刷新调度状态。" if rejected else "请求已受理，等待调度应用。", can_resume=not rejected, desired_version=None if submission is None or submission.receipt is None else submission.receipt.desired_version)
+    if type(request) is PrepareNotifierDeliveryMode:
+        confirmation = result.notifier_confirmation
+        return TaskControlCommandData(**values, status="prepared", message="请确认本次通知模式。",
+            confirmation_id=confirmation.confirmation_id, confirmation_expires_at=confirmation.expires_at)
+    if type(request) in (SetNotifierDeliveryMode, SetMonitorBuiltinEnabled):
+        return TaskControlCommandData(**values, status="submitted", message="设置已保存，等待监控应用。",
+            desired_revision=result.monitor_state.revision,
+            desired_installation_sha256=result.monitor_state.installation_sha256)
     effect = result.unit_effect
     run = effect.run
     status = "succeeded" if effect.stage == "completed" and run.status == "succeeded" else "failed" if effect.stage == "completed" else "started" if effect.stage == "started" else "rejected" if effect.stage == "rejected" else "unknown" if effect.stage in ("unknown", "start_intent", "acknowledged") else "pending"
@@ -89,7 +100,7 @@ def _error(exc: Exception) -> HTTPException:
 @router.get("/control-capabilities", response_model=TaskControlCapabilitiesData, summary="任务执行与调度权限")
 def capabilities(request: Request, response: Response, viewer: _Viewer, generation_id: Annotated[str | None, Query(min_length=1, max_length=128)] = None) -> TaskControlCapabilitiesData:
     web = request.app.state.web
-    if viewer is None or viewer not in web.settings.task_unit_run_users | web.settings.task_scheduling_admin_users or web.task_control_gateway is None or web.proxy_identity is None or web.settings.ingress_socket_path is None:
+    if viewer is None or web.task_control_gateway is None or web.proxy_identity is None or web.settings.ingress_socket_path is None:
         return TaskControlCapabilitiesData()
     recovery = {"can_recover_units": viewer in web.settings.task_unit_run_users, "can_recover_scheduling": viewer in web.settings.task_scheduling_admin_users}
     with web.tracker.borrow() as borrowed:
@@ -109,11 +120,27 @@ def capabilities(request: Request, response: Response, viewer: _Viewer, generati
             return TaskControlCapabilitiesData(generation_id=current, **recovery, note="任务权限暂无法核验。")
         response.headers["X-Rquant-Generation"] = current
         return TaskControlCapabilitiesData(generation_id=current,
-            units=tuple(TaskUnitControlChoice(unit=item.unit, can_request=item.can_request and web.settings.task_control_enabled, requires_confirmation=item.requires_confirmation, reason=_REASONS[item.reason]) for item in caps.units) if viewer in web.settings.task_unit_run_users else (),
+            units=tuple(TaskUnitControlChoice(unit=item.unit, can_request=item.can_request and web.settings.task_control_enabled, requires_confirmation=item.requires_confirmation, reason=_REASONS[item.reason],
+                next_allowed_at=getattr(item, "next_allowed_at", None)) for item in caps.units) if viewer in web.settings.task_unit_run_users else (),
             can_control_scheduling=caps.can_control_scheduling and web.settings.task_control_enabled and viewer in web.settings.task_scheduling_admin_users,
             can_recover_units=caps.can_recover_units and viewer in web.settings.task_unit_run_users,
             can_recover_scheduling=caps.can_recover_scheduling and viewer in web.settings.task_scheduling_admin_users,
-            scheduling=scheduling_view(view.scheduling_control), note="执行前会再次核验。" if web.settings.task_control_enabled else "任务操作尚未开放。")
+            scheduling=scheduling_view(view.scheduling_control),
+            notifier_mode=NotifierModeControlView(available=caps.notifier_mode is not None,
+                mode=None if caps.notifier_mode is None else caps.notifier_mode.mode,
+                revision=None if caps.notifier_mode is None else caps.notifier_mode.revision,
+                installation_sha256=(
+                    None if caps.notifier_mode is None else caps.notifier_mode.installation_sha256),
+                can_request=caps.can_control_notifier_mode and web.settings.task_control_enabled and viewer in web.settings.task_scheduling_admin_users,
+                can_set_live=caps.can_set_notifier_live and web.settings.task_control_enabled and viewer in web.settings.task_scheduling_admin_users,
+                note="切换前需要再次确认。" if caps.notifier_mode is not None else "通知模式暂无法核验。"),
+            monitor_builtins=tuple(MonitorBuiltinControlView(builtin_id=row.builtin_id,
+                label={"pool2_levels": "回踩档位", "pool_attack": "攻击信号", "surge": "爆量", "pulse": "市场异动"}[row.builtin_id],
+                enabled=row.definition.enabled, revision=row.revision,
+                installation_sha256=row.installation_sha256,
+                can_request=caps.can_control_builtins and web.settings.task_control_enabled)
+                for row in caps.builtin_controls),
+            note="执行前会再次核验。" if web.settings.task_control_enabled else "任务操作尚未开放。")
 
 
 async def _strict(request: Request) -> None:
@@ -173,6 +200,21 @@ async def run_unit(unit: _Unit, request: Request, viewer: _Viewer, csrf: _CSRF, 
 
 @router.post("/scheduling/commands", response_model=TaskControlCommandData, summary="暂停或恢复研究调度")
 async def scheduling(request: Request, viewer: _Viewer, csrf: _CSRF, body: SetLabSchedulingPaused) -> TaskControlCommandData:
+    return await _submit(request, viewer, body)
+
+
+@router.post("/notifications/mode/prepare", response_model=TaskControlCommandData, summary="准备切换通知模式")
+async def prepare_notifier_mode(request: Request, viewer: _Viewer, csrf: _CSRF, body: PrepareNotifierDeliveryMode) -> TaskControlCommandData:
+    return await _submit(request, viewer, body)
+
+
+@router.post("/notifications/mode", response_model=TaskControlCommandData, summary="确认切换通知模式")
+async def set_notifier_mode(request: Request, viewer: _Viewer, csrf: _CSRF, body: SetNotifierDeliveryMode) -> TaskControlCommandData:
+    return await _submit(request, viewer, body)
+
+
+@router.post("/monitor/builtins/commands", response_model=TaskControlCommandData, summary="启用或关闭内置监控")
+async def set_monitor_builtin(request: Request, viewer: _Viewer, csrf: _CSRF, body: SetMonitorBuiltinEnabled) -> TaskControlCommandData:
     return await _submit(request, viewer, body)
 
 

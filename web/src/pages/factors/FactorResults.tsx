@@ -1,5 +1,6 @@
 import { useState } from "react";
-import { ApiError } from "@/api/client";
+import { ApiError, apiBaseUrl } from "@/api/client";
+import { useCollaboration } from "@/api/collaboration";
 import {
   type FactorDefinitionItem,
   type FactorExtendedStatistics,
@@ -622,6 +623,7 @@ export function FactorResults({
   onRefresh: () => void;
   preferred?: StoredRun | null;
 }) {
+  const collaboration = useCollaboration();
   const results = useFactorResults(generationId);
   const [selection, setSelection] = useState<SelectedRun | null>(null);
   const sameGeneration = results.serving?.generation_id === generationId;
@@ -665,6 +667,14 @@ export function FactorResults({
     detail.data.result.updated_at === picked.updated_at &&
     detail.data.result.as_of_time === picked.as_of_time;
   const research = detailMatches ? detail.data?.research : null;
+  const reportUrl =
+    collaboration.current &&
+    collaboration.generation === generationId &&
+    detailMatches &&
+    detail.data?.can_report &&
+    picked
+      ? `${apiBaseUrl()}/api/v1/factors/results/${encodeURIComponent(picked.job_id)}/report?generation_id=${encodeURIComponent(generationId)}`
+      : null;
   const latest = runs[0] ?? null;
 
   let body: React.ReactNode;
@@ -751,6 +761,15 @@ export function FactorResults({
     <Panel
       label="检验结果"
       title="检验结果"
+      actions={
+        reportUrl ? (
+          <Tip content="下载当前完整结果的只读页面，可离线查看。" interactive>
+            <a className="btn sm" href={reportUrl} download>
+              导出只读页面
+            </a>
+          </Tip>
+        ) : undefined
+      }
       sub={
         latest ? (
           <span>

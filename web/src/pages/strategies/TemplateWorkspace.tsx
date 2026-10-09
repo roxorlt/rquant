@@ -1,5 +1,6 @@
 import { type FormEvent, useEffect, useRef, useState } from "react";
-import type { Schemas } from "@/api/client";
+import { apiBaseUrl, type Schemas } from "@/api/client";
+import { useCollaboration } from "@/api/collaboration";
 import { type DataColumn, DataTable } from "@/table/DataTable";
 import {
   Button,
@@ -12,6 +13,7 @@ import {
   Tip,
 } from "@/ui";
 import { type SelectedTask, TaskProgressDrawer } from "../tasks/TaskProgressDrawer";
+import { StrategyPromotionPanel } from "./StrategyPromotionPanel";
 import { TemplateEditor } from "./TemplateEditor";
 import { TemplateRulesSummary } from "./TemplateRules";
 import {
@@ -167,6 +169,7 @@ export function TemplateWorkspace({
   ready: boolean;
 }) {
   const catalog = useTemplateCatalog(viewer, generation);
+  const collaboration = useCollaboration();
   const sources = useTemplateSources(viewer, generation);
   const [selected, setSelected] = useState<string | null>(null);
   const [version, setVersion] = useState<number | null>(null);
@@ -479,6 +482,15 @@ export function TemplateWorkspace({
               rules={current.rules}
               sources={sourceMatches ? sources.data : undefined}
             />
+            <StrategyPromotionPanel
+              key={`${viewer}:${generation}:${current.strategy_id}:${current.head.version}`}
+              viewer={viewer}
+              generation={generation}
+              ready={ready && detailMatches}
+              sourceKind="template"
+              strategyId={current.strategy_id}
+              head={current.head}
+            />
             <section>
               <h3>最近回测</h3>
               {(() => {
@@ -489,6 +501,20 @@ export function TemplateWorkspace({
                     <Button size="sm" onClick={() => showProgress(run.job_id, current.name)}>
                       查看回测进展
                     </Button>
+                    {collaboration.current &&
+                    collaboration.viewer === viewer &&
+                    collaboration.generation === generation &&
+                    /^[a-f0-9]{64}$/.test(run.complete_result_hash) ? (
+                      <Tip content="下载这一版本的完整封存结果，可离线查看。" interactive>
+                        <a
+                          className="btn sm"
+                          href={`${apiBaseUrl()}/api/v1/experiments/template-results/${encodeURIComponent(run.job_id)}/report.html?result_hash=${encodeURIComponent(run.complete_result_hash)}`}
+                          download
+                        >
+                          导出只读页面
+                        </a>
+                      </Tip>
+                    ) : null}
                   </div>
                 ) : (
                   <p className="muted">暂无回测</p>

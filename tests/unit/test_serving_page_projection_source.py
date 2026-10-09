@@ -3616,3 +3616,25 @@ def test_a_sealed_generation_publishes_the_same_totals_as_an_unsealed_one(
 
     assert coverage(sealed) == coverage(unsealed)
     assert coverage(sealed), "the fixture must publish something for this to mean anything"
+
+
+def test_ai_projection_uses_same_pinned_owner_snapshot_and_old_tables_are_unknown(tmp_path:Path) -> None:
+    from rquant.stock_news_sources import StockNewsArtifactStore
+    from rquant.stock_news_digest import validate_stock_news_digest
+    from tests.unit.test_stock_news_digest import collection,draft
+    from rquant.ai_assistance import AIInterpretationCache
+    outbox=PageControlOutbox(tmp_path/'original.sqlite3')
+    reader=_ReadonlyPageControlAuditReader(outbox.path)
+    assert reader.ai_assistance_projections(NOW)==()
+    AIInterpretationCache(outbox)
+    store=StockNewsArtifactStore(tmp_path/'news',outbox=outbox)
+    facts=collection();store.put_facts(facts)
+    store.put_digest(facts,validate_stock_news_digest(facts,draft=draft(facts)),model_id='test-model',template_version='v1')
+    observed=datetime(2026,10,6,10,tzinfo=UTC)
+    with reader.snapshot():
+        projections=reader.ai_assistance_projections(observed)
+    assert {p.table_name for p in projections}=={'ai_news_digest','ai_interpretation','ai_usage_day'}
+    news=next(p for p in projections if p.table_name=='ai_news_digest')
+    assert news.rows[0]['owner_uid']=='alice' and news.rows[0]['stock_code']=='000001.SZ'
+    assert news.rows[0]['context_sha256']==facts.context_sha256
+    assert all(p.available_at==observed for p in projections)

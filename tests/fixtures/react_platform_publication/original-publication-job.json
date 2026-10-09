@@ -1,0 +1,358 @@
+{
+  "kind": "original-private-publication-job/v1",
+  "job_id": "be75c2f4-ac29-54fa-b021-d425a0b1a779",
+  "application_id": 0,
+  "user_version": 0,
+  "schema": [
+    {
+      "type": "table",
+      "name": "experiment_attempt",
+      "sql": "CREATE TABLE experiment_attempt (\n                    experiment_id TEXT PRIMARY KEY,\n                    hypothesis_family TEXT NOT NULL,\n                    spec_json TEXT NOT NULL,\n                    status TEXT NOT NULL,\n                    registered_at TEXT NOT NULL,\n                    started_at TEXT,\n                    completed_at TEXT,\n                    first_error TEXT\n                )"
+    },
+    {
+      "type": "table",
+      "name": "experiment_child_admission",
+      "sql": "CREATE TABLE experiment_child_admission(\n job_id TEXT PRIMARY KEY,experiment_id TEXT NOT NULL UNIQUE,hypothesis_family TEXT NOT NULL,\n owner TEXT NOT NULL,payload_json TEXT NOT NULL)"
+    },
+    {
+      "type": "table",
+      "name": "experiment_evidence",
+      "sql": "CREATE TABLE experiment_evidence(\n evidence_id TEXT PRIMARY KEY,owner TEXT NOT NULL,family_id TEXT NOT NULL,payload_json TEXT NOT NULL)"
+    },
+    {
+      "type": "table",
+      "name": "experiment_evidence_head",
+      "sql": "CREATE TABLE experiment_evidence_head(\n family_id TEXT PRIMARY KEY,owner TEXT NOT NULL,evidence_id TEXT NOT NULL)"
+    },
+    {
+      "type": "table",
+      "name": "experiment_family_request",
+      "sql": "CREATE TABLE experiment_family_request(\n request_id TEXT PRIMARY KEY,owner TEXT NOT NULL,body_hash TEXT NOT NULL,\n family_id TEXT NOT NULL UNIQUE,state TEXT NOT NULL,payload_json TEXT NOT NULL)"
+    },
+    {
+      "type": "table",
+      "name": "experiment_note",
+      "sql": "CREATE TABLE experiment_note(\n family_id TEXT PRIMARY KEY,owner TEXT NOT NULL,version INTEGER NOT NULL,payload_json TEXT NOT NULL)"
+    },
+    {
+      "type": "table",
+      "name": "experiment_outcome",
+      "sql": "CREATE TABLE experiment_outcome (\n                    experiment_id TEXT PRIMARY KEY\n                        REFERENCES experiment_attempt(experiment_id),\n                    outcome_json TEXT NOT NULL,\n                    attempted_configuration_count INTEGER NOT NULL,\n                    selected_rank INTEGER NOT NULL,\n                    raw_p_value TEXT NOT NULL\n                )"
+    },
+    {
+      "type": "table",
+      "name": "experiment_outer_grant",
+      "sql": "CREATE TABLE experiment_outer_grant(\n grant_id TEXT PRIMARY KEY,owner TEXT NOT NULL,request_id TEXT NOT NULL UNIQUE,\n range_start TEXT NOT NULL,range_end TEXT NOT NULL,payload_json TEXT NOT NULL)"
+    },
+    {
+      "type": "table",
+      "name": "experiment_platform_metadata",
+      "sql": "CREATE TABLE experiment_platform_metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL)"
+    },
+    {
+      "type": "table",
+      "name": "experiment_platform_operation",
+      "sql": "CREATE TABLE experiment_platform_operation(\n seq INTEGER PRIMARY KEY AUTOINCREMENT,kind TEXT NOT NULL,identity TEXT NOT NULL,at TEXT NOT NULL)"
+    },
+    {
+      "type": "table",
+      "name": "experiment_platform_receipt",
+      "sql": "CREATE TABLE experiment_platform_receipt(\n request_id TEXT PRIMARY KEY,owner TEXT NOT NULL,body_hash TEXT NOT NULL,payload_json TEXT NOT NULL)"
+    },
+    {
+      "type": "table",
+      "name": "experiment_preparation_reservation",
+      "sql": "CREATE TABLE experiment_preparation_reservation(\n family_id TEXT NOT NULL,child_index INTEGER NOT NULL,payload_json TEXT NOT NULL,\n PRIMARY KEY(family_id,child_index))"
+    },
+    {
+      "type": "table",
+      "name": "experiment_prepared_child",
+      "sql": "CREATE TABLE experiment_prepared_child(\n family_id TEXT NOT NULL,child_index INTEGER NOT NULL,payload_json TEXT NOT NULL,\n PRIMARY KEY(family_id,child_index))"
+    },
+    {
+      "type": "table",
+      "name": "experiment_private_family",
+      "sql": "CREATE TABLE experiment_private_family(\n hypothesis_family TEXT PRIMARY KEY,owner TEXT NOT NULL,request_id TEXT NOT NULL,\n phase TEXT NOT NULL,parent_family_id TEXT)"
+    },
+    {
+      "type": "table",
+      "name": "experiment_submission_outbox",
+      "sql": "CREATE TABLE experiment_submission_outbox (\n                    request_id TEXT PRIMARY KEY,\n                    job_id TEXT NOT NULL UNIQUE,\n                    experiment_id TEXT NOT NULL REFERENCES experiment_attempt(experiment_id),\n                    attempt_identity TEXT NOT NULL,\n                    intent_json TEXT NOT NULL,\n                    command_content_hash TEXT NOT NULL,\n                    state TEXT NOT NULL CHECK(state IN ('prepared', 'published')),\n                    prepared_at TEXT NOT NULL,\n                    published_at TEXT\n                )"
+    },
+    {
+      "type": "table",
+      "name": "experiment_template_slot",
+      "sql": "CREATE TABLE experiment_template_slot(family_id TEXT NOT NULL,child_index INTEGER NOT NULL,payload_json TEXT NOT NULL,PRIMARY KEY(family_id,child_index))"
+    },
+    {
+      "type": "table",
+      "name": "family_adjustment",
+      "sql": "CREATE TABLE family_adjustment (\n                    experiment_id TEXT PRIMARY KEY\n                        REFERENCES experiment_outcome(experiment_id),\n                    hypothesis_family TEXT NOT NULL,\n                    adjusted_p_value TEXT NOT NULL,\n                    adjusted_at TEXT NOT NULL\n                )"
+    },
+    {
+      "type": "table",
+      "name": "formal_experiment_plan",
+      "sql": "CREATE TABLE formal_experiment_plan (\n                    plan_id TEXT PRIMARY KEY,\n                    experiment_id TEXT NOT NULL UNIQUE,\n                    resolution_key TEXT NOT NULL UNIQUE,\n                    preregistered_at TEXT NOT NULL,\n                    plan_json TEXT NOT NULL\n                )"
+    },
+    {
+      "type": "table",
+      "name": "hypothesis_family_manifest",
+      "sql": "CREATE TABLE hypothesis_family_manifest (\n                    hypothesis_family TEXT PRIMARY KEY,\n                    manifest_id TEXT NOT NULL UNIQUE,\n                    preregistered_at TEXT NOT NULL,\n                    payload_json TEXT NOT NULL\n                )"
+    },
+    {
+      "type": "table",
+      "name": "promotion_decision",
+      "sql": "CREATE TABLE promotion_decision (\n                    decision_id TEXT PRIMARY KEY,\n                    stage TEXT NOT NULL,\n                    approved INTEGER NOT NULL CHECK(approved IN (0, 1)),\n                    decided_at TEXT NOT NULL,\n                    payload_json TEXT NOT NULL\n                )"
+    },
+    {
+      "type": "table",
+      "name": "registry_metadata",
+      "sql": "CREATE TABLE registry_metadata (\n                    key TEXT PRIMARY KEY,\n                    value TEXT NOT NULL\n                )"
+    },
+    {
+      "type": "table",
+      "name": "strategy_walk_forward_plan",
+      "sql": "CREATE TABLE strategy_walk_forward_plan(request_id TEXT PRIMARY KEY,actor_id TEXT NOT NULL,request_hash TEXT NOT NULL,plan_hash TEXT NOT NULL,plan_json TEXT NOT NULL)"
+    },
+    {
+      "type": "index",
+      "name": "experiment_attempt_family_idx",
+      "sql": "CREATE INDEX experiment_attempt_family_idx\n                    ON experiment_attempt(hypothesis_family, experiment_id)"
+    },
+    {
+      "type": "index",
+      "name": "experiment_attempt_family_registered_keyset_idx",
+      "sql": "CREATE INDEX experiment_attempt_family_registered_keyset_idx\n                    ON experiment_attempt(\n                        hypothesis_family, registered_at DESC, experiment_id DESC\n                    )"
+    },
+    {
+      "type": "index",
+      "name": "experiment_attempt_registered_keyset_idx",
+      "sql": "CREATE INDEX experiment_attempt_registered_keyset_idx\n                    ON experiment_attempt(registered_at DESC, experiment_id DESC)"
+    },
+    {
+      "type": "index",
+      "name": "experiment_outer_owner_range",
+      "sql": "CREATE INDEX experiment_outer_owner_range ON experiment_outer_grant(owner,range_start,range_end)"
+    },
+    {
+      "type": "index",
+      "name": "experiment_submission_pending_idx",
+      "sql": "CREATE INDEX experiment_submission_pending_idx\n                    ON experiment_submission_outbox(state, prepared_at, request_id)"
+    },
+    {
+      "type": "index",
+      "name": "family_adjustment_family_idx",
+      "sql": "CREATE INDEX family_adjustment_family_idx\n                    ON family_adjustment(hypothesis_family, experiment_id)"
+    },
+    {
+      "type": "index",
+      "name": "formal_experiment_plan_resolution_idx",
+      "sql": "CREATE INDEX formal_experiment_plan_resolution_idx\n                    ON formal_experiment_plan(resolution_key, preregistered_at, plan_id)"
+    },
+    {
+      "type": "index",
+      "name": "promotion_decision_time_idx",
+      "sql": "CREATE INDEX promotion_decision_time_idx\n                    ON promotion_decision(decided_at, decision_id)"
+    }
+  ],
+  "tables": [
+    {
+      "name": "registry_metadata",
+      "columns": [
+        "key",
+        "value"
+      ],
+      "rows": [
+        [
+          "promotion_policy",
+          "{\"maximum_forward_drawdown\":\"0.10\",\"minimum_comparable_trades\":30,\"minimum_forward_days\":10,\"minimum_forward_fills\":20,\"policy_fingerprint\":\"521fcd35640c25e1636429b051ca20b418419bf18272d4694d4832dee8487312\",\"significance_level\":\"0.05\"}"
+        ]
+      ]
+    },
+    {
+      "name": "experiment_platform_metadata",
+      "columns": [
+        "key",
+        "value"
+      ],
+      "rows": [
+        [
+          "config:93d412bee6d3b3a243ef37881b283f3923b33d2cd7ce69cb973ba0044e305777",
+          "{\"end_date\":\"2026-04-30\",\"kind\":\"native_minute\",\"selection\":{\"profile_hash\":\"53ce404bc4d6a3ad88cdacaea35d3b0be93aec75660547beabc1c84aa7838a28\",\"source_key\":\"synthetic.native-minute:n_shape\",\"source_version\":1,\"target\":{\"cost_fingerprint\":\"36052fdd4d04c441b211ceaa709b207b496f537e30089ee833290f7ff8606425\",\"head\":{\"record_hash\":\"7f125a04d2d3ad868f4c1fb76c6b8daf18c196b00fc4eca3e8508c9815015a26\",\"registration_fingerprint\":\"d859a5007029b5eb39558449757741032e4b1d6fae637353d676a00201cef1f7\",\"spec_fingerprint\":\"109798b69da028d4e58b155161e31419443bcd77cbb3b44fc36d590bb977e9b0\",\"version\":1},\"name\":\"N \\u5b57\\u5f62\\u6001\",\"owner_id\":\"fixture-owner\",\"parameter_fingerprint\":\"c2151f878e4382301a76205e68aa00cb5098b8440450158d990f43f389a315d3\",\"source_kind\":\"builtin\",\"strategy_id\":\"n_shape\"}},\"start_date\":\"2026-01-05\"}"
+        ],
+        [
+          "holdout_policy",
+          "{\"months\":0,\"updated_at\":\"2026-10-07T00:00:00Z\",\"version\":1}"
+        ],
+        [
+          "version",
+          "1"
+        ]
+      ]
+    },
+    {
+      "name": "hypothesis_family_manifest",
+      "columns": [
+        "hypothesis_family",
+        "manifest_id",
+        "preregistered_at",
+        "payload_json"
+      ],
+      "rows": [
+        [
+          "experiment-search:729049a746ae09afdcc734d7e98f0d14f3a2a9193e8170b0e4266bebf955f5a9",
+          "507ad50c0d74735e9780a70283348483e8e60b1e64b1273f52559d8d76998073",
+          "2026-10-07T00:00:01.000000Z",
+          "{\"experiment_ids\":[\"93d412bee6d3b3a243ef37881b283f3923b33d2cd7ce69cb973ba0044e305777\",\"a692f45c21c5f3e0b42c6008c9eb20df8e225afa07e1a154abe64d2936135f38\",\"cdfe9960457789edf26d109e2b17cf109dcf9dd0096b5b566004b62da82dfee1\"],\"hypothesis_family\":\"experiment-search:729049a746ae09afdcc734d7e98f0d14f3a2a9193e8170b0e4266bebf955f5a9\",\"manifest_id\":\"507ad50c0d74735e9780a70283348483e8e60b1e64b1273f52559d8d76998073\",\"metric_definition_fingerprint\":\"00ba664b1c21b5621ed95d0fc07b40cafee9d536cfd8fb38b865772278aa0a76\",\"preregistered_at\":\"2026-10-07T00:00:01Z\",\"search_space_fingerprint\":\"879d06a751aac19cc7b944ed9a84b7bbb51e3946cb94d0699fb9128e0fdf55e0\"}"
+        ]
+      ]
+    },
+    {
+      "name": "experiment_attempt",
+      "columns": [
+        "experiment_id",
+        "hypothesis_family",
+        "spec_json",
+        "status",
+        "registered_at",
+        "started_at",
+        "completed_at",
+        "first_error"
+      ],
+      "rows": [
+        [
+          "93d412bee6d3b3a243ef37881b283f3923b33d2cd7ce69cb973ba0044e305777",
+          "experiment-search:729049a746ae09afdcc734d7e98f0d14f3a2a9193e8170b0e4266bebf955f5a9",
+          "{\"candidate_schema_fingerprint\":\"e48fda7dd9bc9915c8d519cc225b00a21d2d0448dc23286d4a6ec5fdb963dda1\",\"code_commit\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"cost_model_fingerprint\":\"36052fdd4d04c441b211ceaa709b207b496f537e30089ee833290f7ff8606425\",\"dataset_snapshot_id\":\"ffa6abed69fbc0740953f716e00ffd85b0272d678a5d5feb2013af3b380e56d5\",\"execution_model_fingerprint\":\"eabf94386bbdbd5845fc8c8c4bf6e0d3e968622b7395a344ee4102bb2a5f27f6\",\"experiment_id\":\"93d412bee6d3b3a243ef37881b283f3923b33d2cd7ce69cb973ba0044e305777\",\"frozen_outer_test_range\":{\"end_date\":\"2026-05-29\",\"start_date\":\"2026-05-04\"},\"hypothesis_family\":\"experiment-search:729049a746ae09afdcc734d7e98f0d14f3a2a9193e8170b0e4266bebf955f5a9\",\"metric_definition_fingerprint\":\"00ba664b1c21b5621ed95d0fc07b40cafee9d536cfd8fb38b865772278aa0a76\",\"parameter_fingerprint\":\"7908d66cf68ef0d7a907a62a35dea9003dcf828c27818985f848e501c909d04d\",\"seed\":0,\"strategy_executable_fingerprint\":\"d0678597aa7c98ed56681ef341c04dabed878ffc545127d6b9ad66d4f4bbb798\",\"strategy_spec_fingerprint\":\"ab456cf9fb0c67b54ca958529529db88670c35e4c818a2c4046b88ac9e73ec74\",\"train_range\":{\"end_date\":\"2026-02-27\",\"start_date\":\"2026-01-05\"},\"validation_range\":{\"end_date\":\"2026-04-30\",\"start_date\":\"2026-03-02\"}}",
+          "executed",
+          "2026-10-07T00:00:02.000000Z",
+          "2026-10-07T00:00:02.000000Z",
+          "2026-10-07T00:00:02.000000Z",
+          null
+        ]
+      ]
+    },
+    {
+      "name": "formal_experiment_plan",
+      "columns": [
+        "plan_id",
+        "experiment_id",
+        "resolution_key",
+        "preregistered_at",
+        "plan_json"
+      ],
+      "rows": [
+        [
+          "07214a201c3b3de771136bb05f6d20453ed3beede86f245cf1e4b30ead7084d1",
+          "93d412bee6d3b3a243ef37881b283f3923b33d2cd7ce69cb973ba0044e305777",
+          "8c1010d3a71a8150eba03e6e32679ae1d9bc8f2bdfd3cf4a8a09002d6923449b",
+          "2026-10-07T00:00:02.000000Z",
+          "{\"definition_registration_record_hash\":\"7c1aaa3d69866f6b1757769210e9dc797e5e67aea815ca58f66090fe30ea6707\",\"hypothesis_variant\":\"native-configuration-0\",\"plan_id\":\"07214a201c3b3de771136bb05f6d20453ed3beede86f245cf1e4b30ead7084d1\",\"preregistered_at\":\"2026-10-07T00:00:02Z\",\"schema_version\":2,\"spec\":{\"candidate_schema_fingerprint\":\"e48fda7dd9bc9915c8d519cc225b00a21d2d0448dc23286d4a6ec5fdb963dda1\",\"code_commit\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"cost_model_fingerprint\":\"36052fdd4d04c441b211ceaa709b207b496f537e30089ee833290f7ff8606425\",\"dataset_snapshot_id\":\"ffa6abed69fbc0740953f716e00ffd85b0272d678a5d5feb2013af3b380e56d5\",\"execution_model_fingerprint\":\"eabf94386bbdbd5845fc8c8c4bf6e0d3e968622b7395a344ee4102bb2a5f27f6\",\"experiment_id\":\"93d412bee6d3b3a243ef37881b283f3923b33d2cd7ce69cb973ba0044e305777\",\"frozen_outer_test_range\":{\"end_date\":\"2026-05-29\",\"start_date\":\"2026-05-04\"},\"hypothesis_family\":\"experiment-search:729049a746ae09afdcc734d7e98f0d14f3a2a9193e8170b0e4266bebf955f5a9\",\"metric_definition_fingerprint\":\"00ba664b1c21b5621ed95d0fc07b40cafee9d536cfd8fb38b865772278aa0a76\",\"parameter_fingerprint\":\"7908d66cf68ef0d7a907a62a35dea9003dcf828c27818985f848e501c909d04d\",\"seed\":0,\"strategy_executable_fingerprint\":\"d0678597aa7c98ed56681ef341c04dabed878ffc545127d6b9ad66d4f4bbb798\",\"strategy_spec_fingerprint\":\"ab456cf9fb0c67b54ca958529529db88670c35e4c818a2c4046b88ac9e73ec74\",\"train_range\":{\"end_date\":\"2026-02-27\",\"start_date\":\"2026-01-05\"},\"validation_range\":{\"end_date\":\"2026-04-30\",\"start_date\":\"2026-03-02\"}},\"strategy_definition_fingerprint\":\"789540c56fae9eb4caed5782c426c68bcd39238801c1e8d860d87adc296d0b50\"}"
+        ]
+      ]
+    },
+    {
+      "name": "experiment_submission_outbox",
+      "columns": [
+        "request_id",
+        "job_id",
+        "experiment_id",
+        "attempt_identity",
+        "intent_json",
+        "command_content_hash",
+        "state",
+        "prepared_at",
+        "published_at"
+      ],
+      "rows": [
+        [
+          "6a655717-6114-5d9d-9a93-f274067e9b22",
+          "be75c2f4-ac29-54fa-b021-d425a0b1a779",
+          "93d412bee6d3b3a243ef37881b283f3923b33d2cd7ce69cb973ba0044e305777",
+          "a2ec7fc2fea81f9b22636928889ab757b6f3eb6b07526904bce02086d384b81a",
+          "{\"attempt_identity\":\"a2ec7fc2fea81f9b22636928889ab757b6f3eb6b07526904bce02086d384b81a\",\"command_content_hash\":\"a57fb1877a7aa886892f5006a4ee9b64cfc35e3f08fa487a0fe3d43f0a5b5829\",\"definition_registration_record_hash\":\"7c1aaa3d69866f6b1757769210e9dc797e5e67aea815ca58f66090fe30ea6707\",\"envelope_json\":\"{\\\"command\\\":{\\\"command_type\\\":\\\"submit\\\",\\\"job_id\\\":\\\"be75c2f4-ac29-54fa-b021-d425a0b1a779\\\",\\\"max_attempts\\\":2,\\\"spec\\\":{\\\"code_sha\\\":\\\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"dataset_snapshot\\\":{\\\"audit_run_id\\\":\\\"91b3e1b41ebd4028b979820482dc1a31bce5f907cc5ebfe975e40b24c9498966\\\",\\\"binding_hash\\\":\\\"5343e0b88731ba7785a9cab60f3d1708828a16a251f56b60a3e2dc378507dfb3\\\",\\\"snapshot_id\\\":\\\"ffa6abed69fbc0740953f716e00ffd85b0272d678a5d5feb2013af3b380e56d5\\\"},\\\"deadline\\\":\\\"2026-10-07T01:00:02Z\\\",\\\"execution_costs\\\":{\\\"assessment_unit\\\":\\\"FILL\\\",\\\"commission_rules\\\":[{\\\"applies_to\\\":\\\"BOTH\\\",\\\"minimum_amount\\\":\\\"5\\\",\\\"rate_bps\\\":\\\"3\\\",\\\"rule_id\\\":\\\"commission-cn-sse-a-share\\\",\\\"selector_id\\\":\\\"cn-sse-a-share\\\"},{\\\"applies_to\\\":\\\"BOTH\\\",\\\"minimum_amount\\\":\\\"5\\\",\\\"rate_bps\\\":\\\"3\\\",\\\"rule_id\\\":\\\"commission-cn-szse-a-share\\\",\\\"selector_id\\\":\\\"cn-szse-a-share\\\"}],\\\"cost_engine_version\\\":\\\"test-paper-cost-engine-v3\\\",\\\"cost_spec_id\\\":\\\"0051a4640a6350b06f50196e1846981a2c60e77dbd6747516ba784df602d7ce0\\\",\\\"fee_notional_basis\\\":\\\"EXECUTED_NOTIONAL\\\",\\\"instrument_selectors\\\":[{\\\"exchange\\\":\\\"SSE\\\",\\\"instrument_class\\\":\\\"EQUITY\\\",\\\"market\\\":\\\"CN\\\",\\\"security_class\\\":\\\"A_SHARE\\\",\\\"selector_id\\\":\\\"cn-sse-a-share\\\"},{\\\"exchange\\\":\\\"SZSE\\\",\\\"instrument_class\\\":\\\"EQUITY\\\",\\\"market\\\":\\\"CN\\\",\\\"security_class\\\":\\\"A_SHARE\\\",\\\"selector_id\\\":\\\"cn-szse-a-share\\\"}],\\\"money\\\":{\\\"quantum\\\":\\\"0.01\\\",\\\"rounding\\\":\\\"HALF_UP\\\"},\\\"research_notional_per_trade\\\":null,\\\"schema_version\\\":3,\\\"slippage\\\":{\\\"buy_bps\\\":\\\"2\\\",\\\"owner\\\":\\\"shared_cost_engine\\\",\\\"price_rounding\\\":\\\"HALF_UP\\\",\\\"price_tick\\\":\\\"0.0001\\\",\\\"sell_bps\\\":\\\"2\\\"},\\\"stamp_duty_rules\\\":[{\\\"applies_to\\\":\\\"SELL\\\",\\\"minimum_amount\\\":\\\"0\\\",\\\"rate_bps\\\":\\\"10\\\",\\\"rule_id\\\":\\\"stamp-cn-sse-a-share\\\",\\\"selector_id\\\":\\\"cn-sse-a-share\\\"},{\\\"applies_to\\\":\\\"SELL\\\",\\\"minimum_amount\\\":\\\"0\\\",\\\"rate_bps\\\":\\\"10\\\",\\\"rule_id\\\":\\\"stamp-cn-szse-a-share\\\",\\\"selector_id\\\":\\\"cn-szse-a-share\\\"}],\\\"transfer_fee_rules\\\":[{\\\"applies_to\\\":\\\"BOTH\\\",\\\"minimum_amount\\\":\\\"0\\\",\\\"rate_bps\\\":\\\"0.1\\\",\\\"rule_id\\\":\\\"transfer-cn-sse-a-share\\\",\\\"selector_id\\\":\\\"cn-sse-a-share\\\"},{\\\"applies_to\\\":\\\"BOTH\\\",\\\"minimum_amount\\\":\\\"0\\\",\\\"rate_bps\\\":\\\"0.1\\\",\\\"rule_id\\\":\\\"transfer-cn-szse-a-share\\\",\\\"selector_id\\\":\\\"cn-szse-a-share\\\"}]},\\\"experiment\\\":{\\\"attempt_identity\\\":\\\"a2ec7fc2fea81f9b22636928889ab757b6f3eb6b07526904bce02086d384b81a\\\",\\\"experiment_id\\\":\\\"93d412bee6d3b3a243ef37881b283f3923b33d2cd7ce69cb973ba0044e305777\\\",\\\"formal_plan_id\\\":\\\"07214a201c3b3de771136bb05f6d20453ed3beede86f245cf1e4b30ead7084d1\\\",\\\"hypothesis_family\\\":\\\"experiment-search:729049a746ae09afdcc734d7e98f0d14f3a2a9193e8170b0e4266bebf955f5a9\\\",\\\"hypothesis_variant\\\":\\\"native-configuration-0\\\",\\\"schema_version\\\":2,\\\"spec\\\":{\\\"candidate_schema_fingerprint\\\":\\\"e48fda7dd9bc9915c8d519cc225b00a21d2d0448dc23286d4a6ec5fdb963dda1\\\",\\\"code_commit\\\":\\\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"cost_model_fingerprint\\\":\\\"36052fdd4d04c441b211ceaa709b207b496f537e30089ee833290f7ff8606425\\\",\\\"dataset_snapshot_id\\\":\\\"ffa6abed69fbc0740953f716e00ffd85b0272d678a5d5feb2013af3b380e56d5\\\",\\\"execution_model_fingerprint\\\":\\\"eabf94386bbdbd5845fc8c8c4bf6e0d3e968622b7395a344ee4102bb2a5f27f6\\\",\\\"experiment_id\\\":\\\"93d412bee6d3b3a243ef37881b283f3923b33d2cd7ce69cb973ba0044e305777\\\",\\\"frozen_outer_test_range\\\":{\\\"end_date\\\":\\\"2026-05-29\\\",\\\"start_date\\\":\\\"2026-05-04\\\"},\\\"hypothesis_family\\\":\\\"experiment-search:729049a746ae09afdcc734d7e98f0d14f3a2a9193e8170b0e4266bebf955f5a9\\\",\\\"metric_definition_fingerprint\\\":\\\"00ba664b1c21b5621ed95d0fc07b40cafee9d536cfd8fb38b865772278aa0a76\\\",\\\"parameter_fingerprint\\\":\\\"7908d66cf68ef0d7a907a62a35dea9003dcf828c27818985f848e501c909d04d\\\",\\\"seed\\\":0,\\\"strategy_executable_fingerprint\\\":\\\"d0678597aa7c98ed56681ef341c04dabed878ffc545127d6b9ad66d4f4bbb798\\\",\\\"strategy_spec_fingerprint\\\":\\\"ab456cf9fb0c67b54ca958529529db88670c35e4c818a2c4046b88ac9e73ec74\\\",\\\"train_range\\\":{\\\"end_date\\\":\\\"2026-02-27\\\",\\\"start_date\\\":\\\"2026-01-05\\\"},\\\"validation_range\\\":{\\\"end_date\\\":\\\"2026-04-30\\\",\\\"start_date\\\":\\\"2026-03-02\\\"}}},\\\"feature_contract\\\":{\\\"contract_hash\\\":\\\"f65124cbe7fbd177252ab6054c2506f03b61e379f861d663ea18388fe38a631f\\\",\\\"contract_id\\\":\\\"strategy-adapter-execution\\\",\\\"contract_version\\\":\\\"p13b-adapter-v1\\\"},\\\"job_type\\\":\\\"strategy_replay\\\",\\\"parameters\\\":{\\\"arguments\\\":[{\\\"kind\\\":\\\"text\\\",\\\"name\\\":\\\"core_input_hash\\\",\\\"value\\\":\\\"f6906087a526e5d64f19d6f04a043f92684fdee364e601d66df486712be7bcd3\\\"},{\\\"kind\\\":\\\"text\\\",\\\"name\\\":\\\"full_input_hash\\\",\\\"value\\\":\\\"47a5c1079c3b6b96b8137c6935e24e3b4ceb409c5d77dc42c6265a7a10736f87\\\"},{\\\"kind\\\":\\\"text\\\",\\\"name\\\":\\\"native_registration_hash\\\",\\\"value\\\":\\\"7f125a04d2d3ad868f4c1fb76c6b8daf18c196b00fc4eca3e8508c9815015a26\\\"},{\\\"kind\\\":\\\"text\\\",\\\"name\\\":\\\"native_strategy_id\\\",\\\"value\\\":\\\"n_shape\\\"},{\\\"kind\\\":\\\"integer\\\",\\\"name\\\":\\\"native_strategy_version\\\",\\\"value\\\":1},{\\\"kind\\\":\\\"text\\\",\\\"name\\\":\\\"owner_id\\\",\\\"value\\\":\\\"fixture-owner\\\"},{\\\"kind\\\":\\\"text\\\",\\\"name\\\":\\\"profile_hash\\\",\\\"value\\\":\\\"53ce404bc4d6a3ad88cdacaea35d3b0be93aec75660547beabc1c84aa7838a28\\\"},{\\\"kind\\\":\\\"text\\\",\\\"name\\\":\\\"seed_hash\\\",\\\"value\\\":\\\"7f0c763606324bacae644b373bba9b39f6b15ee1f74713cbd623a2dc5fd2a0e4\\\"},{\\\"kind\\\":\\\"text\\\",\\\"name\\\":\\\"source_key\\\",\\\"value\\\":\\\"native-phase:425fc1136a4c9bf1cacb2e51db7699026c318f0bb64827c2e8f2dd18151812ef\\\"},{\\\"kind\\\":\\\"integer\\\",\\\"name\\\":\\\"source_version\\\",\\\"value\\\":1},{\\\"kind\\\":\\\"integer\\\",\\\"name\\\":\\\"work_units\\\",\\\"value\\\":13190},{\\\"kind\\\":\\\"text\\\",\\\"name\\\":\\\"wrapper_registration_hash\\\",\\\"value\\\":\\\"7c1aaa3d69866f6b1757769210e9dc797e5e67aea815ca58f66090fe30ea6707\\\"}],\\\"end_date\\\":\\\"2026-04-30\\\",\\\"start_date\\\":\\\"2026-01-05\\\",\\\"strategy_name\\\":\\\"minute_runtime_replay\\\"},\\\"random_seed\\\":0,\\\"research_status\\\":\\\"comparable\\\",\\\"resource_class\\\":\\\"standard\\\",\\\"schema_version\\\":3,\\\"strategy_execution\\\":{\\\"adapter_id\\\":\\\"minute-runtime-replay\\\",\\\"adapter_version\\\":\\\"2\\\",\\\"candidate_schema_fingerprint\\\":\\\"e48fda7dd9bc9915c8d519cc225b00a21d2d0448dc23286d4a6ec5fdb963dda1\\\",\\\"definition_available_at\\\":\\\"2026-10-07T00:00:00Z\\\",\\\"definition_registered_at\\\":\\\"2026-10-07T00:00:00Z\\\",\\\"definition_registration_record_hash\\\":\\\"7c1aaa3d69866f6b1757769210e9dc797e5e67aea815ca58f66090fe30ea6707\\\",\\\"identity_hash\\\":\\\"404e9aa46f511b0f1ae23258ea05e7e59522d1d5fbf9eeb4b57fddf30755f252\\\",\\\"producer_code_commit\\\":\\\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"schema_version\\\":1,\\\"strategy_definition_fingerprint\\\":\\\"789540c56fae9eb4caed5782c426c68bcd39238801c1e8d860d87adc296d0b50\\\",\\\"strategy_executable_fingerprint\\\":\\\"d0678597aa7c98ed56681ef341c04dabed878ffc545127d6b9ad66d4f4bbb798\\\",\\\"strategy_id\\\":\\\"minute_runtime_replay\\\",\\\"strategy_spec_fingerprint\\\":\\\"ab456cf9fb0c67b54ca958529529db88670c35e4c818a2c4046b88ac9e73ec74\\\",\\\"strategy_version\\\":1}}},\\\"content_hash\\\":\\\"a57fb1877a7aa886892f5006a4ee9b64cfc35e3f08fa487a0fe3d43f0a5b5829\\\",\\\"request_id\\\":\\\"6a655717-6114-5d9d-9a93-f274067e9b22\\\",\\\"schema_version\\\":1}\",\"envelope_sha256\":\"5de878b81da180a4e7be1e5a96c39395ad447073b08eba4bfa47c391c7c5b874\",\"experiment_id\":\"93d412bee6d3b3a243ef37881b283f3923b33d2cd7ce69cb973ba0044e305777\",\"formal_plan_id\":\"07214a201c3b3de771136bb05f6d20453ed3beede86f245cf1e4b30ead7084d1\",\"hypothesis_variant\":\"native-configuration-0\",\"job_id\":\"be75c2f4-ac29-54fa-b021-d425a0b1a779\",\"request_id\":\"6a655717-6114-5d9d-9a93-f274067e9b22\",\"schema_version\":2,\"strategy_definition_fingerprint\":\"789540c56fae9eb4caed5782c426c68bcd39238801c1e8d860d87adc296d0b50\"}",
+          "a57fb1877a7aa886892f5006a4ee9b64cfc35e3f08fa487a0fe3d43f0a5b5829",
+          "published",
+          "2026-10-07T00:00:02.000000Z",
+          "2026-10-07T00:00:02.000000Z"
+        ]
+      ]
+    },
+    {
+      "name": "experiment_private_family",
+      "columns": [
+        "hypothesis_family",
+        "owner",
+        "request_id",
+        "phase",
+        "parent_family_id"
+      ],
+      "rows": [
+        [
+          "experiment-search:729049a746ae09afdcc734d7e98f0d14f3a2a9193e8170b0e4266bebf955f5a9",
+          "fixture-owner",
+          "9d2a1a2c-94eb-4a0f-91bc-ffd715d9fa32",
+          "search",
+          null
+        ]
+      ]
+    },
+    {
+      "name": "experiment_family_request",
+      "columns": [
+        "request_id",
+        "owner",
+        "body_hash",
+        "family_id",
+        "state",
+        "payload_json"
+      ],
+      "rows": [
+        [
+          "9d2a1a2c-94eb-4a0f-91bc-ffd715d9fa32",
+          "fixture-owner",
+          "4df186115c15bb9ae286ce579c9ffde49e0e22c9047dfdbb35e1ccae68a9cb68",
+          "experiment-search:729049a746ae09afdcc734d7e98f0d14f3a2a9193e8170b0e4266bebf955f5a9",
+          "ready",
+          "{\"actual_configurations\":[{\"end_date\":\"2026-04-30\",\"kind\":\"native_minute\",\"selection\":{\"profile_hash\":\"53ce404bc4d6a3ad88cdacaea35d3b0be93aec75660547beabc1c84aa7838a28\",\"source_key\":\"synthetic.native-minute:n_shape\",\"source_version\":1,\"target\":{\"cost_fingerprint\":\"36052fdd4d04c441b211ceaa709b207b496f537e30089ee833290f7ff8606425\",\"head\":{\"record_hash\":\"7f125a04d2d3ad868f4c1fb76c6b8daf18c196b00fc4eca3e8508c9815015a26\",\"registration_fingerprint\":\"d859a5007029b5eb39558449757741032e4b1d6fae637353d676a00201cef1f7\",\"spec_fingerprint\":\"109798b69da028d4e58b155161e31419443bcd77cbb3b44fc36d590bb977e9b0\",\"version\":1},\"name\":\"N \\u5b57\\u5f62\\u6001\",\"owner_id\":\"fixture-owner\",\"parameter_fingerprint\":\"c2151f878e4382301a76205e68aa00cb5098b8440450158d990f43f389a315d3\",\"source_kind\":\"builtin\",\"strategy_id\":\"n_shape\"}},\"start_date\":\"2026-01-05\"},{\"end_date\":\"2026-04-30\",\"kind\":\"native_minute\",\"selection\":{\"profile_hash\":\"53ce404bc4d6a3ad88cdacaea35d3b0be93aec75660547beabc1c84aa7838a28\",\"source_key\":\"synthetic.native-minute:auction_gap\",\"source_version\":1,\"target\":{\"cost_fingerprint\":\"36052fdd4d04c441b211ceaa709b207b496f537e30089ee833290f7ff8606425\",\"head\":{\"record_hash\":\"18c276325eb215c0606b8094dceb4f501281e3614ba672d7e184149ec0b5e59f\",\"registration_fingerprint\":\"2bf67e4244668bb8ff0e75fae9311b88bbde79f43cde66125ef22b0db6df0718\",\"spec_fingerprint\":\"d2bbca3813bb974991f14800e5b986f817fdc6faeadd2a253374ed66ce293b8f\",\"version\":1},\"name\":\"\\u96c6\\u5408\\u7ade\\u4ef7\\u8df3\\u7a7a\",\"owner_id\":\"fixture-owner\",\"parameter_fingerprint\":\"2f8688ba760cdcffc2031eefc1638833207a68417d2748f5579a512979262083\",\"source_kind\":\"builtin\",\"strategy_id\":\"auction_gap\"}},\"start_date\":\"2026-01-05\"},{\"end_date\":\"2026-04-30\",\"kind\":\"native_minute\",\"selection\":{\"profile_hash\":\"53ce404bc4d6a3ad88cdacaea35d3b0be93aec75660547beabc1c84aa7838a28\",\"source_key\":\"synthetic.native-minute:growth_board_surge\",\"source_version\":1,\"target\":{\"cost_fingerprint\":\"36052fdd4d04c441b211ceaa709b207b496f537e30089ee833290f7ff8606425\",\"head\":{\"record_hash\":\"4b8f3cb39d700c5b12f98b1ef9eb8ea8f8744a2bf66b0241fa7408393c0041df\",\"registration_fingerprint\":\"fde9e76d03f37aa38fa467627f512565131c06d4bfed6c8e3be33331aebe3671\",\"spec_fingerprint\":\"9d25ee7d3ca3f6a68484cc45b94c9a8c7d03221d86f35bbd63f168c0f501e086\",\"version\":1},\"name\":\"\\u79d1\\u521b\\u53ca\\u521b\\u4e1a\\u677f\\u653e\\u91cf\",\"owner_id\":\"fixture-owner\",\"parameter_fingerprint\":\"5836203dc40825e9378e2f37ac9f2509a15bc2970b86f9e5439fb37bf0390a4d\",\"source_kind\":\"builtin\",\"strategy_id\":\"growth_board_surge\"}},\"start_date\":\"2026-01-05\"}],\"body_hash\":\"4df186115c15bb9ae286ce579c9ffde49e0e22c9047dfdbb35e1ccae68a9cb68\",\"contract\":\"experiment-family/v1\",\"enumeration_version\":\"ordered-product-python-random-sample/v1\",\"family_id\":\"experiment-search:729049a746ae09afdcc734d7e98f0d14f3a2a9193e8170b0e4266bebf955f5a9\",\"owner\":\"fixture-owner\",\"parent_family_id\":null,\"phase\":\"search\",\"policy\":{\"months\":0,\"updated_at\":\"2026-10-07T00:00:00Z\",\"version\":1},\"registered_at\":\"2026-10-07T00:00:01Z\",\"request\":{\"confidence\":\"0.95\",\"configurations\":[{\"end_date\":\"2026-04-30\",\"kind\":\"native_minute\",\"selection\":{\"profile_hash\":\"53ce404bc4d6a3ad88cdacaea35d3b0be93aec75660547beabc1c84aa7838a28\",\"source_key\":\"synthetic.native-minute:n_shape\",\"source_version\":1,\"target\":{\"cost_fingerprint\":\"36052fdd4d04c441b211ceaa709b207b496f537e30089ee833290f7ff8606425\",\"head\":{\"record_hash\":\"7f125a04d2d3ad868f4c1fb76c6b8daf18c196b00fc4eca3e8508c9815015a26\",\"registration_fingerprint\":\"d859a5007029b5eb39558449757741032e4b1d6fae637353d676a00201cef1f7\",\"spec_fingerprint\":\"109798b69da028d4e58b155161e31419443bcd77cbb3b44fc36d590bb977e9b0\",\"version\":1},\"name\":\"N \\u5b57\\u5f62\\u6001\",\"owner_id\":\"fixture-owner\",\"parameter_fingerprint\":\"c2151f878e4382301a76205e68aa00cb5098b8440450158d990f43f389a315d3\",\"source_kind\":\"builtin\",\"strategy_id\":\"n_shape\"}},\"start_date\":\"2026-01-05\"},{\"end_date\":\"2026-04-30\",\"kind\":\"native_minute\",\"selection\":{\"profile_hash\":\"53ce404bc4d6a3ad88cdacaea35d3b0be93aec75660547beabc1c84aa7838a28\",\"source_key\":\"synthetic.native-minute:auction_gap\",\"source_version\":1,\"target\":{\"cost_fingerprint\":\"36052fdd4d04c441b211ceaa709b207b496f537e30089ee833290f7ff8606425\",\"head\":{\"record_hash\":\"18c276325eb215c0606b8094dceb4f501281e3614ba672d7e184149ec0b5e59f\",\"registration_fingerprint\":\"2bf67e4244668bb8ff0e75fae9311b88bbde79f43cde66125ef22b0db6df0718\",\"spec_fingerprint\":\"d2bbca3813bb974991f14800e5b986f817fdc6faeadd2a253374ed66ce293b8f\",\"version\":1},\"name\":\"\\u96c6\\u5408\\u7ade\\u4ef7\\u8df3\\u7a7a\",\"owner_id\":\"fixture-owner\",\"parameter_fingerprint\":\"2f8688ba760cdcffc2031eefc1638833207a68417d2748f5579a512979262083\",\"source_kind\":\"builtin\",\"strategy_id\":\"auction_gap\"}},\"start_date\":\"2026-01-05\"},{\"end_date\":\"2026-04-30\",\"kind\":\"native_minute\",\"selection\":{\"profile_hash\":\"53ce404bc4d6a3ad88cdacaea35d3b0be93aec75660547beabc1c84aa7838a28\",\"source_key\":\"synthetic.native-minute:growth_board_surge\",\"source_version\":1,\"target\":{\"cost_fingerprint\":\"36052fdd4d04c441b211ceaa709b207b496f537e30089ee833290f7ff8606425\",\"head\":{\"record_hash\":\"4b8f3cb39d700c5b12f98b1ef9eb8ea8f8744a2bf66b0241fa7408393c0041df\",\"registration_fingerprint\":\"fde9e76d03f37aa38fa467627f512565131c06d4bfed6c8e3be33331aebe3671\",\"spec_fingerprint\":\"9d25ee7d3ca3f6a68484cc45b94c9a8c7d03221d86f35bbd63f168c0f501e086\",\"version\":1},\"name\":\"\\u79d1\\u521b\\u53ca\\u521b\\u4e1a\\u677f\\u653e\\u91cf\",\"owner_id\":\"fixture-owner\",\"parameter_fingerprint\":\"5836203dc40825e9378e2f37ac9f2509a15bc2970b86f9e5439fb37bf0390a4d\",\"source_kind\":\"builtin\",\"strategy_id\":\"growth_board_surge\"}},\"start_date\":\"2026-01-05\"}],\"kind\":\"native_minute_experiment\",\"name\":\"\\u539f\\u751f\\u7b56\\u7565\\u5b8c\\u6574\\u9a8c\\u8bc1\",\"pbo_slices\":4,\"protocol\":{\"frozen_outer_test_range\":{\"end_date\":\"2026-05-29\",\"start_date\":\"2026-05-04\"},\"train_range\":{\"end_date\":\"2026-02-27\",\"start_date\":\"2026-01-05\"},\"validation_range\":{\"end_date\":\"2026-04-30\",\"start_date\":\"2026-03-02\"}},\"seed\":0,\"target_period_sharpe\":\"0\",\"walk_forward_command_id\":null,\"walk_forward_plan_hash\":null},\"request_id\":\"9d2a1a2c-94eb-4a0f-91bc-ffd715d9fa32\",\"state\":\"ready\",\"template_baseline\":null}"
+        ]
+      ]
+    },
+    {
+      "name": "experiment_child_admission",
+      "columns": [
+        "job_id",
+        "experiment_id",
+        "hypothesis_family",
+        "owner",
+        "payload_json"
+      ],
+      "rows": [
+        [
+          "be75c2f4-ac29-54fa-b021-d425a0b1a779",
+          "93d412bee6d3b3a243ef37881b283f3923b33d2cd7ce69cb973ba0044e305777",
+          "experiment-search:729049a746ae09afdcc734d7e98f0d14f3a2a9193e8170b0e4266bebf955f5a9",
+          "fixture-owner",
+          "{\"cancel_job_version\":null,\"cancel_request_chain\":[],\"cancel_seq\":null,\"cancel_state\":\"none\",\"command_content_hash\":\"a57fb1877a7aa886892f5006a4ee9b64cfc35e3f08fa487a0fe3d43f0a5b5829\",\"experiment_id\":\"93d412bee6d3b3a243ef37881b283f3923b33d2cd7ce69cb973ba0044e305777\",\"family_id\":\"experiment-search:729049a746ae09afdcc734d7e98f0d14f3a2a9193e8170b0e4266bebf955f5a9\",\"job_id\":\"be75c2f4-ac29-54fa-b021-d425a0b1a779\",\"owner\":\"fixture-owner\",\"publish_grant_seq\":1,\"request_id\":\"6a655717-6114-5d9d-9a93-f274067e9b22\"}"
+        ]
+      ]
+    },
+    {
+      "name": "experiment_platform_operation",
+      "columns": [
+        "seq",
+        "kind",
+        "identity",
+        "at"
+      ],
+      "rows": [
+        [
+          1,
+          "publish",
+          "be75c2f4-ac29-54fa-b021-d425a0b1a779",
+          "2026-10-07T00:00:02.000000Z"
+        ]
+      ]
+    }
+  ]
+}

@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 from rquant.runtime_contracts import canonical_sha256
 from rquant.signal_contracts import SignalEnvelopeFamily, parse_signal_envelope
 
-AlertSource = Literal["signal", "monitor_event", "surge_event"]
+AlertSource = Literal["signal", "monitor_event", "surge_event", "monitor_builtin_event"]
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 _STOCK_CODE = re.compile(r"^[0-9]{6}\.(?:SH|SZ|BJ)$")
 _REQUIRED_TEXT = frozenset({"ts_code", "level", "name", "theme", "status"})
@@ -144,6 +144,12 @@ def stable_alert_id(
     event: Mapping[str, object] | SignalEnvelopeFamily,
 ) -> str:
     """Derive a v1 identity from verified, published trigger facts only."""
+    if source == "monitor_builtin_event":
+        from rquant.monitor_builtin_contracts import parse_builtin_condition_alert_event
+
+        original = parse_builtin_condition_alert_event(event)
+        return canonical_sha256({"domain": "rquant-alert/v1", "source": source,
+            "fields": [["event_id", original.event_id]]})
     if source == "signal":
         payload = (
             event.model_dump(mode="json") if isinstance(event, SignalEnvelopeFamily) else event
@@ -207,6 +213,10 @@ def alert_event_at(
     event: Mapping[str, object] | SignalEnvelopeFamily,
 ) -> datetime:
     """Interpret the trigger instant using the same source clock rules as its identity."""
+    if source == "monitor_builtin_event":
+        from rquant.monitor_builtin_contracts import parse_builtin_condition_alert_event
+
+        return parse_builtin_condition_alert_event(event).event_time.astimezone(UTC)
     if source == "signal":
         payload = (
             event.model_dump(mode="json") if isinstance(event, SignalEnvelopeFamily) else event

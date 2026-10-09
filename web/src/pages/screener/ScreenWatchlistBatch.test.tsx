@@ -9,7 +9,11 @@ import { server } from "@/test/server";
 import { ScreenWatchlistBatch } from "./ScreenWatchlistBatch";
 
 const serving = metaEnvelope().serving;
-const source: ScreenRunData["source"] = { mode: "daily", identity: "c".repeat(64), updated_at: "2026-09-24T07:30:00Z" };
+const source: ScreenRunData["source"] = {
+  mode: "daily",
+  identity: "c".repeat(64),
+  updated_at: "2026-09-24T07:30:00Z",
+};
 const rows = [
   { ts_code: "600001.SH", name: "样本一", close: 11, pct_chg: 1 },
   { ts_code: "600002.SH", name: "样本二", close: 12, pct_chg: 2 },

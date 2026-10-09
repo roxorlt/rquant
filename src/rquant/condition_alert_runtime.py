@@ -28,6 +28,8 @@ from rquant.price_alert_runtime_store import PriceAlertRuntimeStore
 from rquant.runtime_contracts import AwareUtcDatetime, canonical_sha256, normalize_aware_utc
 
 if TYPE_CHECKING:
+    from rquant.monitor_builtin_contracts import MonitorBuiltinDefinition
+    from rquant.monitor_builtin_runtime import MonitorBuiltinCapturedRead, MonitorBuiltinRoundReceipt, MonitorBuiltinRuntimeHead
     from rquant.runtime_market_session import MarketCalendarAuthority
     from rquant.screen.dynamic_rsi import VerifiedDynamicRsiProjection
     from rquant.screen.replica_source import VerifiedReplicaScreenSource
@@ -403,6 +405,204 @@ class ConditionAlertRuntimeStore:
             records=records,
         )
         return self.commit_round(value)
+
+    def builtin_heads(self) -> tuple[MonitorBuiltinRuntimeHead, ...]:
+        from rquant.monitor_builtin_runtime import MonitorBuiltinRuntimeHead, verify_builtin_metadata
+
+        with self.ledger._connection() as connection:
+            verify_condition_runtime_namespace(connection)
+            verify_builtin_metadata(connection)
+            rows = connection.execute("SELECT body FROM monitor_builtin_head ORDER BY owner_id,builtin_id").fetchall()
+            if len(rows) > 128:
+                raise PriceAlertCapacityExceeded("builtin owner metadata exceeds the installed domain")
+            return tuple(MonitorBuiltinRuntimeHead.model_validate_json(row[0]) for row in rows)
+
+    def commit_builtin_round(
+        self, *, captured: MonitorBuiltinCapturedRead, definitions: tuple[MonitorBuiltinDefinition, ...],
+        evaluated_at: datetime, current_scope: Callable[[], bool] | None = None,
+    ) -> MonitorBuiltinRoundReceipt:
+        from rquant.monitor import _market_phase
+        from rquant.monitor_builtin_contracts import BuiltinConditionAlertEventEnvelope, BuiltinStockDetection
+        from rquant.monitor_builtin_runtime import (
+            MonitorBuiltinRoundInput, MonitorBuiltinRoundReceipt, MonitorBuiltinRuntimeHead,
+            builtin_head_definitions, detections_for_definition, read_builtin_control_snapshot,
+            require_builtin_captured_read, verify_builtin_metadata,
+        )
+        from rquant.surge_watch import CLOSE_TIME, MORNING_END
+
+        binding = require_condition_alert_activation(self.activation, "event_write")
+        builtin_head_definitions(self.activation, definitions, evaluated_at=evaluated_at)
+        material = require_builtin_captured_read(captured)
+        capture = material.capture
+        now = normalize_aware_utc(evaluated_at)
+        round_input = MonitorBuiltinRoundInput(evaluated_at=now, definitions=definitions, material=material)
+        digest = round_input.sha256
+        local = now.astimezone(_SHANGHAI)
+        phase = _market_phase(local)
+        age = timedelta(seconds=15 if capture.origin in {"watchlist_quote", "original_monitor"} else 90)
+        state, reason = capture.source_state, capture.reason
+        if capture.origin in {"original_surge", "original_pulse"} and capture.missing_codes:
+            state, reason = "disconnected", "incomplete_universe"
+        if now - capture.available_at > age:
+            state, reason = "stale", "source_stale"
+        elif phase not in {"morning", "afternoon"} or capture.trade_date != local.date():
+            state, reason = "waiting", "outside_window"
+        events: list[ConditionAlertProducerEventRecord] = []
+        suppressed = 0
+        with self.ledger._connection(write=True) as connection:
+            source = verify_condition_runtime_namespace(connection)
+            verify_builtin_metadata(connection, install=True)
+            control = read_builtin_control_snapshot(self.activation, now=now,
+                borrowed_condition=self, source_connection=connection)
+            applied = {} if control is None else {
+                (row.owner_id, row.builtin_id): row for row in control.builtins
+            }
+            if (control is not None
+                    and tuple(row.definition for row in control.builtins) != definitions):
+                raise ValueError("builtin application differs from the same original control read")
+            prior = connection.execute("SELECT body FROM condition_alert_round_receipt WHERE round_id=?", (digest,)).fetchone()
+            if prior is not None:
+                return MonitorBuiltinRoundReceipt.model_validate_json(prior[0])
+            last_clock = connection.execute("SELECT last_evaluated_at FROM condition_alert_runtime_identity WHERE key='current'").fetchone()[0]
+            if last_clock is not None and now < datetime.fromisoformat(last_clock):
+                raise ValueError("builtin original owner clock regressed")
+            if self.ledger.path.stat().st_size + len(round_input.wire_bytes()) * 3 > 512 * 1024 * 1024:
+                raise PriceAlertCapacityExceeded("original alert ledger capacity is exhausted")
+            high = source.high_watermark
+            origin_kinds = {"watchlist_quote": {"pool2_levels", "pool_attack"}, "original_monitor": {"pool2_levels", "pool_attack"},
+                "original_surge": {"surge"}, "original_pulse": {"pulse"}}[capture.origin]
+            member_digest = canonical_sha256(capture.universe_codes)
+            scope_version = canonical_sha256({"origin": capture.origin, "universe": capture.universe_codes, "basis": capture.basis_sha256})
+            for definition in definitions:
+                if definition.builtin_id not in origin_kinds:
+                    continue
+                old = connection.execute("SELECT body FROM monitor_builtin_head WHERE owner_id=? AND builtin_id=?", (definition.owner_id, definition.builtin_id)).fetchone()
+                last_triggered = None if old is None else MonitorBuiltinRuntimeHead.model_validate_json(old[0]).last_triggered_at
+                current_state, current_reason = (state, reason) if definition.enabled else ("disabled", "definition_disabled")
+                application = applied.get((definition.owner_id, definition.builtin_id))
+                detections = () if current_state != "ready" else detections_for_definition(definition, capture)
+                for detection in detections:
+                    code = detection.ts_code if type(detection) is BuiltinStockDetection else ""
+                    key = detection.kind if definition.builtin_id in {"pool2_levels", "pool_attack"} else "" if definition.builtin_id == "surge" else detection.kind + ":" + capture.observed_at.isoformat()
+                    daily_key = (definition.owner_id, definition.builtin_id, capture.trade_date.isoformat(), code, key)
+                    if connection.execute("SELECT event_id FROM monitor_builtin_day_dedupe WHERE owner_id=? AND builtin_id=? AND trade_date=? AND ts_code=? AND detection_key=?", daily_key).fetchone() is not None:
+                        suppressed += 1
+                        continue
+                    if high >= 100000:
+                        raise PriceAlertCapacityExceeded("condition event ledger is full")
+                    window_end = datetime.combine(local.date(), MORNING_END if phase == "morning" else CLOSE_TIME, tzinfo=_SHANGHAI)
+                    expires = min(now + timedelta(minutes=2), window_end.astimezone(now.tzinfo))
+                    if now >= expires:
+                        suppressed += 1
+                        continue
+                    event = BuiltinConditionAlertEventEnvelope.create(owner_id=definition.owner_id, builtin_id=definition.builtin_id,
+                        definition=definition, rule_id=definition.rule_id, rule_name=definition.name, channels=definition.channels,
+                        rule_version=definition.version, rule_body_hash=definition.sha256, scope_version=scope_version, member_digest=member_digest,
+                        detection=detection, source_identity=capture.source_generation_id, raw_batch_id=capture.raw_payload_sha256,
+                        feature_snapshot_id=capture.basis_sha256, material_sha256=material.sha256, trade_date=capture.trade_date,
+                        event_time=next((quote.observed_at for quote in capture.quotes if quote.ts_code == code), capture.observed_at), decision_time=now, available_at=now, expires_at=expires,
+                        evaluation_contract_sha256=binding.evaluation_contract_sha256, frequency_policy_sha256=binding.frequency_policy_sha256,
+                        frequency_bucket=capture.trade_date.isoformat() + ":" + key, producer_manifest_sha256=binding.producer_manifest_sha256,
+                        producer_commit=binding.producer_commit, source_epoch=binding.source_epoch)
+                    connection.execute("INSERT INTO monitor_builtin_day_dedupe VALUES(?,?,?,?,?,?)", (*daily_key, event.event_id))
+                    self.failpoint("builtin_dedupe")
+                    high += 1
+                    connection.execute("INSERT INTO condition_alert_event_log VALUES(?,?,?,?)", (high, event.event_id, event.wire_bytes(), event.sha256))
+                    self.failpoint("builtin_event")
+                    events.append(ConditionAlertProducerEventRecord(sequence=high, event=event, payload_json=event.wire_bytes().decode(), payload_sha256=event.sha256))
+                    last_triggered = now
+                head = MonitorBuiltinRuntimeHead(owner_id=definition.owner_id, builtin_id=definition.builtin_id, definition=definition,
+                    evaluated_at=now, round_id=digest, source_state=current_state, reason=current_reason,
+                    material_sha256=material.sha256, source_generation_id=capture.source_generation_id, source_sequence=capture.source_sequence,
+                    observed_at=capture.observed_at if current_state == "ready" else None, available_at=capture.available_at, basis_sha256=capture.basis_sha256,
+                    source_receipt_sha256=capture.source_receipt_sha256, scope_version=scope_version, member_digest=member_digest,
+                    matched_count=len(detections) if current_state == "ready" else None, last_triggered_at=last_triggered,
+                    actual_generation_id=source.generation_id,
+                    applied_revision=None if application is None else application.revision,
+                    applied_command_id=None if application is None else application.command_id,
+                    monitor_installation_sha256=(
+                        None if control is None else control.installation.installation_sha256))
+                connection.execute("INSERT INTO monitor_builtin_head VALUES(?,?,?) ON CONFLICT(owner_id,builtin_id) DO UPDATE SET body=excluded.body", (definition.owner_id, definition.builtin_id, head.wire_bytes()))
+            receipt = MonitorBuiltinRoundReceipt(round_id=digest, evaluated_at=now, source_high_watermark=high,
+                suppressed_count=suppressed, input=round_input, events=tuple(events))
+            connection.execute("INSERT INTO condition_alert_round_receipt VALUES(?,?,?,?)", (digest, digest, receipt.wire_bytes(), utc_text(now)))
+            self.failpoint("builtin_receipt")
+            connection.execute("UPDATE condition_alert_runtime_identity SET high_watermark=?,last_evaluated_at=? WHERE key='current'", (high, utc_text(now)))
+            require_builtin_captured_read(captured)
+            builtin_head_definitions(self.activation, definitions, evaluated_at=evaluated_at,
+                borrowed_condition=self, source_connection=connection)
+            if read_builtin_control_snapshot(self.activation, now=now,
+                    borrowed_condition=self, source_connection=connection) != control:
+                raise ValueError("builtin application changed before the original owner commit")
+            if current_scope is not None and current_scope() is not True:
+                raise ValueError("builtin original owner or source changed before commit")
+            self.failpoint("before_commit")
+        return receipt
+
+    def record_builtin_unavailable(
+        self, *, definitions: tuple[MonitorBuiltinDefinition, ...], origin: str,
+        evaluated_at: datetime, reason: str,
+    ) -> MonitorBuiltinRoundReceipt:
+        from rquant.monitor_builtin_runtime import (
+            MonitorBuiltinRoundInput, MonitorBuiltinRoundReceipt, MonitorBuiltinRuntimeHead,
+            builtin_head_definitions, read_builtin_control_snapshot, verify_builtin_metadata,
+        )
+
+        require_condition_alert_activation(self.activation, "event_write")
+        builtin_head_definitions(self.activation, definitions, evaluated_at=evaluated_at)
+        now = normalize_aware_utc(evaluated_at)
+        value = MonitorBuiltinRoundInput(evaluated_at=now, definitions=definitions, material=None,
+            unavailable_reason=reason, unavailable_origin=origin)
+        kinds = {"watchlist_quote": {"pool2_levels", "pool_attack"}, "original_monitor": {"pool2_levels", "pool_attack"},
+            "original_surge": {"surge"}, "original_pulse": {"pulse"}}[value.unavailable_origin]
+        with self.ledger._connection(write=True) as connection:
+            source = verify_condition_runtime_namespace(connection)
+            verify_builtin_metadata(connection, install=True)
+            control = read_builtin_control_snapshot(self.activation, now=now,
+                borrowed_condition=self, source_connection=connection)
+            applied = {} if control is None else {
+                (row.owner_id, row.builtin_id): row for row in control.builtins
+            }
+            if (control is not None
+                    and tuple(row.definition for row in control.builtins) != definitions):
+                raise ValueError("builtin application differs from the same original control read")
+            prior = connection.execute("SELECT body FROM condition_alert_round_receipt WHERE round_id=?", (value.sha256,)).fetchone()
+            if prior is not None:
+                return MonitorBuiltinRoundReceipt.model_validate_json(prior[0])
+            last_clock = connection.execute("SELECT last_evaluated_at FROM condition_alert_runtime_identity WHERE key='current'").fetchone()[0]
+            if last_clock is not None and now < datetime.fromisoformat(last_clock):
+                raise ValueError("builtin source failure clock regressed")
+            if self.ledger.path.stat().st_size + len(value.wire_bytes()) * 3 > 512 * 1024 * 1024:
+                raise PriceAlertCapacityExceeded("original alert ledger capacity is exhausted")
+            for definition in definitions:
+                if definition.builtin_id not in kinds:
+                    continue
+                old = connection.execute("SELECT body FROM monitor_builtin_head WHERE owner_id=? AND builtin_id=?", (definition.owner_id, definition.builtin_id)).fetchone()
+                last_triggered = None if old is None else MonitorBuiltinRuntimeHead.model_validate_json(old[0]).last_triggered_at
+                state = "disabled" if not definition.enabled or reason == "source_disabled" else "waiting" if reason == "outside_window" else "stale" if reason == "source_stale" else "unknown"
+                application = applied.get((definition.owner_id, definition.builtin_id))
+                head = MonitorBuiltinRuntimeHead(owner_id=definition.owner_id, builtin_id=definition.builtin_id, definition=definition,
+                    evaluated_at=now, round_id=value.sha256, source_state=state, reason=reason,
+                    material_sha256=None, source_generation_id=None, source_sequence=None, observed_at=None, available_at=None,
+                    basis_sha256=None, source_receipt_sha256=None, scope_version=None, member_digest=None,
+                    matched_count=None, last_triggered_at=last_triggered,
+                    actual_generation_id=source.generation_id,
+                    applied_revision=None if application is None else application.revision,
+                    applied_command_id=None if application is None else application.command_id,
+                    monitor_installation_sha256=(
+                        None if control is None else control.installation.installation_sha256))
+                connection.execute("INSERT INTO monitor_builtin_head VALUES(?,?,?) ON CONFLICT(owner_id,builtin_id) DO UPDATE SET body=excluded.body", (definition.owner_id, definition.builtin_id, head.wire_bytes()))
+            receipt = MonitorBuiltinRoundReceipt(round_id=value.sha256, evaluated_at=now, source_high_watermark=source.high_watermark,
+                suppressed_count=0, input=value, events=())
+            connection.execute("INSERT INTO condition_alert_round_receipt VALUES(?,?,?,?)", (value.sha256, value.sha256, receipt.wire_bytes(), utc_text(now)))
+            connection.execute("UPDATE condition_alert_runtime_identity SET last_evaluated_at=? WHERE key='current'", (utc_text(now),))
+            builtin_head_definitions(self.activation, definitions, evaluated_at=evaluated_at,
+                borrowed_condition=self, source_connection=connection)
+            if read_builtin_control_snapshot(self.activation, now=now,
+                    borrowed_condition=self, source_connection=connection) != control:
+                raise ValueError("builtin application changed before the original owner commit")
+            self.failpoint("before_commit")
+        return receipt
 
     def commit_round(
         self, round_input: ConditionRoundInput, *, current_scope: Callable[[], bool] | None = None
@@ -970,7 +1170,7 @@ def condition_producer_snapshot(
                 latest = connection.execute(
                     "SELECT payload FROM condition_alert_event_log WHERE json_extract"
                     "(CAST(payload AS TEXT),'$.owner_id')=? AND json_extract(CAST(pay"
-                    "load AS TEXT),'$.rule_id')=? ORDER BY sequence DESC LIMIT 1",
+                    "load AS TEXT),'$.rule_id')=? AND json_extract(CAST(payload AS TEXT),'$.envelope_schema')='rquant.condition-alert-event/v1' ORDER BY sequence DESC LIMIT 1",
                     (bound.owned.owner_id, bound.owned.rule.rule_id),
                 ).fetchone()
                 event = None if latest is None else parse_condition_alert_event(bytes(latest[0]))

@@ -157,6 +157,49 @@ export const manualWatchlistExactUnavailableHandler = () =>
 
 /** MSW server for component tests; every test starts with ready responses. */
 export const server = setupServer(
+  http.get("*/api/v1/strategy-promotions/:strategy_id", ({ params, request }) => {
+    const envelope: Schemas["Envelope_StrategyPromotionData_"] = {
+      serving: metaEnvelope().serving,
+      data: {
+        availability: "unavailable",
+        source_kind:
+          new URL(request.url).searchParams.get("source_kind") === "builtin"
+            ? "builtin"
+            : "template",
+        strategy_id: String(params.strategy_id),
+        available_at: null,
+        states: [],
+        reviews: [],
+        next_offset: null,
+        candidates: [],
+        walk_forward: [],
+        paper_accounts: [],
+        can_evaluate: false,
+        can_prepare_approval: false,
+        can_run_walk_forward: false,
+        reason: "人工晋级未启用。",
+      },
+    };
+    return HttpResponse.json(envelope);
+  }),
+  http.get("*/api/v1/collaboration/me", () => {
+    const envelope: Schemas["Envelope_CollaborationMe_"] = {
+      serving: { ...metaEnvelope().serving, generation_id: null },
+      data: {
+        available: false,
+        mode: "legacy",
+        username: metaEnvelope().data.viewer,
+        role: null,
+        revision: null,
+        state_sha256: null,
+        can_manage_users: false,
+        can_research: false,
+        can_read_audit: false,
+        message: "协作权限尚未启用。",
+      },
+    };
+    return HttpResponse.json(envelope);
+  }),
   http.get("*/api/v1/monitor/condition-rules", () => {
     const envelope: Schemas["Envelope_ConditionAlertRuleListData_"] = {
       serving: metaEnvelope().serving,

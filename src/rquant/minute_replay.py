@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import date, datetime, time
 from typing import Literal
 
 import pandas as pd
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from rquant.paper import (
     PaperPosition,
@@ -127,6 +128,84 @@ class MinuteReplayConfig(BaseModel):
     volume_profile: VolumeProfileRuleConfig = Field(
         default_factory=VolumeProfileRuleConfig
     )
+
+
+class NShapeEntryCheck(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    signal_time: datetime | None
+    is_signal: bool
+    is_above_vwap: bool
+    is_amount_surge: bool
+    factor_score: float | None
+    eligible: bool
+
+
+def evaluate_n_shape_entry(
+    *,
+    config: MinuteReplayConfig,
+    quote_time: datetime,
+    latest_price: float,
+    bar_low: float,
+    session_low: float,
+    session_high: float,
+    t_close: float,
+    t_high: float,
+    vwap: float | None,
+    minute_amount: float,
+    prior_amounts: tuple[float, ...],
+    first_signal_time: datetime | None,
+    static_factors: Mapping[str, float | int | None] | None = None,
+) -> NShapeEntryCheck:
+    """原六种入场判断；调用者提供截至当前 bar 的累计事实。"""
+    if first_signal_time is not None and first_signal_time > quote_time:
+        raise ValueError("first signal time is in the future")
+    positive_prior = [amount for amount in prior_amounts[-config.amount_surge_lookback:] if amount > 0]
+    average_prior_amount = sum(positive_prior) / len(positive_prior) if positive_prior else None
+    is_amount_surge = (
+        average_prior_amount is not None
+        and len(positive_prior) >= config.amount_surge_min_prior_minutes
+        and minute_amount >= average_prior_amount * config.amount_surge_ratio
+    )
+    is_strong_carry = (
+        session_low >= t_close * config.carry_low_ratio
+        and latest_price >= t_close * config.carry_close_ratio
+    )
+    is_signal = is_strong_carry and session_high > t_high * config.break_high_ratio
+    is_above_vwap = vwap is None or latest_price >= vwap * (1 + config.vwap_buffer_pct)
+    signal_time = first_signal_time
+    if is_signal and signal_time is None:
+        signal_time = quote_time
+    factor_score: float | None = None
+    if config.entry_mode == "factor_confirm" and is_signal:
+        factor_score = score_feature_terms(
+            {**(static_factors or {}), "vwap_position": latest_price / vwap if vwap is not None and vwap > 0 else None},
+            N_SHAPE_B_V1_SCORE_TERMS,
+        )
+    if config.entry_mode == "first_break":
+        eligible = is_signal
+    elif config.entry_mode == "vwap_confirm":
+        eligible = is_signal and is_above_vwap
+    elif config.entry_mode == "amount_surge":
+        eligible = is_signal and is_above_vwap and is_amount_surge
+    elif config.entry_mode == "factor_confirm":
+        eligible = factor_score is not None and factor_score >= config.factor_score_threshold
+    elif config.entry_mode == "break_retest":
+        eligible = (
+            signal_time is not None and quote_time > signal_time
+            and bar_low <= t_high * (1 + config.retest_tolerance_pct)
+            and latest_price >= t_high and is_above_vwap
+        )
+    elif config.entry_mode == "late_confirm":
+        eligible = (
+            signal_time is not None and quote_time.time() >= config.late_confirm_at
+            and latest_price >= t_high and is_above_vwap
+        )
+    else:
+        raise ValueError("unknown N shape entry mode")
+    return NShapeEntryCheck(signal_time=signal_time, is_signal=is_signal,
+        is_above_vwap=is_above_vwap, is_amount_surge=is_amount_surge,
+        factor_score=factor_score, eligible=eligible)
 
 
 @dataclass(frozen=True)
@@ -759,40 +838,24 @@ def _find_entry_snapshot(
         quote_time = _as_datetime(row["trade_time"])
         quote = _minute_quote(row)
         minute_amount = float(row["amount"]) if pd.notna(row["amount"]) else 0.0
-        prior_amounts = [
-            amount
-            for amount in amount_history[-config.amount_surge_lookback:]
-            if amount > 0
-        ]
-        average_prior_amount = (
-            sum(prior_amounts) / len(prior_amounts) if prior_amounts else None
-        )
-        is_amount_surge = (
-            average_prior_amount is not None
-            and len(prior_amounts) >= config.amount_surge_min_prior_minutes
-            and minute_amount >= average_prior_amount * config.amount_surge_ratio
-        )
         cum_low = min(cum_low, float(row["low"]))
         cum_high = max(cum_high, float(row["high"]))
         if pd.notna(row["vol"]) and pd.notna(row["amount"]):
             cum_vol += float(row["vol"])
             cum_amount += float(row["amount"])
         vwap = cum_amount / cum_vol if cum_vol > 0 else None
-        is_strong_carry = (
-            cum_low >= item.t_close * config.carry_low_ratio
-            and quote.price >= item.t_close * config.carry_close_ratio
+        entry_check = evaluate_n_shape_entry(
+            config=config, quote_time=quote_time, latest_price=quote.price,
+            bar_low=float(row["low"]), session_low=cum_low, session_high=cum_high,
+            t_close=item.t_close, t_high=item.t_high, vwap=vwap,
+            minute_amount=minute_amount, prior_amounts=tuple(amount_history),
+            first_signal_time=signal_time, static_factors=static_factors,
         )
-        is_break_high = cum_high > item.t_high * config.break_high_ratio
-        is_signal = is_strong_carry and is_break_high
-        is_above_vwap = (
-            vwap is None or quote.price >= vwap * (1 + config.vwap_buffer_pct)
-        )
+        signal_time = entry_check.signal_time
+        signal_seen = signal_time is not None
 
-        if is_signal:
-            if not signal_seen:
-                signal_seen = True
-                signal_time = quote_time
-            if config.entry_mode == "first_break":
+        if entry_check.is_signal:
+            if config.entry_mode == "first_break" and entry_check.eligible:
                 signal_features = build_intraday_relative_volume_features(
                     store,
                     item.ts_code,
@@ -810,7 +873,7 @@ def _find_entry_snapshot(
                 )
                 if snapshot is not None:
                     return snapshot
-            if config.entry_mode == "vwap_confirm" and is_above_vwap:
+            if config.entry_mode == "vwap_confirm" and entry_check.eligible:
                 signal_features = build_intraday_relative_volume_features(
                     store,
                     item.ts_code,
@@ -839,10 +902,9 @@ def _find_entry_snapshot(
                     **(static_factors or {}),
                     "vwap_position": vwap_position,
                 }
-                factor_score = score_feature_terms(
-                    raw_factor_values, N_SHAPE_B_V1_SCORE_TERMS
-                )
-                if factor_score >= config.factor_score_threshold:
+                factor_score = entry_check.factor_score
+                assert factor_score is not None
+                if entry_check.eligible:
                     rel_features = build_intraday_relative_volume_features(
                         store,
                         item.ts_code,
@@ -877,8 +939,7 @@ def _find_entry_snapshot(
                         return snapshot
             if (
                 config.entry_mode == "amount_surge"
-                and is_above_vwap
-                and is_amount_surge
+                and entry_check.eligible
             ):
                 signal_features = build_intraday_relative_volume_features(
                     store,
@@ -904,16 +965,7 @@ def _find_entry_snapshot(
             continue
 
         if config.entry_mode == "break_retest":
-            touched_break_level = float(row["low"]) <= item.t_high * (
-                1 + config.retest_tolerance_pct
-            )
-            reclaimed_break_level = quote.price >= item.t_high
-            if (
-                quote_time > signal_time
-                and touched_break_level
-                and reclaimed_break_level
-                and is_above_vwap
-            ):
+            if entry_check.eligible:
                 signal_features = build_intraday_relative_volume_features(
                     store,
                     item.ts_code,
@@ -934,9 +986,7 @@ def _find_entry_snapshot(
 
         if (
             config.entry_mode == "late_confirm"
-            and quote_time.time() >= config.late_confirm_at
-            and quote.price >= item.t_high
-            and is_above_vwap
+            and entry_check.eligible
         ):
             signal_features = build_intraday_relative_volume_features(
                 store,

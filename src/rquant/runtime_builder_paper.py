@@ -6,13 +6,13 @@ from collections.abc import Callable
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import Field, StrictBool, StrictInt, field_validator, model_validator
 
 from rquant.paper_broker import BrokerCostPolicy, PaperBrokerStore
-from rquant.paper_portfolio_runtime import PaperPortfolioRuntimeCatalog
 from rquant.paper_ledger_anchor import Ed25519PaperLedgerAnchorVerifier
+from rquant.paper_portfolio_runtime import PaperPortfolioRuntimeCatalog
 from rquant.paper_signal_consumer import (
     PaperSignalConsumerStateStore,
     consume_notification_events_to_paper,
@@ -35,6 +35,10 @@ from rquant.runtime_service_entrypoint import (
 from rquant.signal_bus import SignalBusStore
 from rquant.signal_contracts import SignalAction
 from rquant.signal_route_spool import ReadonlyNotificationEventRouteSpool
+
+if TYPE_CHECKING:
+    from rquant.runtime_health_details import RuntimeHealthMetric
+    from rquant.runtime_serving_snapshot import SourceReadResult
 
 
 class PaperSignalPolicySettings(RuntimeContractModel):
@@ -82,6 +86,7 @@ class PaperConsumerSettings(PaperSignalPolicySettings):
 
 
 class PaperBrokerSettings(PaperSignalPolicySettings):
+    health_metrics_enabled: StrictBool = False
     condition_history_enabled: StrictBool = False
     signal_spool_root: Path
     queue_path: Path
@@ -249,7 +254,10 @@ def paper_broker_builder(
     trade_date_resolver: TradeDateResolver | None = None,
     portfolio_catalog: PaperPortfolioRuntimeCatalog | None = None,
 ) -> RuntimeServiceBuilder:
-    if portfolio_catalog is not None and type(portfolio_catalog) is not PaperPortfolioRuntimeCatalog:
+    if (
+        portfolio_catalog is not None
+        and type(portfolio_catalog) is not PaperPortfolioRuntimeCatalog
+    ):
         raise TypeError("paper builder requires its finite concrete portfolio catalog")
     if (quote_resolver is None) != (trade_date_resolver is None):
         raise ValueError("paper broker dependencies must be provided together")
@@ -259,8 +267,11 @@ def paper_broker_builder(
         if not isinstance(settings, PaperBrokerSettings):
             raise TypeError("paper broker settings are unavailable")
         portfolio_runtime = portfolio_catalog.for_manifest(manifest) if portfolio_catalog else None
-        if (portfolio_runtime is not None and portfolio_runtime.risk_publisher is not None
-                and portfolio_runtime.risk_publisher.spool.paths.root != settings.signal_spool_root):
+        if (
+            portfolio_runtime is not None
+            and portfolio_runtime.risk_publisher is not None
+            and portfolio_runtime.risk_publisher.spool.paths.root != settings.signal_spool_root
+        ):
             raise ValueError("paper risk route differs from the original exact role spool")
         if quote_resolver is None and trade_date_resolver is None:
             if (
@@ -295,8 +306,12 @@ def paper_broker_builder(
                 from rquant.backtest.contracts import SSECalendar
 
                 dates = pit_resolver._sse_open_dates
-                portfolio_runtime.calendar = SSECalendar(source_identity=settings.trade_calendar_sha256,
-                                                        coverage_start=dates[0], coverage_end=dates[-1], dates=dates)
+                portfolio_runtime.calendar = SSECalendar(
+                    source_identity=settings.trade_calendar_sha256,
+                    coverage_start=dates[0],
+                    coverage_end=dates[-1],
+                    dates=dates,
+                )
         else:
             if quote_resolver is None or trade_date_resolver is None:
                 raise RuntimeError("paper broker dependencies are unavailable")
@@ -343,6 +358,7 @@ def paper_broker_builder(
         authority_publisher = None
         portfolio_view_source = None
         portfolio_sequence_floor = None
+        last_health_metrics = None
         if settings.serving_authority_root is not None:
             from rquant.runtime_serving_authority import ServingSourceAuthorityPublisher
 
@@ -356,10 +372,15 @@ def paper_broker_builder(
             if portfolio_runtime is not None:
                 from rquant.paper_portfolio_view_source import PaperPortfolioViewSource
 
-                portfolio_view_source = PaperPortfolioViewSource(portfolio_runtime, broker=broker, queue=queue)
+                portfolio_view_source = PaperPortfolioViewSource(
+                    portfolio_runtime,
+                    broker=broker,
+                    queue=queue,
+                    health_metrics_enabled=settings.health_metrics_enabled,
+                )
 
         def publish_account_authority(observed_at: datetime) -> str | None:
-            nonlocal portfolio_sequence_floor
+            nonlocal portfolio_sequence_floor, last_health_metrics
             if authority_publisher is None:
                 return None
             from rquant.paper_history_serving import paper_history_projections
@@ -381,20 +402,34 @@ def paper_broker_builder(
             projections = paper_history_projections(history)
             sequence = history.ledger_revision
             if portfolio_view_source is not None:
-                from rquant.paper_portfolio_projection import PaperPortfolioSnapshot, paper_portfolio_projections
-                from rquant.runtime_serving_authority import ServingSourceAuthorityReader, ServingSourceAuthorityUnavailableError
+                from rquant.paper_portfolio_projection import (
+                    PaperPortfolioSnapshot,
+                    paper_portfolio_projections,
+                )
+                from rquant.runtime_serving_authority import (
+                    ServingSourceAuthorityReader,
+                    ServingSourceAuthorityUnavailableError,
+                )
 
                 portfolio_account = portfolio_view_source.read(as_of=observed_at)
-                portfolio_snapshot = PaperPortfolioSnapshot(available_at=observed_at, accounts=(portfolio_account,))
+                portfolio_snapshot = PaperPortfolioSnapshot(
+                    available_at=observed_at, accounts=(portfolio_account,)
+                )
                 projections += paper_portfolio_projections(portfolio_snapshot)
                 if portfolio_sequence_floor is None:
                     try:
-                        previous = ServingSourceAuthorityReader(root=settings.serving_authority_root, expected_producer_commit=manifest.producer_commit,
-                                                                expected_dataset_id="paper_accounts", expected_payload_kind="paper_accounts")(observed_at)
+                        previous = ServingSourceAuthorityReader(
+                            root=settings.serving_authority_root,
+                            expected_producer_commit=manifest.producer_commit,
+                            expected_dataset_id="paper_accounts",
+                            expected_payload_kind="paper_accounts",
+                        )(observed_at)
                         portfolio_sequence_floor = previous.sequence
                     except ServingSourceAuthorityUnavailableError:
                         portfolio_sequence_floor = 0
-                sequence = portfolio_view_source.publication_sequence(portfolio_snapshot, minimum_sequence=max(sequence, portfolio_sequence_floor))
+                sequence = portfolio_view_source.publication_sequence(
+                    portfolio_snapshot, minimum_sequence=max(sequence, portfolio_sequence_floor)
+                )
                 if portfolio_account.reason:
                     reason = "; ".join(part for part in (reason, portfolio_account.reason) if part)
             values: dict[str, object] = {
@@ -419,10 +454,16 @@ def paper_broker_builder(
                     raise ValueError("paper authority payload is inconsistent")
                 tables = {item.table_name: item for item in payload.projections}
                 if "paper_portfolio_state" in tables:
-                    from rquant.paper_portfolio_projection import validate_paper_portfolio_projections
-                    from rquant.paper_portfolio_view_source import paper_portfolio_publication_identity
+                    from rquant.paper_portfolio_projection import (
+                        validate_paper_portfolio_projections,
+                    )
+                    from rquant.paper_portfolio_view_source import (
+                        paper_portfolio_publication_identity,
+                    )
 
-                    return paper_portfolio_publication_identity(validate_paper_portfolio_projections(tables))
+                    return paper_portfolio_publication_identity(
+                        validate_paper_portfolio_projections(tables)
+                    )
                 if set(tables) != {
                     "paper_order_window",
                     "paper_order_history",
@@ -443,9 +484,28 @@ def paper_broker_builder(
                     }
                 )
 
+            candidate = SourceReadResult.model_validate(values)
             publication = authority_publisher.publish_if_changed(
-                SourceReadResult.model_validate(values), unchanged_identity=unchanged_identity
+                candidate, unchanged_identity=unchanged_identity
             )
+            if settings.health_metrics_enabled:
+                selected = candidate
+                if not publication.written:
+                    from rquant.runtime_serving_authority import ServingSourceAuthorityReader
+
+                    selected = ServingSourceAuthorityReader(
+                        root=settings.serving_authority_root,
+                        expected_producer_commit=manifest.producer_commit,
+                        expected_dataset_id="paper_accounts",
+                        expected_payload_kind="paper_accounts",
+                    )(observed_at)
+                if selected.generation_id != publication.pointer.generation_id:
+                    raise ValueError("paper health detail lost its selected immutable publication")
+                last_health_metrics = paper_health_metrics_for_publication(
+                    selected,
+                    account_id=policy.account_id,
+                    fallback_configuration_identity=policy.fingerprint,
+                )
             return publication.pointer.generation_id
 
         def step() -> RuntimeStepResult:
@@ -478,6 +538,7 @@ def paper_broker_builder(
                     degraded_reasons=("paper_broker:paused",),
                     # A paused broker never observes the spool source, so nothing moved.
                     watermark_advanced=False,
+                    health_metrics=last_health_metrics,
                 )
             consumed = consume_notification_events_to_paper(
                 source,
@@ -499,10 +560,16 @@ def paper_broker_builder(
                 try:
                     with portfolio_runtime.state._connection(write=True):
                         if portfolio_runtime.risk_publisher is not None:
-                            portfolio_runtime.risk_publisher.publish_pending(observed_at=observed_at)
-                        portfolio_runtime.plan_risk_reductions(broker, decision_at=observed_at,
-                                                               trade_date=resolved_trade_date_resolver(observed_at),
-                                                               quote_resolver=resolved_quote_resolver, queue=queue)
+                            portfolio_runtime.risk_publisher.publish_pending(
+                                observed_at=observed_at
+                            )
+                        portfolio_runtime.plan_risk_reductions(
+                            broker,
+                            decision_at=observed_at,
+                            trade_date=resolved_trade_date_resolver(observed_at),
+                            quote_resolver=resolved_quote_resolver,
+                            queue=queue,
+                        )
                     portfolio_runtime.risk_reason = None
                 except ValueError as exc:
                     portfolio_runtime.risk_reason = str(exc)
@@ -512,9 +579,15 @@ def paper_broker_builder(
             if portfolio_runtime is not None:
                 applied = portfolio_runtime.operator.current()
                 portfolio_generations = {
-                    "paper_portfolio_configuration": portfolio_runtime.state.configuration.fingerprint,
+                    "paper_portfolio_configuration": (
+                        portfolio_runtime.state.configuration.fingerprint
+                    ),
                     "paper_operator_application": canonical_sha256(applied),
-                    **({"paper_operator_control": applied.control_fingerprint} if applied.control_fingerprint else {}),
+                    **(
+                        {"paper_operator_control": applied.control_fingerprint}
+                        if applied.control_fingerprint
+                        else {}
+                    ),
                 }
             return RuntimeStepResult(
                 input_sequence=descriptor.high_watermark,
@@ -535,14 +608,305 @@ def paper_broker_builder(
                     ),
                 },
                 degraded_reasons=(("paper_execution_failed",) if failures else ())
-                                 + (("paper_portfolio_risk_unavailable",) if portfolio_runtime is not None and portfolio_runtime.risk_reason else ()),
-                observations=({"paper_operator_applied_sequence": applied.sequence} if portfolio_runtime is not None else {}),
+                + (
+                    ("paper_portfolio_risk_unavailable",)
+                    if portfolio_runtime is not None and portfolio_runtime.risk_reason
+                    else ()
+                ),
+                observations=(
+                    {"paper_operator_applied_sequence": applied.sequence}
+                    if portfolio_runtime is not None
+                    else {}
+                ),
                 watermark_advanced=consumed.watermark_advanced,
+                health_metrics=last_health_metrics,
             )
 
+        # Original readonly peers require this writer's real WAL side file.
+        # Keep an idle owner session, without holding a financial transaction.
+        owner_connection = broker._connect()
+        if owner_connection.in_transaction:
+            owner_connection.close()
+            raise ValueError("paper owner peer session cannot retain a transaction")
+
+        def close() -> None:
+            nonlocal owner_connection
+            if owner_connection is not None:
+                owner_connection.close()
+                owner_connection = None
+
+        step.close = close
         return step
 
     return build
+
+
+def paper_health_metrics_for_publication(
+    read: SourceReadResult,
+    *,
+    account_id: str,
+    fallback_configuration_identity: str,
+) -> tuple[RuntimeHealthMetric, ...]:
+    """Transfer the selected original publication, including an unchanged old version."""
+    from rquant.paper_broker import PaperOrderHistorySnapshot
+    from rquant.paper_history_serving import paper_history_summary
+    from rquant.paper_portfolio_projection import validate_paper_portfolio_projections
+    from rquant.runtime_health_details import (
+        RuntimeHealthAsOfValidity,
+        RuntimeHealthComparisonScope,
+        RuntimeHealthMetric,
+        RuntimeHealthPortfolioScope,
+        RuntimeHealthRealtimeValidity,
+        RuntimeHealthRetainedOrderScope,
+    )
+    from rquant.runtime_serving_snapshot import PaperAccountsPayload, SourceReadResult
+
+    read = SourceReadResult.model_validate(read.model_dump(mode="python"))
+    if read.dataset_id != "paper_accounts" or not isinstance(read.payload, PaperAccountsPayload):
+        raise ValueError("paper health input must be its original complete owner publication")
+    tables = {item.table_name: item for item in read.payload.projections}
+    snapshot = validate_paper_portfolio_projections(tables)
+    portfolio = None
+    if snapshot is not None:
+        portfolio = next(
+            (
+                item
+                for item in snapshot.accounts
+                if item.configuration.binding.account_id == account_id
+            ),
+            None,
+        )
+        if portfolio is None:
+            raise ValueError("paper health account is absent from its actual publication")
+    window = tables["paper_order_window"].rows[0]
+    payload_ids = tuple(item.account_id for item in read.payload.paper_accounts)
+    if (
+        payload_ids.count(account_id) != 1
+        or payload_ids.count(window["account_id"]) != 1
+        or snapshot is None
+        and (len(payload_ids) != 1 or window["account_id"] != account_id)
+    ):
+        raise ValueError("paper health retained window belongs to a different account")
+    window_portfolio = (
+        next(
+            (
+                item
+                for item in snapshot.accounts
+                if item.configuration.binding.account_id == window["account_id"]
+            ),
+            None,
+        )
+        if snapshot is not None
+        else None
+    )
+    if snapshot is not None and window_portfolio is None:
+        raise ValueError("paper health retained account is absent from its complete graph")
+    revision = (
+        portfolio.frame.ledger_revision
+        if portfolio is not None and portfolio.frame is not None
+        else read.sequence
+    )
+    history = PaperOrderHistorySnapshot.model_validate(
+        dict(
+            account_id=window["account_id"],
+            as_of=window["as_of_time"],
+            price_tick=window["price_tick"],
+            ledger_revision=window_portfolio.frame.ledger_revision
+            if window_portfolio is not None and window_portfolio.frame is not None
+            else read.sequence,
+            total_orders=window["total_orders"],
+            has_more=window["has_more"],
+            orders=tables["paper_order_history"].rows,
+            fills=tables["paper_fill_history"].rows,
+        )
+    )
+    if (
+        history.as_of != read.published_at
+        or len(history.orders) != window["retained_orders"]
+        or len(history.fills) != window["retained_fills"]
+    ):
+        raise ValueError("paper health detail is detached from its exact retained window")
+    summary = paper_history_summary(history)
+    configuration_identity = (
+        portfolio.configuration.fingerprint
+        if portfolio is not None
+        else fallback_configuration_identity
+    )
+    common = dict(
+        owner_dataset_id="paper_accounts",
+        source_generation_id=read.generation_id,
+        source_identity=canonical_sha256(read),
+        available_at=read.published_at,
+        observed_at=read.published_at,
+    )
+
+    def as_of(basis: str, identity: str, material: dict[str, object]) -> RuntimeHealthAsOfValidity:
+        return RuntimeHealthAsOfValidity(
+            basis=basis,
+            basis_identity=identity,
+            as_of=material["observed_at"],
+            scope_identity=canonical_sha256(material["scope"]),
+            **{
+                key: value for key, value in material.items() if key not in {"scope", "observed_at"}
+            },
+        )
+
+    metrics = []
+    if window["account_id"] == account_id:
+        scope = RuntimeHealthRetainedOrderScope(
+            account_id=account_id,
+            configuration_identity=configuration_identity,
+            ledger_revision=revision,
+            retained_count=summary.retained_count,
+            total_orders=summary.total_orders,
+            has_more=history.has_more,
+        )
+        retained = common | dict(
+            scope=scope,
+            event_time_start=summary.oldest_updated_at,
+            event_time_end=summary.newest_updated_at,
+        )
+        metrics.append(
+            RuntimeHealthMetric(
+                metric_id="order_rejection_ratio",
+                unit="ratio",
+                **retained,
+                validity=as_of("retained_window", common["source_identity"], retained),
+                completeness="complete" if summary.rejection_ratio is not None else "unavailable",
+                value=summary.rejection_ratio,
+                numerator=summary.rejected_count,
+                denominator=summary.retained_count,
+                verdict="unassessed" if summary.rejection_ratio is not None else "unavailable",
+                reason_code="retained_order_window"
+                if summary.retained_count
+                else "retained_order_window_empty",
+            )
+        )
+    if portfolio is None:
+        return tuple(metrics)
+    configuration, risk = portfolio.configuration, portfolio.risk
+    policy_identity = (
+        canonical_sha256(configuration.drawdown_rule)
+        if configuration.drawdown_rule is not None
+        else None
+    )
+    scope = RuntimeHealthPortfolioScope(
+        account_id=account_id,
+        configuration_identity=configuration_identity,
+        ledger_revision=risk.ledger_revision if risk is not None else revision,
+    )
+    instant = risk.observed_at if risk is not None else read.event_time
+    common = common | dict(scope=scope, event_time_start=instant, event_time_end=instant)
+    known_risk = risk is not None and risk.decision is not None and policy_identity is not None
+    metrics.append(
+        RuntimeHealthMetric(
+            metric_id="portfolio_risk",
+            unit="risk_state",
+            **common,
+            validity=as_of("past_risk_decision", common["source_identity"], common)
+            if known_risk
+            else None,
+            completeness="complete" if known_risk else "unavailable",
+            policy_identity=policy_identity,
+            value=("breached" if risk.decision.state.active else "clear") if known_risk else None,
+            verdict=("abnormal" if risk.decision.state.active else "normal")
+            if known_risk
+            else "unavailable",
+            reason_code="past_portfolio_risk_decision"
+            if known_risk
+            else "portfolio_risk_unavailable",
+        )
+    )
+    exposure = portfolio.exposure
+    cash = (
+        next((item for item in exposure.exposure.rows if item.kind == "cash"), None)
+        if exposure is not None
+        else None
+    )
+    material = portfolio.market_material
+    receipt = portfolio.exposure_receipt
+    # Original weights exist even when the separate period-attribution result is absent.
+    known_exposure = (
+        portfolio.status == "complete"
+        and exposure is not None
+        and receipt is not None
+        and material is not None
+        and cash is not None
+    )
+    scope = RuntimeHealthPortfolioScope(
+        account_id=account_id,
+        configuration_identity=configuration_identity,
+        ledger_revision=revision,
+    )
+    instant = material.observed_at if material is not None else read.event_time
+    common = common | dict(scope=scope, event_time_start=instant, event_time_end=instant)
+    validity = (
+        RuntimeHealthRealtimeValidity(
+            rule_identity=canonical_sha256(
+                {
+                    "owner": "paper_portfolio_view_source",
+                    "rules": ("market_material.observed_at+90s", "benchmark.valid_through"),
+                    "boundary": "inclusive",
+                }
+            ),
+            valid_until=min(instant + timedelta(seconds=90), receipt.benchmark.valid_through),
+            boundary="inclusive",
+        )
+        if material is not None and receipt is not None
+        else None
+    )
+    metrics.append(
+        RuntimeHealthMetric(
+            metric_id="portfolio_exposure",
+            unit="fraction",
+            **common,
+            validity=validity,
+            completeness="complete" if known_exposure else "unavailable",
+            value=cash.portfolio_weight if known_exposure else None,
+            verdict="unassessed" if known_exposure else "unavailable",
+            reason_code="portfolio_cash_weight"
+            if known_exposure
+            else "portfolio_exposure_unavailable",
+        )
+    )
+    band, dates = portfolio.band, portfolio.complete_comparison_dates()
+    if portfolio.calendar is not None:
+        binding = configuration.binding
+        scope = RuntimeHealthComparisonScope(
+            account_id=account_id,
+            strategy_version=binding.strategy_version,
+            parameter_fingerprint=binding.parameter_fingerprint,
+            cost_identity=binding.cost_spec_id,
+            calendar_identity=portfolio.calendar.source_identity,
+            baseline_identity=band.backtest_source_hash if band is not None else None,
+            comparison_dates=dates or (),
+            baseline_dates=band.dates if band is not None else (),
+            complete=portfolio.band_position is not None,
+        )
+        known = portfolio.band_position is not None
+        common = common | dict(
+            scope=scope,
+            event_time_start=portfolio.nav[0].close_at if portfolio.nav else read.event_time,
+            event_time_end=portfolio.nav[-1].close_at if portfolio.nav else read.event_time,
+        )
+        metrics.append(
+            RuntimeHealthMetric(
+                metric_id="return_comparison",
+                unit="band_position",
+                **common,
+                validity=as_of("sealed_comparison", band.backtest_source_hash, common)
+                if known
+                else None,
+                completeness="complete" if known else "unavailable",
+                value=portfolio.band_position,
+                policy_identity=band.fingerprint if known else None,
+                verdict=("normal" if portfolio.band_position == "inside" else "attention")
+                if known
+                else "unavailable",
+                reason_code="sealed_return_comparison" if known else "comparison_unavailable",
+            )
+        )
+    return tuple(metrics)
 
 
 __all__ = [

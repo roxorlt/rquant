@@ -4,6 +4,7 @@ import { type ServingQueryResult, useServingQuery } from "./useServingQuery";
 export type ExperimentItem = Schemas["ExperimentItem"];
 export type ExperimentListData = Schemas["ExperimentListData"];
 export type FormalExperiment = Schemas["ExperimentAttemptRow"];
+export type NativeExperimentConfiguration = Schemas["NativeMinuteConfiguration"];
 export type ExperimentCapabilities = Schemas["ExperimentCapabilities"];
 export type ExperimentFamily = Schemas["ExperimentFamilyData"];
 export type ExperimentResult = Schemas["ExperimentResultData"];
@@ -20,6 +21,13 @@ export type ExperimentWrite =
   | Schemas["ExperimentPolicyWrite"];
 export type ExperimentReceipt = Schemas["ExperimentWriteReceipt"];
 type ExperimentEnvelope = Schemas["Envelope_ExperimentListData_"];
+
+export function isNativeExperimentConfiguration(
+  value: FormalExperiment["configuration"],
+): value is NativeExperimentConfiguration {
+  // The generated default kind is optional; only native configurations require selection.
+  return "selection" in value;
+}
 
 function required<T extends { serving: { generation_id: string | null } }>(
   data: T | undefined,

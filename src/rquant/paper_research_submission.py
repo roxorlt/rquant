@@ -12,13 +12,15 @@ from uuid import UUID, uuid4
 from rquant.lab_job_center import CommandSubmissionReceipt, LabCommandSubmissionFacade, _preflight_research_plan, _research_parameter
 from rquant.lab_job_protocol import LabCommandEnvelope, SubmitJobCommand
 from rquant.paper_reconcile import freeze_paper_reconcile
-from rquant.paper_research import FrozenPaperResearchInput, PaperResearchAdapterCatalog, PaperResearchRunParameters
+from rquant.paper_research import FrozenPaperResearchInput, PaperResearchAdapterCatalog, NativePaperResearchAdapterCatalog, PaperResearchCatalog, PaperResearchRunParameters
 from rquant.paper_research_adapter import paper_research_adapter_registry
 from rquant.paper_research_commands import OwnedRunPaperPortfolioResearch, PaperResearchSubmissionReceipt, RunPaperPortfolioResearch
 from rquant.paper_research_source import paper_research_code_identity, publish_paper_research_input
 from rquant.paper_portfolio_models import PaperPortfolioStateIdentity
 from rquant.paper_portfolio_view_source import PaperPortfolioViewSource
 from rquant.paper_portfolio_state import PaperPortfolioStateStore
+from rquant.paper_research_runtime import NativeMinuteForwardState, NativeMinuteForwardViewSource
+from rquant.strategy_authoring_commands import StrategyAuthoringIdentity
 from rquant.paper_backtest_source import PaperBacktestSourceReader
 from rquant.research_catalog import ResearchCatalog
 from rquant.research_run_spec import ResearchJobType, ResearchRunParameters, ResearchRunSpec, ResourceClass
@@ -27,14 +29,17 @@ from rquant.storage.duckdb import DuckDBStore
 from rquant.strategy_job_adapters import build_adapter_execution_contract
 
 MAX_PAPER_RESEARCH_ADMISSIONS = 4096
+PaperResearchViewSource = PaperPortfolioViewSource | NativeMinuteForwardViewSource
+PaperResearchState = PaperPortfolioStateStore | NativeMinuteForwardState
+PaperResearchIdentity = PaperPortfolioStateIdentity | StrategyAuthoringIdentity
 
 
 class PaperResearchRunPreparer:
-    def __init__(self, *, sources: tuple[PaperPortfolioViewSource, ...],
+    def __init__(self, *, sources: tuple[PaperResearchViewSource, ...],
                  metadata_store_factory: Callable[[], AbstractContextManager[DuckDBStore]], research_catalog: ResearchCatalog,
                  input_root: Path, lake_root: Path, code_sha: str, clock: Callable[[], datetime],
                  backtest_reader: PaperBacktestSourceReader | None = None) -> None:
-        if not 1 <= len(sources) <= 64 or any(type(item) is not PaperPortfolioViewSource for item in sources):
+        if not 1 <= len(sources) <= 64 or any(type(item) not in {PaperPortfolioViewSource, NativeMinuteForwardViewSource} for item in sources):
             raise TypeError("paper research requires its finite concrete role sources")
         value = input_root.lstat()
         if (not stat.S_ISDIR(value.st_mode) or stat.S_IMODE(value.st_mode) != 0o700
@@ -45,39 +50,53 @@ class PaperResearchRunPreparer:
         self.sources, self.metadata_store_factory, self.research_catalog = sources, metadata_store_factory, research_catalog
         self.input_root, self.lake_root, self.code_sha, self.clock, self.backtest_reader = input_root, lake_root, code_sha, clock, backtest_reader
 
-    def source_for(self, account_id: str, owner_id: str) -> PaperPortfolioViewSource:
+    def source_for(self, account_id: str, owner_id: str) -> PaperResearchViewSource:
         matches = tuple(item for item in self.sources if (item.runtime.state.configuration.binding.account_id,
                                                          item.runtime.state.configuration.binding.owner_id) == (account_id, owner_id))
         if len(matches) != 1:
             raise PermissionError("paper research account is unknown or belongs to another user")
         return matches[0]
 
-    def prepare(self, request: RunPaperPortfolioResearch, *, owner_id: str, expected_identity: PaperPortfolioStateIdentity) -> OwnedRunPaperPortfolioResearch:
+    def catalog_for(self, source: PaperResearchViewSource) -> PaperResearchCatalog:
+        state = source.runtime.state
+        if self.source_for(state.configuration.binding.account_id, state.configuration.binding.owner_id) is not source:
+            raise PermissionError("paper catalog must use its installed original source")
+        native = type(source) is NativeMinuteForwardViewSource
+        model = NativePaperResearchAdapterCatalog if native else PaperResearchAdapterCatalog
+        return model(metadata_identity=state.identity(), configuration=state.configuration,
+            source_code_identity=paper_research_code_identity(native=native))
+
+    def prepare(self, request: RunPaperPortfolioResearch, *, owner_id: str, expected_identity: PaperResearchIdentity) -> OwnedRunPaperPortfolioResearch:
         source = self.source_for(request.account_id, owner_id)
         state = source.runtime.state
         state.refresh_configuration()
         configuration = state.configuration
+        native = type(source) is NativeMinuteForwardViewSource
+        if native:
+            state.authorize(owner_id)
         if state.identity() != expected_identity or configuration.fingerprint != request.configuration_fingerprint:
             raise ValueError("paper research current configuration or metadata changed")
         now = normalize_aware_utc(self.clock())
         view = source.read(as_of=now)
         if view.status != "complete" or view.frame is None or view.frame.account is None:
             raise ValueError("缺少当前估值，暂不能运行研究")
-        catalog = PaperResearchAdapterCatalog(metadata_identity=expected_identity, configuration=configuration,
-                                               source_code_identity=paper_research_code_identity())
+        catalog = self.catalog_for(source)
         reconcile, band = None, None
         if request.task_name == "paper_reconcile":
+            if native:
+                raise ValueError("原生策略直接核对完整财务账本，不使用组合目标对账")
             reconcile = freeze_paper_reconcile(source.runtime.ledger_source_for(source.broker), configuration, as_of=now,
                                                prices={item.code: item.market_price for item in view.frame.account.holdings})
         else:
             from rquant.paper_backtest_source import PaperBacktestSourceReader
-            if type(self.backtest_reader) is not PaperBacktestSourceReader or source.runtime.calendar is None:
+            if (not native and type(self.backtest_reader) is not PaperBacktestSourceReader) or source.runtime.calendar is None:
                 raise ValueError("缺少同版本封存回测，暂不能计算区间")
             comparison_dates = view.complete_comparison_dates()
             if comparison_dates is None:
                 raise ValueError("模拟净值或日收益有缺口，暂不能计算同日区间")
-            band = self.backtest_reader.band_input(configuration=configuration, job_id=request.backtest_job_id,
-                                                   calendar=source.runtime.calendar, comparison_dates=comparison_dates, as_of=now)
+            band = (source.runtime.band_input(job_id=request.backtest_job_id, comparison_dates=comparison_dates, as_of=now)
+                if native else self.backtest_reader.band_input(configuration=configuration, job_id=request.backtest_job_id,
+                    calendar=source.runtime.calendar, comparison_dates=comparison_dates, as_of=now))
         value = FrozenPaperResearchInput(task_name=request.task_name, catalog=catalog, code_sha=self.code_sha, available_at=now,
                                          reconcile=reconcile, band=band)
         directory = self.input_root/uuid4().hex
@@ -94,6 +113,10 @@ class PaperResearchRunPreparer:
                                feature_contract=build_adapter_execution_contract(adapter, "1", self.code_sha), execution_costs=configuration.execution_cost_spec,
                                random_seed=20261005, resource_class=ResourceClass.STANDARD, deadline=now+timedelta(hours=4), research_status="exploratory")
         _preflight_research_plan(spec, paper_catalog=catalog)
+        if native:
+            state.authorize(owner_id)
+            if state.refresh_configuration() != configuration or state.identity() != expected_identity:
+                raise ValueError("native forward source changed while freezing the original band")
         return OwnedRunPaperPortfolioResearch(**request.model_dump(mode="python"), owner_id=owner_id, metadata_identity=expected_identity,
                                               accepted_at=now, catalog=catalog, spec=spec,
                                               plan_hash=canonical_sha256(paper_research_adapter_registry(catalog).plan(spec)))
@@ -107,18 +130,21 @@ class PaperResearchRunBackend:
         for source in preparer.sources:
             self._table(source.runtime.state)
 
-    def _state(self, account_id: str, owner_id: str, identity: PaperPortfolioStateIdentity) -> PaperPortfolioStateStore:
+    def _state(self, account_id: str, owner_id: str, identity: PaperResearchIdentity) -> PaperResearchState:
         state = self.preparer.source_for(account_id, owner_id).runtime.state
         if state.identity() != identity:
             raise ValueError("original paper research metadata identity was replaced")
         return state
 
     @staticmethod
-    def _table(state: PaperPortfolioStateStore) -> None:
+    def _table(state: PaperResearchState) -> None:
+        with state._connection() as connection:
+            if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='paper_research_admissions'").fetchone():
+                return
         with state._connection(write=True) as connection:
             connection.execute("CREATE TABLE IF NOT EXISTS paper_research_admissions(command_id TEXT PRIMARY KEY,owner_id TEXT NOT NULL,request_body TEXT NOT NULL,owned_body TEXT NOT NULL,receipt_body TEXT)")
 
-    def lookup(self, request: RunPaperPortfolioResearch, *, owner_id: str, expected_identity: PaperPortfolioStateIdentity) -> OwnedRunPaperPortfolioResearch | None:
+    def lookup(self, request: RunPaperPortfolioResearch, *, owner_id: str, expected_identity: PaperResearchIdentity) -> OwnedRunPaperPortfolioResearch | None:
         state = self._state(request.account_id, owner_id, expected_identity)
         self._table(state)
         with state._connection() as connection:
@@ -131,9 +157,12 @@ class PaperResearchRunBackend:
             raise ValueError("original paper research request or actor differs")
         return owned
 
-    def compile(self, request: RunPaperPortfolioResearch, *, owner_id: str, expected_identity: PaperPortfolioStateIdentity) -> OwnedRunPaperPortfolioResearch:
+    def compile(self, request: RunPaperPortfolioResearch, *, owner_id: str, expected_identity: PaperResearchIdentity) -> OwnedRunPaperPortfolioResearch:
         state = self._state(request.account_id, owner_id, expected_identity)
         self._table(state)
+        old = self.lookup(request, owner_id=owner_id, expected_identity=expected_identity)
+        if old is not None:
+            return old
         with state._connection(write=True) as connection:
             old = self.lookup(request, owner_id=owner_id, expected_identity=expected_identity)
             if old is not None:

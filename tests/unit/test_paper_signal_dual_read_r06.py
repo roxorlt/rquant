@@ -207,7 +207,11 @@ def _schema_and_data_snapshot(path: Path) -> tuple[object, ...]:
     return schema, columns, _snapshot(path)
 
 
-@pytest.mark.parametrize(("_name", "expected_type", "expected_id", "literal"), _FAMILIES)
+@pytest.mark.parametrize(
+    ("_name", "expected_type", "expected_id", "literal"),
+    _FAMILIES,
+    ids=[family[0] for family in _FAMILIES],
+)
 def test_paper_consumer_copies_every_verified_signal_family_to_the_queue(
     tmp_path: Path,
     _name: str,
@@ -251,7 +255,11 @@ def test_paper_consumer_copies_every_verified_signal_family_to_the_queue(
     assert state.receipt(1) is not None
 
 
-@pytest.mark.parametrize(("_name", "_expected_type", "expected_id", "literal"), _FAMILIES)
+@pytest.mark.parametrize(
+    ("_name", "_expected_type", "expected_id", "literal"),
+    _FAMILIES,
+    ids=[family[0] for family in _FAMILIES],
+)
 @pytest.mark.parametrize("tamper", ("signal_id", "payload_hash", "payload_size"))
 def test_queue_integrity_mismatch_stops_before_quote_or_paper_order_mutation(
     tmp_path: Path,
@@ -420,7 +428,11 @@ def test_corrupt_late_legacy_row_rolls_back_the_entire_queue_migration(
     assert _schema_and_data_snapshot(queue_path) == before
 
 
-@pytest.mark.parametrize(("_name", "literal"), _INVALID_CURRENT_PAYLOADS)
+@pytest.mark.parametrize(
+    ("_name", "literal"),
+    _INVALID_CURRENT_PAYLOADS,
+    ids=[payload[0] for payload in _INVALID_CURRENT_PAYLOADS],
+)
 def test_invalid_bus_payload_fails_before_consumer_or_queue_mutation(
     tmp_path: Path,
     _name: str,
@@ -455,7 +467,11 @@ def test_invalid_bus_payload_fails_before_consumer_or_queue_mutation(
     assert _snapshot(state_path) == before_state
 
 
-@pytest.mark.parametrize(("_name", "expected_type", "_expected_id", "literal"), _FAMILIES)
+@pytest.mark.parametrize(
+    ("_name", "expected_type", "_expected_id", "literal"),
+    _FAMILIES,
+    ids=[family[0] for family in _FAMILIES],
+)
 def test_paper_quote_and_lifecycle_accept_every_verified_signal_family(
     tmp_path: Path,
     _name: str,

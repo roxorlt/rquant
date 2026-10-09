@@ -1,5 +1,6 @@
 import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { HttpResponse, http } from "msw";
 import { metaEnvelope } from "@/test/fixtures";
 import { findJargon } from "@/test/jargon";
 import { renderApp } from "@/test/render";
@@ -7,6 +8,34 @@ import { metaHandler, server } from "@/test/server";
 import { NAV_GROUPS, PAGES } from "./pages";
 
 describe("app shell", () => {
+  it("opens the assistant from the top bar and restores keyboard focus", async () => {
+    server.use(
+      http.get("*/api/v1/ai/capabilities", () =>
+        HttpResponse.json({
+          serving: metaEnvelope().serving,
+          data: {
+            available: false,
+            can_generate: false,
+            can_prepare_backtest: false,
+            message: "助手尚未配置，可继续手动编辑。",
+          },
+        }),
+      ),
+    );
+    const user = userEvent.setup();
+    renderApp("/overview");
+    const button = await screen.findByRole("button", { name: "AI 助手" });
+    const label = button.querySelector(".lbl");
+    if (label instanceof HTMLElement) label.hidden = true;
+    expect(screen.getByRole("button", { name: "AI 助手" })).toBe(button);
+    await user.click(button);
+    expect(await screen.findByRole("dialog", { name: "AI 助手" })).toBeInTheDocument();
+    await user.keyboard("{Escape}");
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog", { name: "AI 助手" })).not.toBeInTheDocument(),
+    );
+    await waitFor(() => expect(button).toHaveFocus());
+  });
   it("renders the top bar, the grouped rail and the first page", async () => {
     renderApp("/overview");
 

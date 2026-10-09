@@ -132,7 +132,8 @@ def get_blocks(
     data = data.model_copy(
         update={
             "nl_generate_available": (
-                web.nl_parser is not None
+                web.ai_assistance_gateway is not None
+                and _viewer in web.settings.ai_users
                 and mode == "daily"
                 and data.available
                 and data.source is not None
@@ -155,65 +156,32 @@ async def preview_screen_natural_language(
         raise HTTPException(status_code=401, detail="请先登录。")
     if len(await request.body()) > MAX_NL_REQUEST_BYTES:
         raise HTTPException(status_code=413, detail="描述过长，请删减后重试。")
-    web = request.app.state.web
-    parser = web.nl_parser
-    if parser is None:
-        raise HTTPException(status_code=503, detail="暂不能生成，仍可手动添加条件。")
-    with _screen_slot(web.screen_gate), web.tracker.borrow() as borrowed:
-        meta = serving_meta(
-            borrowed,
-            now=web.clock(),
-            stale_after=web.settings.stale_after,
-            failure=web.tracker.failure,
-        )
-        catalog = web.screen_service.catalog(borrowed)
-        if not _catalog_matches(body, catalog, meta.state):
-            raise HTTPException(status_code=409, detail="选股数据已更新，请刷新条件后重试。")
-    if not web.nl_gate.acquire(blocking=False):
-        raise HTTPException(
-            status_code=429, detail="正在生成，请稍后再试。", headers={"Retry-After": "1"}
-        )
-    try:
-        if not web.nl_rate_limiter.admit(viewer):
-            raise HTTPException(
-                status_code=429,
-                detail="操作太频繁，请一分钟后再试。",
-                headers={"Retry-After": "60"},
-            )
-        try:
-            raw = await anyio.to_thread.run_sync(
-                parser.parse_new, body.instruction.strip(), body.trade_date.isoformat()
-            )
-        except NlClarificationNeededError as error:
-            raise HTTPException(status_code=422, detail="请说清想筛选的股票条件。") from error
-        except (NlParserUnavailableError, TimeoutError) as error:
-            raise HTTPException(status_code=503, detail="暂不能生成，请稍后重试。") from error
+    from functools import partial
+    from rquant.web.models.ai_assistance import AIScreenRequest, AIScreenDraft
+    from rquant.web.models.screen import ScreenCondition
+    from rquant.web.routes.ai_assistance import generate_ai, original_header_id
+    if request.app.state.web.ai_assistance_gateway is None:
+        raise HTTPException(503, "暂不能生成，仍可手动添加条件。")
+    original = AIScreenRequest(request_id=original_header_id(request), include_ranking=False, **body.model_dump())
+    def new_request_preflight() -> None:
+        web = request.app.state.web
+        web.tracker.refresh()
         with _screen_slot(web.screen_gate), web.tracker.borrow() as borrowed:
-            meta = serving_meta(
-                borrowed,
-                now=web.clock(),
-                stale_after=web.settings.stale_after,
-                failure=web.tracker.failure,
-            )
-            current = web.screen_service.catalog(borrowed)
-            if not _catalog_matches(body, current, meta.state) or current.blocks != catalog.blocks:
-                raise HTTPException(status_code=409, detail="选股数据已更新，请刷新条件后重试。")
-        try:
-            conditions = validate_screen_draft(raw, current, body.trade_date)
-        except ScreenDateMismatchError as error:
-            raise HTTPException(status_code=422, detail="请先选择想筛选的日期。") from error
-        except InvalidScreenDraftError as error:
-            raise HTTPException(
-                status_code=422, detail="没能生成可用条件，请换一种说法。"
-            ) from error
-        return ScreenNlPreviewData(
-            source_kind=body.source_kind,
-            source_identity=body.source_identity,
-            trade_date=body.trade_date,
-            conditions=conditions,
-        )
-    finally:
-        web.nl_gate.release()
+            meta = serving_meta(borrowed, now=web.clock(), stale_after=web.settings.stale_after,
+                failure=web.tracker.failure)
+            catalog = web.screen_service.catalog(borrowed)
+            if not _catalog_matches(body, catalog, meta.state):
+                raise HTTPException(409, "选股数据已更新，请刷新条件后重试。")
+    data = await anyio.to_thread.run_sync(partial(generate_ai, request, viewer, original,
+        new_request_preflight=new_request_preflight))
+    view = data.request
+    if view is None or view.state != "completed":
+        raise HTTPException(503, "调用结果未知，请继续查看原请求。")
+    if not isinstance(view.result, AIScreenDraft):
+        raise HTTPException(422, "没能生成可用条件，请换一种说法。")
+    definition = view.result.definition
+    return ScreenNlPreviewData(source_kind=definition.source_kind, source_identity=definition.source_identity,
+        trade_date=definition.trade_date, conditions=[ScreenCondition(key=c.name, args=c.args) for c in definition.conditions])
 
 
 @router.post("/run", response_model=Envelope[ScreenRunData], summary="运行选股条件")

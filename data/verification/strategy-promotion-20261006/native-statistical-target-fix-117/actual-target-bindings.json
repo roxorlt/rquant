@@ -1,0 +1,1444 @@
+{
+  "scope": "Focused typed candidate selection and existing validation identity refusals; not new owner/physical seal authority",
+  "original_complete_seal_accepted": {
+    "path": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-source-integration/data/verification/strategy-promotion-20261006/native-parent-worker-root-07/accepted-read-existing.json",
+    "sha256": "0513e3d2fee578e032c14b8f49e102215a230565a7bf5cf3742e22beb2105a20"
+  },
+  "original_configuration_provenance": {
+    "path": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-source-integration/data/verification/strategy-promotion-20261006/native-domain-implementation-15/green-96-original-material/complete-parent-preparation-facts.json",
+    "sha256": "db3b35d6e8ea592e97fc5871d4abb4c7c092aac28f4bf05c2e8b28473d6c6936"
+  },
+  "sealed_metadata_sources": [
+    {
+      "path": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-source-integration/data/verification/strategy-promotion-20261006/native-domain-implementation-15/parent3-read-112/n_shape-sealed-original.json",
+      "sha256": "3614001650721adfe567111747a1170b25951570e456402f7763c34d042efa33",
+      "bytes": 10339339
+    },
+    {
+      "path": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-source-integration/data/verification/strategy-promotion-20261006/native-domain-implementation-15/parent3-read-112/auction_gap-sealed-original.json",
+      "sha256": "caf8771017443e233340ef132f1b95f3627263a5de7d840e9b819f59ade7f22c",
+      "bytes": 10654502
+    },
+    {
+      "path": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-source-integration/data/verification/strategy-promotion-20261006/native-domain-implementation-15/parent3-read-112/growth_board_surge-sealed-original.json",
+      "sha256": "b76e59447847456394d1888b52cf42bdbd0374aaf00a1a7f68f420d699f269a0",
+      "bytes": 10794577
+    }
+  ],
+  "bindings": [
+    {
+      "configuration": {
+        "kind": "native_minute",
+        "selection": {
+          "target": {
+            "source_kind": "builtin",
+            "owner_id": "fixture-owner",
+            "strategy_id": "n_shape",
+            "name": "N 字形态",
+            "head": {
+              "version": 1,
+              "registration_fingerprint": "d859a5007029b5eb39558449757741032e4b1d6fae637353d676a00201cef1f7",
+              "record_hash": "7f125a04d2d3ad868f4c1fb76c6b8daf18c196b00fc4eca3e8508c9815015a26",
+              "spec_fingerprint": "109798b69da028d4e58b155161e31419443bcd77cbb3b44fc36d590bb977e9b0"
+            },
+            "parameter_fingerprint": "c2151f878e4382301a76205e68aa00cb5098b8440450158d990f43f389a315d3",
+            "cost_fingerprint": "36052fdd4d04c441b211ceaa709b207b496f537e30089ee833290f7ff8606425"
+          },
+          "source_key": "synthetic.native-minute:n_shape",
+          "source_version": 1,
+          "profile_hash": "53ce404bc4d6a3ad88cdacaea35d3b0be93aec75660547beabc1c84aa7838a28"
+        },
+        "start_date": "2026-01-05",
+        "end_date": "2026-04-30"
+      },
+      "registration": {
+        "schema_version": 5,
+        "schema_compatibility": {
+          "producer_schema_version": 5,
+          "min_consumer_schema_version": 5,
+          "max_consumer_schema_version": 5,
+          "legacy_schema_policy": "explicit_re_registration_required"
+        },
+        "kind": "strategy_spec",
+        "logical_id": "n_shape",
+        "version": 1,
+        "registered_at": "2026-10-07T00:00:00Z",
+        "available_at": "2026-10-07T00:00:00Z",
+        "fingerprint": "d859a5007029b5eb39558449757741032e4b1d6fae637353d676a00201cef1f7",
+        "parent_fingerprint": null,
+        "supersedes": null,
+        "replacement_reason": null,
+        "producer_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "feature_contract_fingerprint": "a052796a547d9f34432c67c13936ae61386587aae468cee71b06cc93d78654f4",
+        "feature_contract_version": 3,
+        "feature_contract_producer_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "spec": {
+          "strategy_id": "n_shape",
+          "version": 1,
+          "feature_contract_id": "intraday-pit",
+          "min_feature_contract_version": 3,
+          "required_features": [
+            {
+              "name": "candidate_price_basis",
+              "level": "required",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "latest_close",
+              "level": "required",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "limit_pct",
+              "level": "required",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "limit_up_price_session_raw",
+              "level": "required",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "price_over_vwap",
+              "level": "required",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "session_high",
+              "level": "required",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "session_low",
+              "level": "required",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "t_close_session_raw",
+              "level": "required",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "t_high_session_raw",
+              "level": "required",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            }
+          ],
+          "optional_features": [
+            {
+              "name": "amount_accel_10m",
+              "level": "optional",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "amount_accel_5m",
+              "level": "optional",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "eligible_high_price_raw",
+              "level": "optional",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "entry_fill_status",
+              "level": "optional",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "entry_price_raw",
+              "level": "optional",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "exit_execution_status",
+              "level": "optional",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "historical_sessions",
+              "level": "optional",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "holding_trading_sessions",
+              "level": "optional",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "position_closed",
+              "level": "optional",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "position_sellable",
+              "level": "optional",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "rel_cumulative",
+              "level": "optional",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "rel_same_minute",
+              "level": "optional",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "remaining_position_fraction",
+              "level": "optional",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "structure_stop_price_raw",
+              "level": "optional",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "tick_rule_buy_sell_ratio_proxy",
+              "level": "optional",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            }
+          ],
+          "initial_state": "idle",
+          "transitions": [
+            {
+              "from_state": "armed",
+              "event": "entry_filled",
+              "to_state": "holding"
+            },
+            {
+              "from_state": "armed",
+              "event": "entry_rejected",
+              "to_state": "terminal"
+            },
+            {
+              "from_state": "holding",
+              "event": "exit",
+              "to_state": "holding"
+            },
+            {
+              "from_state": "holding",
+              "event": "exit_filled",
+              "to_state": "terminal"
+            },
+            {
+              "from_state": "holding",
+              "event": "take_profit_partial",
+              "to_state": "holding"
+            },
+            {
+              "from_state": "idle",
+              "event": "entry_ready",
+              "to_state": "armed"
+            },
+            {
+              "from_state": "idle",
+              "event": "structure_supported",
+              "to_state": "watching"
+            },
+            {
+              "from_state": "watching",
+              "event": "entry_ready",
+              "to_state": "armed"
+            },
+            {
+              "from_state": "watching",
+              "event": "support_broken",
+              "to_state": "terminal"
+            }
+          ],
+          "parameters": {
+            "break_high_ratio": 1.0,
+            "carry_low_ratio": 1.0,
+            "expires_seconds": 120,
+            "min_price_over_vwap": 1.0,
+            "price_tolerance_ratio": 0.001
+          },
+          "allowed_actions": [
+            "b_intent",
+            "reduce",
+            "s_intent",
+            "watch"
+          ],
+          "run_mode": "shadow",
+          "producer_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "execution_binding": {
+          "candidate_schema_fingerprint": "0feab1a719beca1b0d7d00f227675e44366811861b6f75c8acff4517c7d50e5b",
+          "entry_event": "entry_filled",
+          "entry_evaluator_id": "rquant.strategy_evaluators:_n_shape_evaluator",
+          "entry_evaluator_version": "1.0.0",
+          "entry_evaluator_fingerprint": "8edec5309b2a5d99ec5e05c311693df3640f12f4dc3fe1505d5b2f47053aff7a",
+          "exit_evaluator_id": "rquant.strategy_evaluators:_position_exit_evaluator",
+          "exit_evaluator_version": "1.0.0",
+          "exit_evaluator_fingerprint": "5d8a09b249f082daecc0413b8e9800e7292788eb51e411d8d88b110fc2903034",
+          "runtime_evaluator_id": "rquant.strategy_evaluators:_n_shape_runtime_evaluator",
+          "runtime_evaluator_version": "1.0.0",
+          "runtime_evaluator_fingerprint": "bd9eacd74e56c9c8191e2e5ce039128b72703f97805d54a4c051e5970c435ce7",
+          "decision_formula_fingerprint": "07f2f8d3a77a748907a82ea0bd6ebc66fca61616d55e2ddc897f8680b33356aa",
+          "exit_rules": [
+            {
+              "event": "take_profit_partial",
+              "fill_event": null,
+              "action": "reduce",
+              "evaluator_id": "rquant.strategy_evaluators:_position_exit_evaluator",
+              "eligibility": {
+                "settlement_rule": "a_share_t_plus_one",
+                "minimum_holding_trading_sessions": 1,
+                "same_day_sell_allowed": false,
+                "sellable_position_required": true
+              },
+              "price_basis": {
+                "adjustment_basis": "raw",
+                "decision_price": "minute_close",
+                "execution_price": "next_minute_open"
+              },
+              "structure_stop": {
+                "reference": "signal_support",
+                "buffer_bps": 0
+              },
+              "percent_stop": {
+                "maximum_loss_bps": 300,
+                "acts_as_fallback": true
+              },
+              "trailing_take_profit": {
+                "activation_gain_bps": 800,
+                "retracement_bps": 300,
+                "high_watermark": "eligible_intraday_high"
+              },
+              "sell_tranche": {
+                "sequence": 1,
+                "position_fraction": 0.5,
+                "reevaluate_after_fill": true,
+                "terminal_after_fill": false
+              }
+            },
+            {
+              "event": "exit",
+              "fill_event": "exit_filled",
+              "action": "s_intent",
+              "evaluator_id": "rquant.strategy_evaluators:_position_exit_evaluator",
+              "eligibility": {
+                "settlement_rule": "a_share_t_plus_one",
+                "minimum_holding_trading_sessions": 1,
+                "same_day_sell_allowed": false,
+                "sellable_position_required": true
+              },
+              "price_basis": {
+                "adjustment_basis": "raw",
+                "decision_price": "minute_close",
+                "execution_price": "next_minute_open"
+              },
+              "structure_stop": {
+                "reference": "signal_support",
+                "buffer_bps": 0
+              },
+              "percent_stop": {
+                "maximum_loss_bps": 300,
+                "acts_as_fallback": true
+              },
+              "trailing_take_profit": {
+                "activation_gain_bps": 800,
+                "retracement_bps": 300,
+                "high_watermark": "eligible_intraday_high"
+              },
+              "sell_tranche": {
+                "sequence": 2,
+                "position_fraction": 1.0,
+                "reevaluate_after_fill": false,
+                "terminal_after_fill": true
+              }
+            }
+          ]
+        },
+        "candidate_schema_fingerprint": "0feab1a719beca1b0d7d00f227675e44366811861b6f75c8acff4517c7d50e5b",
+        "executable_fingerprint": "50669be02e43c663cdb9949aa626670292b81530da597aea5311bf5c6b88a7bf",
+        "record_hash": "7f125a04d2d3ad868f4c1fb76c6b8daf18c196b00fc4eca3e8508c9815015a26"
+      },
+      "spec": {
+        "experiment_id": "93d412bee6d3b3a243ef37881b283f3923b33d2cd7ce69cb973ba0044e305777",
+        "strategy_spec_fingerprint": "ab456cf9fb0c67b54ca958529529db88670c35e4c818a2c4046b88ac9e73ec74",
+        "strategy_executable_fingerprint": "d0678597aa7c98ed56681ef341c04dabed878ffc545127d6b9ad66d4f4bbb798",
+        "candidate_schema_fingerprint": "e48fda7dd9bc9915c8d519cc225b00a21d2d0448dc23286d4a6ec5fdb963dda1",
+        "dataset_snapshot_id": "ffa6abed69fbc0740953f716e00ffd85b0272d678a5d5feb2013af3b380e56d5",
+        "code_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "parameter_fingerprint": "7908d66cf68ef0d7a907a62a35dea9003dcf828c27818985f848e501c909d04d",
+        "hypothesis_family": "experiment-search:729049a746ae09afdcc734d7e98f0d14f3a2a9193e8170b0e4266bebf955f5a9",
+        "metric_definition_fingerprint": "00ba664b1c21b5621ed95d0fc07b40cafee9d536cfd8fb38b865772278aa0a76",
+        "train_range": {
+          "start_date": "2026-01-05",
+          "end_date": "2026-02-27"
+        },
+        "validation_range": {
+          "start_date": "2026-03-02",
+          "end_date": "2026-04-30"
+        },
+        "frozen_outer_test_range": {
+          "start_date": "2026-05-04",
+          "end_date": "2026-05-29"
+        },
+        "cost_model_fingerprint": "36052fdd4d04c441b211ceaa709b207b496f537e30089ee833290f7ff8606425",
+        "execution_model_fingerprint": "eabf94386bbdbd5845fc8c8c4bf6e0d3e968622b7395a344ee4102bb2a5f27f6",
+        "seed": 0
+      },
+      "job_id": "be75c2f4-ac29-54fa-b021-d425a0b1a779",
+      "spec_hash": "dc011d7eb16740b5bc8f43759597c06d5427cabf0a9898702de23577849be787",
+      "manifest_hash": "f81408985be409516fe55980d072ce162d929897712c0cf42fb1bde3267543b8",
+      "result_hash": "4fac0e44b1a51a6e334d50bd9e9c15b94bf9f75fac307c2eec9c41a4e0ddae17",
+      "completed_at": "2026-10-07T00:00:02Z",
+      "execution_costs": {
+        "schema_version": 3,
+        "cost_engine_version": "test-paper-cost-engine-v3",
+        "instrument_selectors": [
+          {
+            "selector_id": "cn-sse-a-share",
+            "market": "CN",
+            "exchange": "SSE",
+            "instrument_class": "EQUITY",
+            "security_class": "A_SHARE"
+          },
+          {
+            "selector_id": "cn-szse-a-share",
+            "market": "CN",
+            "exchange": "SZSE",
+            "instrument_class": "EQUITY",
+            "security_class": "A_SHARE"
+          }
+        ],
+        "commission_rules": [
+          {
+            "rule_id": "commission-cn-sse-a-share",
+            "selector_id": "cn-sse-a-share",
+            "rate_bps": "3",
+            "minimum_amount": "5",
+            "applies_to": "BOTH"
+          },
+          {
+            "rule_id": "commission-cn-szse-a-share",
+            "selector_id": "cn-szse-a-share",
+            "rate_bps": "3",
+            "minimum_amount": "5",
+            "applies_to": "BOTH"
+          }
+        ],
+        "transfer_fee_rules": [
+          {
+            "rule_id": "transfer-cn-sse-a-share",
+            "selector_id": "cn-sse-a-share",
+            "rate_bps": "0.1",
+            "minimum_amount": "0",
+            "applies_to": "BOTH"
+          },
+          {
+            "rule_id": "transfer-cn-szse-a-share",
+            "selector_id": "cn-szse-a-share",
+            "rate_bps": "0.1",
+            "minimum_amount": "0",
+            "applies_to": "BOTH"
+          }
+        ],
+        "stamp_duty_rules": [
+          {
+            "rule_id": "stamp-cn-sse-a-share",
+            "selector_id": "cn-sse-a-share",
+            "rate_bps": "10",
+            "minimum_amount": "0",
+            "applies_to": "SELL"
+          },
+          {
+            "rule_id": "stamp-cn-szse-a-share",
+            "selector_id": "cn-szse-a-share",
+            "rate_bps": "10",
+            "minimum_amount": "0",
+            "applies_to": "SELL"
+          }
+        ],
+        "fee_notional_basis": "EXECUTED_NOTIONAL",
+        "assessment_unit": "FILL",
+        "slippage": {
+          "owner": "shared_cost_engine",
+          "buy_bps": "2",
+          "sell_bps": "2",
+          "price_tick": "0.0001",
+          "price_rounding": "HALF_UP"
+        },
+        "money": {
+          "quantum": "0.01",
+          "rounding": "HALF_UP"
+        },
+        "cost_spec_id": "0051a4640a6350b06f50196e1846981a2c60e77dbd6747516ba784df602d7ce0",
+        "research_notional_per_trade": null
+      }
+    },
+    {
+      "configuration": {
+        "kind": "native_minute",
+        "selection": {
+          "target": {
+            "source_kind": "builtin",
+            "owner_id": "fixture-owner",
+            "strategy_id": "auction_gap",
+            "name": "集合竞价跳空",
+            "head": {
+              "version": 1,
+              "registration_fingerprint": "2bf67e4244668bb8ff0e75fae9311b88bbde79f43cde66125ef22b0db6df0718",
+              "record_hash": "18c276325eb215c0606b8094dceb4f501281e3614ba672d7e184149ec0b5e59f",
+              "spec_fingerprint": "d2bbca3813bb974991f14800e5b986f817fdc6faeadd2a253374ed66ce293b8f"
+            },
+            "parameter_fingerprint": "2f8688ba760cdcffc2031eefc1638833207a68417d2748f5579a512979262083",
+            "cost_fingerprint": "36052fdd4d04c441b211ceaa709b207b496f537e30089ee833290f7ff8606425"
+          },
+          "source_key": "synthetic.native-minute:auction_gap",
+          "source_version": 1,
+          "profile_hash": "53ce404bc4d6a3ad88cdacaea35d3b0be93aec75660547beabc1c84aa7838a28"
+        },
+        "start_date": "2026-01-05",
+        "end_date": "2026-04-30"
+      },
+      "registration": {
+        "schema_version": 5,
+        "schema_compatibility": {
+          "producer_schema_version": 5,
+          "min_consumer_schema_version": 5,
+          "max_consumer_schema_version": 5,
+          "legacy_schema_policy": "explicit_re_registration_required"
+        },
+        "kind": "strategy_spec",
+        "logical_id": "auction_gap",
+        "version": 1,
+        "registered_at": "2026-10-07T00:00:00Z",
+        "available_at": "2026-10-07T00:00:00Z",
+        "fingerprint": "2bf67e4244668bb8ff0e75fae9311b88bbde79f43cde66125ef22b0db6df0718",
+        "parent_fingerprint": null,
+        "supersedes": null,
+        "replacement_reason": null,
+        "producer_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "feature_contract_fingerprint": "a052796a547d9f34432c67c13936ae61386587aae468cee71b06cc93d78654f4",
+        "feature_contract_version": 3,
+        "feature_contract_producer_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "spec": {
+          "strategy_id": "auction_gap",
+          "version": 1,
+          "feature_contract_id": "intraday-pit",
+          "min_feature_contract_version": 3,
+          "required_features": [
+            {
+              "name": "auction_price_raw",
+              "level": "required",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "auction_vol_ratio_5d",
+              "level": "required",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "candidate_price_basis",
+              "level": "required",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "gap_pct_close",
+              "level": "required",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "latest_close",
+              "level": "required",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "limit_up_price_session_raw",
+              "level": "required",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "price_over_vwap",
+              "level": "required",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "session_high",
+              "level": "required",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "session_low",
+              "level": "required",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            }
+          ],
+          "optional_features": [
+            {
+              "name": "amount_accel_10m",
+              "level": "optional",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "amount_accel_5m",
+              "level": "optional",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "eligible_high_price_raw",
+              "level": "optional",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "entry_fill_status",
+              "level": "optional",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "entry_price_raw",
+              "level": "optional",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "exit_execution_status",
+              "level": "optional",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "holding_trading_sessions",
+              "level": "optional",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "position_closed",
+              "level": "optional",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "position_sellable",
+              "level": "optional",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "rel_cumulative",
+              "level": "optional",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "rel_same_minute",
+              "level": "optional",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "remaining_position_fraction",
+              "level": "optional",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "structure_stop_price_raw",
+              "level": "optional",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "tick_rule_buy_sell_ratio_proxy",
+              "level": "optional",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            }
+          ],
+          "initial_state": "idle",
+          "transitions": [
+            {
+              "from_state": "armed",
+              "event": "entry_filled",
+              "to_state": "holding"
+            },
+            {
+              "from_state": "armed",
+              "event": "entry_rejected",
+              "to_state": "terminal"
+            },
+            {
+              "from_state": "holding",
+              "event": "exit",
+              "to_state": "holding"
+            },
+            {
+              "from_state": "holding",
+              "event": "exit_filled",
+              "to_state": "terminal"
+            },
+            {
+              "from_state": "holding",
+              "event": "take_profit_partial",
+              "to_state": "holding"
+            },
+            {
+              "from_state": "idle",
+              "event": "observer_match",
+              "to_state": "watching"
+            },
+            {
+              "from_state": "watching",
+              "event": "entry_ready",
+              "to_state": "armed"
+            }
+          ],
+          "parameters": {
+            "auction_ratio_max": 5.0,
+            "auction_ratio_min": 0.15,
+            "expires_seconds": 120,
+            "min_gap_pct": 0.0,
+            "min_hold_auction_price_ratio": 1.0,
+            "min_price_over_vwap": 1.0
+          },
+          "allowed_actions": [
+            "b_intent",
+            "reduce",
+            "s_intent",
+            "watch"
+          ],
+          "run_mode": "shadow",
+          "producer_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "execution_binding": {
+          "candidate_schema_fingerprint": "59b8a63fb538fc21d3aa0ea2afc4ef46b0b0a9f215677b6d98fd505bfd305539",
+          "entry_event": "entry_filled",
+          "entry_evaluator_id": "rquant.strategy_evaluators:_auction_gap_evaluator",
+          "entry_evaluator_version": "1.0.0",
+          "entry_evaluator_fingerprint": "e816ef7f9e4f06f1c88414901fc5d3be886ca04a298ef08c2cbe7249942091d8",
+          "exit_evaluator_id": "rquant.strategy_evaluators:_position_exit_evaluator",
+          "exit_evaluator_version": "1.0.0",
+          "exit_evaluator_fingerprint": "5d8a09b249f082daecc0413b8e9800e7292788eb51e411d8d88b110fc2903034",
+          "runtime_evaluator_id": "rquant.strategy_evaluators:_auction_gap_runtime_evaluator",
+          "runtime_evaluator_version": "1.0.0",
+          "runtime_evaluator_fingerprint": "c0e418331e45a8344b13da7e6a7784c22d28d04656a263191998fc12ea971e1f",
+          "decision_formula_fingerprint": "6d89376c1cffb22908c63eae143606af991145865f20ec08c90772d040be15f0",
+          "exit_rules": [
+            {
+              "event": "take_profit_partial",
+              "fill_event": null,
+              "action": "reduce",
+              "evaluator_id": "rquant.strategy_evaluators:_position_exit_evaluator",
+              "eligibility": {
+                "settlement_rule": "a_share_t_plus_one",
+                "minimum_holding_trading_sessions": 1,
+                "same_day_sell_allowed": false,
+                "sellable_position_required": true
+              },
+              "price_basis": {
+                "adjustment_basis": "raw",
+                "decision_price": "minute_close",
+                "execution_price": "next_minute_open"
+              },
+              "structure_stop": {
+                "reference": "signal_support",
+                "buffer_bps": 0
+              },
+              "percent_stop": {
+                "maximum_loss_bps": 300,
+                "acts_as_fallback": true
+              },
+              "trailing_take_profit": {
+                "activation_gain_bps": 800,
+                "retracement_bps": 300,
+                "high_watermark": "eligible_intraday_high"
+              },
+              "sell_tranche": {
+                "sequence": 1,
+                "position_fraction": 0.5,
+                "reevaluate_after_fill": true,
+                "terminal_after_fill": false
+              }
+            },
+            {
+              "event": "exit",
+              "fill_event": "exit_filled",
+              "action": "s_intent",
+              "evaluator_id": "rquant.strategy_evaluators:_position_exit_evaluator",
+              "eligibility": {
+                "settlement_rule": "a_share_t_plus_one",
+                "minimum_holding_trading_sessions": 1,
+                "same_day_sell_allowed": false,
+                "sellable_position_required": true
+              },
+              "price_basis": {
+                "adjustment_basis": "raw",
+                "decision_price": "minute_close",
+                "execution_price": "next_minute_open"
+              },
+              "structure_stop": {
+                "reference": "signal_support",
+                "buffer_bps": 0
+              },
+              "percent_stop": {
+                "maximum_loss_bps": 300,
+                "acts_as_fallback": true
+              },
+              "trailing_take_profit": {
+                "activation_gain_bps": 800,
+                "retracement_bps": 300,
+                "high_watermark": "eligible_intraday_high"
+              },
+              "sell_tranche": {
+                "sequence": 2,
+                "position_fraction": 1.0,
+                "reevaluate_after_fill": false,
+                "terminal_after_fill": true
+              }
+            }
+          ]
+        },
+        "candidate_schema_fingerprint": "59b8a63fb538fc21d3aa0ea2afc4ef46b0b0a9f215677b6d98fd505bfd305539",
+        "executable_fingerprint": "ef8f5d02718e7aba7462f3b2f4915177111cf314fc9a0bf228ee1ca5b42d749e",
+        "record_hash": "18c276325eb215c0606b8094dceb4f501281e3614ba672d7e184149ec0b5e59f"
+      },
+      "spec": {
+        "experiment_id": "cdfe9960457789edf26d109e2b17cf109dcf9dd0096b5b566004b62da82dfee1",
+        "strategy_spec_fingerprint": "ab456cf9fb0c67b54ca958529529db88670c35e4c818a2c4046b88ac9e73ec74",
+        "strategy_executable_fingerprint": "d0678597aa7c98ed56681ef341c04dabed878ffc545127d6b9ad66d4f4bbb798",
+        "candidate_schema_fingerprint": "e48fda7dd9bc9915c8d519cc225b00a21d2d0448dc23286d4a6ec5fdb963dda1",
+        "dataset_snapshot_id": "683783fdfd358fa6a2fb66478839459bf325b6ebe9d0f9afb8bb527de751387d",
+        "code_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "parameter_fingerprint": "952e288c7217d9ca77d719a8b0cadfcebfb2865cc193573561c6e1acd68b89a2",
+        "hypothesis_family": "experiment-search:729049a746ae09afdcc734d7e98f0d14f3a2a9193e8170b0e4266bebf955f5a9",
+        "metric_definition_fingerprint": "00ba664b1c21b5621ed95d0fc07b40cafee9d536cfd8fb38b865772278aa0a76",
+        "train_range": {
+          "start_date": "2026-01-05",
+          "end_date": "2026-02-27"
+        },
+        "validation_range": {
+          "start_date": "2026-03-02",
+          "end_date": "2026-04-30"
+        },
+        "frozen_outer_test_range": {
+          "start_date": "2026-05-04",
+          "end_date": "2026-05-29"
+        },
+        "cost_model_fingerprint": "36052fdd4d04c441b211ceaa709b207b496f537e30089ee833290f7ff8606425",
+        "execution_model_fingerprint": "eabf94386bbdbd5845fc8c8c4bf6e0d3e968622b7395a344ee4102bb2a5f27f6",
+        "seed": 0
+      },
+      "job_id": "73b731ff-0088-53e2-bf0c-16bab697ae8d",
+      "spec_hash": "fd2c1fe4d79a90f04eb4fed8d659a7398a51a15b4a97a4c959c3b125cb14089a",
+      "manifest_hash": "7a847f6d812f3f31d377419e6545206c8b9ab728e40003ae90636a42815dd55b",
+      "result_hash": "0f43845624e529044058422b9824a4e60d14effda5ec6dc21126566bd96e24b2",
+      "completed_at": "2026-10-07T00:00:02Z",
+      "execution_costs": {
+        "schema_version": 3,
+        "cost_engine_version": "test-paper-cost-engine-v3",
+        "instrument_selectors": [
+          {
+            "selector_id": "cn-sse-a-share",
+            "market": "CN",
+            "exchange": "SSE",
+            "instrument_class": "EQUITY",
+            "security_class": "A_SHARE"
+          },
+          {
+            "selector_id": "cn-szse-a-share",
+            "market": "CN",
+            "exchange": "SZSE",
+            "instrument_class": "EQUITY",
+            "security_class": "A_SHARE"
+          }
+        ],
+        "commission_rules": [
+          {
+            "rule_id": "commission-cn-sse-a-share",
+            "selector_id": "cn-sse-a-share",
+            "rate_bps": "3",
+            "minimum_amount": "5",
+            "applies_to": "BOTH"
+          },
+          {
+            "rule_id": "commission-cn-szse-a-share",
+            "selector_id": "cn-szse-a-share",
+            "rate_bps": "3",
+            "minimum_amount": "5",
+            "applies_to": "BOTH"
+          }
+        ],
+        "transfer_fee_rules": [
+          {
+            "rule_id": "transfer-cn-sse-a-share",
+            "selector_id": "cn-sse-a-share",
+            "rate_bps": "0.1",
+            "minimum_amount": "0",
+            "applies_to": "BOTH"
+          },
+          {
+            "rule_id": "transfer-cn-szse-a-share",
+            "selector_id": "cn-szse-a-share",
+            "rate_bps": "0.1",
+            "minimum_amount": "0",
+            "applies_to": "BOTH"
+          }
+        ],
+        "stamp_duty_rules": [
+          {
+            "rule_id": "stamp-cn-sse-a-share",
+            "selector_id": "cn-sse-a-share",
+            "rate_bps": "10",
+            "minimum_amount": "0",
+            "applies_to": "SELL"
+          },
+          {
+            "rule_id": "stamp-cn-szse-a-share",
+            "selector_id": "cn-szse-a-share",
+            "rate_bps": "10",
+            "minimum_amount": "0",
+            "applies_to": "SELL"
+          }
+        ],
+        "fee_notional_basis": "EXECUTED_NOTIONAL",
+        "assessment_unit": "FILL",
+        "slippage": {
+          "owner": "shared_cost_engine",
+          "buy_bps": "2",
+          "sell_bps": "2",
+          "price_tick": "0.0001",
+          "price_rounding": "HALF_UP"
+        },
+        "money": {
+          "quantum": "0.01",
+          "rounding": "HALF_UP"
+        },
+        "cost_spec_id": "0051a4640a6350b06f50196e1846981a2c60e77dbd6747516ba784df602d7ce0",
+        "research_notional_per_trade": null
+      }
+    },
+    {
+      "configuration": {
+        "kind": "native_minute",
+        "selection": {
+          "target": {
+            "source_kind": "builtin",
+            "owner_id": "fixture-owner",
+            "strategy_id": "growth_board_surge",
+            "name": "科创及创业板放量",
+            "head": {
+              "version": 1,
+              "registration_fingerprint": "fde9e76d03f37aa38fa467627f512565131c06d4bfed6c8e3be33331aebe3671",
+              "record_hash": "4b8f3cb39d700c5b12f98b1ef9eb8ea8f8744a2bf66b0241fa7408393c0041df",
+              "spec_fingerprint": "9d25ee7d3ca3f6a68484cc45b94c9a8c7d03221d86f35bbd63f168c0f501e086"
+            },
+            "parameter_fingerprint": "5836203dc40825e9378e2f37ac9f2509a15bc2970b86f9e5439fb37bf0390a4d",
+            "cost_fingerprint": "36052fdd4d04c441b211ceaa709b207b496f537e30089ee833290f7ff8606425"
+          },
+          "source_key": "synthetic.native-minute:growth_board_surge",
+          "source_version": 1,
+          "profile_hash": "53ce404bc4d6a3ad88cdacaea35d3b0be93aec75660547beabc1c84aa7838a28"
+        },
+        "start_date": "2026-01-05",
+        "end_date": "2026-04-30"
+      },
+      "registration": {
+        "schema_version": 5,
+        "schema_compatibility": {
+          "producer_schema_version": 5,
+          "min_consumer_schema_version": 5,
+          "max_consumer_schema_version": 5,
+          "legacy_schema_policy": "explicit_re_registration_required"
+        },
+        "kind": "strategy_spec",
+        "logical_id": "growth_board_surge",
+        "version": 1,
+        "registered_at": "2026-10-07T00:00:00Z",
+        "available_at": "2026-10-07T00:00:00Z",
+        "fingerprint": "fde9e76d03f37aa38fa467627f512565131c06d4bfed6c8e3be33331aebe3671",
+        "parent_fingerprint": null,
+        "supersedes": null,
+        "replacement_reason": null,
+        "producer_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "feature_contract_fingerprint": "a052796a547d9f34432c67c13936ae61386587aae468cee71b06cc93d78654f4",
+        "feature_contract_version": 3,
+        "feature_contract_producer_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "spec": {
+          "strategy_id": "growth_board_surge",
+          "version": 1,
+          "feature_contract_id": "intraday-pit",
+          "min_feature_contract_version": 3,
+          "required_features": [
+            {
+              "name": "board_type",
+              "level": "required",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "candidate_price_basis",
+              "level": "required",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "historical_sessions",
+              "level": "required",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "large_net_vol_t1",
+              "level": "required",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "latest_close",
+              "level": "required",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "limit_up_price_session_raw",
+              "level": "required",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "ma_alignment",
+              "level": "required",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "opening_bar_high",
+              "level": "required",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "opening_bar_low",
+              "level": "required",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "price_over_vwap",
+              "level": "required",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "rel_cumulative",
+              "level": "required",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "session_pre_close_raw",
+              "level": "required",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            }
+          ],
+          "optional_features": [
+            {
+              "name": "amount_accel_10m",
+              "level": "optional",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "amount_accel_5m",
+              "level": "optional",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "cumulative_volume",
+              "level": "optional",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "eligible_high_price_raw",
+              "level": "optional",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "entry_fill_status",
+              "level": "optional",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "entry_price_raw",
+              "level": "optional",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "exit_execution_status",
+              "level": "optional",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "holding_trading_sessions",
+              "level": "optional",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "minute_volume",
+              "level": "optional",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "position_closed",
+              "level": "optional",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "position_sellable",
+              "level": "optional",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "rel_same_minute",
+              "level": "optional",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "remaining_position_fraction",
+              "level": "optional",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "structure_stop_price_raw",
+              "level": "optional",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            },
+            {
+              "name": "tick_rule_buy_sell_ratio_proxy",
+              "level": "optional",
+              "min_contract_version": 3,
+              "allow_degraded": false
+            }
+          ],
+          "initial_state": "idle",
+          "transitions": [
+            {
+              "from_state": "armed",
+              "event": "entry_filled",
+              "to_state": "holding"
+            },
+            {
+              "from_state": "armed",
+              "event": "entry_rejected",
+              "to_state": "terminal"
+            },
+            {
+              "from_state": "holding",
+              "event": "exit",
+              "to_state": "holding"
+            },
+            {
+              "from_state": "holding",
+              "event": "exit_filled",
+              "to_state": "terminal"
+            },
+            {
+              "from_state": "holding",
+              "event": "take_profit_partial",
+              "to_state": "holding"
+            },
+            {
+              "from_state": "idle",
+              "event": "entry_ready",
+              "to_state": "armed"
+            },
+            {
+              "from_state": "idle",
+              "event": "volume_building",
+              "to_state": "watching"
+            },
+            {
+              "from_state": "watching",
+              "event": "entry_ready",
+              "to_state": "armed"
+            }
+          ],
+          "parameters": {
+            "allowed_boards": [
+              "gem",
+              "star"
+            ],
+            "expires_seconds": 120,
+            "min_amount_accel_5m": 2.0,
+            "min_historical_sessions": 5,
+            "min_price_over_vwap": 1.0,
+            "min_rel_cumulative": 1.4,
+            "min_rel_same_minute": 2.0,
+            "price_tolerance_ratio": 0.001
+          },
+          "allowed_actions": [
+            "b_intent",
+            "reduce",
+            "s_intent",
+            "watch"
+          ],
+          "run_mode": "shadow",
+          "producer_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "execution_binding": {
+          "candidate_schema_fingerprint": "7bc4d9e448f9cd66cb326acbb73b37ce75d9cef750dd16227f6e0ac80f069aca",
+          "entry_event": "entry_filled",
+          "entry_evaluator_id": "rquant.strategy_evaluators:_growth_board_surge_evaluator",
+          "entry_evaluator_version": "1.0.0",
+          "entry_evaluator_fingerprint": "714658ae413f88e3c409dd3175a828d305920beb37b6bf0861a2af15290f95a3",
+          "exit_evaluator_id": "rquant.strategy_evaluators:_position_exit_evaluator",
+          "exit_evaluator_version": "1.0.0",
+          "exit_evaluator_fingerprint": "5d8a09b249f082daecc0413b8e9800e7292788eb51e411d8d88b110fc2903034",
+          "runtime_evaluator_id": "rquant.strategy_evaluators:_growth_board_surge_runtime_evaluator",
+          "runtime_evaluator_version": "1.0.0",
+          "runtime_evaluator_fingerprint": "110f68b4c22cd910f55900b1017db2296e1560dc17e47d8334d082fbc9590b8c",
+          "decision_formula_fingerprint": "789872bbf259fc8ee80f22e93e0de3f0cbc04b16c18c7ffd899f837824675a7a",
+          "exit_rules": [
+            {
+              "event": "take_profit_partial",
+              "fill_event": null,
+              "action": "reduce",
+              "evaluator_id": "rquant.strategy_evaluators:_position_exit_evaluator",
+              "eligibility": {
+                "settlement_rule": "a_share_t_plus_one",
+                "minimum_holding_trading_sessions": 1,
+                "same_day_sell_allowed": false,
+                "sellable_position_required": true
+              },
+              "price_basis": {
+                "adjustment_basis": "raw",
+                "decision_price": "minute_close",
+                "execution_price": "next_minute_open"
+              },
+              "structure_stop": {
+                "reference": "signal_support",
+                "buffer_bps": 0
+              },
+              "percent_stop": {
+                "maximum_loss_bps": 300,
+                "acts_as_fallback": true
+              },
+              "trailing_take_profit": {
+                "activation_gain_bps": 800,
+                "retracement_bps": 300,
+                "high_watermark": "eligible_intraday_high"
+              },
+              "sell_tranche": {
+                "sequence": 1,
+                "position_fraction": 0.5,
+                "reevaluate_after_fill": true,
+                "terminal_after_fill": false
+              }
+            },
+            {
+              "event": "exit",
+              "fill_event": "exit_filled",
+              "action": "s_intent",
+              "evaluator_id": "rquant.strategy_evaluators:_position_exit_evaluator",
+              "eligibility": {
+                "settlement_rule": "a_share_t_plus_one",
+                "minimum_holding_trading_sessions": 1,
+                "same_day_sell_allowed": false,
+                "sellable_position_required": true
+              },
+              "price_basis": {
+                "adjustment_basis": "raw",
+                "decision_price": "minute_close",
+                "execution_price": "next_minute_open"
+              },
+              "structure_stop": {
+                "reference": "signal_support",
+                "buffer_bps": 0
+              },
+              "percent_stop": {
+                "maximum_loss_bps": 300,
+                "acts_as_fallback": true
+              },
+              "trailing_take_profit": {
+                "activation_gain_bps": 800,
+                "retracement_bps": 300,
+                "high_watermark": "eligible_intraday_high"
+              },
+              "sell_tranche": {
+                "sequence": 2,
+                "position_fraction": 1.0,
+                "reevaluate_after_fill": false,
+                "terminal_after_fill": true
+              }
+            }
+          ]
+        },
+        "candidate_schema_fingerprint": "7bc4d9e448f9cd66cb326acbb73b37ce75d9cef750dd16227f6e0ac80f069aca",
+        "executable_fingerprint": "7fc00ccaf9eb0a8e9947490939ce3439c1588341fcc69528527a240a1b97edeb",
+        "record_hash": "4b8f3cb39d700c5b12f98b1ef9eb8ea8f8744a2bf66b0241fa7408393c0041df"
+      },
+      "spec": {
+        "experiment_id": "a692f45c21c5f3e0b42c6008c9eb20df8e225afa07e1a154abe64d2936135f38",
+        "strategy_spec_fingerprint": "ab456cf9fb0c67b54ca958529529db88670c35e4c818a2c4046b88ac9e73ec74",
+        "strategy_executable_fingerprint": "d0678597aa7c98ed56681ef341c04dabed878ffc545127d6b9ad66d4f4bbb798",
+        "candidate_schema_fingerprint": "e48fda7dd9bc9915c8d519cc225b00a21d2d0448dc23286d4a6ec5fdb963dda1",
+        "dataset_snapshot_id": "86c4b07f9a3af17010233c6b415dbab0d210789deafe0faa4c9c206f6f6e031f",
+        "code_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "parameter_fingerprint": "3f4cf755ef0631ec94dc41f4031b33f7765400429f63aaed014db07d75003d4a",
+        "hypothesis_family": "experiment-search:729049a746ae09afdcc734d7e98f0d14f3a2a9193e8170b0e4266bebf955f5a9",
+        "metric_definition_fingerprint": "00ba664b1c21b5621ed95d0fc07b40cafee9d536cfd8fb38b865772278aa0a76",
+        "train_range": {
+          "start_date": "2026-01-05",
+          "end_date": "2026-02-27"
+        },
+        "validation_range": {
+          "start_date": "2026-03-02",
+          "end_date": "2026-04-30"
+        },
+        "frozen_outer_test_range": {
+          "start_date": "2026-05-04",
+          "end_date": "2026-05-29"
+        },
+        "cost_model_fingerprint": "36052fdd4d04c441b211ceaa709b207b496f537e30089ee833290f7ff8606425",
+        "execution_model_fingerprint": "eabf94386bbdbd5845fc8c8c4bf6e0d3e968622b7395a344ee4102bb2a5f27f6",
+        "seed": 0
+      },
+      "job_id": "4da8214c-f3fa-593f-bd80-839f684a6c6a",
+      "spec_hash": "ebb27c2550e3366b24a4e0bc2c54bde6ec7c9671e1c6cb8fd374aa2525ef2257",
+      "manifest_hash": "e1daaee47f70d4091c5fb7f1571985245877cc0d641a89af4cba6ea7705b0e6f",
+      "result_hash": "9f572ab30769e513bc5e0c35090329f985bc04907eec8b6cfd35c62404827388",
+      "completed_at": "2026-10-07T00:00:02Z",
+      "execution_costs": {
+        "schema_version": 3,
+        "cost_engine_version": "test-paper-cost-engine-v3",
+        "instrument_selectors": [
+          {
+            "selector_id": "cn-sse-a-share",
+            "market": "CN",
+            "exchange": "SSE",
+            "instrument_class": "EQUITY",
+            "security_class": "A_SHARE"
+          },
+          {
+            "selector_id": "cn-szse-a-share",
+            "market": "CN",
+            "exchange": "SZSE",
+            "instrument_class": "EQUITY",
+            "security_class": "A_SHARE"
+          }
+        ],
+        "commission_rules": [
+          {
+            "rule_id": "commission-cn-sse-a-share",
+            "selector_id": "cn-sse-a-share",
+            "rate_bps": "3",
+            "minimum_amount": "5",
+            "applies_to": "BOTH"
+          },
+          {
+            "rule_id": "commission-cn-szse-a-share",
+            "selector_id": "cn-szse-a-share",
+            "rate_bps": "3",
+            "minimum_amount": "5",
+            "applies_to": "BOTH"
+          }
+        ],
+        "transfer_fee_rules": [
+          {
+            "rule_id": "transfer-cn-sse-a-share",
+            "selector_id": "cn-sse-a-share",
+            "rate_bps": "0.1",
+            "minimum_amount": "0",
+            "applies_to": "BOTH"
+          },
+          {
+            "rule_id": "transfer-cn-szse-a-share",
+            "selector_id": "cn-szse-a-share",
+            "rate_bps": "0.1",
+            "minimum_amount": "0",
+            "applies_to": "BOTH"
+          }
+        ],
+        "stamp_duty_rules": [
+          {
+            "rule_id": "stamp-cn-sse-a-share",
+            "selector_id": "cn-sse-a-share",
+            "rate_bps": "10",
+            "minimum_amount": "0",
+            "applies_to": "SELL"
+          },
+          {
+            "rule_id": "stamp-cn-szse-a-share",
+            "selector_id": "cn-szse-a-share",
+            "rate_bps": "10",
+            "minimum_amount": "0",
+            "applies_to": "SELL"
+          }
+        ],
+        "fee_notional_basis": "EXECUTED_NOTIONAL",
+        "assessment_unit": "FILL",
+        "slippage": {
+          "owner": "shared_cost_engine",
+          "buy_bps": "2",
+          "sell_bps": "2",
+          "price_tick": "0.0001",
+          "price_rounding": "HALF_UP"
+        },
+        "money": {
+          "quantum": "0.01",
+          "rounding": "HALF_UP"
+        },
+        "cost_spec_id": "0051a4640a6350b06f50196e1846981a2c60e77dbd6747516ba784df602d7ce0",
+        "research_notional_per_trade": null
+      }
+    }
+  ]
+}

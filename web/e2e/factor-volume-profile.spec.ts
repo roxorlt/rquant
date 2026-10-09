@@ -65,6 +65,7 @@ for (const viewport of [
         route.fulfill({
           json: {
             data: {
+              can_report: false,
               availability: "ready",
               available_at: metadata.serving.built_at,
               result,

@@ -34,10 +34,12 @@ async function useSyntheticApi(
   const monitor = monitorEnvelope({
     unacknowledged: summary,
     items: [
-      ...original.data.items.map((item, index) => ({
-        ...item,
-        acknowledgment: acknowledgments[index],
-      })),
+      ...original.data.items.map((item, index) => {
+        const acknowledgment = acknowledgments[index];
+        if (!acknowledgment)
+          throw new Error("Original fixture event has no expected acknowledgment state");
+        return { ...item, acknowledgment };
+      }),
       {
         kind: "notification",
         event_key: "notification:old",

@@ -175,6 +175,7 @@ for (const viewport of [
         return route.fulfill({
           json: {
             data: {
+              can_report: false,
               availability: "ready",
               available_at: metadata.serving.built_at,
               result: old ? older : latest,

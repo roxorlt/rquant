@@ -1,0 +1,136 @@
+import type { Schemas } from "@/api/client";
+
+// Synthetic UI facts from the frozen owners/schema; no installed source or worker claim.
+export const nShapeParameters = {
+  amount_surge_lookback: 5,
+  amount_surge_min_prior_minutes: 2,
+  amount_surge_ratio: 2.0,
+  break_high_ratio: 1.0,
+  carry_close_ratio: 1.0,
+  carry_low_ratio: 1.0,
+  entry_mode: "first_break",
+  factor_score_threshold: 35.0,
+  family: "n_shape",
+  freq: "1min",
+  late_confirm_at: "10:30:00",
+  max_hold_days: 5,
+  preset_name: "n-shape-pool1",
+  price_discontinuity_pct: 0.01,
+  retest_tolerance_pct: 0.005,
+  vwap_buffer_pct: 0.0,
+  paper: {
+    candidate_id: "baseline",
+    entry_buffer_pct: 0.005,
+    entry_slippage_pct: 0.0,
+    stop_loss_pct: 0.03,
+    take_profit_pct: 0.05,
+    trailing_stop_pct: 0.025,
+  },
+  volume_profile: {
+    bin_ratio: null,
+    enabled: false,
+    fallback_take_profit_pct: 0.05,
+    filter_entry: true,
+    lookback_days: [90],
+    max_stop_distance_pct: 0.045,
+    min_reclaimed_poc_count: 1,
+    min_reward_risk: 1.2,
+    min_take_profit_pct: 0.03,
+    require_profile: true,
+    resistance_buffer_pct: 0.002,
+    support_buffer_pct: 0.003,
+    trailing_stop_pct: 0.02,
+  },
+} satisfies Schemas["MinuteNShapeParameters"];
+
+export const auctionParameters = {
+  end_date: "2026-08-03",
+  entry_mode: "vwap_push",
+  entry_pullback_tolerance_pct: 0.02,
+  entry_start_time: "09:31:00",
+  entry_vwap_buffer_pct: 0.0,
+  factor_score_threshold: null,
+  family: "auction_gap",
+  freq: "1min",
+  gap_mode: "close",
+  max_auction_vol_ratio_5d: 5.0,
+  max_hold_days: 1,
+  min_auction_vol_ratio_5d: 0.15,
+  min_limit_progress_pct: 0.2,
+  next_auction_weak_gap_pct: -0.01,
+  next_morning_exit_until: "10:00:00",
+  next_morning_vwap_break_buffer_pct: 0.003,
+  price_tol: 0.01,
+  seal_hold_enabled: false,
+  seal_hold_max_days: 3,
+  seal_hold_max_open_times: 0,
+  seal_hold_min_fd_to_circ_pct: null,
+  st_filter: "case_insensitive",
+  start_date: "2026-01-05",
+  strong_seal_min_close_minutes: 3,
+  strong_seal_weak_gap_pct: -0.03,
+  paper: {
+    candidate_id: "baseline",
+    entry_buffer_pct: 0.005,
+    entry_slippage_pct: 0.0,
+    stop_loss_pct: 0.03,
+    take_profit_pct: 0.05,
+    trailing_stop_pct: 0.025,
+  },
+} satisfies Schemas["MinuteAuctionGapParameters"];
+
+export const auctionV2Parameters = {
+  ...auctionParameters,
+  next_day_price_policy: "keep_candidate_mark_unavailable",
+} satisfies Schemas["MinuteParameterSet"]["parameters"];
+
+export const auctionV2Recipe = {
+  kind: "minute-parameter-set",
+  schema_version: 2,
+  parameters: auctionV2Parameters,
+} satisfies Schemas["MinuteParameterSet"];
+
+export const growthParameters = {
+  board_hist_days: 3,
+  enable_factor_confirm: false,
+  factor_score_threshold: 45.0,
+  family: "growth_board_surge",
+  freq: "1min",
+  fresh_lookback_days: 5,
+  fresh_max_prior_volume_ratio: 2.0,
+  lookback_days: 20,
+  max_hold_days: 3,
+  max_inner_outer_ratio: 1.0,
+  min_amount_accel_5m: 2.0,
+  min_board_auction_amount_ratio: 1.0,
+  min_board_gap_up_ratio: 0.5,
+  min_cum_amount_ratio: 1.4,
+  min_hist_days: 10,
+  min_large_net_vol: 0.0,
+  min_listing_trading_days: 0,
+  min_same_minute_amount_ratio: 2.0,
+  min_signal_time: "09:30:00",
+  price_tol: 0.01,
+  require_board_favor: false,
+  require_fresh_surge: false,
+  require_inner_outer: false,
+  require_large_net_vol: false,
+  require_vwap_strength: true,
+  use_accel_surge: true,
+  use_same_minute_surge: true,
+  vwap_buffer_pct: 0.0,
+  paper: {
+    candidate_id: "growth_board_surge_v0",
+    entry_buffer_pct: 0.005,
+    entry_slippage_pct: 0.0,
+    stop_loss_pct: 0.05,
+    take_profit_pct: 0.08,
+    trailing_stop_pct: 0.03,
+  },
+} satisfies Schemas["MinuteGrowthParameters"];
+
+export function parameterSet(
+  parameters: Schemas["MinuteParameterSet"]["parameters"],
+): Schemas["MinuteParameterSet"] {
+  return { kind: "minute-parameter-set", schema_version: 1, parameters };
+}

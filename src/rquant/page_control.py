@@ -6,6 +6,16 @@ mutable Canvas, preset, query-log, and Lab export paths.
 
 from __future__ import annotations
 
+from contextvars import ContextVar
+from functools import wraps
+
+from rquant.collaboration_commands import (
+    CommandAuthorization, PageControlRoleAuthority, SetUserRoleCommand,
+    require_original_role_command,
+)
+
+_TRUSTED_COLLABORATION_ACTOR: ContextVar[str | None] = ContextVar("page_control_private_actor", default=None)
+
 import errno
 import fcntl
 import json
@@ -14,22 +24,30 @@ import re
 import sqlite3
 import stat
 import urllib.request
-from collections.abc import Callable, Mapping
-from contextlib import suppress
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Literal, Protocol
+from typing import TYPE_CHECKING, Annotated, Literal, Protocol, TypeVar
 
 if TYPE_CHECKING:
+    from rquant.factor.job_ledger import FactorJobRecord
+    from rquant.web.models.collaboration import ResultOwnerProof
+    from rquant.ai_assistance import AIAssistanceOwner
+    from rquant.ai_assistance_contracts import AIMeasuredUsage, AIRequestBinding
+    from rquant.ai_usage import AIUsageDispatch, AIUsageRecord, AIUsageRepository, AIUsageSummary
     from rquant.task_control import TaskControlPageControlBackend
     from rquant.paper_portfolio_commands import PaperPortfolioPageControlBackend
     from rquant.web.condition_alert_commands import ConditionRuleScopeResolver
     from rquant.research_query.saved import SavedResearchQuery
     from rquant.strategy_authoring import StrategyAuthoringPageControlBackend
     from rquant.strategy_authoring_source import StrategySourceCatalog
+    from rquant.strategy_promotion import StrategyPromotionPageControlBackend
+    from rquant.minute_backtest_parameter_study_journal import MinuteParameterStudyCommandWriter
+    from rquant.minute_backtest_native_report_runtime import MinuteNativeReportCommandWriter
 from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID, uuid4
 
@@ -42,6 +60,8 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+
+_AIUsageT = TypeVar("_AIUsageT")
 
 from rquant.alert_price_rule import PriceAlertRule
 from rquant.alert_rule_contracts import ConditionAlertRuleDefinition
@@ -91,6 +111,9 @@ from rquant.portfolio_backtest_commands import (
     PortfolioPageControlBackend,
     SubmitPortfolioBacktest,
 )
+from rquant.minute_backtest_commands import ExportMinuteReplayZip, MinuteCommand, MinutePageControlBackend, SubmitMinuteReplay
+from rquant.minute_backtest_parameter_study_commands import SubmitMinuteParameterStudy
+from rquant.strict_json import canonical_json_bytes
 from rquant.experiment_platform_commands import (
     ExperimentCommand,
     EXPERIMENT_COMMAND_TYPES,
@@ -143,7 +166,14 @@ from rquant.strategy_template_run_commands import (
 from rquant.task_control_commands import (
     TASK_CONTROL_KINDS, TASK_CONTROL_OWNED_TYPES, TASK_CONTROL_PUBLIC_TYPES,
     OwnedPrepareUnitRun, OwnedRequestUnitRun, OwnedSetLabSchedulingPaused,
+    OwnedPrepareNotifierDeliveryMode, OwnedSetNotifierDeliveryMode, OwnedSetMonitorBuiltinEnabled,
     OwnedTaskControl, TaskControlRequest, TaskControlIdentity,
+)
+from rquant.strategy_promotion_commands import (
+    PROMOTION_PUBLIC_TYPES, PROMOTION_OWNED_TYPES, OwnedApprovePromotion,
+    OwnedRequestPromotionReview, OwnedPreparePromotionApproval, OwnedRunStrategyWalkForward,
+    OwnedStrategyPromotionCommand, StrategyPromotionCommand,
+    StrategyPromotionRateLimitError,
 )
 
 _SAFE_NAME = re.compile(r"^[\w\u4e00-\u9fff-]+$")
@@ -176,6 +206,7 @@ _FACTOR_TRACKING_KINDS = frozenset({"set_factor_tracked"})
 _STRATEGY_AUTHORING_KINDS = frozenset(
     {"save_strategy_template", "archive_strategy_template", "run_strategy_template"}
 )
+_STRATEGY_PROMOTION_KINDS = frozenset(model.model_fields["kind"].default for model in PROMOTION_PUBLIC_TYPES)
 _PAPER_PORTFOLIO_KINDS = frozenset({"set_paper_account_paused", "save_paper_portfolio_configuration", "run_paper_portfolio_research"})
 _FACTOR_REGISTRY_EFFECT_IDENTITY = "factor-registry-identity/v1"
 _LOCAL_FILESYSTEM_FENCE_SCHEMA_VERSION = 1
@@ -887,6 +918,7 @@ class FactorDefinitionPageControlBackend(Protocol):
 
 PageControlCommandValue = Annotated[
     AckAlert
+    | SetUserRoleCommand
     | _OwnedExecuteScreenQuery
     | _OwnedSaveNlPreset
     | _OwnedSaveResearchQuery
@@ -905,12 +937,19 @@ PageControlCommandValue = Annotated[
     | OwnedSaveStrategyTemplate
     | OwnedArchiveStrategyTemplate
     | OwnedRunStrategyTemplate
+    | OwnedRequestPromotionReview
+    | OwnedPreparePromotionApproval
+    | OwnedApprovePromotion
+    | OwnedRunStrategyWalkForward
     | OwnedSetPaperAccountPaused
     | OwnedSavePaperPortfolioConfiguration
     | OwnedRunPaperPortfolioResearch
     | OwnedPrepareUnitRun
     | OwnedRequestUnitRun
     | OwnedSetLabSchedulingPaused
+    | OwnedPrepareNotifierDeliveryMode
+    | OwnedSetNotifierDeliveryMode
+    | OwnedSetMonitorBuiltinEnabled
     | SaveCanvas
     | CreateCanvas
     | DeleteCanvas
@@ -932,6 +971,9 @@ PageControlCommandValue = Annotated[
     | SubmitFormulaMarketRun
     | ExportLabArtifactZip
     | SubmitPortfolioBacktest
+    | SubmitMinuteReplay
+    | SubmitMinuteParameterStudy
+    | ExportMinuteReplayZip
     | ExportPortfolioBacktestZip
     | ExperimentCommand
     | DiscardLabArtifactZip,
@@ -1220,6 +1262,7 @@ class PageControlOutbox:
 
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
+        self.collaboration: PageControlRoleAuthority | None = None
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as connection:
             connection.executescript(
@@ -1278,10 +1321,19 @@ class PageControlOutbox:
                 """
             )
             install_screen_query_tables(connection)
+            from rquant.ai_usage import install_ai_usage_tables
+
+            install_ai_usage_tables(connection)
             self._ensure_column(connection, "processing_owner", "TEXT")
             self._ensure_column(connection, "lease_expires_at", "TEXT")
             self._ensure_column(connection, "attempt_count", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(connection, "claim_token", "TEXT")
+            self._ensure_column(connection, "authorization_json", "TEXT")
+            try:
+                connection.execute("ALTER TABLE page_control_effect ADD COLUMN original_admission_json TEXT")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" not in str(exc):
+                    raise
             connection.commit()
             self._activate_safe_effect_journal_protocol(connection)
 
@@ -1379,7 +1431,93 @@ class PageControlOutbox:
         connection.row_factory = sqlite3.Row
         return connection
 
+    def _ai_usage_transaction(self, operation: Callable[[AIUsageRepository], _AIUsageT]) -> _AIUsageT:
+        from contextlib import closing
+        from rquant.ai_usage import AIUsageRepository
+
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                result = operation(AIUsageRepository(connection))
+                connection.commit()
+                return result
+            except BaseException:
+                connection.rollback()
+                raise
+
+    def ai_usage_reserve(self, binding: AIRequestBinding, *, daily_limit: int) -> AIUsageRecord:
+        return self._ai_usage_transaction(lambda repo: repo.reserve(binding, daily_limit=daily_limit))
+
+    def ai_usage_lookup(self, owner_uid: str, request_id: UUID, body_sha256: str | None = None) -> AIUsageRecord:
+        return self._ai_usage_transaction(lambda repo: repo.lookup(owner_uid, request_id, body_sha256))
+
+    def ai_usage_dispatch(self, owner_uid: str, request_id: UUID, body_sha256: str, *, now: datetime) -> AIUsageDispatch:
+        return self._ai_usage_transaction(lambda repo: repo.dispatch(owner_uid, request_id, body_sha256, now=now))
+
+    def ai_usage_finish(self, owner_uid: str, request_id: UUID, body_sha256: str, *, dispatch_token: str,
+                        now: datetime, usage: AIMeasuredUsage, result: JsonValue | None,
+                        error_code: str | None = None) -> AIUsageRecord:
+        return self._ai_usage_transaction(lambda repo: repo.finish(owner_uid, request_id, body_sha256,
+            dispatch_token=dispatch_token, now=now, usage=usage, result=result, error_code=error_code))
+
+    def ai_usage_release(self, owner_uid: str, request_id: UUID, body_sha256: str, *, now: datetime,
+                         reason: str) -> AIUsageRecord:
+        return self._ai_usage_transaction(lambda repo: repo.release(owner_uid, request_id, body_sha256, now=now, reason=reason))
+
+    def ai_usage_unknown(self, owner_uid: str, request_id: UUID, body_sha256: str, *, dispatch_token: str,
+                         now: datetime) -> AIUsageRecord:
+        return self._ai_usage_transaction(lambda repo: repo.unknown(owner_uid, request_id, body_sha256, dispatch_token=dispatch_token, now=now))
+
+    def ai_usage_recover_dispatches(self, *, now: datetime) -> int:
+        return self._ai_usage_transaction(lambda repo: repo.recover_dispatches(now=now))
+
+    def ai_usage_summary(self, owner_uid: str, account_id: str, *, start_date: date, end_date: date) -> AIUsageSummary:
+        return self._ai_usage_transaction(lambda repo: repo.summary(owner_uid, account_id, start_date=start_date, end_date=end_date))
+
+    def ai_usage_request_exists(self, request_id: UUID) -> bool:
+        return self._ai_usage_transaction(lambda repo: repo.connection.execute("SELECT 1 FROM ai_request WHERE request_id=?", (str(request_id),)).fetchone() is not None)
+
+    def ai_usage_account_calls(self, account_id: str, budget_date: date) -> int:
+        return self._ai_usage_transaction(lambda repo: int(repo.connection.execute("SELECT COUNT(*) FROM ai_request WHERE account_id=? AND budget_date=? AND state!='not_dispatched'", (account_id, budget_date.isoformat())).fetchone()[0]))
+
+    def authorize_ai_portfolio_result(self, owner_uid: str, job_id: UUID) -> SubmitPortfolioBacktest:
+        from contextlib import closing
+        from rquant.portfolio_backtest_commands import SubmitPortfolioBacktest, portfolio_job_id
+        from rquant.lab_job_center import CommandSubmissionReceipt
+        authority = self.collaboration
+        if authority is not None and authority.mode == "enforced":
+            with authority.locked():
+                authority.require_outbox_path(self.path)
+                authority.current_role(owner_uid)
+                with closing(self._connect()) as connection:
+                    connection.execute("PRAGMA query_only = ON")
+                    connection.execute("BEGIN")
+                    for row in self._result_submission_rows(connection, "submit_portfolio_backtest"):
+                        proof = self._result_submission_binding(row, authority)
+                        if proof is not None and proof.owner_id == owner_uid and UUID(proof.job_id) == job_id:
+                            command = SubmitPortfolioBacktest.model_validate_json(row["payload_json"])
+                            if portfolio_job_id(owner_uid, command.command_id) != job_id:
+                                raise PermissionError("original AI result owner submission differs")
+                            return command
+            raise PermissionError("original proven portfolio result owner is unavailable")
+        with closing(self._connect()) as connection:
+            rows = connection.execute("SELECT * FROM page_control_command WHERE command_kind='submit_portfolio_backtest' AND json_extract(payload_json,'$.actor_id')=?", (owner_uid,))
+            for row in rows:
+                command = SubmitPortfolioBacktest.model_validate_json(row["payload_json"])
+                if command.actor_id == owner_uid and portfolio_job_id(owner_uid, command.command_id) == job_id:
+                    effect=connection.execute('SELECT * FROM page_control_effect WHERE command_id=?',(command.command_id,)).fetchone()
+                    if row["status"] != "succeeded" or _command_hash(command) != row["command_hash"] or effect is None or effect['status']!='succeeded' or effect['command_hash']!=row['command_hash'] or effect['effect_kind']!=command.kind:
+                        raise PermissionError("original portfolio owner receipt is not complete")
+                    receipt=CommandSubmissionReceipt.model_validate_json(row['result_json'])
+                    effect_receipt=CommandSubmissionReceipt.model_validate_json(effect['result_json'])
+                    if receipt!=effect_receipt or (receipt.job_id,receipt.command_type)!=(job_id,'submit'):
+                        raise PermissionError('original portfolio command/effect/job binding differs')
+                    return command
+        raise PermissionError("original portfolio result is not owned by this viewer")
+
     def enqueue(self, command: PageControlCommandValue) -> PageControlReceipt:
+        if isinstance(command, PROMOTION_PUBLIC_TYPES):
+            raise ValueError("manual promotion requires trusted private submission")
         if isinstance(command, TASK_CONTROL_PUBLIC_TYPES):
             raise ValueError("task controls require trusted private submission")
         if isinstance(command, (SetPaperAccountPaused, SavePaperPortfolioConfiguration, RunPaperPortfolioResearch)):
@@ -1466,6 +1604,11 @@ class PageControlOutbox:
             raise TypeError("strategy authoring requires an owned command")
         return self._enqueue(command, require_strategy_authoring_trust=True)
 
+    def enqueue_trusted_strategy_promotion(self, command: OwnedStrategyPromotionCommand) -> PageControlReceipt:
+        if type(command) not in PROMOTION_OWNED_TYPES:
+            raise TypeError("private promotion command required")
+        return self._enqueue(command, require_strategy_promotion_trust=True)
+
     def enqueue_trusted_paper_portfolio(
         self, command: OwnedPaperPortfolioCommand
     ) -> PageControlReceipt:
@@ -1489,7 +1632,16 @@ class PageControlOutbox:
         require_screen_query_trust: bool = False,
         require_paper_portfolio_trust: bool = False,
         require_task_control_trust: bool = False,
+        require_strategy_promotion_trust: bool = False,
     ) -> PageControlReceipt:
+        if isinstance(command, PROMOTION_PUBLIC_TYPES) != require_strategy_promotion_trust or (
+            require_strategy_promotion_trust and type(command) not in PROMOTION_OWNED_TYPES
+        ):
+            raise ValueError("manual promotion requires trusted private submission")
+        if require_strategy_promotion_trust and (
+            self.collaboration is None or self.collaboration.mode != "enforced"
+        ):
+            raise PermissionError("manual promotion requires installed current roles")
         if isinstance(command, TASK_CONTROL_PUBLIC_TYPES) != require_task_control_trust or (
             require_task_control_trust and type(command) not in TASK_CONTROL_OWNED_TYPES
         ):
@@ -1557,6 +1709,12 @@ class PageControlOutbox:
             raise ValueError("tracking requires trusted submission")
         payload = command.model_dump_json()
         command_hash = _command_hash(command)
+        authorization = None
+        if self.collaboration is not None and self.collaboration.mode == "enforced":
+            actor = _TRUSTED_COLLABORATION_ACTOR.get()
+            if actor is None:
+                raise PermissionError("command requires the original trusted private ingress")
+            authorization = self.collaboration.issue_authorization(actor, command.model_dump(mode="json"))
         enqueued_at = (command.accepted_at if type(command) in TASK_CONTROL_OWNED_TYPES else command.requested_at).isoformat(timespec="microseconds")
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -1583,12 +1741,17 @@ class PageControlOutbox:
                     raise PageControlCommandConflictError(
                         "command_id already exists with different payload"
                     )
+                if authorization is not None:
+                    original = self._row_authorization(existing)
+                    if original is None or original.actor_id != authorization.actor_id:
+                        raise PermissionError("original trusted command actor is unavailable or differs")
                 if (
                     require_task_control_trust
                     or require_condition_rule_activation
                     or require_price_rule_activation
                     or require_factor_definition_trust
                     or require_strategy_authoring_trust
+                    or require_strategy_promotion_trust
                     or require_paper_portfolio_trust
                 ):
                     stored = _COMMAND_ADAPTER.validate_json(existing["payload_json"])
@@ -1601,11 +1764,32 @@ class PageControlOutbox:
                             "command_id already exists with different payload"
                         )
                 return self._receipt(existing)
+            if require_strategy_promotion_trust:
+                # Client requested_at never changes these persistent rate limits.
+                count = connection.execute(
+                    "SELECT COUNT(*) FROM page_control_command WHERE command_kind IN (?,?,?,?) "
+                    "AND json_extract(payload_json,'$.owner_id')=? "
+                    "AND julianday(json_extract(payload_json,'$.accepted_at'))>julianday(?)",
+                    (*sorted(_STRATEGY_PROMOTION_KINDS), command.owner_id,
+                        (command.accepted_at - timedelta(minutes=1)).isoformat()),
+                ).fetchone()[0]
+                if count >= 30:
+                    raise StrategyPromotionRateLimitError("每分钟最多 30 次操作，请稍后重试。")
+                if type(command) is OwnedApprovePromotion and connection.execute(
+                    "SELECT 1 FROM page_control_command WHERE command_kind='approve_promotion' "
+                    "AND json_extract(payload_json,'$.owner_id')=? "
+                    "AND json_extract(payload_json,'$.target.strategy_id')=? "
+                    "AND julianday(json_extract(payload_json,'$.accepted_at'))>julianday(?) LIMIT 1",
+                    (command.owner_id, command.target.strategy_id,
+                        (command.accepted_at - timedelta(minutes=10)).isoformat()),
+                ).fetchone() is not None:
+                    raise StrategyPromotionRateLimitError("同一策略每 10 分钟只能批准一次。")
             if require_task_control_trust:
                 if len(payload.encode()) > 32 * 1024:
                     raise ValueError("task control effect exceeds 32 KiB")
                 count = connection.execute(
-                    "SELECT COUNT(*) FROM page_control_command WHERE command_kind IN (?, ?, ?)",
+                    "SELECT COUNT(*) FROM page_control_command WHERE command_kind IN ("
+                    + ",".join("?" for _ in TASK_CONTROL_KINDS) + ")",
                     tuple(sorted(TASK_CONTROL_KINDS)),
                 ).fetchone()[0]
                 if count >= 4096:
@@ -1614,8 +1798,8 @@ class PageControlOutbox:
                 """
                 INSERT INTO page_control_command(
                     command_id, command_kind, command_hash, payload_json,
-                    status, enqueued_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    status, enqueued_at, authorization_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     command.command_id,
@@ -1624,6 +1808,7 @@ class PageControlOutbox:
                     payload,
                     PageControlStatus.PENDING.value,
                     enqueued_at,
+                    None if authorization is None else authorization.model_dump_json(),
                 ),
             )
             if type(command) is _OwnedExecuteScreenQuery:
@@ -1631,6 +1816,312 @@ class PageControlOutbox:
         receipt = self.receipt(command.command_id)
         assert receipt is not None
         return receipt
+
+    def _row_authorization(self, row: sqlite3.Row) -> CommandAuthorization | None:
+        return self._journal_authorization(row, self.collaboration)
+
+    @staticmethod
+    def _journal_authorization(
+        row: sqlite3.Row, collaboration: PageControlRoleAuthority | None,
+    ) -> CommandAuthorization | None:
+        if "authorization_json" not in row.keys() or row["authorization_json"] is None:
+            return None
+        try:
+            raw = row["authorization_json"]
+            if not isinstance(raw, str) or len(raw.encode()) > 4096:
+                raise ValueError("authorization metadata exceeds capacity")
+            from rquant.strict_json import strict_json_loads
+            strict_json_loads(raw)
+            proof = CommandAuthorization.model_validate_json(raw)
+            if collaboration is not None and collaboration.mode == "enforced":
+                if proof.journal_identity != collaboration.require_outbox_identity():
+                    raise ValueError("authorization belongs to another original journal")
+            stored = _COMMAND_ADAPTER.validate_json(row["payload_json"])
+            if (proof.command_id != row["command_id"] or proof.command_kind != row["command_kind"]
+                    or proof.command_sha256 != row["command_hash"]
+                    or _command_hash(stored) != proof.command_sha256
+                    or stored.command_id != proof.command_id or stored.kind != proof.command_kind):
+                raise ValueError("original trusted command binding differs")
+            return proof
+        except (ValueError, TypeError, KeyError) as exc:
+            raise PermissionError("original trusted command provenance is unavailable") from exc
+
+    def trusted_command_actor(self, command_id: str, command_hash: str) -> str | None:
+        with self._connect() as connection:
+            connection.execute("PRAGMA query_only = ON")
+            connection.execute("BEGIN")
+            row = self._bounded_command_row(connection, command_id)
+        if row is None or row["command_hash"] != command_hash:
+            return None
+        proof = self._row_authorization(row)
+        return None if proof is None else proof.actor_id
+
+    @staticmethod
+    def _bounded_command_row(connection: sqlite3.Connection, command_id: str) -> sqlite3.Row | None:
+        if not connection.in_transaction:
+            raise ValueError("original command read snapshot is required")
+        columns = {item[1] for item in connection.execute("PRAGMA table_info(page_control_command)")}
+        authorization = "authorization_json" if "authorization_json" in columns else "NULL"
+        lengths = connection.execute(f"""
+            SELECT length(CAST(command_id AS BLOB)),length(CAST(command_kind AS BLOB)),
+                length(CAST(command_hash AS BLOB)),length(CAST(payload_json AS BLOB)),
+                length(CAST({authorization} AS BLOB))
+            FROM page_control_command WHERE command_id=?
+        """, (command_id,)).fetchone()
+        if lengths is None:
+            return None
+        sizes = tuple(int(item or 0) for item in lengths)
+        if any(size > 128 for size in sizes[:3]) or sizes[3] > 1024 * 1024 or sizes[4] > 4096:
+            raise ValueError("original command or authorization exceeds read capacity")
+        return connection.execute(f"""
+            SELECT command_id,command_kind,command_hash,payload_json,
+                {authorization} AS authorization_json
+            FROM page_control_command WHERE command_id=?
+        """, (command_id,)).fetchone()
+
+    @staticmethod
+    def _factor_job_origin(command: _OwnedSubmitFactorRun) -> tuple[str, FactorJobRecord] | None:
+        from rquant.factor.job_ledger import FactorEvaluationJobLedger, _checked_command
+
+        ledger = FactorEvaluationJobLedger.open_existing(command.ledger_identity)
+        with ledger._reader() as connection:
+            identity = connection.execute("SELECT job_id FROM factor_jobs WHERE spec_sha256 = ?",
+                (command.spec.spec_sha256,)).fetchone()
+            if identity is None:
+                return None
+            state = ledger._load_job(connection, identity["job_id"])
+            anchor = connection.execute("SELECT * FROM factor_commands WHERE job_id = ? ORDER BY rowid LIMIT 1",
+                (identity["job_id"],)).fetchone()
+            if state is None or anchor is None:
+                raise PermissionError("original factor job origin is unavailable")
+            original_id, original_spec, original_job = _checked_command(anchor)
+            if state.spec != command.spec or (original_spec, original_job) != (state.spec_sha256, state.job_id):
+                raise PermissionError("original factor job origin differs")
+            return original_id, state.public()
+
+    @staticmethod
+    def _result_submission_binding(
+        row: sqlite3.Row, collaboration: PageControlRoleAuthority, *,
+        restored_private_owner: str | None = None,
+    ) -> ResultOwnerProof | None:
+        from rquant.portfolio_backtest_commands import PortfolioRunEffect, portfolio_interaction, portfolio_job_id
+        from rquant.strict_json import strict_json_loads
+        from rquant.web.models.collaboration import ResultOwnerProof
+
+        command = _COMMAND_ADAPTER.validate_json(row["payload_json"])
+        kind = command.kind
+        if (row["status"] != "succeeded" or row["verified_effect_status"] != "succeeded"
+                or _command_hash(command) != row["command_hash"]
+                or row["verified_effect_hash"] != row["command_hash"] or row["verified_effect_kind"] != kind):
+            raise PermissionError("original result command/effect binding differs")
+        result = strict_json_loads(row["verified_effect_result"])
+        completed = strict_json_loads(row["result_json"])
+        if not isinstance(result, dict) or result != completed:
+            raise PermissionError("original accepted command and effect receipts differ")
+        proof = PageControlOutbox._journal_authorization(row, collaboration)
+        owner = restored_private_owner if proof is None else proof.actor_id
+        if owner is None:
+            return None
+        if type(command) is _OwnedSubmitFactorRun:
+            domain, spec_hash = "factor", command.spec.spec_sha256
+            if command.actor_id != owner or result.get("spec_sha256") != spec_hash:
+                raise PermissionError("original factor owner/spec acceptance differs")
+            job_id = UUID(str(result["job_id"])).hex
+            origin = PageControlOutbox._factor_job_origin(command)
+            if origin is None or origin[1].job_id != job_id:
+                raise PermissionError("original factor ledger binding differs")
+            if origin[0] != command.command_id:
+                # A new UUID can reuse a job, but cannot replace its first owner.
+                return None
+        elif type(command) is OwnedRunStrategyTemplate:
+            domain, spec_hash = "strategy", command.accepted.spec.spec_hash
+            job_id = str(UUID(str(result["job_id"])))
+            if (command.owner_id != owner or result.get("owner_id") != owner
+                    or result.get("spec_hash") != spec_hash or UUID(command.command_id) != UUID(job_id)
+                    or result.get("command_id") != command.command_id):
+                raise PermissionError("original strategy owner/spec acceptance differs")
+        elif type(command) is SubmitPortfolioBacktest:
+            if proof is None:
+                return None
+            raw = row["original_admission_json"]
+            if not isinstance(raw, str) or len(raw.encode()) > 1024 * 1024:
+                raise PermissionError("original portfolio admission is unavailable")
+            strict_json_loads(raw)
+            marker = PortfolioRunEffect.model_validate_json(raw)
+            arguments = {item.name: item.value for item in marker.command.spec.parameters.arguments}
+            if (marker.command_hash != canonical_sha256(command) or marker.config_hash != command.config.config_hash
+                    or arguments.get("config_hash") != marker.config_hash
+                    or marker.command.job_id != portfolio_job_id(owner, command.command_id)
+                    or marker.interaction_key != portfolio_interaction(command)
+                    or marker.command.spec.schema_version != 3
+                    or marker.command.spec.parameters.strategy_name != "portfolio_backtest"
+                    or command.actor_id != owner or result.get("result") != "submitted"
+                    or UUID(str(result["job_id"])) != marker.command.job_id):
+                raise PermissionError("original portfolio admission differs")
+            domain, spec_hash, job_id = "portfolio", marker.command.spec.spec_hash, str(marker.command.job_id)
+        elif type(command) is SubmitMinuteReplay:
+            from rquant.minute_backtest_commands import (
+                MinuteParameterRunConfig, MinuteRunEffect, _minute_command_hash, _minute_config_hash,
+                minute_interaction, minute_job_id,
+            )
+            from rquant.minute_backtest_formal_adapter import MinuteFormalParameters
+
+            if proof is None:
+                return None
+            raw = row["original_admission_json"]
+            if not isinstance(raw, str) or len(raw.encode()) > 1024 * 1024:
+                raise PermissionError("original minute admission is unavailable")
+            strict_json_loads(raw)
+            marker = MinuteRunEffect.model_validate_json(raw)
+            spec, config = marker.command.spec, command.config
+            experiment = spec.experiment
+            if type(config) is MinuteParameterRunConfig:
+                from rquant.minute_backtest_parameter_adapter import MinuteParameterFormalParameters
+                from rquant.minute_backtest_parameter_producer import MinuteParameterPreparedPublication
+
+                parameters = MinuteParameterFormalParameters.model_validate({item.name: item.value for item in spec.parameters.arguments})
+                if parameters.prepared_publication_json is None:
+                    raise PermissionError("original parameter admission lacks its full baseline publication")
+                prepared = MinuteParameterPreparedPublication.model_validate_json(parameters.prepared_publication_json)
+                from rquant.minute_backtest_parameter_study import verify_minute_parameter_study_request
+
+                verify_minute_parameter_study_request(prepared.study_binding, config)
+                if (marker.command_hash != _minute_command_hash(command) or marker.config_hash != _minute_config_hash(config)
+                        or marker.command.job_id != minute_job_id(owner, command.command_id)
+                        or marker.interaction_key != minute_interaction(command)
+                        or spec.schema_version != 3 or spec.parameters.strategy_name != "minute_parameter_replay"
+                        or command.actor_id != owner or result.get("result") != "submitted"
+                        or UUID(str(result["job_id"])) != marker.command.job_id or experiment is None
+                        or (parameters.owner_id, prepared.baseline.owner_id, prepared.baseline.source_key,
+                            prepared.baseline.source_version, prepared.baseline.full_input_hash,
+                            parameters.parameter_set_json, parameters.parameter_hash,
+                            parameters.native_strategy_id, parameters.native_strategy_version, spec.deadline, spec.random_seed,
+                            experiment.spec.train_range, experiment.spec.validation_range, experiment.spec.frozen_outer_test_range) != (
+                            owner, owner, config.source_key, config.source_version, config.full_input_hash,
+                            config.parameters.model_dump_json(), config.parameters.fingerprint,
+                            config.parameters.definition_id, config.parameters.definition_version, config.deadline, config.random_seed,
+                            config.protocol.train_range, config.protocol.validation_range, config.protocol.frozen_outer_test_range)):
+                    raise PermissionError("original complete parameter admission differs")
+            else:
+                parameters = MinuteFormalParameters.model_validate({item.name: item.value for item in spec.parameters.arguments})
+                if (marker.command_hash != canonical_sha256(command) or marker.config_hash != canonical_sha256(config)
+                        or marker.command.job_id != minute_job_id(owner, command.command_id)
+                        or marker.interaction_key != minute_interaction(command)
+                        or spec.schema_version != 3 or spec.parameters.strategy_name != "minute_runtime_replay"
+                        or command.actor_id != owner or result.get("result") != "submitted"
+                        or UUID(str(result["job_id"])) != marker.command.job_id or experiment is None
+                        or (parameters.owner_id, parameters.source_key, parameters.source_version, parameters.full_input_hash,
+                            parameters.native_strategy_id, parameters.native_strategy_version, spec.deadline, spec.random_seed,
+                            experiment.spec.train_range, experiment.spec.validation_range, experiment.spec.frozen_outer_test_range) != (
+                            owner, config.source_key, config.source_version, config.full_input_hash, config.native_id,
+                            config.native_version, config.deadline, config.random_seed, config.protocol.train_range,
+                            config.protocol.validation_range, config.protocol.frozen_outer_test_range)):
+                    raise PermissionError("original minute admission differs")
+            domain, spec_hash, job_id = "minute", spec.spec_hash, str(marker.command.job_id)
+        else:
+            raise PermissionError("unknown original result submission kind")
+        return ResultOwnerProof(domain=domain, job_id=job_id, spec_hash=spec_hash, owner_id=owner,
+            command_id=row["command_id"], command_sha256=row["command_hash"],
+            effect_sha256=canonical_sha256(result), worker_owner_id=row["effect_worker_owner_id"])
+
+    @staticmethod
+    def _result_submission_rows(connection: sqlite3.Connection, kind: str) -> Iterator[sqlite3.Row]:
+        # Bound transfers before loading full original bodies or saved admission material.
+        metadata = connection.execute("""
+            SELECT c.rowid,
+                length(CAST(c.payload_json AS BLOB)),length(CAST(c.result_json AS BLOB)),
+                length(CAST(c.authorization_json AS BLOB)),length(CAST(e.result_json AS BLOB)),
+                length(CAST(e.original_admission_json AS BLOB))
+            FROM page_control_command c JOIN page_control_effect e ON c.command_id=e.command_id
+            WHERE c.command_kind=? AND c.status='succeeded' AND e.status='succeeded'
+            ORDER BY c.rowid DESC LIMIT 4097
+        """, (kind,))
+        total = 0
+        for count, item in enumerate(metadata, start=1):
+            sizes = tuple(int(value or 0) for value in item[1:])
+            total += sum(sizes)
+            if count > 4096 or any(size > 1024 * 1024 for size in sizes) or sizes[2] > 4096 or total > 4 * 1024 * 1024:
+                raise PermissionError("original result submission history exceeds read capacity")
+            row = connection.execute("""
+                SELECT c.*,e.status AS verified_effect_status,e.command_hash AS verified_effect_hash,
+                    e.effect_kind AS verified_effect_kind,e.result_json AS verified_effect_result,
+                    e.original_admission_json,e.owner_id AS effect_worker_owner_id
+                FROM page_control_command c JOIN page_control_effect e ON c.command_id=e.command_id
+                WHERE c.rowid=?
+            """, (item[0],)).fetchone()
+            if row is None:
+                raise PermissionError("original result submission disappeared")
+            yield row
+
+    def original_command_bytes(self, command_id: str) -> bytes:
+        with self._connect() as connection:
+            connection.execute("PRAGMA query_only = ON")
+            connection.execute("BEGIN")
+            row = self._bounded_command_row(connection, command_id)
+        if row is None:
+            raise KeyError("original command is absent")
+        self._row_authorization(row)
+        return row["payload_json"].encode("utf-8")
+
+    def require_current_command_role(self, command: PageControlCommandValue) -> str | None:
+        if self.collaboration is None or self.collaboration.mode != "enforced":
+            return
+        actor = self.trusted_command_actor(command.command_id, _command_hash(command))
+        if actor is None:
+            raise PermissionError("original trusted command actor is unavailable")
+        self.collaboration.require_command(actor, command.kind)
+        return actor
+
+    def require_active_claim(
+        self, command: PageControlCommandValue, *, owner_id: str, claim_token: str,
+    ) -> None:
+        from contextlib import closing
+
+        if not owner_id or not claim_token or len(owner_id) > 128 or len(claim_token) > 128:
+            raise PermissionError("original current claim identity is invalid")
+        with closing(self._connect()) as connection:
+            connection.execute("PRAGMA query_only = ON")
+            connection.execute("BEGIN")
+            row = self._bounded_command_row(connection, command.command_id)
+            if row is None:
+                raise PermissionError("original current claim is absent")
+            stored = _COMMAND_ADAPTER.validate_json(row["payload_json"])
+            if (stored != command or row["command_kind"] != command.kind
+                    or row["command_hash"] != _command_hash(command)):
+                raise PermissionError("original current claim body binding differs")
+            proof = self._row_authorization(row)
+            if self.collaboration is not None and self.collaboration.mode == "enforced":
+                if proof is None or getattr(command, "actor_id", proof.actor_id) != proof.actor_id:
+                    raise PermissionError("original current claim actor is unavailable")
+                self.collaboration.require_command(proof.actor_id, command.kind)
+            sizes = connection.execute("""
+                SELECT length(CAST(status AS BLOB)),length(CAST(processing_owner AS BLOB)),
+                    length(CAST(claim_token AS BLOB))
+                FROM page_control_command WHERE command_id=?
+            """, (command.command_id,)).fetchone()
+            if sizes is None or any(int(size or 0) > 128 for size in sizes):
+                raise PermissionError("original current claim exceeds read capacity")
+            current = connection.execute("""
+                SELECT status,processing_owner,claim_token
+                FROM page_control_command WHERE command_id=?
+            """, (command.command_id,)).fetchone()
+            if (current is None or current["status"] != PageControlStatus.PROCESSING.value
+                    or current["processing_owner"] != owner_id or current["claim_token"] != claim_token):
+                raise PermissionError("original current command claim changed")
+
+    @contextmanager
+    def command_fence(self, command: PageControlCommandValue) -> Iterator[None]:
+        if self.collaboration is None or self.collaboration.mode != "enforced" or type(command) is SetUserRoleCommand:
+            yield
+            return
+        with self.collaboration.locked(read_only=type(command) in (
+                SubmitMinuteReplay, ExportMinuteReplayZip, SubmitMinuteParameterStudy)):
+            actor = self.require_current_command_role(command)
+            token = _TRUSTED_COLLABORATION_ACTOR.set(actor)
+            try:
+                yield
+            finally:
+                _TRUSTED_COLLABORATION_ACTOR.reset(token)
 
     def enqueue_trusted_screen_query(
         self, command: _OwnedExecuteScreenQuery | _OwnedSaveNlPreset
@@ -2050,6 +2541,24 @@ class PageControlOutbox:
             raise PageControlCommandConflictError(
                 "command_id already exists with different payload or actor"
             )
+        return stored, self._receipt(row)
+
+    def lookup_strategy_promotion_command(self, request: StrategyPromotionCommand, *,
+            authenticated_actor_id: str) -> tuple[OwnedStrategyPromotionCommand, PageControlReceipt] | None:
+        if type(request) not in PROMOTION_PUBLIC_TYPES:
+            raise TypeError("original ownerless promotion required")
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM page_control_command WHERE command_id=?", (request.command_id,)).fetchone()
+        if row is None:
+            return None
+        stored = _COMMAND_ADAPTER.validate_json(row["payload_json"])
+        if (type(stored) not in PROMOTION_OWNED_TYPES or stored.owner_id != authenticated_actor_id
+                or stored.original() != request or row["command_kind"] != request.kind
+                or _command_hash(stored) != row["command_hash"]):
+            raise PageControlCommandConflictError("original promotion UUID body or actor differs")
+        proof = self._row_authorization(row)
+        if proof is None or proof.actor_id != authenticated_actor_id:
+            raise PermissionError("original promotion private actor is unproved")
         return stored, self._receipt(row)
 
     def lookup_factor_save_command(
@@ -2593,6 +3102,7 @@ class PageControlOutbox:
         lease_seconds: int = _DEFAULT_LEASE_SECONDS,
         now: datetime | None = None,
         target_command_id: str | None = None,
+        target_command_kinds: tuple[str, ...] | None = None,
     ) -> tuple[PageControlClaim, ...]:
         if not 1 <= limit <= 100:
             raise ValueError("limit must be between 1 and 100")
@@ -2600,6 +3110,11 @@ class PageControlOutbox:
             raise ValueError("owner_id is required")
         if lease_seconds < 1:
             raise ValueError("lease_seconds must be positive")
+        if target_command_kinds is not None and (not target_command_kinds
+                or len(set(target_command_kinds)) != len(target_command_kinds)
+                or not set(target_command_kinds) <= {
+                    "submit_minute_replay", "export_minute_replay_zip", "submit_minute_parameter_study"}):
+            raise ValueError("minute consumer kinds differ from the original closed commands")
         observed = _normalize_utc(now or datetime.now(UTC))
         observed_at = observed.isoformat(timespec="microseconds")
         lease_expires_at = (observed + timedelta(seconds=lease_seconds)).isoformat(
@@ -2607,6 +3122,9 @@ class PageControlOutbox:
         )
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            kind_filter = "" if target_command_kinds is None else (
+                " AND command_kind IN (" + ",".join("?" for _ in target_command_kinds) + ") "
+            )
             rows = connection.execute(
                 """
                 SELECT command_id, command_kind, command_hash, payload_json
@@ -2614,14 +3132,14 @@ class PageControlOutbox:
                 WHERE (status = ?
                    OR (status = ? AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?))
                   AND (? IS NULL OR command_id = ?)
-                ORDER BY CASE status WHEN ? THEN 0 ELSE 1 END, enqueued_at, rowid
-                """,
+                """ + kind_filter + " ORDER BY CASE status WHEN ? THEN 0 ELSE 1 END, enqueued_at, rowid",
                 (
                     PageControlStatus.PENDING.value,
                     PageControlStatus.PROCESSING.value,
                     observed_at,
                     target_command_id,
                     target_command_id,
+                    *(target_command_kinds or ()),
                     PageControlStatus.PENDING.value,
                 ),
             )
@@ -2983,6 +3501,12 @@ class PageControlOutbox:
         claim_token: str,
     ) -> PageControlEffectRecord:
         with self._connect() as connection:
+            command_row = connection.execute("SELECT * FROM page_control_command WHERE command_id=?", (command_id,)).fetchone()
+            if command_row is not None and self._row_authorization(command_row) is not None:
+                # Preserve the actual original owner marker before terminal result
+                # replaces result_json. This is not a synthesized job or new ledger.
+                connection.execute("UPDATE page_control_effect SET original_admission_json=COALESCE(original_admission_json, ?) WHERE command_id=? AND status=? AND owner_id=? AND claim_token=?",
+                    (json.dumps(result, ensure_ascii=True), command_id, PageControlEffectStatus.STARTED.value, owner_id, claim_token))
             changed = connection.execute(
                 """
                 UPDATE page_control_effect
@@ -3141,6 +3665,9 @@ class PageControlConsumer:
         allowed_lab_export_roots: tuple[Path, ...] = (),
         lab_backend: LabPageControlBackend | None = None,
         portfolio_backend: PortfolioPageControlBackend | None = None,
+        minute_backend: MinutePageControlBackend | None = None,
+        minute_study_backend: MinuteParameterStudyCommandWriter | None = None,
+        minute_native_report_backend: MinuteNativeReportCommandWriter | None = None,
         experiment_backend: ExperimentPageControlBackend | None = None,
         backfill_plan_backend: BackfillPlanPageControlBackend | None = None,
         data_audit_report_backend: DataAuditReportPageControlBackend | None = None,
@@ -3151,6 +3678,7 @@ class PageControlConsumer:
         factor_run_backend: FactorRunPageControlBackend | None = None,
         factor_tracking_backend: FactorTrackingPageControlBackend | None = None,
         strategy_authoring_backend: StrategyAuthoringPageControlBackend | None = None,
+        strategy_promotion_backend: StrategyPromotionPageControlBackend | None = None,
         paper_portfolio_backend: PaperPortfolioPageControlBackend | None = None,
         task_control_backend: TaskControlPageControlBackend | None = None,
         screen_query_history: ScreenQueryHistory | None = None,
@@ -3173,6 +3701,9 @@ class PageControlConsumer:
         )
         self.lab_backend = lab_backend
         self.portfolio_backend = portfolio_backend
+        self.minute_backend = minute_backend
+        self.minute_study_backend = minute_study_backend
+        self.minute_native_report_backend = minute_native_report_backend
         self.experiment_backend = experiment_backend
         self.backfill_plan_backend = backfill_plan_backend
         self.data_audit_report_backend = data_audit_report_backend
@@ -3183,6 +3714,7 @@ class PageControlConsumer:
         self.factor_run_backend = factor_run_backend
         self.factor_tracking_backend = factor_tracking_backend
         self.strategy_authoring_backend = strategy_authoring_backend
+        self.strategy_promotion_backend = strategy_promotion_backend
         self.paper_portfolio_backend = paper_portfolio_backend
         self.screen_query_history = screen_query_history
         self.screen_query_executor = screen_query_executor
@@ -3227,6 +3759,60 @@ class PageControlConsumer:
             if not acquired:
                 return ()
             return self._drain_locked(limit=limit)
+
+    def drain_minute_commands(self, *, limit: int = 1) -> tuple[PageControlReceipt, ...]:
+        if self.minute_backend is None and self.minute_native_report_backend is None:
+            return ()
+        with _PageControlExecutionMutex(self._consumer_mutex_path()) as acquired:
+            if not acquired:
+                return ()
+            return self._complete_claims(self.outbox.claim_records(
+                limit=limit, owner_id=self.consumer_id, lease_seconds=self.lease_seconds, now=self.clock(),
+                target_command_kinds=(("export_minute_replay_zip",) if self.minute_backend is None else
+                    ("submit_minute_replay", "export_minute_replay_zip", "submit_minute_parameter_study"))))
+
+    def _selected_minute_backend(self, command: MinuteCommand) -> MinutePageControlBackend:
+        native = self.minute_native_report_backend
+        if type(command) is ExportMinuteReplayZip and native is not None:
+            from rquant.minute_backtest_commands import MinuteCommandWriter
+            from rquant.minute_backtest_native_report_runtime import MinuteNativeReportCommandWriter
+            from rquant.web.models.collaboration import ResultOwnerQuery
+
+            if type(native) is not MinuteNativeReportCommandWriter or native.owner_authority is None:
+                raise PermissionError("native minute export lacks its original bound authority")
+            actor = self.outbox.trusted_command_actor(command.command_id, _command_hash(command))
+            if actor != command.actor_id:
+                raise PermissionError("native minute export requires its original authenticated command")
+            original = self.minute_backend
+            if type(original) is MinuteCommandWriter:
+                if original.owner_authority is not native.owner_authority:
+                    raise PermissionError("original minute export requires its own bound authority")
+                original.installation.verify_current()
+                original_context = original.installation.reader.get_command_context(command.job_id)
+                if original_context is not None:
+                    try:
+                        original.owner_authority._trusted_result_owner(ResultOwnerQuery(domain="minute",
+                            job_id=str(command.job_id), spec_hash=original_context.job.spec_hash),
+                            authenticated_actor_id=actor)
+                    except LookupError:
+                        pass
+                    else:
+                        return original
+            native.runtime.verify_current()
+            context = native.runtime.reader.get_command_context(command.job_id)
+            if context is None:
+                raise LookupError("native minute original target is unavailable")
+            try:
+                native.owner_authority._trusted_result_owner(ResultOwnerQuery(domain="minute",
+                    job_id=str(command.job_id), spec_hash=context.job.spec_hash), authenticated_actor_id=actor)
+            except LookupError:
+                return native
+            if type(self.minute_backend) is not MinuteCommandWriter or self.minute_backend.owner_authority is not native.owner_authority:
+                raise PermissionError("original submitted minute export lacks its own bound writer")
+            raise PermissionError("original submitted minute target is absent from its own Lab")
+        if self.minute_backend is None:
+            raise RuntimeError("minute writer is unavailable")
+        return self.minute_backend
 
     def drain_price_rule_command(
         self, command: _OwnedPriceAlertRuleValue
@@ -3273,6 +3859,7 @@ class PageControlConsumer:
             )
 
     def _complete_screen_query_claim(self, claim: PageControlClaim) -> PageControlReceipt:
+        self.outbox.require_current_command_role(claim.command)
         if self.screen_query_history is None:
             raise RuntimeError("private screening is not configured")
         data = None
@@ -3287,6 +3874,7 @@ class PageControlConsumer:
                 data = self.screen_query_executor(claim.command.definition)
             except ScreenApplicationError as error:
                 code = "source_expired" if error.status_code == 409 else "source_unavailable"
+        self.outbox.require_current_command_role(claim.command)
         return self.screen_query_history.complete(
             claim, now=self.clock(), data=data, failure_code=code
         )
@@ -3353,6 +3941,18 @@ class PageControlConsumer:
                 raise PageControlCommandConflictError("strategy command changed before claim")
             return self._complete_claims(claims)
 
+    def drain_strategy_promotion_command(self, command: OwnedStrategyPromotionCommand) -> tuple[PageControlReceipt, ...]:
+        with _PageControlExecutionMutex(self._consumer_mutex_path()) as acquired:
+            if not acquired:
+                return ()
+            claims = self.outbox.claim_records(limit=1, owner_id=self.consumer_id,
+                lease_seconds=self.lease_seconds, now=self.clock(), target_command_id=command.command_id)
+            if not claims:
+                return ()
+            if claims[0].command != command:
+                raise PageControlCommandConflictError("original promotion changed before claim")
+            return self._complete_claims(claims)
+
     def drain_paper_portfolio_command(
         self, command: OwnedPaperPortfolioCommand
     ) -> tuple[PageControlReceipt, ...]:
@@ -3405,78 +4005,57 @@ class PageControlConsumer:
     ) -> tuple[PageControlReceipt, ...]:
         receipts: list[PageControlReceipt] = []
         for claim in claims:
-            if type(claim.command) in (_OwnedExecuteScreenQuery, _OwnedSaveNlPreset):
-                receipts.append(self._complete_screen_query_claim(claim))
-                continue
-            if isinstance(claim.command, _OwnedSaveResearchQuery):
-                receipts.append(self.outbox.complete_research_query(claim, now=self.clock()))
-                continue
-            if isinstance(claim.command, (AddWatchlistItem, RemoveWatchlistItem)):
-                receipts.append(self.outbox.complete_watchlist(claim, now=self.clock()))
-                continue
-            if isinstance(
-                claim.command,
-                (
-                    _OwnedSavePriceAlertRule,
-                    _OwnedSetPriceAlertRuleEnabled,
-                    _OwnedDeletePriceAlertRule,
-                ),
-            ):
-                receipts.append(self.outbox.complete_price_rule(claim, now=self.clock()))
-                continue
-            if type(claim.command) in _CONDITION_OWNED_TYPES:
-                receipts.append(
-                    self.outbox.complete_condition_rule(
-                        claim, now=self.clock(), resolve_scope=self.condition_rule_scope
-                    )
-                )
-                continue
-            if isinstance(claim.command, AckAlert):
-                try:
-                    self._assert_command_time(claim.command)
-                except ValueError as exc:
-                    receipts.append(
-                        self.outbox.complete(
-                            claim.command.command_id,
-                            error=f"{type(exc).__name__}: {exc}",
-                            owner_id=claim.owner_id,
-                            claim_token=claim.claim_token,
-                        )
-                    )
-                    continue
-                receipts.append(self.outbox.complete_ack(claim))
-                continue
             try:
-                outcome = self._execute_claim(claim)
-            except _RetryableUncertainEffectError:
-                receipts.append(
-                    self.outbox.release_claim_for_retry(
-                        claim.command.command_id,
-                        owner_id=claim.owner_id,
-                        claim_token=claim.claim_token,
-                    )
-                )
-            except Exception as exc:
-                receipts.append(
-                    self.outbox.complete(
-                        claim.command.command_id,
-                        error=f"{type(exc).__name__}: {exc}",
-                        owner_id=claim.owner_id,
-                        claim_token=claim.claim_token,
-                    )
-                )
-            else:
-                receipts.append(
-                    self.outbox.complete(
-                        claim.command.command_id,
-                        result=outcome.result,
-                        error=outcome.error,
-                        status=outcome.status,
-                        owner_id=claim.owner_id,
-                        claim_token=claim.claim_token,
-                    )
-                )
+                fence = self._promotion_command_fence(claim.command) if type(claim.command) in PROMOTION_OWNED_TYPES else self.outbox.command_fence(claim.command)
+                with fence:
+                    receipts.append(self._complete_claim_locked(claim))
+            except PermissionError:
+                receipts.append(self.outbox.complete(claim.command.command_id,
+                    error="current_permission_denied", owner_id=claim.owner_id,
+                    claim_token=claim.claim_token))
         return tuple(receipts)
+
+    @contextmanager
+    def _promotion_command_fence(self, command: OwnedStrategyPromotionCommand) -> Iterator[None]:
+        with self.outbox.collaboration.locked():
+            self._strategy_promotion_backend().validate(command)
+            actor = self.outbox.trusted_command_actor(command.command_id, _command_hash(command))
+            if actor != command.owner_id:
+                raise PermissionError("original manual command actor differs")
+            token = _TRUSTED_COLLABORATION_ACTOR.set(actor)
+            try:
+                yield
+            finally:
+                _TRUSTED_COLLABORATION_ACTOR.reset(token)
+
+    def _complete_claim_locked(self, claim: PageControlClaim) -> PageControlReceipt:
+        if type(claim.command) in (_OwnedExecuteScreenQuery, _OwnedSaveNlPreset):
+            return self._complete_screen_query_claim(claim)
+        if isinstance(claim.command, _OwnedSaveResearchQuery):
+            return self.outbox.complete_research_query(claim, now=self.clock())
+        if isinstance(claim.command, (AddWatchlistItem, RemoveWatchlistItem)):
+            return self.outbox.complete_watchlist(claim, now=self.clock())
+        if isinstance(claim.command, (_OwnedSavePriceAlertRule, _OwnedSetPriceAlertRuleEnabled, _OwnedDeletePriceAlertRule)):
+            return self.outbox.complete_price_rule(claim, now=self.clock())
+        if type(claim.command) in _CONDITION_OWNED_TYPES:
+            return self.outbox.complete_condition_rule(claim, now=self.clock(), resolve_scope=self.condition_rule_scope)
+        if isinstance(claim.command, AckAlert):
+            try:
+                self._assert_command_time(claim.command)
+            except ValueError as exc:
+                return self.outbox.complete(claim.command.command_id, error=f"{type(exc).__name__}: {exc}",
+                    owner_id=claim.owner_id, claim_token=claim.claim_token)
+            return self.outbox.complete_ack(claim)
+        try:
+            outcome = self._execute_claim(claim)
+        except _RetryableUncertainEffectError:
+            return self.outbox.release_claim_for_retry(claim.command.command_id,
+                owner_id=claim.owner_id, claim_token=claim.claim_token)
+        except Exception as exc:
+            return self.outbox.complete(claim.command.command_id, error=f"{type(exc).__name__}: {exc}",
+                owner_id=claim.owner_id, claim_token=claim.claim_token)
+        return self.outbox.complete(claim.command.command_id, result=outcome.result, error=outcome.error,
+            status=outcome.status, owner_id=claim.owner_id, claim_token=claim.claim_token)
 
     def _consumer_mutex_path(self) -> Path:
         return self.outbox.path.with_name(f"{self.outbox.path.name}{_CONSUMER_MUTEX_SUFFIX}")
@@ -3488,7 +4067,28 @@ class PageControlConsumer:
 
     def _execute_claim(self, claim: PageControlClaim) -> _ExecutionOutcome:
         command = claim.command
+        if type(command) is SetUserRoleCommand:
+            if self.outbox.trusted_command_actor(command.command_id, _command_hash(command)) != command.actor_id:
+                raise PermissionError("original role command actor is unavailable")
+        elif type(command) in PROMOTION_OWNED_TYPES:
+            backend = self._strategy_promotion_backend()
+            backend.validate(command)
+            if self.outbox.trusted_command_actor(command.command_id, _command_hash(command)) != command.owner_id:
+                raise PermissionError("original promotion private actor differs")
+            try:
+                recovered = backend.recover(command)
+            except Exception as exc:
+                raise _RetryableUncertainEffectError("原评估结果暂时无法核验。") from exc
+            prior_effect = self.outbox.effect(command.command_id)
+            if recovered is None and prior_effect is None:
+                self.outbox.require_current_command_role(command)
+                backend.authorize(command.owner_id, command.original())
+        else:
+            self.outbox.require_current_command_role(command)
         self._assert_command_time(command)
+        if type(command) is _OwnedSubmitFactorRun:
+            self._require_factor_job_owner(command)
+        self._require_owned_lab_target(command)
         effect, created = self.outbox.begin_effect(
             command,
             owner_id=claim.owner_id,
@@ -3498,6 +4098,10 @@ class PageControlConsumer:
         terminal = self._outcome_from_effect(effect)
         if terminal is not None:
             return terminal
+        if type(command) is SubmitMinuteParameterStudy:
+            return self._execute_minute_study_claim(claim, effect=effect)
+        if type(command) is SetUserRoleCommand:
+            return self._execute_role_change(claim, effect)
         if type(command) in TASK_CONTROL_OWNED_TYPES:
             marker = {"contract": "task-control-identity/v1", "identity": command.metadata_identity.model_dump(mode="json")}
             try:
@@ -3553,6 +4157,19 @@ class PageControlConsumer:
                     raise ValueError("strategy original metadata identity differs")
             except Exception as exc:
                 raise _RetryableUncertainEffectError(f"strategy original identity cannot be verified: {exc}") from exc
+        if type(command) in PROMOTION_OWNED_TYPES:
+            marker = {"contract": "strategy-manual-promotion-identity/v1",
+                "identity": command.metadata_identity.model_dump(mode="json"),
+                "original_request_hash": command.original().request_hash}
+            try:
+                self._strategy_promotion_backend().validate(command)
+                if effect.result is None:
+                    effect = self.outbox.record_started_effect_result(command.command_id, result=marker,
+                        owner_id=claim.owner_id, claim_token=claim.claim_token)
+                if effect.result != marker:
+                    raise ValueError("original promotion effect marker differs")
+            except Exception as exc:
+                raise _RetryableUncertainEffectError("原评估回执待核验。") from exc
         if type(command) in (OwnedSetPaperAccountPaused, OwnedSavePaperPortfolioConfiguration, OwnedRunPaperPortfolioResearch):
             marker = {"contract": "paper-portfolio-identity/v1", "identity": command.metadata_identity.model_dump(mode="json")}
             try:
@@ -3588,6 +4205,17 @@ class PageControlConsumer:
                     owner_id=claim.owner_id,
                     claim_token=claim.claim_token,
                 )
+                outcome = self._outcome_from_effect(effect)
+                assert outcome is not None
+                return outcome
+        if isinstance(command, (SubmitMinuteReplay, ExportMinuteReplayZip)) and effect.result is None:
+            try:
+                marker = self._selected_minute_backend(command).freeze(command)
+                effect = self.outbox.record_started_effect_result(command.command_id, result=marker,
+                    owner_id=claim.owner_id, claim_token=claim.claim_token)
+            except Exception as exc:
+                effect = self.outbox.finish_effect(command.command_id, status=PageControlEffectStatus.FAILED,
+                    error=f"{type(exc).__name__}: {exc}", owner_id=claim.owner_id, claim_token=claim.claim_token)
                 outcome = self._outcome_from_effect(effect)
                 assert outcome is not None
                 return outcome
@@ -3775,6 +4403,23 @@ class PageControlConsumer:
                 outcome = self._outcome_from_effect(effect)
                 assert outcome is not None
                 return outcome
+            if type(command) in PROMOTION_OWNED_TYPES:
+                try:
+                    resumed = self._strategy_promotion_backend().recover_partial_walk_forward(command)
+                except Exception as exc:
+                    raise _RetryableUncertainEffectError("original WF child recovery is unconfirmed") from exc
+                if resumed is not None:
+                    effect = self.outbox.finish_effect(command.command_id, status=PageControlEffectStatus.SUCCEEDED, result=resumed, owner_id=claim.owner_id, claim_token=claim.claim_token)
+                    outcome = self._outcome_from_effect(effect)
+                    assert outcome is not None
+                    return outcome
+                effect = self.outbox.finish_effect(command.command_id,
+                    status=PageControlEffectStatus.AMBIGUOUS,
+                    error="原操作结果待确认，请保留这次操作。",
+                    owner_id=claim.owner_id, claim_token=claim.claim_token)
+                outcome = self._outcome_from_effect(effect)
+                assert outcome is not None
+                return outcome
             if _is_external_lab_effect(command):
                 result = _ambiguous_lab_effect_result(command)
                 effect = self.outbox.finish_effect(
@@ -3893,9 +4538,49 @@ class PageControlConsumer:
         binding.verify()
         return binding.descriptor
 
+    def _execute_minute_study_claim(
+        self, claim: PageControlClaim, *, effect: PageControlEffectRecord,
+    ) -> _ExecutionOutcome:
+        from rquant.minute_backtest_parameter_study_journal import MinuteParameterStudySubmissionUncertainError
+
+        command = claim.command
+        backend = self.minute_study_backend
+        if type(command) is not SubmitMinuteParameterStudy or backend is None:
+            raise RuntimeError("original minute study writer is unavailable")
+        try:
+            self.outbox.require_active_claim(command, owner_id=claim.owner_id, claim_token=claim.claim_token)
+            recovering = effect.result is not None
+            if not recovering:
+                marker = backend.freeze(command)
+                self.outbox.require_active_claim(command, owner_id=claim.owner_id, claim_token=claim.claim_token)
+                effect = self.outbox.record_started_effect_result(command.command_id, result=marker,
+                    owner_id=claim.owner_id, claim_token=claim.claim_token)
+            if effect.result is None:
+                raise RuntimeError("original minute study admission is unavailable")
+            self.outbox.require_active_claim(command, owner_id=claim.owner_id, claim_token=claim.claim_token)
+            result = backend.recover(command, effect.result) if recovering else backend.submit(command, effect.result)
+            if result is None:
+                raise _RetryableUncertainEffectError("original minute study child receipt is unconfirmed")
+            self.outbox.require_active_claim(command, owner_id=claim.owner_id, claim_token=claim.claim_token)
+        except (_RetryableUncertainEffectError, MinuteParameterStudySubmissionUncertainError) as exc:
+            raise _RetryableUncertainEffectError("original minute study submission is unconfirmed") from exc
+        except Exception as exc:
+            effect = self.outbox.finish_effect(command.command_id, status=PageControlEffectStatus.FAILED,
+                error=f"{type(exc).__name__}: {exc}", owner_id=claim.owner_id, claim_token=claim.claim_token)
+            outcome = self._outcome_from_effect(effect)
+            assert outcome is not None
+            return outcome
+        effect = self.outbox.finish_effect(command.command_id, status=PageControlEffectStatus.SUCCEEDED,
+            result=result, owner_id=claim.owner_id, claim_token=claim.claim_token)
+        outcome = self._outcome_from_effect(effect)
+        assert outcome is not None
+        return outcome
+
     def _must_recover_before_failure(
         self, command: PageControlCommandValue, *, created: bool
     ) -> bool:
+        if type(command) in PROMOTION_OWNED_TYPES:
+            return True
         if type(command) in TASK_CONTROL_OWNED_TYPES:
             try:
                 return self._task_control_backend().has_effect(command)
@@ -3912,6 +4597,9 @@ class PageControlConsumer:
         if isinstance(command, (OwnedSaveStrategyTemplate, OwnedArchiveStrategyTemplate, OwnedRunStrategyTemplate)):
             return not created or self.strategy_authoring_backend is not None
         if isinstance(command, (SubmitPortfolioBacktest, ExportPortfolioBacktestZip)):
+            effect = self.outbox.effect(command.command_id)
+            return effect is not None and effect.result is not None
+        if isinstance(command, (SubmitMinuteReplay, ExportMinuteReplayZip)):
             effect = self.outbox.effect(command.command_id)
             return effect is not None and effect.result is not None
         if isinstance(command, _OwnedSetFactorTracked):
@@ -3981,7 +4669,62 @@ class PageControlConsumer:
             )
         return _ExecutionOutcome(PageControlStatus.FAILED, effect.result, effect.error)
 
+    def _execute_role_change(self, claim: PageControlClaim, effect: PageControlEffectRecord) -> _ExecutionOutcome:
+        from rquant.collaboration_commands import confirm_set_user_role
+        from rquant.collaboration_roles import RoleState
+
+        command = claim.command
+        assert type(command) is SetUserRoleCommand
+        authority = self.outbox.collaboration
+        if authority is None or authority.mode != "enforced":
+            raise PermissionError("current role authority is unavailable")
+        try:
+            with authority.locked() as directory:
+                current = authority._read_locked(directory)
+                if effect.result is None:
+                    after = confirm_set_user_role(current, command,
+                        original_preparation=command.preparation, now=self.clock())
+                    marker = {"contract": "page-control-role-cas/v1", "command_sha256": _command_hash(command),
+                        "before": current.model_dump(mode="json"), "after": after.model_dump(mode="json")}
+                    effect = self.outbox.record_started_effect_result(command.command_id, result=marker,
+                        owner_id=claim.owner_id, claim_token=claim.claim_token)
+                marker = effect.result
+                if not isinstance(marker, dict) or set(marker) != {"contract", "command_sha256", "before", "after"} or marker["contract"] != "page-control-role-cas/v1" or marker["command_sha256"] != _command_hash(command):
+                    raise PermissionError("original role effect binding differs")
+                before = RoleState.model_validate_json(json.dumps(marker["before"]))
+                after = RoleState.model_validate_json(json.dumps(marker["after"]))
+                expected = confirm_set_user_role(before, command,
+                    original_preparation=command.preparation, now=command.preparation.confirmation.issued_at)
+                if expected != after:
+                    raise PermissionError("original role effect result differs")
+                if current == before:
+                    if not any(e.username == command.actor_id and e.role == "admin" for e in current.users):
+                        raise PermissionError("current admin permission is required")
+                    authority._write_locked(directory, after)
+                elif current != after:
+                    raise PermissionError("role CAS generation differs")
+            effect = self.outbox.finish_effect(command.command_id,
+                status=PageControlEffectStatus.SUCCEEDED,
+                result={"status": "role_changed", "revision": after.revision,
+                    "state_sha256": after.content_sha256, "target_id": command.target_id, "role": command.new_role},
+                owner_id=claim.owner_id, claim_token=claim.claim_token)
+        except (ValueError, PermissionError) as exc:
+            effect = self.outbox.finish_effect(command.command_id,
+                status=PageControlEffectStatus.FAILED, error=f"{type(exc).__name__}: role change rejected",
+                owner_id=claim.owner_id, claim_token=claim.claim_token)
+        outcome = self._outcome_from_effect(effect)
+        assert outcome is not None
+        return outcome
+
     def _execute(self, command: PageControlCommandValue) -> JsonValue:
+        if type(command) in PROMOTION_OWNED_TYPES:
+            return self._strategy_promotion_backend().submit(command)
+        self.outbox.require_current_command_role(command)
+        if isinstance(command, (SubmitMinuteReplay, ExportMinuteReplayZip)):
+            effect = self.outbox.effect(command.command_id)
+            if effect is None or effect.result is None:
+                raise RuntimeError("minute frozen admission is unavailable")
+            return self._selected_minute_backend(command).submit(command, effect.result)
         if type(command) in TASK_CONTROL_OWNED_TYPES:
             return self._task_control_backend().submit(command)
         if isinstance(command, EXPERIMENT_COMMAND_TYPES):
@@ -4115,6 +4858,113 @@ class PageControlConsumer:
             raise RuntimeError("formula pool backend is unavailable")
         return self.formula_pool_backend
 
+    def _require_owned_lab_target(self, command: PageControlCommandValue) -> None:
+        authority = self.outbox.collaboration
+        if authority is None or authority.mode != "enforced":
+            return
+        from rquant.lab_job_protocol import SubmitJobCommand
+        from rquant.lab_job_center import LabCommandSubmissionFacade
+        from rquant.lab_page_control import LabPageControlWriter
+        from rquant.portfolio_backtest_commands import PortfolioCommandWriter
+
+        expected_hash, required_domain = None, None
+        if type(command) is ExportPortfolioBacktestZip:
+            backend = self.portfolio_backend
+            if type(backend) is not PortfolioCommandWriter:
+                raise PermissionError("original portfolio target authority is unavailable")
+            expected_hash, required_domain = command.result_hash, "portfolio"
+            job_id, commands = command.job_id, backend.commands
+        elif type(command) is ExportMinuteReplayZip:
+            from rquant.minute_backtest_commands import MinuteCommandWriter
+            backend = self._selected_minute_backend(command)
+            if backend is self.minute_native_report_backend:
+                from rquant.minute_experiment_result_owner import MinuteExperimentProvenance
+                from rquant.web.models.collaboration import MinuteReportOwnerQuery
+
+                actor = self.outbox.trusted_command_actor(command.command_id, _command_hash(command))
+                context = backend.runtime.reader.get_command_context(command.job_id)
+                if actor != command.actor_id or context is None:
+                    raise PermissionError("native minute original target or actor is unavailable")
+                proof = backend.owner_authority._trusted_minute_report_owner(MinuteReportOwnerQuery(
+                    job_id=str(command.job_id), spec_hash=context.job.spec_hash), authenticated_actor_id=actor)
+                sealed = backend.runtime.reader.get_artifact_preview_authority(command.job_id)
+                if type(proof) is not MinuteExperimentProvenance or sealed is None or sealed.evidence.complete_result_hash != command.result_hash:
+                    raise PermissionError("native minute original owner or sealed target differs")
+                if backend.runtime.reader.get_command_context(command.job_id) != context:
+                    raise PermissionError("native minute original target changed before effect")
+                backend.runtime.verify_current()
+                return
+            if type(backend) is not MinuteCommandWriter:
+                raise PermissionError("original minute target authority is unavailable")
+            expected_hash, required_domain = command.result_hash, "minute"
+            job_id, commands = command.job_id, backend.installation.commands
+        elif type(command) in (ExportLabArtifactZip, DiscardLabArtifactZip, SubmitLabCommand):
+            if type(command) is SubmitLabCommand and type(command.command) is SubmitJobCommand:
+                return
+            backend = self.lab_backend
+            if type(backend) is not LabPageControlWriter:
+                raise PermissionError("original Lab target authority is unavailable")
+            job_id = command.command.job_id if type(command) is SubmitLabCommand else command.job_id
+            commands = backend.commands
+        else:
+            return
+        if type(commands) is not LabCommandSubmissionFacade:
+            raise PermissionError("original Lab command owner is unavailable")
+        actor = self.outbox.trusted_command_actor(command.command_id, _command_hash(command))
+        context = commands.reader.get_command_context(job_id)
+        if actor is None or context is None:
+            raise PermissionError("original owned target is unavailable")
+        domains = (required_domain,) if required_domain is not None else ("portfolio", "strategy")
+        owned = False
+        with self.outbox._connect() as connection:
+            connection.execute("PRAGMA query_only = ON")
+            connection.execute("BEGIN")
+            for domain in domains:
+                kind = {"portfolio": "submit_portfolio_backtest", "strategy": "run_strategy_template", "minute": "submit_minute_replay"}[domain]
+                for row in self.outbox._result_submission_rows(connection, kind):
+                    proof = self.outbox._result_submission_binding(row, authority)
+                    if (proof is not None and UUID(proof.job_id) == job_id
+                            and proof.spec_hash == context.job.spec_hash and proof.owner_id == actor):
+                        owned = True
+        if not owned:
+            raise PermissionError("original target belongs to another or unknown owner")
+        if expected_hash is not None:
+            sealed = commands.reader.get_artifact_preview_authority(job_id)
+            if sealed is None or sealed.evidence.complete_result_hash != expected_hash:
+                raise PermissionError("original sealed target differs")
+        if commands.reader.get_command_context(job_id) != context:
+            raise PermissionError("original target changed before effect")
+
+    def _require_factor_job_owner(self, command: _OwnedSubmitFactorRun, *, actor_id: str | None = None) -> None:
+        authority = self.outbox.collaboration
+        if authority is None or authority.mode != "enforced":
+            return
+        actor = actor_id or self.outbox.trusted_command_actor(command.command_id, _command_hash(command))
+        if actor is None or actor != command.actor_id:
+            raise PermissionError("original factor submit actor is unavailable")
+        authority.require_command(actor, command.kind)
+        self._factor_run_backend().validate(command)
+        origin = self.outbox._factor_job_origin(command)
+        if origin is None or origin[0] == command.command_id:
+            return
+        with self.outbox._connect() as connection:
+            connection.execute("PRAGMA query_only = ON")
+            connection.execute("BEGIN")
+            for row in self.outbox._result_submission_rows(connection, command.kind):
+                if row["command_id"] != origin[0]:
+                    continue
+                previous = _COMMAND_ADAPTER.validate_json(row["payload_json"])
+                if (type(previous) is not _OwnedSubmitFactorRun
+                        or previous.ledger_identity != command.ledger_identity or previous.spec != command.spec):
+                    raise PermissionError("original factor submission origin differs")
+                self._factor_run_backend().validate(previous)
+                proof = self.outbox._result_submission_binding(row, authority,
+                    restored_private_owner=previous.actor_id)
+                if proof is not None and proof.owner_id == actor:
+                    return
+                break
+        raise PermissionError("original factor result belongs to another or unknown owner")
+
     def _factor_run_backend(self) -> FactorRunPageControlBackend:
         if self.factor_run_backend is None:
             raise ValueError("factor run backend is not configured")
@@ -4134,6 +4984,12 @@ class PageControlConsumer:
         if self.strategy_authoring_backend is None:
             raise RuntimeError("strategy authoring backend is unavailable")
         return self.strategy_authoring_backend
+
+    def _strategy_promotion_backend(self) -> StrategyPromotionPageControlBackend:
+        from rquant.strategy_promotion import StrategyPromotionPageControlBackend
+        if type(self.strategy_promotion_backend) is not StrategyPromotionPageControlBackend:
+            raise RuntimeError("人工评估暂未开放。")
+        return self.strategy_promotion_backend
 
     @staticmethod
     def _factor_effect_identity(effect: PageControlEffectRecord) -> FactorRegistryIdentity:
@@ -4366,6 +5222,13 @@ class PageControlConsumer:
 
 
     def _recover_started_effect(self, command: PageControlCommandValue) -> JsonValue | None:
+        if isinstance(command, (SubmitMinuteReplay, ExportMinuteReplayZip)):
+            effect = self.outbox.effect(command.command_id)
+            if effect is None or effect.result is None:
+                raise RuntimeError("minute original admission is unavailable")
+            return self._selected_minute_backend(command).recover(command, effect.result)
+        if type(command) in PROMOTION_OWNED_TYPES:
+            return self._strategy_promotion_backend().recover(command)
         if type(command) in TASK_CONTROL_OWNED_TYPES:
             return self._task_control_backend().recover(command)
         if isinstance(command, EXPERIMENT_COMMAND_TYPES):
@@ -5471,11 +6334,45 @@ class PageControlService:
         *,
         outbox: PageControlOutbox,
         consumer: PageControlConsumer,
+        ai_assistance: AIAssistanceOwner | None = None,
+        collaboration: PageControlRoleAuthority | None = None,
     ) -> None:
         self.outbox = outbox
         self.consumer = consumer
+        self._defer_minute_commands = False
+        if ai_assistance is not None and ai_assistance.outbox is not outbox:
+            raise ValueError("AI owner must share the original PageControl SQLite")
+        self.ai_assistance = ai_assistance
+        self.collaboration = collaboration or PageControlRoleAuthority()
+        self.collaboration.bind_outbox(outbox.path)
+        self.outbox.collaboration = self.collaboration
+        from rquant.minute_backtest_commands import MinuteCommandWriter
+        if type(consumer.minute_backend) is MinuteCommandWriter:
+            consumer.minute_backend.bind_owner_authority(self)
+        if consumer.minute_native_report_backend is not None:
+            from rquant.minute_backtest_native_report_runtime import MinuteNativeReportCommandWriter
+
+            if type(consumer.minute_native_report_backend) is not MinuteNativeReportCommandWriter:
+                raise TypeError("native minute reports require their original concrete command writer")
+            consumer.minute_native_report_backend.bind_owner_authority(self)
+        if consumer.minute_study_backend is not None:
+            from rquant.minute_backtest_parameter_study_journal import MinuteParameterStudyCommandWriter
+
+            if type(consumer.minute_study_backend) is not MinuteParameterStudyCommandWriter:
+                raise TypeError("minute study requires its original concrete command writer")
+            consumer.minute_study_backend.bind_owner_authority(self)
+        if consumer.strategy_promotion_backend is not None:
+            backend = consumer._strategy_promotion_backend()
+            if backend.domain.roles is not self.collaboration or self.collaboration.mode != "enforced":
+                raise ValueError("manual promotion must use the same original current-role authority")
 
     def submit(self, command: PageControlCommandValue) -> PageControlReceipt:
+        if isinstance(command, PROMOTION_PUBLIC_TYPES):
+            raise ValueError("manual promotion requires trusted private submission")
+        if self.collaboration.mode == "enforced" and _TRUSTED_COLLABORATION_ACTOR.get() is None:
+            raise PermissionError("command requires the original trusted private ingress")
+        if type(command) is SetUserRoleCommand:
+            raise PermissionError("role command requires its original private confirmation")
         if isinstance(
             command, (SaveStrategyTemplate, ArchiveStrategyTemplate, RunStrategyTemplate)
         ):
@@ -5498,7 +6395,300 @@ class PageControlService:
                 raise ValueError("ack_alert requires verified Serving eligibility")
         else:
             receipt = self.outbox.enqueue(command)
+        if type(command) is SubmitMinuteParameterStudy or (self._defer_minute_commands
+                and isinstance(command, (SubmitMinuteReplay, ExportMinuteReplayZip))):
+            return receipt
         return self._settle(command, receipt)
+
+    def submit_authorized(self, command: PageControlCommandValue, proof: CommandAuthorization) -> PageControlReceipt:
+        verified = self.collaboration.verify_authorization(proof, command.model_dump(mode="json"))
+        token = _TRUSTED_COLLABORATION_ACTOR.set(verified.actor_id)
+        try:
+            return self.submit(command)
+        finally:
+            _TRUSTED_COLLABORATION_ACTOR.reset(token)
+
+    def submit_role(self, command: SetUserRoleCommand, *, authenticated_actor_id: str,
+                    issuance_proof: str) -> PageControlReceipt:
+        self.collaboration.require_command(authenticated_actor_id, command.kind)
+        audit = self.outbox.audit(command.command_id)
+        if audit is not None:
+            require_original_role_command(command, command_id=audit.command_id,
+                command_hash=audit.command_hash, payload_json=self.outbox.original_command_bytes(command.command_id))
+            if self.outbox.trusted_command_actor(command.command_id, audit.command_hash) != authenticated_actor_id:
+                raise PermissionError("original role command actor differs")
+            receipt = self.outbox.receipt(command.command_id)
+            assert receipt is not None
+            return self._settle(command, receipt)
+        self.collaboration.validate_preparation(command,
+            authenticated_actor_id=authenticated_actor_id, issuance_proof=issuance_proof)
+        token = _TRUSTED_COLLABORATION_ACTOR.set(authenticated_actor_id)
+        try:
+            return self._settle(command, self.outbox._enqueue(command))
+        finally:
+            _TRUSTED_COLLABORATION_ACTOR.reset(token)
+
+    def lookup_role(self, command: SetUserRoleCommand, *, authenticated_actor_id: str) -> PageControlReceipt | None:
+        self.collaboration.require_command(authenticated_actor_id, command.kind)
+        audit = self.outbox.audit(command.command_id)
+        if audit is None:
+            return None
+        require_original_role_command(command, command_id=audit.command_id,
+            command_hash=audit.command_hash, payload_json=self.outbox.original_command_bytes(command.command_id))
+        if self.outbox.trusted_command_actor(command.command_id, audit.command_hash) != authenticated_actor_id:
+            raise PermissionError("original role command actor differs")
+        return self.outbox.receipt(command.command_id)
+
+    def collaboration_request(self, message: object) -> object:
+        """Called only by the original FactorDefinitionAdmission peer-UID handler."""
+        from rquant.command_audit_projection import read_command_audit
+        from rquant.web.models.collaboration import CollaborationMe, CollaborationPrivateRequest, RoleLookupData
+
+        if type(message) is not CollaborationPrivateRequest:
+            raise ValueError("exact private collaboration request required")
+        actor = message.authenticated_actor_id
+        operation = message.operation
+        if operation in {"me", "users"}:
+            # Keep the complete read coherent while the original CAS writer waits.
+            with self.collaboration.locked(read_only=True):
+                role = self.collaboration.current_role(actor)
+                if operation == "users":
+                    self.collaboration.require_operation(actor, "GET", "/api/v1/collaboration/users")
+                    return self.collaboration.read_state()
+                state = self.collaboration.read_state()
+                return CollaborationMe(available=True, mode="enforced", username=actor, role=role,
+                    revision=state.revision, state_sha256=state.content_sha256,
+                    can_manage_users=role == "admin", can_research=role in {"admin", "researcher"}, can_read_audit=True)
+        self.collaboration.current_role(actor)
+        if operation == "prepare_role":
+            assert message.role_request is not None
+            return self.collaboration.prepare_role(message.role_request, authenticated_actor_id=actor)
+        if operation == "submit_role":
+            assert message.role_submission is not None
+            return self.submit_role(message.role_submission.command, authenticated_actor_id=actor,
+                issuance_proof=message.role_submission.issuance_proof)
+        if operation == "lookup_role":
+            assert message.role_lookup is not None
+            receipt = self.lookup_role(message.role_lookup.command, authenticated_actor_id=actor)
+            return RoleLookupData(found=receipt is not None,
+                receipt=None if receipt is None else receipt.model_dump(mode="json"))
+        if operation == "authorize_command":
+            assert message.original_command is not None
+            command = parse_page_control_command(message.original_command)
+            # Canonical original body, including defaults, must be forwarded unchanged.
+            return self.collaboration.issue_authorization(actor, command.model_dump(mode="json"))
+        if operation == "audit":
+            assert message.audit_query is not None
+            self.collaboration.require_operation(actor, "GET", "/api/v1/collaboration/audit")
+            state = self.collaboration.read_state()
+            with self.outbox._connect() as connection:
+                connection.execute("PRAGMA query_only = ON")
+                connection.execute("BEGIN")
+                metadata = connection.execute("""
+                    SELECT length(CAST(command_id AS BLOB)),length(CAST(command_hash AS BLOB)),
+                        length(CAST(status AS BLOB)),length(CAST(completed_at AS BLOB)),
+                        length(CAST(authorization_json AS BLOB))
+                    FROM page_control_command ORDER BY rowid DESC LIMIT 4097
+                """).fetchall()
+                if len(metadata) > 4096:
+                    raise ValueError("audit source exceeds original command capacity")
+                total = 0
+                for item in metadata:
+                    sizes = tuple(int(value or 0) for value in item)
+                    total += sum(sizes)
+                    if any(size > 128 for size in sizes[:4]) or sizes[4] > 4096 or total > 4 * 1024 * 1024:
+                        raise ValueError("audit source metadata exceeds read capacity")
+                facts = connection.execute("SELECT command_id,command_hash,status,completed_at,authorization_json FROM page_control_command ORDER BY rowid DESC LIMIT 4097").fetchall()
+                generation = canonical_sha256(tuple(tuple(row) for row in facts))
+                def actual_actor(command_id: str, command_hash: str) -> str | None:
+                    row = self.outbox._bounded_command_row(connection, command_id)
+                    if row is None or row["command_hash"] != command_hash:
+                        return None
+                    proof = self.outbox._row_authorization(row)
+                    return None if proof is None else proof.actor_id
+                page = read_command_audit(connection, state=state, viewer_id=actor,
+                    source_generation=generation, query=message.audit_query, actor_resolver=actual_actor)
+                connection.rollback()
+            after = self.collaboration.read_state()
+            if after != state:
+                raise PermissionError("current audit role generation changed")
+            return page
+        if operation == "result_owner":
+            assert message.owner_query is not None
+            return self._trusted_result_owner(message.owner_query, authenticated_actor_id=actor)
+        if operation == "study_journal":
+            assert message.study_query is not None
+            return self._trusted_minute_study_journal(message.study_query, authenticated_actor_id=actor)
+        if operation == "minute_report_owner":
+            assert message.minute_owner_query is not None
+            return self._trusted_minute_report_owner(message.minute_owner_query, authenticated_actor_id=actor)
+        raise PermissionError("unknown collaboration operation")
+
+    def _trusted_minute_report_owner(self, query: object, *, authenticated_actor_id: str) -> object:
+        from rquant.experiment_platform_projection import ExperimentPrivateResultAuthority
+        from rquant.minute_backtest_commands import MinuteCommandWriter
+        from rquant.minute_backtest_installation import load_minute_replay_installation
+        from rquant.minute_experiment_result_owner import MinuteExperimentResultOwner
+        from rquant.web.models.collaboration import MinuteReportOwnerQuery, ResultOwnerQuery
+
+        if type(query) is not MinuteReportOwnerQuery:
+            raise ValueError("exact minute report ownership query required")
+        with self.collaboration.locked(read_only=True):
+            self.collaboration.require_operation(authenticated_actor_id, "GET",
+                "/api/v1/backtests/minute-runtime/runs/{job_id}/report.html")
+            if query.artifact is not None and query.artifact.private_owner != authenticated_actor_id:
+                raise PermissionError("complete minute artifact belongs to another original actor")
+            try:
+                return self._trusted_result_owner(ResultOwnerQuery(domain="minute", job_id=query.job_id,
+                    spec_hash=query.spec_hash), authenticated_actor_id=authenticated_actor_id)
+            except LookupError:
+                # A missing old submission is distinct from a failed old authorization.
+                pass
+            native = self.consumer.minute_native_report_backend
+            if native is not None:
+                from rquant.minute_backtest_native_report_runtime import MinuteNativeReportCommandWriter
+
+                if type(native) is not MinuteNativeReportCommandWriter or native.owner_authority is not self:
+                    raise PermissionError("native minute report requires the same original bound backend")
+                port = native.runtime.replay_reader(UUID(query.job_id))
+                owner = MinuteExperimentResultOwner(private_authority=port.private_authority,
+                    jobs=port.reader, roles=self.collaboration)
+                provenance = owner.read(UUID(query.job_id), authenticated_actor_id=authenticated_actor_id,
+                    expected_spec_hash=query.spec_hash)
+                result = provenance if query.artifact is None else owner.bind_sealed(provenance, query.artifact,
+                    authenticated_actor_id=authenticated_actor_id)
+                native.runtime.verify_current()
+                return result
+            backend = self.consumer.minute_backend
+            if type(backend) is not MinuteCommandWriter or backend.owner_authority is not self:
+                raise PermissionError("family minute report requires the same original installed backend")
+            installed = backend.installation
+            # Legitimate first Lab reads can establish WAL coordination. Capture
+            # the readonly Registry entrance only after this original preflight.
+            installed.reader.get_artifact_preview_authority(UUID(query.job_id))
+            fresh = load_minute_replay_installation(installed.reference.path,
+                expected_code_sha=installed.profile.code_sha, clock=installed.clock)
+            if (fresh.profile, fresh.reference, fresh.authority) != (
+                installed.profile, installed.reference, installed.authority):
+                raise PermissionError("complete installed minute authority changed before family report")
+            owner = MinuteExperimentResultOwner(private_authority=ExperimentPrivateResultAuthority(fresh.experiments),
+                jobs=fresh.reader, roles=self.collaboration)
+            provenance = owner.read(UUID(query.job_id), authenticated_actor_id=authenticated_actor_id,
+                expected_spec_hash=query.spec_hash)
+            result = provenance if query.artifact is None else owner.bind_sealed(provenance, query.artifact,
+                authenticated_actor_id=authenticated_actor_id)
+            fresh.verify_current()
+            installed.verify_current()
+            return result
+
+    def _trusted_minute_study_journal(self, query: object, *, authenticated_actor_id: str) -> object:
+        from rquant.strict_json import strict_json_loads
+        from rquant.web.models.collaboration import MinuteStudyJournalFact, MinuteStudyJournalQuery
+
+        if type(query) is not MinuteStudyJournalQuery:
+            raise ValueError("exact original study journal query required")
+        command_id = str(query.command_id)
+        with self.collaboration.locked(read_only=True):
+            self.collaboration.require_operation(authenticated_actor_id, "GET",
+                "/api/v1/backtests/minute-runtime/studies/{command_id}")
+            self.collaboration.require_outbox_identity()
+            with self.outbox._connect() as connection:
+                connection.execute("PRAGMA query_only = ON")
+                connection.execute("BEGIN")
+                row = self.outbox._bounded_command_row(connection, command_id)
+                if row is None or row["command_kind"] != "submit_minute_parameter_study":
+                    raise LookupError("original study parent is unavailable")
+                command = _COMMAND_ADAPTER.validate_json(row["payload_json"])
+                proof = self.outbox._row_authorization(row)
+                if (type(command) is not SubmitMinuteParameterStudy or proof is None
+                        or proof.actor_id != authenticated_actor_id or command.actor_id != authenticated_actor_id
+                        or command.command_id != command_id or _command_hash(command) != row["command_hash"]):
+                    raise PermissionError("original study authenticated parent differs")
+                sizes = connection.execute("""
+                    SELECT length(CAST(c.result_json AS BLOB)),length(CAST(e.original_admission_json AS BLOB))
+                    FROM page_control_command c LEFT JOIN page_control_effect e ON e.command_id=c.command_id
+                    WHERE c.command_id=?
+                """, (command_id,)).fetchone()
+                if sizes is None or any(int(value or 0) > 1024 * 1024 for value in sizes):
+                    raise ValueError("original study journal exceeds control capacity")
+                fact = connection.execute("""
+                    SELECT c.status,c.enqueued_at,c.completed_at,c.result_json,
+                        e.command_hash AS effect_hash,e.effect_kind,
+                        CASE WHEN ? THEN e.original_admission_json ELSE NULL END AS admission_json
+                    FROM page_control_command c LEFT JOIN page_control_effect e ON e.command_id=c.command_id
+                    WHERE c.command_id=?
+                """, (query.include_admission, command_id)).fetchone()
+                if fact is None or (fact["effect_hash"] is not None and
+                        (fact["effect_hash"], fact["effect_kind"]) != (row["command_hash"], command.kind)):
+                    raise PermissionError("original study effect has another complete parent")
+                admission = fact["admission_json"]
+                if admission is not None:
+                    strict_json_loads(admission)
+                value = MinuteStudyJournalFact(command=command, command_hash=row["command_hash"],
+                    status=fact["status"], enqueued_at=datetime.fromisoformat(fact["enqueued_at"]),
+                    completed_at=None if fact["completed_at"] is None else datetime.fromisoformat(fact["completed_at"]),
+                    result=None if fact["result_json"] is None else strict_json_loads(fact["result_json"]),
+                    admission_json=admission)
+                connection.rollback()
+            self.collaboration.current_role(authenticated_actor_id)
+            return value
+
+    def _trusted_result_owner(self, query: object, *, authenticated_actor_id: str) -> ResultOwnerProof:
+        from rquant.strict_json import strict_json_loads
+        from rquant.web.models.collaboration import ResultOwnerQuery
+
+        if type(query) is not ResultOwnerQuery:
+            raise ValueError("exact result ownership query required")
+        self.collaboration.current_role(authenticated_actor_id)
+        self.collaboration.require_outbox_identity()
+        kind = {"factor": "submit_factor_run", "portfolio": "submit_portfolio_backtest", "strategy": "run_strategy_template", "minute": "submit_minute_replay"}[query.domain]
+        with self.outbox._connect() as connection:
+            connection.execute("PRAGMA query_only = ON")
+            connection.execute("BEGIN")
+            found = None
+            for row in self.outbox._result_submission_rows(connection, kind):
+                command = _COMMAND_ADAPTER.validate_json(row["payload_json"])
+                result = strict_json_loads(row["verified_effect_result"])
+                if not isinstance(result, dict):
+                    raise PermissionError("original result acceptance is unavailable")
+                if UUID(str(result.get("job_id"))) != UUID(query.job_id):
+                    continue
+                proof = self.outbox._row_authorization(row)
+                restored = None
+                # Only original private owned types, their concrete metadata verifier,
+                # and the exact original job receipt can restore historic provenance.
+                if type(command) is _OwnedSubmitFactorRun:
+                    self.consumer._factor_run_backend().validate(command)
+                    from rquant.factor.job_ledger import FactorEvaluationJobLedger
+                    record = FactorEvaluationJobLedger.open_existing(command.ledger_identity,
+                        clock=self.consumer.clock).lookup_command(command.command_id, command.spec.spec_sha256)
+                    if (record is None or record.spec != command.spec or record.job_id != result.get("job_id")
+                            or result.get("status") != "queued"
+                            or result.get("spec_sha256") != record.spec_sha256
+                            or result.get("definition_version") != command.spec.adapter_request.formula.definition.version):
+                        raise PermissionError("original factor job acceptance differs")
+                    restored = command.actor_id if proof is None else None
+                elif type(command) is OwnedRunStrategyTemplate:
+                    backend = self.consumer._strategy_authoring_backend()
+                    backend.validate(command)
+                    recovered = backend.store.lookup_command(command.original(), owner_id=command.owner_id,
+                        expected_identity=command.metadata_identity)
+                    if recovered is None or recovered.model_dump(mode="json") != result:
+                        raise PermissionError("original strategy job acceptance differs")
+                    restored = command.owner_id if proof is None else None
+                candidate = self.outbox._result_submission_binding(row, self.collaboration,
+                    restored_private_owner=restored)
+                if (candidate is None or candidate.owner_id != authenticated_actor_id
+                        or candidate.spec_hash != query.spec_hash or candidate.job_id != query.job_id):
+                    continue
+                if found is not None and found != candidate:
+                    raise PermissionError("original result has ambiguous submission provenance")
+                found = candidate
+            connection.rollback()
+        self.collaboration.current_role(authenticated_actor_id)
+        if found is None:
+            raise LookupError("original result ownership is unavailable")
+        return found
 
     def _submit_verified_ack(self, command: AckAlert) -> PageControlReceipt:
         """Called only after the local Serving admission checks succeed."""
@@ -5749,6 +6939,12 @@ class PageControlService:
             spec=plan.spec,
             original_request_sha256=request.request_sha256,
         )
+        if self.collaboration.mode == "enforced":
+            with self.collaboration.locked():
+                self.collaboration.require_command(authenticated_actor_id, owned.kind)
+                self.consumer._require_factor_job_owner(owned, actor_id=authenticated_actor_id)
+                receipt = self.outbox.enqueue_trusted_factor_run(owned)
+            return self._settle(owned, receipt, factor_run_command=owned)
         return self._settle(
             owned, self.outbox.enqueue_trusted_factor_run(owned), factor_run_command=owned
         )
@@ -5927,6 +7123,39 @@ class PageControlService:
         )
         return None if matched is None else matched[1]
 
+    def _enqueue_strategy_promotion(self, command: OwnedStrategyPromotionCommand, *, actor_id: str) -> PageControlReceipt:
+        if command.owner_id != actor_id:
+            raise PermissionError("original private actor differs")
+        token = _TRUSTED_COLLABORATION_ACTOR.set(actor_id)
+        try:
+            return self.outbox.enqueue_trusted_strategy_promotion(command)
+        finally:
+            _TRUSTED_COLLABORATION_ACTOR.reset(token)
+
+    def _lookup_trusted_strategy_promotion(self, request: StrategyPromotionCommand, *, authenticated_actor_id: str) -> PageControlReceipt | None:
+        self.consumer._strategy_promotion_backend().authorize(authenticated_actor_id, request, read=True)
+        matched = self.outbox.lookup_strategy_promotion_command(request, authenticated_actor_id=authenticated_actor_id)
+        return None if matched is None else matched[1]
+
+    def _resume_trusted_strategy_promotion(self, request: StrategyPromotionCommand, *, authenticated_actor_id: str) -> PageControlReceipt:
+        self.consumer._strategy_promotion_backend().authorize(authenticated_actor_id, request, read=True)
+        matched = self.outbox.lookup_strategy_promotion_command(request, authenticated_actor_id=authenticated_actor_id)
+        if matched is None:
+            raise KeyError("原评估操作尚未受理。")
+        return self._settle(matched[0], matched[1], strategy_promotion_command=matched[0])
+
+    def _submit_trusted_strategy_promotion(self, request: StrategyPromotionCommand, *, authenticated_actor_id: str,
+            verified_metadata_identity: StrategyAuthoringIdentity) -> PageControlReceipt:
+        backend = self.consumer._strategy_promotion_backend()
+        with self.collaboration.locked():
+            backend.authorize(authenticated_actor_id, request, read=True)
+            matched = self.outbox.lookup_strategy_promotion_command(request, authenticated_actor_id=authenticated_actor_id)
+            if matched is not None:
+                return self._settle(matched[0], matched[1], strategy_promotion_command=matched[0])
+            owned = backend.compile(request, actor_id=authenticated_actor_id, expected_identity=verified_metadata_identity)
+            receipt = self._enqueue_strategy_promotion(owned, actor_id=authenticated_actor_id)
+            return self._settle(owned, receipt, strategy_promotion_command=owned)
+
     def _resume_trusted_strategy_authoring(
         self, request: StrategyTemplateCommand, *, authenticated_actor_id: str
     ) -> PageControlReceipt:
@@ -6028,11 +7257,15 @@ class PageControlService:
         research_query_command: _OwnedSaveResearchQuery | None = None,
         screen_query_command: _OwnedExecuteScreenQuery | _OwnedSaveNlPreset | None = None,
         strategy_authoring_command: OwnedStrategyTemplateCommand | None = None,
+        strategy_promotion_command: OwnedStrategyPromotionCommand | None = None,
         paper_portfolio_command: OwnedPaperPortfolioCommand | None = None,
         task_control_command: OwnedTaskControl | None = None,
     ) -> PageControlReceipt:
         for _ in range(100):
             if receipt.status in _PAGE_CONTROL_TERMINAL_STATUSES:
+                if strategy_promotion_command is not None and receipt.status is PageControlStatus.SUCCEEDED:
+                    if self.consumer._strategy_promotion_backend().recover(strategy_promotion_command) != receipt.result:
+                        raise RuntimeError("原人工阶段回执与命令日志不同。")
                 if task_control_command is not None and receipt.status is PageControlStatus.SUCCEEDED:
                     recovered = self.consumer._task_control_backend().recover(task_control_command)
                     if recovered != receipt.result:
@@ -6055,6 +7288,8 @@ class PageControlService:
                 return receipt
             if task_control_command is not None:
                 drained = self.consumer.drain_task_control_command(task_control_command)
+            elif strategy_promotion_command is not None:
+                drained = self.consumer.drain_strategy_promotion_command(strategy_promotion_command)
             elif paper_portfolio_command is not None:
                 drained = self.consumer.drain_paper_portfolio_command(paper_portfolio_command)
             elif screen_query_command is not None:
@@ -6118,6 +7353,51 @@ class PageControlService:
         backend.validate(owned)
         receipt = self.outbox.enqueue_trusted_task_control(owned)
         return self._settle(owned, receipt, task_control_command=owned)
+
+
+def _private_role_entry(method: Callable[..., object]) -> Callable[..., object]:
+    """Intersect actual original private service entries; generic parsers stay closed."""
+    @wraps(method)
+    def guarded(self: PageControlService, *args: object, **kwargs: object) -> object:
+        if self.collaboration.mode != "enforced":
+            return method(self, *args, **kwargs)
+        actor = kwargs.get("authenticated_actor_id", kwargs.get("authenticated_owner_id"))
+        request = args[0] if args else kwargs.get("command", kwargs.get("request", kwargs.get("draft")))
+        if method.__name__ == "_submit_verified_ack":
+            actor = getattr(request, "actor_id", None)
+        if not isinstance(actor, str):
+            raise PermissionError("original private actor is unavailable")
+        kind = getattr(request, "kind", None)
+        if type(request) is FactorRunRequest:
+            kind = "submit_factor_run"
+        elif "factor_save" in method.__name__:
+            kind = "save_factor_definition"
+        elif kind == "save_nl_preset" and "screen_query" in method.__name__:
+            kind = "save_screen_query_preset"
+        if not isinstance(kind, str):
+            raise PermissionError("original private command kind is unavailable")
+        promotion = method.__name__.endswith("strategy_promotion")
+        if promotion:
+            self.consumer._strategy_promotion_backend().authorize(actor, request, read=True)
+        else:
+            self.collaboration.require_command(actor, kind)
+        token = _TRUSTED_COLLABORATION_ACTOR.set(actor)
+        try:
+            result = method(self, *args, **kwargs)
+            if promotion:
+                self.consumer._strategy_promotion_backend().authorize(actor, request, read=True)
+            else:
+                self.collaboration.require_command(actor, kind)
+            return result
+        finally:
+            _TRUSTED_COLLABORATION_ACTOR.reset(token)
+    return guarded
+
+
+# Only original concrete trusted service methods; no new entry or dispatcher.
+for _private_name in tuple(PageControlService.__dict__):
+    if _private_name.startswith(("_submit_trusted_", "_lookup_trusted_", "_resume_trusted_")) or _private_name == "_submit_verified_ack":
+        setattr(PageControlService, _private_name, _private_role_entry(getattr(PageControlService, _private_name)))
 
 
 PageControlTransport = Callable[[dict[str, object]], dict[str, object]]
@@ -6776,6 +8056,24 @@ def _fsync_descriptor(descriptor: int) -> None:
 
 
 def parse_page_control_command(payload: object) -> PageControlCommandValue:
+    if isinstance(payload, SubmitMinuteParameterStudy):
+        return SubmitMinuteParameterStudy.model_validate(payload)
+    if isinstance(payload, Mapping) and payload.get("kind") == "submit_minute_parameter_study":
+        return SubmitMinuteParameterStudy.model_validate_json(canonical_json_bytes(payload))
+    if isinstance(payload, SubmitMinuteReplay):
+        return SubmitMinuteReplay.model_validate(payload)
+    if isinstance(payload, Mapping) and payload.get("kind") == "submit_minute_replay":
+        return SubmitMinuteReplay.model_validate_json(canonical_json_bytes(payload))
+    if isinstance(payload, ExportMinuteReplayZip):
+        return ExportMinuteReplayZip.model_validate(payload)
+    if isinstance(payload, Mapping) and payload.get("kind") == "export_minute_replay_zip":
+        return ExportMinuteReplayZip.model_validate_json(canonical_json_bytes(payload))
+    if isinstance(payload, PROMOTION_PUBLIC_TYPES) or (
+        isinstance(payload, Mapping) and payload.get("kind") in _STRATEGY_PROMOTION_KINDS
+    ):
+        raise ValueError("manual promotion requires trusted private submission")
+    if isinstance(payload, SetUserRoleCommand) or (isinstance(payload, Mapping) and payload.get("kind") == "set_user_role"):
+        raise ValueError("role command requires trusted private confirmation")
     if isinstance(payload, TASK_CONTROL_PUBLIC_TYPES) or (
         isinstance(payload, Mapping) and payload.get("kind") in TASK_CONTROL_KINDS
     ):

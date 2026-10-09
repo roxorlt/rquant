@@ -19,6 +19,11 @@ class StrategyTemplateHead(RuntimeContractModel):
     spec_fingerprint: Sha256
 
 
+class ExperimentTemplateSelection(RuntimeContractModel):
+    strategy_id: str = Field(pattern=TEMPLATE_ID_PATTERN)
+    head: StrategyTemplateHead
+
+
 class StrategyAuthoringIdentity(RuntimeContractModel):
     instance_id: str = Field(pattern=r"^[0-9a-f]{32}$")
     path: str

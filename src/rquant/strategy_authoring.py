@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from pydantic import Field, JsonValue
 
@@ -61,6 +61,11 @@ from rquant.strategy_template_run_commands import (
 )
 
 if TYPE_CHECKING:
+    from rquant.strategy_promotion_contracts import (
+        PreparedPromotionApproval, StrategyPromotionApproval,
+        StrategyPromotionReview, StrategyPromotionState, StrategyPromotionTarget,
+    )
+    from rquant.strategy_promotion_commands import StrategyPromotionCommand
     from rquant.strategy_template_submission import StrategyTemplateRunBackend
 
 
@@ -708,6 +713,442 @@ class StrategyAuthoringStore:
             if len(rows) > 500:
                 raise StrategyAuthoringIntegrityError("strategy count exceeds read budget")
             return tuple(self.get_current(row[0], owner_id=owner_id) for row in rows)
+
+    @staticmethod
+    def _promotion_schema(connection: sqlite3.Connection, *, create: bool = False) -> bool:
+        tables = {
+            "strategy_manual_stage",
+            "strategy_manual_review",
+            "strategy_manual_preparation",
+            "strategy_manual_approval",
+        }
+        found = {
+            row[0]
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        } & tables
+        if found and found != tables:
+            raise StrategyAuthoringIntegrityError("partial manual promotion schema")
+        if not found and create:
+            connection.execute(
+                "CREATE TABLE strategy_manual_stage(target_key TEXT PRIMARY KEY,owner_id TEXT NOT NULL,state_json TEXT NOT NULL)"
+            )
+            connection.execute(
+                "CREATE TABLE strategy_manual_review(review_id TEXT PRIMARY KEY,command_id TEXT UNIQUE NOT NULL,owner_id TEXT NOT NULL,request_hash TEXT NOT NULL,target_key TEXT NOT NULL,body_json TEXT NOT NULL)"
+            )
+            connection.execute(
+                "CREATE TABLE strategy_manual_preparation(command_id TEXT PRIMARY KEY,owner_id TEXT NOT NULL,request_hash TEXT NOT NULL,body_json TEXT NOT NULL)"
+            )
+            connection.execute(
+                "CREATE TABLE strategy_manual_approval(command_id TEXT PRIMARY KEY,effect_id TEXT UNIQUE NOT NULL,owner_id TEXT NOT NULL,request_hash TEXT NOT NULL,target_key TEXT NOT NULL,body_json TEXT NOT NULL)"
+            )
+            return True
+        return bool(found)
+
+    def _require_promotion_target(
+        self,
+        connection: sqlite3.Connection,
+        target: StrategyPromotionTarget,
+        *,
+        current: bool,
+        verify_builtin: Callable[[StrategyPromotionTarget], None] | None = None,
+    ) -> None:
+        if target.source_kind == "builtin":
+            if verify_builtin is None:
+                raise PermissionError("builtin promotion owner is not explicitly installed")
+            verify_builtin(target)
+            return
+        value = self._version(connection, target.strategy_id, target.head.version, target.owner_id)
+        if (value.head, value.name) != (target.head, target.name):
+            raise StrategyAuthoringIntegrityError(
+                "promotion target differs from original definition"
+            )
+        registration = self.definition_registry(target.strategy_id).read_strategy_spec(
+            target.head.registration_fingerprint
+        )
+        if (
+            registration is None
+            or registration.spec.parameter_fingerprint != target.parameter_fingerprint
+        ):
+            raise StrategyAuthoringIntegrityError(
+                "promotion fixed parameters differ from original definition"
+            )
+        if current:
+            row = self._head_row(connection, target.strategy_id, target.owner_id)
+            self._require_head(row, target.head)
+            if row["archived"]:
+                raise StrategyAuthoringConflict("strategy is archived")
+
+    def _promotion_state_in(
+        self, connection: sqlite3.Connection, target: StrategyPromotionTarget
+    ) -> StrategyPromotionState:
+        from rquant.strategy_promotion_contracts import StrategyPromotionState
+
+        row = connection.execute(
+            "SELECT owner_id,state_json FROM strategy_manual_stage WHERE target_key=?",
+            (target.version_key,),
+        ).fetchone()
+        if row is None:
+            return StrategyPromotionState(target=target)
+        value = StrategyPromotionState.model_validate_json(row[1])
+        if row[0] != target.owner_id or value.target != target:
+            raise StrategyAuthoringIntegrityError("manual stage owner or exact version differs")
+        return value
+
+    def promotion_state(
+        self,
+        target: StrategyPromotionTarget,
+        *,
+        verify_builtin: Callable[[StrategyPromotionTarget], None] | None = None,
+    ) -> StrategyPromotionState:
+        from rquant.strategy_promotion_contracts import StrategyPromotionState
+
+        with self._connection() as connection:
+            self._require_promotion_target(
+                connection, target, current=False, verify_builtin=verify_builtin
+            )
+            if not self._promotion_schema(connection):
+                return StrategyPromotionState(target=target)
+            return self._promotion_state_in(connection, target)
+
+    @staticmethod
+    def _promotion_lookup_in(
+        connection: sqlite3.Connection, request: StrategyPromotionCommand, actor_id: str
+    ) -> StrategyPromotionReview | PreparedPromotionApproval | StrategyPromotionApproval | None:
+        from rquant.strategy_promotion_contracts import (
+            PreparedPromotionApproval,
+            StrategyPromotionApproval,
+            StrategyPromotionReview,
+        )
+
+        rows = []
+        for table in ("command_refs", "run_admissions"):
+            original = connection.execute(
+                f"SELECT owner_id FROM {table} WHERE command_id=?", (request.command_id,)
+            ).fetchone()
+            if original is not None:
+                if original[0] != actor_id:
+                    raise PermissionError("original command belongs to another actor")
+                raise StrategyAuthoringConflict("original UUID has another request kind")
+        if not StrategyAuthoringStore._promotion_schema(connection):
+            return None
+        for table, model in (
+            ("strategy_manual_review", StrategyPromotionReview),
+            ("strategy_manual_preparation", PreparedPromotionApproval),
+            ("strategy_manual_approval", StrategyPromotionApproval),
+        ):
+            row = connection.execute(
+                f"SELECT owner_id,request_hash,body_json FROM {table} WHERE command_id=?",
+                (request.command_id,),
+            ).fetchone()
+            if row is not None:
+                if row[0] != actor_id:
+                    raise PermissionError("original promotion command belongs to another actor")
+                if row[1] != request.request_hash:
+                    raise StrategyAuthoringConflict("original promotion request body differs")
+                rows.append(model.model_validate_json(row[2]))
+        if len(rows) > 1:
+            raise StrategyAuthoringIntegrityError("original promotion UUID has conflicting facts")
+        return rows[0] if rows else None
+
+    def lookup_promotion_command(
+        self, request: StrategyPromotionCommand, *, actor_id: str
+    ) -> StrategyPromotionReview | PreparedPromotionApproval | StrategyPromotionApproval | None:
+        with self._connection() as connection:
+            return self._promotion_lookup_in(connection, request, _owner(actor_id))
+
+    def record_promotion_review(
+        self,
+        request: StrategyPromotionCommand,
+        review: StrategyPromotionReview,
+        *,
+        verify_builtin: Callable[[StrategyPromotionTarget], None] | None = None,
+    ) -> StrategyPromotionReview:
+        from rquant.strategy_promotion_contracts import (
+            MAX_PROMOTION_REVIEWS,
+            StrategyPromotionReview,
+        )
+        from rquant.strategy_promotion_commands import RequestPromotionReview
+
+        review = StrategyPromotionReview.model_validate(review.model_dump(mode="python"))
+        if type(request) is not RequestPromotionReview or (
+            str(review.command_id),
+            review.actor_id,
+            review.target,
+            review.expected_revision,
+            review.selection,
+        ) != (
+            request.command_id,
+            request.target.owner_id,
+            request.target,
+            request.expected_revision,
+            request.selection,
+        ):
+            raise StrategyAuthoringIntegrityError("review differs from its exact request")
+        with self._connection(write=True, expected_identity=review.metadata_identity) as connection:
+            self._promotion_schema(connection, create=True)
+            old = self._promotion_lookup_in(connection, request, review.actor_id)
+            if old is not None:
+                if type(old) is not StrategyPromotionReview:
+                    return self._bad_promotion_kind()
+                return old
+            self._require_promotion_target(
+                connection, review.target, current=True, verify_builtin=verify_builtin
+            )
+            state = self._promotion_state_in(connection, review.target)
+            if (state.revision, state.stage) != (review.expected_revision, review.from_stage):
+                raise StrategyAuthoringConflict("manual stage changed before review")
+            if (
+                connection.execute("SELECT COUNT(*) FROM strategy_manual_review").fetchone()[0]
+                >= MAX_PROMOTION_REVIEWS
+            ):
+                raise StrategyAuthoringConflict("manual review capacity reached")
+            if (
+                connection.execute("SELECT COUNT(*) FROM strategy_manual_stage").fetchone()[0]
+                >= 4096
+                and connection.execute(
+                    "SELECT 1 FROM strategy_manual_stage WHERE target_key=?",
+                    (review.target.version_key,),
+                ).fetchone()
+                is None
+            ):
+                raise StrategyAuthoringConflict("manual version capacity reached")
+            connection.execute(
+                "INSERT INTO strategy_manual_stage VALUES(?,?,?) ON CONFLICT(target_key) DO NOTHING",
+                (review.target.version_key, review.target.owner_id, state.model_dump_json()),
+            )
+            connection.execute(
+                "INSERT INTO strategy_manual_review VALUES(?,?,?,?,?,?)",
+                (
+                    review.review_id,
+                    request.command_id,
+                    review.actor_id,
+                    request.request_hash,
+                    review.target.version_key,
+                    review.model_dump_json(),
+                ),
+            )
+        return review
+
+    @staticmethod
+    def _bad_promotion_kind() -> None:
+        raise StrategyAuthoringIntegrityError("promotion UUID has another original kind")
+
+    def promotion_review(self, review_id: str, *, owner_id: str) -> StrategyPromotionReview:
+        from rquant.strategy_promotion_contracts import StrategyPromotionReview
+
+        with self._connection() as connection:
+            if not self._promotion_schema(connection):
+                raise KeyError("promotion review is unavailable")
+            row = connection.execute(
+                "SELECT owner_id,body_json FROM strategy_manual_review WHERE review_id=?",
+                (review_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError("promotion review is unavailable")
+            if row[0] != owner_id:
+                raise PermissionError("promotion review belongs to another owner")
+            value = StrategyPromotionReview.model_validate_json(row[1])
+            if value.review_id != review_id or value.actor_id != owner_id:
+                raise StrategyAuthoringIntegrityError("review index differs from original fact")
+            return value
+
+    def record_promotion_preparation(
+        self,
+        request: StrategyPromotionCommand,
+        prepared: PreparedPromotionApproval,
+        *,
+        verify_builtin: Callable[[StrategyPromotionTarget], None] | None = None,
+    ) -> PreparedPromotionApproval:
+        from rquant.strategy_promotion_contracts import PreparedPromotionApproval
+        from rquant.strategy_promotion_commands import PreparePromotionApproval
+
+        prepared = PreparedPromotionApproval.model_validate(prepared.model_dump(mode="python"))
+        if type(request) is not PreparePromotionApproval or (
+            str(prepared.preparation_id),
+            prepared.actor_id,
+            prepared.review.target,
+            prepared.review.review_id,
+        ) != (request.command_id, request.target.owner_id, request.target, request.review_id):
+            raise StrategyAuthoringIntegrityError(
+                "preparation differs from its exact original request"
+            )
+        with self._connection(
+            write=True, expected_identity=prepared.review.metadata_identity
+        ) as connection:
+            self._promotion_schema(connection, create=True)
+            old = self._promotion_lookup_in(connection, request, prepared.actor_id)
+            if old is not None:
+                if type(old) is not PreparedPromotionApproval:
+                    self._bad_promotion_kind()
+                return old
+            original = connection.execute(
+                "SELECT body_json FROM strategy_manual_review WHERE review_id=? AND owner_id=?",
+                (request.review_id, prepared.actor_id),
+            ).fetchone()
+            if original is None or original[0] != prepared.review.model_dump_json():
+                raise StrategyAuthoringIntegrityError(
+                    "preparation review is not the recorded original"
+                )
+            self._require_promotion_target(
+                connection, request.target, current=True, verify_builtin=verify_builtin
+            )
+            state = self._promotion_state_in(connection, request.target)
+            if state.revision != prepared.review.expected_revision:
+                raise StrategyAuthoringConflict("manual stage changed before confirmation")
+            if (
+                connection.execute("SELECT COUNT(*) FROM strategy_manual_preparation").fetchone()[0]
+                >= 4096
+            ):
+                raise StrategyAuthoringConflict("manual preparation capacity reached")
+            connection.execute(
+                "INSERT INTO strategy_manual_preparation VALUES(?,?,?,?)",
+                (
+                    request.command_id,
+                    prepared.actor_id,
+                    request.request_hash,
+                    prepared.model_dump_json(),
+                ),
+            )
+        return prepared
+
+    def apply_promotion_approval(
+        self,
+        request: StrategyPromotionCommand,
+        *,
+        effect_id: UUID,
+        verify: Callable[[StrategyPromotionState], None],
+        verify_builtin: Callable[[StrategyPromotionTarget], None] | None = None,
+    ) -> StrategyPromotionApproval:
+        from rquant.strategy_promotion import build_approval
+        from rquant.strategy_promotion_contracts import StrategyPromotionApproval
+
+        review = request.preparation.review
+        with self._connection(write=True, expected_identity=review.metadata_identity) as connection:
+            self._promotion_schema(connection, create=True)
+            old = self._promotion_lookup_in(connection, request, review.actor_id)
+            if old is not None:
+                if type(old) is not StrategyPromotionApproval:
+                    self._bad_promotion_kind()
+                if old.effect_id != effect_id:
+                    raise StrategyAuthoringConflict("original promotion effect differs")
+                return old
+            self._require_promotion_target(
+                connection, request.target, current=True, verify_builtin=verify_builtin
+            )
+            stored = connection.execute(
+                "SELECT body_json FROM strategy_manual_review WHERE review_id=?",
+                (review.review_id,),
+            ).fetchone()
+            if stored is None or stored[0] != review.model_dump_json():
+                raise StrategyAuthoringIntegrityError(
+                    "approval review is not the recorded original"
+                )
+            preparation = connection.execute(
+                "SELECT body_json FROM strategy_manual_preparation WHERE command_id=?",
+                (str(request.preparation.preparation_id),),
+            ).fetchone()
+            if preparation is None or preparation[0] != request.preparation.model_dump_json():
+                raise StrategyAuthoringIntegrityError(
+                    "approval preparation is not the recorded original"
+                )
+            state = self._promotion_state_in(connection, request.target)
+            if (state.revision, state.stage) != (review.expected_revision, review.from_stage):
+                raise StrategyAuthoringConflict("manual stage revision conflict")
+            verify(state)
+            approval = build_approval(request, state, effect_id=effect_id, applied_at=self._now())
+            changed = connection.execute(
+                "UPDATE strategy_manual_stage SET state_json=? WHERE target_key=? AND state_json=?",
+                (
+                    approval.after.model_dump_json(),
+                    request.target.version_key,
+                    state.model_dump_json(),
+                ),
+            ).rowcount
+            if changed != 1:
+                raise StrategyAuthoringConflict("manual stage CAS conflict")
+            connection.execute(
+                "INSERT INTO strategy_manual_approval VALUES(?,?,?,?,?,?)",
+                (
+                    request.command_id,
+                    str(effect_id),
+                    review.actor_id,
+                    request.request_hash,
+                    request.target.version_key,
+                    approval.model_dump_json(),
+                ),
+            )
+        return approval
+
+    def promotion_snapshot(
+        self, *, owner_id: str | None = None
+    ) -> tuple[tuple[StrategyPromotionState, ...], tuple[StrategyPromotionReview, ...]]:
+        from rquant.strategy_promotion_contracts import (
+            StrategyPromotionReview,
+            StrategyPromotionState,
+        )
+
+        with self._connection() as connection:
+            if not self._promotion_schema(connection):
+                return (), ()
+            clause = " WHERE owner_id=?" if owner_id is not None else ""
+            values = () if owner_id is None else (_owner(owner_id),)
+            rows = connection.execute(
+                "SELECT owner_id,target_key,state_json FROM strategy_manual_stage"
+                + clause
+                + " ORDER BY target_key LIMIT 4097",
+                values,
+            ).fetchall()
+            if len(rows) > 4096:
+                raise StrategyAuthoringIntegrityError("manual state capacity exceeded")
+            states = tuple(StrategyPromotionState.model_validate_json(row[2]) for row in rows)
+            if any(
+                (state.target.owner_id, state.target.version_key) != (row[0], row[1])
+                for state, row in zip(states, rows, strict=True)
+            ):
+                raise StrategyAuthoringIntegrityError("manual state index differs from exact fact")
+            reviews = connection.execute(
+                "SELECT body_json FROM strategy_manual_review"
+                + clause
+                + " ORDER BY rowid DESC LIMIT 1000",
+                values,
+            ).fetchall()
+            return states, tuple(
+                StrategyPromotionReview.model_validate_json(row[0]) for row in reviews
+            )
+
+    def promotion_approvals(
+        self, *, owner_id: str | None = None
+    ) -> tuple[StrategyPromotionApproval, ...]:
+        from rquant.strategy_promotion_contracts import StrategyPromotionApproval
+
+        with self._connection() as connection:
+            if not self._promotion_schema(connection):
+                return ()
+            clause = " WHERE owner_id=?" if owner_id is not None else ""
+            values = () if owner_id is None else (_owner(owner_id),)
+            rows = connection.execute(
+                "SELECT command_id,effect_id,owner_id,target_key,body_json FROM strategy_manual_approval"
+                + clause
+                + " ORDER BY rowid DESC LIMIT 12289",
+                values,
+            ).fetchall()
+            if len(rows) > 12288:
+                raise StrategyAuthoringIntegrityError("manual approval capacity exceeded")
+            approvals = tuple(StrategyPromotionApproval.model_validate_json(row[4]) for row in rows)
+            if any(
+                (
+                    str(value.command_id),
+                    str(value.effect_id),
+                    value.actor_id,
+                    value.after.target.version_key,
+                )
+                != (row[0], row[1], row[2], row[3])
+                for row, value in zip(rows, approvals, strict=True)
+            ):
+                raise StrategyAuthoringIntegrityError(
+                    "manual approval index differs from original fact"
+                )
+            return approvals
 
     def admit_run(
         self,

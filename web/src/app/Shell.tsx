@@ -1,8 +1,10 @@
-import { Suspense, useCallback, useEffect, useState } from "react";
+import { Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { Link, Outlet, ScrollRestoration, useLocation, useMatches } from "react-router";
 import { useMeta } from "@/api/useMeta";
 import { readPreference, writePreference } from "@/theme/storage";
 import { PageSkeleton, ServingBanner } from "@/ui";
+import { AiAssistantDrawer } from "./AiAssistantDrawer";
+import { AiUsageDrawer } from "./AiUsageDrawer";
 import { PhoneNav } from "./PhoneNav";
 import { APP_TITLE } from "./pages";
 import { RAIL_STORAGE_KEY, Rail } from "./Rail";
@@ -40,6 +42,9 @@ export function Shell() {
     () => readPreference(RAIL_STORAGE_KEY) === "min",
   );
   const [navOpen, setNavOpen] = useState(false);
+  const [assistantOpen, setAssistantOpen] = useState(false);
+  const [usageOpen, setUsageOpen] = useState(false);
+  const returnFocus = useRef<HTMLElement | null>(null);
   const location = useLocation();
   const meta = useMeta();
   usePageTitle();
@@ -58,10 +63,37 @@ export function Shell() {
 
   const envelope = meta.data;
   const failed = meta.isError && envelope === undefined;
+  const viewer = envelope?.data.viewer ?? null;
+  const openAssistant = useCallback(() => {
+    returnFocus.current =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    setAssistantOpen(true);
+  }, []);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: Viewer changes must close private drawers.
+  useEffect(() => {
+    setAssistantOpen(false);
+    setUsageOpen(false);
+  }, [viewer]);
+  useEffect(() => {
+    const key = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && event.shiftKey && event.key.toLowerCase() === "a") {
+        event.preventDefault();
+        openAssistant();
+      }
+    };
+    window.addEventListener("keydown", key);
+    return () => window.removeEventListener("keydown", key);
+  }, [openAssistant]);
 
   return (
     <div className="shell">
-      <Topbar meta={envelope} metaReceivedAt={meta.dataUpdatedAt} metaFailed={failed} />
+      <Topbar
+        meta={envelope}
+        metaReceivedAt={meta.dataUpdatedAt}
+        metaFailed={failed}
+        onAssistant={openAssistant}
+        onAiUsage={() => setUsageOpen(true)}
+      />
       <div className={railCollapsed ? "app rail-min" : "app"}>
         <Rail collapsed={railCollapsed} onToggle={toggleRail} />
         <main className="content" id="content">
@@ -88,6 +120,19 @@ export function Shell() {
       </div>
       <PhoneNav open={navOpen} onOpen={() => setNavOpen(true)} onClose={() => setNavOpen(false)} />
       <ScrollRestoration />
+      <AiAssistantDrawer
+        key={viewer}
+        open={assistantOpen}
+        viewer={viewer}
+        onClose={() => setAssistantOpen(false)}
+        onClosed={() => returnFocus.current?.focus()}
+      />
+      <AiUsageDrawer
+        key={`usage:${viewer}`}
+        open={usageOpen}
+        viewer={viewer}
+        onClose={() => setUsageOpen(false)}
+      />
     </div>
   );
 }

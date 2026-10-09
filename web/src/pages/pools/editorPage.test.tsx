@@ -2,6 +2,7 @@ import { act, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { HttpResponse, http } from "msw";
 import type { Schemas } from "@/api/client";
+import { readOriginal, saveOriginal } from "@/app/aiAssistanceSession";
 import { metaEnvelope } from "@/test/fixtures";
 import { findJargon } from "@/test/jargon";
 import { renderApp } from "@/test/render";
@@ -11,6 +12,40 @@ import { type EditorJournal, POOL_EDITOR_JOURNAL_KEY } from "./editorSession";
 const serving = metaEnvelope().serving;
 const VERSION = "a".repeat(64);
 const NEXT_VERSION = "b".repeat(64);
+type RunResolver = Parameters<typeof http.post>[1];
+const aiReplies = new Map<string, Schemas["AIRequestView"]>();
+let currentEditor: Schemas["PoolEditorData"];
+function poolAiDraftHandler(resolver: RunResolver) {
+  return http.post("*/api/v1/ai/requests", async (context) => {
+    const body = (await context.request.clone().json()) as Schemas["AIPoolRequest"];
+    const response = await resolver(context);
+    if (!(response instanceof Response))
+      throw new Error("Synthetic resolver must return an actual response");
+    if (!response.ok) return response;
+    const raw = await response.json();
+    const base = currentEditor.pools.find((pool) => pool.key === body.pool_key);
+    if (!base) throw new Error("Original editable pool fixture is absent");
+    const view: Schemas["AIRequestView"] = {
+      request_id: body.request_id,
+      purpose: "pool_edit",
+      state: "completed",
+      created_at: "2026-10-06T06:00:00Z",
+      message: response.ok ? null : raw.detail,
+      result: response.ok
+        ? {
+            purpose: "pool_edit",
+            base_generation_id: raw.base_generation_id,
+            base: { ...base, version: raw.base_version },
+            rule_calls: raw.rule_calls,
+            changes: raw.changes,
+            message: raw.message,
+          }
+        : null,
+    };
+    aiReplies.set(body.request_id, view);
+    return HttpResponse.json({ serving, data: view });
+  });
+}
 const catalog: Schemas["ScreenCatalogData"] = {
   source_kind: "serving",
   nl_generate_available: false,
@@ -172,10 +207,27 @@ const editor: Schemas["PoolEditorData"] = {
   ],
 };
 
-beforeEach(() => window.sessionStorage.clear());
+beforeEach(() => {
+  window.sessionStorage.clear();
+  aiReplies.clear();
+});
 
 function respond(options: { editor?: Schemas["PoolEditorData"]; editorGeneration?: string } = {}) {
+  currentEditor = options.editor ?? editor;
   server.use(
+    http.get("*/api/v1/ai/capabilities", () =>
+      HttpResponse.json({
+        serving,
+        data: { available: true, can_generate: true, daily_limit: 20, remaining_calls: 20 },
+      }),
+    ),
+    http.post("*/api/v1/ai/requests/lookup", async ({ request }) => {
+      const body = (await request.json()) as Schemas["AIPoolRequest"];
+      const view = aiReplies.get(body.request_id);
+      return view
+        ? HttpResponse.json({ serving, data: view })
+        : HttpResponse.json({ detail: "找不到原请求。" }, { status: 404 });
+    }),
     http.get("*/api/v1/pools", () => HttpResponse.json({ data: published, serving })),
     http.get("*/api/v1/pools/editor", () =>
       HttpResponse.json({
@@ -186,6 +238,148 @@ function respond(options: { editor?: Schemas["PoolEditorData"]; editorGeneration
     http.get("*/api/v1/screen/blocks", () => HttpResponse.json({ data: catalog, serving })),
   );
 }
+
+it("继续生成只用于已证明未发出的原池子请求，保留完整正文和未知结果", async () => {
+  respond();
+  const generation = serving.generation_id;
+  if (!generation) throw new Error("Original ready Serving fixture must have a generation");
+  const original: Schemas["AIPoolRequest"] = {
+    purpose: "pool_edit",
+    request_id: "685cf99f-e774-4bb9-a21b-dfe01b859ac3",
+    instruction: "把放量倍数调到 3",
+    pool_key: "user/自建观察",
+    generation_id: generation,
+    expected_version: VERSION,
+  };
+  saveOriginal("tester", "pool:user/自建观察", original);
+  const generated: unknown[] = [];
+  const looked: unknown[] = [];
+  server.use(
+    http.get("*/api/v1/ai/capabilities", () =>
+      HttpResponse.json({
+        serving,
+        data: { available: true, can_generate: false, remaining_calls: 0 },
+      }),
+    ),
+    http.post("*/api/v1/ai/requests/lookup", async ({ request }) => {
+      looked.push(await request.json());
+      return HttpResponse.json({
+        serving,
+        data: {
+          request_id: original.request_id,
+          purpose: "pool_edit",
+          state: generated.length ? "unknown" : "reserved",
+          created_at: "2026-10-06T00:00:00Z",
+          result: null,
+        },
+      });
+    }),
+    http.post("*/api/v1/ai/requests", async ({ request }) => {
+      generated.push(await request.json());
+      return HttpResponse.json({
+        serving,
+        data: {
+          request_id: original.request_id,
+          purpose: "pool_edit",
+          state: "unknown",
+          created_at: "2026-10-06T00:00:00Z",
+          result: null,
+        },
+      });
+    }),
+  );
+  const user = userEvent.setup();
+  renderApp("/pools");
+  await user.click(await screen.findByRole("button", { name: "查看 自建观察条件" }));
+  await user.click(screen.getByRole("button", { name: "用一句话改池子" }));
+  const dialog = screen.getByRole("dialog", { name: "编辑规则" });
+  await user.click(within(dialog).getByRole("button", { name: "继续查看原请求" }));
+  expect(generated).toEqual([]);
+  await user.click(await within(dialog).findByRole("button", { name: "继续生成原请求" }));
+  await waitFor(() => expect(generated).toEqual([original]));
+  await user.click(await within(dialog).findByRole("button", { name: "继续查看原请求" }));
+  await waitFor(() => expect(looked).toEqual([original, original]));
+  expect(generated).toEqual([original]);
+});
+
+it.each(["not_dispatched", "completed"] as const)(
+  "FCR-001 pool preserves a missing original until confirmed %s",
+  async (terminal) => {
+    respond();
+    const generation = serving.generation_id;
+    if (!generation) throw new Error("Original ready Serving fixture must have a generation");
+    const original: Schemas["AIPoolRequest"] = {
+      purpose: "pool_edit",
+      request_id: "685cf99f-e774-4bb9-a21b-dfe01b859ac3",
+      instruction: "把放量倍数调到 3",
+      pool_key: "user/自建观察",
+      generation_id: generation,
+      expected_version: VERSION,
+    };
+    saveOriginal("tester", "pool:user/自建观察", original);
+    const generated: unknown[] = [];
+    const looked: unknown[] = [];
+    server.use(
+      http.get("*/api/v1/ai/capabilities", () =>
+        HttpResponse.json({
+          serving,
+          data: { available: true, can_generate: false, remaining_calls: 0 },
+        }),
+      ),
+      http.post("*/api/v1/ai/requests/lookup", async ({ request }) => {
+        looked.push(await request.json());
+        if (looked.length === 1) {
+          return HttpResponse.json({ detail: "找不到原请求。" }, { status: 404 });
+        }
+        return HttpResponse.json({
+          serving,
+          data: {
+            request_id: original.request_id,
+            purpose: "pool_edit",
+            state: terminal,
+            created_at: "2026-10-06T00:00:00Z",
+            result: null,
+          },
+        });
+      }),
+      http.post("*/api/v1/ai/requests", async ({ request }) => {
+        generated.push(await request.json());
+        return HttpResponse.json({
+          serving,
+          data: {
+            request_id: original.request_id,
+            purpose: "pool_edit",
+            state: "unknown",
+            created_at: "2026-10-06T00:00:00Z",
+            result: null,
+          },
+        });
+      }),
+    );
+    const user = userEvent.setup();
+    renderApp("/pools");
+    await user.click(await screen.findByRole("button", { name: "查看 自建观察条件" }));
+    await user.click(screen.getByRole("button", { name: "用一句话改池子" }));
+    const dialog = screen.getByRole("dialog", { name: "编辑规则" });
+    await user.click(within(dialog).getByRole("button", { name: "继续查看原请求" }));
+    await within(dialog).findByText("暂未查到原请求，请继续原请求。");
+    expect(within(dialog).queryByRole("button", { name: "新建描述" })).not.toBeInTheDocument();
+    expect(within(dialog).queryByText("调用未发出。")).not.toBeInTheDocument();
+    expect(readOriginal("tester", "pool:user/自建观察")).toEqual(original);
+    expect(generated).toEqual([]);
+    await user.click(within(dialog).getByRole("button", { name: "继续生成原请求" }));
+    await within(dialog).findByRole("button", { name: "继续查看原请求" });
+    expect(generated).toEqual([original]);
+    expect(readOriginal("tester", "pool:user/自建观察")).toEqual(original);
+    expect(within(dialog).queryByRole("button", { name: "新建描述" })).not.toBeInTheDocument();
+    await user.click(within(dialog).getByRole("button", { name: "继续查看原请求" }));
+    await user.click(await within(dialog).findByRole("button", { name: "新建描述" }));
+    expect(looked).toEqual([original, original]);
+    expect(readOriginal("tester", "pool:user/自建观察")).toBeNull();
+    expect(within(dialog).getByRole("button", { name: "解析并预览" })).toBeInTheDocument();
+    expect(generated).toEqual([original]);
+  },
+);
 
 it("池子编辑目录不提供尚未接入池子执行的数据项", async () => {
   respond();
@@ -641,9 +835,9 @@ it("previews a sentence edit without changing the draft, then applies, corrects,
   respond();
   const saves: Schemas["SavePoolCommand"][] = [];
   server.use(
-    http.post("*/api/v1/pools/editor/nl-preview", async ({ request }) => {
+    poolAiDraftHandler(async ({ request }) => {
       expect(request.headers.get("X-Rquant-Csrf")).toBe("1");
-      expect(await request.json()).toEqual({
+      expect(await request.json()).toMatchObject({
         pool_key: "user/自建观察",
         generation_id: serving.generation_id,
         expected_version: VERSION,
@@ -707,7 +901,7 @@ it("previews a sentence edit without changing the draft, then applies, corrects,
 it("can undo an applied suggestion without discarding the original rules", async () => {
   respond();
   server.use(
-    http.post("*/api/v1/pools/editor/nl-preview", () =>
+    poolAiDraftHandler(() =>
       HttpResponse.json({
         pool_key: "user/自建观察",
         base_generation_id: serving.generation_id,
@@ -747,7 +941,7 @@ it("can undo an applied suggestion without discarding the original rules", async
 it("keeps undo available after editing pool details and preserves those edits", async () => {
   respond();
   server.use(
-    http.post("*/api/v1/pools/editor/nl-preview", () =>
+    poolAiDraftHandler(() =>
       HttpResponse.json({
         pool_key: "user/自建观察",
         base_generation_id: serving.generation_id,
@@ -793,9 +987,7 @@ it("keeps manual rules when sentence preview is unavailable or returns a stale v
 
   respond();
   server.use(
-    http.post("*/api/v1/pools/editor/nl-preview", () =>
-      HttpResponse.json({ detail: "规则已更新" }, { status: 409 }),
-    ),
+    poolAiDraftHandler(() => HttpResponse.json({ detail: "规则已更新" }, { status: 409 })),
   );
   renderApp("/pools");
   await user.click(await screen.findByRole("button", { name: "查看 自建观察条件" }));
@@ -816,7 +1008,7 @@ it("does not replace a manually edited rule with an authoritative sentence sugge
   respond();
   let previewCalls = 0;
   server.use(
-    http.post("*/api/v1/pools/editor/nl-preview", () => {
+    poolAiDraftHandler(() => {
       previewCalls += 1;
       return HttpResponse.json({ detail: "unexpected request" }, { status: 500 });
     }),
@@ -844,7 +1036,7 @@ it("discards an in-flight suggestion when the description changes", async () => 
   });
   let requests = 0;
   server.use(
-    http.post("*/api/v1/pools/editor/nl-preview", async () => {
+    poolAiDraftHandler(async () => {
       requests += 1;
       await gate;
       return HttpResponse.json({
@@ -998,7 +1190,7 @@ it("keeps a historic operand editable when a suggestion reorders duplicate condi
         serving,
       }),
     ),
-    http.post("*/api/v1/pools/editor/nl-preview", () =>
+    poolAiDraftHandler(() =>
       HttpResponse.json({
         pool_key: pool.key,
         base_generation_id: serving.generation_id,

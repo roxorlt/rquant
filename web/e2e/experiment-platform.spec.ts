@@ -160,7 +160,9 @@ async function syntheticApi(
       } else if (body.kind === "set_experiment_holdout_policy") {
         receipt = { ...common, status: "policy_saved", message: "设置已保存。", version: 2 };
       } else {
-        const count = body.request.method === "random" ? body.request.random_count : 4;
+        const request = body.request;
+        if (!("base_config" in request)) throw new Error("期望组合策略实验请求");
+        const count = request.method === "random" ? request.random_count : 4;
         receipt = {
           ...common,
           status: "registered",

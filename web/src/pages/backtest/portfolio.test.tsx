@@ -29,6 +29,15 @@ const resultHash = portfolioSummary.data.result_hash;
 
 function results() {
   server.use(
+    http.get("*/api/v1/ai/capabilities", () =>
+      HttpResponse.json({
+        serving: metaEnvelope().serving,
+        data: { available: false, can_generate: false },
+      }),
+    ),
+    http.post("*/api/v1/ai/interpretations/read", () =>
+      HttpResponse.json({ detail: "解读尚未配置。" }, { status: 503 }),
+    ),
     http.get(`${base}/capabilities`, () => HttpResponse.json(portfolioCapabilities)),
     http.get(`${base}/runs`, () => HttpResponse.json(portfolioJobs)),
     http.get(`${base}/runs/:job`, () => HttpResponse.json(portfolioSummary)),

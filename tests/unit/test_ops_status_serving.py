@@ -17,6 +17,7 @@ from rquant.ops_status import (
 )
 from rquant.ops_status_serving import (
     collect_and_publish_ops_status,
+    ops_runtime_health_metrics,
     ops_status_source_result,
     publish_ops_status_snapshot,
 )
@@ -137,3 +138,26 @@ def test_invalid_install_signature_never_starts_systemctl_or_publishes(tmp_path:
             collector=collector,
         )
     assert not (tmp_path / "ops-authority").exists()
+
+
+def test_health_cpu_expiry_uses_actual_end_not_later_task_collection_completion() -> None:
+    from tests.unit.test_ops_host_cpu import collector, manifest
+
+    owner, _reads = collector()
+    sample = owner.collect(manifest())
+    end = sample.host_cpu.current.observed_at
+    completed = end + timedelta(seconds=10)
+    sample = OpsSnapshot.model_validate(
+        sample.model_dump(mode="python") | {"sampled_at": completed}
+    )
+    metrics = ops_runtime_health_metrics(ops_status_source_result(sample))
+    cpu = next(item for item in metrics if item.metric_id == "host_cpu")
+    memory = next(item for item in metrics if item.metric_id == "host_memory")
+    boundary = end + timedelta(seconds=120)
+    assert cpu.event_time_end == end and cpu.observed_at == completed
+    assert cpu.validity.valid_until == boundary
+    assert cpu.validity.boundary == "exclusive"
+    assert not cpu.validity.expired_at(boundary - timedelta(microseconds=1))
+    assert cpu.validity.expired_at(boundary)
+    assert cpu.validity.expired_at(boundary + timedelta(microseconds=1))
+    assert memory.validity.valid_until == completed + timedelta(seconds=120)

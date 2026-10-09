@@ -6,6 +6,7 @@ from pydantic import Field, StrictBool, StrictInt, StrictStr
 
 from rquant.runtime_contracts import AwareUtcDatetime, RuntimeContractModel
 from rquant.task_control_commands import TaskControlRequest
+from rquant.monitor_builtin_contracts import BuiltinId
 
 
 class TaskUnitControlChoice(RuntimeContractModel):
@@ -13,6 +14,26 @@ class TaskUnitControlChoice(RuntimeContractModel):
     can_request: StrictBool
     requires_confirmation: StrictBool
     reason: StrictStr = Field(min_length=1, max_length=80)
+    next_allowed_at: AwareUtcDatetime | None = None
+
+
+class NotifierModeControlView(RuntimeContractModel):
+    available: StrictBool = False
+    mode: Literal["shadow", "live"] | None = None
+    revision: StrictInt | None = Field(default=None, ge=0)
+    installation_sha256: StrictStr | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    can_request: StrictBool = False
+    can_set_live: StrictBool = False
+    note: StrictStr = "通知模式暂无法核验。"
+
+
+class MonitorBuiltinControlView(RuntimeContractModel):
+    builtin_id: BuiltinId
+    label: StrictStr = Field(min_length=1, max_length=8)
+    enabled: StrictBool
+    revision: StrictInt = Field(ge=0)
+    installation_sha256: StrictStr | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    can_request: StrictBool = False
 
 
 class TaskSchedulingView(RuntimeContractModel):
@@ -34,6 +55,8 @@ class TaskControlCapabilitiesData(RuntimeContractModel):
     can_recover_units: StrictBool = False
     can_recover_scheduling: StrictBool = False
     scheduling: TaskSchedulingView = TaskSchedulingView()
+    notifier_mode: NotifierModeControlView = NotifierModeControlView()
+    monitor_builtins: tuple[MonitorBuiltinControlView, ...] = Field(default=(), max_length=4)
     note: StrictStr = "任务操作尚未开放。"
 
 
@@ -50,3 +73,5 @@ class TaskControlCommandData(RuntimeContractModel):
     invocation_id: StrictStr | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
     duration_seconds: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     desired_version: StrictInt | None = Field(default=None, ge=0)
+    desired_revision: StrictInt | None = Field(default=None, ge=0)
+    desired_installation_sha256: StrictStr | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")

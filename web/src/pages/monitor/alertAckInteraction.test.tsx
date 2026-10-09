@@ -348,6 +348,21 @@ it("recovers a lost old-version request after a proved no-effect retry on the re
     view.queryClient.invalidateQueries({ queryKey: ["meta"] }),
     view.queryClient.invalidateQueries({ queryKey: ["monitor"] }),
   ]);
+  await waitFor(() => {
+    const current = view.queryClient.getQueryState([
+      "monitor",
+      "timeline",
+      "tester",
+      generation,
+      null,
+      0,
+    ]);
+    expect(current?.fetchStatus).toBe("idle");
+    expect(current?.status).toBe("success");
+    expect(
+      (current?.data as ReturnType<typeof eligibleEnvelope> | undefined)?.serving.generation_id,
+    ).toBe(generation);
+  });
   await user.click(screen.getByRole("button", { name: "继续核对" }));
   await screen.findByText("数据已更新，请刷新后重新确认。");
   expect(posts[1]).toEqual(posts[0]);

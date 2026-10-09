@@ -5,12 +5,14 @@ from __future__ import annotations
 import math
 import os
 from collections import Counter
+from collections.abc import Callable
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from hashlib import sha256
 from io import BytesIO
 from pathlib import Path
 from typing import Literal, Self
+from weakref import WeakKeyDictionary
 
 from pydantic import Field, StrictInt, StrictStr, field_serializer, model_validator
 
@@ -38,6 +40,7 @@ from rquant.serving_price_alert_rule_projection import (
 from rquant.serving_publisher import ServingGenerationLease
 from rquant.serving_read_models import PAGE_PROJECTION_CONTRACTS, ServingProjectionInput
 from rquant.watchlist_quote_gateway import decode_watchlist_quote_payload
+from rquant.strict_json import canonical_json_bytes, strict_canonical_json_loads
 
 _SCOPE_TABLES = (
     "manual_watchlist",
@@ -320,12 +323,40 @@ class PriceQuoteRequestBinding(PriceRuntimeModel):
         return cls.model_validate(facts)
 
 
+class BuiltinQuoteRequestBinding(PriceQuoteRequestBinding):
+    binding_schema: Literal["monitor-watchlist-quote-request/v1"] = "monitor-watchlist-quote-request/v1"
+    scope_kind: Literal["original_pool_watchlist"] = "original_pool_watchlist"
+    watch_basis_sha256: PriceSha256
+    schema_version: Literal[3] = 3
+
+
+def parse_quote_request_binding(raw: str | bytes) -> PriceQuoteRequestBinding | BuiltinQuoteRequestBinding:
+    from rquant.strict_json import strict_json_loads
+
+    value = strict_json_loads(raw)
+    if not isinstance(value, dict):
+        raise ValueError("quote request must be a complete typed binding")
+    model = BuiltinQuoteRequestBinding if value.get("binding_schema") == "monitor-watchlist-quote-request/v1" else PriceQuoteRequestBinding
+    return model.model_validate_json(raw)
+
+
 def freeze_price_quote_request(root: Path, binding: PriceQuoteRequestBinding) -> Path:
-    from rquant.price_alert_runtime_contracts import _activation_bytes
 
     if type(binding) is not PriceQuoteRequestBinding:
         raise TypeError("quote binding must have the exact request type")
     binding = PriceQuoteRequestBinding.model_validate(binding)
+    return _freeze_quote_request(root, binding)
+
+
+def freeze_builtin_quote_request(root: Path, binding: BuiltinQuoteRequestBinding) -> Path:
+    if type(binding) is not BuiltinQuoteRequestBinding:
+        raise TypeError("builtin quotes require their explicit original watchlist request")
+    return _freeze_quote_request(root, BuiltinQuoteRequestBinding.model_validate(binding))
+
+
+def _freeze_quote_request(root: Path, binding: PriceQuoteRequestBinding | BuiltinQuoteRequestBinding) -> Path:
+    from rquant.price_alert_runtime_contracts import _activation_bytes
+
     path = root / f"{binding.request_id}.json"
     from rquant.price_alert_runtime_store import _private_parent
 
@@ -388,41 +419,110 @@ class PriceQuoteSnapshot(PriceRuntimeModel):
     quotes: tuple[PriceQuoteFact, ...]
 
 
+class PriceQuoteFullReadMaterial(PriceRuntimeModel):
+    snapshot: PriceQuoteSnapshot
+    original_rows_json: StrictStr = Field(min_length=1, max_length=4 * 1024 * 1024)
+    request_json: StrictStr = Field(min_length=1, max_length=64 * 1024)
+    envelope_json: StrictStr = Field(min_length=1, max_length=64 * 1024)
+    pointer_json: StrictStr = Field(min_length=1, max_length=64 * 1024)
+
+    @model_validator(mode="after")
+    def actual_rows(self) -> Self:
+        rows = strict_canonical_json_loads(self.original_rows_json)
+        request = parse_quote_request_binding(self.request_json)
+        envelope = BatchEnvelope.model_validate_json(self.envelope_json)
+        pointer = CurrentPointer.model_validate_json(self.pointer_json)
+        if not isinstance(rows, list) or len(rows) != envelope.row_count or len(rows) > 500 or (
+            self.snapshot.batch_id != envelope.batch_id or self.snapshot.payload_sha256 != envelope.content_sha256
+            or self.snapshot.source_generation_id != pointer.source_generation_id or self.snapshot.requested_codes != request.codes
+            or self.snapshot.request_binding_sha256 != sha256(self.request_json.encode()).hexdigest()
+        ):
+            raise ValueError("complete quote material differs from its actual same-read request and batch")
+        original = {item["ts_code"]: item for item in rows}
+        if len(original) != len(rows) or len(rows) != len(self.snapshot.quotes):
+            raise ValueError("complete quote material repeats or omits an original member")
+        for quote in self.snapshot.quotes:
+            row = original.get(quote.ts_code)
+            if row is None or decimal_text(Decimal(str(row["price"]))) != quote.price or datetime.fromisoformat(row["observed_at"]) != quote.observed_at:
+                raise ValueError("complete quote material changed the original values")
+        if len(self.wire_bytes()) > 4 * 1024 * 1024:
+            raise ValueError("complete quote material exceeds the original quote budget")
+        return self
+
+
+class PriceQuoteOwnedRead:
+    __slots__ = ("__weakref__",)
+
+    def __init__(self) -> None:
+        raise TypeError("complete quote material requires the actual original owned read")
+
+
+_QUOTE_READS: WeakKeyDictionary[PriceQuoteOwnedRead, tuple[PriceQuoteFullReadMaterial, LiveBatchSpool, tuple[tuple[Path, tuple[int, ...]], ...]]] = WeakKeyDictionary()
+
+
+def _quote_file_identity(path: Path) -> tuple[int, ...]:
+    info = path.lstat()
+    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_mode, info.st_uid, info.st_nlink
+
+
+def require_price_quote_owned_read(value: object) -> PriceQuoteFullReadMaterial:
+    if type(value) is not PriceQuoteOwnedRead or value not in _QUOTE_READS:
+        raise TypeError("quote material requires the exact original same-read capability")
+    material, spool, files = _QUOTE_READS[value]
+    if (any(_quote_file_identity(path) != identity for path, identity in files)
+            or spool._source_generation(LiveChannel.WATCHLIST_QUOTE) != material.snapshot.source_generation_id):
+        raise ValueError("original quote source changed after the complete owned read")
+    return material
+
+
 def read_latest_price_quote_snapshot(
     spool: LiveBatchSpool,
     *,
     request_root: Path,
-    binding: PriceQuoteRequestBinding,
+    binding: PriceQuoteRequestBinding | BuiltinQuoteRequestBinding,
     evaluated_at: datetime,
     expected_producer_commit: str,
+    owned_read_observer: Callable[[PriceQuoteOwnedRead], None] | None = None,
 ) -> PriceQuoteSnapshot:
     from zoneinfo import ZoneInfo
 
     from pyarrow.parquet import ParquetFile
 
     from rquant.price_alert_runtime_contracts import _activation_bytes
-    from rquant.watchlist_quote_gateway import _COLUMNS
+    from rquant.watchlist_quote_gateway import _COLUMNS, _COLUMNS_V3
 
-    if type(binding) is not PriceQuoteRequestBinding:
+    if type(binding) not in (PriceQuoteRequestBinding, BuiltinQuoteRequestBinding):
         raise TypeError("price quote binding must be exact")
-    binding = PriceQuoteRequestBinding.model_validate(binding)
-    request_payload = _activation_bytes(request_root / f"{binding.request_id}.json", request_root)
+    if type(binding) is BuiltinQuoteRequestBinding and owned_read_observer is None:
+        raise TypeError("builtin quotes require the complete original owned read")
+    binding = type(binding).model_validate(binding)
+    request_path = request_root / f"{binding.request_id}.json"
+    owned_identities = [] if owned_read_observer is not None else None
+    if owned_identities is not None:
+        owned_identities.append((request_path, _quote_file_identity(request_path)))
+    request_payload = _activation_bytes(request_path, request_root)
     if request_payload != binding.wire_bytes():
         raise ValueError("price quotes lack the original pre-call request binding")
     channel = LiveChannel.WATCHLIST_QUOTE
     pointer_path = spool._current_path(channel)
+    if owned_identities is not None:
+        owned_identities.append((pointer_path, _quote_file_identity(pointer_path)))
     before = _secure_read_regular_file(
         pointer_path, label="price quote pointer", max_bytes=64 * 1024
     )
     pointer = CurrentPointer.model_validate_json(before)
+    columns = _COLUMNS_V3 if owned_read_observer is not None and binding.schema_version == 3 else _COLUMNS
     if (
         pointer.channel is not channel
         or pointer.source_generation_id != binding.quote_source_generation_id
         or spool._source_generation(channel) != pointer.source_generation_id
     ):
         raise ValueError("price quote source generation differs from the actual request")
+    manifest_path = spool._manifest_path(channel, pointer.sequence)
+    if owned_identities is not None:
+        owned_identities.append((manifest_path, _quote_file_identity(manifest_path)))
     manifest_payload = _secure_read_regular_file(
-        spool._manifest_path(channel, pointer.sequence),
+        manifest_path,
         label="price quote batch envelope",
         max_bytes=64 * 1024,
     )
@@ -452,8 +552,11 @@ def read_latest_price_quote_snapshot(
         )
     ):
         raise ValueError("price quote envelope does not match the authoritative original request")
+    payload_path = spool._payload_path(channel, pointer.sequence)
+    if owned_identities is not None:
+        owned_identities.append((payload_path, _quote_file_identity(payload_path)))
     payload = _secure_read_regular_file(
-        spool._payload_path(channel, pointer.sequence),
+        payload_path,
         label="price quote payload",
         max_bytes=4 * 1024 * 1024,
     )
@@ -462,8 +565,8 @@ def read_latest_price_quote_snapshot(
     parquet = ParquetFile(BytesIO(payload))
     if (
         parquet.metadata.num_rows != envelope.row_count
-        or parquet.metadata.num_columns != len(_COLUMNS)
-        or tuple(parquet.schema_arrow.names) != _COLUMNS
+        or parquet.metadata.num_columns != len(columns)
+        or tuple(parquet.schema_arrow.names) != columns
         or sum(
             parquet.metadata.row_group(i).total_byte_size
             for i in range(parquet.metadata.num_row_groups)
@@ -517,7 +620,7 @@ def read_latest_price_quote_snapshot(
         raise ValueError("price quote current pointer changed during inspection")
     if spool._source_generation(channel) != pointer.source_generation_id:
         raise ValueError("price quote source changed during inspection")
-    return PriceQuoteSnapshot(
+    snapshot = PriceQuoteSnapshot(
         scope_generation_id=binding.scope_generation_id,
         scope_manifest_sha256=binding.scope_manifest_sha256,
         source_generation_id=pointer.source_generation_id,
@@ -531,3 +634,26 @@ def read_latest_price_quote_snapshot(
         requested_codes=binding.codes,
         quotes=tuple(sorted(quotes, key=lambda item: item.ts_code)),
     )
+    if owned_read_observer is not None:
+        import pandas as pd
+
+        rows = []
+        for original in frame.to_dict(orient="records"):
+            row = {}
+            for key, item in original.items():
+                if isinstance(item, (date, datetime)):
+                    item = item.isoformat()
+                elif pd.isna(item):
+                    item = None
+                elif hasattr(item, "item"):
+                    item = item.item()
+                row[key] = item
+            rows.append(row)
+        material = PriceQuoteFullReadMaterial(snapshot=snapshot, original_rows_json=canonical_json_bytes(rows).decode(),
+            request_json=request_payload.decode(), envelope_json=manifest_payload.decode(), pointer_json=before.decode())
+        value = object.__new__(PriceQuoteOwnedRead)
+        if any(_quote_file_identity(path) != identity for path, identity in owned_identities):
+            raise ValueError("original quote files changed during the complete same-read material capture")
+        _QUOTE_READS[value] = material, spool, tuple(owned_identities)
+        owned_read_observer(value)
+    return snapshot

@@ -10,9 +10,10 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from datetime import time as dt_time
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pandas as pd
 from loguru import logger
@@ -20,6 +21,9 @@ from pydantic import BaseModel
 
 from rquant.panorama_data import compute_market_pulse
 from rquant.surge_watch import grid_index
+
+if TYPE_CHECKING:
+    from rquant.monitor_builtin_runtime import OriginalBuiltinSourceOutlet
 
 PULSE_FILE_PREFIX = "pulse-"
 ALERTS_FILE_PREFIX = "pulse_alerts-"
@@ -205,15 +209,29 @@ class PulseSession:
         config: PulseConfig | None = None,
         notify_fn: Callable[..., None] | None = None,
         dry_run: bool = False,
+        builtin_outlet: OriginalBuiltinSourceOutlet | None = None,
+        market_universe: tuple[str, ...] = (),
+        builtin_clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.live_dir = live_dir
         self.day = day
         self.dry_run = dry_run
         self.notify_fn = notify_fn
+        self.builtin_outlet = builtin_outlet
+        self.market_universe = market_universe
+        self.builtin_clock = builtin_clock or (lambda: datetime.now(UTC))
+        if builtin_outlet is not None:
+            from rquant.monitor_builtin_runtime import require_original_builtin_source_outlet
+
+            require_original_builtin_source_outlet(builtin_outlet)
+            if not builtin_outlet.captures("original_pulse"):
+                self.builtin_outlet = None
         self.watcher = PulseAnomalyWatcher(config)
         try:
             seeded = self.watcher.seed(read_pulse_points(pulse_path(live_dir, day)))
         except Exception as e:
+            if self.builtin_outlet is not None:
+                self.builtin_outlet.unavailable(origins=("original_pulse",), observed_at=self.builtin_clock(), reason="pulse_capture_unavailable")
             logger.warning(f"pulse seed 失败（从空滑窗开始，不阻塞启动）: {type(e).__name__}: {e}")
             seeded = 0
         if seeded:
@@ -223,12 +241,16 @@ class PulseSession:
         try:
             return self._on_snapshot(snapshot, now)
         except Exception as e:
+            if self.builtin_outlet is not None:
+                self.builtin_outlet.unavailable(origins=("original_pulse",), observed_at=self.builtin_clock(), reason="pulse_capture_unavailable")
             logger.warning(f"pulse 挂钩异常（不影响主循环）: {type(e).__name__}: {e}")
             return []
 
     def _on_snapshot(self, snapshot: pd.DataFrame, now: datetime) -> list[PulseAlert]:
         pulse = compute_market_pulse(snapshot)
         if pulse.total_count == 0:
+            if self.builtin_outlet is not None:
+                self.builtin_outlet.unavailable(origins=("original_pulse",), observed_at=self.builtin_clock(), reason="pulse_snapshot_empty")
             return []
         point = PulsePoint(
             t=now.strftime("%H:%M"),
@@ -246,8 +268,13 @@ class PulseSession:
                 f"{a.message}｜当前 涨停 {point.limit_up} / 跌停 {point.limit_down}"
                 f" / 炸板 {point.broken} / 上涨占比 {ratio_txt}"
             )
+            if self.builtin_outlet is not None:
+                continue
             if self.dry_run or self.notify_fn is None:
                 print(f"\n===== [DRY-RUN] {title} =====\n{body}\n")
             else:
                 self.notify_fn("pulse_alert", title=title, body=body)
+        if self.builtin_outlet is not None:
+            self.builtin_outlet.pulse_snapshot(snapshot=snapshot, session=self, point=point, alerts=tuple(alerts),
+                observed_at=now, available_at=self.builtin_clock(), market_universe=self.market_universe)
         return alerts

@@ -1,0 +1,60 @@
+.exp-native-controls {
+  min-inline-size: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.exp-native-config {
+  min-width: 0;
+}
+
+.exp-native-tip {
+  min-height: 32px;
+  padding: 0;
+  border: 0;
+  border-bottom: 1px dotted var(--muted);
+  background: none;
+  color: inherit;
+  font: inherit;
+  cursor: help;
+}
+
+.exp-native-tip:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.exp-native-parameters,
+.exp-native-quantities {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.exp-native-parameters > div {
+  margin-bottom: 6px;
+}
+
+.exp-native-parameters dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.exp-native-parameters dd .exp-native-tip {
+  margin-left: 8px;
+}
+
+@media (max-width: 640px) {
+  .exp-native-config {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .exp-native-tip {
+    min-height: 44px;
+  }
+}
+
+.exp-native-controls:disabled .exp-native-tip {
+  pointer-events: none;
+}

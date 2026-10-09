@@ -20,6 +20,9 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Annotated, Self
 
 if TYPE_CHECKING:
+    from rquant.factor.job_ledger import FactorLedgerIdentity
+    from rquant.collaboration_commands import PageControlRoleAuthority
+    from rquant.web.models.collaboration import ResultOwnerProof
     from rquant.condition_alert_runtime_projection import ConditionRuleAuthoritySnapshot
     from rquant.factor.tracking import FactorTrackingIdentity
     from rquant.screen.intraday_source import IntradayScreenProjectionSource
@@ -1020,6 +1023,98 @@ class _ReadonlyPageControlAuditReader:
         with self._connect() as connection, interruptible_read(connection):
             yield connection
 
+    def collaboration_projections(
+        self, collaboration: PageControlRoleAuthority, *, observed_at: datetime,
+    ) -> tuple[ServingProjectionPayload, ...]:
+        from rquant.collaboration_commands import PageControlRoleAuthority
+        from rquant.command_audit_projection import read_command_audit_source
+
+        if type(collaboration) is not PageControlRoleAuthority:
+            raise PermissionError("original role authority is required")
+        identity = collaboration.require_outbox_path(self.path)
+        observed = normalize_aware_utc(observed_at)
+        state = collaboration.read_state()
+        if self._snapshot_connection is None:
+            with self.snapshot():
+                return self.collaboration_projections(collaboration, observed_at=observed)
+        connection = self._snapshot_connection
+
+        def actual_actor(command_id: str, command_hash: str) -> str | None:
+            row = PageControlOutbox._bounded_command_row(connection, command_id)
+            if row is None or row["command_hash"] != command_hash:
+                raise PermissionError("original audit command binding differs")
+            proof = PageControlOutbox._journal_authorization(row, collaboration)
+            return None if proof is None else proof.actor_id
+
+        window = read_command_audit_source(connection, actor_resolver=actual_actor)
+        generation = canonical_sha256({"journal_identity": identity,
+            "role_state_sha256": state.content_sha256, "window": window})
+        projections = (
+            ServingProjectionPayload(table_name="collaboration_role", available_at=observed,
+                rows=tuple({**entry.model_dump(mode="json"), "ordinal": ordinal, "revision": state.revision,
+                    "state_sha256": state.content_sha256} for ordinal, entry in enumerate(state.users))),
+            ServingProjectionPayload(table_name="command_audit_window", available_at=observed,
+                rows=({"window_key": "current", "source_generation": generation,
+                    "journal_identity": identity,
+                    "role_revision": state.revision, "role_state_sha256": state.content_sha256,
+                    "row_count": len(window.items), "has_more": window.has_more},)),
+            ServingProjectionPayload(table_name="command_audit", available_at=observed,
+                rows=tuple(item.model_dump(mode="json", exclude={"schema_version"}) for item in window.items)),
+        )
+        if collaboration.read_state() != state or collaboration.require_outbox_path(self.path) != identity:
+            raise PermissionError("original role or journal generation changed during projection")
+        return projections
+
+    def result_submission_bindings(
+        self, collaboration: PageControlRoleAuthority, *, domain: str,
+        factor_ledger_identity: FactorLedgerIdentity | None = None,
+    ) -> tuple[ResultOwnerProof, ...]:
+        """Read actual accepted command/effect pairs from this bound original journal."""
+        from rquant.collaboration_commands import PageControlRoleAuthority
+
+        kinds = {"factor": "submit_factor_run", "portfolio": "submit_portfolio_backtest",
+            "strategy": "run_strategy_template"}
+        if type(collaboration) is not PageControlRoleAuthority or domain not in kinds:
+            raise PermissionError("exact bound original ownership source required")
+        if domain == "factor":
+            from rquant.factor.job_ledger import FactorLedgerIdentity
+            if type(factor_ledger_identity) is not FactorLedgerIdentity:
+                raise PermissionError("original factor ledger instance is required")
+        elif factor_ledger_identity is not None:
+            raise PermissionError("factor ledger cannot authorize another result domain")
+        identity = collaboration.require_outbox_path(self.path)
+        state = collaboration.read_state()
+        if self._snapshot_connection is None:
+            with self.snapshot():
+                return self.result_submission_bindings(collaboration, domain=domain,
+                    factor_ledger_identity=factor_ledger_identity)
+        connection = self._snapshot_connection
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(page_control_command)")}
+        if "authorization_json" not in columns:
+            return ()
+        found = {}
+        for row in PageControlOutbox._result_submission_rows(connection, kinds[domain]):
+            if row["authorization_json"] is None:
+                continue
+            if domain == "factor":
+                from rquant.page_control import _COMMAND_ADAPTER, _OwnedSubmitFactorRun
+                command = _COMMAND_ADAPTER.validate_json(row["payload_json"])
+                if type(command) is not _OwnedSubmitFactorRun:
+                    raise PermissionError("original private factor submission is required")
+                if factor_ledger_identity is None or command.ledger_identity != factor_ledger_identity:
+                    continue
+            proof = PageControlOutbox._result_submission_binding(row, collaboration)
+            if proof is None or proof.owner_id not in {entry.username for entry in state.users}:
+                continue
+            key = proof.job_id, proof.spec_hash
+            previous = found.get(key)
+            if previous is not None and previous != proof:
+                raise PermissionError("result has ambiguous original submission provenance")
+            found[key] = proof
+        if collaboration.read_state() != state or collaboration.require_outbox_path(self.path) != identity:
+            raise PermissionError("original result role or journal generation changed")
+        return tuple(found[key] for key in sorted(found))
+
     @contextmanager
     def snapshot(self) -> Iterator[None]:
         if self._snapshot_connection is not None:
@@ -1152,6 +1247,10 @@ class _ReadonlyPageControlAuditReader:
         return after
 
     def _validate_schema_connection(self, connection: sqlite3.Connection) -> None:
+        additive_columns = {
+            "page_control_command": {"authorization_json": ("TEXT", 0, None, 0)},
+            "page_control_effect": {"original_admission_json": ("TEXT", 0, None, 0)},
+        }
         for table_name, expected in self._REQUIRED_TABLES.items():
             rows = connection.execute(f"PRAGMA table_info({table_name})").fetchall()
             observed = {
@@ -1163,7 +1262,8 @@ class _ReadonlyPageControlAuditReader:
                 )
                 for row in rows
             }
-            if observed != expected:
+            extended = {**expected, **additive_columns.get(table_name, {})}
+            if observed != expected and observed != extended:
                 raise PageProjectionSourceIntegrityError(
                     "PageControl audit schema is invalid or incomplete"
                 )
@@ -1305,6 +1405,11 @@ class _ReadonlyPageControlAuditReader:
             raise PageProjectionSourceIntegrityError(
                 "PageControl alert authority snapshot is invalid"
             ) from exc
+
+    def ai_assistance_projections(self, observed_at: datetime) -> tuple[ServingProjectionPayload, ...]:
+        from rquant.ai_assistance import build_ai_page_projections
+        with self._read_connection() as connection:
+            return build_ai_page_projections(connection, observed_at)
 
     def manual_watchlist_snapshot(self) -> ManualWatchlistAuthoritySnapshot | None:
         """Read activation and the full bounded row set in the pinned audit transaction."""
@@ -2974,6 +3079,11 @@ class DuckDBSignalPageProjectionSource:
                 available,
                 max(item.updated_at for item in canvas_definitions),
             )
+        try:
+            ai_projections=() if self.page_control_outbox is None else self.page_control_outbox.ai_assistance_projections(observed)
+        except (OSError,sqlite3.Error,ValueError) as error:
+            logger.warning("助手页面来源暂不可用：{}",error)
+            ai_projections=()
         return SignalPageProjectionSnapshot.create(
             available_at=available,
             screen_bounds=screen_bounds,
@@ -3017,6 +3127,7 @@ class DuckDBSignalPageProjectionSource:
             ),
             condition_alert_rule_state=condition_rules[0],
             condition_alert_rule=condition_rules[1],
+            ai_projections=ai_projections,
         )
 
     def legacy_notification_projections(
@@ -4444,6 +4555,7 @@ class SignalPageProjectionProducer:
                     "alert_ack",
                     "manual_watchlist_state",
                     "manual_watchlist",
+                    "ai_news_digest", "ai_interpretation", "ai_usage_day",
                     "price_alert_rule_state",
                     "price_alert_rule",
                 }
@@ -5438,6 +5550,7 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
             "canvas_definition",
         }
         optional_names = {
+            "ai_news_digest", "ai_interpretation", "ai_usage_day",
             "pool_definition",
             "formula_pool_state",
             "formula_pool_definition",
@@ -5462,6 +5575,9 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
             "legacy_notification",
             "legacy_notification_status",
         }
+        ai_names={item.table_name for item in self.projections if item.table_name.startswith("ai_")}
+        if ai_names and ai_names!={"ai_news_digest","ai_interpretation","ai_usage_day"}:
+            raise ValueError("AI projection group is incomplete")
         published_names = {item.table_name for item in self.projections}
         if not required_names.issubset(published_names) or not published_names.issubset(
             required_names | optional_names
@@ -5512,6 +5628,7 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
         condition_alert_rule: ServingProjectionPayload | None = None,
         legacy_notification: ServingProjectionPayload | None = None,
         legacy_notification_status: ServingProjectionPayload | None = None,
+        ai_projections: tuple[ServingProjectionPayload,...] = (),
     ) -> SignalPageProjectionSnapshot:
         available = normalize_aware_utc(available_at)
         rows = {
@@ -5590,6 +5707,14 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
                 if projection.table_name != table_name:
                     raise ValueError("signal event projection has the wrong table")
                 optional.append(projection)
+        if ai_projections:
+            candidate=(*projections,*optional,*ai_projections)
+            try:
+                require_projection_owner_budget(tuple(ServingProjectionInput(**item.model_dump(mode="python"),owner_dataset_id="signals",owner_generation_id="0"*64) for item in candidate))
+                optional.extend(ai_projections)
+            except ValueError:
+                # Optional new facts cannot displace the accepted complete original owner.
+                pass
         projections = tuple(sorted((*projections, *optional), key=lambda item: item.table_name))
         snapshot_available = max(item.available_at for item in projections)
         identity = {"available_at": snapshot_available, "projections": projections}

@@ -21,8 +21,15 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from rquant.alert_ack import stable_alert_id, stable_signal_alert_id
+from rquant.alert_ack_read import read_alert_ack as read_domain_alert_ack
+from rquant.condition_alert_runtime_projection import (
+    MonitorRuntimeProjectionSnapshot,
+    read_condition_triggers,
+    read_monitor_runtime,
+)
 from rquant.dashboard.runtime_console_data import DeliveryRow, SignalRow
 from rquant.page_control import AckAlert, PageControlReceipt, PageControlStatus
+from rquant.pulse_watch import PulseAlert
 from rquant.runtime_contracts import AwareUtcDatetime
 from rquant.serving_contracts import FreshnessStatus
 from rquant.web import readers
@@ -45,10 +52,16 @@ from rquant.web.models.alert_ack import (
     UnacknowledgedSummary,
 )
 from rquant.web.models.monitor import (
+    MonitorBuiltinStatus,
+    MonitorBuiltinTrigger,
+    MonitorChannelAttempt,
     MonitorChannelsData,
     MonitorChannelSubmission,
+    MonitorConditionTrigger,
     MonitorNotification,
     MonitorReceipt,
+    MonitorRuntimeChannel,
+    MonitorRuntimeData,
     MonitorSignal,
     MonitorSurge,
     MonitorTimelineData,
@@ -116,6 +129,8 @@ _TRIGGER_LABELS = {
     "stop_weak": "弱势止损档",
 }
 _SURGE_STATUS = {"confirmed": "已确认", "unbuyable": "临近涨停"}
+_BUILTIN_LABELS = {"pool2_levels": "回踩档位", "pool_attack": "攻击信号", "surge": "爆量", "pulse": "市场异动"}
+_SOURCE_LABELS = {"ready": "正常", "waiting": "等待", "stale": "陈旧", "disconnected": "断开", "unknown": "未知", "disabled": "未运行"}
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 _CHANNELS = (("pushdeer", CHANNEL_LABELS["pushdeer"]), ("pushplus", CHANNEL_LABELS["pushplus"]))
 _MAX_LEGACY_NOTIFICATIONS = 10_000
@@ -158,9 +173,15 @@ class _Cursor(BaseModel):
     page_size: int = Field(ge=1, le=50)
 
 
+class _OwnerCursor(_Cursor):
+    kind: Literal["monitor_timeline_v2"]
+    last_rank: int = Field(ge=1, le=7)
+    actor_key: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 @dataclass(frozen=True)
 class _Event:
-    kind: Literal["signal", "monitor", "surge", "notification"]
+    kind: Literal["signal", "monitor", "surge", "notification", "builtin", "condition", "channel_attempt"]
     at: datetime
     rank: int
     sort_key: str
@@ -171,13 +192,13 @@ def _segment(raw: bytes) -> str:
     return urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
 
-def _encode_cursor(cursor: _Cursor, key: bytes) -> str:
+def _encode_cursor(cursor: _Cursor | _OwnerCursor, key: bytes) -> str:
     payload = cursor.model_dump_json().encode("utf-8")
     signature = hmac.new(key, payload, hashlib.sha256).digest()
     return f"{_segment(payload)}.{_segment(signature)}"
 
 
-def _decode_cursor(token: str, key: bytes) -> _Cursor:
+def _decode_cursor(token: str, key: bytes) -> _Cursor | _OwnerCursor:
     try:
         if len(token) > 512:
             raise ValueError("cursor too long")
@@ -192,9 +213,132 @@ def _decode_cursor(token: str, key: bytes) -> _Cursor:
             raise ValueError("non-canonical cursor encoding")
         if not hmac.compare_digest(hmac.new(key, payload, hashlib.sha256).digest(), signature):
             raise ValueError("cursor signature differs")
-        return _Cursor.model_validate_json(payload)
+        try:
+            return _Cursor.model_validate_json(payload)
+        except ValidationError:
+            return _OwnerCursor.model_validate_json(payload)
     except (UnicodeError, ValueError, TypeError, ValidationError) as error:
         raise HTTPException(status_code=409, detail="数据已更新，请重新查看告警时间线。") from error
+
+
+def _actor_key(actor_id: str | None) -> str:
+    return hashlib.sha256(("monitor-viewer/v1:" + (actor_id or "")).encode()).hexdigest()
+
+
+def _runtime_or_none(borrowed: BorrowedGeneration, *, now: datetime) -> MonitorRuntimeProjectionSnapshot | None:
+    try:
+        return read_monitor_runtime(borrowed, now=now)
+    except (TypeError, ValueError, RuntimeError):
+        return None
+
+
+def _runtime_data(runtime: MonitorRuntimeProjectionSnapshot | None, *, viewer: str | None,
+    now: datetime,
+) -> MonitorRuntimeData:
+    if runtime is None or viewer is None:
+        return MonitorRuntimeData(state="unavailable", source_label="监控事实未就绪", source_note="尚未核对原运行来源。")
+    builtins = []
+    for row in runtime.builtin_heads:
+        head = row.head
+        if head.owner_id != viewer:
+            continue
+        state = head.source_state
+        if state == "ready" and (not row.current_source_ready or row.source_valid_until is None or now > row.source_valid_until):
+            state = "stale"
+        builtins.append(MonitorBuiltinStatus(builtin_id=head.builtin_id, label=_BUILTIN_LABELS[head.builtin_id],
+            enabled=head.definition.enabled, state=state, state_label=_SOURCE_LABELS[state], source_note=head.reason,
+            observed_at=head.observed_at, evaluated_at=head.evaluated_at, source_valid_until=row.source_valid_until,
+            last_triggered_at=head.last_triggered_at, matched_count=head.matched_count,
+            channels=[channel.value for channel in head.definition.channels],
+            applied_revision=head.applied_revision, applied_command_id=head.applied_command_id,
+            monitor_installation_sha256=head.monitor_installation_sha256))
+    fields = set(MonitorRuntimeChannel.model_fields) - {"channel_label"}
+    channels = [MonitorRuntimeChannel(**row.model_dump(include=fields), channel_label=CHANNEL_LABELS[row.channel.value])
+        for row in runtime.channels if row.owner_id == viewer]
+    window = runtime.notification_window
+    mode = "unknown" if window.binding is None else window.binding.mode
+    ready = runtime.builtin_window.state == "ready" or window.complete
+    return MonitorRuntimeData(state="ready" if ready else "unavailable", source_label="监控运行事实" if ready else "监控事实未就绪",
+        source_note="统计仅覆盖标注的原账本窗口；通道接受不代表手机送达。", observed_at=window.observed_at,
+        mode=mode, mode_label={"unknown": "未确认", "shadow": "影子", "live": "正式"}[mode],
+        applied_revision=window.applied_revision, applied_command_id=window.applied_command_id,
+        monitor_installation_sha256=window.monitor_installation_sha256,
+        builtins=builtins, channels=channels)
+
+
+def _builtin_summary(alerts: AlertReadModel) -> UnacknowledgedSummary:
+    if alerts.builtin_count_as_of is None:
+        return UnacknowledgedSummary(note="内置告警的完整原窗口尚未核对。")
+    count = sum(alerts.is_eligible(source, alert_id) for source, alert_id in alerts.events if source == "monitor_builtin_event")
+    return UnacknowledgedSummary(state="ready", count=count, count_as_of=alerts.builtin_count_as_of,
+        label="内置待确认", note="仅统计当前账号可见的完整内置告警窗口。")
+
+
+def _private_events(borrowed: BorrowedGeneration, runtime: MonitorRuntimeProjectionSnapshot | None, *,
+    actor_id: str | None, now: datetime, window_start: datetime,
+) -> list[_Event]:
+    if actor_id is None:
+        return []
+    result = []
+    if runtime is not None:
+        for row in runtime.builtin_events:
+            if row.event.owner_id == actor_id:
+                result.append(_Event("builtin", row.event.event_time, 7, row.event.event_id, (row,)))
+        for row in runtime.groups:
+            group = row.group
+            if group.binding.owner_id != actor_id:
+                continue
+            if not row.attempts:
+                state = "shadow" if group.status == "shadow" else "waiting" if group.status == "waiting" else "unknown"
+                result.append(_Event("channel_attempt", group.opened_at, 5, group.group_id, (row, None, state)))
+            for attempt in row.attempts:
+                observed = attempt.observation
+                at = attempt.intent.issued_at if observed is None else observed.called_at
+                key = attempt.intent.physical_id(0 if observed is None else observed.key_slot)
+                state = "possible" if observed is None else observed.disposition
+                result.append(_Event("channel_attempt", at, 5, key, (row, attempt, state)))
+    for row in read_condition_triggers(borrowed, owner_id=actor_id, now=now):
+        result.append(_Event("condition", row.event.event_time, 6, row.event.event_id, (row,)))
+    return [row for row in result if window_start <= row.at <= now]
+
+
+def _private_item(event: _Event, *, alerts: AlertReadModel) -> MonitorTimelineItem:
+    if event.kind == "builtin":
+        original = event.values[0].event
+        detection = original.detection
+        market = detection.subject == "market"
+        label = (
+            PulseAlert.model_validate_json(detection.original_result_json).kind_label
+            if market else _BUILTIN_LABELS[original.builtin_id]
+        )
+        comparison_unit = (
+            ("percent" if detection.kind == "ratio_jump" else "count") if market else None
+        )
+        threshold = getattr(detection, "threshold", None)
+        threshold_unit = (
+            None if threshold is None else "multiple" if original.builtin_id == "surge" else "CNY"
+        )
+        return MonitorBuiltinTrigger(event_key="builtin:" + original.event_id, at=event.at,
+            builtin_id=original.builtin_id, event_label=label,
+            subject=detection.subject, code=original.ts_code, name=original.stock_name,
+            price=getattr(detection, "trigger_price", None), threshold=threshold,
+            threshold_unit=threshold_unit,
+            before=getattr(detection, "before", None), after=getattr(detection, "after", None),
+            comparison_unit=comparison_unit,
+            source_note=detection.kind, acknowledgment=alerts.status_for("monitor_builtin_event", stable_alert_id("monitor_builtin_event", original)))
+    if event.kind == "condition":
+        row = event.values[0]
+        return MonitorConditionTrigger(event_key="condition:" + row.event.event_id, at=event.at,
+            code=row.event.ts_code, name=row.event.stock_name, event_label=row.event.rule_name,
+            status_label="已恢复" if row.event.trigger_kind == "recovered" else "已触发",
+            source_note="原通用条件事件；" + row.delivery_state)
+    row, attempt, state = event.values
+    return MonitorChannelAttempt(event_key="channel:" + event.sort_key, at=event.at,
+        channel_label=CHANNEL_LABELS[row.group.target.channel.value], mode=row.group.binding.mode,
+        state=state, state_label={"waiting": "等待合并", "sending": "正在提交", "shadow": "影子记录", "accepted": "通道接受",
+            "rejected": "通道拒绝", "unknown": "结果未知", "possible": "可能已请求"}[state],
+        logical_count=len(row.group.members), attempt_no=None if attempt is None else max(member.attempt_no for member in attempt.intent.members),
+        source_note="原通知账本；提交结果不代表手机送达。")
 
 
 def _source_published(borrowed: BorrowedGeneration) -> bool:
@@ -287,6 +431,9 @@ def _channels(borrowed: BorrowedGeneration, *, now: datetime) -> MonitorChannels
 
 
 def _mode(cursor: Any) -> DeliveryMode:
+    # Empty optional Serving tables may infer a non-string service_id type.
+    if cursor.execute("SELECT 1 FROM runtime_services LIMIT 1").fetchone() is None:
+        return delivery_mode(())
     rows = cursor.execute(_NOTIFIERS).fetchall()
     if len(rows) > 50:
         return DeliveryMode("unknown", "未确认", "推送服务太多，无法确认手机是否收到")
@@ -418,6 +565,8 @@ def _page(
     key: bytes,
     now: datetime,
     alerts: AlertReadModel | None = None,
+    actor_id: str | None = None,
+    runtime: MonitorRuntimeProjectionSnapshot | None = None,
 ) -> MonitorTimelineData:
     if alerts is None:
         alerts = AlertReadModel(UnacknowledgedSummary(), None, {}, {})
@@ -425,6 +574,8 @@ def _page(
     local_start = shanghai_trade_date(now) - timedelta(days=29)
     window_start = datetime.combine(local_start, time.min, tzinfo=_SHANGHAI).astimezone(UTC)
     states = readers.table_states(cursor)
+    private_events = _private_events(borrowed, runtime, actor_id=actor_id, now=now, window_start=window_start)
+    private = runtime is not None or bool(private_events)
     has_monitor = states.get("monitor_event") is not None and states["monitor_event"].available
     has_surge = states.get("surge_event") is not None and states["surge_event"].available
     has_notification = (
@@ -535,6 +686,14 @@ def _page(
             )
     else:
         notification_note = "通知记录尚未接入，仅显示其他告警"
+    total += len(private_events)
+    events.extend(row for row in private_events if after is None or (row.at, row.rank, row.sort_key) < after)
+    if private and (missing or notification_note or bad_times
+            or runtime is not None and (runtime.builtin_window.state != "ready"
+                or runtime.builtin_window.truncated or runtime.notification_window.truncated)
+            or any(row.kind == "condition" for row in private_events)):
+        # The legacy projections and retained generic history do not prove a full joint window.
+        total = None
     events.sort(key=lambda event: (event.at, event.rank, event.sort_key), reverse=True)
     selected = events[:page_size]
     signals = [
@@ -561,7 +720,7 @@ def _page(
             else event.values[2]
         )
         for event in selected
-        if event.kind != "notification"
+        if event.kind in {"signal", "monitor", "surge"}
     ]
     names = readers.stock_names(cursor, states, codes)
     mode = _mode(cursor)
@@ -642,6 +801,8 @@ def _page(
                     acknowledgment=_event_ack(alerts, "surge_event", facts),
                 )
             )
+        elif event.kind in {"builtin", "condition", "channel_attempt"}:
+            items.append(_private_item(event, alerts=alerts))
         else:
             scene_label, channel_label, submitted = event.values
             items.append(
@@ -656,13 +817,14 @@ def _page(
             )
     next_cursor = (
         _encode_cursor(
-            _Cursor(
-                kind="monitor_timeline_v1",
+            (_OwnerCursor if private else _Cursor)(
+                kind="monitor_timeline_v2" if private else "monitor_timeline_v1",
                 generation_id=borrowed.manifest.generation_id,
                 last_at=selected[-1].at,
                 last_rank=selected[-1].rank,
                 last_key=selected[-1].sort_key,
                 page_size=page_size,
+                **({"actor_key": _actor_key(actor_id)} if private else {}),
             ),
             key,
         )
@@ -678,9 +840,9 @@ def _page(
     if bad_times:
         source_notes.append(f"{bad_times} 条爆量记录时间无效，未纳入时间线")
     return MonitorTimelineData(
-        source_state="ready" if total else "empty",
+        source_state="ready" if total or events else "empty",
         source_label=(
-            "告警时间线" if total else "告警数据暂不完整" if source_notes else "最近 30 天没有告警"
+            "告警时间线" if total or events else "告警数据暂不完整" if source_notes else "最近 30 天没有告警"
         ),
         source_note="；".join(source_notes) if source_notes else None,
         receipt_state=receipt_state,
@@ -698,7 +860,24 @@ def _page(
         mode_note=mode.note,
         market_note=_market_note(cursor, now),
         unacknowledged=alerts.summary,
+        builtin_unacknowledged=_builtin_summary(alerts),
     )
+
+
+@router.get("/runtime", response_model=Envelope[MonitorRuntimeData], summary="监控原运行事实")
+def get_runtime(
+    request: Request, response: Response,
+    viewer: Annotated[str | None, Depends(current_user)],
+) -> Envelope[MonitorRuntimeData]:
+    web = request.app.state.web
+    now = web.clock()
+    with web.tracker.borrow() as borrowed:
+        meta = serving_meta(borrowed, now=now, stale_after=web.settings.stale_after, failure=web.tracker.failure)
+        if meta.generation_id is not None:
+            response.headers["X-Rquant-Generation"] = meta.generation_id
+        runtime = None if borrowed is None or meta.state != "ready" else _runtime_or_none(borrowed, now=now)
+        data = _runtime_data(runtime, viewer=viewer, now=now)
+    return Envelope[MonitorRuntimeData](data=data, serving=meta)
 
 
 @router.get("/channels", response_model=Envelope[MonitorChannelsData], summary="推送通道提交状态")
@@ -740,12 +919,16 @@ def get_timeline(
         meta = serving_meta(
             borrowed, now=now, stale_after=web.settings.stale_after, failure=web.tracker.failure
         )
-        alerts = read_alert_ack(borrowed, meta=meta, now=now, stale_after=web.settings.stale_after)
+        alerts = read_domain_alert_ack(borrowed, serving_ready=meta.state == "ready", now=now,
+            stale_after=web.settings.stale_after, actor_id=_viewer)
+        runtime = None if borrowed is None else _runtime_or_none(borrowed, now=now)
         if meta.generation_id is not None:
             response.headers["X-Rquant-Generation"] = meta.generation_id
         decoded = _decode_cursor(cursor, web.cursor_key) if cursor is not None else None
         if decoded is not None and (
             decoded.generation_id != meta.generation_id or decoded.page_size != page_size
+            or isinstance(decoded, _OwnerCursor) and decoded.actor_key != _actor_key(_viewer)
+            or runtime is not None and not isinstance(decoded, _OwnerCursor)
         ):
             raise HTTPException(status_code=409, detail="数据已更新，请重新查看告警时间线。")
         if borrowed is None or meta.state == "unavailable":
@@ -766,6 +949,8 @@ def get_timeline(
                 key=web.cursor_key,
                 now=now,
                 alerts=alerts,
+                actor_id=_viewer,
+                runtime=runtime,
             )
     return Envelope[MonitorTimelineData](data=data, serving=meta)
 
@@ -820,10 +1005,11 @@ async def acknowledge_alert(
         if borrowed is None:
             rejection = HTTPException(status_code=409, detail="数据已更新，请刷新告警时间线。")
         elif meta.generation_id == body.generation_id:
-            alerts = read_alert_ack(
-                borrowed, meta=meta, now=now, stale_after=web.settings.stale_after
+            alerts = read_domain_alert_ack(
+                borrowed, serving_ready=meta.state == "ready", now=now,
+                stale_after=web.settings.stale_after, actor_id=viewer,
             )
-            if alerts.summary.state != "ready" or not any(
+            if not any(
                 item.alert_id == body.alert_id and alerts.is_eligible(item.source, item.alert_id)
                 for item in alerts.events.values()
             ):

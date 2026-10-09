@@ -87,6 +87,10 @@ async function api(page: Page, baseURL: string | undefined, preparing = false) {
         return respond(fixture.statistics[selected.experiment_id]);
       const result = fixture.results[selected.experiment_id];
       if (!result) throw new Error("synthetic original result is missing");
+      const configuration = result.data.configuration;
+      if ("kind" in configuration) {
+        throw new Error("synthetic original template result must use Portfolio configuration");
+      }
       expect(url.searchParams.get("result_hash")).toBe(result.data.result_hash);
       return respond({
         ...result,
@@ -98,8 +102,8 @@ async function api(page: Page, baseURL: string | undefined, preparing = false) {
             content_hash: "b".repeat(64),
             rules: {
               ...template.detail.data.rules,
-              weight_rule: result.data.configuration.weight_rule,
-              rebalance_rule: result.data.configuration.rebalance_rule,
+              weight_rule: configuration.weight_rule,
+              rebalance_rule: configuration.rebalance_rule,
             },
           },
         },
@@ -112,18 +116,18 @@ async function api(page: Page, baseURL: string | undefined, preparing = false) {
       expect(body).not.toHaveProperty("actor_id");
       commands.push(body);
       if (body.kind === "register_experiment_family") {
-        expect(body.request.template).toEqual({
+        const request = body.request;
+        if (!("base_config" in request)) throw new Error("期望组合策略实验请求");
+        expect(request.template).toEqual({
           strategy_id: template.detail.data.strategy_id,
           head: template.detail.data.head,
         });
-        expect(body.request.base_config.weight_rule).toEqual(
-          template.detail.data.rules.weight_rule,
-        );
-        expect(body.request.base_config.rebalance_rule).toEqual(
+        expect(request.base_config.weight_rule).toEqual(template.detail.data.rules.weight_rule);
+        expect(request.base_config.rebalance_rule).toEqual(
           template.detail.data.rules.rebalance_rule,
         );
-        expect(body.request.template).not.toHaveProperty("rules");
-        expect(body.request.template).not.toHaveProperty("owner_id");
+        expect(request.template).not.toHaveProperty("rules");
+        expect(request.template).not.toHaveProperty("owner_id");
         return respond({
           command_id: body.command_id,
           status: "registered",

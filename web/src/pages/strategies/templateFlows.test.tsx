@@ -337,6 +337,21 @@ describe("策略模板完整操作", () => {
     await user.click(within(drawer).getByRole("button", { name: "保存策略" }));
     await screen.findByText("结果待确认，请继续查看。");
     expect(screen.queryByText("错误回执不显示。")).toBeNull();
+    server.use(
+      http.get("*/api/v1/meta", () =>
+        HttpResponse.json(metaEnvelope({ generationId: "b".repeat(64) })),
+      ),
+      http.get("*/api/v1/strategies", () =>
+        HttpResponse.json(templateEnvelope({ available: true, strategies: [] }, "b".repeat(64))),
+      ),
+      http.get(base, () => HttpResponse.json(templateEnvelope(templateCatalog(), "b".repeat(64)))),
+      http.get(base + "/sources", () =>
+        HttpResponse.json(templateEnvelope(templateSources, "b".repeat(64))),
+      ),
+      http.get(base + "/:strategyId", () =>
+        HttpResponse.json(templateEnvelope(templateDetail, "b".repeat(64))),
+      ),
+    );
     act(() =>
       view.queryClient.setQueryData(["meta"], metaEnvelope({ generationId: "b".repeat(64) })),
     );

@@ -42,6 +42,7 @@ _SAVE_ROUTE = f"{_ROUTE}/save"
 _SAVE_LOOKUP_ROUTE = f"{_SAVE_ROUTE}/lookup"
 _SAVE_RESUME_ROUTE = f"{_SAVE_ROUTE}/resume"
 _CAPABILITIES_ROUTE = f"{_ROUTE}/capabilities"
+_COLLABORATION_ROUTE = "/v1/collaboration"
 _ACTOR_ADAPTER = TypeAdapter(OwnerId)
 _INSTANCE_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 
@@ -446,6 +447,7 @@ def _handler_for_admission() -> type[BaseHTTPRequestHandler]:
                 _SAVE_LOOKUP_ROUTE,
                 _SAVE_RESUME_ROUTE,
                 _CAPABILITIES_ROUTE,
+                _COLLABORATION_ROUTE,
             }:
                 self.send_error(404)
                 return
@@ -463,11 +465,30 @@ def _handler_for_admission() -> type[BaseHTTPRequestHandler]:
                 ):
                     raise ValueError("invalid factor archive admission framing")
                 size = int(lengths[0])
-                if not 1 <= size <= _MAX_COMMAND_BYTES:
+                if not 1 <= size <= (1024 * 1024 if self.path == _COLLABORATION_ROUTE else _MAX_COMMAND_BYTES):
                     raise ValueError("invalid factor archive admission body size")
                 body = self.rfile.read(size)
                 if len(body) != size:
                     raise ValueError("truncated factor archive admission body")
+                if self.path == _COLLABORATION_ROUTE:
+                    from rquant.web.models.collaboration import CollaborationPrivateRequest
+                    strict_json_loads(body, parse_constant=_reject_json_constant)
+                    message = CollaborationPrivateRequest.model_validate_json(body)
+                    try:
+                        result = self.server.admission.service.collaboration_request(message)
+                        raw = result.model_dump(mode="json")
+                        self._collaboration_json(200, raw)
+                    except PermissionError:
+                        self._collaboration_json(403, {"error": "actor_forbidden"})
+                    except LookupError:
+                        self._collaboration_json(404, {"error": "not_found"})
+                    except PageControlCommandConflictError:
+                        self._collaboration_json(409, {"error": "command_conflict"})
+                    except (ValueError, TypeError):
+                        self._collaboration_json(409, {"error": "rejected"})
+                    except Exception:
+                        self._collaboration_json(503, {"error": "unavailable"})
+                    return
                 if capability_route:
                     envelope = strict_json_loads(body, parse_constant=_reject_json_constant)
                     if not isinstance(envelope, dict) or set(envelope) != {
@@ -565,6 +586,16 @@ def _handler_for_admission() -> type[BaseHTTPRequestHandler]:
         def log_message(self, format: str, *args: object) -> None:
             return
 
+        def _collaboration_json(self, status: int, payload: object) -> None:
+            body = json.dumps(payload, ensure_ascii=True, allow_nan=False, separators=(",", ":")).encode("utf-8")
+            if len(body) > 4 * 1024 * 1024:
+                status, body = 503, b'{"error":"unavailable"}'
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         def _json(self, status: int, payload: object) -> None:
             body = json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
             if len(body) > _MAX_RESPONSE_BYTES:
@@ -589,7 +620,11 @@ def build_factor_definition_admission_server(
     _handler_type: type[BaseHTTPRequestHandler] | None = None,
 ) -> FactorDefinitionAdmissionServer | None:
     if not admission.editor_users:
-        return None
+        authority = admission.service.collaboration
+        if authority.mode != "enforced":
+            return None
+        authority.require_outbox_path(admission.service.outbox.path)
+        authority.read_state()
     if socket_path is None:
         if trusted_web_uid is not None or shared_gid is not None:
             raise ValueError(

@@ -572,6 +572,53 @@ def _run_condition_notification_item(
     )
 
 
+def _run_merged_notification_group(
+    store: object, provider: object, group: object, records: tuple[OutboxRecord, ...], *,
+    worker_id: str, now: datetime, clock: Callable[[], datetime],
+    price_activation: object | None, condition_activation: object | None,
+) -> tuple[NotificationItemResult, ...]:
+    from rquant.runtime_notification_providers import (
+        deliver_merged_notification, prepare_merged_notification,
+    )
+
+    try:
+        prepared, binding = prepare_merged_notification(
+            provider, store=store, group=group, records=records, worker_id=worker_id,
+            now=now, price_activation=price_activation, condition_activation=condition_activation,
+        )
+    except Exception:
+        try:
+            uncertain = store.merge_preparation_committed(group, records)
+        except Exception:
+            uncertain = True
+        if uncertain:
+            return tuple(_record_unknown(store, r, worker_id=worker_id, observed_at=now,
+                                         error="merge admission commit is unresolved; no automatic resend") for r in records)
+        return tuple(_release_not_attempted(store, r, worker_id=worker_id, observed_at=now,
+                                            reason="merge preparation or current authority is unavailable") for r in records)
+    try:
+        current = max(now, _utc(clock()))
+        deliver_merged_notification(provider, prepared, store=store, now=current, clock=clock)
+    except Exception:
+        # A committed send intent has no proof of non-submission. It cannot be
+        # converted into an ordinary provider rejection or a fresh send right.
+        pass
+    completed = max(now, _utc(clock()))
+    try:
+        disposition = store.complete_merge(binding, records, worker_id=worker_id, completed_at=completed)
+    except Exception:
+        disposition = "unknown"
+    if disposition == "unknown":
+        return tuple(_record_unknown(store, r, worker_id=worker_id, observed_at=completed,
+                                     error="merge physical request or result writeback is unresolved; no automatic resend") for r in records)
+    if disposition == "rejected":
+        return tuple(_result(r, outcome=NotificationItemOutcome.FAILED, observed_at=completed,
+                             error="channel definitely rejected group request") for r in records)
+    receipt = ("shadow:" if group.binding.mode == "shadow" else "channel:") + binding.physical_id()
+    return tuple(_result(r, outcome=NotificationItemOutcome.SUCCEEDED, observed_at=completed,
+                         provider_receipt=receipt) for r in records)
+
+
 def run_notification_batch(
     store: SignalBusStore,
     providers: Mapping[DeliveryChannel, NotificationProvider],
@@ -630,7 +677,30 @@ def run_notification_batch(
     items: list[NotificationItemResult] = []
     cursor_time = started_at
 
+    merged_ids: set[str] = set()
+    if getattr(store, "merge_binding", None) is not None:
+        from rquant.notification_state import NotificationStateStore
+
+        if type(store) is not NotificationStateStore:
+            raise TypeError("merge execution requires the original notifier store")
+        by_id = {row.outbox_id: row for row in claimed}
+        for group in store.merge_groups():
+            members = tuple(by_id[item] for item in group.members if item in by_id)
+            if not members:
+                continue
+            cursor_time = max(cursor_time, _utc(current_time()))
+            outcomes = _run_merged_notification_group(
+                store, provider_by_channel.get(group.target.channel), group, members,
+                worker_id=worker_id, now=cursor_time, clock=current_time,
+                price_activation=price_activation, condition_activation=condition_activation,
+            )
+            items.extend(outcomes)
+            merged_ids.update(row.outbox_id for row in members)
+            cursor_time = max(cursor_time, *(item.observed_at for item in outcomes))
+
     for record in claimed:
+        if record.outbox_id in merged_ids:
+            continue
         cursor_time = max(cursor_time, _utc(current_time()))
         assert record.lease_until is not None
         if cursor_time >= record.lease_until or cursor_time >= record.expires_at:

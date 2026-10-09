@@ -1308,6 +1308,12 @@ class ConditionAlertRouteSpoolRecord(ConditionRuntimeModel):
 
     @model_validator(mode="after")
     def verify_condition_chain(self) -> Self:
+        from rquant.condition_alert_runtime_contracts import ConditionAlertEventEnvelope
+        from rquant.monitor_builtin_contracts import BuiltinConditionAlertEventEnvelope
+
+        expected_event = ConditionAlertEventEnvelope if self.schema_version == 5 else BuiltinConditionAlertEventEnvelope
+        if type(self.record.event) is not expected_event:
+            raise ValueError("condition spool variant differs from the exact frozen event codec")
         if (
             self.record.global_sequence != self.global_sequence
             or self.payload_hash != self.record.sha256
@@ -1337,8 +1343,26 @@ class ConditionAlertRouteSpoolRecord(ConditionRuntimeModel):
         return cls(**body, record_hash=_sha256_bytes(canonical_json_bytes(body)), record=record)
 
 
+class BuiltinConditionAlertRouteSpoolRecord(ConditionAlertRouteSpoolRecord):
+    schema_version: Literal[6] = 6
+    record_schema: Literal["rquant.builtin-condition-alert-route-record/v1"] = "rquant.builtin-condition-alert-route-record/v1"
+
+    @classmethod
+    def create(
+        cls, *, record: ConditionAlertBusRoutedRecord, previous_record_hash: str | None
+    ) -> BuiltinConditionAlertRouteSpoolRecord:
+        from rquant.monitor_builtin_contracts import BuiltinConditionAlertEventEnvelope
+
+        if type(record) is not ConditionAlertBusRoutedRecord or type(record.event) is not BuiltinConditionAlertEventEnvelope:
+            raise TypeError("builtin spool requires the exact new committed builtin variant")
+        record = ConditionAlertBusRoutedRecord.model_validate_json(record.wire_bytes())
+        body = dict(schema_version=6, record_schema="rquant.builtin-condition-alert-route-record/v1",
+            global_sequence=record.global_sequence, previous_record_hash=previous_record_hash, payload_hash=record.sha256)
+        return cls(**body, record_hash=_sha256_bytes(canonical_json_bytes(body)), record=record)
+
+
 NotificationRouteSpoolRecord: TypeAlias = (
-    SignalRouteSpoolRecord | PriceAlertRouteSpoolRecord | ConditionAlertRouteSpoolRecord
+    SignalRouteSpoolRecord | PriceAlertRouteSpoolRecord | ConditionAlertRouteSpoolRecord | BuiltinConditionAlertRouteSpoolRecord
 )
 NotificationBusRoutedRecord: TypeAlias = (
     SignalBusRoutedRecord | PriceAlertBusRoutedRecord | ConditionAlertBusRoutedRecord
@@ -1396,6 +1420,11 @@ def _decode_notification_spool_record(
         entry = ConditionAlertRouteSpoolRecord.model_validate_json(payload)
         if entry.wire_bytes() != payload:
             raise ValueError("condition spool record is not canonical")
+    elif body.get("schema_version") == 6:
+        strict_canonical_json_loads(payload)
+        entry = BuiltinConditionAlertRouteSpoolRecord.model_validate_json(payload)
+        if entry.wire_bytes() != payload:
+            raise ValueError("builtin spool record is not canonical")
     else:
         raise TypeError("mixed notification history rejects current v3 or unknown schemas")
     if entry.global_sequence != sequence:
@@ -1442,13 +1471,13 @@ class ReadonlyNotificationEventRouteSpool:
             if entry.previous_record_hash != previous_hash:
                 raise ValueError("mixed notification spool hash chain differs")
             if (
-                type(entry) in {PriceAlertRouteSpoolRecord, ConditionAlertRouteSpoolRecord}
+                type(entry) in {PriceAlertRouteSpoolRecord, ConditionAlertRouteSpoolRecord, BuiltinConditionAlertRouteSpoolRecord}
                 and entry.record.bus_generation_id != identity.generation_id
             ):
                 raise ValueError("price spool proof belongs to another actual bus")
             available = (
                 entry.record.event.available_at
-                if type(entry) in {PriceAlertRouteSpoolRecord, ConditionAlertRouteSpoolRecord}
+                if type(entry) in {PriceAlertRouteSpoolRecord, ConditionAlertRouteSpoolRecord, BuiltinConditionAlertRouteSpoolRecord}
                 else entry.record.signal.available_at
             )
             latest_time = max(
@@ -1662,7 +1691,10 @@ def publish_mixed_notification_bus_prefix(
                             raise ValueError(
                                 "condition routed record belongs to another actual bus"
                             )
-                        entry = ConditionAlertRouteSpoolRecord.create(
+                        from rquant.monitor_builtin_contracts import BuiltinConditionAlertEventEnvelope
+
+                        wrapper = BuiltinConditionAlertRouteSpoolRecord if type(record.event) is BuiltinConditionAlertEventEnvelope else ConditionAlertRouteSpoolRecord
+                        entry = wrapper.create(
                             record=record, previous_record_hash=previous_hash
                         )
                         payload = entry.wire_bytes()

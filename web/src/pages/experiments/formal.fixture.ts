@@ -3,6 +3,10 @@
 // Original DTO SHA256: 7a27a629c3bea0464bf361af32c62f7348ee24eac31b709475c4ce866d533e77
 import type { Schemas } from "@/api/client";
 
+type PortfolioAttempt = Omit<Schemas["ExperimentAttemptRow"], "configuration"> & {
+  configuration: Schemas["PortfolioEditableConfig-Output"];
+};
+
 type ExperimentFixture = {
   kind: string;
   actual_market_source: false;
@@ -10,7 +14,9 @@ type ExperimentFixture = {
   generation_id: string;
   capabilities: Schemas["Envelope_ExperimentCapabilities_"];
   mine: Schemas["Envelope_ExperimentMineData_"];
-  family: Schemas["Envelope_ExperimentFamilyData_"];
+  family: Omit<Schemas["Envelope_ExperimentFamilyData_"], "data"> & {
+    data: Omit<Schemas["ExperimentFamilyData"], "items"> & { items: PortfolioAttempt[] };
+  };
   results: Record<string, Schemas["Envelope_ExperimentResultData_"]>;
   statistics: Record<string, Schemas["Envelope_ExperimentStatisticsData_"]>;
   heatmap: Schemas["Envelope_ExperimentHeatmapData_"];

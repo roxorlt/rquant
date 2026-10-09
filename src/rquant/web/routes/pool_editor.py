@@ -68,7 +68,7 @@ def get_pool_editor(
     data = snapshot.data.model_copy(
         update={
             "nl_preview_available": (
-                web.nl_parser is not None
+                web.ai_assistance_gateway is not None and _viewer in web.settings.ai_users
                 and snapshot.data.state == "ready"
                 and meta.state == "ready"
             )
@@ -88,96 +88,37 @@ async def preview_pool_natural_language(
         raise HTTPException(status_code=401, detail="请先登录。")
     if len(await request.body()) > MAX_NL_REQUEST_BYTES:
         raise HTTPException(status_code=413, detail="描述过长，请删减后重试。")
-    web = request.app.state.web
-    parser = web.nl_parser
-    if parser is None:
-        raise HTTPException(status_code=503, detail="暂不能生成，仍可手动编辑。")
-    with web.tracker.borrow() as borrowed:
-        meta = serving_meta(
-            borrowed,
-            now=web.clock(),
-            stale_after=web.settings.stale_after,
-            failure=web.tracker.failure,
-        )
-        if meta.state != "ready" or meta.generation_id != body.generation_id:
-            raise HTTPException(status_code=409, detail="池子数据已变化，请刷新后重试。")
-        snapshot = read_pool_editor(borrowed)
-        if snapshot.data.state != "ready":
-            raise HTTPException(status_code=409, detail="池子规则暂不可编辑，请刷新后重试。")
-        base = next((pool for pool in snapshot.data.pools if pool.key == body.pool_key), None)
-        if base is None:
-            detail = (
-                "内置池需先复制为自建池。"
-                if body.pool_key in snapshot.builtin_names
-                else "这份池子规则尚不可编辑，请刷新后重试。"
-            )
-            raise HTTPException(status_code=409, detail=detail)
-        if base.version != body.expected_version:
-            raise HTTPException(status_code=409, detail="规则已变化，请刷新后重试。")
-        if any(column in _UNPUBLISHED_POOL_COLUMNS for column in base.include_columns):
-            raise HTTPException(status_code=409, detail="这份池子含暂不可用的数据项，请手动编辑。")
-        base_bytes = json.dumps(
-            [rule.model_dump(mode="json") for rule in base.rule_calls], ensure_ascii=False
-        ).encode("utf-8")
-        if len(base_bytes) > MAX_NL_BASE_BYTES:
-            raise HTTPException(status_code=409, detail="这份池子条件较多，请手动编辑。")
-    if not web.nl_rate_limiter.admit(viewer):
-        raise HTTPException(
-            status_code=429, detail="操作太频繁，请一分钟后再试。", headers={"Retry-After": "60"}
-        )
-    if not web.nl_gate.acquire(blocking=False):
-        raise HTTPException(
-            status_code=429, detail="正在生成，请稍后再试。", headers={"Retry-After": "1"}
-        )
-    try:
-        try:
-            raw = await anyio.to_thread.run_sync(
-                parser.parse_edit, body.instruction.strip(), base.rule_calls
-            )
-        except NlClarificationNeededError as error:
-            raise HTTPException(
-                status_code=422, detail="请具体说明要增加、删除或修改哪个条件。"
-            ) from error
-        except NlParserUnavailableError as error:
-            raise HTTPException(status_code=503, detail="暂不能生成，请稍后重试。") from error
+    from functools import partial
+    from rquant.web.models.ai_assistance import AIPoolRequest, AIPoolDraft
+    from rquant.web.routes.ai_assistance import generate_ai, original_header_id
+    if request.app.state.web.ai_assistance_gateway is None:
+        raise HTTPException(503, "暂不能生成，仍可手动编辑。")
+    original = AIPoolRequest(request_id=original_header_id(request), **body.model_dump())
+    def new_request_preflight() -> None:
+        web = request.app.state.web
+        web.tracker.refresh()
         with web.tracker.borrow() as borrowed:
-            meta = serving_meta(
-                borrowed,
-                now=web.clock(),
-                stale_after=web.settings.stale_after,
-                failure=web.tracker.failure,
-            )
+            meta = serving_meta(borrowed, now=web.clock(), stale_after=web.settings.stale_after,
+                failure=web.tracker.failure)
             snapshot = read_pool_editor(borrowed)
-            current = next(
-                (pool for pool in snapshot.data.pools if pool.key == body.pool_key), None
-            )
-            if (
-                meta.state != "ready"
-                or meta.generation_id != body.generation_id
-                or snapshot.data.state != "ready"
-                or current is None
-                or current.version != body.expected_version
-            ):
-                raise HTTPException(status_code=409, detail="池子数据已变化，请刷新后重试。")
-        try:
-            calls, changes = validate_pool_draft(raw, base)
-        except NoPoolRuleChangeError as error:
-            raise HTTPException(
-                status_code=422, detail="没有识别出规则变化，请说得更具体。"
-            ) from error
-        except InvalidPoolDraftError as error:
-            raise HTTPException(
-                status_code=422, detail="没能生成可用的修改，请换一种说法。"
-            ) from error
-        return PoolNlPreview(
-            pool_key=base.key,
-            base_generation_id=body.generation_id,
-            base_version=base.version,
-            rule_calls=calls,
-            changes=changes,
-        )
-    finally:
-        web.nl_gate.release()
+            base = next((pool for pool in snapshot.data.pools if pool.key == body.pool_key), None)
+            if (meta.state != "ready" or meta.generation_id != body.generation_id or
+                snapshot.data.state != "ready" or base is None or base.version != body.expected_version):
+                raise HTTPException(409, "池子数据已变化，请刷新后重试。")
+            if any(column in _UNPUBLISHED_POOL_COLUMNS for column in base.include_columns):
+                raise HTTPException(409, "这份池子含暂不可用的数据项，请手动编辑。")
+            if len(base.model_dump_json().encode()) > MAX_NL_BASE_BYTES:
+                raise HTTPException(409, "这份池子条件较多，请手动编辑。")
+    data = await anyio.to_thread.run_sync(partial(generate_ai, request, viewer, original,
+        new_request_preflight=new_request_preflight))
+    view = data.request
+    if view is None or view.state != "completed":
+        raise HTTPException(503, "调用结果未知，请继续查看原请求。")
+    if not isinstance(view.result, AIPoolDraft):
+        raise HTTPException(422, "没能生成可用的修改，请换一种说法。")
+    result = view.result
+    return PoolNlPreview(pool_key=result.base.key, base_generation_id=result.base_generation_id,
+        base_version=result.base.version, rule_calls=list(result.rule_calls), changes=list(result.changes))
 
 
 def _authorize(snapshot: PoolEditorSnapshot, body: PoolEditorCommand) -> None:

@@ -45,10 +45,12 @@ describe("告警确认状态展示", () => {
         monitorEnvelope({
           unacknowledged: READY,
           items: [
-            ...original.data.items.map((item, index) => ({
-              ...item,
-              acknowledgment: states[index],
-            })),
+            ...original.data.items.map((item, index) => {
+              const acknowledgment = states[index];
+              if (!acknowledgment)
+                throw new Error("Original fixture event has no expected acknowledgment state");
+              return { ...item, acknowledgment };
+            }),
             {
               kind: "notification",
               event_key: "notification:old",
