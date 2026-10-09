@@ -11,7 +11,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
-from typing import Annotated, Literal, Protocol, Self
+from typing import TYPE_CHECKING, Annotated, Literal, Protocol, Self
 
 import duckdb
 import pandas as pd
@@ -35,11 +35,6 @@ from rquant.daily_valuation_pit import (
     DailyValuationRow,
     _record_daily_valuation_batch_in_transaction,
 )
-from rquant.ingest import (
-    DailyIngestMaterialization,
-    apply_daily_materialization_in_transaction,
-    derive_daily_materialization_indicators,
-)
 from rquant.live_contracts import BatchQualityStatus, LiveChannel
 from rquant.live_spool import LiveBatchSpool
 from rquant.runtime_contracts import (
@@ -51,6 +46,13 @@ from rquant.runtime_contracts import (
 from rquant.security_status import SecurityStatusDaily
 from rquant.storage.duckdb import DuckDBStore
 from rquant.suspension import normalize_suspend_d_snapshot
+
+if TYPE_CHECKING:
+    from rquant.ingest import (
+        DailyIngestMaterialization,
+        apply_daily_materialization_in_transaction,
+        derive_daily_materialization_indicators,
+    )
 
 Sha256Hex = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 
@@ -236,6 +238,16 @@ class DailyCanonicalPublisher:
         ledger_fence_verifier: DailyCanonicalLedgerFenceVerifier,
         clock: Callable[[], datetime],
     ) -> None:
+        global DailyIngestMaterialization
+        global apply_daily_materialization_in_transaction
+        global derive_daily_materialization_indicators
+        # Ingest requires business settings; contract-only web imports do not.
+        from rquant.ingest import (
+            DailyIngestMaterialization,
+            apply_daily_materialization_in_transaction,
+            derive_daily_materialization_indicators,
+        )
+
         self.candidate_store = candidate_store
         self._raw_spool = raw_spool
         self._indicator_reader_factory = indicator_reader_factory

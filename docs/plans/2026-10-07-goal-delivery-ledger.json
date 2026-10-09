@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "revision": 165,
-  "updated_at": "2026-10-09T20:18:32+08:00",
+  "revision": 166,
+  "updated_at": "2026-10-09T21:17:01+08:00",
   "thread_id": "01a0dd53-e9c9-7b73-a7b5-843473fcd6ac",
   "worktree": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-source-integration",
   "branch": "cdx/20260929-factor-source-integration",
@@ -71,7 +71,7 @@
     "confidence": "19项本地已验、6项剩余。当前仅完成新参数双版本门禁和一次集中候选审查；实际阻断修复归R12。正式资料、生产安装切换和20个实际开市日另列，原日期窗口不重置。",
     "assumptions": [
       "本地19项已验收，14个模块已本地验证；正式市场资料不由合成资料替代。",
-      "唯一集中候选审查正在执行；有实际阻断再做最小定向修复，复用有效测试。",
+      "唯一集中候选审查及原19叶CI补修复核已通过；新增实际阻断只作定向修复和复核，复用有效测试。",
       "验收及上线原估6–12工程小时；正式资料、授权等待和20个实际开市日另计。",
       "不增加新的设计、重构或审查阶段；必要验收完成后收尾。",
       "原10月8–10日候选目标窗口保持，不因更新重置日期。"
@@ -2418,7 +2418,7 @@
       "title": "整体候选最终验收",
       "category": "acceptance",
       "status": "in_progress",
-      "owner": "Root整合；原审查者定向复核本批CI补修",
+      "owner": "Root整合；原审查者只核两处新增改动及派生路径",
       "modules": [
         "M1",
         "M2",
@@ -2479,10 +2479,16 @@
         "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-delta-review-01/DERIVED-DELTA.json",
         "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-delta-review-accepted-root.json",
         "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-fixes-root-accepted-partials-01.json",
-        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-repairs-r07-policy-02/check-result.json"
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-repairs-r07-policy-02/check-result.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-actual-repairs-review-01/accepted-root.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-wave-02-03.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/web-wave-02-03.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-generation-bootstrap-diagnostic-01/verification.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-generation-cause-01/root-result-05.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-web-openapi-import-01/EV.json"
       ],
       "closure_level": "pending",
-      "last_progress": "本批CI补修及必要快照已冻结。标准3.12刷新和check通过，仅5项初始化快照更新，3处原摘要恢复；完整行、字节、异常、哨兵和零写条件保持。原审查者只复核本批19叶差异，随后同一PR运行仓库CI；原功能、构建和审查证据继续复用。",
+      "last_progress": "本批19个文件定向复核通过。版本188af226的CI已有18项通过，10个完整测试分片仍在运行；网页1208项测试及构建通过。当前只处理两类实际阻断：无业务配置的API导入已修复，原快照一致、日终22项回归通过；运行时两版本失败原因仍被隐藏，已仅在测试入口增加异常日志，本地原两例通过。接下来只核两处新增改动和必要派生路径，复用有效结果，不增加交付项。",
       "submilestones": [
         {
           "name": "网页最终候选准备门禁",
@@ -2606,7 +2612,7 @@
         }
       ],
       "pull_request": "https://github.com/roxorlt/rquant/pull/323",
-      "candidate_commit": "1cdf121fe374c33082abbf53db3df044d72d1eb1"
+      "candidate_commit": "188af2261ace57270e30424394e1402f8e4e6cbc"
     },
     {
       "id": "R13",
@@ -3749,6 +3755,12 @@
       "type": "actual_ci_repair_snapshot_freeze",
       "added_ids": [],
       "description": "本批CI补修及必要快照已冻结。标准3.12刷新和check通过，仅5项初始化快照更新，3处原摘要恢复；完整行、字节、异常、哨兵和零写条件保持。原审查者只复核本批19叶差异，随后同一PR运行仓库CI；原功能、构建和审查证据继续复用。"
+    },
+    {
+      "date": "2026-10-09T21:17:01+08:00",
+      "type": "actual_ci_two_gate_repairs",
+      "added_ids": [],
+      "description": "本批19个文件定向复核通过。版本188af226的CI已有18项通过，10个完整测试分片仍在运行；网页1208项测试及构建通过。当前只处理两类实际阻断：无业务配置的API导入已修复，原快照一致、日终22项回归通过；运行时两版本失败原因仍被隐藏，已仅在测试入口增加异常日志，本地原两例通过。接下来只核两处新增改动和必要派生路径，复用有效结果，不增加交付项。"
     }
   ],
   "update_policy": [
@@ -3803,7 +3815,7 @@
         "tasks": [
           "R12"
         ],
-        "work": "只修Web18项实际失败及直接测试接点，保持完整用户交互和权限断言。",
+        "work": "API导入副作用单叶修复已冻；快照一致、原日终22项通过。",
         "status": "completed"
       },
       {
@@ -3811,7 +3823,7 @@
         "tasks": [
           "R12"
         ],
-        "work": "复用原候选与41叶审查结论；本轮只复核新19叶实际CI补修。",
+        "work": "原19个文件复核通过；下一步只复核两处新增改动及派生路径。",
         "status": "queued"
       },
       {
@@ -3828,7 +3840,7 @@
           "R12"
         ],
         "status": "completed",
-        "work": "两叶格式与导入修复已冻结；36项Ruff红转绿，AST等价，无新增测试。"
+        "work": "仅补测试入口异常日志；原调用保持，本地原两条Linux验收通过。"
       },
       {
         "agent": "/root/r07_candidate_metadata",
@@ -3845,7 +3857,7 @@
       "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-source-integration/.codex/config.toml"
     ],
     "live_reload_verified": true,
-    "root_work": "本批补修与必要快照已冻；原审查者只核新增差异，随后同一PR执行仓库门禁。",
+    "root_work": "仅复核两处新增改动及派生路径；保留当前完整CI，取得真实运行时原因后局部补修。",
     "waiting_subagents": 0,
     "runtime_capacity_evidence": "本轮app运行环境重新初始化后的原生元数据明确提供16个并发槽位，包含Root；不是修改配置后推断即时生效。",
     "active_subagents": []
