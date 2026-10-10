@@ -12,6 +12,7 @@ from typing import Annotated, Any, TypeVar
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from rquant.web import page_control
+from rquant.web.backtest_perf import backtest_perf
 from rquant.web.models import (
     AckAlertRequest,
     AddWatchRequest,
@@ -229,13 +230,16 @@ def backtest_detail(run_id: str, source: SourceDep,
     if not runs:
         raise HTTPException(404, "backtest run not found")
     run = runs[0]
-    trades = [BacktestTrade(code=t.pop("ts_code"), **t) for t in source.query(
+    raw = source.query(
         "SELECT trade_id, signal_date, ts_code, name, entry_time, entry_price, exit_time, "
         "exit_price, exit_reason, ret_pct FROM strategy_trade "
         "WHERE run_id = ? AND entry_mode = ? AND profile_variant = ? "
         "ORDER BY entry_time LIMIT 10000",
-        [run_id, run["entry_mode"], run["profile_variant"]])]
-    return _envelope(source, BacktestDetailData(run=BacktestRun(**run), trades=trades))
+        [run_id, run["entry_mode"], run["profile_variant"]])
+    perf = backtest_perf(raw)
+    trades = [BacktestTrade(code=t.pop("ts_code"), **t) for t in raw]
+    return _envelope(
+        source, BacktestDetailData(run=BacktestRun(**run), trades=trades, perf=perf))
 
 
 @router.get("/alerts", response_model=Envelope[AlertsData], summary="告警时间线")

@@ -265,6 +265,7 @@ export interface components {
         };
         /** BacktestDetailData */
         BacktestDetailData: {
+            perf?: components["schemas"]["BacktestPerf"] | null;
             run: components["schemas"]["BacktestRun"];
             /** Trades */
             trades: components["schemas"]["BacktestTrade"][];
@@ -273,6 +274,40 @@ export interface components {
         BacktestListData: {
             /** Runs */
             runs: components["schemas"]["BacktestRun"][];
+        };
+        /**
+         * BacktestPerf
+         * @description Ratios are fractions (0.12 = 12%); ``method`` says how NAV was derived.
+         */
+        BacktestPerf: {
+            /** Annualized Return */
+            annualized_return: number | null;
+            /** Annualized Volatility */
+            annualized_volatility: number | null;
+            /** Calmar */
+            calmar: number | null;
+            /** Days */
+            days: number;
+            /** Max Drawdown */
+            max_drawdown: number | null;
+            /** Max Drawdown Days */
+            max_drawdown_days: number | null;
+            /** Method */
+            method: string;
+            /** Monthly */
+            monthly: components["schemas"]["MonthlyReturn"][];
+            /** Nav */
+            nav: components["schemas"]["NavPoint"][];
+            /** Payoff Ratio */
+            payoff_ratio: number | null;
+            /** Sharpe */
+            sharpe: number | null;
+            /** Sortino */
+            sortino: number | null;
+            /** Total Return */
+            total_return: number | null;
+            /** Win Rate */
+            win_rate: number | null;
         };
         /** BacktestRun */
         BacktestRun: {
@@ -478,6 +513,27 @@ export interface components {
             notice?: string | null;
             /** Version */
             version: string;
+        };
+        /** MonthlyReturn */
+        MonthlyReturn: {
+            /** Month */
+            month: number;
+            /** Ret */
+            ret: number;
+            /** Year */
+            year: number;
+        };
+        /** NavPoint */
+        NavPoint: {
+            /**
+             * Date
+             * Format: date
+             */
+            date: string;
+            /** Drawdown */
+            drawdown: number;
+            /** Nav */
+            nav: number;
         };
         /** OverviewData */
         OverviewData: {
