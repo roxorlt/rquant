@@ -318,6 +318,23 @@ PAGE_PROJECTION_CONTRACTS: Mapping[str, ServingProjectionContract] = MappingProx
             max_bytes=512 * 1024,
             event_date_columns=("trade_date",),
         ),
+        "alert_rule": _contract(
+            "signals",
+            (
+                ("rule_id", "string"),
+                ("title", "string"),
+                ("enabled", "bool"),
+                ("pools", "string"),
+                ("levels", "string"),
+                ("cooldown_minutes", "int"),
+                ("saved_at", "timestamp"),
+                ("command_id", "string"),
+            ),
+            ("rule_id",),
+            max_rows=200,
+            max_bytes=128 * 1024,
+            event_time_columns=("saved_at",),
+        ),
         "manual_watchlist": _contract(
             "signals",
             (

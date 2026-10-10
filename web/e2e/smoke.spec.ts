@@ -58,3 +58,11 @@ test("factor page shows IC and quantiles", async ({ page }) => {
   await expect(page.getByRole("table", { name: "IC 衰减" })).toBeVisible();
   await expect(page.getByLabel("跟踪指标")).toBeVisible();
 });
+
+test("an alert rule saved through page control shows up", async ({ page }) => {
+  await page.goto("./#/monitor");
+  await page.getByLabel("规则 ID").fill("p2-l1");
+  await page.getByLabel("规则名称").fill("二号池一档");
+  await page.getByRole("button", { name: "保存规则" }).click();
+  await expect(page.getByLabel("告警规则", { exact: true })).toContainText("二号池一档");
+});

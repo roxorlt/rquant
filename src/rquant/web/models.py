@@ -328,6 +328,23 @@ class AckAlertRequest(BaseModel):
     alert_id: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
+class AlertRuleBody(BaseModel):
+    rule_id: str = Field(pattern=r"^[a-z0-9_-]{1,40}$")
+    title: str = Field(min_length=1, max_length=60)
+    enabled: bool = True
+    pools: list[Literal["pool1", "pool2", "manual"]] = []
+    levels: list[str] = Field(default=[], max_length=10)
+    cooldown_minutes: int = Field(default=0, ge=0, le=1440)
+
+
+class AlertRuleRow(AlertRuleBody):
+    saved_at: datetime | None = None
+
+
+class AlertRulesData(BaseModel):
+    rules: list[AlertRuleRow]
+
+
 class AddWatchRequest(BaseModel):
     code: str = Field(pattern=r"^\d{6}\.(SH|SZ|BJ)$")
     note: str = ""

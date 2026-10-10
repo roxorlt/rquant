@@ -201,3 +201,29 @@ def test_strategies_list_latest_version(tmp_path) -> None:
     assert (row["slug"], row["version"]) == ("demo-breakout", 1)
     runs = client.get("/api/v1/portfolio-backtests").json()["data"]["runs"]
     assert runs[0]["strategy"] == "demo-breakout@1"
+
+
+def test_alert_rules_save_through_page_control_and_read_back() -> None:
+    from fastapi.testclient import TestClient
+
+    from rquant.web.app import create_app
+    from rquant.web.source import FixtureSource
+
+    fixture = FixtureSource()
+    app = create_app(fixture, dist=None)
+    sent: list[dict] = []
+
+    def transport(payload: dict) -> dict:
+        sent.append(payload)
+        return fixture.record_rule(payload)
+
+    app.state.page_control_transport = transport
+    client = TestClient(app)
+    assert client.get("/api/v1/alert-rules").json()["data"]["rules"] == []
+    body = {"rule_id": "p2", "title": "二号池", "pools": ["pool2"], "levels": ["L1"],
+            "cooldown_minutes": 15}
+    assert client.post("/api/v1/alert-rules", json=body).json()["status"] == "succeeded"
+    assert sent[0]["kind"] == "save_alert_rule" and sent[0]["rule"]["pools"] == ["pool2"]
+    (rule,) = client.get("/api/v1/alert-rules").json()["data"]["rules"]
+    assert (rule["rule_id"], rule["pools"], rule["cooldown_minutes"]) == ("p2", ["pool2"], 15)
+    assert client.post("/api/v1/alert-rules", json={**body, "rule_id": "Bad"}).status_code == 422

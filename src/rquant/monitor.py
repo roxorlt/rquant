@@ -17,6 +17,7 @@ import pandas as pd
 from loguru import logger
 from pydantic import BaseModel
 
+from rquant.alert_rules import AlertGate, load_alert_rules
 from rquant.config import settings
 from rquant.pipeline import _compute_levels
 from rquant.price_adjustment import resolve_price_basis_adjustment
@@ -930,6 +931,7 @@ def run_monitor(interval: int = 5) -> int:
 
     with DuckDBStore() as store:
         watchlist = build_watchlist(store, manual_codes=load_manual_watchlist_codes())
+        alert_gate = AlertGate(load_alert_rules())
 
         if not watchlist:
             logger.warning("Watchlist 为空，退出")
@@ -1039,6 +1041,8 @@ def run_monitor(interval: int = 5) -> int:
                         )
                         ref_date = item.entry_date or item.limit_up_date
 
+                        if not alert_gate.allow(item.pool, evt["level"], code, _now()):
+                            continue
                         notify(
                             "price_level",
                             ts_code=code,

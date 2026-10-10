@@ -52,6 +52,7 @@ const BODIES: Record<string, unknown> = {
   paper: { accounts: [] },
   factors: { factors: [] },
   strategies: { strategies: [] },
+  "alert-rules": { rules: [] },
   "data-center": {
     datasets: [
       {

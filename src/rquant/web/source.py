@@ -66,6 +66,8 @@ CREATE TABLE strategy_summary(run_id VARCHAR, computed_at TIMESTAMP, start_date 
   candidates INTEGER, trades INTEGER, trigger_rate_pct DOUBLE, mean_ret_pct DOUBLE,
   median_ret_pct DOUBLE, win_rate_pct DOUBLE, best_ret_pct DOUBLE, worst_ret_pct DOUBLE,
   gap_stop_rate_pct DOUBLE);
+CREATE TABLE alert_rule(rule_id VARCHAR, title VARCHAR, enabled BOOLEAN, pools VARCHAR,
+  levels VARCHAR, cooldown_minutes INTEGER, saved_at TIMESTAMPTZ, command_id VARCHAR);
 CREATE TABLE benchmark_daily(ts_code VARCHAR, trade_date DATE, close DOUBLE,
   pct_chg DOUBLE);
 CREATE TABLE strategy_trade(run_id VARCHAR, trade_id VARCHAR, entry_mode VARCHAR,
@@ -177,6 +179,17 @@ class FixtureSource:
         self.con.execute(
             "INSERT INTO alert_ack VALUES (?, now(), ?, ?)",
             [payload["alert_id"], payload["actor_id"], payload["command_id"]],
+        )
+        return {"command_id": payload["command_id"], "status": "succeeded"}
+
+    def record_rule(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Fixture stand-in for ``save_alert_rule`` + Serving republish (latest wins)."""
+        rule = payload["rule"]
+        self.con.execute("DELETE FROM alert_rule WHERE rule_id = ?", [rule["rule_id"]])
+        self.con.execute(
+            "INSERT INTO alert_rule VALUES (?, ?, ?, ?, ?, ?, now(), ?)",
+            [rule["rule_id"], rule["title"], rule["enabled"], ",".join(rule["pools"]),
+             ",".join(rule["levels"]), rule["cooldown_minutes"], payload["command_id"]],
         )
         return {"command_id": payload["command_id"], "status": "succeeded"}
 

@@ -1186,3 +1186,11 @@
     width: 100%;
   }
 }
+
+.rule-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  padding: 10px 12px;
+}
