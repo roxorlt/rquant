@@ -405,6 +405,9 @@ Streamlit 只创建 job spec 和读取状态。浏览器卡死、刷新、切 ta
 | serving refresh | 云端短任务 | 原子发布且资源受限时可盘中运行 |
 
 完成物理隔离后，午休可以用于研究计算；但任何生产写入、服务部署、schema migration 仍遵守交易保护窗口。
+在物理隔离完成前，重型只读任务也属于保护对象：只读 DuckDB/Parquet 扫描仍会争抢 CPU、页缓存和
+磁盘带宽。2026-07-23 在 2 核生产机实测，`research-repair-minute` 预演可持续占满约 1 核，因此
+planner、repair、snapshot、全量 audit 和 replay 在交易窗口内一律不运行，轻量元数据状态查询除外。
 
 ## 12. 页面与查询层解耦
 
@@ -595,6 +598,8 @@ scheduler 在领取任务前检查：
 ## 17. 分阶段迁移方案
 
 迁移必须渐进，不做一次性大重构。
+文件级任务、测试和最终验收清单见
+[工作负载解耦端到端实施计划](../plans/2026-07-23-workload-isolation-implementation.md)。
 
 ### Phase 0：关闭当前 Stage 1
 
