@@ -1,14 +1,14 @@
 {
   "schema_version": 1,
-  "revision": 185,
-  "updated_at": "2026-10-10T09:14:00+08:00",
+  "revision": 187,
+  "updated_at": "2026-10-10T09:35:00+08:00",
   "thread_id": "01a0dd53-e9c9-7b73-a7b5-843473fcd6ac",
   "worktree": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-source-integration",
   "branch": "cdx/20260929-factor-source-integration",
   "goal_state": {
     "reported_status": "active",
-    "last_updated_at": "2026-10-10T09:14:00+08:00",
-    "current_turn": "R12_single_file_review_PASS_publish_same_PR_candidate",
+    "last_updated_at": "2026-10-10T09:35:00+08:00",
+    "current_turn": "R12_WEB_expiry_fixture_single_clock_fixed10P_self_checked",
     "stored_block_reason": "正式指数来源及32日资料仍缺；生产安装切流授权和实际开市日观察按固定6项处理。",
     "explicit_goal_token_budget": null,
     "resume_control": "get_goal已实际返回active；当前无需再点Target继续。",
@@ -17,10 +17,10 @@
     "previous_goal_turn_evidence": "r12-auction-python311312-accepted-20261009-01.json：两版本原54节点通过并核原记录；集中审查形成唯一FCR-001并交原实现者。",
     "last_observation": {
       "classification": "actual_progress",
-      "observed_at": "2026-10-10T09:14:00+08:00",
-      "actual": "原审查者一次增量复核PASS、0新增阻断；唯一源码lab_jobs.py两函数，源79cfdcc8不变。原18结构用例及普通141.785秒原13+3启动通过，所有测试资源全清。必要元数据465826字节前后相同，标准生成/check通过，原19边界结果复用。仅提交该源码及本会话3个进度文档到原PR323，随后正式CI验证修后候选；旧失败和取消保留。固定25项、19本地完成、6剩余、生产0/15，目标及授权保持，不追加实现、审计、重构或完整本地重跑。",
-      "evidence": "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-f982-web-failure-01/macro-startup-diagnosis-01/sql-text-reuse-implementation-01/reviewer-final-01/EV.json",
-      "next": "提交同一PR修后候选并完成必要正式CI；保留旧运行终态和取消缺口。仅在正式日志出现真实阻断时做必要局部修复，复用有效证据。"
+      "observed_at": "2026-10-10T09:35:00+08:00",
+      "actual": "前端CI38012489178实际1207通过、1失败，报告和浏览器阶段未执行。仅测试数据签发与到期双时钟问题可复现：跨1ms生成120001ms而被原120000ms上限拒绝；未取得CI当次时间。单叶改为同一签发起点，原10项通过、0跳过，格式与自检通过，产品校验、断言和超时不变。原18项、141.785秒普通启动、构建和独立审查复用，元数据不重算。后端20作业通过、完整分片仍运行。只提交补修至原PR并完成必要正式CI。固定25项、19本地完成、6剩余、生产0/15，Target active，授权不扩大范围。",
+      "evidence": "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-f982-web-failure-01/macro-startup-diagnosis-01/sql-text-reuse-implementation-01/root-candidate-01/published-candidate-01/web-expiry-fixture-01/EV.json",
+      "next": "提交这处已自检的单叶测试补修和现有3个进度文档，由原PR的修后精确候选完成必要CI；保存原失败和取消，不增审查或完整本地重跑。"
     },
     "previous_blocked_audit": {
       "consecutive_goal_turns_without_available_safe_implementation": 3,
@@ -30,7 +30,7 @@
     },
     "blocked_audit": {
       "consecutive_goal_turns_without_available_safe_implementation": 0,
-      "condition": "局部修复与原审查者增量复核已过，可提交修后候选运行正式CI。",
+      "condition": "测试单叶实际补修通过，继续必要提交和同候选正式CI。",
       "update_goal_blocked_threshold": 3
     }
   },
@@ -65,7 +65,7 @@
       1,
       3
     ],
-    "confidence": "两函数补修、原18用例、普通141.79秒启动及一次增量复核均通过；仅提交同PR修后候选并完成正式CI。已有有效源码、测试、构建及页面证据复用；正式资料、生产授权及20个实际开市日另计。",
+    "confidence": "原10项测试补修通过，正式精确候选CI仍待；原18项、普通141.79秒启动、构建和独立审查复用。正式资料、生产授权与20个实际开市日另计。",
     "assumptions": [
       "本地19项已验收，14个模块已本地验证；正式市场资料不由合成资料替代。",
       "唯一集中候选审查及原19叶CI补修复核已通过；本批实际阻断修复已冻；只作组合增量复核，复用有效测试。",
@@ -2557,10 +2557,12 @@
         "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-f982-web-failure-01/run.json",
         "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-f982-web-failure-01/macro-startup-diagnosis-01/linux311-profile-01/HOST-CLEANUP.json",
         "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-f982-web-failure-01/macro-startup-diagnosis-01/sql-text-reuse-implementation-01/EV.json",
-        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-f982-web-failure-01/macro-startup-diagnosis-01/sql-text-reuse-implementation-01/reviewer-final-01/EV.json"
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-f982-web-failure-01/macro-startup-diagnosis-01/sql-text-reuse-implementation-01/reviewer-final-01/EV.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-f982-web-failure-01/macro-startup-diagnosis-01/sql-text-reuse-implementation-01/root-candidate-01/published-candidate-01/RUNS.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-f982-web-failure-01/macro-startup-diagnosis-01/sql-text-reuse-implementation-01/root-candidate-01/published-candidate-01/web-expiry-fixture-01/EV.json"
       ],
       "closure_level": "pending",
-      "last_progress": "原审查者一次增量复核PASS、0新增阻断；唯一源码lab_jobs.py两函数，源79cfdcc8不变。原18结构用例及普通141.785秒原13+3启动通过，所有测试资源全清。必要元数据465826字节前后相同，标准生成/check通过，原19边界结果复用。仅提交该源码及本会话3个进度文档到原PR323，随后正式CI验证修后候选；旧失败和取消保留。固定25项、19本地完成、6剩余、生产0/15，目标及授权保持，不追加实现、审计、重构或完整本地重跑。",
+      "last_progress": "前端CI38012489178实际1207通过、1失败，报告和浏览器阶段未执行。仅测试数据签发与到期双时钟问题可复现：跨1ms生成120001ms而被原120000ms上限拒绝；未取得CI当次时间。单叶改为同一签发起点，原10项通过、0跳过，格式与自检通过，产品校验、断言和超时不变。原18项、141.785秒普通启动、构建和独立审查复用，元数据不重算。后端20作业通过、完整分片仍运行。只提交补修至原PR并完成必要正式CI。固定25项、19本地完成、6剩余、生产0/15，Target active，授权不扩大范围。",
       "submilestones": [
         {
           "name": "网页最终候选准备门禁",
@@ -2712,9 +2714,9 @@
         }
       ],
       "pull_request": "https://github.com/roxorlt/rquant/pull/323",
-      "candidate_commit": "f9823df71e5e0b28d0ec781471bc1272bc859958",
-      "remaining_hours_note": "局部代码、原18用例、普通启动及增量复核通过；正式同候选CI及既定外部条件仍待。",
-      "published_candidate_commit": "f9823df71e5e0b28d0ec781471bc1272bc859958"
+      "candidate_commit": "5435fcb17a49a8797f9cd738e5070282486788b5",
+      "remaining_hours_note": "只提交已自检的测试单叶和完成正式CI，未取得整体通过耗时。外部条件仍待。",
+      "published_candidate_commit": "5435fcb17a49a8797f9cd738e5070282486788b5"
     },
     {
       "id": "R13",
@@ -4000,6 +4002,20 @@
       "delivery_unit_added": false,
       "actual": "原审查者一次增量复核PASS、0新增阻断；唯一源码lab_jobs.py两函数，源79cfdcc8不变。原18结构用例及普通141.785秒原13+3启动通过，所有测试资源全清。必要元数据465826字节前后相同，标准生成/check通过，原19边界结果复用。仅提交该源码及本会话3个进度文档到原PR323，随后正式CI验证修后候选；旧失败和取消保留。固定25项、19本地完成、6剩余、生产0/15，目标及授权保持，不追加实现、审计、重构或完整本地重跑。",
       "scope": "仅已验单文件差异和同PR必要门禁，全部既有范围保持。"
+    },
+    {
+      "at": "2026-10-10T09:19:00+08:00",
+      "task_id": "R12",
+      "delivery_unit_added": false,
+      "actual": "修后候选5435fcb17a49a8797f9cd738e5070282486788b5已commit/push原PR323，精确提交与已审源码相符。原18结构用例、普通141.785秒启动及一次增量复核PASS，全部自有测试资源清理；必要元数据逐字节不变。后端CI38012489134、前端CI38012489178已启动，尚未整体通过。旧候选由原PR并发规则收尾，失败、取消和缺口保留。Target实际active，固定25项、19本地完成、6剩余、生产0/15；目标及授权保持，不追加审计、重构、完整本地重跑或交付项。",
+      "scope": "仅修后精确候选的仓库必需门禁及真实终态，无新实现或审计范围。"
+    },
+    {
+      "at": "2026-10-10T09:35:00+08:00",
+      "task_id": "R12",
+      "delivery_unit_added": false,
+      "actual": "前端CI38012489178实际1207通过、1失败，报告和浏览器阶段未执行。仅测试数据签发与到期双时钟问题可复现：跨1ms生成120001ms而被原120000ms上限拒绝；未取得CI当次时间。单叶改为同一签发起点，原10项通过、0跳过，格式与自检通过，产品校验、断言和超时不变。原18项、141.785秒普通启动、构建和独立审查复用，元数据不重算。后端20作业通过、完整分片仍运行。只提交补修至原PR并完成必要正式CI。固定25项、19本地完成、6剩余、生产0/15，Target active，授权不扩大范围。",
+      "scope": "只改builtinPromotion.test.tsx同一签发起点；不改产品、守卫、断言、超时或工作流，不新增审查或测试组。"
     }
   ],
   "update_policy": [
@@ -4150,10 +4166,10 @@
       "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-source-integration/.codex/config.toml"
     ],
     "live_reload_verified": true,
-    "root_work": "维护固定25项与明确文件归属，复用原证据；冻结必要差异，统一元数据和同候选CI。",
+    "root_work": "仅一测试数据叶补修、自检与必要候选提交；保持固定25项，复用原有效测试、审查和构建。",
     "waiting_subagents": 0,
     "runtime_capacity_evidence": "本轮app运行环境重新初始化后的原生元数据明确提供16个并发槽位，包含Root；不是修改配置后推断即时生效。",
     "active_subagents": [],
-    "next": "提交同一PR修后候选并完成必要正式CI；保留旧运行终态和取消缺口。仅在正式日志出现真实阻断时做必要局部修复，复用有效证据。"
+    "next": "提交这处已自检的单叶测试补修和现有3个进度文档，由原PR的修后精确候选完成必要CI；保存原失败和取消，不增审查或完整本地重跑。"
   }
 }

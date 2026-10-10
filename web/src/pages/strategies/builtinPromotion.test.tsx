@@ -301,6 +301,7 @@ function setup(initial = source()) {
         result = { ...result, review: lastReview };
       } else if (body.kind === "prepare_promotion_approval") {
         if (!lastReview) throw new Error("Prior review required");
+        const issuedAt = Date.now();
         prepared = {
           actor_id: "tester",
           preparation_id: body.command_id,
@@ -308,8 +309,8 @@ function setup(initial = source()) {
           role_revision: 1,
           role_state_hash: roleHash,
           issuance_proof: "4".repeat(64),
-          issued_at: new Date().toISOString(),
-          expires_at: new Date(Date.now() + 120_000).toISOString(),
+          issued_at: new Date(issuedAt).toISOString(),
+          expires_at: new Date(issuedAt + 120_000).toISOString(),
         };
         result = { ...result, preparation: prepared };
       } else if (body.kind === "approve_promotion") {
