@@ -217,3 +217,20 @@ def write_demo_research(root: Path) -> None:
                                   latest_date=days[-2], rows_in_window=15000,
                                   missing_open_days=[days[-1]], required_on_open_day=True)],
     ), root)
+
+    import numpy as np
+    import pandas as pd
+
+    from rquant.factor.store import run_factor
+    from rquant.factor.store import save as save_factor
+
+    rng = np.random.default_rng(7)
+    idx = pd.bdate_range(end=pd.Timestamp(today), periods=90)
+    close = pd.DataFrame(10 * np.exp(np.cumsum(rng.normal(0, 0.02, (len(idx), 40)), axis=0)),
+                         index=idx, columns=[f"{600000 + i}.SH" for i in range(40)])
+    panel = {f: close for f in ("open", "high", "low", "close", "pre_close")}
+    panel |= {"pct_chg": close.pct_change() * 100, "vol": close * 0 + 1, "amount": close * 0 + 1}
+    expr = "cs_rank(ts_delta(close, 5))"
+    start = idx[30].date()
+    save_factor("演示动量因子", expr, start, today,
+                run_factor(panel, expr, start, today), root=root)

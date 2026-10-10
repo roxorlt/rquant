@@ -1084,6 +1084,31 @@
         "title": "DatasetCoverage",
         "type": "object"
       },
+      "DecayPoint": {
+        "properties": {
+          "horizon": {
+            "title": "Horizon",
+            "type": "integer"
+          },
+          "mean_ic": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mean Ic"
+          }
+        },
+        "required": [
+          "horizon",
+          "mean_ic"
+        ],
+        "title": "DecayPoint",
+        "type": "object"
+      },
       "Envelope_AlertsData_": {
         "properties": {
           "data": {
@@ -1146,6 +1171,38 @@
           "serving"
         ],
         "title": "Envelope[DataCenterData]",
+        "type": "object"
+      },
+      "Envelope_FactorDetailData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/FactorDetailData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[FactorDetailData]",
+        "type": "object"
+      },
+      "Envelope_FactorListData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/FactorListData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[FactorListData]",
         "type": "object"
       },
       "Envelope_HealthData_": {
@@ -1308,6 +1365,226 @@
         "title": "Envelope[ScreenData]",
         "type": "object"
       },
+      "FactorDetailData": {
+        "properties": {
+          "factor": {
+            "$ref": "#/components/schemas/FactorSummary"
+          },
+          "result": {
+            "$ref": "#/components/schemas/FactorTestResult"
+          }
+        },
+        "required": [
+          "factor",
+          "result"
+        ],
+        "title": "FactorDetailData",
+        "type": "object"
+      },
+      "FactorListData": {
+        "properties": {
+          "factors": {
+            "items": {
+              "$ref": "#/components/schemas/FactorSummary"
+            },
+            "title": "Factors",
+            "type": "array"
+          }
+        },
+        "required": [
+          "factors"
+        ],
+        "title": "FactorListData",
+        "type": "object"
+      },
+      "FactorSummary": {
+        "properties": {
+          "days": {
+            "title": "Days",
+            "type": "integer"
+          },
+          "end": {
+            "format": "date",
+            "title": "End",
+            "type": "string"
+          },
+          "expression": {
+            "title": "Expression",
+            "type": "string"
+          },
+          "factor_id": {
+            "title": "Factor Id",
+            "type": "string"
+          },
+          "horizon": {
+            "title": "Horizon",
+            "type": "integer"
+          },
+          "ic_ir": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ic Ir"
+          },
+          "long_short": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Long Short"
+          },
+          "mean_ic": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mean Ic"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "start": {
+            "format": "date",
+            "title": "Start",
+            "type": "string"
+          }
+        },
+        "required": [
+          "factor_id",
+          "name",
+          "expression",
+          "start",
+          "end",
+          "horizon",
+          "days",
+          "mean_ic",
+          "ic_ir",
+          "long_short"
+        ],
+        "title": "FactorSummary",
+        "type": "object"
+      },
+      "FactorTestResult": {
+        "properties": {
+          "coverage": {
+            "title": "Coverage",
+            "type": "number"
+          },
+          "days": {
+            "title": "Days",
+            "type": "integer"
+          },
+          "decay": {
+            "items": {
+              "$ref": "#/components/schemas/DecayPoint"
+            },
+            "title": "Decay",
+            "type": "array"
+          },
+          "horizon": {
+            "title": "Horizon",
+            "type": "integer"
+          },
+          "ic_ir": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ic Ir"
+          },
+          "ic_series": {
+            "items": {
+              "$ref": "#/components/schemas/IcPoint"
+            },
+            "title": "Ic Series",
+            "type": "array"
+          },
+          "long_short": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Long Short"
+          },
+          "mean_ic": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mean Ic"
+          },
+          "positive_ratio": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Positive Ratio"
+          },
+          "quantiles": {
+            "items": {
+              "$ref": "#/components/schemas/QuantileReturn"
+            },
+            "title": "Quantiles",
+            "type": "array"
+          },
+          "t_stat": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "T Stat"
+          }
+        },
+        "required": [
+          "horizon",
+          "days",
+          "mean_ic",
+          "ic_ir",
+          "t_stat",
+          "positive_ratio",
+          "long_short",
+          "coverage",
+          "ic_series",
+          "quantiles",
+          "decay"
+        ],
+        "title": "FactorTestResult",
+        "type": "object"
+      },
       "FreshnessItem": {
         "properties": {
           "key": {
@@ -1423,6 +1700,25 @@
           "unrealized_pnl"
         ],
         "title": "HoldingItem",
+        "type": "object"
+      },
+      "IcPoint": {
+        "properties": {
+          "date": {
+            "format": "date",
+            "title": "Date",
+            "type": "string"
+          },
+          "ic": {
+            "title": "Ic",
+            "type": "number"
+          }
+        },
+        "required": [
+          "date",
+          "ic"
+        ],
+        "title": "IcPoint",
         "type": "object"
       },
       "IndustryExposure": {
@@ -2179,6 +2475,24 @@
         "title": "PortfolioRunSummary",
         "type": "object"
       },
+      "QuantileReturn": {
+        "properties": {
+          "mean_return": {
+            "title": "Mean Return",
+            "type": "number"
+          },
+          "quantile": {
+            "title": "Quantile",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "quantile",
+          "mean_return"
+        ],
+        "title": "QuantileReturn",
+        "type": "object"
+      },
       "SavePoolRequest": {
         "properties": {
           "description": {
@@ -2697,6 +3011,63 @@
           }
         },
         "summary": "数据中心"
+      }
+    },
+    "/api/v1/factors": {
+      "get": {
+        "operationId": "factors_api_v1_factors_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_FactorListData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "因子检验列表"
+      }
+    },
+    "/api/v1/factors/{factor_id}": {
+      "get": {
+        "operationId": "factor_detail_api_v1_factors__factor_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "factor_id",
+            "required": true,
+            "schema": {
+              "title": "Factor Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_FactorDetailData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "因子检验详情"
       }
     },
     "/api/v1/health": {

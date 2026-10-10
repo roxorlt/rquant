@@ -4,6 +4,7 @@ export type PageId =
   | "overview"
   | "screener"
   | "pools"
+  | "factor"
   | "backtest"
   | "paper"
   | "monitor"
@@ -29,6 +30,7 @@ export const PAGES: readonly PageDef[] = [
   { id: "overview", path: "/overview", title: "总览", group: "概览", phoneTab: "总览" },
   { id: "screener", path: "/screener", title: "选股与排序", group: "研究" },
   { id: "pools", path: "/pools", title: "池子", group: "研究" },
+  { id: "factor", path: "/factor", title: "因子检验", group: "研究" },
   { id: "backtest", path: "/backtest", title: "回测结果", group: "策略与验证" },
   { id: "paper", path: "/paper", title: "模拟盘", group: "跟踪与告警" },
   { id: "monitor", path: "/monitor", title: "告警", group: "跟踪与告警", phoneTab: "告警" },

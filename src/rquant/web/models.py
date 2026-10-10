@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 from rquant.backtest.exposure import IndustryExposure
 from rquant.data_catalog.audit import AuditReport
 from rquant.data_catalog.models import CatalogDataset
+from rquant.factor.evaluation import FactorTestResult
 from rquant.web.overfit_stats import OverfitStats
 
 T = TypeVar("T")
@@ -339,3 +340,25 @@ class CommandReceipt(BaseModel):
 class DataCenterData(BaseModel):
     datasets: list[CatalogDataset]
     audit: AuditReport | None
+
+
+class FactorSummary(BaseModel):
+    factor_id: str
+    name: str
+    expression: str
+    start: date
+    end: date
+    horizon: int
+    days: int
+    mean_ic: float | None
+    ic_ir: float | None
+    long_short: float | None
+
+
+class FactorListData(BaseModel):
+    factors: list[FactorSummary]
+
+
+class FactorDetailData(BaseModel):
+    factor: FactorSummary
+    result: FactorTestResult

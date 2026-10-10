@@ -177,3 +177,23 @@ export function useDataCenter(): ServingQueryResult<Schemas["DataCenterData"]> {
     return unwrap(data, response);
   });
 }
+
+export function useFactors(): ServingQueryResult<Schemas["FactorListData"]> {
+  return useServingQuery(["factors"], async () => {
+    const { data, response } = await apiClient().GET("/api/v1/factors");
+    return unwrap(data, response);
+  });
+}
+
+export function useFactor(id: string | null): ServingQueryResult<Schemas["FactorDetailData"]> {
+  return useServingQuery(
+    ["factors", id],
+    async () => {
+      const { data, response } = await apiClient().GET("/api/v1/factors/{factor_id}", {
+        params: { path: { factor_id: id ?? "" } },
+      });
+      return unwrap(data, response);
+    },
+    { enabled: id !== null },
+  );
+}

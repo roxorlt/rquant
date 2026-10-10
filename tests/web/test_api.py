@@ -171,3 +171,18 @@ def test_data_center_lists_catalog_and_audit(tmp_path) -> None:
     write_demo_research(tmp_path)
     audit = client.get("/api/v1/data-center").json()["data"]["audit"]
     assert audit["datasets"][0]["missing_open_days"]
+
+
+def test_factor_results_are_listed_and_read(tmp_path) -> None:
+    from fastapi.testclient import TestClient
+
+    from rquant.web.app import create_app
+    from rquant.web.source import FixtureSource, write_demo_research
+
+    write_demo_research(tmp_path)
+    client = TestClient(create_app(FixtureSource(), dist=None, research_root=tmp_path))
+    items = client.get("/api/v1/factors").json()["data"]["factors"]
+    assert [f["name"] for f in items] == ["演示动量因子"]
+    detail = client.get(f"/api/v1/factors/{items[0]['factor_id']}").json()["data"]
+    assert len(detail["result"]["decay"]) == 6
+    assert client.get("/api/v1/factors/x").status_code == 404
