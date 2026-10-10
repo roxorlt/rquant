@@ -152,26 +152,21 @@ def _driver(parent_root: Path, output: Path, seed_path: Path) -> None:
             return frozen_now if tz is None else frozen_now.astimezone(tz)
 
     policy = BrokerCostPolicy(**seed["cost_policy"])
-    output.parent.mkdir(parents=True, exist_ok=True)
-    with (
-        patch.object(parent_broker, "datetime", FrozenDateTime),
-        patch.object(
-            parent_broker.secrets,
-            "token_hex",
-            return_value=str(seed["ledger_generation"]),
-        ),
-    ):
+
+    def execute_account(account: dict[str, object]) -> None:
+        account_id = str(account["account_id"])
         store = PaperBrokerStore(
             output,
-            account_id=seed["account_id"],
-            initial_cash=Decimal(seed["initial_cash"]),
+            account_id=account_id,
+            initial_cash=Decimal(str(account["initial_cash"])),
             cost_policy=policy,
         )
-        buy = seed["executions"][0]
+        executions = list(account["executions"])
+        buy = executions[0]
         buy_event = datetime.fromisoformat(buy["event_time"])
         buy_intent = PaperOrderIntent(
             signal_id=buy["signal_id"],
-            account_id=seed["account_id"],
+            account_id=account_id,
             ts_code=seed["ts_code"],
             side=PaperSide.BUY,
             order_type=PaperOrderType.MARKET,
@@ -191,26 +186,28 @@ def _driver(parent_root: Path, output: Path, seed_path: Path) -> None:
             trade_date=date.fromisoformat(buy["trade_date"]),
             quote=BrokerExecutionContext(
                 executable_price=Decimal(buy["price"]),
-                executable_quantity=buy["executable_quantity"],
+                executable_quantity=buy.get("executable_quantity"),
                 acquisition_available_date=date.fromisoformat(buy["available_date"]),
             ),
         )
-        incremental_buy = seed["executions"][1]
-        store.apply_execution(
-            buy_order.order_id,
-            execution_id=incremental_buy["execution_id"],
-            executed_at=datetime.fromisoformat(incremental_buy["executed_at"]),
-            persisted_at=datetime.fromisoformat(incremental_buy["persisted_at"]),
-            trade_date=date.fromisoformat(incremental_buy["trade_date"]),
-            quantity=incremental_buy["quantity"],
-            price_snapshot_id=seed["price_snapshot_id"],
-            quote=BrokerExecutionContext(
-                executable_price=Decimal(incremental_buy["price"]),
-                executable_quantity=incremental_buy["quantity"],
-                acquisition_available_date=date.fromisoformat(incremental_buy["available_date"]),
-            ),
-        )
-        sell = seed["executions"][2]
+        for incremental_buy in (item for item in executions[1:] if item["side"] == "BUY"):
+            store.apply_execution(
+                buy_order.order_id,
+                execution_id=incremental_buy["execution_id"],
+                executed_at=datetime.fromisoformat(incremental_buy["executed_at"]),
+                persisted_at=datetime.fromisoformat(incremental_buy["persisted_at"]),
+                trade_date=date.fromisoformat(incremental_buy["trade_date"]),
+                quantity=incremental_buy["quantity"],
+                price_snapshot_id=seed["price_snapshot_id"],
+                quote=BrokerExecutionContext(
+                    executable_price=Decimal(incremental_buy["price"]),
+                    executable_quantity=incremental_buy["quantity"],
+                    acquisition_available_date=date.fromisoformat(
+                        incremental_buy["available_date"]
+                    ),
+                ),
+            )
+        sell = next(item for item in executions if item["side"] == "SELL")
         sell_decision = datetime.fromisoformat(sell["decision_time"])
         authority = store.sell_quantity_authority(
             exit_signal_id=sell["signal_id"],
@@ -226,7 +223,7 @@ def _driver(parent_root: Path, output: Path, seed_path: Path) -> None:
             signal_id=sell["signal_id"],
             entry_signal_id=buy["signal_id"],
             sell_quantity_authority=authority,
-            account_id=seed["account_id"],
+            account_id=account_id,
             ts_code=seed["ts_code"],
             side=PaperSide.SELL,
             order_type=PaperOrderType.MARKET,
@@ -249,6 +246,18 @@ def _driver(parent_root: Path, output: Path, seed_path: Path) -> None:
         reconciliation = store.reconcile()
         if not reconciliation.is_consistent:
             raise RuntimeError("parent fixture business ledger did not reconcile")
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with (
+        patch.object(parent_broker, "datetime", FrozenDateTime),
+        patch.object(
+            parent_broker.secrets,
+            "token_hex",
+            return_value=str(seed["ledger_generation"]),
+        ),
+    ):
+        for account in seed["accounts"]:
+            execute_account(account)
     with sqlite3.connect(output) as connection:
         connection.execute(
             "UPDATE paper_ledger_schema SET migrated_at = ? WHERE singleton = 1",
@@ -266,10 +275,11 @@ def _driver(parent_root: Path, output: Path, seed_path: Path) -> None:
             str(row[0])
             for row in connection.execute(
                 """
-                SELECT lot_id FROM paper_lot
+                SELECT lot_id FROM paper_lot WHERE account_id = ?
                 ORDER BY available_date, acquisition_trade_date, buy_executed_at,
                          buy_persisted_at, buy_fill_sequence, lot_id
-                """
+                """,
+                (seed["accounts"][0]["account_id"],),
             ).fetchall()
         )
         if len(chronological_lot_ids) != 2 or chronological_lot_ids != tuple(
@@ -278,6 +288,15 @@ def _driver(parent_root: Path, output: Path, seed_path: Path) -> None:
             raise RuntimeError(
                 "parent fixture lot ids are not inverse to canonical FIFO chronology"
             )
+        account_count = int(connection.execute("SELECT COUNT(*) FROM broker_account").fetchone()[0])
+        same_symbol_accounts = int(
+            connection.execute(
+                "SELECT COUNT(DISTINCT account_id) FROM paper_lot WHERE ts_code = ?",
+                (seed["ts_code"],),
+            ).fetchone()[0]
+        )
+        if account_count != 2 or same_symbol_accounts != 2:
+            raise RuntimeError("parent fixture does not contain two isolated same-symbol accounts")
 
 
 def _build(repo: Path, output_dir: Path) -> None:

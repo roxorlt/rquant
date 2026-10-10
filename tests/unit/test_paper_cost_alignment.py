@@ -17,6 +17,7 @@ from rquant.paper_broker import (
     PaperBrokerStore,
 )
 from rquant.paper_contracts import (
+    PaperAccountSnapshot,
     PaperOrderIntent,
     PaperOrderStatus,
     PaperOrderType,
@@ -607,6 +608,188 @@ def test_store_comparator_rejects_stale_signed_anchor(tmp_path: Path) -> None:
 
     assert not comparison.is_comparable
     assert comparison.reason == "CURRENT_HEAD_UNANCHORED"
+
+
+def test_store_comparator_rejects_anchored_synchronized_non_fifo_state_tamper(
+    tmp_path: Path,
+) -> None:
+    from rquant.strategy_execution_costs import ExecutionCostBindingEvidence
+    from rquant.runtime_contracts import canonical_sha256
+    from tests.paper_ledger_anchor_support import create_paper_ledger_test_authority
+
+    spec = _v3_spec()
+    anchor_authority = create_paper_ledger_test_authority(
+        tmp_path / "anchor-key",
+        as_of=_ANCHOR_NOW,
+        max_age=_ANCHOR_MAX_AGE,
+        future_skew=_ANCHOR_FUTURE_SKEW,
+    )
+    anchor_path = tmp_path / "current-head-anchor.json"
+    store = _paper_store(
+        tmp_path / "paper.sqlite3",
+        spec=spec,
+        initial_cash=Decimal("100000.00"),
+        anchor_authority=anchor_authority,
+        anchor_path=anchor_path,
+    )
+    intent = _paper_intent(signal_seed="a", quantity=200)
+    buy_order = store.submit_intent(
+        intent,
+        execution_id="1" * 64,
+        decision_time=_BUY_TIME,
+        trade_date=_BUY_DATE,
+        quote=_paper_quote("10.00", executable_quantity=100),
+    )
+    store.apply_execution(
+        buy_order.order_id,
+        execution_id="2" * 64,
+        executed_at=_BUY_TIME + timedelta(minutes=1),
+        persisted_at=_BUY_TIME + timedelta(minutes=1),
+        trade_date=_BUY_DATE,
+        quantity=100,
+        quote=_paper_quote("11.00", executable_quantity=100),
+        price_snapshot_id=_PRICE_SNAPSHOT_ID,
+    )
+    sell_authority = store.sell_quantity_authority(
+        exit_signal_id="d" * 64,
+        entry_signal_id=intent.signal_id,
+        ts_code="600000.SH",
+        action="REDUCE",
+        tranche_fraction=Decimal("0.5"),
+        decision_cutoff=_BUY_TIME + timedelta(days=1),
+        trade_date=_NEXT_TRADE_DATE,
+    )
+    store.submit_intent(
+        _paper_intent(
+            signal_seed="d",
+            side=PaperSide.SELL,
+            quantity=100,
+            event_time=_BUY_TIME + timedelta(days=1, seconds=-2),
+            entry_signal_id=intent.signal_id,
+            sell_quantity_authority=sell_authority,
+        ),
+        execution_id="3" * 64,
+        decision_time=_BUY_TIME + timedelta(days=1),
+        trade_date=_NEXT_TRADE_DATE,
+        quote=_paper_quote("12.00", available_date=None),
+    )
+    store.account_authority_snapshot(
+        as_of=_BUY_TIME + timedelta(days=1, seconds=1),
+        market_prices={"600000.SH": Decimal("12.00")},
+        producer_commit=_PRODUCER_COMMIT,
+    )
+    receipts = tuple(store.execution(execution_id) for execution_id in ("1" * 64, "2" * 64, "3" * 64))
+    assert all(receipt is not None and receipt.cost_calculation is not None for receipt in receipts)
+    research = ExecutionCostBindingEvidence(
+        provenance_state="KNOWN_V3",
+        execution_cost_spec=spec,
+        calculations=tuple(receipt.cost_calculation for receipt in receipts if receipt is not None),
+    )
+    anchor_authority.write_current_anchor(store.path, anchor_path, issued_at=_ANCHOR_NOW)
+
+    with sqlite3.connect(store.path) as connection:
+        connection.row_factory = sqlite3.Row
+        head_before = str(
+            connection.execute(
+                "SELECT head_marker_fingerprint FROM paper_ledger_head_marker ORDER BY revision DESC LIMIT 1"
+            ).fetchone()[0]
+        )
+        lots = connection.execute(
+            """
+            SELECT lot_id, unit_cost FROM paper_lot
+            WHERE account_id = ? ORDER BY available_date, acquisition_trade_date,
+                buy_executed_at, buy_persisted_at, buy_fill_sequence, lot_id
+            """,
+            (_ACCOUNT_ID,),
+        ).fetchall()
+        sell_fill = connection.execute(
+            """
+            SELECT f.fill_id, f.quantity, f.price, f.total_fees
+            FROM paper_fill AS f JOIN paper_order AS o ON o.order_id = f.order_id
+            WHERE o.account_id = ? AND o.side = 'SELL'
+            """,
+            (_ACCOUNT_ID,),
+        ).fetchone()
+        trigger = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' "
+            "AND name = 'paper_lot_consumption_row_immutable'"
+        ).fetchone()
+        authority_row = connection.execute(
+            "SELECT snapshot_json FROM paper_account_authority WHERE account_id = ?",
+            (_ACCOUNT_ID,),
+        ).fetchone()
+        assert len(lots) == 2 and sell_fill is not None and trigger is not None
+        assert authority_row is not None
+        first_lot, second_lot = lots
+        connection.execute("DROP TRIGGER paper_lot_consumption_row_immutable")
+        connection.execute(
+            """
+            UPDATE paper_lot_consumption SET lot_id = ?, unit_cost = ?
+            WHERE fill_id = ? AND lot_id = ?
+            """,
+            (second_lot["lot_id"], second_lot["unit_cost"], sell_fill["fill_id"], first_lot["lot_id"]),
+        )
+        connection.execute(str(trigger[0]))
+        connection.execute(
+            "UPDATE paper_lot SET remaining_quantity = original_quantity WHERE lot_id = ?",
+            (first_lot["lot_id"],),
+        )
+        connection.execute(
+            "UPDATE paper_lot SET remaining_quantity = 0 WHERE lot_id = ?",
+            (second_lot["lot_id"],),
+        )
+        tampered_realized = (
+            Decimal(str(sell_fill["price"])) * int(sell_fill["quantity"])
+            - Decimal(str(sell_fill["total_fees"]))
+            - Decimal(str(second_lot["unit_cost"])) * int(sell_fill["quantity"])
+        )
+        connection.execute(
+            "UPDATE broker_account SET realized_pnl = ? WHERE account_id = ?",
+            (str(tampered_realized), _ACCOUNT_ID),
+        )
+        old_snapshot = PaperAccountSnapshot.model_validate_json(authority_row["snapshot_json"])
+        holding = old_snapshot.holdings[0].model_copy(
+            update={"average_cost": Decimal(str(first_lot["unit_cost"]))}
+        )
+        replacement_snapshot = PaperAccountSnapshot(
+            **{
+                **old_snapshot.model_dump(mode="python", exclude={"snapshot_id"}),
+                "holdings": (holding,),
+                "realized_pnl": tampered_realized,
+                "unrealized_pnl": (
+                    (holding.market_price - holding.average_cost) * holding.quantity
+                ),
+            }
+        )
+        state_fingerprint = canonical_sha256(
+            replacement_snapshot.model_dump(
+                mode="python", exclude={"snapshot_id", "as_of_time"}
+            )
+        )
+        connection.execute(
+            """
+            UPDATE paper_account_authority SET state_fingerprint = ?, snapshot_json = ?
+            WHERE account_id = ?
+            """,
+            (state_fingerprint, replacement_snapshot.model_dump_json(), _ACCOUNT_ID),
+        )
+        head_after = str(
+            connection.execute(
+                "SELECT head_marker_fingerprint FROM paper_ledger_head_marker ORDER BY revision DESC LIMIT 1"
+            ).fetchone()[0]
+        )
+
+    assert head_after == head_before
+    comparison = store.compare_research_execution_costs(
+        research,
+        account_id=_ACCOUNT_ID,
+        execution_ids=("1" * 64, "2" * 64, "3" * 64),
+    )
+    assert not comparison.is_comparable
+    assert comparison.reason in {
+        "CURRENT_HEAD_UNANCHORED",
+        "PAPER_LEDGER_RECONCILIATION_FAILED",
+    }
 
 
 def test_strict_v3_binding_comparator_has_machine_negative_reasons(tmp_path: Path) -> None:
