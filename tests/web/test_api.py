@@ -141,3 +141,18 @@ def test_portfolio_backtests_are_read_from_result_files(tmp_path) -> None:
     assert detail["perf"]["days"] == 4
     assert {o["code"] for o in detail["orders"]} == {"600519.SH", "000001.SZ"}
     assert client.get("/api/v1/portfolio-backtests/nope").status_code == 404
+
+
+def test_portfolio_compare_and_overfit_block(tmp_path) -> None:
+    from fastapi.testclient import TestClient
+
+    from rquant.web.app import create_app
+    from rquant.web.source import FixtureSource, write_demo_research
+
+    write_demo_research(tmp_path)
+    client = TestClient(create_app(FixtureSource(), dist=None, research_root=tmp_path))
+    run_id = client.get("/api/v1/portfolio-backtests").json()["data"]["runs"][0]["run_id"]
+    detail = client.get(f"/api/v1/portfolio-backtests/{run_id}").json()["data"]
+    assert detail["overfit"]["trials"] == 1
+    both = client.get(f"/api/v1/portfolio-backtests/compare?a={run_id}&b={run_id}").json()
+    assert both["data"]["a"]["run"]["run_id"] == both["data"]["b"]["run"]["run_id"]

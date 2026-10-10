@@ -192,6 +192,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/portfolio-backtests/compare": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 组合回测对比 */
+        get: operations["portfolio_compare_api_v1_portfolio_backtests_compare_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/portfolio-backtests/{run_id}": {
         parameters: {
             query?: never;
@@ -484,6 +501,11 @@ export interface components {
             data: components["schemas"]["PoolsData"];
             serving: components["schemas"]["ServingMeta"];
         };
+        /** Envelope[PortfolioCompareData] */
+        Envelope_PortfolioCompareData_: {
+            data: components["schemas"]["PortfolioCompareData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
         /** Envelope[PortfolioRunDetailData] */
         Envelope_PortfolioRunDetailData_: {
             data: components["schemas"]["PortfolioRunDetailData"];
@@ -597,6 +619,21 @@ export interface components {
             /** Nav */
             nav: number;
         };
+        /** OverfitStats */
+        OverfitStats: {
+            /** Dsr */
+            dsr: number | null;
+            /** Min Track Record Days */
+            min_track_record_days: number | null;
+            /** Observations */
+            observations: number;
+            /** Psr */
+            psr: number | null;
+            /** Sharpe Per Day */
+            sharpe_per_day: number;
+            /** Trials */
+            trials: number;
+        };
         /** OverviewData */
         OverviewData: {
             /** Kpis */
@@ -669,6 +706,16 @@ export interface components {
             /** Trade Date */
             trade_date: string | null;
         };
+        /** PortfolioCompareData */
+        PortfolioCompareData: {
+            a: components["schemas"]["PortfolioCompareSide"];
+            b: components["schemas"]["PortfolioCompareSide"];
+        };
+        /** PortfolioCompareSide */
+        PortfolioCompareSide: {
+            perf: components["schemas"]["BacktestPerf"] | null;
+            run: components["schemas"]["PortfolioRunSummary"];
+        };
         /** PortfolioOrder */
         PortfolioOrder: {
             /** Code */
@@ -699,6 +746,7 @@ export interface components {
             };
             /** Orders */
             orders: components["schemas"]["PortfolioOrder"][];
+            overfit?: components["schemas"]["OverfitStats"] | null;
             perf: components["schemas"]["BacktestPerf"] | null;
             run: components["schemas"]["PortfolioRunSummary"];
         };
@@ -1137,6 +1185,39 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_PortfolioRunListData_"];
+                };
+            };
+        };
+    };
+    portfolio_compare_api_v1_portfolio_backtests_compare_get: {
+        parameters: {
+            query: {
+                a: string;
+                b: string;
+                benchmark?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_PortfolioCompareData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };

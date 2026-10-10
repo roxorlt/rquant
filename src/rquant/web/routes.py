@@ -40,6 +40,8 @@ from rquant.web.models import (
     PoolItem,
     PoolMember,
     PoolsData,
+    PortfolioCompareData,
+    PortfolioCompareSide,
     PortfolioOrder,
     PortfolioRunDetailData,
     PortfolioRunListData,
@@ -51,6 +53,7 @@ from rquant.web.models import (
     ServingMeta,
     SignalItem,
 )
+from rquant.web.overfit_stats import overfit_stats, sharpe_per_period
 from rquant.web.source import Source, table_missing
 
 router = APIRouter(prefix="/api/v1")
@@ -273,6 +276,29 @@ def portfolio_backtests(request: Request, source: SourceDep) -> Envelope[Portfol
     return _envelope(source, PortfolioRunListData(runs=runs[:200]))
 
 
+def _nav_returns(run: Any) -> pd.Series:
+    navs = pd.Series({pd.Timestamp(d.trade_date): d.nav for d in run.result.days},
+                     dtype="float64").sort_index()
+    return navs.pct_change().fillna(navs.iloc[0] - 1) if len(navs) else navs
+
+
+@router.get("/portfolio-backtests/compare", response_model=Envelope[PortfolioCompareData],
+            summary="组合回测对比")
+def portfolio_compare(a: str, b: str, request: Request, source: SourceDep,
+                      benchmark: str = "000300.SH") -> Envelope[PortfolioCompareData]:
+    root = _research_root(request)
+    bench = _benchmark_rows(source, benchmark)
+    sides = []
+    for run_id in (a, b):
+        run = read_run(run_id, root)
+        if run is None:
+            raise HTTPException(404, f"portfolio backtest not found: {run_id}")
+        perf = perf_from_returns(_nav_returns(run), (benchmark, bench) if bench else None,
+                                 method="组合回测逐日净值")
+        sides.append(PortfolioCompareSide(run=_portfolio_summary(run), perf=perf))
+    return _envelope(source, PortfolioCompareData(a=sides[0], b=sides[1]))
+
+
 @router.get("/portfolio-backtests/{run_id}", response_model=Envelope[PortfolioRunDetailData],
             summary="组合回测详情")
 def portfolio_backtest(run_id: str, request: Request, source: SourceDep,
@@ -280,9 +306,9 @@ def portfolio_backtest(run_id: str, request: Request, source: SourceDep,
     run = read_run(run_id, _research_root(request))
     if run is None:
         raise HTTPException(404, "portfolio backtest not found")
-    navs = pd.Series({pd.Timestamp(d.trade_date): d.nav for d in run.result.days},
-                     dtype="float64").sort_index()
-    returns = navs.pct_change().fillna(navs.iloc[0] - 1) if len(navs) else navs
+    returns = _nav_returns(run)
+    family = [sp for r in list_runs(_research_root(request)) if r.preset == run.preset
+              if (sp := sharpe_per_period(_nav_returns(r))) is not None]
     bench_rows = _benchmark_rows(source, benchmark)
     perf = perf_from_returns(returns, (benchmark, bench_rows) if bench_rows else None,
                              method="组合回测逐日净值")
@@ -290,7 +316,8 @@ def portfolio_backtest(run_id: str, request: Request, source: SourceDep,
               for o in run.result.orders[-2000:]]
     holdings = run.result.days[-1].positions if run.result.days else {}
     return _envelope(source, PortfolioRunDetailData(
-        run=_portfolio_summary(run), perf=perf, orders=orders, holdings=holdings))
+        run=_portfolio_summary(run), perf=perf, orders=orders, holdings=holdings,
+        overfit=overfit_stats(returns, family)))
 
 
 def _benchmark_rows(source: Source, code: str) -> list[dict[str, Any]]:
