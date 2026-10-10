@@ -977,6 +977,38 @@
         "title": "Envelope[PoolsData]",
         "type": "object"
       },
+      "Envelope_PortfolioRunDetailData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/PortfolioRunDetailData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[PortfolioRunDetailData]",
+        "type": "object"
+      },
+      "Envelope_PortfolioRunListData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/PortfolioRunListData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[PortfolioRunListData]",
+        "type": "object"
+      },
       "Envelope_ScreenData_": {
         "properties": {
           "data": {
@@ -1522,6 +1554,197 @@
           "pools"
         ],
         "title": "PoolsData",
+        "type": "object"
+      },
+      "PortfolioOrder": {
+        "properties": {
+          "code": {
+            "title": "Code",
+            "type": "string"
+          },
+          "fee": {
+            "title": "Fee",
+            "type": "number"
+          },
+          "price": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Price"
+          },
+          "quantity": {
+            "title": "Quantity",
+            "type": "integer"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "side": {
+            "title": "Side",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "trade_date": {
+            "format": "date",
+            "title": "Trade Date",
+            "type": "string"
+          }
+        },
+        "required": [
+          "trade_date",
+          "code",
+          "side",
+          "quantity",
+          "price",
+          "fee",
+          "status",
+          "reason"
+        ],
+        "title": "PortfolioOrder",
+        "type": "object"
+      },
+      "PortfolioRunDetailData": {
+        "properties": {
+          "holdings": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Holdings",
+            "type": "object"
+          },
+          "orders": {
+            "items": {
+              "$ref": "#/components/schemas/PortfolioOrder"
+            },
+            "title": "Orders",
+            "type": "array"
+          },
+          "perf": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BacktestPerf"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "run": {
+            "$ref": "#/components/schemas/PortfolioRunSummary"
+          }
+        },
+        "required": [
+          "run",
+          "perf",
+          "orders",
+          "holdings"
+        ],
+        "title": "PortfolioRunDetailData",
+        "type": "object"
+      },
+      "PortfolioRunListData": {
+        "properties": {
+          "runs": {
+            "items": {
+              "$ref": "#/components/schemas/PortfolioRunSummary"
+            },
+            "title": "Runs",
+            "type": "array"
+          }
+        },
+        "required": [
+          "runs"
+        ],
+        "title": "PortfolioRunListData",
+        "type": "object"
+      },
+      "PortfolioRunSummary": {
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "end": {
+            "format": "date",
+            "title": "End",
+            "type": "string"
+          },
+          "filled": {
+            "title": "Filled",
+            "type": "integer"
+          },
+          "final_nav": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Final Nav"
+          },
+          "max_positions": {
+            "title": "Max Positions",
+            "type": "integer"
+          },
+          "preset": {
+            "title": "Preset",
+            "type": "string"
+          },
+          "rebalance_every": {
+            "title": "Rebalance Every",
+            "type": "integer"
+          },
+          "rejected": {
+            "title": "Rejected",
+            "type": "integer"
+          },
+          "run_id": {
+            "title": "Run Id",
+            "type": "string"
+          },
+          "start": {
+            "format": "date",
+            "title": "Start",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "run_id",
+          "title",
+          "preset",
+          "start",
+          "end",
+          "created_at",
+          "max_positions",
+          "rebalance_every",
+          "final_nav",
+          "filled",
+          "rejected"
+        ],
+        "title": "PortfolioRunSummary",
         "type": "object"
       },
       "SavePoolRequest": {
@@ -2168,6 +2391,73 @@
           }
         },
         "summary": "保存池子"
+      }
+    },
+    "/api/v1/portfolio-backtests": {
+      "get": {
+        "operationId": "portfolio_backtests_api_v1_portfolio_backtests_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_PortfolioRunListData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "组合回测列表"
+      }
+    },
+    "/api/v1/portfolio-backtests/{run_id}": {
+      "get": {
+        "operationId": "portfolio_backtest_api_v1_portfolio_backtests__run_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "benchmark",
+            "required": false,
+            "schema": {
+              "default": "000300.SH",
+              "title": "Benchmark",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_PortfolioRunDetailData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "组合回测详情"
       }
     },
     "/api/v1/screen": {

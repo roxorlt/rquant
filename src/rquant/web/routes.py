@@ -9,10 +9,12 @@ from collections.abc import Callable
 from datetime import date
 from typing import Annotated, Any, TypeVar
 
+import pandas as pd
 from fastapi import APIRouter, Depends, HTTPException, Request
 
+from rquant.backtest.store import list_runs, read_run
 from rquant.web import page_control
-from rquant.web.backtest_perf import backtest_perf
+from rquant.web.backtest_perf import backtest_perf, perf_from_returns
 from rquant.web.models import (
     AckAlertRequest,
     AddWatchRequest,
@@ -38,6 +40,10 @@ from rquant.web.models import (
     PoolItem,
     PoolMember,
     PoolsData,
+    PortfolioOrder,
+    PortfolioRunDetailData,
+    PortfolioRunListData,
+    PortfolioRunSummary,
     SavePoolRequest,
     ScreenData,
     ScreenRow,
@@ -236,18 +242,66 @@ def backtest_detail(run_id: str, source: SourceDep, entry_mode: str | None = Non
         "WHERE run_id = ? AND entry_mode = ? AND profile_variant = ? "
         "ORDER BY entry_time LIMIT 10000",
         [run_id, run["entry_mode"], run["profile_variant"]])
-    try:
-        bench_rows = source.query(
-            "SELECT trade_date, close FROM benchmark_daily WHERE ts_code = ? "
-            "ORDER BY trade_date LIMIT 1200", [benchmark])
-    except Exception as exc:  # noqa: BLE001 - optional projection
-        if not table_missing(exc):
-            raise
-        bench_rows = []
+    bench_rows = _benchmark_rows(source, benchmark)
     perf = backtest_perf(raw, (benchmark, bench_rows) if bench_rows else None)
     trades = [BacktestTrade(code=t.pop("ts_code"), **t) for t in raw]
     return _envelope(
         source, BacktestDetailData(run=BacktestRun(**run), trades=trades, perf=perf))
+
+
+def _research_root(request: Request) -> Any:
+    return getattr(request.app.state, "research_root", None)
+
+
+def _portfolio_summary(run: Any) -> PortfolioRunSummary:
+    orders = run.result.orders
+    return PortfolioRunSummary(
+        run_id=run.run_id, title=run.title, preset=run.preset, start=run.start, end=run.end,
+        created_at=run.created_at,
+        max_positions=run.result.config.weights.max_positions,
+        rebalance_every=run.result.config.rebalance_every,
+        final_nav=run.result.days[-1].nav if run.result.days else None,
+        filled=sum(o.status == "filled" for o in orders),
+        rejected=sum(o.status == "rejected" for o in orders),
+    )
+
+
+@router.get("/portfolio-backtests", response_model=Envelope[PortfolioRunListData],
+            summary="组合回测列表")
+def portfolio_backtests(request: Request, source: SourceDep) -> Envelope[PortfolioRunListData]:
+    runs = [_portfolio_summary(r) for r in list_runs(_research_root(request))]
+    return _envelope(source, PortfolioRunListData(runs=runs[:200]))
+
+
+@router.get("/portfolio-backtests/{run_id}", response_model=Envelope[PortfolioRunDetailData],
+            summary="组合回测详情")
+def portfolio_backtest(run_id: str, request: Request, source: SourceDep,
+                       benchmark: str = "000300.SH") -> Envelope[PortfolioRunDetailData]:
+    run = read_run(run_id, _research_root(request))
+    if run is None:
+        raise HTTPException(404, "portfolio backtest not found")
+    navs = pd.Series({pd.Timestamp(d.trade_date): d.nav for d in run.result.days},
+                     dtype="float64").sort_index()
+    returns = navs.pct_change().fillna(navs.iloc[0] - 1) if len(navs) else navs
+    bench_rows = _benchmark_rows(source, benchmark)
+    perf = perf_from_returns(returns, (benchmark, bench_rows) if bench_rows else None,
+                             method="组合回测逐日净值")
+    orders = [PortfolioOrder(code=o.ts_code, **o.model_dump(exclude={"ts_code"}))
+              for o in run.result.orders[-2000:]]
+    holdings = run.result.days[-1].positions if run.result.days else {}
+    return _envelope(source, PortfolioRunDetailData(
+        run=_portfolio_summary(run), perf=perf, orders=orders, holdings=holdings))
+
+
+def _benchmark_rows(source: Source, code: str) -> list[dict[str, Any]]:
+    try:
+        return source.query(
+            "SELECT trade_date, close FROM benchmark_daily WHERE ts_code = ? "
+            "ORDER BY trade_date LIMIT 1200", [code])
+    except Exception as exc:  # noqa: BLE001 - optional projection
+        if not table_missing(exc):
+            raise
+        return []
 
 
 @router.get("/alerts", response_model=Envelope[AlertsData], summary="告警时间线")

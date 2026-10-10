@@ -28,8 +28,11 @@ def _version() -> str:
         return "dev"
 
 
-def create_app(source: Source | None = None, dist: Path | None = DIST) -> FastAPI:
+def create_app(source: Source | None = None, dist: Path | None = DIST,
+               research_root: Path | None = None) -> FastAPI:
     app = FastAPI(title="rQuant web API", version=_version())
+    #: portfolio backtest results (files); None → $RQUANT_RESEARCH_ROOT or data/research
+    app.state.research_root = research_root
     if source is None:
         root = os.environ.get("RQUANT_SERVING_ROOT")
         if not root:

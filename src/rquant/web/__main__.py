@@ -26,7 +26,16 @@ def main(argv: list[str] | None = None) -> None:
     import uvicorn
 
     fixture = FixtureSource() if args.fixture else None
-    app = create_app(fixture)
+    research = None
+    if fixture is not None:
+        import tempfile
+        from pathlib import Path
+
+        from rquant.web.source import write_demo_research
+
+        research = Path(tempfile.mkdtemp(prefix="rquant-research-"))
+        write_demo_research(research)
+    app = create_app(fixture, research_root=research)
     if fixture is not None:
         # Demo mode: acks land in the in-memory fixture (as if page control + Serving
         # republished); other commands are accepted and dropped. Nothing touches disk.

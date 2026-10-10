@@ -47,6 +47,7 @@ const BODIES: Record<string, unknown> = {
   },
   pools: { trade_date: null, pools: [] },
   backtests: { runs: [] },
+  "portfolio-backtests": { runs: [] },
   alerts: { items: [] },
   paper: { accounts: [] },
 };

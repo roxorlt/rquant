@@ -50,7 +50,14 @@ def backtest_perf(
     trades: Iterable[dict[str, Any]],
     benchmark: tuple[str, Iterable[dict[str, Any]]] | None = None,
 ) -> BacktestPerf | None:
-    returns = daily_returns(trades)
+    return perf_from_returns(daily_returns(trades), benchmark)
+
+
+def perf_from_returns(
+    returns: pd.Series,
+    benchmark: tuple[str, Iterable[dict[str, Any]]] | None = None,
+    method: str = METHOD,
+) -> BacktestPerf | None:
     if returns.empty:
         return None
     bench_stats: BenchmarkStats | None = None
@@ -94,7 +101,7 @@ def backtest_perf(
         if not pd.isna(value)
     ]
     return BacktestPerf(
-        method=METHOD,
+        method=method,
         days=summary.observations,
         total_return=_num(summary.total_return),
         annualized_return=_num(summary.annualized_return),

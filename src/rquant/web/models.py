@@ -216,6 +216,42 @@ class BacktestDetailData(BaseModel):
     perf: BacktestPerf | None = None
 
 
+class PortfolioRunSummary(BaseModel):
+    run_id: str
+    title: str
+    preset: str
+    start: date
+    end: date
+    created_at: datetime
+    max_positions: int
+    rebalance_every: int
+    final_nav: float | None
+    filled: int
+    rejected: int
+
+
+class PortfolioOrder(BaseModel):
+    trade_date: date
+    code: str
+    side: str
+    quantity: int
+    price: float | None
+    fee: float
+    status: str
+    reason: str | None
+
+
+class PortfolioRunListData(BaseModel):
+    runs: list[PortfolioRunSummary]
+
+
+class PortfolioRunDetailData(BaseModel):
+    run: PortfolioRunSummary
+    perf: BacktestPerf | None
+    orders: list[PortfolioOrder]
+    holdings: dict[str, int]
+
+
 class AlertItem(BaseModel):
     alert_id: str
     trade_date: date

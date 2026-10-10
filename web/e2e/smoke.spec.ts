@@ -31,3 +31,10 @@ test("a backtest run shows its performance block", async ({ page }) => {
   await expect(page.getByRole("img", { name: "净值与回撤" })).toBeVisible();
   await expect(page.getByText("超额 vs 000300.SH")).toBeVisible();
 });
+
+test("a portfolio backtest shows orders and performance", async ({ page }) => {
+  await page.goto("./#/backtest");
+  await page.getByText("演示组合回测").click();
+  await expect(page.getByLabel("组合回测委托")).toBeVisible();
+  await expect(page.getByText("组合回测逐日净值")).toBeVisible();
+});
