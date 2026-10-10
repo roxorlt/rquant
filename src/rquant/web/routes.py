@@ -15,7 +15,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from rquant.backtest.band import bootstrap_band
 from rquant.backtest.exposure import industry_exposure
-from rquant.backtest.store import list_runs, read_run
+from rquant.backtest.store import list_runs, read_run, research_root
 from rquant.backtest.strategy import list_strategies
 from rquant.data_catalog.audit import read_report
 from rquant.data_catalog.models import CatalogDocument
@@ -26,6 +26,7 @@ from rquant.factor.tdx import translate as translate_tdx
 from rquant.web import page_control
 from rquant.web.ai_explain import Explanation, build_facts, deepseek_complete, explain
 from rquant.web.backtest_perf import backtest_perf, perf_from_returns
+from rquant.web.health_layers import build_layers
 from rquant.web.models import (
     AckAlertRequest,
     AddWatchRequest,
@@ -164,7 +165,7 @@ def overview(source: SourceDep) -> Envelope[OverviewData]:
 
 
 @router.get("/health", response_model=Envelope[HealthData], summary="系统健康")
-def health(source: SourceDep) -> Envelope[HealthData]:
+def health(request: Request, source: SourceDep) -> Envelope[HealthData]:
     services = [ServiceItem(**{k: r.get(k) for k in ServiceItem.model_fields}) for r in
                 source.query(
                     "SELECT service_id, plane, status, stale, heartbeat_at, backlog_count, "
@@ -179,7 +180,10 @@ def health(source: SourceDep) -> Envelope[HealthData]:
     row = summary[0] if summary else {}
     freshness = [FreshnessItem(key=k, label=v, value=None if row.get(k) is None else str(row[k]))
                  for k, v in labels.items()]
-    return _envelope(source, HealthData(services=services, freshness=freshness))
+    root = _research_root(request)
+    layers = build_layers(services, {f.key: f.value for f in freshness}, source.generation()[1],
+                          read_report(root), root or research_root(), request.app.version)
+    return _envelope(source, HealthData(services=services, freshness=freshness, layers=layers))
 
 
 @router.get("/panorama", response_model=Envelope[PanoramaData], summary="市场全景")

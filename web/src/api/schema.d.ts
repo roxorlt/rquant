@@ -1077,8 +1077,27 @@ export interface components {
         HealthData: {
             /** Freshness */
             freshness: components["schemas"]["FreshnessItem"][];
+            /**
+             * Layers
+             * @default []
+             */
+            layers: components["schemas"]["HealthLayer"][];
             /** Services */
             services: components["schemas"]["ServiceItem"][];
+        };
+        /** HealthLayer */
+        HealthLayer: {
+            /** Detail */
+            detail: string[];
+            /** Key */
+            key: string;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "ok" | "warn" | "crit" | "unknown";
+            /** Title */
+            title: string;
         };
         /** HoldingItem */
         HoldingItem: {

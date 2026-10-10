@@ -12,6 +12,26 @@ export default function HealthPage() {
       <QueryView query={query}>
         {(data) => (
           <>
+            {data.layers?.length ? (
+              <Panel title="分层健康" sub="每层取其输入中最差的状态">
+                <ul className="health-layers" aria-label="分层健康">
+                  {data.layers.map((layer) => (
+                    <li key={layer.key}>
+                      <StatusBadge
+                        state={
+                          layer.state === "unknown"
+                            ? "warn"
+                            : (layer.state as "ok" | "warn" | "crit")
+                        }
+                        label={`${layer.title}${layer.state === "unknown" ? "（未知）" : ""}`}
+                        reason={layer.detail.join("；")}
+                      />
+                      <span className="sub">{layer.detail[0]}</span>
+                    </li>
+                  ))}
+                </ul>
+              </Panel>
+            ) : null}
             <Panel title="服务" flush>
               <DataTable
                 label="服务"
