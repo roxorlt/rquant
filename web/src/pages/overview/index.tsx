@@ -1,14 +1,170 @@
-import { useOverview } from "@/api/endpoints";
+import { Link } from "react-router";
+import { useAlerts, useHealth, useOverview } from "@/api/endpoints";
 import { formatShanghaiDateTime } from "@/format/time";
 import { DataTable } from "@/table/DataTable";
-import { KpiStrip, PageHeader, Panel } from "@/ui";
+import { Button, KpiStrip, PageHeader, Panel, Pill } from "@/ui";
 import { QueryView } from "../shared";
+
+const STATE_PILL = {
+  ok: ["ok", "正常"],
+  warn: ["warn", "注意"],
+  crit: ["crit", "需处理"],
+  unknown: ["idle", "未知"],
+} as const;
+
+function Pipeline() {
+  const health = useHealth();
+  const layers = health.data?.layers ?? [];
+  if (!layers.length) return null;
+  return (
+    <section aria-labelledby="pipe-h">
+      <div className="block-h">
+        <h2 id="pipe-h">今日链路</h2>
+        <span className="hint">数据采集 → 存储 → Serving → 信号盯盘 → 研究产出 → 网页</span>
+      </div>
+      <ol
+        className="pipe"
+        aria-label="今日链路"
+        style={{ gridTemplateColumns: `repeat(${layers.length}, minmax(0, 1fr))` }}
+      >
+        {layers.map((layer) => {
+          const [kind, text] = STATE_PILL[layer.state];
+          return (
+            <li key={layer.key}>
+              <span className="pn">{layer.title}</span>
+              <Pill kind={kind}>{text}</Pill>
+              <span className="pd">{layer.detail.slice(0, 2).join("；") || "—"}</span>
+            </li>
+          );
+        })}
+      </ol>
+    </section>
+  );
+}
+
+function Attention() {
+  const health = useHealth();
+  const alerts = useAlerts();
+  const items: {
+    key: string;
+    kind: "crit" | "warn" | "acc";
+    text: string;
+    sub: string;
+    to: string;
+    btn: string;
+  }[] = [];
+  for (const layer of health.data?.layers ?? []) {
+    if (layer.state === "crit" || layer.state === "warn")
+      items.push({
+        key: layer.key,
+        kind: layer.state,
+        text: `${layer.title}：${layer.state === "crit" ? "异常" : "需留意"}`,
+        sub: layer.detail[0] ?? "",
+        to: "/health",
+        btn: "看健康",
+      });
+  }
+  const unacked = (alerts.data?.items ?? []).filter((a) => !a.acked_at).length;
+  if (unacked)
+    items.push({
+      key: "alerts",
+      kind: "acc",
+      text: `${unacked} 条告警未确认`,
+      sub: "在盯盘页逐条确认",
+      to: "/monitor",
+      btn: "去盯盘",
+    });
+  return (
+    <Panel title="需要关注" sub={`${items.length} 项`} flush>
+      {items.length ? (
+        <ul className="attn" aria-label="需要关注">
+          {items.map((a) => (
+            <li key={a.key}>
+              <Pill kind={a.kind}>
+                {a.kind === "crit" ? "需处理" : a.kind === "warn" ? "注意" : "等你操作"}
+              </Pill>
+              <span className="txt">
+                {a.text}
+                <span className="s">{a.sub}</span>
+              </span>
+              <Link className="btn sm" to={a.to}>
+                {a.btn}
+              </Link>
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <p className="hint" style={{ padding: "12px 16px" }}>
+          一切正常
+        </p>
+      )}
+    </Panel>
+  );
+}
+
+function LatestAlerts() {
+  const alerts = useAlerts();
+  const rows = (alerts.data?.items ?? []).slice(0, 6);
+  return (
+    <Panel
+      title="最新告警"
+      flush
+      actions={
+        <Link className="btn ghost sm" to="/monitor">
+          全部告警
+        </Link>
+      }
+    >
+      <DataTable
+        label="最新告警"
+        rows={rows}
+        rowKey={(row) => row.alert_id}
+        emptyText="今天还没有告警"
+        columns={[
+          {
+            id: "at",
+            header: "时间",
+            value: (r) => r.at ?? null,
+            cell: (r) => (r.at ? formatShanghaiDateTime(r.at).slice(-8, -3) : "—"),
+          },
+          {
+            id: "code",
+            header: "股票",
+            value: (r) => r.code,
+            cell: (r) => `${r.name ?? ""} ${r.code}`,
+          },
+          { id: "type", header: "规则", value: (r) => r.trigger_type ?? r.level },
+          {
+            id: "state",
+            header: "状态",
+            value: (r) => (r.acked_at ? 1 : 0),
+            cell: (r) =>
+              r.acked_at ? <Pill kind="ok">已确认</Pill> : <Pill kind="warn">未确认</Pill>,
+          },
+        ]}
+      />
+    </Panel>
+  );
+}
 
 export default function OverviewPage() {
   const query = useOverview();
   return (
     <>
-      <PageHeader eyebrow="概览" title="总览" note={query.data?.trade_date ?? undefined} />
+      <PageHeader
+        eyebrow="概览"
+        title="总览"
+        note={query.data?.trade_date ?? undefined}
+        actions={
+          <>
+            <Button onClick={() => query.refetch()}>刷新</Button>
+            <Link className="btn primary" to="/monitor">
+              去盯盘
+            </Link>
+          </>
+        }
+      />
+      <Pipeline />
       <QueryView query={query}>
         {(data) => (
           <>
@@ -16,6 +172,10 @@ export default function OverviewPage() {
               label="关键数字"
               items={data.kpis.map((kpi) => ({ ...kpi, tone: kpi.tone ?? undefined }))}
             />
+            <div className="g2">
+              <LatestAlerts />
+              <Attention />
+            </div>
             <Panel title="最新信号" flush>
               <DataTable
                 label="最新信号"

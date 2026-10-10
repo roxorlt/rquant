@@ -137,7 +137,7 @@ export default function FactorPage() {
   const [id, setId] = useState<string | null>(null);
   return (
     <>
-      <PageHeader eyebrow="研究" title="因子检验" />
+      <PageHeader eyebrow="研究" title="因子研究" />
       <QueryView query={query}>
         {(data) => (
           <Panel title="因子" sub="python -m rquant.factor --name … --expr … 产出" flush>

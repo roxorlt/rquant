@@ -4,11 +4,11 @@ test("every MVP page opens from the rail", async ({ page }) => {
   await page.goto("./#/overview");
   await expect(page.getByText("候选股").first()).toBeVisible();
   for (const [title, text] of [
-    ["选股与排序", "贵州茅台"],
+    ["选股器", "贵州茅台"],
     ["池子", "核心观察"],
-    ["回测结果", "run-demo"],
+    ["回测", "run-demo"],
     ["模拟盘", "paper-main"],
-    ["告警", "breakout"],
+    ["盯盘与告警", "breakout"],
     ["市场全景", "白酒"],
     ["系统健康", "rquant-monitor"],
   ] as const) {
@@ -33,8 +33,9 @@ test("a backtest run shows its performance block", async ({ page }) => {
 });
 
 test("a portfolio backtest shows orders and performance", async ({ page }) => {
-  await page.goto("./#/backtest");
+  await page.goto("./#/strategies");
   await expect(page.getByText("demo-breakout@1（共 1 版）")).toBeVisible();
+  await page.goto("./#/experiments");
   await page.getByText("演示组合回测").click();
   await expect(page.getByLabel("组合回测委托")).toBeVisible();
   await expect(page.getByText("组合回测逐日净值")).toBeVisible();
