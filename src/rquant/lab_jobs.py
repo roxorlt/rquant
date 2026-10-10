@@ -3217,12 +3217,20 @@ def _normalized_sql_tokens(sql: str) -> tuple[tuple[str, str], ...]:
 
 
 @lru_cache(maxsize=128)
-def _normalized_expected_sql_tokens(expected: str) -> tuple[tuple[str, str], ...]:
-    return _normalized_sql_tokens(expected)
+def _normalized_expected_sql_tokens(
+    expected: str, actual: str | None = None
+) -> tuple[tuple[str, str], ...] | tuple[tuple[tuple[str, str], ...], tuple[tuple[str, str], ...]]:
+    expected_tokens = _normalized_sql_tokens(expected)
+    if actual is None:
+        return expected_tokens
+    return expected_tokens, _normalized_sql_tokens(actual)
 
 
 def _sql_ddl_equivalent(expected: str, actual: str) -> bool:
     try:
+        if len(actual) <= len(expected):
+            expected_tokens, actual_tokens = _normalized_expected_sql_tokens(expected, actual)
+            return expected_tokens == actual_tokens
         return _normalized_expected_sql_tokens(expected) == _normalized_sql_tokens(actual)
     except ValueError:
         return False

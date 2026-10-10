@@ -1,14 +1,14 @@
 {
   "schema_version": 1,
-  "revision": 181,
-  "updated_at": "2026-10-10T08:08:14+08:00",
+  "revision": 185,
+  "updated_at": "2026-10-10T09:14:00+08:00",
   "thread_id": "01a0dd53-e9c9-7b73-a7b5-843473fcd6ac",
   "worktree": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-source-integration",
   "branch": "cdx/20260929-factor-source-integration",
   "goal_state": {
     "reported_status": "active",
-    "last_updated_at": "2026-10-10T08:08:14+08:00",
-    "current_turn": "R12_original_Linux_report_ready_verified_final_candidate_CI_preparation",
+    "last_updated_at": "2026-10-10T09:14:00+08:00",
+    "current_turn": "R12_single_file_review_PASS_publish_same_PR_candidate",
     "stored_block_reason": "正式指数来源及32日资料仍缺；生产安装切流授权和实际开市日观察按固定6项处理。",
     "explicit_goal_token_budget": null,
     "resume_control": "get_goal已实际返回active；当前无需再点Target继续。",
@@ -17,10 +17,10 @@
     "previous_goal_turn_evidence": "r12-auction-python311312-accepted-20261009-01.json：两版本原54节点通过并核原记录；集中审查形成唯一FCR-001并交原实现者。",
     "last_observation": {
       "classification": "actual_progress",
-      "observed_at": "2026-10-10T08:08:14+08:00",
-      "actual": "报告原Linux链在普通UID502环境159.26秒取得Alice认证meta200，低于原180秒；原准备、worker、封存、审批、完整读取和发布均执行，7份worker与全部自有资源清理通过。AI原Linux启动24.81秒通过。源码和829叶快照不变；UID0旧失败及WAL元数据观察保留，底层机制未证明，停止追加诊断。原17个浏览器失败定向通过，六叶代码复核无新增阻断，固定25项、19本地完成、6剩余；正式CI和R12整体仍待。",
-      "evidence": "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-candidate-02/native-tmp-fix-01/linux311-07/RUN-EV.json",
-      "next": "只更新R07派生元数据并核精确候选，原审查者补核实际启动证据，提交同一PR并运行正式CI；复用有效结果，不再完整本地重跑。"
+      "observed_at": "2026-10-10T09:14:00+08:00",
+      "actual": "原审查者一次增量复核PASS、0新增阻断；唯一源码lab_jobs.py两函数，源79cfdcc8不变。原18结构用例及普通141.785秒原13+3启动通过，所有测试资源全清。必要元数据465826字节前后相同，标准生成/check通过，原19边界结果复用。仅提交该源码及本会话3个进度文档到原PR323，随后正式CI验证修后候选；旧失败和取消保留。固定25项、19本地完成、6剩余、生产0/15，目标及授权保持，不追加实现、审计、重构或完整本地重跑。",
+      "evidence": "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-f982-web-failure-01/macro-startup-diagnosis-01/sql-text-reuse-implementation-01/reviewer-final-01/EV.json",
+      "next": "提交同一PR修后候选并完成必要正式CI；保留旧运行终态和取消缺口。仅在正式日志出现真实阻断时做必要局部修复，复用有效证据。"
     },
     "previous_blocked_audit": {
       "consecutive_goal_turns_without_available_safe_implementation": 3,
@@ -30,7 +30,7 @@
     },
     "blocked_audit": {
       "consecutive_goal_turns_without_available_safe_implementation": 0,
-      "condition": "Linux原启动通过；候选整理、原finding证据复核和同候选正式CI可继续。",
+      "condition": "局部修复与原审查者增量复核已过，可提交修后候选运行正式CI。",
       "update_goal_blocked_threshold": 3
     }
   },
@@ -53,7 +53,7 @@
     "production_modules_migrated": 0,
     "production_modules_total": 15,
     "running_workflows": 1,
-    "waiting_workflows": 1
+    "waiting_workflows": 0
   },
   "forecast": {
     "implementation_staff_hours": [
@@ -65,7 +65,7 @@
       1,
       3
     ],
-    "confidence": "原17个网页失败、Linux原3项、报告与AI启动均有实际通过证据，六叶代码复核无新增阻断。只待实际证据补核与同候选正式CI；正式资料、生产授权和20个实际开市日另计。",
+    "confidence": "两函数补修、原18用例、普通141.79秒启动及一次增量复核均通过；仅提交同PR修后候选并完成正式CI。已有有效源码、测试、构建及页面证据复用；正式资料、生产授权及20个实际开市日另计。",
     "assumptions": [
       "本地19项已验收，14个模块已本地验证；正式市场资料不由合成资料替代。",
       "唯一集中候选审查及原19叶CI补修复核已通过；本批实际阻断修复已冻；只作组合增量复核，复用有效测试。",
@@ -2553,10 +2553,14 @@
         "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-candidate-02/ai-tmp-fix-01/EV.json",
         "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-candidate-02/post-whole-repair-final-01/reviewer/EV.json",
         "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-candidate-02/native-tmp-fix-01/linux311-05/RUN-EV.json",
-        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-candidate-02/native-tmp-fix-01/linux311-07/RUN-EV.json"
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-candidate-02/native-tmp-fix-01/linux311-07/RUN-EV.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-f982-web-failure-01/run.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-f982-web-failure-01/macro-startup-diagnosis-01/linux311-profile-01/HOST-CLEANUP.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-f982-web-failure-01/macro-startup-diagnosis-01/sql-text-reuse-implementation-01/EV.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-f982-web-failure-01/macro-startup-diagnosis-01/sql-text-reuse-implementation-01/reviewer-final-01/EV.json"
       ],
       "closure_level": "pending",
-      "last_progress": "报告原Linux链在普通UID502环境159.26秒取得Alice认证meta200，低于原180秒；原准备、worker、封存、审批、完整读取和发布均执行，7份worker与全部自有资源清理通过。AI原Linux启动24.81秒通过。源码和829叶快照不变；UID0旧失败及WAL元数据观察保留，底层机制未证明，停止追加诊断。原17个浏览器失败定向通过，六叶代码复核无新增阻断，固定25项、19本地完成、6剩余；正式CI和R12整体仍待。",
+      "last_progress": "原审查者一次增量复核PASS、0新增阻断；唯一源码lab_jobs.py两函数，源79cfdcc8不变。原18结构用例及普通141.785秒原13+3启动通过，所有测试资源全清。必要元数据465826字节前后相同，标准生成/check通过，原19边界结果复用。仅提交该源码及本会话3个进度文档到原PR323，随后正式CI验证修后候选；旧失败和取消保留。固定25项、19本地完成、6剩余、生产0/15，目标及授权保持，不追加实现、审计、重构或完整本地重跑。",
       "submilestones": [
         {
           "name": "网页最终候选准备门禁",
@@ -2708,9 +2712,9 @@
         }
       ],
       "pull_request": "https://github.com/roxorlt/rquant/pull/323",
-      "candidate_commit": "308708b4dbf6cdd722a5a45be93ba1c84924dcba",
-      "remaining_hours_note": "原Linux启动已通过；同候选正式CI及既定条件验收仍待，不据局部通过承诺日期。",
-      "published_candidate_commit": "308708b4dbf6cdd722a5a45be93ba1c84924dcba"
+      "candidate_commit": "f9823df71e5e0b28d0ec781471bc1272bc859958",
+      "remaining_hours_note": "局部代码、原18用例、普通启动及增量复核通过；正式同候选CI及既定外部条件仍待。",
+      "published_candidate_commit": "f9823df71e5e0b28d0ec781471bc1272bc859958"
     },
     {
       "id": "R13",
@@ -3968,6 +3972,34 @@
       "delivery_unit_added": false,
       "actual": "报告原Linux链在普通UID502环境159.26秒取得Alice认证meta200，低于原180秒；原准备、worker、封存、审批、完整读取和发布均执行，7份worker与全部自有资源清理通过。AI原Linux启动24.81秒通过。源码和829叶快照不变；UID0旧失败及WAL元数据观察保留，底层机制未证明，停止追加诊断。原17个浏览器失败定向通过，六叶代码复核无新增阻断，固定25项、19本地完成、6剩余；正式CI和R12整体仍待。",
       "scope": "只补核原启动证据、必要派生元数据与同候选正式CI；停止追加底层诊断，无新增源码、审计、重构或完整本地重跑。"
+    },
+    {
+      "at": "2026-10-10T08:33:52+08:00",
+      "task_id": "R12",
+      "delivery_unit_added": false,
+      "actual": "候选f9823df7已commit/push原PR323，原FCR-CI-02-001已关闭，79个构建产物校验通过。正式Web CI38008478031的格式、类型、Vitest、dist、OpenAPI和生成类型均通过；报告测试服务在原180秒未就绪处失败，浏览器业务未开始。后端CI38008478026已有20作业通过，完整分片仍运行，未计整体通过。原作者仅冷读报告准备直接链，必要时做局部观察；原守卫、13+3任务、完整读取和180秒保持。固定25项、19本地完成、6剩余，生产0/15。",
+      "scope": "仅原报告准备链局部诊断与实际CI门禁；无新审计、重构、交付项或完整本地重跑。"
+    },
+    {
+      "at": "2026-10-10T08:49:12+08:00",
+      "task_id": "R12",
+      "delivery_unit_added": false,
+      "actual": "候选f9823df7正式前端CI报告测试启动未通过，其他前置检查通过，浏览器业务未开始。唯一原链profile实际定位重复SQL解析：1896次结构校验、177067次DDL等价比较；插桩耗时不作为未插桩性能结论。源保持，容器、进程、端口和临时资源清理通过。只授权原作者复用现有128项LRU中的不可变文本解析，现场读取实际库及每次比较保持，SQL字节变化重算；原词法、权限、13+3任务、封存、完整读回和180秒不变。原结构拒绝用例及无插桩启动待验；后端20作业通过，完整分片仍运行。固定25项、19本地完成、6剩余，生产0/15。",
+      "scope": "仅一个现有文本解析接点；原库读取及全部守卫保持，无全仓审计、重构、额外交付或完整本地重跑。"
+    },
+    {
+      "at": "2026-10-10T09:03:00+08:00",
+      "task_id": "R12",
+      "delivery_unit_added": false,
+      "actual": "两个现有函数的纯SQL文本解析复用已冻结，源79cfdcc8。原18结构校验用例实际18通过、0失败、0跳过；Linux3.11.16/UID502/2CPU无插桩原13+3任务、审批、封存、完整读回及发布完成，Alice meta200为141.785秒，低于原180秒。容器、config、worker、根、IPC、端口及线程全部清理，833输入起终一致。Root实际核12原件及7worker回执、源码前后SHA均匹配。只核必要元数据、原审查者一次增量复核及同PR修后CI；原有效证据复用，旧失败和取消不改为通过。固定25项、19本地完成、6剩余，生产0/15。",
+      "scope": "单一现有缓存与两函数；原校验、任务和180秒保持，已有工作及证据保留。"
+    },
+    {
+      "at": "2026-10-10T09:14:00+08:00",
+      "task_id": "R12",
+      "delivery_unit_added": false,
+      "actual": "原审查者一次增量复核PASS、0新增阻断；唯一源码lab_jobs.py两函数，源79cfdcc8不变。原18结构用例及普通141.785秒原13+3启动通过，所有测试资源全清。必要元数据465826字节前后相同，标准生成/check通过，原19边界结果复用。仅提交该源码及本会话3个进度文档到原PR323，随后正式CI验证修后候选；旧失败和取消保留。固定25项、19本地完成、6剩余、生产0/15，目标及授权保持，不追加实现、审计、重构或完整本地重跑。",
+      "scope": "仅已验单文件差异和同PR必要门禁，全部既有范围保持。"
     }
   ],
   "update_policy": [
@@ -3982,7 +4014,7 @@
   "parallelism": {
     "user_authorized_subagents": 15,
     "runtime_slots_including_root": 16,
-    "running_subagents": 1,
+    "running_subagents": 0,
     "policy": "全部可独立写入的工作按依赖并行；共享接口单一负责人整合；空出槽位立即接下一个具备条件的交付。",
     "workers": [
       {
@@ -4008,9 +4040,9 @@
         "tasks": [
           "R12"
         ],
-        "work": "报告原Linux链159.26秒通过，源码和快照不变，自有资源全清，冻结停写。",
+        "work": "两函数最小文本解析复用冻结，原18P/0skip及普通原链141.79s通过，所有资源清理；写权已归还。",
         "status": "frozen_completed_or_waiting_final_candidate",
-        "baseline_commit": "308708b4dbf6cdd722a5a45be93ba1c84924dcba"
+        "baseline_commit": "f9823df71e5e0b28d0ec781471bc1272bc859958"
       },
       {
         "agent": "/root/parameter_family_acceptance",
@@ -4035,9 +4067,9 @@
         "tasks": [
           "R12"
         ],
-        "work": "复用原53叶和六叶复核，只补核实际Linux启动及R07派生元数据，裁定FCR-CI-02-001。",
-        "status": "active_original_finding_evidence_and_derived_metadata_review",
-        "baseline_commit": "308708b4dbf6cdd722a5a45be93ba1c84924dcba"
+        "work": "两函数普通增量及18P/0skip、141.785s原链、元数据不变证据一次复核PASS，0阻断；写权归还，无自有资源。",
+        "status": "frozen_completed_or_waiting_final_candidate",
+        "baseline_commit": "f9823df71e5e0b28d0ec781471bc1272bc859958"
       },
       {
         "agent": "/root/ai_assistance_completion_impl",
@@ -4119,11 +4151,9 @@
     ],
     "live_reload_verified": true,
     "root_work": "维护固定25项与明确文件归属，复用原证据；冻结必要差异，统一元数据和同候选CI。",
-    "waiting_subagents": 1,
+    "waiting_subagents": 0,
     "runtime_capacity_evidence": "本轮app运行环境重新初始化后的原生元数据明确提供16个并发槽位，包含Root；不是修改配置后推断即时生效。",
-    "active_subagents": [
-      "/root/final_candidate_review"
-    ],
-    "next": "只更新R07派生元数据并核精确候选，原审查者补核实际启动证据，提交同一PR并运行正式CI；复用有效结果，不再完整本地重跑。"
+    "active_subagents": [],
+    "next": "提交同一PR修后候选并完成必要正式CI；保留旧运行终态和取消缺口。仅在正式日志出现真实阻断时做必要局部修复，复用有效证据。"
   }
 }
