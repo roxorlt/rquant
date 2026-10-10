@@ -25,7 +25,7 @@ from rquant.web.service_log_access_audit import ServiceLogAccessRecord
 router = APIRouter(prefix="/tasks")
 
 _SEVEN_DAYS = timedelta(days=7)
-_QUERY_FIELDS = frozenset({"since", "level", "page_size", "cursor"})
+_QUERY_FIELDS = frozenset({"since", "level", "page_size", "cursor", "invocation_id"})
 _SINCE = re.compile(
     r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
     r"(?:\.[0-9]{1,6})?(?:Z|[+-][0-9]{2}:[0-9]{2})\Z"
@@ -50,6 +50,7 @@ class _LogQuery(BaseModel):
     level: LogLevel | None = None
     page_size: int = Field(default=100, ge=1, le=498)
     cursor: str | None = Field(default=None, min_length=1, max_length=4096)
+    invocation_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
 
 
 def _parse_query(request: Request, *, now: datetime) -> _LogQuery:
@@ -194,6 +195,7 @@ def _admitted(gate: threading.BoundedSemaphore) -> Iterator[None]:
     summary="服务运行日志",
     openapi_extra={
         "parameters": [
+            {"name": "invocation_id", "in": "query", "required": False, "schema": {"type": "string", "pattern": "^[0-9a-f]{32}$"}},
             {
                 "name": "since",
                 "in": "query",
@@ -259,8 +261,9 @@ def get_service_logs(
                 level=query.level,
                 page_size=query.page_size,
                 cursor=query.cursor,
+                **({"invocation_id": query.invocation_id} if query.invocation_id is not None else {}),
             )
-            if type(page) is not JournalPage:
+            if type(page) is not JournalPage or page.invocation_id != query.invocation_id:
                 raise ValueError("invalid journal page")
             return page
         except UnitLogServiceError as error:

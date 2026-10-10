@@ -14,7 +14,7 @@ from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import (
     Field,
@@ -27,6 +27,11 @@ from pydantic import (
 from rquant.ed25519_verify import verify_ed25519_signature
 from rquant.runtime_contracts import AwareUtcDatetime, RuntimeContractModel, canonical_sha256
 from rquant.strict_json import canonical_json_bytes, strict_canonical_json_loads
+
+if TYPE_CHECKING:
+    from rquant.task_center_runtime import TaskUnitRunSource
+    from rquant.task_center_projection import TaskOpsSample
+    from rquant.task_cpu import LinuxTaskCpuReader, TaskCpuObservation
 
 STATIC_TIMER_STEMS = (
     "artifact-retention",
@@ -389,6 +394,69 @@ class OpsStatusCollector:
         self.clock = clock
         self.monotonic = monotonic
         self.host_name = host_name
+
+    def collect_tasks(
+        self, manifest: OpsInstallManifest, *, previous: TaskCpuObservation | None,
+        cpu_reader: LinuxTaskCpuReader, run_source: TaskUnitRunSource | None = None,
+    ) -> TaskOpsSample:
+        from rquant.task_center_projection import TaskOpsEvidence, TaskOpsSample
+        from rquant.task_cpu import LinuxTaskCpuReader, TaskCpuPair, compute_task_cpu
+        from rquant.task_center_runtime import TaskUnitRunSource
+
+        if type(cpu_reader) is not LinuxTaskCpuReader:
+            raise TypeError("task CPU collection requires the exact fixed kernel reader")
+        if run_source is not None and type(run_source) is not TaskUnitRunSource:
+            raise TypeError("task run collection requires the exact original journal reader")
+        started = self.monotonic()
+        snapshot = self.collect(manifest)
+        runs = ()
+        if run_source is not None:
+            try:
+                runs = run_source.read(host_name=snapshot.host_name, boot_id=snapshot.boot_id, manifest_digest=snapshot.manifest_digest,
+                    units=tuple(unit.service for unit in snapshot.units), cutoff=self.clock())
+            except (OSError, ValueError, TimeoutError):
+                runs = ()
+        try:
+            properties = {
+                name: self._show_task_cpu(name, start=started)
+                for name in _SLICES
+            }
+            remaining = _TOTAL_SECONDS - (self.monotonic() - started)
+            current = cpu_reader.capture(host_name=snapshot.host_name, boot_id=snapshot.boot_id, manifest_digest=snapshot.manifest_digest, properties=properties, max_seconds=remaining, clock=self.clock)
+            if self.monotonic() - started >= _TOTAL_SECONDS:
+                raise TimeoutError("task CPU exceeded original collection deadline")
+            if self.host_name() != snapshot.host_name or self.proc_reader(_BOOT_PATH, 128).decode("ascii").strip() != snapshot.boot_id:
+                raise ValueError("ops host or boot changed during task collection")
+            at = self.clock()
+            snapshot = OpsSnapshot.model_validate(snapshot.model_dump(mode="python") | {"sampled_at": at})
+            pair = TaskCpuPair(previous=previous, current=current)
+            cpu = compute_task_cpu(pair, cutoff=at)
+            return TaskOpsSample(snapshot=snapshot, evidence=TaskOpsEvidence(cpu=cpu, runs=runs))
+        except (OSError, ValueError, TimeoutError, AttributeError) as exc:
+            reason = "budget_exceeded" if isinstance(exc, TimeoutError) else "capture_unavailable"
+            snapshot = OpsSnapshot.model_validate(snapshot.model_dump() | {"sampled_at": self.clock()})
+            return TaskOpsSample(snapshot=snapshot, evidence=TaskOpsEvidence(cpu=None, cpu_unavailable_reason=reason, runs=runs))
+
+    def _show_task_cpu(self, unit: str, *, start: float) -> Mapping[str, str]:
+        if unit not in _SLICES:
+            raise ValueError("CPU unit is outside the exact fixed slices")
+        remaining = _TOTAL_SECONDS - (self.monotonic() - start)
+        if remaining <= 0:
+            raise TimeoutError("ops collection exceeded total time budget")
+        allowed = ("LoadState", "ControlGroup", "InvocationID")
+        argv = ("/usr/bin/systemctl", "show", unit, "--no-pager", "--property=" + ",".join(allowed))
+        payload = self.command_runner(argv, min(_PER_COMMAND_SECONDS, remaining), _MAX_COMMAND_BYTES)
+        if len(payload) > _MAX_COMMAND_BYTES:
+            raise ValueError("CPU systemctl show exceeded byte budget")
+        result: dict[str, str] = {}
+        for line in payload.decode("ascii").splitlines():
+            key, separator, value = line.partition("=")
+            if not separator or key not in allowed or key in result or len(value) > 512:
+                raise ValueError("CPU systemctl show contains invalid fixed properties")
+            result[key] = value
+        if self.monotonic() - start >= _TOTAL_SECONDS:
+            raise TimeoutError("ops collection exceeded total time budget")
+        return MappingProxyType(result)
 
     def collect(self, manifest: OpsInstallManifest) -> OpsSnapshot:
         manifest = OpsInstallManifest.model_validate(manifest)

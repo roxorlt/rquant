@@ -8,6 +8,7 @@ import sqlite3
 import sys
 import threading
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -30,6 +31,62 @@ EXPECTED_ROOT = "/tmp/rquant-expected"
 TRUSTED_GIT = "/usr/bin/git"
 GENERATION = "1" * 40
 STARTUP_DEADLINE = 9_999_999_999.0
+
+
+def test_tsc_10_fixed_task_entry_and_explicit_scheduler_profile_parser() -> None:
+    parser = build_parser()
+    args = parser.parse_args(["ops-task-snapshot", "--manifest", "/private/manifest.json", "--manifest-public-key", "/private/public.pem",
+        "--authority-root", "/private/ops", "--producer-commit", GENERATION])
+    assert args.task_center_profile is None
+    assert args.manifest == Path("/private/manifest.json")
+    scheduler = parser.parse_args(["lab-scheduler", "--runtime-code-config", "/etc/rquant/runtime-code-bootstrap.json",
+        "--runtime-code-trusted-base", "/etc/rquant", "--runtime-code-authority-uid", "0", "--runtime-code-authority-gid", "0",
+        "--runtime-deployment-root", "/private/runtime", "--deployment-generation", GENERATION,
+        "--deployment-lock-path", "/private/deployment.lock", "--deployment-generation-fd", "17", "--startup-deadline-monotonic", "9999999999",
+        "--task-center-profile", "/private/runtime/task-center-control.json"])
+    assert scheduler.task_center_profile == Path("/private/runtime/task-center-control.json")
+
+
+def test_tsc_10_task_runtime_profile_is_exact_default_closed_and_preserves_schema16_binding(tmp_path: Path) -> None:
+    from rquant.task_center_runtime import TaskCenterControlProfile, build_lab_scheduling_control
+    from rquant.lab_scheduling_control import LabSchedulingMaintenanceScope
+    from rquant.lab_shard_protocol import LabClaimSpool, LabReportSpool
+    from rquant.lab_artifact_protocol import LabArtifactCommitSpool
+    from rquant.lab_artifacts import LabJobArtifactStore
+    from rquant.strict_json import canonical_model_json_bytes
+
+    assert build_lab_scheduling_control(None, store=None, producer_commit=GENERATION, runtime_root=tmp_path,
+        claim_spool_root=tmp_path / "unused", maintenance_scope=None, production_mode=False) is None
+    store = LabJobStore(tmp_path / "jobs.db")
+    store.initialize()
+    claims = LabClaimSpool(tmp_path / "claims")
+    reports = LabReportSpool(tmp_path / "reports")
+    artifacts = LabArtifactCommitSpool(tmp_path / "commits")
+    final = LabJobArtifactStore(tmp_path / "final")
+    scope = LabSchedulingMaintenanceScope(report_root=reports.root, artifact_commit_root=artifacts.root, final_artifact_root=final.root)
+    binding = store.scheduling_identity()
+    profile = TaskCenterControlProfile(producer_commit=GENERATION, runtime_root=tmp_path, enabled=True, allow_local_migration=True,
+        queue_identity=binding, claim_spool_root=claims.root, claim_spool_generation=(claims.root.stat().st_dev, claims.root.stat().st_ino),
+        maintenance_scope=scope, maintenance_generations=tuple((path.stat().st_dev, path.stat().st_ino) for path in (scope.report_root, scope.artifact_commit_root, scope.final_artifact_root)))
+    path = tmp_path / "task-center-control.json"
+    path.write_bytes(canonical_model_json_bytes(profile))
+    path.chmod(0o600)
+    port = build_lab_scheduling_control(path, store=store, producer_commit=GENERATION, runtime_root=tmp_path,
+        claim_spool_root=claims.root, maintenance_scope=scope, production_mode=False)
+    lease = store.acquire_scheduler_lease(owner_id="scheduler", lease_seconds=120, now=datetime.now(UTC))
+    state = store.enable_scheduling_control(lease=lease, barrier_port=port, now=datetime.now(UTC))
+    assert state.queue_identity.schema_version == 17 and binding.schema_version == 16
+    assert state.queue_identity.implementation_digest == binding.implementation_digest
+    reopened = build_lab_scheduling_control(path, store=store, producer_commit=GENERATION, runtime_root=tmp_path,
+        claim_spool_root=claims.root, maintenance_scope=scope, production_mode=False)
+    assert reopened.identity == port.identity
+    with pytest.raises(ValueError, match="production"):
+        build_lab_scheduling_control(path, store=store, producer_commit=GENERATION, runtime_root=tmp_path,
+            claim_spool_root=claims.root, maintenance_scope=scope, production_mode=True)
+    with pytest.raises(ValueError, match="commit|code"):
+        build_lab_scheduling_control(path, store=store, producer_commit="2" * 40, runtime_root=tmp_path,
+            claim_spool_root=claims.root, maintenance_scope=scope, production_mode=False)
+    final.close()
 
 
 @pytest.fixture(autouse=True)

@@ -3,6 +3,36 @@
   gap: 14px;
 }
 
+.tasks-unit-controls {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.tasks-unit-actions,
+.tasks-scheduling-state {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  min-width: 0;
+}
+
+.tasks-unit-actions .btn {
+  min-height: 32px;
+}
+
+.tasks-scheduling-controls {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--rule);
+  margin-bottom: 12px;
+}
+
 .tasks-name-cell,
 .tasks-progress-cell {
   display: grid;
@@ -71,6 +101,10 @@
   font-size: 12px;
 }
 
+.tasks-scheduling-controls .tasks-control-pending {
+  flex-basis: 100%;
+}
+
 .tasks-progress-cell {
   min-width: 100px;
 }
@@ -136,11 +170,11 @@
 }
 
 .tasks-groups .tbl th:first-child {
-  width: 40%;
+  width: 34%;
 }
 
 .tasks-groups .tbl th:not(:first-child) {
-  width: 30%;
+  width: 22%;
 }
 
 .tasks-notice {

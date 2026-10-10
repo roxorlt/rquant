@@ -55,6 +55,7 @@ class JournalReader(Protocol):
         level: str | None = None,
         page_size: int = 100,
         cursor: str | None = None,
+        invocation_id: str | None = None,
     ) -> JournalPage: ...
 
 
@@ -187,16 +188,19 @@ def _send_frame(connection: socket.socket, payload: bytes) -> None:
 def _request_values(payload: bytes) -> dict[str, object]:
     try:
         request = strict_json_loads(payload)
-        if type(request) is not dict or set(request) != _REQUEST_FIELDS:
+        if type(request) is not dict or set(request) not in (_REQUEST_FIELDS, _REQUEST_FIELDS | {"invocation_id"}):
             raise ValueError
         unit = request["unit"]
         since = request["since"]
         level = request["level"]
         size = request["page_size"]
         cursor = request["cursor"]
+        invocation = request.get("invocation_id")
         if (
             type(request["version"]) is not int
-            or request["version"] != 1
+            or request["version"] not in (1, 2)
+            or (request["version"] == 1) != ("invocation_id" not in request)
+            or request["version"] == 2 and (type(invocation) is not str or re.fullmatch(r"[0-9a-f]{32}", invocation) is None)
             or request["op"] != "read"
             or type(unit) is not str
             or _SERVICE_UNIT.fullmatch(unit) is None
@@ -217,6 +221,7 @@ def _request_values(payload: bytes) -> dict[str, object]:
             "level": level,
             "page_size": size,
             "cursor": cursor,
+            **({"invocation_id": invocation} if request["version"] == 2 else {}),
         }
     except (TypeError, ValueError, UnicodeError):
         raise UnitLogServiceError("invalid_request") from None
@@ -384,23 +389,19 @@ class UnitLogClient:
         return True
 
     def read(
-        self,
-        *,
-        unit: str,
-        since: datetime,
-        level: str | None = None,
-        page_size: int = 100,
-        cursor: str | None = None,
+        self, *, unit: str, since: datetime, level: str | None = None, page_size: int = 100,
+        cursor: str | None = None, invocation_id: str | None = None,
     ) -> JournalPage:
         try:
             request = {
-                "version": 1,
+                "version": 1 if invocation_id is None else 2,
                 "op": "read",
                 "unit": unit,
                 "since": since.isoformat(),
                 "level": level,
                 "page_size": page_size,
                 "cursor": cursor,
+                **({"invocation_id": invocation_id} if invocation_id is not None else {}),
             }
             _request_values(canonical_json_bytes(request))
             _private_directory(
@@ -430,7 +431,10 @@ class UnitLogClient:
             if response["status"] == "ok":
                 if set(response) != {"status", "page"}:
                     raise ValueError
-                return JournalPage.model_validate(response["page"])
+                page = JournalPage.model_validate(response["page"])
+                if page.invocation_id != invocation_id:
+                    raise ValueError("journal response invocation differs")
+                return page
             if set(response) != {"status", "code", "message"}:
                 raise ValueError
             code = response["code"]

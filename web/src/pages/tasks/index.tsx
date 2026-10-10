@@ -8,6 +8,7 @@ import {
   useServiceLogCapabilities,
   useTaskOverview,
 } from "@/api/endpoints";
+import { useTaskControlCapabilities } from "@/api/taskControls";
 import { useCurrentMeta } from "@/api/useMeta";
 import { formatCount, formatPercent } from "@/format/number";
 import { formatShanghaiDateTime, formatShanghaiTime } from "@/format/time";
@@ -25,9 +26,12 @@ import {
   Tip,
 } from "@/ui";
 import { LabJobControls } from "./LabJobControls";
+import { LabSchedulingControls } from "./LabSchedulingControls";
 import { OverviewSections } from "./OverviewSections";
 import { type SelectedServiceLog, ServiceLogDrawer } from "./ServiceLogDrawer";
 import { type SelectedTask, TaskProgressDrawer } from "./TaskProgressDrawer";
+import { TaskUnitControls } from "./TaskUnitControls";
+import { settledTask, TaskControlMemory } from "./taskControlRecovery";
 import "./tasks.css";
 
 function metrics(data: ResearchJobsData): Kpi[] {
@@ -195,12 +199,14 @@ export default function TasksPage() {
   const returnFocus = useRef<HTMLButtonElement | null>(null);
   const logReturnFocus = useRef<HTMLButtonElement | null>(null);
   const refreshAction = useRef<HTMLSpanElement | null>(null);
+  const taskMemory = useRef(new TaskControlMemory());
   const invalidateLogCapabilities = useInvalidateServiceLogCapabilities();
   const meta = useCurrentMeta();
   const viewer = meta.isError ? null : (meta.data?.data.viewer ?? null);
   const [identity, setIdentity] = useState({ viewer, failed: meta.isError });
   const identityChanged = identity.viewer !== viewer || identity.failed !== meta.isError;
   const trustedViewer = !identityChanged && !meta.isError ? viewer : null;
+  taskMemory.current.activate(trustedViewer);
   const capabilities = useServiceLogCapabilities(trustedViewer);
   const pageIndex = cursors.length - 1;
   const result = useTaskOverview(
@@ -217,6 +223,26 @@ export default function TasksPage() {
   const generationId = result.serving?.generation_id ?? null;
   const outdated = currentGeneration !== undefined && currentGeneration !== generationId;
   const changed = result.error instanceof ApiError && result.error.status === 409;
+  const taskCapabilities = useTaskControlCapabilities(
+    trustedViewer,
+    currentGeneration ?? generationId,
+    refreshKey,
+  );
+  const taskGrants = !taskCapabilities.isError ? taskCapabilities.data : undefined;
+  const recoveryGeneration = currentGeneration ?? generationId;
+  const revokeTaskControls = useCallback(() => {
+    if (trustedViewer !== null) taskMemory.current.clear(trustedViewer);
+    void taskCapabilities.refetch();
+  }, [trustedViewer, taskCapabilities.refetch]);
+  useEffect(() => {
+    if (
+      trustedViewer !== null &&
+      taskCapabilities.error instanceof ApiError &&
+      [401, 403].includes(taskCapabilities.error.status)
+    ) {
+      taskMemory.current.clear(trustedViewer);
+    }
+  }, [trustedViewer, taskCapabilities.error]);
   const canViewProgress =
     !outdated &&
     trustedViewer !== null &&
@@ -288,6 +314,20 @@ export default function TasksPage() {
     data?.resources.source_state === "ready" &&
     resourcesDeadline !== null &&
     resourcesDeadline > now;
+  const missingUnitRequests =
+    trustedViewer === null
+      ? []
+      : taskMemory.current
+          .entries(trustedViewer)
+          .filter(
+            ([unit, pending]) =>
+              unit !== "scheduling" &&
+              !settledTask(pending) &&
+              (outdated ||
+                !scheduledFresh ||
+                result.error !== null ||
+                !data?.scheduled.items.some((row) => row.service_unit === unit)),
+          );
   const logUnits = useMemo(() => {
     if (trustedViewer === null || capabilities.isError || outdated || result.error !== null) {
       return new Set<string>();
@@ -313,6 +353,11 @@ export default function TasksPage() {
       outdated ||
       result.error !== null ||
       !allowedLogUnits.has(selectedLog.unit) ||
+      (selectedLog.invocationId != null &&
+        !data?.scheduled.items.some(
+          (row) =>
+            row.service_unit === selectedLog.unit && row.invocation_id === selectedLog.invocationId,
+        )) ||
       !(
         data?.scheduled.items.some((row) => row.service_unit === selectedLog.unit) ||
         data?.services.items.some((row) => row.service_id === selectedLog.unit)
@@ -401,11 +446,18 @@ export default function TasksPage() {
   );
   const closeProgress = useCallback(() => setSelected(null), []);
   const openLog = useCallback(
-    (unit: string, name: string, trigger: HTMLButtonElement) => {
+    (unit: string, name: string, trigger: HTMLButtonElement, invocationId?: string | null) => {
       if (trustedViewer === null || generationId === null || !allowedLogUnits.has(unit)) return;
       logReturnFocus.current = trigger;
       setLogNotice(null);
-      setSelectedLog({ unit, name, viewer: trustedViewer, generationId, openedAt: Date.now() });
+      setSelectedLog({
+        unit,
+        name,
+        viewer: trustedViewer,
+        generationId,
+        openedAt: Date.now(),
+        invocationId,
+      });
     },
     [trustedViewer, generationId, allowedLogUnits],
   );
@@ -575,6 +627,25 @@ export default function TasksPage() {
           {logNotice}
         </p>
       ) : null}
+      {trustedViewer !== null && recoveryGeneration !== null && missingUnitRequests.length > 0 ? (
+        <Panel title="待确认的原请求">
+          <p className="hint">当前任务状态不可用。可继续核验原请求。</p>
+          {missingUnitRequests.map(([unit, pending]) => (
+            <TaskUnitControls
+              key={unit}
+              unit={unit}
+              name={pending.unitName ?? "任务"}
+              viewer={trustedViewer}
+              generationId={recoveryGeneration}
+              choice={undefined}
+              canRecover={taskGrants?.can_recover_units === true}
+              memory={taskMemory.current}
+              onRefresh={refresh}
+              onRevoked={revokeTaskControls}
+            />
+          ))}
+        </Panel>
+      ) : null}
       {meta.isError ? (
         <Panel title="任务总览">
           <EmptyState title="当前身份暂无法确认" hint="请稍后点「刷新」重试。" />
@@ -603,6 +674,28 @@ export default function TasksPage() {
             resourcesFresh={resourcesFresh}
             logUnits={allowedLogUnits}
             onLog={openLog}
+            unitControls={
+              trustedViewer !== null && generationId !== null
+                ? (row) => (
+                    <TaskUnitControls
+                      key={row.service_unit}
+                      unit={row.service_unit}
+                      name={row.name}
+                      viewer={trustedViewer}
+                      generationId={generationId}
+                      choice={
+                        scheduledFresh
+                          ? taskGrants?.units.find((choice) => choice.unit === row.service_unit)
+                          : undefined
+                      }
+                      canRecover={taskGrants?.can_recover_units === true}
+                      memory={taskMemory.current}
+                      onRefresh={refresh}
+                      onRevoked={revokeTaskControls}
+                    />
+                  )
+                : undefined
+            }
           />
           {data.research.counts ? (
             <KpiStrip items={metrics(data.research)} label="任务状态概况" compact />
@@ -618,6 +711,18 @@ export default function TasksPage() {
               ) : undefined
             }
           >
+            {trustedViewer !== null && generationId !== null ? (
+              <LabSchedulingControls
+                state={data.scheduling ?? { available: false, note: "调度状态尚未发布。" }}
+                viewer={trustedViewer}
+                generationId={generationId}
+                canControl={taskGrants?.can_control_scheduling === true}
+                canRecover={taskGrants?.can_recover_scheduling === true}
+                memory={taskMemory.current}
+                onRefresh={refresh}
+                onRevoked={revokeTaskControls}
+              />
+            ) : null}
             {data.research.source_note ? (
               <p className="tasks-notice" role="status">
                 {data.research.source_note}

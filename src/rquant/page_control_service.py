@@ -55,6 +55,7 @@ from rquant.runtime_shadow_validation import _ed25519_signing_payload
 from rquant.strict_json import canonical_json_bytes
 
 if TYPE_CHECKING:
+    from rquant.task_control import TaskControlPageControlBackend
     from rquant.config import Settings
     from rquant.experiment_platform_commands import ExperimentPageControlBackend
     from rquant.paper_portfolio_commands import PaperPortfolioPageControlBackend
@@ -150,6 +151,7 @@ def build_page_control_service(
     factor_definition_backend: FactorDefinitionPageControlBackend | None = None,
     strategy_authoring_backend: StrategyAuthoringPageControlBackend | None = None,
     paper_portfolio_backend: PaperPortfolioPageControlBackend | None = None,
+    task_control_backend: TaskControlPageControlBackend | None = None,
     load_default_lab_backend: bool = True,
     clock: Callable[[], datetime] | None = None,
     lease_seconds: int = 30,
@@ -172,6 +174,7 @@ def build_page_control_service(
         factor_definition_backend=factor_definition_backend,
         strategy_authoring_backend=strategy_authoring_backend,
         paper_portfolio_backend=paper_portfolio_backend,
+        task_control_backend=task_control_backend,
         load_default_lab_backend=load_default_lab_backend,
         clock=clock,
         lease_seconds=lease_seconds,
@@ -197,6 +200,7 @@ def build_page_control_service_with_dependencies(
     factor_definition_backend: FactorDefinitionPageControlBackend | None = None,
     strategy_authoring_backend: StrategyAuthoringPageControlBackend | None = None,
     paper_portfolio_backend: PaperPortfolioPageControlBackend | None = None,
+    task_control_backend: TaskControlPageControlBackend | None = None,
     load_default_lab_backend: bool = True,
     clock: Callable[[], datetime] | None = None,
     lease_seconds: int = 30,
@@ -216,15 +220,16 @@ def build_page_control_service_with_dependencies(
         ) or (_settings().lab_runtime_dir_resolved / "exports",)
     else:
         allowed_roots = allowed_lab_export_roots
-    outbox = PageControlOutbox(
-        Path(
-            outbox_path
-            or os.environ.get(
-                "RQUANT_PAGE_CONTROL_OUTBOX",
-                _settings().data_dir / "page-control.sqlite3",
-            )
-        )
-    )
+    journal_path = Path(outbox_path or os.environ.get("RQUANT_PAGE_CONTROL_OUTBOX", _settings().data_dir / "page-control.sqlite3"))
+    if task_control_backend is not None:
+        from rquant.task_control import TaskControlPageControlBackend
+
+        if type(task_control_backend) is not TaskControlPageControlBackend or Path(os.path.abspath(journal_path)) != task_control_backend.journal.path:
+            raise ValueError("task control backend differs from original PageControl path")
+        task_control_backend.journal.identity()
+        outbox = task_control_backend.journal.outbox
+    else:
+        outbox = PageControlOutbox(journal_path)
     return PageControlService(
         outbox=outbox,
         consumer=PageControlConsumer(
@@ -245,6 +250,7 @@ def build_page_control_service_with_dependencies(
             factor_definition_backend=factor_definition_backend,
             strategy_authoring_backend=strategy_authoring_backend,
             paper_portfolio_backend=paper_portfolio_backend,
+            task_control_backend=task_control_backend,
             clock=clock,
             lease_seconds=lease_seconds,
             consumer_id=consumer_instance_id,

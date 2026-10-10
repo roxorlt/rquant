@@ -10,6 +10,7 @@ export interface SelectedServiceLog {
   viewer: string;
   generationId: string;
   openedAt: number;
+  invocationId?: string | null;
 }
 
 type Range = "hour" | "day" | "week";
@@ -86,7 +87,14 @@ function ServiceLogContent({
     const controller = new AbortController();
     setLoading(true);
     setError(null);
-    void fetchServiceLogPage(selected.unit, filter.since, filter.level, cursor, controller.signal)
+    void fetchServiceLogPage(
+      selected.unit,
+      filter.since,
+      filter.level,
+      cursor,
+      controller.signal,
+      selected.invocationId,
+    )
       .then((page) => {
         if (controller.signal.aborted) return;
         const pageEntries = page.entries.slice(0, 498).map((entry) => ({
@@ -123,7 +131,7 @@ function ServiceLogContent({
         if (!controller.signal.aborted) setLoading(false);
       });
     return () => controller.abort();
-  }, [selected.unit, filter, cursor, onRevoked, halted, expireRange]);
+  }, [selected.unit, selected.invocationId, filter, cursor, onRevoked, halted, expireRange]);
 
   function changeRange(value: Range): void {
     setEntries([]);
@@ -269,7 +277,7 @@ export function ServiceLogDrawer({
     >
       {selected ? (
         <ServiceLogContent
-          key={`${selected.viewer}:${selected.generationId}:${selected.unit}:${selected.openedAt}`}
+          key={`${selected.viewer}:${selected.generationId}:${selected.unit}:${selected.invocationId ?? "all"}:${selected.openedAt}`}
           selected={selected}
           onRevoked={onRevoked}
         />

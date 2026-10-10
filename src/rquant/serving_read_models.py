@@ -52,6 +52,7 @@ from rquant.signal_contracts import (
 )
 from rquant.strategy_authoring_projection_contract import STRATEGY_TEMPLATE_PROJECTION_LAYOUTS
 from rquant.strict_json import canonical_json_bytes, strict_canonical_json_loads
+from rquant.task_center_projection import CPU_COLUMNS, RUN_COLUMNS, SCHEDULING_COLUMNS
 
 GenerationId = Annotated[StrictStr, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 ProjectionScalar = StrictStr | StrictInt | StrictFloat | StrictBool | None
@@ -420,6 +421,18 @@ PAGE_PROJECTION_CONTRACTS: Mapping[str, ServingProjectionContract] = MappingProx
             ("slice_name",),
             max_rows=5,
             max_bytes=8 * 1024,
+        ),
+        "ops_task_cpu": _contract(
+            "ops_status", CPU_COLUMNS, ("slice_name",), max_rows=5,
+            max_bytes=32 * 1024, event_time_columns=("observed_at",),
+        ),
+        "ops_task_runs": _contract(
+            "ops_status", RUN_COLUMNS, ("service",), max_rows=32,
+            max_bytes=64 * 1024, event_time_columns=("started_at", "ended_at", "observed_at"),
+        ),
+        "lab_scheduler_control": _contract(
+            "lab_jobs", SCHEDULING_COLUMNS, ("control_key",), max_rows=1,
+            max_bytes=16 * 1024, event_time_columns=("observed_at",),
         ),
         "dashboard_summary": _contract(
             "runtime_health",

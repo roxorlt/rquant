@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Literal, Protocol
 
 if TYPE_CHECKING:
+    from rquant.task_control import TaskControlPageControlBackend
     from rquant.paper_portfolio_commands import PaperPortfolioPageControlBackend
     from rquant.research_query.saved import SavedResearchQuery
     from rquant.strategy_authoring import StrategyAuthoringPageControlBackend
@@ -118,6 +119,11 @@ from rquant.strategy_authoring_commands import (
 )
 
 from rquant.strategy_template_run_commands import OwnedRunStrategyTemplate, RunStrategyTemplate, OwnedStrategyTemplateCommandValue as OwnedStrategyTemplateCommand, StrategyTemplateCommandValue as StrategyTemplateCommand
+from rquant.task_control_commands import (
+    TASK_CONTROL_KINDS, TASK_CONTROL_OWNED_TYPES, TASK_CONTROL_PUBLIC_TYPES,
+    OwnedPrepareUnitRun, OwnedRequestUnitRun, OwnedSetLabSchedulingPaused,
+    OwnedTaskControl, TaskControlRequest, TaskControlIdentity,
+)
 
 _SAFE_NAME = re.compile(r"^[\w\u4e00-\u9fff-]+$")
 _CANVAS_CATALOG_SCHEMA_VERSION = 1
@@ -718,6 +724,9 @@ PageControlCommandValue = Annotated[
     | OwnedSetPaperAccountPaused
     | OwnedSavePaperPortfolioConfiguration
     | OwnedRunPaperPortfolioResearch
+    | OwnedPrepareUnitRun
+    | OwnedRequestUnitRun
+    | OwnedSetLabSchedulingPaused
     | SaveCanvas
     | CreateCanvas
     | DeleteCanvas
@@ -1185,6 +1194,8 @@ class PageControlOutbox:
         return connection
 
     def enqueue(self, command: PageControlCommandValue) -> PageControlReceipt:
+        if isinstance(command, TASK_CONTROL_PUBLIC_TYPES):
+            raise ValueError("task controls require trusted private submission")
         if isinstance(command, (SetPaperAccountPaused, SavePaperPortfolioConfiguration, RunPaperPortfolioResearch)):
             raise ValueError("paper portfolio requires trusted submission")
         if isinstance(command, (SaveStrategyTemplate, ArchiveStrategyTemplate, RunStrategyTemplate)):
@@ -1259,6 +1270,11 @@ class PageControlOutbox:
             raise TypeError("paper portfolio requires an owned command")
         return self._enqueue(command, require_paper_portfolio_trust=True)
 
+    def enqueue_trusted_task_control(self, command: OwnedTaskControl) -> PageControlReceipt:
+        if type(command) not in TASK_CONTROL_OWNED_TYPES:
+            raise TypeError("task controls require exact owned commands")
+        return self._enqueue(command, require_task_control_trust=True)
+
     def _enqueue(
         self,
         command: PageControlCommandValue,
@@ -1271,7 +1287,12 @@ class PageControlOutbox:
         require_research_query_trust: bool = False,
         require_strategy_authoring_trust: bool = False,
         require_paper_portfolio_trust: bool = False,
+        require_task_control_trust: bool = False,
     ) -> PageControlReceipt:
+        if isinstance(command, TASK_CONTROL_PUBLIC_TYPES) != require_task_control_trust or (
+            require_task_control_trust and type(command) not in TASK_CONTROL_OWNED_TYPES
+        ):
+            raise ValueError("task controls require trusted private submission")
         if isinstance(command, (SetPaperAccountPaused, SavePaperPortfolioConfiguration, RunPaperPortfolioResearch)) != require_paper_portfolio_trust or (
             require_paper_portfolio_trust and type(command) not in (OwnedSetPaperAccountPaused, OwnedSavePaperPortfolioConfiguration, OwnedRunPaperPortfolioResearch)
         ):
@@ -1316,7 +1337,7 @@ class PageControlOutbox:
             raise ValueError("tracking requires trusted submission")
         payload = command.model_dump_json()
         command_hash = _command_hash(command)
-        enqueued_at = command.requested_at.isoformat(timespec="microseconds")
+        enqueued_at = (command.accepted_at if type(command) in TASK_CONTROL_OWNED_TYPES else command.requested_at).isoformat(timespec="microseconds")
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             if require_watchlist_activation and not self._manual_watchlist_activated(connection):
@@ -1340,7 +1361,7 @@ class PageControlOutbox:
                     raise PageControlCommandConflictError(
                         "command_id already exists with different payload"
                     )
-                if require_price_rule_activation or require_factor_definition_trust or require_strategy_authoring_trust or require_paper_portfolio_trust:
+                if require_task_control_trust or require_price_rule_activation or require_factor_definition_trust or require_strategy_authoring_trust or require_paper_portfolio_trust:
                     stored = _COMMAND_ADAPTER.validate_json(existing["payload_json"])
                     if (
                         stored != command
@@ -1351,6 +1372,15 @@ class PageControlOutbox:
                             "command_id already exists with different payload"
                         )
                 return self._receipt(existing)
+            if require_task_control_trust:
+                if len(payload.encode()) > 32 * 1024:
+                    raise ValueError("task control effect exceeds 32 KiB")
+                count = connection.execute(
+                    "SELECT COUNT(*) FROM page_control_command WHERE command_kind IN (?, ?, ?)",
+                    tuple(sorted(TASK_CONTROL_KINDS)),
+                ).fetchone()[0]
+                if count >= 4096:
+                    raise ValueError("task control history exceeds 4096 commands")
             connection.execute(
                 """
                 INSERT INTO page_control_command(
@@ -1668,6 +1698,31 @@ class PageControlOutbox:
             raise PageControlCommandConflictError("stored paper command is invalid") from exc
         if (
             type(stored) not in (OwnedSetPaperAccountPaused, OwnedSavePaperPortfolioConfiguration, OwnedRunPaperPortfolioResearch)
+            or stored.owner_id != authenticated_actor_id
+            or row["command_kind"] != request.kind
+            or stored.original() != request
+            or _command_hash(stored) != row["command_hash"]
+        ):
+            raise PageControlCommandConflictError("command_id already exists with different payload or actor")
+        return stored, self._receipt(row)
+
+    def lookup_task_control_command(
+        self, request: TaskControlRequest, *, authenticated_actor_id: str,
+    ) -> tuple[OwnedTaskControl, PageControlReceipt] | None:
+        if type(request) not in TASK_CONTROL_PUBLIC_TYPES:
+            raise TypeError("task lookup requires an ownerless original request")
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM page_control_command WHERE command_id = ?", (request.command_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            stored = _COMMAND_ADAPTER.validate_json(row["payload_json"])
+        except ValueError as exc:
+            raise PageControlCommandConflictError("stored task command is invalid") from exc
+        if (
+            type(stored) not in TASK_CONTROL_OWNED_TYPES
             or stored.owner_id != authenticated_actor_id
             or row["command_kind"] != request.kind
             or stored.original() != request
@@ -2724,6 +2779,7 @@ class PageControlConsumer:
         factor_tracking_backend: FactorTrackingPageControlBackend | None = None,
         strategy_authoring_backend: StrategyAuthoringPageControlBackend | None = None,
         paper_portfolio_backend: PaperPortfolioPageControlBackend | None = None,
+        task_control_backend: TaskControlPageControlBackend | None = None,
         clock: Callable[[], datetime] | None = None,
         lease_seconds: int = _DEFAULT_LEASE_SECONDS,
         consumer_id: str | None = None,
@@ -2749,6 +2805,12 @@ class PageControlConsumer:
         self.factor_tracking_backend = factor_tracking_backend
         self.strategy_authoring_backend = strategy_authoring_backend
         self.paper_portfolio_backend = paper_portfolio_backend
+        if task_control_backend is not None:
+            from rquant.task_control import TaskControlPageControlBackend
+
+            if type(task_control_backend) is not TaskControlPageControlBackend or task_control_backend.journal.outbox is not outbox:
+                raise TypeError("task controls require the same original concrete PageControl journal")
+        self.task_control_backend = task_control_backend
         self.clock = clock or (lambda: datetime.now(UTC))
         self.lease_seconds = lease_seconds
         self.consumer_service_id = consumer_service_id
@@ -2839,6 +2901,18 @@ class PageControlConsumer:
                 return ()
             if claims[0].command != command:
                 raise PageControlCommandConflictError("paper command changed before claim")
+            return self._complete_claims(claims)
+
+    def drain_task_control_command(self, command: OwnedTaskControl) -> tuple[PageControlReceipt, ...]:
+        with _PageControlExecutionMutex(self._consumer_mutex_path()) as acquired:
+            if not acquired:
+                return ()
+            claims = self.outbox.claim_records(limit=1, owner_id=self.consumer_id, lease_seconds=self.lease_seconds,
+                now=self.clock(), target_command_id=command.command_id)
+            if not claims:
+                return ()
+            if claims[0].command != command:
+                raise PageControlCommandConflictError("task original command changed before claim")
             return self._complete_claims(claims)
 
     def drain_factor_definition_command(
@@ -2959,6 +3033,17 @@ class PageControlConsumer:
         terminal = self._outcome_from_effect(effect)
         if terminal is not None:
             return terminal
+        if type(command) in TASK_CONTROL_OWNED_TYPES:
+            marker = {"contract": "task-control-identity/v1", "identity": command.metadata_identity.model_dump(mode="json")}
+            try:
+                self._task_control_backend().validate(command)
+                if effect.result is None:
+                    effect = self.outbox.record_started_effect_result(command.command_id, result=marker,
+                        owner_id=claim.owner_id, claim_token=claim.claim_token)
+                if effect.result != marker:
+                    raise ValueError("task original metadata identity differs")
+            except Exception as exc:
+                raise _RetryableUncertainEffectError(f"task original identity cannot be verified: {exc}") from exc
         if isinstance(command, EXPERIMENT_COMMAND_TYPES) and effect.result is None:
             try:
                 if self.experiment_backend is None:
@@ -3346,6 +3431,11 @@ class PageControlConsumer:
     def _must_recover_before_failure(
         self, command: PageControlCommandValue, *, created: bool
     ) -> bool:
+        if type(command) in TASK_CONTROL_OWNED_TYPES:
+            try:
+                return self._task_control_backend().has_effect(command)
+            except Exception:
+                return True
         if isinstance(command, EXPERIMENT_COMMAND_TYPES):
             effect = self.outbox.effect(command.command_id)
             return effect is not None and effect.result is not None
@@ -3427,6 +3517,8 @@ class PageControlConsumer:
         return _ExecutionOutcome(PageControlStatus.FAILED, effect.result, effect.error)
 
     def _execute(self, command: PageControlCommandValue) -> JsonValue:
+        if type(command) in TASK_CONTROL_OWNED_TYPES:
+            return self._task_control_backend().submit(command)
         if isinstance(command, EXPERIMENT_COMMAND_TYPES):
             effect = self.outbox.effect(command.command_id)
             if self.experiment_backend is None or effect is None or effect.result is None:
@@ -3575,6 +3667,11 @@ class PageControlConsumer:
         if self.paper_portfolio_backend is None:
             raise RuntimeError("paper portfolio backend is unavailable")
         return self.paper_portfolio_backend
+
+    def _task_control_backend(self) -> TaskControlPageControlBackend:
+        if self.task_control_backend is None:
+            raise RuntimeError("task control backend is unavailable")
+        return self.task_control_backend
 
     @staticmethod
     def _factor_effect_identity(effect: PageControlEffectRecord) -> FactorRegistryIdentity:
@@ -3801,6 +3898,8 @@ class PageControlConsumer:
         return None
 
     def _recover_started_effect(self, command: PageControlCommandValue) -> JsonValue | None:
+        if type(command) in TASK_CONTROL_OWNED_TYPES:
+            return self._task_control_backend().recover(command)
         if isinstance(command, EXPERIMENT_COMMAND_TYPES):
             effect = self.outbox.effect(command.command_id)
             if self.experiment_backend is None or effect is None or effect.result is None:
@@ -5279,6 +5378,37 @@ class PageControlService:
         backend.validate(owned)
         return self._settle(owned, self.outbox.enqueue_trusted_paper_portfolio(owned), paper_portfolio_command=owned)
 
+    def _lookup_trusted_task_control(self, request: TaskControlRequest, *, authenticated_actor_id: str) -> PageControlReceipt | None:
+        backend = self.consumer._task_control_backend()
+        backend.authorize(authenticated_actor_id, request)
+        matched = self.outbox.lookup_task_control_command(request, authenticated_actor_id=authenticated_actor_id)
+        if matched is None:
+            return None
+        backend.validate(matched[0])
+        return matched[1]
+
+    def _resume_trusted_task_control(self, request: TaskControlRequest, *, authenticated_actor_id: str) -> PageControlReceipt:
+        backend = self.consumer._task_control_backend()
+        backend.authorize(authenticated_actor_id, request)
+        matched = self.outbox.lookup_task_control_command(request, authenticated_actor_id=authenticated_actor_id)
+        if matched is None:
+            raise KeyError("task original command not found")
+        backend.validate(matched[0])
+        return self._settle(matched[0], matched[1], task_control_command=matched[0])
+
+    def _submit_trusted_task_control(self, request: TaskControlRequest, *, authenticated_actor_id: str,
+                                     verified_metadata_identity: TaskControlIdentity) -> PageControlReceipt:
+        backend = self.consumer._task_control_backend()
+        backend.authorize(authenticated_actor_id, request)
+        matched = self.outbox.lookup_task_control_command(request, authenticated_actor_id=authenticated_actor_id)
+        if matched is not None:
+            backend.validate(matched[0])
+            return self._settle(matched[0], matched[1], task_control_command=matched[0])
+        owned = backend.compile(request, authenticated_actor_id=authenticated_actor_id, expected_identity=verified_metadata_identity)
+        backend.validate(owned)
+        receipt = self.outbox.enqueue_trusted_task_control(owned)
+        return self._settle(owned, receipt, task_control_command=owned)
+
     def _resume_trusted_price_rule(
         self, command: PriceAlertRuleRequestValue, *, authenticated_owner_id: str
     ) -> PageControlReceipt:
@@ -5300,9 +5430,14 @@ class PageControlService:
         research_query_command: _OwnedSaveResearchQuery | None = None,
         strategy_authoring_command: OwnedStrategyTemplateCommand | None = None,
         paper_portfolio_command: OwnedPaperPortfolioCommand | None = None,
+        task_control_command: OwnedTaskControl | None = None,
     ) -> PageControlReceipt:
         for _ in range(100):
             if receipt.status in _PAGE_CONTROL_TERMINAL_STATUSES:
+                if task_control_command is not None and receipt.status is PageControlStatus.SUCCEEDED:
+                    recovered = self.consumer._task_control_backend().recover(task_control_command)
+                    if recovered != receipt.result:
+                        raise RuntimeError("task original acceptance receipt differs from journal")
                 if paper_portfolio_command is not None and receipt.status is PageControlStatus.SUCCEEDED:
                     recovered = self.consumer._paper_portfolio_backend().recover(paper_portfolio_command)
                     if recovered != receipt.result:
@@ -5312,7 +5447,9 @@ class PageControlService:
                     if recovered != receipt.result:
                         raise RuntimeError("strategy original metadata receipt differs from journal")
                 return receipt
-            if paper_portfolio_command is not None:
+            if task_control_command is not None:
+                drained = self.consumer.drain_task_control_command(task_control_command)
+            elif paper_portfolio_command is not None:
                 drained = self.consumer.drain_paper_portfolio_command(paper_portfolio_command)
             elif strategy_authoring_command is not None:
                 drained = self.consumer.drain_strategy_authoring_command(strategy_authoring_command)
@@ -5998,6 +6135,10 @@ def _fsync_descriptor(descriptor: int) -> None:
 
 
 def parse_page_control_command(payload: object) -> PageControlCommandValue:
+    if isinstance(payload, TASK_CONTROL_PUBLIC_TYPES) or (
+        isinstance(payload, Mapping) and payload.get("kind") in TASK_CONTROL_KINDS
+    ):
+        raise ValueError("task controls require trusted private submission")
     if isinstance(payload, (SetPaperAccountPaused, SavePaperPortfolioConfiguration, RunPaperPortfolioResearch)) or (
         isinstance(payload, Mapping) and payload.get("kind") in _PAPER_PORTFOLIO_KINDS
     ):

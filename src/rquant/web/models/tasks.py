@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from rquant.runtime_contracts import AwareUtcDatetime
 from rquant.web.models.common import StatusInfo
+from rquant.web.models.task_controls import TaskSchedulingView
 
 JobSourceState = Literal["ready", "empty", "not_published", "unavailable"]
 ResearchJobAction = Literal["pause", "resume", "cancel", "retry"]
@@ -105,6 +106,11 @@ class ScheduledTaskItem(BaseModel):
     result_label: str
     timer_unit: str = Field(max_length=128)
     service_unit: str = Field(max_length=128)
+    started_at: AwareUtcDatetime | None = None
+    ended_at: AwareUtcDatetime | None = None
+    invocation_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
+    origin_label: str = "待确认"
+    previous_result_label: str | None = None
 
 
 class ScheduledTasksData(BaseModel):
@@ -151,6 +157,8 @@ class ResourceGroupItem(BaseModel):
     slice_unit: str
     memory_current_bytes: int | None = Field(ge=0)
     memory_peak_bytes: int | None = Field(ge=0)
+    cpu_usage_percent: float | None = Field(default=None, ge=0, le=100, allow_inf_nan=False)
+    cpu_note: str = "暂无可信 CPU 数据"
 
 
 class ResourcesData(BaseModel):
@@ -185,3 +193,4 @@ class TaskOverviewData(BaseModel):
     research: ResearchJobsData
     can_view_research_logs: bool = False
     can_control_research_jobs: bool = False
+    scheduling: TaskSchedulingView = TaskSchedulingView()

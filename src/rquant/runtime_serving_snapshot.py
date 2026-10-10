@@ -22,6 +22,8 @@ from rquant.delivery_contracts import OutboxRecord
 from rquant.experiment_registry import PromotionDecision
 from rquant.lab_jobs import JobStatus
 from rquant.ops_status import OpsSnapshot
+from rquant.task_center_projection import TaskOpsEvidence, TaskOpsSample, validate_scheduling_projection
+from rquant.lab_scheduling_control import LabSchedulingControlState
 from rquant.paper_contracts import PaperAccountSnapshot
 from rquant.runtime_builder_serving import (
     DEFAULT_OPTIONAL_SOURCE_DATASETS,
@@ -239,9 +241,11 @@ class LabJobsPayload(RuntimeContractModel):
     payload_kind: Literal["lab_jobs"] = "lab_jobs"
     lab_jobs: tuple[ServingLabJobRecord, ...] = ()
     projections: tuple[ServingProjectionPayload, ...] = ()
+    scheduling_control: LabSchedulingControlState | None = Field(default=None, exclude_if=lambda value: value is None)
 
     @model_validator(mode="after")
     def validate_event_windows(self) -> LabJobsPayload:
+        validate_scheduling_projection(self.scheduling_control, self.projections)
         from rquant.factor.result_serving import (
             FACTOR_RESULT_PROJECTION_TABLES,
             validate_factor_result_projections,
@@ -351,21 +355,25 @@ class PromotionsPayload(RuntimeContractModel):
 class OpsStatusPayload(RuntimeContractModel):
     payload_kind: Literal["ops_status"] = "ops_status"
     snapshot: OpsSnapshot | None = None
+    task_evidence: TaskOpsEvidence | None = Field(default=None, exclude_if=lambda value: value is None)
     projections: tuple[ServingProjectionPayload, ...] = ()
 
     @model_validator(mode="after")
     def validate_projection_set(self) -> OpsStatusPayload:
         expected = {"ops_host_status", "ops_unit_status", "ops_resource_status"}
+        if self.task_evidence is not None:
+            expected.update({"ops_task_cpu", "ops_task_runs"})
         observed = {projection.table_name for projection in self.projections}
         if self.snapshot is None:
-            if observed:
+            if observed or self.task_evidence is not None:
                 raise ValueError("ops projections require a source snapshot")
         elif observed != expected or len(self.projections) != len(expected):
             raise ValueError("ops snapshot requires its exact serving projections")
         else:
             from rquant.ops_status_serving import ops_status_projections
 
-            if self.projections != ops_status_projections(self.snapshot):
+            sample = self.snapshot if self.task_evidence is None else TaskOpsSample(snapshot=self.snapshot, evidence=self.task_evidence)
+            if self.projections != ops_status_projections(sample):
                 raise ValueError("ops projections must match sample evidence")
         return self
 

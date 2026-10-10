@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { createContext, type ReactNode, useContext, useMemo } from "react";
 import type {
   ResourceGroupItem,
   RuntimeServiceItem,
@@ -35,31 +35,78 @@ function Duration({ seconds }: { seconds: number | null }) {
   return <span className="num">{seconds === null ? EMPTY : `${formatNumber(seconds, 1)} 秒`}</span>;
 }
 
-type OpenLog = (unit: string, name: string, trigger: HTMLButtonElement) => void;
+type OpenLog = (
+  unit: string,
+  name: string,
+  trigger: HTMLButtonElement,
+  invocationId?: string | null,
+) => void;
+const TimerCellContext = createContext<{
+  logUnits: ReadonlySet<string>;
+  onLog?: OpenLog;
+  unitControls?: (row: ScheduledTaskItem) => ReactNode;
+}>({ logUnits: new Set() });
 
-function LogButton({ unit, name, onLog }: { unit: string; name: string; onLog: OpenLog }) {
+function TimerCell({ row }: { row: ScheduledTaskItem }) {
+  const controls = useContext(TimerCellContext);
+  return (
+    <TimerName
+      row={row}
+      onLog={controls.logUnits.has(row.service_unit) ? controls.onLog : undefined}
+      controls={controls.unitControls?.(row)}
+    />
+  );
+}
+
+function LogButton({
+  unit,
+  name,
+  onLog,
+  invocationId,
+}: {
+  unit: string;
+  name: string;
+  onLog: OpenLog;
+  invocationId?: string | null;
+}) {
   return (
     <Button
       size="sm"
       variant="ghost"
       className="tasks-progress-link"
       aria-label={`查看${name}的运行日志`}
-      onClick={(event) => onLog(unit, name, event.currentTarget)}
+      onClick={(event) => onLog(unit, name, event.currentTarget, invocationId)}
     >
       运行日志
     </Button>
   );
 }
 
-function TimerName({ row, onLog }: { row: ScheduledTaskItem; onLog?: OpenLog }) {
+function TimerName({
+  row,
+  onLog,
+  controls,
+}: {
+  row: ScheduledTaskItem;
+  onLog?: OpenLog;
+  controls?: ReactNode;
+}) {
   return (
     <div className="tasks-name-cell">
       <div className="tasks-name-head">
         <Tip content={`${row.timer_unit} · ${row.service_unit}`}>
           <strong className="tasks-name">{row.name}</strong>
         </Tip>
-        {onLog ? <LogButton unit={row.service_unit} name={row.name} onLog={onLog} /> : null}
+        {onLog ? (
+          <LogButton
+            unit={row.service_unit}
+            name={row.name}
+            onLog={onLog}
+            invocationId={row.invocation_id}
+          />
+        ) : null}
       </div>
+      {controls}
       <div className="tasks-mobile-timer">
         <StatusBadge state={row.status.state} label={row.status.label} reason={row.status.reason} />
         <span className="tasks-timer-times">
@@ -71,8 +118,14 @@ function TimerName({ row, onLog }: { row: ScheduledTaskItem; onLog?: OpenLog }) 
           </span>
         </span>
         <span className="tasks-timer-outcome">
-          结果 {row.result_label} · 耗时 <Duration seconds={row.duration_seconds} />
+          {row.origin_label !== "待确认" ? `${row.origin_label ?? ""} · ` : ""}结果{" "}
+          {row.result_label} · 耗时 <Duration seconds={row.duration_seconds} />
         </span>
+        {row.started_at != null ? (
+          <span className="tasks-timer-times">
+            开始 <Timestamp at={row.started_at} /> · 结束 <Timestamp at={row.ended_at ?? null} />
+          </span>
+        ) : null}
       </div>
     </div>
   );
@@ -83,7 +136,7 @@ const TIMER_COLUMNS: DataColumn<ScheduledTaskItem>[] = [
     id: "task",
     header: "任务",
     value: (row) => row.name,
-    cell: (row) => <TimerName row={row} />,
+    cell: (row) => <TimerCell row={row} />,
     wrap: true,
   },
   {
@@ -111,8 +164,28 @@ const TIMER_COLUMNS: DataColumn<ScheduledTaskItem>[] = [
   },
   {
     id: "result",
-    header: "上次结果",
+    header: "最近运行结果",
     value: (row) => row.result_label,
+    cell: (row) => (
+      <Tip content={row.previous_result_label ?? "尚无已确认的前次结果"}>
+        <span>{row.result_label}</span>
+      </Tip>
+    ),
+    secondary: true,
+  },
+  { id: "origin", header: "来源", value: (row) => row.origin_label ?? "待确认", secondary: true },
+  {
+    id: "start",
+    header: "开始",
+    value: (row) => row.started_at ?? null,
+    cell: (row) => <Timestamp at={row.started_at ?? null} />,
+    secondary: true,
+  },
+  {
+    id: "end",
+    header: "结束",
+    value: (row) => row.ended_at ?? null,
+    cell: (row) => <Timestamp at={row.ended_at ?? null} />,
     secondary: true,
   },
   {
@@ -191,6 +264,19 @@ const GROUP_COLUMNS: DataColumn<ResourceGroupItem>[] = [
     wrap: true,
   },
   {
+    id: "cpu",
+    header: "CPU",
+    value: (row) => row.cpu_usage_percent ?? null,
+    cell: (row) => (
+      <Tip content={row.cpu_note ?? "暂无可信 CPU 数据"}>
+        <span className="num">
+          {row.cpu_usage_percent == null ? EMPTY : formatPercent(row.cpu_usage_percent, 1)}
+        </span>
+      </Tip>
+    ),
+    numeric: true,
+  },
+  {
     id: "current",
     header: "当前占用",
     value: (row) => row.memory_current_bytes,
@@ -228,28 +314,16 @@ export function OverviewSections({
   resourcesFresh,
   logUnits,
   onLog,
+  unitControls,
 }: {
   data: TaskOverviewData;
   scheduledFresh: boolean;
   resourcesFresh: boolean;
   logUnits: ReadonlySet<string>;
   onLog: OpenLog;
+  unitControls?: (row: ScheduledTaskItem) => ReactNode;
 }) {
   const { scheduled, services, resources } = data;
-  const timerColumns = useMemo(
-    () =>
-      TIMER_COLUMNS.map((column) =>
-        column.id === "task"
-          ? {
-              ...column,
-              cell: (row: ScheduledTaskItem) => (
-                <TimerName row={row} onLog={logUnits.has(row.service_unit) ? onLog : undefined} />
-              ),
-            }
-          : column,
-      ),
-    [logUnits, onLog],
-  );
   const serviceColumns = useMemo(
     () =>
       SERVICE_COLUMNS.map((column) =>
@@ -291,13 +365,15 @@ export function OverviewSections({
         ) : (
           <>
             <SourceNote note={scheduled.source_note} />
-            <DataTable
-              rows={scheduled.items.slice(0, 32)}
-              columns={timerColumns}
-              rowKey={(row) => row.timer_unit}
-              label="定时任务"
-              emptyText={<EmptyState title="当前没有定时任务" hint="请稍后刷新。" />}
-            />
+            <TimerCellContext value={{ logUnits, onLog, unitControls }}>
+              <DataTable
+                rows={scheduled.items.slice(0, 32)}
+                columns={TIMER_COLUMNS}
+                rowKey={(row) => row.timer_unit}
+                label="定时任务"
+                emptyText={<EmptyState title="当前没有定时任务" hint="请稍后刷新。" />}
+              />
+            </TimerCellContext>
           </>
         )}
       </Panel>

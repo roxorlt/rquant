@@ -71,6 +71,16 @@ def _request(**overrides: object) -> dict[str, object]:
     return value
 
 
+def test_tsc_11_original_private_protocol_has_explicit_invocation_v2_and_keeps_v1() -> None:
+    old = unit_log_service._request_values(canonical_json_bytes(_request()))
+    assert "invocation_id" not in old
+    new = unit_log_service._request_values(canonical_json_bytes(_request(version=2, invocation_id="a" * 32)))
+    assert new["invocation_id"] == "a" * 32 and new["unit"] == UNIT
+    for changes in ({"version": 1, "invocation_id": "a" * 32}, {"version": 2}, {"version": 2, "invocation_id": "a" * 33}, {"version": 2, "invocation_id": True}):
+        with pytest.raises(UnitLogServiceError):
+            unit_log_service._request_values(canonical_json_bytes(_request(**changes)))
+
+
 def _receive_exact(connection: socket.socket, size: int) -> bytes:
     data = bytearray()
     while len(data) < size:

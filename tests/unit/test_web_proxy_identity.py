@@ -319,7 +319,7 @@ def test_current_user_route_inventory_matches_documented_categories(tmp_path: Pa
         / "docs/plans/2026-09-29-web-private-identity-route-inventory.md"
     ).read_text(encoding="utf-8")
     documented = re.findall(r"\| (GET|POST) \| `(/api/v1[^`]+)` \|", document)
-    assert len(documented) == len(set(documented)) == 121
+    assert len(documented) == len(set(documented)) == 127
 
     app = create_app(WebSettings(serving_root=tmp_path), background=False)
 

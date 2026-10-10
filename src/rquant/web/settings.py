@@ -145,6 +145,12 @@ class WebSettings(BaseModel):
     paper_portfolio_socket_path: Path | None = None
     paper_portfolio_service_uid: StrictInt | None = Field(default=None, ge=0)
     paper_portfolio_shared_gid: StrictInt | None = Field(default=None, ge=0)
+    task_control_enabled: bool = False
+    task_unit_run_users: frozenset[str] = frozenset()
+    task_scheduling_admin_users: frozenset[str] = frozenset()
+    task_control_socket_path: Path | None = None
+    task_control_service_uid: StrictInt | None = Field(default=None, ge=0, le=2**31-1)
+    task_control_web_group_gid: StrictInt | None = Field(default=None, ge=0, le=2**31-1)
     factor_run_enabled: bool = False
     factor_run_users: frozenset[str] = frozenset()
     factor_run_admission_socket_path: Path | None = None
@@ -171,6 +177,23 @@ class WebSettings(BaseModel):
 
     @model_validator(mode="after")
     def validate_sources_and_ingress(self) -> Self:
+        task_fields = (self.task_control_socket_path, self.task_control_service_uid, self.task_control_web_group_gid)
+        if self.task_control_enabled or self.task_unit_run_users or self.task_scheduling_admin_users or any(value is not None for value in task_fields):
+            if self.ingress_socket_path is None or self.proxy_proof_file is None or not (self.task_unit_run_users or self.task_scheduling_admin_users):
+                raise ValueError("task controls require private ingress, proof and exact roles")
+            if any(value is not None for value in task_fields):
+                if not all(value is not None for value in task_fields):
+                    raise ValueError("task private socket and IDs must be configured together")
+                path = self.task_control_socket_path
+                if not path.is_absolute() or ".." in path.parts or len(os.fsencode(path)) >= 100:
+                    raise ValueError("task private socket must be short and canonical")
+                if self.task_control_service_uid == os.geteuid():
+                    raise ValueError("task service UID must differ from Web UID")
+                others = (self.ingress_socket_path, self.unit_log_socket_path, self.paper_portfolio_socket_path, self.strategy_authoring_socket_path,
+                    self.ack_admission_socket_path, self.factor_admission_socket_path, self.factor_run_admission_socket_path, self.factor_tracking_admission_socket_path,
+                    self.watchlist_admission_socket_path, self.price_alert_admission_socket_path, self.research_query_socket_path, self.research_query_save_socket_path)
+                if any(other is not None and path.parent == other.parent for other in others):
+                    raise ValueError("task private socket needs a separate directory")
         paper_fields = (self.paper_portfolio_socket_path, self.paper_portfolio_service_uid, self.paper_portfolio_shared_gid)
         if self.paper_portfolio_enabled or self.paper_portfolio_users or any(value is not None for value in paper_fields):
             if self.ingress_socket_path is None or self.proxy_proof_file is None or not self.paper_portfolio_users:
@@ -473,6 +496,8 @@ class WebSettings(BaseModel):
         "research_query_users",
         "strategy_authoring_users",
         "paper_portfolio_users",
+        "task_unit_run_users",
+        "task_scheduling_admin_users",
     )
     @classmethod
     def validate_operator_users(cls, value: frozenset[str]) -> frozenset[str]:
@@ -570,6 +595,27 @@ class WebSettings(BaseModel):
     def from_env(cls, environ: Mapping[str, str] | None = None, *, bind: str | None = None) -> Self:
         source = os.environ if environ is None else environ
         values: dict[str, object] = {"serving_root": Path(serving_root_from_env(source))}
+        raw = source.get("RQUANT_WEB_TASK_CONTROL_ENABLED", "").strip().lower()
+        if raw:
+            if raw not in {"true", "false"}:
+                raise ValueError("task control enabled must be true or false")
+            values["task_control_enabled"] = raw == "true"
+        for key, field in (("RQUANT_WEB_TASK_UNIT_RUN_USERS", "task_unit_run_users"), ("RQUANT_WEB_TASK_SCHEDULING_ADMIN_USERS", "task_scheduling_admin_users")):
+            raw = source.get(key, "").strip()
+            if raw:
+                names = tuple(name.strip() for name in raw.split(","))
+                if len(set(names)) != len(names) or any(not name for name in names):
+                    raise ValueError("task roles must be distinct exact names")
+                values[field] = frozenset(names)
+        raw = source.get("RQUANT_WEB_TASK_CONTROL_SOCKET", "").strip()
+        if raw:
+            values["task_control_socket_path"] = Path(raw)
+        for suffix, field in (("SERVICE_UID", "task_control_service_uid"), ("WEB_GROUP_GID", "task_control_web_group_gid")):
+            raw = source.get(f"RQUANT_WEB_TASK_CONTROL_{suffix}", "").strip()
+            if raw:
+                if re.fullmatch(r"[0-9]{1,10}", raw) is None:
+                    raise ValueError("task private IDs require bounded nonnegative integers")
+                values[field] = int(raw)
         raw = source.get("RQUANT_WEB_PAPER_PORTFOLIO_ENABLED", "").strip().lower()
         if raw:
             if raw not in {"true", "false"}:

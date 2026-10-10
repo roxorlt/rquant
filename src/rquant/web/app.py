@@ -95,6 +95,8 @@ from rquant.web.serving import GenerationTracker
 from rquant.web.settings import WebSettings
 from rquant.web.strategy_authoring_gateway import StrategyAuthoringGateway
 from rquant.web.paper_portfolio_gateway import PaperPortfolioGateway
+from rquant.web.task_control_gateway import TaskControlGateway
+from rquant.web.routes import task_center_controls
 
 if TYPE_CHECKING:
     from rquant.alert_ack_admission import AckAdmissionClient
@@ -124,6 +126,9 @@ _WRITE_BODY_LIMITS = {
     "/api/v1/screen/tdx/market/commands": formula_market_commands.MAX_REQUEST_BYTES,
     "/api/v1/pools/formula/commands": formula_pool_save_commands.MAX_REQUEST_BYTES,
     "/api/v1/tasks/jobs/commands": tasks_controls.MAX_REQUEST_BYTES,
+    "/api/v1/tasks/scheduling/commands": task_center_controls.MAX_SCHEDULING_COMMAND_BYTES,
+    "/api/v1/tasks/controls/lookup": task_center_controls.MAX_TASK_COMMAND_BYTES,
+    "/api/v1/tasks/controls/resume": task_center_controls.MAX_TASK_COMMAND_BYTES,
     "/api/v1/research/query": research_query.MAX_REQUEST_BYTES,
     "/api/v1/research/queries/save": research_query.MAX_REQUEST_BYTES,
     "/api/v1/research/queries/resume": research_query.MAX_REQUEST_BYTES,
@@ -166,6 +171,7 @@ class WebContext:
     factor_tracking_admission: FactorTrackingAdmissionClient | None
     strategy_authoring_gateway: StrategyAuthoringGateway | None
     paper_portfolio_gateway: PaperPortfolioGateway | None
+    task_control_gateway: TaskControlGateway | None
     unit_log_client: UnitLogClient | None
     unit_log_access_audit: ServiceLogAccessAudit | None
     unit_log_gate: threading.BoundedSemaphore
@@ -196,6 +202,7 @@ def create_app(
     factor_tracking_admission_client: FactorTrackingAdmissionClient | None = None,
     strategy_authoring_gateway: StrategyAuthoringGateway | None = None,
     paper_portfolio_gateway: PaperPortfolioGateway | None = None,
+    task_control_gateway: TaskControlGateway | None = None,
     unit_log_client: UnitLogClient | None = None,
     unit_log_access_audit: ServiceLogAccessAudit | None = None,
     backfill_plan_command_transport: BackfillPlanCommandTransport | None = None,
@@ -346,6 +353,14 @@ def create_app(
             )
         )
     configured_nl_parser = nl_parser
+    configured_task_control = task_control_gateway
+    if configured_task_control is not None and not isinstance(configured_task_control, TaskControlGateway):
+        raise TypeError("task controls require the typed private gateway")
+    if configured_task_control is None and settings.task_control_socket_path is not None:
+        from rquant.task_control_admission import TaskControlAdmissionClient
+
+        configured_task_control = TaskControlAdmissionClient(settings.task_control_socket_path,
+            expected_service_uid=settings.task_control_service_uid, shared_gid=settings.task_control_web_group_gid)
     configured_paper_portfolio = paper_portfolio_gateway
     if configured_paper_portfolio is not None and not isinstance(configured_paper_portfolio, PaperPortfolioGateway):
         raise TypeError("paper portfolios require a typed private gateway")
@@ -402,6 +417,7 @@ def create_app(
         factor_tracking_admission=configured_factor_tracking,
         strategy_authoring_gateway=configured_strategy_authoring,
         paper_portfolio_gateway=configured_paper_portfolio,
+        task_control_gateway=configured_task_control,
         unit_log_client=configured_unit_log,
         unit_log_access_audit=unit_log_access_audit,
         unit_log_gate=threading.BoundedSemaphore(1),
@@ -431,6 +447,8 @@ def create_app(
     @app.middleware("http")
     async def security_headers(request: Request, call_next: Callable[..., Any]) -> Response:
         body_limit = _WRITE_BODY_LIMITS.get(request.url.path)
+        if body_limit is None and re.fullmatch(r"/api/v1/tasks/units/[^/]{1,128}/run(?:/prepare)?", request.url.path):
+            body_limit = task_center_controls.MAX_TASK_COMMAND_BYTES
         paper_write = re.fullmatch(r"/api/v1/paper-portfolios/[^/]{1,128}/(configuration|pause/prepare|pause/confirm|recover|reconcile|band)", request.url.path)
         if body_limit is None and paper_write is not None:
             body_limit = {"configuration": paper_portfolio.MAX_CONFIGURATION_BYTES, "recover": paper_portfolio.MAX_PAPER_RECOVERY_BYTES}.get(paper_write.group(1), paper_portfolio.MAX_PAPER_CONTROL_BYTES)
@@ -545,6 +563,7 @@ def create_app(
     app.include_router(price_alert_rules.router, prefix="/api/v1", tags=["monitor"])
     app.include_router(price_alert_runtime.router, prefix="/api/v1", tags=["monitor"])
     app.include_router(tasks.router, prefix="/api/v1", tags=["tasks"], dependencies=private)
+    app.include_router(task_center_controls.router, prefix="/api/v1", tags=["tasks"], dependencies=private)
     app.include_router(
         tasks_controls.router, prefix="/api/v1", tags=["tasks"], dependencies=private
     )

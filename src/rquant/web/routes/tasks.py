@@ -590,6 +590,11 @@ def get_overview(
 ) -> Envelope[TaskOverviewData]:
     web = request.app.state.web
     now = web.clock()
+    from rquant.web.models.task_controls import TaskSchedulingView
+    from rquant.web.routes.task_center_controls import scheduling_view
+    from rquant.task_control_admission import read_task_center_view
+
+    scheduling = TaskSchedulingView()
     with web.tracker.borrow() as borrowed:
         meta = serving_meta(
             borrowed, now=now, stale_after=web.settings.stale_after, failure=web.tracker.failure
@@ -612,6 +617,12 @@ def get_overview(
         else:
             day = calendar_day(borrowed.cursor, shanghai_trade_date(now))
             scheduled, resources = ops_sections(borrowed, now=now, day=day)
+            try:
+                task_view = read_task_center_view(borrowed)
+                if task_view is not None and 0 <= (now-task_view.snapshot.sampled_at).total_seconds() < 120 and task_view.scheduling_control is not None:
+                    scheduling = scheduling_view(task_view.scheduling_control)
+            except (ServingQueryError, ValueError, TypeError, ValidationError):
+                scheduling = TaskSchedulingView(note="调度状态暂无法核验。")
             services = service_section(borrowed, now=now, day=day)
             mark = _watermark(borrowed)
             if mark is None or mark.status is FreshnessStatus.UNAVAILABLE:
@@ -636,6 +647,7 @@ def get_overview(
             research=research,
             can_view_research_logs=_can_view_research_logs(viewer, request),
             can_control_research_jobs=_can_control_research_jobs(viewer, request),
+            scheduling=scheduling,
         ),
         serving=meta,
     )
