@@ -122,3 +122,9 @@ id_rsa*
 tmp/
 temp/
 .cache/
+
+# React MVP build output and tooling (built in CI / on deploy, never committed)
+web/dist/
+web/node_modules/
+web/test-results/
+web/playwright-report/

@@ -1,0 +1,1932 @@
+{
+  "components": {
+    "schemas": {
+      "AckAlertRequest": {
+        "properties": {
+          "alert_id": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Alert Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "alert_id"
+        ],
+        "title": "AckAlertRequest",
+        "type": "object"
+      },
+      "AddWatchRequest": {
+        "properties": {
+          "code": {
+            "pattern": "^\\d{6}\\.(SH|SZ|BJ)$",
+            "title": "Code",
+            "type": "string"
+          },
+          "note": {
+            "default": "",
+            "title": "Note",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code"
+        ],
+        "title": "AddWatchRequest",
+        "type": "object"
+      },
+      "AlertItem": {
+        "properties": {
+          "alert_id": {
+            "title": "Alert Id",
+            "type": "string"
+          },
+          "at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "At"
+          },
+          "code": {
+            "title": "Code",
+            "type": "string"
+          },
+          "level": {
+            "title": "Level",
+            "type": "string"
+          },
+          "level_price": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Level Price"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "pool": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pool"
+          },
+          "trade_date": {
+            "format": "date",
+            "title": "Trade Date",
+            "type": "string"
+          },
+          "trigger_price": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trigger Price"
+          },
+          "trigger_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trigger Type"
+          }
+        },
+        "required": [
+          "alert_id",
+          "trade_date",
+          "at",
+          "code",
+          "name",
+          "level",
+          "trigger_type",
+          "trigger_price",
+          "level_price",
+          "pool"
+        ],
+        "title": "AlertItem",
+        "type": "object"
+      },
+      "AlertsData": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/AlertItem"
+            },
+            "title": "Items",
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "AlertsData",
+        "type": "object"
+      },
+      "BacktestDetailData": {
+        "properties": {
+          "run": {
+            "$ref": "#/components/schemas/BacktestRun"
+          },
+          "trades": {
+            "items": {
+              "$ref": "#/components/schemas/BacktestTrade"
+            },
+            "title": "Trades",
+            "type": "array"
+          }
+        },
+        "required": [
+          "run",
+          "trades"
+        ],
+        "title": "BacktestDetailData",
+        "type": "object"
+      },
+      "BacktestListData": {
+        "properties": {
+          "runs": {
+            "items": {
+              "$ref": "#/components/schemas/BacktestRun"
+            },
+            "title": "Runs",
+            "type": "array"
+          }
+        },
+        "required": [
+          "runs"
+        ],
+        "title": "BacktestListData",
+        "type": "object"
+      },
+      "BacktestRun": {
+        "properties": {
+          "best_ret_pct": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Best Ret Pct"
+          },
+          "computed_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Computed At"
+          },
+          "end_date": {
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "End Date"
+          },
+          "entry_mode": {
+            "title": "Entry Mode",
+            "type": "string"
+          },
+          "mean_ret_pct": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mean Ret Pct"
+          },
+          "median_ret_pct": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Median Ret Pct"
+          },
+          "profile_variant": {
+            "title": "Profile Variant",
+            "type": "string"
+          },
+          "run_id": {
+            "title": "Run Id",
+            "type": "string"
+          },
+          "start_date": {
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Start Date"
+          },
+          "trades": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trades"
+          },
+          "win_rate_pct": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Win Rate Pct"
+          },
+          "worst_ret_pct": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Worst Ret Pct"
+          }
+        },
+        "required": [
+          "run_id",
+          "computed_at",
+          "start_date",
+          "end_date",
+          "entry_mode",
+          "profile_variant",
+          "trades",
+          "win_rate_pct",
+          "mean_ret_pct",
+          "median_ret_pct",
+          "best_ret_pct",
+          "worst_ret_pct"
+        ],
+        "title": "BacktestRun",
+        "type": "object"
+      },
+      "BacktestTrade": {
+        "properties": {
+          "code": {
+            "title": "Code",
+            "type": "string"
+          },
+          "entry_price": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Entry Price"
+          },
+          "entry_time": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Entry Time"
+          },
+          "exit_price": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Exit Price"
+          },
+          "exit_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Exit Reason"
+          },
+          "exit_time": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Exit Time"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "ret_pct": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ret Pct"
+          },
+          "signal_date": {
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Signal Date"
+          },
+          "trade_id": {
+            "title": "Trade Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "trade_id",
+          "signal_date",
+          "code",
+          "name",
+          "entry_time",
+          "entry_price",
+          "exit_time",
+          "exit_price",
+          "exit_reason",
+          "ret_pct"
+        ],
+        "title": "BacktestTrade",
+        "type": "object"
+      },
+      "BoardItem": {
+        "properties": {
+          "amount": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Amount"
+          },
+          "board_code": {
+            "title": "Board Code",
+            "type": "string"
+          },
+          "board_name": {
+            "title": "Board Name",
+            "type": "string"
+          },
+          "leading_stock": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Leading Stock"
+          },
+          "limit_up_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Limit Up Count"
+          },
+          "main_net_amount": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Main Net Amount"
+          },
+          "pct_chg_median": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pct Chg Median"
+          },
+          "stock_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stock Count"
+          },
+          "system": {
+            "title": "System",
+            "type": "string"
+          }
+        },
+        "required": [
+          "system",
+          "board_code",
+          "board_name",
+          "amount",
+          "main_net_amount",
+          "pct_chg_median",
+          "limit_up_count",
+          "stock_count",
+          "leading_stock"
+        ],
+        "title": "BoardItem",
+        "type": "object"
+      },
+      "CommandReceipt": {
+        "properties": {
+          "command_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Command Id"
+          },
+          "detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Detail"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "title": "CommandReceipt",
+        "type": "object"
+      },
+      "Envelope_AlertsData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/AlertsData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[AlertsData]",
+        "type": "object"
+      },
+      "Envelope_BacktestDetailData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/BacktestDetailData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[BacktestDetailData]",
+        "type": "object"
+      },
+      "Envelope_BacktestListData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/BacktestListData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[BacktestListData]",
+        "type": "object"
+      },
+      "Envelope_HealthData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/HealthData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[HealthData]",
+        "type": "object"
+      },
+      "Envelope_MetaData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/MetaData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[MetaData]",
+        "type": "object"
+      },
+      "Envelope_OverviewData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/OverviewData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[OverviewData]",
+        "type": "object"
+      },
+      "Envelope_PanoramaData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/PanoramaData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[PanoramaData]",
+        "type": "object"
+      },
+      "Envelope_PaperData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/PaperData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[PaperData]",
+        "type": "object"
+      },
+      "Envelope_PoolsData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/PoolsData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[PoolsData]",
+        "type": "object"
+      },
+      "Envelope_ScreenData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/ScreenData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[ScreenData]",
+        "type": "object"
+      },
+      "FreshnessItem": {
+        "properties": {
+          "key": {
+            "title": "Key",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "value": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Value"
+          }
+        },
+        "required": [
+          "key",
+          "label",
+          "value"
+        ],
+        "title": "FreshnessItem",
+        "type": "object"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "title": "Detail",
+            "type": "array"
+          }
+        },
+        "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "HealthData": {
+        "properties": {
+          "freshness": {
+            "items": {
+              "$ref": "#/components/schemas/FreshnessItem"
+            },
+            "title": "Freshness",
+            "type": "array"
+          },
+          "services": {
+            "items": {
+              "$ref": "#/components/schemas/ServiceItem"
+            },
+            "title": "Services",
+            "type": "array"
+          }
+        },
+        "required": [
+          "services",
+          "freshness"
+        ],
+        "title": "HealthData",
+        "type": "object"
+      },
+      "HoldingItem": {
+        "properties": {
+          "average_cost": {
+            "title": "Average Cost",
+            "type": "number"
+          },
+          "code": {
+            "title": "Code",
+            "type": "string"
+          },
+          "market_price": {
+            "title": "Market Price",
+            "type": "number"
+          },
+          "market_value": {
+            "title": "Market Value",
+            "type": "number"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "quantity": {
+            "title": "Quantity",
+            "type": "number"
+          },
+          "unrealized_pnl": {
+            "title": "Unrealized Pnl",
+            "type": "number"
+          }
+        },
+        "required": [
+          "code",
+          "name",
+          "quantity",
+          "average_cost",
+          "market_price",
+          "market_value",
+          "unrealized_pnl"
+        ],
+        "title": "HoldingItem",
+        "type": "object"
+      },
+      "Kpi": {
+        "properties": {
+          "key": {
+            "title": "Key",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "tone": {
+            "anyOf": [
+              {
+                "enum": [
+                  "ok",
+                  "warn",
+                  "crit"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tone"
+          },
+          "value": {
+            "title": "Value",
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "label",
+          "value"
+        ],
+        "title": "Kpi",
+        "type": "object"
+      },
+      "MarketPulse": {
+        "properties": {
+          "down": {
+            "title": "Down",
+            "type": "integer"
+          },
+          "flat": {
+            "title": "Flat",
+            "type": "integer"
+          },
+          "limit_down": {
+            "title": "Limit Down",
+            "type": "integer"
+          },
+          "limit_up": {
+            "title": "Limit Up",
+            "type": "integer"
+          },
+          "up": {
+            "title": "Up",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "up",
+          "down",
+          "flat",
+          "limit_up",
+          "limit_down"
+        ],
+        "title": "MarketPulse",
+        "type": "object"
+      },
+      "MetaData": {
+        "properties": {
+          "app": {
+            "default": "rQuant",
+            "title": "App",
+            "type": "string"
+          },
+          "generation": {
+            "$ref": "#/components/schemas/ServingMeta"
+          },
+          "version": {
+            "title": "Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "version",
+          "generation"
+        ],
+        "title": "MetaData",
+        "type": "object"
+      },
+      "OverviewData": {
+        "properties": {
+          "kpis": {
+            "items": {
+              "$ref": "#/components/schemas/Kpi"
+            },
+            "title": "Kpis",
+            "type": "array"
+          },
+          "signals": {
+            "items": {
+              "$ref": "#/components/schemas/SignalItem"
+            },
+            "title": "Signals",
+            "type": "array"
+          },
+          "trade_date": {
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trade Date"
+          }
+        },
+        "required": [
+          "trade_date",
+          "kpis",
+          "signals"
+        ],
+        "title": "OverviewData",
+        "type": "object"
+      },
+      "PanoramaData": {
+        "properties": {
+          "as_of": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "As Of"
+          },
+          "boards": {
+            "items": {
+              "$ref": "#/components/schemas/BoardItem"
+            },
+            "title": "Boards",
+            "type": "array"
+          },
+          "pulse": {
+            "$ref": "#/components/schemas/MarketPulse"
+          }
+        },
+        "required": [
+          "as_of",
+          "pulse",
+          "boards"
+        ],
+        "title": "PanoramaData",
+        "type": "object"
+      },
+      "PaperAccount": {
+        "properties": {
+          "account_id": {
+            "title": "Account Id",
+            "type": "string"
+          },
+          "as_of": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "As Of"
+          },
+          "cash": {
+            "title": "Cash",
+            "type": "number"
+          },
+          "holdings": {
+            "items": {
+              "$ref": "#/components/schemas/HoldingItem"
+            },
+            "title": "Holdings",
+            "type": "array"
+          },
+          "nav": {
+            "title": "Nav",
+            "type": "number"
+          },
+          "realized_pnl": {
+            "title": "Realized Pnl",
+            "type": "number"
+          },
+          "unrealized_pnl": {
+            "title": "Unrealized Pnl",
+            "type": "number"
+          }
+        },
+        "required": [
+          "account_id",
+          "as_of",
+          "nav",
+          "cash",
+          "unrealized_pnl",
+          "realized_pnl",
+          "holdings"
+        ],
+        "title": "PaperAccount",
+        "type": "object"
+      },
+      "PaperData": {
+        "properties": {
+          "accounts": {
+            "items": {
+              "$ref": "#/components/schemas/PaperAccount"
+            },
+            "title": "Accounts",
+            "type": "array"
+          }
+        },
+        "required": [
+          "accounts"
+        ],
+        "title": "PaperData",
+        "type": "object"
+      },
+      "PoolItem": {
+        "properties": {
+          "description": {
+            "title": "Description",
+            "type": "string"
+          },
+          "members": {
+            "items": {
+              "$ref": "#/components/schemas/PoolMember"
+            },
+            "title": "Members",
+            "type": "array"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "pool_refs": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Pool Refs",
+            "type": "array"
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At"
+          }
+        },
+        "required": [
+          "name",
+          "description",
+          "pool_refs",
+          "updated_at",
+          "members"
+        ],
+        "title": "PoolItem",
+        "type": "object"
+      },
+      "PoolMember": {
+        "properties": {
+          "code": {
+            "title": "Code",
+            "type": "string"
+          },
+          "detail": {
+            "additionalProperties": true,
+            "title": "Detail",
+            "type": "object"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "preset": {
+            "title": "Preset",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "name",
+          "preset"
+        ],
+        "title": "PoolMember",
+        "type": "object"
+      },
+      "PoolsData": {
+        "properties": {
+          "pools": {
+            "items": {
+              "$ref": "#/components/schemas/PoolItem"
+            },
+            "title": "Pools",
+            "type": "array"
+          },
+          "trade_date": {
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trade Date"
+          }
+        },
+        "required": [
+          "trade_date",
+          "pools"
+        ],
+        "title": "PoolsData",
+        "type": "object"
+      },
+      "SavePoolRequest": {
+        "properties": {
+          "description": {
+            "default": "",
+            "title": "Description",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "pool_refs": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Pool Refs",
+            "type": "array"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "SavePoolRequest",
+        "type": "object"
+      },
+      "ScreenData": {
+        "properties": {
+          "presets": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Presets",
+            "type": "array"
+          },
+          "rows": {
+            "items": {
+              "$ref": "#/components/schemas/ScreenRow"
+            },
+            "title": "Rows",
+            "type": "array"
+          },
+          "trade_date": {
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trade Date"
+          }
+        },
+        "required": [
+          "trade_date",
+          "presets",
+          "rows"
+        ],
+        "title": "ScreenData",
+        "type": "object"
+      },
+      "ScreenRow": {
+        "properties": {
+          "close": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Close"
+          },
+          "code": {
+            "title": "Code",
+            "type": "string"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "pct_chg": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pct Chg"
+          },
+          "preset": {
+            "title": "Preset",
+            "type": "string"
+          },
+          "trade_date": {
+            "format": "date",
+            "title": "Trade Date",
+            "type": "string"
+          }
+        },
+        "required": [
+          "trade_date",
+          "code",
+          "name",
+          "preset",
+          "close",
+          "pct_chg"
+        ],
+        "title": "ScreenRow",
+        "type": "object"
+      },
+      "ServiceItem": {
+        "properties": {
+          "backlog_count": {
+            "title": "Backlog Count",
+            "type": "integer"
+          },
+          "consecutive_failures": {
+            "title": "Consecutive Failures",
+            "type": "integer"
+          },
+          "heartbeat_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Heartbeat At"
+          },
+          "last_error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Error"
+          },
+          "plane": {
+            "title": "Plane",
+            "type": "string"
+          },
+          "service_id": {
+            "title": "Service Id",
+            "type": "string"
+          },
+          "stale": {
+            "title": "Stale",
+            "type": "boolean"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "service_id",
+          "plane",
+          "status",
+          "stale",
+          "heartbeat_at",
+          "backlog_count",
+          "consecutive_failures",
+          "last_error"
+        ],
+        "title": "ServiceItem",
+        "type": "object"
+      },
+      "ServingMeta": {
+        "properties": {
+          "generated_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Generated At"
+          },
+          "generation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Generation Id"
+          },
+          "message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Message"
+          },
+          "state": {
+            "enum": [
+              "ready",
+              "stale",
+              "degraded",
+              "unavailable"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state"
+        ],
+        "title": "ServingMeta",
+        "type": "object"
+      },
+      "SignalItem": {
+        "properties": {
+          "action": {
+            "title": "Action",
+            "type": "string"
+          },
+          "at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "At"
+          },
+          "code": {
+            "title": "Code",
+            "type": "string"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "sequence": {
+            "title": "Sequence",
+            "type": "integer"
+          },
+          "strategy_id": {
+            "title": "Strategy Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "sequence",
+          "at",
+          "code",
+          "name",
+          "strategy_id",
+          "action"
+        ],
+        "title": "SignalItem",
+        "type": "object"
+      },
+      "ValidationError": {
+        "properties": {
+          "ctx": {
+            "title": "Context",
+            "type": "object"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "title": "Location",
+            "type": "array"
+          },
+          "msg": {
+            "title": "Message",
+            "type": "string"
+          },
+          "type": {
+            "title": "Error Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError",
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "title": "rQuant web API",
+    "version": "0.31.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/api/v1/alerts": {
+      "get": {
+        "operationId": "alerts_api_v1_alerts_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 200,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_AlertsData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "告警时间线"
+      }
+    },
+    "/api/v1/alerts/ack": {
+      "post": {
+        "operationId": "ack_alert_api_v1_alerts_ack_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AckAlertRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandReceipt"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "确认告警"
+      }
+    },
+    "/api/v1/backtests": {
+      "get": {
+        "operationId": "backtests_api_v1_backtests_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_BacktestListData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "回测结果"
+      }
+    },
+    "/api/v1/backtests/{run_id}": {
+      "get": {
+        "operationId": "backtest_detail_api_v1_backtests__run_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "entry_mode",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Entry Mode"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_BacktestDetailData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "回测详情"
+      }
+    },
+    "/api/v1/health": {
+      "get": {
+        "operationId": "health_api_v1_health_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_HealthData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "系统健康"
+      }
+    },
+    "/api/v1/meta": {
+      "get": {
+        "operationId": "meta_api_v1_meta_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_MetaData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Meta"
+      }
+    },
+    "/api/v1/overview": {
+      "get": {
+        "operationId": "overview_api_v1_overview_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_OverviewData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "总览"
+      }
+    },
+    "/api/v1/panorama": {
+      "get": {
+        "operationId": "panorama_api_v1_panorama_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_PanoramaData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "市场全景"
+      }
+    },
+    "/api/v1/paper": {
+      "get": {
+        "operationId": "paper_api_v1_paper_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_PaperData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "模拟盘"
+      }
+    },
+    "/api/v1/pools": {
+      "get": {
+        "operationId": "pools_api_v1_pools_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_PoolsData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "池子"
+      },
+      "post": {
+        "operationId": "save_pool_api_v1_pools_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SavePoolRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandReceipt"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "保存池子"
+      }
+    },
+    "/api/v1/screen": {
+      "get": {
+        "operationId": "screen_api_v1_screen_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "trade_date",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "date",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Trade Date"
+            }
+          },
+          {
+            "in": "query",
+            "name": "preset",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Preset"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_ScreenData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "选股结果与排序"
+      }
+    },
+    "/api/v1/watchlist": {
+      "post": {
+        "operationId": "add_watch_api_v1_watchlist_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddWatchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandReceipt"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "加入自选"
+      }
+    }
+  }
+}
