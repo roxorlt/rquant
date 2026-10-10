@@ -143,6 +143,10 @@ for (const mode of ["desktop", "phone"] as const) {
       await dialog.getByRole("textbox").fill(target.username);
       await dialog.getByRole("button", { name: "确认修改", exact: true }).click();
       await expect(page.getByText("角色已更新。", { exact: true })).toBeVisible();
+      await expect(page.getByRole("row").filter({ has: role }).getByRole("cell").nth(1)).toHaveText(
+        "查看者",
+      );
+      await expect(role).toHaveValue(target.role);
       await page
         .getByLabel(`${target.username} 的角色`, { exact: true })
         .selectOption("researcher");

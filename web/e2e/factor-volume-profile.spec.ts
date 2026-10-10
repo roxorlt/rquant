@@ -9,7 +9,7 @@ import {
   volumeProfileResearch,
 } from "../src/pages/factors/factorVolumeProfile.fixture.ts";
 import { findJargon } from "../src/test/jargon.ts";
-import { APP_URL, REPO_ROOT } from "./env.ts";
+import { APP_URL } from "./env.ts";
 import { expectNoHorizontalOverflow, watch } from "./watch.ts";
 
 for (const viewport of [
@@ -121,7 +121,7 @@ for (const viewport of [
       await source.getByText("查看字段覆盖", { exact: true }).click();
       await expect(source.getByRole("table", { name: "字段覆盖" })).toContainText("12 / 12");
       await expectNoHorizontalOverflow(page, `成交分布示例 ${viewport.label}`);
-      const values = `${REPO_ROOT}/data/verification/factor-volume-profile-20261005/frontend/values-${viewport.label}.png`;
+      const values = testInfo.outputPath(`values-${viewport.label}.png`);
       await page.screenshot({ path: values, fullPage: true });
       await testInfo.attach("volume-profile-values", { path: values, contentType: "image/png" });
       research = nullVolumeProfileResearch;
@@ -151,7 +151,7 @@ for (const viewport of [
       await expect(dialog.getByRole("textbox", { name: "表达式" })).toHaveValue("vp90_vwap");
       await expect(page.getByRole("tooltip").filter({ hasText: "单位：股" })).toBeHidden();
       await expectNoHorizontalOverflow(page, `成交分布编辑 ${viewport.label}`);
-      const editor = `${REPO_ROOT}/data/verification/factor-volume-profile-20261005/frontend/editor-${viewport.label}.png`;
+      const editor = testInfo.outputPath(`editor-${viewport.label}.png`);
       await page.screenshot({ path: editor, fullPage: true });
       await testInfo.attach("volume-profile-editor", { path: editor, contentType: "image/png" });
       expect(watcher.problems).toEqual([]);

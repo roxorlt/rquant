@@ -205,7 +205,9 @@ for (const viewport of [
         await expectTipInViewport(page, tip);
         if (name === "15:00分钟成交额" || name === "近5次成交额加速")
           await page.screenshot({
-            path: testInfo.outputPath(`minute-unit-${name}-${viewport.label}.png`),
+            path: testInfo.outputPath(
+              `minute-unit-${name.replace(":", "-")}-${viewport.label}.png`,
+            ),
           });
         await hide(info);
         await expect(tip).toBeHidden();

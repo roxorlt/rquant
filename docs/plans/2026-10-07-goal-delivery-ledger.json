@@ -1,14 +1,14 @@
 {
   "schema_version": 1,
-  "revision": 190,
-  "updated_at": "2026-10-10T11:14:00+08:00",
+  "revision": 194,
+  "updated_at": "2026-10-10T12:42:57+08:00",
   "thread_id": "01a0dd53-e9c9-7b73-a7b5-843473fcd6ac",
   "worktree": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-source-integration",
   "branch": "cdx/20260929-factor-source-integration",
   "goal_state": {
     "reported_status": "active",
-    "last_updated_at": "2026-10-10T11:14:00+08:00",
-    "current_turn": "R12_finite_fixture_and_Web_job_wait_two_scalar_repair",
+    "last_updated_at": "2026-10-10T11:31:00+08:00",
+    "current_turn": "R12_exact_candidate_three_unit_failures_original_author_scoped_followup",
     "stored_block_reason": "正式指数来源及32日资料仍缺；生产安装切流授权和实际开市日观察按固定6项处理。",
     "explicit_goal_token_budget": null,
     "resume_control": "get_goal已实际返回active；当前无需再点Target继续。",
@@ -17,10 +17,10 @@
     "previous_goal_turn_evidence": "r12-auction-python311312-accepted-20261009-01.json：两版本原54节点通过并核原记录；集中审查形成唯一FCR-001并交原实现者。",
     "last_observation": {
       "classification": "actual_progress",
-      "observed_at": "2026-10-10T11:14:00+08:00",
-      "actual": "候选bbdcac5d第二次正式前端的格式、类型、单元、构建和接口类型通过；报告测试服务在180秒终止，最后一组未完成，浏览器0项正文执行。首轮模拟盘两项失败原因未证实，本地原两项通过、24项过滤未执行，产品源码零改。Root核直接链并明确将原测试启动期限改300秒；原完整浏览器1024秒加本次前置262秒超过旧20分钟，Web总限改30分钟。仅两标量，其余字节、业务60秒、断言10秒、产品TTL120秒和权限、完整读取标准保持。原作者Biome、配置解析收集、YAML均退出0；收集4业务+1setup，不计执行通过。21份冻结证据及两叶SHA已核，资源全清、写权归还。一次提交两处必要改动及进度记录到原PR，再取修后精确候选正式CI；原有效结构测试、构建和审查复用。后端仍在运行，旧失败、取消和缺口保留。Target active，固定25项、19本地完成、6剩余、生产0/15，目标与不限时长次数授权不扩大范围。",
-      "evidence": "data/verification/goal-progress-root/release-preconditions-20261009-01/web-owner-ready-ci180-01/implementation-01/root-candidate-01/CHECK.json",
-      "next": "两处测试等待改动及本会话进度记录一次提交原PR；正式CI验证修后精确候选。保存并收尾旧运行，复用有效验证与审查；不增加完整本地重跑、猜测性诊断或交付项。"
+      "observed_at": "2026-10-10T11:31:00+08:00",
+      "actual": "两处测试等待改动及三份进度记录已一次发布原PR323，精确候选7df51ab0。新前端CI38020051932格式、类型通过；单元1205通过、3失败，分别为回测标题、模拟盘持仓表和模拟账户按钮首次查找，原因未证实。构建和浏览器未执行，300秒启动仍待验证。完整日志和原始回执已保存，前端监听63880自然退出1并回收。原模拟盘作者仅核这三节点及直接共同接点，产品和共享助手先只读；只做证据明确的局部准备补修及原节点验证，复用有效证据。旧后端20通过、10取消、2汇总门禁失败、1跳过，59725已自然结束并回收；新后端38020051858/39989继续。Target active，固定25项、19本地完成、6剩余、生产0/15，0追加；不限时长次数不扩范围。",
+      "evidence": "data/verification/goal-progress-root/release-preconditions-20261009-01/web-owner-ready-ci180-01/implementation-01/root-candidate-01/WEB-COMPLETION.json",
+      "next": "原作者对照本次三个失败DOM、实际调用及共同接点；只处理证据明确的准备问题并验证原节点。新后端正式CI继续；无新源码补修时不重复猜测性测试，不另开全仓审计、重构、完整本地重跑或审查阶段。"
     },
     "previous_blocked_audit": {
       "consecutive_goal_turns_without_available_safe_implementation": 3,
@@ -30,7 +30,7 @@
     },
     "blocked_audit": {
       "consecutive_goal_turns_without_available_safe_implementation": 0,
-      "condition": "正式前端实际启动失败已定位；两处测试等待补修已冻结，集中提交并运行修后正式CI。",
+      "condition": "实际CI失败日志已收齐；原作者对照三个原节点，后端正式CI继续。",
       "update_goal_blocked_threshold": 3
     }
   },
@@ -2430,7 +2430,7 @@
       "title": "整体候选最终验收",
       "category": "acceptance",
       "status": "in_progress",
-      "owner": "Root两处测试等待补修整合及正式CI；原作者已冻结停写",
+      "owner": "Root集中提交必要补修并跟踪修后正式门禁",
       "modules": [
         "M1",
         "M2",
@@ -2572,10 +2572,20 @@
         "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-f982-web-failure-01/macro-startup-diagnosis-01/sql-text-reuse-implementation-01/root-candidate-01/published-candidate-01/web-expiry-fixture-01/published-f7dd-01/promotion-fixture-01/grouped-candidate-01/published-bbdcac-01/WEB-ATTEMPT2-COMPLETION.json",
         "data/verification/goal-progress-root/release-preconditions-20261009-01/web-owner-ready-ci180-01/implementation-01/EV.json",
         "data/verification/goal-progress-root/release-preconditions-20261009-01/web-owner-ready-ci180-01/implementation-01/FREEZE.json",
-        "data/verification/goal-progress-root/release-preconditions-20261009-01/web-owner-ready-ci180-01/implementation-01/root-candidate-01/CHECK.json"
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/web-owner-ready-ci180-01/implementation-01/root-candidate-01/CHECK.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/web-owner-ready-ci180-01/implementation-01/root-candidate-01/COMMIT.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/web-owner-ready-ci180-01/implementation-01/root-candidate-01/PUBLISHED.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/web-owner-ready-ci180-01/implementation-01/root-candidate-01/WEB-COMPLETION.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/web-owner-ready-ci180-01/implementation-01/root-candidate-01/PREVIOUS-BACKEND-COMPLETION.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/paper-unit-ci-failures-01/formal-repeat-three-nodes-01/EV.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/web-owner-ready-ci180-01/implementation-01/root-candidate-01/THREE-UNIT-LOCAL-CHECK.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/web-owner-ready-ci180-01/implementation-01/root-candidate-01/web-attempt2-run.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/web-owner-ready-ci180-01/implementation-01/root-candidate-01/WEB-ATTEMPT2-COMPLETION.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/web-owner-ready-ci180-01/implementation-01/root-candidate-01/browser-failures/root-grouped-candidate-01/MANIFEST.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/web-owner-ready-ci180-01/implementation-01/root-candidate-01/browser-failures/root-grouped-candidate-01/REVIEW-ACCEPTED.json"
       ],
       "closure_level": "pending",
-      "last_progress": "候选bbdcac5d第二次正式前端的格式、类型、单元、构建和接口类型通过；报告测试服务在180秒终止，最后一组未完成，浏览器0项正文执行。首轮模拟盘两项失败原因未证实，本地原两项通过、24项过滤未执行，产品源码零改。Root核直接链并明确将原测试启动期限改300秒；原完整浏览器1024秒加本次前置262秒超过旧20分钟，Web总限改30分钟。仅两标量，其余字节、业务60秒、断言10秒、产品TTL120秒和权限、完整读取标准保持。原作者Biome、配置解析收集、YAML均退出0；收集4业务+1setup，不计执行通过。21份冻结证据及两叶SHA已核，资源全清、写权归还。一次提交两处必要改动及进度记录到原PR，再取修后精确候选正式CI；原有效结构测试、构建和审查复用。后端仍在运行，旧失败、取消和缺口保留。Target active，固定25项、19本地完成、6剩余、生产0/15，目标与不限时长次数授权不扩大范围。",
+      "last_progress": "四测试叶冻结增量经原审查者一次复核PASS、0新增阻断。Root已核四源SHA与回执，直接一次提交原PR；前端原190P/7F/10skip及未知原因保留，旧后端20作业通过、10分片运行、1跳过不计整体通过。新候选正式门禁待启动，发布后的精确提交与运行记录见PUBLISHED.json。固定25项、19本地完成、6剩余、生产0/15、0追加。",
       "submilestones": [
         {
           "name": "网页最终候选准备门禁",
@@ -2727,9 +2737,9 @@
         }
       ],
       "pull_request": "https://github.com/roxorlt/rquant/pull/323",
-      "candidate_commit": "bbdcac5d68d7255c1006882b8cfec31ec4c9f09e",
-      "remaining_hours_note": "两处测试等待数值已冻，集中提交并执行修后正式CI；用例收集不算通过，新启动耗时未保证。正式资料、真实Linux读回及合法正面链仍待。",
-      "published_candidate_commit": "bbdcac5d68d7255c1006882b8cfec31ec4c9f09e"
+      "candidate_commit": "7df51ab0b9ddc4d159523107472ef3c0ab294c09",
+      "remaining_hours_note": "四叶增量复核已通过；修后正式CI及既有真实资料/Linux/合法正面链仍待，不追加本地测试或审查。",
+      "published_candidate_commit": "7df51ab0b9ddc4d159523107472ef3c0ab294c09"
     },
     {
       "id": "R13",
@@ -4050,6 +4060,34 @@
       "delivery_unit_added": false,
       "actual": "候选bbdcac5d第二次正式前端的格式、类型、单元、构建和接口类型通过；报告测试服务在180秒终止，最后一组未完成，浏览器0项正文执行。首轮模拟盘两项失败原因未证实，本地原两项通过、24项过滤未执行，产品源码零改。Root核直接链并明确将原测试启动期限改300秒；原完整浏览器1024秒加本次前置262秒超过旧20分钟，Web总限改30分钟。仅两标量，其余字节、业务60秒、断言10秒、产品TTL120秒和权限、完整读取标准保持。原作者Biome、配置解析收集、YAML均退出0；收集4业务+1setup，不计执行通过。21份冻结证据及两叶SHA已核，资源全清、写权归还。一次提交两处必要改动及进度记录到原PR，再取修后精确候选正式CI；原有效结构测试、构建和审查复用。后端仍在运行，旧失败、取消和缺口保留。Target active，固定25项、19本地完成、6剩余、生产0/15，目标与不限时长次数授权不扩大范围。",
       "scope": "小改动：仅owned report promotion webServer180000→300000ms及Web job20→30min。原测试和产品标准保持，旧180秒失败保留；不新增产品实现、诊断、审查或本地整套重跑。"
+    },
+    {
+      "at": "2026-10-10T11:31:00+08:00",
+      "task_id": "R12",
+      "delivery_unit_added": false,
+      "actual": "两处测试等待改动及三份进度记录已一次发布原PR323，精确候选7df51ab0。新前端CI38020051932格式、类型通过；单元1205通过、3失败，分别为回测标题、模拟盘持仓表和模拟账户按钮首次查找，原因未证实。构建和浏览器未执行，300秒启动仍待验证。完整日志和原始回执已保存，前端监听63880自然退出1并回收。原模拟盘作者仅核这三节点及直接共同接点，产品和共享助手先只读；只做证据明确的局部准备补修及原节点验证，复用有效证据。旧后端20通过、10取消、2汇总门禁失败、1跳过，59725已自然结束并回收；新后端38020051858/39989继续。Target active，固定25项、19本地完成、6剩余、生产0/15，0追加；不限时长次数不扩范围。",
+      "scope": "只处理正式CI本次三首次页面查找失败，原作者查看三测试叶和直接依赖；产品与共享助手先只读。旧工作、失败和有效结果保留，不增加猜测性实现、整套本地重跑、审计或新交付。"
+    },
+    {
+      "at": "2026-10-10T11:48:00+08:00",
+      "task_id": "R12",
+      "delivery_unit_added": false,
+      "actual": "候选7df51ab0保持。原三个失败节点本地一次3通过，27项名称筛选未执行，源码未改；原失败原因未证实。原作者已冻证并清理自有资源、归还写权。相同候选第二次正式前端已通过单元、构建、接口快照和类型检查，浏览器阶段进行中，300秒报告服务启动及浏览器正文结果仍待取得；第一轮1205通过、3失败保留。新后端20个作业通过、10个分片运行、1项跳过，整体门禁未结束。Root继续跟踪现有两运行，当前无活动子代理。Target active，固定25项、19本地完成、6剩余、生产0/15、0追加；复用有效验证和审查，不追加相同本地测试或猜测性修复。",
+      "scope": "只完成当前精确候选已有正式门禁，复用原三节点及其他有效证据。若同样失败再现，只补完整失败状态；不增加整套本地重跑、审计、重构或新交付。"
+    },
+    {
+      "at": "2026-10-10T12:34:06+08:00",
+      "task_id": "R12",
+      "delivery_unit_added": false,
+      "actual": "候选7df51ab0第二次正式前端单元、构建和接口检查通过；浏览器190通过、7失败、10跳过，包含setup，整体未通过。报告服务在真实x64环境208.20秒就绪，300秒启动期限已取得实证。四原作者完成限定取证并停写，只冻结四测试叶：角色刷新等待、导航history完整响应等待、截图本轮输出路径及合法文件名。协作与导航原节点各一次通过；任务空态两项、晋级两业务及setup、成交分布手机本地通过，正式相应失败原因仍未证实。原审查者对四叶做一次合并增量复核；后端20个作业通过、10个分片运行、1项跳过。固定25项、19本地完成、6剩余、生产0/15、0追加。",
+      "scope": "按已确认目标收敛；只保留这份冻结增量的必要复核、修后正式门禁及既有六项真实验收/安装切换/观察。复用有效验证；不猜修未复现原因、不重复完整本地测试、不新增审计、重构或交付。 原前端已失败，复核通过后直接一次发布必要候选；不增加等待旧完整后端结束的前置。"
+    },
+    {
+      "at": "2026-10-10T12:42:57+08:00",
+      "task_id": "R12",
+      "delivery_unit_added": false,
+      "actual": "四测试叶冻结增量经原审查者一次复核PASS、0新增阻断。Root已核四源SHA与回执，直接一次提交原PR；前端原190P/7F/10skip及未知原因保留，旧后端20作业通过、10分片运行、1跳过不计整体通过。新候选正式门禁待启动，发布后的精确提交与运行记录见PUBLISHED.json。固定25项、19本地完成、6剩余、生产0/15、0追加。",
+      "scope": "只发布已冻结的四叶补修及三进度记录，复用有效结果；保留原失败/取消/未知资料，不扩展实现、诊断或审查范围。"
     }
   ],
   "update_policy": [
@@ -4072,9 +4110,9 @@
         "tasks": [
           "R12"
         ],
-        "work": "原协作4项及原Linux AI ready通过，所有自有资源全清、源码冻结停写。",
+        "work": "协作原手机一次1P；仅四行真实角色刷新等待，正式原因未完整复现。证据和自有资源已清，冻结停写。",
         "status": "frozen_completed_or_waiting_final_candidate",
-        "baseline_commit": "308708b4dbf6cdd722a5a45be93ba1c84924dcba"
+        "baseline_commit": "7df51ab0b9ddc4d159523107472ef3c0ab294c09"
       },
       {
         "agent": "/root/r03_scope_closure",
@@ -4090,9 +4128,9 @@
         "tasks": [
           "R12"
         ],
-        "work": "两处测试等待标量补修冻结，格式/原项目收集/YAML实际退出0；4业务+1setup仅收集、未执行。原18P及141.79秒ARM证据复用，正式x64待验；无遗留资源，写权归还。",
+        "work": "原晋级两业务+setup一次3P、源码零改。正式empty未复现，原失败保留；全部自有资源清理并停写。",
         "status": "frozen_completed_or_waiting_final_candidate",
-        "baseline_commit": "bbdcac5d68d7255c1006882b8cfec31ec4c9f09e"
+        "baseline_commit": "7df51ab0b9ddc4d159523107472ef3c0ab294c09"
       },
       {
         "agent": "/root/parameter_family_acceptance",
@@ -4117,9 +4155,9 @@
         "tasks": [
           "R12"
         ],
-        "work": "两函数普通增量及18P/0skip、141.785s原链、元数据不变证据一次复核PASS，0阻断；写权归还，无自有资源。",
+        "work": "四测试叶4639B冻结增量一次复核PASS，0新增阻断；未运行测试或写源码/Git，无遗留资源，冻结停写。",
         "status": "frozen_completed_or_waiting_final_candidate",
-        "baseline_commit": "f9823df71e5e0b28d0ec781471bc1272bc859958"
+        "baseline_commit": "7df51ab0b9ddc4d159523107472ef3c0ab294c09"
       },
       {
         "agent": "/root/ai_assistance_completion_impl",
@@ -4145,8 +4183,8 @@
           "R12"
         ],
         "status": "frozen_completed_or_waiting_final_candidate",
-        "work": "原stock2节点通过，单叶冻结。",
-        "baseline_commit": "308708b4dbf6cdd722a5a45be93ba1c84924dcba"
+        "work": "成交分布原手机可比较一次1P；仅两截图输出路径迁移。原401由私有proof祖先导致，正式tooltip失败未复现；冻结停写。",
+        "baseline_commit": "7df51ab0b9ddc4d159523107472ef3c0ab294c09"
       },
       {
         "agent": "/root/ci_task_entrypoints",
@@ -4154,8 +4192,8 @@
           "R12"
         ],
         "status": "frozen_completed_or_waiting_final_candidate",
-        "work": "原task6个唯一节点通过，单叶冻结。",
-        "baseline_commit": "308708b4dbf6cdd722a5a45be93ba1c84924dcba"
+        "work": "导航请求取消在本地原trace复现；仅十行完整响应等待，原桌面一次1P。两空态本地通过但正式原因未证；冻结停写。",
+        "baseline_commit": "7df51ab0b9ddc4d159523107472ef3c0ab294c09"
       },
       {
         "agent": "/root/ci_worker_resource_failures",
@@ -4190,8 +4228,8 @@
           "R12"
         ],
         "status": "frozen_completed_or_waiting_final_candidate",
-        "work": "模拟盘正式两失败原节点本地一次2P、24过滤未执行，源码补修为空；失败原因未证实。证据和清理冻结、写权归还；同候选第二次正式单元门禁通过。",
-        "baseline_commit": "bbdcac5d68d7255c1006882b8cfec31ec4c9f09e"
+        "work": "原三个失败节点本地一次3P、27项筛选未执行；三测试叶及直接源均保持，失败原因未证实，源码补修为空。证据已冻结、自有资源清理、写权归还；不追加相同本地验证。",
+        "baseline_commit": "7df51ab0b9ddc4d159523107472ef3c0ab294c09"
       }
     ],
     "configured_max_threads": 15,
@@ -4200,10 +4238,10 @@
       "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-source-integration/.codex/config.toml"
     ],
     "live_reload_verified": true,
-    "root_work": "两处测试等待标量补修与原作者证据已冻结，Root核21份原件和两叶版本；集中提交并执行正式CI，复用原有效验证及审查。",
+    "root_work": "四叶冻结增量经原审查者一次复核PASS，0阻断；Root核对源SHA与回执后直接一次提交原PR。旧后端仍运行，新候选正式门禁待启动。",
     "waiting_subagents": 0,
     "runtime_capacity_evidence": "本轮app运行环境重新初始化后的原生元数据明确提供16个并发槽位，包含Root；不是修改配置后推断即时生效。",
     "active_subagents": [],
-    "next": "两处测试等待改动及本会话进度记录一次提交原PR；正式CI验证修后精确候选。保存并收尾旧运行，复用有效验证与审查；不增加完整本地重跑、猜测性诊断或交付项。"
+    "next": "一次发布必要四叶补修和本会话三进度记录，由修后精确候选完成正式CI；不再追加本地测试或审查，不等待旧失败候选整套后端结束。"
   }
 }

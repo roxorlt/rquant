@@ -86,6 +86,15 @@ for (const viewport of VIEWPORTS) {
       await expect(page.locator(".gen-tag")).toContainText(/^数据 (刚刚|\d+ 分钟前)更新$/);
 
       for (const target of PAGES) {
+        const history =
+          target.path === "/screener"
+            ? page.waitForResponse(
+                (response) =>
+                  response.request().method() === "GET" &&
+                  response.url().endsWith("/app/api/v1/screen/query/history?limit=20"),
+                { timeout: 10_000 },
+              )
+            : null;
         if (viewport.name === "desktop") {
           await page
             .getByRole("navigation", { name: "主导航" })
@@ -99,6 +108,7 @@ for (const viewport of VIEWPORTS) {
           await expect(sheet).toBeHidden();
         }
         await expectPage(page, target.path, target.title);
+        if (history) await (await history).finished();
       }
 
       for (const [path, title] of [
