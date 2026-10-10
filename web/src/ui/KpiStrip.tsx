@@ -13,10 +13,18 @@ export interface Kpi {
   tone?: "warn" | "crit" | "ok";
 }
 
-/** A row of key numbers drawn as one joined strip. */
-export function KpiStrip({ items, label }: { items: readonly Kpi[]; label: string }) {
+/** A row of key numbers drawn as one joined strip; `compact` for dense rows. */
+export function KpiStrip({
+  items,
+  label,
+  compact,
+}: {
+  items: readonly Kpi[];
+  label: string;
+  compact?: boolean;
+}) {
   return (
-    <section className="kpis" aria-label={label}>
+    <section className={compact ? "kpis compact" : "kpis"} aria-label={label}>
       {items.map((item) => (
         <div className="kpi" key={item.key} data-kpi={item.key}>
           {item.tip ? (

@@ -27,22 +27,36 @@ import {
   VisualMapComponent,
   type VisualMapComponentOption,
 } from "echarts/components";
-import { type ComposeOption, init, use } from "echarts/core";
+import { type ComposeOption, init as initECharts, use } from "echarts/core";
 import { CanvasRenderer } from "echarts/renderers";
 
-use([
-  BarChart,
-  CandlestickChart,
-  HeatmapChart,
-  LineChart,
-  DataZoomComponent,
-  GridComponent,
-  LegendComponent,
-  MarkLineComponent,
-  TooltipComponent,
-  VisualMapComponent,
-  CanvasRenderer,
-]);
+let registered = false;
+
+/**
+ * Registers the chart types and components. Called by `init` below rather than at module
+ * load: the package is declared side-effect free (`"sideEffects": ["*.css"]`), and the
+ * production bundle dropped a bare top-level `use([...])`, so the first real chart failed
+ * with "… is not a constructor".
+ */
+export function registerECharts(): void {
+  if (registered) {
+    return;
+  }
+  use([
+    BarChart,
+    CandlestickChart,
+    HeatmapChart,
+    LineChart,
+    DataZoomComponent,
+    GridComponent,
+    LegendComponent,
+    MarkLineComponent,
+    TooltipComponent,
+    VisualMapComponent,
+    CanvasRenderer,
+  ]);
+  registered = true;
+}
 
 export type EChartOption = ComposeOption<
   | BarSeriesOption
@@ -58,4 +72,9 @@ export type EChartOption = ComposeOption<
 >;
 
 export type { ECharts } from "echarts/core";
-export { init };
+
+/** echarts.init after the registration above. */
+export function init(...args: Parameters<typeof initECharts>): ReturnType<typeof initECharts> {
+  registerECharts();
+  return initECharts(...args);
+}
