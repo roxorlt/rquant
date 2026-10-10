@@ -7,6 +7,7 @@ from collections.abc import Sequence
 from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo
+from typing import Literal
 
 import duckdb
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
@@ -163,8 +164,16 @@ def _import_page(
     conn: duckdb.DuckDBPyConnection,
     page: FinancialCommittedPage,
     expected_cursor: tuple[str, datetime | None, int, str] | None,
+    *,transaction_mode: Literal['own','existing'] = 'own',
 ) -> None:
-    conn.execute("BEGIN TRANSACTION")
+    if transaction_mode not in {'own','existing'}:
+        raise ValueError('invalid financial page transaction mode')
+    if transaction_mode=='existing':
+        transaction_id=conn.execute('SELECT txid_current()').fetchone()[0]
+        if transaction_id!=conn.execute('SELECT txid_current()').fetchone()[0]:
+            raise ValueError('financial page existing mode requires an actual outer transaction')
+    else:
+        conn.execute("BEGIN TRANSACTION")
     try:
         current = _cursor(conn)
         if current != expected_cursor:
@@ -233,9 +242,11 @@ def _import_page(
             "anchor_record_sha256 = excluded.anchor_record_sha256",
             (page.archive_id, last_at, page.anchor_generation, page.anchor_record_sha256),
         )
-        conn.execute("COMMIT")
+        if transaction_mode=='own':
+            conn.execute("COMMIT")
     except BaseException:
-        conn.execute("ROLLBACK")
+        if transaction_mode=='own':
+            conn.execute("ROLLBACK")
         raise
 
 

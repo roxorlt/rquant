@@ -1,7 +1,12 @@
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { HttpResponse, http } from "msw";
 import type { Schemas } from "@/api/client";
-import { DatasetReportContent } from "./DatasetReportPanel";
+import { AppProviders } from "@/app/App";
+import { metaEnvelope } from "@/test/fixtures";
+import { testQueryClient } from "@/test/queryClient";
+import { metaHandler, server } from "@/test/server";
+import { CollectionScopeBadge, DatasetReportContent } from "./DatasetReportPanel";
 
 type Dataset = Schemas["AuditReportDataset"];
 
@@ -166,6 +171,65 @@ const dataset: Dataset = {
   conclusion: "issues_observed",
   conclusion_label: "发现问题",
 };
+
+it.each([
+  ["actual_receipt_set", "本次原回执合计 17 条实际记录"],
+  ["actual_date_rows", "2026-10-05：17 条实际记录"],
+] as const)(
+  "DC-IMPL-03 displays the actual scope of %s behind the original tip",
+  async (scope, expected) => {
+    const meta = metaEnvelope();
+    const collection: Schemas["DataCollectionData"] = {
+      status: "ready",
+      report_hash: "a".repeat(64),
+      coverage_label: "全市场覆盖尚未核验",
+      datasets: [
+        {
+          dataset_id: "daily_bar",
+          name: "股票日线",
+          status: "partial",
+          status_label: "采集部分已核对",
+          completed_through: null,
+          scopes: [
+            {
+              dataset_id: "daily_bar",
+              trade_date: "2026-10-05",
+              scope,
+              row_count: 17,
+              coverage_complete: false,
+              source_api: "daily",
+              content_sha256: "b".repeat(64),
+            },
+          ],
+        },
+      ],
+    };
+    server.use(
+      metaHandler(meta),
+      http.get("*/api/v1/data/collection", () =>
+        HttpResponse.json({ data: collection, serving: meta.serving }),
+      ),
+    );
+    render(
+      <AppProviders queryClient={testQueryClient()}>
+        <CollectionScopeBadge datasetId="daily_bar" generation={meta.serving.generation_id} />
+      </AppProviders>,
+    );
+    const label = await screen.findByText("采集部分已核对");
+    expect(screen.queryByText(expected)).not.toBeInTheDocument();
+    const anchor = label.closest(".tip-anchor");
+    expect(anchor).toBeInstanceOf(HTMLElement);
+    if (!(anchor instanceof HTMLElement)) throw new Error("focusable scope tip missing");
+    act(() => {
+      anchor.focus();
+      fireEvent.focus(anchor);
+    });
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(expected);
+    if (scope === "actual_receipt_set") {
+      expect(screen.getByRole("tooltip")).not.toHaveTextContent("2026-10-05：17");
+    }
+  },
+);
 
 it("shows pending and zero observations without calling them healthy", () => {
   render(<DatasetReportContent dataset={dataset} />);

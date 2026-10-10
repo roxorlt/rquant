@@ -136,7 +136,7 @@ def _record_daily_error_outbox(
         )
 
 
-def _ingest_with_retry(trade_date: str) -> int:
+def _ingest_with_retry(trade_date: str) -> int | None:
     """拉取数据，最多重试 _RETRY_COUNT 次。
 
     两类可重试情况：
@@ -146,13 +146,20 @@ def _ingest_with_retry(trade_date: str) -> int:
          而非 RequestException）。两者都该短重试。故用 `except Exception`——
          真正的代码 bug 也会被重试，但重试耗尽后 `raise` 抛出不吞（daily 非实时，
          延迟暴露可接受），换取对 tushare 抖动的鲁棒性。
-    - 数据未就绪（bar_count == 0）：非交易日或 tushare 数据当天还没出，长间隔重试。
+    - 数据未就绪（bar_count == 0）：旧默认按原规则长间隔重试。
+      显式采集配置只有完整 SSE 日历证明关闭时返回 None，立即正常退出。
     """
     from rquant.ingest import ingest_daily
+    from rquant.config import settings
+    profile_path=settings.data_center_runtime_profile_path
 
     for attempt in range(1, _RETRY_COUNT + 1):
         try:
-            bar_count = ingest_daily(trade_date)
+            if profile_path is None:
+                bar_count = ingest_daily(trade_date)
+            else:
+                from rquant.data_center_maintenance_runtime import collect_daily_from_profile
+                bar_count = collect_daily_from_profile(profile_path,trade_date)
         except Exception as e:
             if attempt < _RETRY_COUNT:
                 logger.warning(
@@ -165,6 +172,9 @@ def _ingest_with_retry(trade_date: str) -> int:
             logger.error(f"{trade_date} ingest 重试 {_RETRY_COUNT} 次仍失败: {e}")
             raise
 
+        if bar_count is None:
+            logger.info(f"{trade_date} 休市，等待下个交易日")
+            return None
         if bar_count > 0:
             return bar_count
         if attempt < _RETRY_COUNT:
@@ -663,6 +673,39 @@ def _run_backfill_supervised_worker(
     )
 
 
+def cmd_data_center_run(args: argparse.Namespace) -> int:
+    from rquant.backfill_execute import load_execution_policy,require_execution_policy
+    from rquant.backfill_execute_contracts import maintenance_window
+    from rquant.data_center_maintenance_runtime import (load_data_center_runtime_profile,build_data_center_worker,
+        run_guarded_data_center_round,verify_maintenance_process_reaped)
+    if not args.apply:
+        raise ValueError('maintenance execution requires explicit --apply')
+    profile=load_data_center_runtime_profile(args.profile)
+    policy=load_execution_policy(profile.policy_path)
+    if args.owner not in profile.allowed_owners:
+        raise ValueError('maintenance owner is not authorized')
+    state=BackfillStateStore(policy.original_state_path,maintenance_enabled=True)
+    status=state.get_maintenance_status(args.execution_id,owner=args.owner)
+    require_execution_policy(policy,kind=status.kind,now=datetime.now(UTC))
+    if args.deadline_worker:
+        worker=build_data_center_worker(args.profile,args.execution_id,owner=args.owner)
+        return run_guarded_data_center_round(worker,args.execution_id,owner=args.owner)
+    now=datetime.now(UTC)
+    window=maintenance_window(now)
+    if not window.may_start_day:
+        return 2
+    hard_deadline=min(window.terminate_at,now+timedelta(seconds=1830))
+    # Fixed native child in this installed source; there is no second task queue.
+    source_root=str(Path(__file__).resolve().parent.parent)
+    bootstrap='import sys; sys.path.insert(0,sys.argv.pop(1)); from rquant.cli import main; raise SystemExit(main())'
+    command=[sys.executable,'-I','-B','-c',bootstrap,source_root,'data-center-run','--profile',str(args.profile),
+        '--execution-id',args.execution_id,'--owner',args.owner,'--apply','--deadline-worker']
+    code=_run_deadline_supervised_process(command,deadline=hard_deadline)
+    verify_maintenance_process_reaped(profile)
+    _print_json(state.get_maintenance_status(args.execution_id,owner=args.owner).model_dump(mode='json'))
+    return code
+
+
 class _RQuantArgumentParser(argparse.ArgumentParser):
     def parse_args(
         self,
@@ -728,6 +771,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
         try:
             bar_count = _ingest_with_retry(trade_date)
+            if bar_count is None:
+                return
             if bar_count == 0:
                 logger.warning(f"{trade_date} 非交易日或数据未就绪，跳过筛选")
                 return
@@ -766,6 +811,8 @@ def cmd_run_daily(args: argparse.Namespace) -> int:
     if not args.no_ingest:
         logger.info(f"拉取数据: {trade_date}")
         bar_count = _ingest_with_retry(trade_date)
+        if bar_count is None:
+            return 0
         if bar_count == 0:
             logger.warning("无数据（非交易日或数据未就绪）")
             return 1
@@ -795,6 +842,8 @@ def cmd_ingest(args: argparse.Namespace) -> int:
     logger.info(f"拉取数据: {trade_date}")
     bar_count = _ingest_with_retry(trade_date)
 
+    if bar_count is None:
+        return 0
     if bar_count == 0:
         logger.warning("无数据（非交易日或数据未就绪）")
         return 1
@@ -6474,6 +6523,12 @@ def build_parser() -> argparse.ArgumentParser:
     """构建 CLI 参数解析器。"""
     parser = _RQuantArgumentParser(prog="rquant", description="rQuant 量化选股平台")
     sub = parser.add_subparsers(dest="command")
+    data_center_run=sub.add_parser('data-center-run',help='在原维护窗口推进一项已确认的数据任务')
+    data_center_run.add_argument('--profile',type=Path,required=True)
+    data_center_run.add_argument('--execution-id',type=_parse_sha256,required=True)
+    data_center_run.add_argument('--owner',required=True)
+    data_center_run.add_argument('--apply',action='store_true')
+    data_center_run.add_argument('--deadline-worker',action='store_true',help=argparse.SUPPRESS)
 
     runtime_code_p = sub.add_parser(
         "runtime-code",
@@ -8729,6 +8784,7 @@ def main() -> int:
         "data-backfill": cmd_data_backfill,
         "backfill-plan": cmd_backfill_plan,
         "backfill-run": cmd_backfill_run,
+        "data-center-run": cmd_data_center_run,
         "backfill-abandon": cmd_backfill_abandon,
         "backfill-status": cmd_backfill_status,
         "suspension-backfill": cmd_suspension_backfill,

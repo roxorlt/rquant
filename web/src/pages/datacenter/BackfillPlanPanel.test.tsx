@@ -1,8 +1,9 @@
-import { fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { HttpResponse, http } from "msw";
 import { vi } from "vitest";
-import type { Schemas } from "@/api/client";
+import type { Schemas, ServingMeta } from "@/api/client";
+import { META_QUERY_KEY } from "@/api/useMeta";
 import { metaEnvelope } from "@/test/fixtures";
 import { findJargon } from "@/test/jargon";
 import { renderApp } from "@/test/render";
@@ -177,11 +178,148 @@ describe("数据中心回补计划", () => {
   beforeEach(() => {
     window.sessionStorage.clear();
     server.use(
+      metaHandler(metaEnvelope({ generationId: serving.generation_id })),
       http.get("*/api/v1/data/catalog", () =>
         HttpResponse.json({ data: { version: 1, datasets: [] }, serving }),
       ),
     );
   });
+
+  it.each(["same hash", "replacement hash"] as const)(
+    "DC-IMPL-01 waits for the current index before reading detail across generations with %s",
+    async (selection) => {
+      let current: ServingMeta = { ...serving };
+      let indexReady = Promise.resolve();
+      let releaseIndex = () => {};
+      const indexes: string[] = [];
+      const requests: { requested: string | null; published: string; status: number }[] = [];
+      server.use(
+        http.get("*/api/v1/meta", () =>
+          HttpResponse.json(metaEnvelope({ generationId: current.generation_id ?? undefined })),
+        ),
+        http.get("*/api/v1/data/executions", () =>
+          HttpResponse.json({
+            serving: current,
+            data: {
+              status: "not_published",
+              configured: false,
+              backfill_enabled: false,
+              financial_enabled: false,
+              may_start: false,
+              executions: [],
+              events: [],
+            } satisfies Schemas["ExecutionIndexData"],
+          }),
+        ),
+        http.get("*/api/v1/data/collection", () =>
+          HttpResponse.json({
+            serving: current,
+            data: {
+              status: "not_published",
+              report_hash: null,
+              datasets: [],
+              coverage_label: "全市场覆盖尚未核验",
+            } satisfies Schemas["DataCollectionData"],
+          }),
+        ),
+        http.get("*/api/v1/data/financial-sources", () =>
+          HttpResponse.json({
+            serving: current,
+            data: {
+              status: "not_published",
+              sources: [],
+            } satisfies Schemas["FinancialSourcesData"],
+          }),
+        ),
+        http.get("*/api/v1/data/backfill-plans", async () => {
+          const published = { ...current };
+          indexes.push(published.generation_id ?? "");
+          await indexReady;
+          const planHash =
+            selection === "same hash" || published.generation_id === serving.generation_id
+              ? firstHash
+              : secondHash;
+          return HttpResponse.json({
+            data: {
+              source_state: "ready",
+              total: 1,
+              page_size: 20,
+              items: [item(planHash, 0)],
+              next_cursor: null,
+              progress: null,
+            } satisfies PlanList,
+            serving: published,
+          });
+        }),
+        http.get("*/api/v1/data/backfill-plans/:hash", ({ params, request }) => {
+          const requested = new URL(request.url).searchParams.get("generation");
+          const status = requested === current.generation_id ? 200 : 409;
+          requests.push({ requested, published: current.generation_id ?? "", status });
+          if (status === 409) return HttpResponse.json({ detail: "数据已更新" }, { status });
+          const date =
+            current.generation_id === serving.generation_id
+              ? "2024-09-02"
+              : current.generation_id === "generation-b"
+                ? "2025-03-18"
+                : "2025-03-19";
+          return HttpResponse.json({
+            data: {
+              source_state: "ready",
+              plan: {
+                ...detail(String(params.hash), 0),
+                missing_day_count: 1,
+                gap_count: 1,
+                missing_dates: [date],
+                monthly: [],
+              },
+              progress: null,
+            } satisfies PlanDetailData,
+            serving: current,
+          });
+        }),
+      );
+      const user = userEvent.setup();
+      const { queryClient } = renderApp("/datacenter");
+      await user.click(await screen.findByRole("button", { name: "回补计划" }));
+      await screen.findByText("2024-09-02");
+      expect(requests).toEqual([
+        { requested: serving.generation_id, published: serving.generation_id, status: 200 },
+      ]);
+      for (const [generation, date] of [
+        ["generation-b", "2025-03-18"],
+        ["generation-c", "2025-03-19"],
+      ] as const) {
+        indexReady = new Promise<void>((resolve) => {
+          releaseIndex = resolve;
+        });
+        current = { ...serving, generation_id: generation };
+        const count = requests.length;
+        try {
+          await act(async () => {
+            await queryClient.refetchQueries({ queryKey: META_QUERY_KEY });
+          });
+          await waitFor(() => expect(indexes).toContain(generation));
+          expect(requests).toHaveLength(count);
+          expect(screen.queryByText(date)).not.toBeInTheDocument();
+          await act(async () => {
+            releaseIndex();
+          });
+          await screen.findByText(date);
+          expect(requests.at(-1)).toEqual({
+            requested: generation,
+            published: generation,
+            status: 200,
+          });
+          expect(
+            requests.every((row) => row.status === 200 && row.requested === row.published),
+          ).toBe(true);
+          expect(screen.queryByText("计划详情已更新")).not.toBeInTheDocument();
+        } finally {
+          releaseIndex();
+        }
+      }
+    },
+  );
 
   it("pages within one data generation and shows every missing day without an execution affordance", async () => {
     const requests = planHandlers();

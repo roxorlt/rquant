@@ -1,4 +1,5 @@
 import type { Schemas } from "@/api/client";
+import { useDataCollection } from "@/api/endpoints";
 import { formatCount, formatPercent } from "@/format/number";
 import { type DataColumn, DataTable } from "@/table/DataTable";
 import { EmptyState, KpiStrip, StatusBadge, Tip } from "@/ui";
@@ -290,5 +291,43 @@ export function DatasetReportContent({ dataset }: { dataset: Dataset }) {
         </section>
       </details>
     </div>
+  );
+}
+
+export function CollectionScopeBadge({
+  datasetId,
+  generation,
+}: {
+  datasetId: string;
+  generation: string | null;
+}) {
+  const collection = useDataCollection();
+  const evidence =
+    generation && collection.serving?.generation_id === generation
+      ? collection.data?.datasets.find((item) => item.dataset_id === datasetId)
+      : undefined;
+  return (
+    <section className="dc-collection-scope" aria-label="实际采集范围">
+      <span>采集范围</span>
+      <StatusBadge
+        state={evidence?.status === "verified" ? "ok" : "warn"}
+        label={evidence?.status_label ?? "采集尚未确认"}
+        reason={
+          evidence?.scopes.length
+            ? evidence.scopes
+                .map((scope) =>
+                  scope.scope === "actual_receipt_set"
+                    ? `本次原回执合计 ${formatCount(scope.row_count)} 条实际记录`
+                    : `${scope.trade_date}：${formatCount(scope.row_count)} 条实际记录`,
+                )
+                .join("；")
+            : "缺少可核对的原采集回执，不能确认完成。"
+        }
+      />
+
+      <Tip content="每个交易日有记录，不代表全市场逐股齐全。实际采集范围只按原回执显示。">
+        <span>全市场覆盖尚未核验</span>
+      </Tip>
+    </section>
   );
 }

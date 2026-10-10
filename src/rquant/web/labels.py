@@ -144,6 +144,26 @@ CHANNEL_LABELS: dict[str, str] = {"pushdeer": "PushDeer", "pushplus": "PushPlus"
 _VERSION_SUFFIX = re.compile(r"\.v\d+$")
 
 
+def data_center_record_labels(event_type: str,task_id: str | None,task_status: str | None,failure_code: str | None) -> tuple[str,str,str | None]:
+    if event_type in {'pause_requested','resume_requested'}:
+        return ('暂停' if event_type=='pause_requested' else '继续','已受理',None)
+    name=next((label for prefix,label in (('day-','采集日线'),('tail-derived','重算指标'),
+        ('financial-raw-','采集财务'),('financial-tail-','更新财务指标'),('verify-completion','核对结果'))
+        if task_id is not None and task_id.startswith(prefix)),'处理数据')
+    label={'running':'开始运行','succeeded':'已完成','failed':'未完成','skipped':'已跳过'}.get(task_status,'待核验')
+    detail=None
+    if failure_code is not None:
+        detail={'source_quota_exhausted':'额度不足，补足后继续。','maintenance_window_closed':'等待允许的运行时段。',
+            'pause_requested':'暂停已请求，等待当前任务释放。'}.get(failure_code,'来源或结果需要核验。')
+    return name,label,detail
+
+
+DATA_CENTER_EXECUTION_LABELS={'queued':'等待运行','running':'正在运行','paused':'已暂停','partial':'部分完成',
+    'verifying':'正在核验','failed':'未完成','completed':'已完成'}
+FINANCIAL_SOURCE_LABELS={'fina_indicator':'财务指标','income':'利润表','balancesheet':'资产负债表','cashflow':'现金流量表',
+    'forecast':'业绩预告','express':'业绩快报','dividend':'分红送转'}
+
+
 def split_service_id(service_id: str) -> tuple[str, str]:
     """``notifier.admin.shadow.v1`` → (``notifier``, ``admin.shadow``)."""
 

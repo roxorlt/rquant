@@ -48,6 +48,10 @@ from rquant.security_status import (
     deduplicate_security_status_rows,
 )
 from rquant.storage.migrations import initialize_schema
+from rquant.storage.primary_writer_gate import (
+    PrimaryWriterGate, PrimaryWriterGateConfig, PrimaryWriterIdentityError,
+    PrimaryWriterLease, configured_primary_gate,
+)
 from rquant.suspension_evidence import suspension_session_evidence_sql
 from rquant.trade_calendar import (
     TradeCalendarConflictError,
@@ -449,12 +453,37 @@ class DuckDBStore:
         *,
         read_only: bool = False,
         artifact_terminal_hook: Callable[[str, str, datetime], None] | None = None,
+        primary_writer_gate: PrimaryWriterGateConfig | None = None,
+        primary_writer_lease: PrimaryWriterLease | None = None,
     ) -> None:
         self.path = path or _settings().duckdb_path
         self._artifact_terminal_hook = artifact_terminal_hook
-        self._conn = duckdb.connect(str(self.path), read_only=read_only)
+        self._owned_primary_lease: PrimaryWriterLease | None = None
+        if primary_writer_gate is not None and primary_writer_lease is not None:
+            raise ValueError('writer gate and borrowed lease are mutually exclusive')
         if not read_only:
-            self._init_schema()
+            if primary_writer_lease is not None:
+                primary_writer_lease.verify(self.path)
+            else:
+                gate = primary_writer_gate or configured_primary_gate(
+                    self.path,getattr(_settings(),'primary_writer_gate_path',None),
+                )
+                if gate is not None:
+                    if self.path != gate.primary_path:
+                        raise PrimaryWriterIdentityError('configured primary path mismatch')
+                    self._owned_primary_lease = PrimaryWriterGate(gate).acquire()
+        try:
+            self._conn = duckdb.connect(str(self.path), read_only=read_only)
+            if not read_only:
+                self._init_schema()
+        except BaseException:
+            try:
+                if hasattr(self,'_conn'):
+                    self._conn.close()
+            finally:
+                if self._owned_primary_lease is not None:
+                    self._owned_primary_lease.close()
+            raise
 
     def _init_schema(self) -> None:
         initialize_schema(self._conn)
@@ -3493,11 +3522,18 @@ class DuckDBStore:
         logger.info(f"DuckDB upsert {table}: {count} 行")
         return count
 
-    def replace_dataset(self, table: str, df: pd.DataFrame) -> int:
+    def replace_dataset(self, table: str, df: pd.DataFrame, *,
+                        transaction_mode: Literal['own','existing'] = 'own') -> int:
         """快照整表替换（事务内 DELETE + INSERT，成分调出即删）。
 
         空 df 拒绝替换（源抽风返回空不该清掉现有快照），调用方约定错误抛。
         """
+        if transaction_mode not in {'own','existing'}:
+            raise ValueError('invalid snapshot transaction mode')
+        if transaction_mode=='existing':
+            transaction_id=self._conn.execute('SELECT txid_current()').fetchone()[0]
+            if transaction_id!=self._conn.execute('SELECT txid_current()').fetchone()[0]:
+                raise ValueError('snapshot existing mode requires an actual outer transaction')
         if df.empty:
             raise ValueError(f"replace_dataset 拒绝空快照：{table}")
         use = self._dataset_insert_cols(table, df)
@@ -3506,15 +3542,18 @@ class DuckDBStore:
         quoted = ", ".join(f'"{c}"' for c in use)
         self._conn.register("dataset_tmp", payload)
         try:
-            self._conn.execute("BEGIN")
+            if transaction_mode=='own':
+                self._conn.execute("BEGIN")
             self._conn.execute(f'DELETE FROM "{table}"')
             self._conn.execute(
                 f'INSERT INTO "{table}" ({quoted}) '
                 f"SELECT {quoted} FROM dataset_tmp"
             )
-            self._conn.execute("COMMIT")
+            if transaction_mode=='own':
+                self._conn.execute("COMMIT")
         except Exception:
-            self._conn.execute("ROLLBACK")
+            if transaction_mode=='own':
+                self._conn.execute("ROLLBACK")
             raise
         finally:
             self._conn.unregister("dataset_tmp")
@@ -3535,7 +3574,12 @@ class DuckDBStore:
         return result[0] if result else 0
 
     def close(self) -> None:
-        self._conn.close()
+        try:
+            self._conn.close()
+        finally:
+            if self._owned_primary_lease is not None:
+                self._owned_primary_lease.close()
+                self._owned_primary_lease = None
 
     def __enter__(self) -> DuckDBStore:
         return self

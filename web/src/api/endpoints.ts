@@ -1,8 +1,9 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useRef } from "react";
-import { ApiError, apiClient, type Schemas } from "./client";
+import { ApiError, apiClient, type MetaEnvelope, type Schemas } from "./client";
 import type { paths } from "./schema";
-import { type ServingQueryResult, useServingQuery } from "./useServingQuery";
+import { META_QUERY_KEY, useCurrentMeta } from "./useMeta";
+import { type ServingEnvelope, type ServingQueryResult, useServingQuery } from "./useServingQuery";
 
 export type OverviewEnvelope = Schemas["Envelope_OverviewData_"];
 export type OverviewData = Schemas["OverviewData"];
@@ -542,4 +543,66 @@ export function useRefreshPanorama(): () => void {
   return () => {
     void client.invalidateQueries({ queryKey: ["panorama"] });
   };
+}
+
+export type DataCenterCommand = NonNullable<
+  paths["/api/v1/data/executions/commands"]["post"]["requestBody"]
+>["content"]["application/json"];
+export type DataCenterCommandReceipt = Schemas["DataCenterCommandReceipt"];
+export type DataCenterExecution = Schemas["ExecutionView"];
+export type DataCenterConfirmation = Schemas["ExecutionConfirmation"];
+export type FinancialSource = Schemas["FinancialSourceView"];
+
+export function useDataCenterExecutions() {
+  const queryClient = useQueryClient();
+  const viewer = useCurrentMeta().data?.data.viewer ?? null;
+  const query = useServingQuery(
+    ["data-center", "executions", viewer],
+    async () => {
+      const { data, response } = await apiClient().GET("/api/v1/data/executions");
+      return unwrap(data, response);
+    },
+    { refetchInterval: 15_000 },
+  );
+  return {
+    ...query,
+    readCurrent: () => ({
+      meta: queryClient.getQueryData<MetaEnvelope>(META_QUERY_KEY),
+      metaFetchStatus: queryClient.getQueryState(META_QUERY_KEY)?.fetchStatus,
+      index: queryClient.getQueryState<ServingEnvelope<Schemas["ExecutionIndexData"]>>([
+        "data-center",
+        "executions",
+        viewer,
+      ]),
+    }),
+  };
+}
+
+export function useDataCollection() {
+  return useServingQuery(["data-center", "collection"], async () => {
+    const { data, response } = await apiClient().GET("/api/v1/data/collection");
+    return unwrap(data, response);
+  });
+}
+
+export function useFinancialSources() {
+  return useServingQuery(["data-center", "financial-sources"], async () => {
+    const { data, response } = await apiClient().GET("/api/v1/data/financial-sources");
+    return unwrap(data, response);
+  });
+}
+
+export async function submitDataCenterCommand(
+  body: DataCenterCommand,
+): Promise<DataCenterCommandReceipt> {
+  const { data, response } = await apiClient()
+    .POST("/api/v1/data/executions/commands", {
+      body,
+      headers: { "X-Rquant-Csrf": "1" },
+      signal: AbortSignal.timeout(12_000),
+    })
+    .catch(() => {
+      throw new ApiError(503, "提交状态待确认，请使用原请求重试。");
+    });
+  return unwrap(data, response);
 }

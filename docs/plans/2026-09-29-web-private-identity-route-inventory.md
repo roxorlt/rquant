@@ -1,8 +1,8 @@
 # Web `current_user` 路由清单
 
-对应 [私有身份边界](2026-09-29-web-private-identity-boundary.md)。以下为当前代码中的全部 110 个 `current_user` 依赖路由；`/api/v1` 前缀已包含。公开类即使收到裸用户头，也只得到 `viewer=None`，不能据此取得身份。私有类统一使用已验证的代理身份；已有 CSRF、角色和业务条件仍单独检查。
+对应 [私有身份边界](2026-09-29-web-private-identity-boundary.md)。以下为当前代码中的全部 114 个 `current_user` 依赖路由；`/api/v1` 前缀已包含。公开类即使收到裸用户头，也只得到 `viewer=None`，不能据此取得身份。私有类统一使用已验证的代理身份；已有 CSRF、角色和业务条件仍单独检查。
 
-## 公开读取（20）
+## 公开读取（23）
 
 | 方法 | 路径 |
 |---|---|
@@ -26,6 +26,9 @@
 | GET | `/api/v1/data/health` |
 | GET | `/api/v1/data/issues` |
 | GET | `/api/v1/data/fundamentals/summary` |
+| GET | `/api/v1/data/collection` |
+| GET | `/api/v1/data/financial-sources` |
+| GET | `/api/v1/data/executions` |
 
 ## 私有读取（54）
 
@@ -88,7 +91,7 @@
 
 名单按认证 owner 过滤。服务日志能力在未登录时只返回空列表，日志正文仍拒绝；普通任务、池子、监控、研究和审计页面则直接返回 401。公开的 `meta` 在没有有效证明时不显示 viewer。
 
-## 受保护操作（36）
+## 受保护操作（37）
 
 | 方法 | 路径 |
 |---|---|
@@ -109,6 +112,7 @@
 | POST | `/api/v1/pools/formula/commands` |
 | POST | `/api/v1/data/audit-report/commands` |
 | POST | `/api/v1/data/backfill-plans/commands` |
+| POST | `/api/v1/data/executions/commands` |
 | POST | `/api/v1/tasks/jobs/commands` |
 | POST | `/api/v1/factors/definitions/save` |
 | POST | `/api/v1/factors/definitions/save/resume` |
@@ -140,6 +144,8 @@
 组合回测读取和下载使用私有身份。运行和 ZIP 准备另核原任务操作名单、CSRF 和完整原请求；结果按原任务与封存摘要读取，未知回执只恢复原操作。没有可用来源时，运行能力明确不可用。
 
 策略模板列表、来源、详情和版本按本人读取。保存、归档及运行另核编辑名单、CSRF 和完整原请求；未知回执只续查原操作。运行须有原任务链及已核验的来源。
+
+数据采集范围、财务来源和任务状态读取使用同一已发布数据代。任务状态只按已验证身份返回本人记录；无身份时本人记录为空，裸用户头不能冒充他人。确认、开始、暂停及继续另核 CSRF、原 PageControl 权限和完整原请求。
 
 ## 本片与生产边界
 

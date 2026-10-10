@@ -1,6 +1,8 @@
 import { type FinancialSummary, useFinancialSummary } from "@/api/financialSummary";
 import { formatCount } from "@/format/number";
 import { Button, EmptyState, PageSkeleton, RelativeTime, Tip } from "@/ui";
+import { BackfillExecutionPanel } from "./BackfillExecutionPanel";
+import type { DataCenterCommandSession } from "./dataCenterCommandSession";
 
 type FinancialField = FinancialSummary["fields"][number];
 
@@ -68,11 +70,16 @@ function UnavailableSummary({ data }: { data: FinancialSummary }) {
   );
 }
 
-export function FinancialPanel() {
+export function FinancialPanel({
+  executionSession,
+}: {
+  executionSession?: DataCenterCommandSession;
+} = {}) {
   const summary = useFinancialSummary();
   const data = summary.phase === "ready" ? summary.data : null;
   return (
     <section className="dc-financial" aria-label="财务概况">
+      <BackfillExecutionPanel mode="financial" executionSession={executionSession} />
       <div className="dc-fin-heading">
         <div>
           <p className="dc-fin-eyebrow">数据中心 / 财务</p>

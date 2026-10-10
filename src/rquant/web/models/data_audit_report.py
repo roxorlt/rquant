@@ -39,10 +39,10 @@ class _ReportModel(BaseModel):
 
 class ReportOverviewRow(_ReportModel):
     report_hash: ReportHash
-    schema_version: Literal[1, 2]
+    schema_version: Literal[1, 2, 3]
     rule_version: Literal["daily-bar-quality-v1"]
     run_status: Literal["completed"]
-    collection_status: Literal["collection_unconfirmed"]
+    collection_status: Literal["collection_unconfirmed","collection_partial"]
     collection_completed_through: None
     coverage_conclusion: Literal["unconfirmed"]
     quality_conclusion: Literal["not_fully_assessed", "issues_observed", "no_issues_observed"]
@@ -67,6 +67,8 @@ class ReportOverviewRow(_ReportModel):
 
     @model_validator(mode="after")
     def validate_counts(self) -> ReportOverviewRow:
+        if (self.schema_version==3)!=(self.collection_status=='collection_partial'):
+            raise ValueError('collection status differs from original report schema')
         span = (self.observed_through - self.audit_start).days + 1
         if not 1 <= span <= MAX_AUDIT_DAYS:
             raise ValueError("report date range is invalid")

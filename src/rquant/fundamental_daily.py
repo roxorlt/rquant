@@ -577,59 +577,85 @@ def _load_fields(raw: str) -> dict[FieldName, FundamentalFieldEvidence]:
     }
 
 
-def derive_fundamental_daily(
-    conn: duckdb.DuckDBPyConnection, query: FundamentalDailyQuery
-) -> FundamentalDailyVersion:
-    """Choose six PIT fields and atomically append/switch one daily version."""
+class PreparedFundamentalDaily(RuntimeContractModel):
+    query: FundamentalDailyQuery
+    version: FundamentalDailyVersion
+    previous_version_id: Sha256Hex | None
 
+
+def _prepare_fundamental_daily(
+    conn: duckdb.DuckDBPyConnection, query: FundamentalDailyQuery
+) -> PreparedFundamentalDaily:
     decision_at = _decision_at(query.trade_date)
-    conn.execute("BEGIN TRANSACTION")
-    try:
-        financial = _financial_source(conn, ts_code=query.ts_code, decision_at=decision_at)
-        valuation = _valuation_source(
-            conn, ts_code=query.ts_code, decision_date=query.trade_date, decision_at=decision_at
-        )
-        period, period_reason, period_digest = _target_period(
-            conn, source=financial, ts_code=query.ts_code, decision_at=decision_at
-        )
-        fields = _financial_fields(
+    financial = _financial_source(conn, ts_code=query.ts_code, decision_at=decision_at)
+    valuation = _valuation_source(
+        conn, ts_code=query.ts_code, decision_date=query.trade_date, decision_at=decision_at
+    )
+    period, period_reason, period_digest = _target_period(
+        conn, source=financial, ts_code=query.ts_code, decision_at=decision_at
+    )
+    fields = _financial_fields(
+        conn,
+        ts_code=query.ts_code,
+        period=period,
+        period_reason=period_reason,
+        period_digest=period_digest,
+        decision_at=decision_at,
+    )
+    fields.update(
+        _valuation_fields(
             conn,
             ts_code=query.ts_code,
-            period=period,
-            period_reason=period_reason,
-            period_digest=period_digest,
+            decision_date=query.trade_date,
             decision_at=decision_at,
+            source=valuation,
         )
-        fields.update(
-            _valuation_fields(
-                conn,
-                ts_code=query.ts_code,
-                decision_date=query.trade_date,
-                decision_at=decision_at,
-                source=valuation,
-            )
-        )
-        version_id = _version_identity(
-            query, decision_at, period, period_reason, financial, valuation, fields
-        )
-        current = read_fundamental_daily(conn, query)
-        if current is not None and current.version_id == version_id:
-            conn.execute("COMMIT")
-            return current
-        if current is not None:
-            _source_progress(conn, current, financial, valuation)
-        version = FundamentalDailyVersion(
-            version_id=version_id,
-            ts_code=query.ts_code,
-            trade_date=query.trade_date,
-            revision=current.revision + 1 if current is not None else 1,
-            decision_at=decision_at,
-            target_report_period=period,
-            target_period_reason=period_reason,
-            financial_source=financial,
-            valuation_source=valuation,
-            fields=fields,
-        )
+    )
+    version_id = _version_identity(
+        query, decision_at, period, period_reason, financial, valuation, fields
+    )
+    current = read_fundamental_daily(conn, query)
+    if current is not None and current.version_id == version_id:
+        return PreparedFundamentalDaily(query=query, version=current, previous_version_id=current.version_id)
+    if current is not None:
+        _source_progress(conn, current, financial, valuation)
+    version = FundamentalDailyVersion(
+        version_id=version_id,
+        ts_code=query.ts_code,
+        trade_date=query.trade_date,
+        revision=current.revision + 1 if current is not None else 1,
+        decision_at=decision_at,
+        target_report_period=period,
+        target_period_reason=period_reason,
+        financial_source=financial,
+        valuation_source=valuation,
+        fields=fields,
+    )
+    return PreparedFundamentalDaily(query=query, version=version,
+        previous_version_id=current.version_id if current is not None else None)
+
+
+def prepare_fundamental_daily(
+    conn: duckdb.DuckDBPyConnection, query: FundamentalDailyQuery
+) -> PreparedFundamentalDaily:
+    """Select the original six fields in one read snapshot before writer protection."""
+
+    conn.execute("BEGIN TRANSACTION")
+    try:
+        prepared = _prepare_fundamental_daily(conn, query)
+        conn.execute("COMMIT")
+        return prepared
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+
+
+def _write_fundamental_daily(
+    conn: duckdb.DuckDBPyConnection, prepared: PreparedFundamentalDaily
+) -> FundamentalDailyVersion:
+    version = prepared.version
+    if prepared.previous_version_id != version.version_id:
+        fields = version.fields
         conn.execute(
             "INSERT INTO fundamental_daily_version VALUES "
             "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -655,6 +681,52 @@ def derive_fundamental_daily(
             ],
         )
         _write_head(conn, version)
+    return version
+
+
+def derive_fundamental_daily(
+    conn: duckdb.DuckDBPyConnection,
+    query: FundamentalDailyQuery,
+    *,
+    transaction_mode: Literal["own", "existing"] = "own",
+    prepared: PreparedFundamentalDaily | None = None,
+) -> FundamentalDailyVersion:
+    """Choose six PIT fields and atomically append/switch one daily version."""
+
+    if transaction_mode not in {"own", "existing"}:
+        raise ValueError("invalid fundamental transaction mode")
+    if transaction_mode == "existing":
+        first = conn.execute("SELECT txid_current()").fetchone()[0]
+        if conn.execute("SELECT txid_current()").fetchone()[0] != first:
+            raise ValueError("fundamental existing mode requires an actual outer transaction")
+        if prepared is None:
+            raise ValueError("fundamental existing mode requires original prepared fields")
+        prepared = PreparedFundamentalDaily.model_validate_json(prepared.model_dump_json())
+        version = prepared.version
+        if (prepared.query != query or version.ts_code != query.ts_code
+                or version.trade_date != query.trade_date or version.decision_at != _decision_at(query.trade_date)
+                or _version_identity(query, version.decision_at, version.target_report_period,
+                    version.target_period_reason, version.financial_source, version.valuation_source,
+                    version.fields) != version.version_id):
+            raise ValueError("prepared fundamental identity changed")
+        current = read_fundamental_daily(conn, query)
+        if (current.version_id if current is not None else None) != prepared.previous_version_id:
+            raise ValueError("prepared fundamental head changed")
+        financial = _financial_source(conn, ts_code=query.ts_code, decision_at=version.decision_at)
+        valuation = _valuation_source(conn, ts_code=query.ts_code,
+            decision_date=query.trade_date, decision_at=version.decision_at)
+        if financial != version.financial_source or valuation != version.valuation_source:
+            raise ValueError("prepared fundamental source changed")
+        if version.revision != (current.revision if current is not None and current.version_id == version.version_id
+                else current.revision + 1 if current is not None else 1):
+            raise ValueError("prepared fundamental revision changed")
+        return _write_fundamental_daily(conn, prepared)
+    if prepared is not None:
+        raise ValueError("own fundamental mode does not accept prepared fields")
+    conn.execute("BEGIN TRANSACTION")
+    try:
+        selected = _prepare_fundamental_daily(conn, query)
+        version = _write_fundamental_daily(conn, selected)
         conn.execute("COMMIT")
         return version
     except BaseException:

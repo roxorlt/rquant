@@ -8,7 +8,7 @@ from __future__ import annotations
 import time
 from collections.abc import Callable
 from datetime import UTC, date, datetime
-from typing import Literal, Protocol, cast
+from typing import TYPE_CHECKING, Literal, Protocol, cast
 
 import pandas as pd
 import tushare as ts
@@ -35,6 +35,9 @@ from rquant.suspension import (
     normalize_suspend_d_snapshot,
     persist_suspension_snapshot,
 )
+
+if TYPE_CHECKING:
+    from rquant.data_collection_authority import CollectionCommitRecorder
 
 # Tushare 接口限流：~120ms 间隔
 _API_SLEEP = 0.15
@@ -524,6 +527,7 @@ def ingest_daily(
     api_sleep: float = _API_SLEEP,
     sleep: Callable[[float], None] = time.sleep,
     state_mode: Literal["recompute_tail", "invalidate_tail"] = "recompute_tail",
+    completion_recorder: CollectionCommitRecorder | None = None,
 ) -> int:
     """拉取指定交易日的全市场数据并入库。
 
@@ -536,6 +540,15 @@ def ingest_daily(
     ds = trade_date.replace("-", "")
     target_date = datetime.strptime(trade_date, "%Y-%m-%d").date()
     resolved_ingested_at = ingested_at or datetime.now(UTC)
+    observation_batch = None
+    if completion_recorder is not None:
+        from rquant.data_collection_authority import (
+            CollectionObservationBatch, ObservedDailyClient, ObservedSecurityClient,
+        )
+
+        observation_batch = CollectionObservationBatch(resolved_ingested_at,clock=completion_recorder.clock,
+            source_normalization_version='tushare-nullable-v1')
+        pro = ObservedDailyClient(pro, observation_batch)
 
     logger.info("拉取 stock_basic...")
     df_basic = pro.stock_basic(
@@ -570,6 +583,9 @@ def ingest_daily(
                 "status_adapter must implement suspend_d_raw or suspension_adapter must be provided"
             )
         suspension_adapter = cast(SuspensionAdapter, status_adapter)
+    if observation_batch is not None:
+        status_adapter = ObservedSecurityClient(status_adapter, observation_batch)
+        suspension_adapter = ObservedSecurityClient(suspension_adapter, observation_batch)
     status_keys = [
         DailySecurityKey(ts_code=str(row.ts_code), trade_date=row.trade_date)
         for row in df_daily[["ts_code", "trade_date"]].itertuples(index=False)
@@ -631,7 +647,8 @@ def ingest_daily(
     logger.info(f"拉取 daily_basic {trade_date}...")
     df_basic_mkt = pro.daily_basic(
         trade_date=ds,
-        fields="ts_code,trade_date,turnover_rate,volume_ratio,total_mv,circ_mv",
+        fields=("ts_code,trade_date,turnover_rate,volume_ratio,total_mv,circ_mv,pe_ttm,pb,dv_ttm"
+            if completion_recorder is not None else "ts_code,trade_date,turnover_rate,volume_ratio,total_mv,circ_mv"),
     )
     if df_basic_mkt is not None and not df_basic_mkt.empty:
         df_basic_mkt = df_basic_mkt.copy()
@@ -717,6 +734,9 @@ def ingest_daily(
                 logger.info(f"market_sentiment_daily: {sentiment_rows} 行")
             else:
                 logger.info(f"state tail 已失效: {target_date}, {len(codes)} 只")
+            if completion_recorder is not None and observation_batch is not None:
+                completion_recorder.record_daily(writer, target_date,
+                    observations=tuple(observation_batch.observations),daily_basic_response=observation_batch.daily_basic_response)
             writer._conn.execute("COMMIT")
             transaction_open = False
         except BaseException as error:

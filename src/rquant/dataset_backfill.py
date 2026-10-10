@@ -17,13 +17,16 @@ from __future__ import annotations
 import time
 from collections.abc import Callable
 from datetime import date, datetime, timedelta
-from typing import Literal, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
 
 import pandas as pd
 from loguru import logger
 from pydantic import BaseModel, ConfigDict
 
 from rquant.storage.duckdb import DuckDBStore
+
+if TYPE_CHECKING:
+    from rquant.data_collection_authority import CollectionCommitRecorder
 
 # Tushare 接口限流间隔（对齐 market_backfill._API_SLEEP）
 _API_SLEEP = 0.35
@@ -363,6 +366,7 @@ def backfill_dataset(
     *,
     dry_run: bool = False,
     api_sleep: float = _API_SLEEP,
+    completion_recorder: CollectionCommitRecorder | None = None,
 ) -> dict:
     """按注册表回补一个数据集。
 
@@ -387,9 +391,9 @@ def backfill_dataset(
         adapter = TushareAdapter()
 
     if spec.mode == "snapshot":
-        return _run_snapshot(spec, end_d, store, adapter, dry_run=dry_run)
+        return _run_snapshot(spec, end_d, store, adapter, dry_run=dry_run,completion_recorder=completion_recorder)
     return _run_by_date(
-        spec, start_d, end_d, store, adapter, dry_run=dry_run, api_sleep=api_sleep
+        spec, start_d, end_d, store, adapter, dry_run=dry_run, api_sleep=api_sleep,completion_recorder=completion_recorder
     )
 
 
@@ -418,6 +422,7 @@ def _run_by_date(
     *,
     dry_run: bool,
     api_sleep: float,
+    completion_recorder: CollectionCommitRecorder | None = None,
 ) -> dict:
     dates = adapter.trade_cal(start_d, end_d)
     summary = _base_summary(spec, start_d, end_d, dry_run)
@@ -435,10 +440,22 @@ def _run_by_date(
         summary["executed_dates"] += 1
         try:
             df = spec.fetch(adapter, trading_date)
+            observation = _completion_observation(spec,df,trading_date,completion_recorder)
             time.sleep(api_sleep)
             if spec.normalize is not None and not df.empty:
                 df = spec.normalize(df)
-            rows = store.upsert_dataset(spec.table, df)
+            if completion_recorder is None:
+                rows = store.upsert_dataset(spec.table, df)
+            else:
+                store._conn.execute('BEGIN')
+                try:
+                    rows=store.upsert_dataset(spec.table,df)
+                    completion_recorder.record_dataset(store,trading_date,dataset_id=spec.name,
+                        source_api=spec.name,observation=observation,snapshot=False)
+                    store._conn.execute('COMMIT')
+                except BaseException:
+                    store._conn.execute('ROLLBACK')
+                    raise
         except Exception as e:
             summary["failed_dates"].append(trading_date.isoformat())
             logger.warning(
@@ -479,6 +496,7 @@ def _run_snapshot(
     adapter: DatasetBackfillAdapter,
     *,
     dry_run: bool,
+    completion_recorder: CollectionCommitRecorder | None = None,
 ) -> dict:
     as_of = _latest_trading_day(adapter, end_d)
     summary = _base_summary(spec, as_of, end_d, dry_run)
@@ -494,11 +512,24 @@ def _run_snapshot(
     summary["executed_dates"] = 1
     try:
         df = spec.fetch(adapter, as_of)
+        observation = _completion_observation(spec,df,as_of,completion_recorder)
         if spec.normalize is not None and not df.empty:
             df = spec.normalize(df)
         if df.empty:
             raise RuntimeError("快照返回空，保留现有数据不替换")
-        summary["rows"] = store.replace_dataset(spec.table, df)
+        if completion_recorder is None:
+            summary["rows"] = store.replace_dataset(spec.table, df)
+        else:
+            store._conn.execute('BEGIN')
+            try:
+                rows=store.replace_dataset(spec.table,df,transaction_mode='existing')
+                completion_recorder.record_dataset(store,as_of,dataset_id=spec.name,source_api=spec.name,
+                    observation=observation,snapshot=True)
+                store._conn.execute('COMMIT')
+                summary['rows']=rows
+            except BaseException:
+                store._conn.execute('ROLLBACK')
+                raise
     except Exception as e:
         summary["failed_dates"].append(as_of.isoformat())
         logger.warning(f"数据集快照失败: {spec.name} as_of={as_of} err={e}")
@@ -508,3 +539,12 @@ def _run_snapshot(
         f"failed={len(summary['failed_dates'])}"
     )
     return summary
+
+
+def _completion_observation(spec: DatasetSpec,frame: pd.DataFrame,day: date,
+                            recorder: CollectionCommitRecorder | None) -> object:
+    if recorder is None:
+        return None
+    from rquant.data_collection_contracts import SourceObservation
+    return SourceObservation.from_frame(spec.name,dict(dataset=spec.name,as_of=day,mode=spec.mode),
+        frame,observed_at=recorder.clock())

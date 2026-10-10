@@ -87,6 +87,8 @@ class BackfillPlanPageBackend:
         if (
             request.audit_start != command.audit_start
             or request.completed_through != command.completed_through
+            or (request.owner is not None and request.owner!=command.actor_id)
+            or (request.page_command_id is not None and request.page_command_id!=command.command_id)
         ):
             raise ValueError("backfill plan command conflicts with a prior task request")
         return self._accepted(task_id)
@@ -114,5 +116,7 @@ class BackfillPlanPageBackend:
             completed_through=command.completed_through,
             observed_at=self.clock(),
             assumptions=self.config.assumptions,
+            owner=command.actor_id,
+            page_command_id=command.command_id,
         )
         return self._accepted(self.store.submit(request).task_id)

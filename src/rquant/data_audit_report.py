@@ -31,6 +31,9 @@ from rquant.data_audit_evidence import (
     audit_daily_bar_quality_from_connection,
 )
 from rquant.data_audit_quality import DailyBarQualityIssue
+from rquant.data_collection_contracts import (
+    AuditCollectionReference, DataCollectionProofV2, DataCollectionProofV3, DataCollectionProof, DatasetCollectionEvidence,
+)
 
 MAX_REPORT_BYTES = 8_000_000
 _MAX_NULL_FIELDS = 9
@@ -383,8 +386,44 @@ class CatalogDataAuditReport(DataAuditReport):
         return self
 
 
+class CollectionDataAuditReport(CatalogDataAuditReport):
+    """V3 binds original collection receipts, retaining the original measurements."""
+
+    schema_version: Literal[3] = 3
+    collection_status: Literal['collection_partial'] = 'collection_partial'
+    collection_reference: AuditCollectionReference
+    collection_proof: DataCollectionProof
+    collection_datasets: tuple[DatasetCollectionEvidence,...] = Field(min_length=24,max_length=24)
+
+    @model_validator(mode='after')
+    def validate_collection_binding(self) -> Self:
+        from rquant.data_catalog.build import CATALOG_CONTRACTS
+        proof=self.collection_proof
+        reference=self.collection_reference
+        payload=_canonical_bytes(proof.model_dump(mode='json'))
+        if (reference.event_id,reference.binding_sha256,reference.sequence,reference.byte_count,
+            reference.proof_sha256)!=(proof.event_id,proof.binding_sha256,proof.sequence,len(payload),
+                                     hashlib.sha256(payload).hexdigest()):
+            raise ValueError('audit collection proof differs from original source reference')
+        if (self.audit_start,self.observed_through,self.source.snapshot_label,self.dataset_contract_sha256)!=(
+            proof.audit_start,proof.observed_through,f'sha256:{proof.replica_sha256}',proof.catalog_contract_sha256):
+            raise ValueError('audit range or source differs from original collection proof')
+        if tuple(item.dataset_id for item in self.collection_datasets)!=tuple(sorted(item.dataset_id for item in CATALOG_CONTRACTS)):
+            raise ValueError('audit collection proof must describe every catalog dataset')
+        for item in self.collection_datasets:
+            if isinstance(proof,DataCollectionProofV3):
+                summary=next((summary for summary in proof.receipt_manifest.datasets if summary.dataset_id==item.dataset_id),None)
+                if item.receipt_set!=summary or item.receipt_ids or item.status!=('partial' if summary is not None else 'unconfirmed'):
+                    raise ValueError('audit dataset differs from complete original receipt set')
+                continue
+            expected=tuple(dict.fromkeys(ref.receipt_id for ref in proof.references if item.dataset_id in ref.dataset_ids))
+            if item.receipt_ids!=expected or item.status!=('partial' if expected else 'unconfirmed'):
+                raise ValueError('audit dataset claim differs from original receipt scope')
+        return self
+
+
 def validate_data_audit_report(report: DataAuditReport) -> DataAuditReport:
-    model = CatalogDataAuditReport if report.schema_version == 2 else DataAuditReport
+    model = CollectionDataAuditReport if report.schema_version == 3 else CatalogDataAuditReport if report.schema_version == 2 else DataAuditReport
     return model.model_validate(report.model_dump(mode="python"))
 
 
@@ -392,6 +431,9 @@ def data_audit_report_path(directory: Path, report_hash: str) -> Path:
     """Resolve two explicit artifact versions without directory scans or fallback on corruption."""
     if len(report_hash) != 64 or any(c not in "0123456789abcdef" for c in report_hash):
         raise ValueError("invalid audit report digest")
+    latest = directory / f"data-audit-v3-{report_hash}.json"
+    if latest.exists():
+        return latest
     current = directory / f"data-audit-v2-{report_hash}.json"
     return current if current.exists() else directory / f"data-audit-v1-{report_hash}.json"
 
@@ -610,7 +652,7 @@ def _decode_report(data: bytes) -> DataAuditReport:
         header = json.loads(data)
         if not isinstance(header, dict):
             raise ValueError("audit report must be an object")
-        model = CatalogDataAuditReport if header.get("schema_version") == 2 else DataAuditReport
+        model = CollectionDataAuditReport if header.get('schema_version')==3 else CatalogDataAuditReport if header.get("schema_version") == 2 else DataAuditReport
         report = model.model_validate_json(data)
     except ValueError as exc:
         raise ValueError("audit report is invalid or its digest mismatches") from exc
@@ -759,6 +801,9 @@ def create_and_publish_data_audit_report(
     expected_file_sha256: str | None = None,
     on_replica_sha256: Callable[[str], None] | None = None,
     include_catalog: bool = False,
+    collection_reference: AuditCollectionReference | None = None,
+    collection_directory: Path | None = None,
+    collection_snapshot_root: Path | None = None,
 ) -> Path:
     """Seal one trusted local replica read into an unverified production report.
 
@@ -855,6 +900,23 @@ def create_and_publish_data_audit_report(
                     null_fields=null_fields,
                     **observation,
                 )
+                if collection_reference is not None:
+                    from rquant.data_collection_authority import (
+                        load_collection_proof, verify_fixed_collection_file, verify_collection_source,
+                    )
+                    if collection_directory is None or not isinstance(report,CatalogDataAuditReport):
+                        raise ValueError('collection audit requires trusted proof directory and original catalog audit')
+                    proof=load_collection_proof(collection_directory,collection_reference)
+                    if (Path(proof.primary_identity.canonical_path),proof.fixed_replica_path,proof.replica_sha256,
+                        proof.audit_start,proof.observed_through)!=(primary_path,replica_path,digest,audit_start,observed_through):
+                        raise ValueError('original audit request differs from collection source')
+                    verify_fixed_collection_file(proof)
+                    evidence=verify_collection_source(connection,proof,snapshot_root=collection_snapshot_root)
+                    body={**report.model_dump(mode='json',exclude={'content_hash'}), 'schema_version':3,
+                        'collection_status':'collection_partial','collection_reference':collection_reference.model_dump(mode='json'),
+                        'collection_proof':proof.model_dump(mode='json'),
+                        'collection_datasets':[item.model_dump(mode='json') for item in evidence]}
+                    report=CollectionDataAuditReport.model_validate({**body,'content_hash':_payload_hash(body)})
                 _require_fixed_replica(primary_path, replica_path, pinned_source)
             if _file_sha256(handle) != digest:
                 raise DataAuditReplicaChangedError("read-only replica digest changed during audit")

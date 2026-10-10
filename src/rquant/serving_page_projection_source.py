@@ -3610,12 +3610,18 @@ class DuckDBLabPageProjectionSource:
         formula_market_job_directory: Path | None = None,
         backfill_plan_directory: Path | None = None,
         backfill_plan_job_state_path: Path | None = None,
+        data_center_state_path: Path | None = None,
+        data_center_policy_path: Path | None = None,
         factor_registry: FactorDefinitionRegistry | None = None,
         factor_registry_identity: FactorRegistryIdentity | None = None,
         factor_tracking_identity: FactorTrackingIdentity | None = None,
         strategy_authoring_source: StrategyAuthoringProjectionSource | None = None,
     ) -> None:
         self.database_path = Path(os.path.abspath(database_path))
+        if (data_center_state_path is None)!=(data_center_policy_path is None):
+            raise ValueError('data center state and policy paths require paired settings')
+        self.data_center_state_path=data_center_state_path
+        self.data_center_policy_path=data_center_policy_path
         #: this role's own state directory; see `_StableReadonlyDuckDB` (#255)
         self.control_root = None if control_root is None else Path(os.path.abspath(control_root))
         if audit_report_path is not None and not audit_report_path.is_absolute():
@@ -3813,7 +3819,10 @@ class DuckDBLabPageProjectionSource:
                 or report.observed_through != success.request.observed_through
                 or report.null_fields
                 != tuple(sorted(success.request.null_fields, key=lambda field: field.field_name))
-                or report.collection_status != "collection_unconfirmed"
+                or report.collection_status != ('collection_partial' if success.request.collection_reference is not None else 'collection_unconfirmed')
+                or (success.request.collection_reference is not None and (
+                    report.schema_version!=3 or getattr(report,'collection_reference',None)!=success.request.collection_reference))
+                or (success.request.collection_reference is None and report.schema_version==3)
             ):
                 raise ValueError("audit report differs from successful task")
             # mtime is caller-settable. Inode ctime and the containing directory's
@@ -4030,7 +4039,15 @@ class DuckDBLabPageProjectionSource:
             factor_definition_projections=self._factor_definition_projections(observed),
             factor_tracking_projections=self._factor_tracking_projections(observed),
             strategy_definition_projections=() if self.strategy_authoring_source is None else self.strategy_authoring_source(observed),
+            data_center_execution_projections=self._data_center_execution_projections(observed),
         )
+
+    def _data_center_execution_projections(self,observed: datetime) -> tuple[ServingProjectionPayload,...]:
+        if self.data_center_state_path is None:
+            return ()
+        from rquant.backfill_execute_projection import project_data_center_execution
+        return project_data_center_execution(state_path=self.data_center_state_path,
+            policy_path=self.data_center_policy_path,observed_at=observed)
 
     @staticmethod
     def _audit_results(
@@ -5285,6 +5302,7 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
 
     @model_validator(mode="after")
     def validate_snapshot(self) -> Self:
+        from rquant.backfill_execute_projection import DATA_CENTER_EXECUTION_TABLES,validate_execution_projections
         from rquant.factor.result_serving import (
             FACTOR_RESULT_PROJECTION_TABLES,
             validate_factor_result_projections,
@@ -5299,6 +5317,8 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
         optional_groups = (
             REPORT_PROJECTION_TABLES,
             {"audit_report_dataset"},
+            {"data_collection_dataset"},
+            DATA_CENTER_EXECUTION_TABLES,
             REPORT_JOB_PROJECTION_TABLES,
             BACKFILL_PLAN_PROJECTION_TABLES,
             FORMULA_MARKET_PROJECTION_TABLES,
@@ -5314,9 +5334,12 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
             or len(names) != len(self.projections)
             or tuple(item.table_name for item in self.projections) != tuple(sorted(names))
             or ("audit_report_dataset" in names and not names >= REPORT_PROJECTION_TABLES)
+            or ("data_collection_dataset" in names and not names >= REPORT_PROJECTION_TABLES)
         ):
             raise ValueError("lab page projection snapshot is incomplete")
         projections = {item.table_name: item for item in self.projections}
+        if names >= DATA_CENTER_EXECUTION_TABLES:
+            validate_execution_projections(projections)
         if names >= FORMULA_MARKET_PROJECTION_TABLES:
             validate_formula_market_projections(projections)
         if names >= FACTOR_DEFINITION_PROJECTION_TABLES:
@@ -5373,7 +5396,7 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
             summary = overview[0]
             if (
                 summary["current"] is not False
-                or summary["collection_status"] != "collection_unconfirmed"
+                or summary["collection_status"] != ('collection_partial' if summary['schema_version']==3 else 'collection_unconfirmed')
                 or summary["collection_completed_through"] is not None
                 or summary["coverage_conclusion"] != "unconfirmed"
                 or summary["source_mode"] != "production_unverified"
@@ -5381,10 +5404,16 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
             ):
                 raise ValueError("audit report source and completion remain unconfirmed")
             report_hash = summary["report_hash"]
-            if summary["schema_version"] not in (1, 2) or (
-                ("audit_report_dataset" in names) != (summary["schema_version"] == 2)
-            ):
+            if summary["schema_version"] not in (1, 2, 3) or (
+                ("audit_report_dataset" in names) != (summary["schema_version"] in (2,3))
+            ) or ("data_collection_dataset" in names)!=(summary["schema_version"]==3):
                 raise ValueError("catalog audit schema and projection set disagree")
+            if "data_collection_dataset" in names:
+                from rquant.data_collection_projection import read_data_collection_projection_rows
+                collection=projections['data_collection_dataset']
+                if collection.available_at!=projections['audit_report_overview'].available_at:
+                    raise ValueError('collection source and original report publication times differ')
+                read_data_collection_projection_rows(tuple(dict(row) for row in collection.rows),report_hash=str(report_hash))
             if "audit_report_dataset" in names:
                 dataset_projection = projections["audit_report_dataset"]
                 if (
@@ -5526,6 +5555,7 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
         factor_result_projections: tuple[ServingProjectionPayload, ...] = (),
         factor_tracking_projections: tuple[ServingProjectionPayload, ...] = (),
         strategy_definition_projections: tuple[ServingProjectionPayload, ...] = (),
+        data_center_execution_projections: tuple[ServingProjectionPayload,...] = (),
     ) -> LabPageProjectionSnapshot:
         from rquant.factor.result_serving import FACTOR_RESULT_PROJECTION_TABLES
 
@@ -5552,7 +5582,8 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
         )
         if audit_report_projections and {
             item.table_name for item in audit_report_projections
-        } not in (REPORT_PROJECTION_TABLES, REPORT_PROJECTION_TABLES | {"audit_report_dataset"}):
+        } not in (REPORT_PROJECTION_TABLES, REPORT_PROJECTION_TABLES | {"audit_report_dataset"},
+            REPORT_PROJECTION_TABLES | {'audit_report_dataset','data_collection_dataset'}):
             raise ValueError("audit report projections must be complete")
         if (
             audit_job_projections
@@ -5597,6 +5628,7 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
                     *factor_result_projections,
                     *factor_tracking_projections,
                     *strategy_definition_projections,
+                    *data_center_execution_projections,
                 ),
                 key=lambda item: item.table_name,
             )

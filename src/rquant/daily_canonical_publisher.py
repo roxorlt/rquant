@@ -753,6 +753,17 @@ class DailyCanonicalPublisher:
             )
         return tuple(watermarks)
 
+    @classmethod
+    def collect_table_watermarks(
+        cls, store: DuckDBStore, trade_date: date,
+    ) -> tuple[CanonicalTableWatermark,...]:
+        """Reuse the published canonical table queries and digest rules."""
+        return cls._collect_watermarks(store,trade_date)
+
+    @staticmethod
+    def database_identity(store: DuckDBStore) -> CanonicalDatabaseIdentity:
+        return DailyCanonicalPublisher._database_identity(store)
+
     @staticmethod
     def _receipt(
         candidate: DailyCloseCandidate,

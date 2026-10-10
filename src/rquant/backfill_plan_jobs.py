@@ -57,6 +57,8 @@ class BackfillPlanJobRequest(_JobModel):
     completed_through: date
     observed_at: datetime
     assumptions: BackfillEstimateAssumptions
+    owner: str | None = Field(default=None,min_length=1,max_length=256)
+    page_command_id: str | None = Field(default=None,min_length=1,max_length=128)
 
     @field_validator("snapshot_path")
     @classmethod
@@ -133,8 +135,9 @@ class _Claim:
 
 
 def _canonical_request(request: BackfillPlanJobRequest) -> str:
+    absent={name for name in ('owner','page_command_id') if getattr(request,name) is None}
     return json.dumps(
-        request.model_dump(mode="json"), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        request.model_dump(mode="json",exclude=absent), ensure_ascii=False, sort_keys=True, separators=(",", ":")
     )
 
 
@@ -434,6 +437,15 @@ class BackfillPlanJobStore:
         request = BackfillPlanJobRequest.model_validate_json(row["request_json"])
         return request, row["task_id"]
 
+    def request_for_task(self,task_id: str) -> BackfillPlanJobRequest:
+        if re.fullmatch(r'[0-9a-f]{32}',task_id) is None:
+            raise ValueError('invalid backfill plan task id')
+        with closing(self._connect()) as connection:
+            row=connection.execute('SELECT request_json FROM backfill_plan_job WHERE task_id=?',(task_id,)).fetchone()
+        if row is None:
+            raise KeyError(task_id)
+        return BackfillPlanJobRequest.model_validate_json(row['request_json'])
+
     def retry_failed(self, task_id: str) -> BackfillPlanJobReceipt:
         with self._transaction() as connection:
             now = _utc(self.clock).isoformat()
@@ -650,8 +662,10 @@ def _error_code(error: Exception) -> _ErrorCode:
 class BackfillPlanJobWorker:
     """Run one claimed read-only task; expired claims are fenced and safely replayed."""
 
-    def __init__(self, store: BackfillPlanJobStore) -> None:
+    def __init__(self, store: BackfillPlanJobStore, *,
+            on_verified_plan: Callable[[BackfillPlanJobRequest, DailyBarBackfillPlan], None] | None = None) -> None:
         self.store = store
+        self.on_verified_plan = on_verified_plan
 
     def run_one(self) -> BackfillPlanJobReceipt | None:
         claim = self.store._claim()
@@ -707,6 +721,10 @@ class BackfillPlanJobWorker:
             snapshot_sha256 = plan.source.claimed_file_sha256
             if lost.is_set():
                 raise RuntimeError("backfill plan task lease was lost")
+            if self.on_verified_plan is not None:
+                self.on_verified_plan(request, plan)
+                if lost.is_set():
+                    raise RuntimeError("backfill plan task lease was lost")
             return self.store._finish_success(claim, plan.content_sha256, snapshot_sha256)
         except Exception as exc:
             if lost.is_set():
