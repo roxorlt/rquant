@@ -33,6 +33,7 @@ from rquant.storage.schema import (
     PAPER_POSITION_TAKE_PROFIT_BASIS_MIGRATION_DDL,
     SCREEN_RUN_PRICE_RECEIPT_MIGRATION_DDLS,
     SCREEN_RUN_RECEIPT_DDL,
+    SCREEN_RUN_EVIDENCE_DDL,
     STOCK_STATUS_DAILY_V4_DDL,
     STOCK_STATUS_NAME_OPTIONAL_MIGRATION_DDLS,
     STOCK_SUSPEND_COVERAGE_DDL,
@@ -189,6 +190,11 @@ MIGRATIONS: tuple[Migration, ...] = (
         version=15,
         name="immutable fundamental daily derivations",
         statements=FUNDAMENTAL_DAILY_VERSION_DDLS,
+    ),
+    Migration(
+        version=16,
+        name="atomic daily screen input and ranking evidence",
+        statements=(SCREEN_RUN_EVIDENCE_DDL,),
     ),
 )
 

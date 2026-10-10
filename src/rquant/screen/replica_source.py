@@ -358,13 +358,18 @@ class VerifiedReplicaScreenSource:
         expected_identity: str | None = None,
         include_columns: Sequence[str] | None = None,
         rsi_projection: VerifiedDynamicRsiProjection | None = None,
+        intraday_columns: frozenset[str] = frozenset(),
     ) -> ScreenUniverseSnapshot:
         if type(trade_date) is not date:
             raise ValueError("screen trade date must be a date")
         if len(rules) > MAX_CONDITIONS:
             raise ScreenReplicaBudgetError("screen has too many conditions")
-        rule_columns = required_rule_columns(rules)
-        requested_columns = rule_columns | frozenset(include_columns or ())
+        from rquant.screen.intraday_contracts import INTRADAY_FIELD_LABELS
+
+        if not intraday_columns.issubset(INTRADAY_FIELD_LABELS):
+            raise ValueError("only registered intraday dependencies may be supplied separately")
+        rule_columns = required_rule_columns(rules) - intraday_columns
+        requested_columns = (rule_columns | frozenset(include_columns or ())) - intraday_columns
         adjusted_return_requested = RETURN_20D_COLUMN in (include_columns or ())
         load_columns = (
             requested_columns - {RETURN_20D_COLUMN}

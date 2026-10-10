@@ -33,6 +33,11 @@ def test_every_api_path_is_versioned_and_only_defined_mutations_use_post() -> No
             if path
             in {
                 "/api/v1/screen/run",
+                "/api/v1/screen/query/execute",
+                "/api/v1/screen/query/lookup",
+                "/api/v1/screen/query/resume",
+                "/api/v1/screen/query/presets/save",
+                "/api/v1/screen/query/alert-draft",
                 "/api/v1/screen/nl-preview",
                 "/api/v1/screen/tdx/parse",
                 "/api/v1/screen/tdx/preview",
@@ -41,6 +46,8 @@ def test_every_api_path_is_versioned_and_only_defined_mutations_use_post() -> No
                 "/api/v1/monitor/ack",
                 "/api/v1/monitor/price-rules/commands",
                 "/api/v1/monitor/price-rules/commands/resume",
+                "/api/v1/monitor/condition-rules/commands",
+                "/api/v1/monitor/condition-rules/commands/resume",
                 "/api/v1/backtests/portfolio/exports",
                 "/api/v1/watchlist/commands",
                 "/api/v1/data/backfill-plans/commands",

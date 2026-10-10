@@ -9,6 +9,7 @@ from typing import Any
 from pydantic_core import PydanticUndefined
 
 from rquant.llm.registry import REGISTRY, RuleSpec
+from rquant.screen.intraday_contracts import INTRADAY_FIELD_LABELS
 from rquant.web.models.screen import (
     ScreenBlock,
     ScreenCondition,
@@ -97,6 +98,7 @@ RANKING_METRIC_LABELS = {
     "TURNOVER_RATE[0]": "换手率",
     "CIRC_MV[0]": "流通市值",
     "PCT_CHG[0]": "今日涨跌幅",
+    **INTRADAY_FIELD_LABELS,
 }
 
 
@@ -137,6 +139,8 @@ def _parameter(
     dynamic_ma: bool,
     dynamic_rsi: bool,
     fundamental_fields: Collection[str],
+    extra_fields: tuple[tuple[str, str], ...],
+    daily_anchor: bool,
 ) -> ScreenParameter:
     field = spec.args_model.model_fields[key]
     prop = spec.args_model.model_json_schema()["properties"][key]
@@ -152,8 +156,9 @@ def _parameter(
         or (spec.name == "between" and key == "field")
     )
     fields = (
-        *_FIELDS,
+        *((key, "上个交易日" + label if daily_anchor else label) for key, label in _FIELDS),
         *(_FUNDAMENTAL_FIELDS[name] for name in _FUNDAMENTAL_FIELDS if name in fundamental_fields),
+        *extra_fields,
     )
     if key == "boards":
         label, kind, options = "板块", "multi_choice", _options(_BOARD_OPTIONS)
@@ -266,6 +271,8 @@ def screen_blocks(
     dynamic_ma: bool = False,
     dynamic_rsi: bool = False,
     fundamental_fields: Collection[str] = (),
+    extra_fields: tuple[tuple[str, str], ...] = (),
+    daily_anchor: bool = False,
 ) -> list[ScreenBlock]:
     if set(_RULE_COPY) != {spec.name for spec in REGISTRY}:
         raise ValueError("screen rule catalog labels are out of sync with registry")
@@ -273,7 +280,7 @@ def screen_blocks(
         ScreenBlock(
             key=spec.name,
             label=_RULE_COPY[spec.name][0],
-            hint=_RULE_COPY[spec.name][1],
+            hint=_RULE_COPY[spec.name][1] + ("；日线条件使用上个已收盘交易日" if daily_anchor else ""),
             category=spec.category,
             category_label=_CATEGORIES[spec.category],
             parameters=[
@@ -283,6 +290,8 @@ def screen_blocks(
                     dynamic_ma=dynamic_ma,
                     dynamic_rsi=dynamic_rsi,
                     fundamental_fields=fundamental_fields,
+                    extra_fields=extra_fields,
+                    daily_anchor=daily_anchor,
                 )
                 for name in spec.args_model.model_fields
             ],
@@ -325,6 +334,7 @@ def validate_screen_choices(
     dynamic_ma: bool = False,
     dynamic_rsi: bool = False,
     fundamental_fields: Collection[str] = (),
+    extra_fields: tuple[tuple[str, str], ...] = (),
 ) -> list[dict[str, Any]]:
     """Accept only offered choices and normalize replica MA periods for the registry."""
 
@@ -334,6 +344,7 @@ def validate_screen_choices(
             dynamic_ma=dynamic_ma,
             dynamic_rsi=dynamic_rsi,
             fundamental_fields=fundamental_fields,
+            extra_fields=extra_fields,
         )
     }
     normalized: list[dict[str, Any]] = []

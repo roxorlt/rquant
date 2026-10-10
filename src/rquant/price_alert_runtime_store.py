@@ -419,7 +419,17 @@ class PriceAlertRuntimeStore:
                 for row in connection.execute("SELECT sql FROM sqlite_master WHERE sql IS NOT NULL")
             }
             if tables != _TABLES or schema != set(_INSTALL_SQL):
-                raise ValueError("price runtime installation marker or schema differs")
+                from rquant.condition_alert_runtime import (
+                    CONDITION_RUNTIME_SQL,
+                    CONDITION_RUNTIME_TABLES,
+                    verify_condition_runtime_namespace,
+                )
+
+                if tables != _TABLES | CONDITION_RUNTIME_TABLES or schema != set(
+                    _INSTALL_SQL
+                ) | set(CONDITION_RUNTIME_SQL):
+                    raise ValueError("price runtime installation marker or schema differs")
+                verify_condition_runtime_namespace(connection)
             row = connection.execute(
                 "SELECT * FROM price_alert_runtime_identity WHERE key='current'"
             ).fetchone()

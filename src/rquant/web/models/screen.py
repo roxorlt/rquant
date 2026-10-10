@@ -7,6 +7,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from rquant.runtime_contracts import AwareUtcDatetime
 from rquant.screen.tdx.ast import ParseResult
 
 
@@ -49,12 +50,18 @@ class ScreenSourceInfo(BaseModel):
 
     identity: str
     updated_at: datetime
+    mode: Literal["daily", "intraday"] = "daily"
+    cutoff: AwareUtcDatetime | None = None
+    daily_anchor_date: date | None = None
+    intraday_source_identity: str | None = None
+    coverage_count: int | None = None
+    missing_count: int | None = None
 
 
 class ScreenCatalogData(BaseModel):
     model_config = ConfigDict(frozen=True)
 
-    source_kind: Literal["serving", "replica"]
+    source_kind: Literal["serving", "replica", "intraday"]
     blocks: list[ScreenBlock]
     dates: list[date]
     available: bool
@@ -127,6 +134,23 @@ class ScreenRunRequest(BaseModel):
     cursor: str | None = Field(default=None, max_length=1024)
     source_identity: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     ranking: ScreenRankingPlan | None = None
+    mode: Literal["daily", "intraday"] = "daily"
+    decision_cutoff: AwareUtcDatetime | None = None
+    intraday_source_identity: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def require_mode_source(self) -> ScreenRunRequest:
+        if self.mode == "intraday" and (
+            self.source_identity is None
+            or self.decision_cutoff is None
+            or self.intraday_source_identity is None
+        ):
+            raise ValueError("intraday screening requires its source and cutoff")
+        if self.mode == "daily" and (
+            self.decision_cutoff is not None or self.intraday_source_identity is not None
+        ):
+            raise ValueError("daily screening cannot contain intraday source context")
+        return self
 
 
 class ScreenStep(BaseModel):

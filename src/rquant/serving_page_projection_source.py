@@ -20,7 +20,9 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Annotated, Self
 
 if TYPE_CHECKING:
+    from rquant.condition_alert_runtime_projection import ConditionRuleAuthoritySnapshot
     from rquant.factor.tracking import FactorTrackingIdentity
+    from rquant.screen.intraday_source import IntradayScreenProjectionSource
     from rquant.strategy_authoring_projection import StrategyAuthoringProjectionSource
 from uuid import uuid4
 from zoneinfo import ZoneInfo
@@ -132,7 +134,14 @@ from rquant.page_control import (
 from rquant.pool_definition_projection import PoolMutation, build_pool_definition_rows
 from rquant.pool_member_return import calculate_adjusted_pool_return
 from rquant.pool_membership import PoolDayEvidence, PoolMemberClose, compute_pool_membership
-from rquant.pool_result_receipt import ScreenRunReceipt, member_price_digest, member_set_digest
+from rquant.pool_result_receipt import (
+    DailyScreenAuthority,
+    ScreenRunEvidence,
+    ScreenRunReceipt,
+    member_price_digest,
+    member_set_digest,
+    persisted_result_digests,
+)
 from rquant.price_alert_rule_store import _SCHEMA_COLUMNS, PriceAlertRuleRepository
 from rquant.readside_replica_gate import (
     UNLIMITED_READ_PROFILE,
@@ -175,10 +184,16 @@ from rquant.serving_price_alert_rule_projection import (
     build_price_alert_rule_projections,
     validate_price_alert_rule_projections,
 )
-from rquant.serving_read_models import ProjectionScalar, ServingProjectionPayload
+from rquant.serving_read_models import (
+    ProjectionScalar,
+    ServingOwnerProjectionCapacityError,
+    ServingProjectionInput,
+    ServingProjectionPayload,
+    require_projection_owner_budget,
+)
 from rquant.storage.duckdb import DuckDBStore
-from rquant.strict_json import StrictJsonError, strict_json_loads
 from rquant.strategy_authoring_projection_contract import STRATEGY_TEMPLATE_PROJECTION_TABLES
+from rquant.strict_json import StrictJsonError, strict_json_loads
 
 Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 CommitSha = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{40}$")]
@@ -1440,6 +1455,46 @@ class _ReadonlyPageControlAuditReader:
                 "PageControl price rule snapshot is invalid"
             ) from exc
 
+    def condition_alert_rule_snapshot(self) -> ConditionRuleAuthoritySnapshot | None:
+        from rquant.condition_alert_rule_store import ConditionAlertRuleRepository
+        from rquant.condition_alert_runtime_projection import ConditionRuleAuthoritySnapshot
+
+        if self._snapshot_connection is None:
+            raise RuntimeError("condition authority requires the original audit snapshot")
+        self._price_rule_read = True
+        self._require_no_sidecars()
+        with self._read_connection() as connection:
+            marker = connection.execute(
+                "SELECT protocol_version,activated_at FROM page_control_protocol_activation "
+                "WHERE marker_name='condition-alert-rule/v1'"
+            ).fetchone()
+            present = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE name='condition_alert_rule'"
+            ).fetchone()
+            if marker is None and present is None:
+                return None
+            if marker is None or present is None or marker[0] != 1:
+                raise PageProjectionSourceIntegrityError(
+                    "condition authority schema and activation differ"
+                )
+            repo = ConditionAlertRuleRepository(connection)
+            repo._require_schema()
+            rows = connection.execute(
+                "SELECT owner_id,rule_id,version,deleted,rule_json,updated_at_utc "
+                "FROM condition_alert_rule ORDER BY owner_id,rule_id LIMIT 10001"
+            ).fetchall()
+        if len(rows) > 10000:
+            raise PageProjectionSourceIntegrityError(
+                "condition authority full heads exceed capacity"
+            )
+        activated = normalize_aware_utc(datetime.fromisoformat(marker[1]))
+        if activated.isoformat(timespec="microseconds") != marker[1]:
+            raise ValueError("condition activation time is not canonical")
+        self._require_no_sidecars()
+        return ConditionRuleAuthoritySnapshot.create(
+            activated_at=activated, rows=tuple(repo._entry(row) for row in rows)
+        )
+
     def audit(self, command_id: str) -> _ReadonlyPageControlAudit | None:
         with self._read_connection() as connection:
             row = connection.execute(
@@ -1989,6 +2044,152 @@ def _receipt_projection(
     )
 
 
+def _verified_daily_screen_authority(
+    connection: duckdb.DuckDBPyConnection,
+    authority: DailyScreenAuthority,
+    *,
+    observed: datetime,
+) -> DailyScreenAuthority | None:
+    from rquant.daily_canonical_publisher import DailyCanonicalPublishReceipt
+
+    tables = connection.execute(
+        "SELECT table_name FROM information_schema.tables WHERE table_schema='main' "
+        "AND table_name IN ('daily_canonical_publication','daily_canonical_publish_receipt')"
+    ).fetchall()
+    if len(tables) != 2:
+        return None
+    raw = connection.execute(
+        "SELECT generation_id,payload_sha256,payload_json "
+        "FROM daily_canonical_publish_receipt WHERE receipt_id=?",
+        [authority.canonical_receipt_id],
+    ).fetchone()
+    if raw is None or not isinstance(raw[2], str) or len(raw[2].encode()) > 2 * 1024 * 1024:
+        return None
+    try:
+        receipt = DailyCanonicalPublishReceipt.model_validate_json(raw[2])
+    except ValueError:
+        return None
+    publication = connection.execute(
+        "SELECT trade_date,source_generation_id,db_content_sha256,canonical_receipt_id,is_current "
+        "FROM daily_canonical_publication WHERE generation_id=?",
+        [authority.canonical_generation_id],
+    ).fetchone()
+    publication_id = (
+        receipt.receipt_id
+        if receipt.publication_mode == "committed"
+        else receipt.recovery_of_receipt_id
+    )
+    if not (
+        raw[0] == receipt.generation_id == authority.canonical_generation_id
+        and raw[1] == hashlib.sha256(raw[2].encode()).hexdigest()
+        and receipt.receipt_id == authority.canonical_receipt_id
+        and receipt.source_generation_id == authority.source_generation_id
+        and receipt.trade_date == authority.trade_date
+        and receipt.available_at == authority.available_at <= observed
+        and receipt.committed_at <= observed
+        and publication
+        == (
+            receipt.trade_date,
+            receipt.source_generation_id,
+            receipt.db_content_sha256,
+            publication_id,
+            True,
+        )
+    ):
+        return None
+    return authority
+
+
+def _screen_evidence_projection(
+    connection: duckdb.DuckDBPyConnection,
+    receipts: _VerifiedRunReceipts | None,
+    *,
+    cutoff: datetime,
+    observed: datetime,
+) -> ServingProjectionPayload | None:
+    if (
+        receipts is None
+        or not connection.execute(
+            "SELECT COUNT(*) FROM information_schema.tables "
+            "WHERE table_schema='main' AND table_name='screen_run_evidence'"
+        ).fetchone()[0]
+    ):
+        return None
+    rows: list[dict[str, object]] = []
+    available = _EMPTY_PROJECTION_AVAILABLE_AT
+    for receipt in receipts.latest:
+        raw = connection.execute(
+            "SELECT result_version,evidence_version,payload_json "
+            "FROM screen_run_evidence WHERE trade_date=? AND preset_name=?",
+            [receipt.trade_date, receipt.preset_name],
+        ).fetchone()
+        if raw is None:
+            continue
+        if not isinstance(raw[2], str) or len(raw[2].encode()) > 2 * 1024 * 1024:
+            raise PageProjectionSourceIntegrityError("screen input evidence exceeds bound")
+        try:
+            proof = ScreenRunEvidence.model_validate_json(raw[2])
+            actual = connection.execute(
+                "SELECT ts_code,extra FROM screen_result WHERE trade_date=? "
+                "AND preset_name=? AND created_at<=? ORDER BY ts_code LIMIT ?",
+                [receipt.trade_date, receipt.preset_name, cutoff, _MAX_RUN_MEMBERS_PER_POOL + 1],
+            ).fetchall()
+            digests = persisted_result_digests(actual, ranked=proof.ranking_plan_digest is not None)
+            if (
+                raw[:2] != (proof.result_version, proof.evidence_version)
+                or proof.result_version not in receipts.price_digest_verified
+                or proof.result_version != receipt.result_version
+                or proof.definition_version != receipt.definition_version
+                or proof.preset_name != receipt.preset_name
+                or proof.input.trade_date != receipt.trade_date
+                or proof.completed_at != receipt.completed_at
+                or proof.completed_at > observed
+                or proof.input.decision_at > proof.completed_at
+                or proof.input.decision_at > observed
+                or len(actual) != proof.hit_count
+                or proof.hit_count != receipt.hit_count
+                or (proof.input.unknown_count and receipt.lineage_complete)
+                or digests != (proof.persisted_extra_digest, proof.member_rank_digest)
+            ):
+                continue
+        except (ValueError, TypeError):
+            continue
+        authority = proof.input.canonical_authority
+        if (
+            authority is not None
+            and _verified_daily_screen_authority(connection, authority, observed=observed) is None
+        ):
+            continue
+        rows.append(
+            {
+                "trade_date": proof.input.trade_date.isoformat(),
+                "preset_name": proof.preset_name,
+                "definition_version": proof.definition_version,
+                "result_version": proof.result_version,
+                "source_kind": proof.input.source_kind,
+                "source_identity": proof.input.source_identity,
+                "content_digest": proof.input.content_digest,
+                "decision_at": proof.input.decision_at.isoformat(),
+                "universe_count": proof.input.universe_count,
+                "unknown_count": proof.input.unknown_count,
+                "hit_count": proof.hit_count,
+                "ranking_plan_digest": proof.ranking_plan_digest,
+                "member_rank_digest": proof.member_rank_digest,
+                "persisted_extra_digest": proof.persisted_extra_digest,
+                "writer_contract_fingerprint": proof.input.writer_contract_fingerprint,
+                "evidence_version": proof.evidence_version,
+                "completed_at": proof.completed_at.isoformat(),
+                "canonical_receipt_id": authority.canonical_receipt_id if authority else None,
+                "canonical_generation_id": authority.canonical_generation_id if authority else None,
+                "source_generation_id": authority.source_generation_id if authority else None,
+            }
+        )
+        available = max(available, proof.completed_at)
+    return ServingProjectionPayload(
+        table_name="screen_run_evidence", available_at=available, rows=tuple(rows)
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class _MembershipSource:
     target_date: date | None
@@ -2437,6 +2638,7 @@ class _DatabaseProjection:
     canvas_diagnostics: tuple[CanvasDiagnosticProjectionRow, ...]
     canvas_hits: tuple[CanvasHitProjectionRow, ...]
     run_receipts: _VerifiedRunReceipts | None
+    screen_run_evidence: ServingProjectionPayload | None
     membership: _MembershipSource
     monitor_event: ServingProjectionPayload
     available_at: datetime
@@ -2745,6 +2947,20 @@ class DuckDBSignalPageProjectionSource:
             price_alert_rule_projections = build_price_alert_rule_projections(
                 None, observed_at=observed, unavailable=True
             )
+        from rquant.condition_alert_runtime_projection import condition_rule_projections
+
+        try:
+            condition_rules = condition_rule_projections(
+                None
+                if self.page_control_outbox is None
+                else self.page_control_outbox.condition_alert_rule_snapshot(),
+                observed_at=observed,
+                unavailable=self.page_control_outbox is None,
+            )
+        except (OSError, sqlite3.Error, ValueError, PageProjectionSourceIntegrityError):
+            condition_rules = condition_rule_projections(
+                None, observed_at=observed, unavailable=True
+            )
         formula_pool_projections: tuple[ServingProjectionPayload, ...] = ()
         if self.formula_pool_config is not None:
             try:
@@ -2779,6 +2995,7 @@ class DuckDBSignalPageProjectionSource:
                 formula_pool_projections[2] if formula_pool_projections else None
             ),
             screen_run_receipt=run_receipt_projection,
+            screen_run_evidence=database.screen_run_evidence,
             pool_membership=pool_membership,
             pool_member_return=pool_member_return,
             pulse_history=pulse_history,
@@ -2798,6 +3015,8 @@ class DuckDBSignalPageProjectionSource:
             price_alert_rule=(
                 price_alert_rule_projections[1] if len(price_alert_rule_projections) > 1 else None
             ),
+            condition_alert_rule_state=condition_rules[0],
+            condition_alert_rule=condition_rules[1],
         )
 
     def legacy_notification_projections(
@@ -2894,6 +3113,12 @@ class DuckDBSignalPageProjectionSource:
                 cutoff=cutoff,
                 observed=observed or cutoff.replace(tzinfo=_SHANGHAI).astimezone(UTC),
                 generation_sealed_before_cutoff=sealed_before_cutoff,
+            )
+            screen_evidence = _screen_evidence_projection(
+                connection,
+                run_receipts,
+                cutoff=cutoff,
+                observed=observed or cutoff.replace(tzinfo=_SHANGHAI).astimezone(UTC),
             )
             if run_receipts is not None:
                 if run_receipts.newest_candidate_day is not None:
@@ -3080,6 +3305,7 @@ class DuckDBSignalPageProjectionSource:
             canvas_diagnostics=diagnostics,
             canvas_hits=hits,
             run_receipts=run_receipts,
+            screen_run_evidence=screen_evidence,
             membership=membership_source,
             monitor_event=monitor_projection,
             available_at=database_available,
@@ -4029,7 +4255,9 @@ class DuckDBLabPageProjectionSource:
             formula_market_projections=self._formula_market_projections(observed),
             factor_definition_projections=self._factor_definition_projections(observed),
             factor_tracking_projections=self._factor_tracking_projections(observed),
-            strategy_definition_projections=() if self.strategy_authoring_source is None else self.strategy_authoring_source(observed),
+            strategy_definition_projections=()
+            if self.strategy_authoring_source is None
+            else self.strategy_authoring_source(observed),
         )
 
     @staticmethod
@@ -4145,6 +4373,7 @@ class SignalPageProjectionProducer:
         source: DuckDBSignalPageProjectionSource,
         store: NotificationStateStore,
         companion_projections: tuple[ServingProjectionPayload, ...] | None = None,
+        intraday_source: IntradayScreenProjectionSource | None = None,
     ) -> None:
         self.source = source
         self.store = store
@@ -4154,6 +4383,7 @@ class SignalPageProjectionProducer:
         ):
             raise ValueError("signal companion projections are incomplete")
         self.companion_projections = companion_projections
+        self.intraday_source = intraday_source
 
     def publish(self, observed_at: datetime) -> NotificationProjectionPublication:
         """Publish this iteration's page projection, and say whether it wrote anything.
@@ -4185,6 +4415,9 @@ class SignalPageProjectionProducer:
                     "legacy_notification_status",
                     "pool_definition",
                     "screen_run_receipt",
+                    "screen_run_evidence",
+                    "intraday_feature_snapshot",
+                    "intraday_screen_source",
                     "pool_membership",
                     "pool_member_return",
                     "formula_pool_state",
@@ -4229,14 +4462,6 @@ class SignalPageProjectionProducer:
             page_projections = tuple(
                 item for item in page_projections if item.table_name not in injected_names
             )
-        page_source = NotificationProjectionSourceReceipt.create(
-            dataset_id="signal-page-projections",
-            generation_id=page_generation_id,
-            sequence=int(page_available_at.timestamp() * 1_000_000),
-            event_time=page_available_at,
-            published_at=observed,
-            projections=page_projections,
-        )
         if self.companion_projections is None:
             previous = self.store.serving_snapshot(observed_at=observed, history_limit=1)
             previous_by_name = {
@@ -4245,35 +4470,99 @@ class SignalPageProjectionProducer:
             companion_projections = tuple(
                 previous_by_name.get(table_name)
                 or ServingProjectionPayload(
-                    table_name=table_name,
-                    available_at=_EMPTY_PROJECTION_AVAILABLE_AT,
-                    rows=(),
+                    table_name=table_name, available_at=_EMPTY_PROJECTION_AVAILABLE_AT, rows=()
                 )
-                for table_name in sorted(
-                    _COMPANION_SIGNAL_TABLES - {"monitor_event", "surge_event"}
-                )
+                for table_name in sorted(_COMPANION_SIGNAL_TABLES - {"monitor_event", "surge_event"})
             )
         else:
             companion_projections = self.companion_projections
-        companion_identity = {
-            "dataset_id": "signal-companion-projections",
-            "projections": companion_projections,
-        }
-        companion_source = NotificationProjectionSourceReceipt.create(
-            dataset_id="signal-companion-projections",
-            generation_id=canonical_sha256(companion_identity),
-            sequence=int(
-                max(item.available_at for item in companion_projections).timestamp() * 1_000_000
-            ),
-            event_time=max(item.available_at for item in companion_projections),
-            published_at=observed,
-            projections=companion_projections,
-        )
-        authority = NotificationProjectionAuthoritySnapshot.create_from_sources(
-            observed_at=observed,
-            sources=(page_source, companion_source),
-        )
+
+
+        def candidate(
+            domain: tuple[ServingProjectionPayload, ...], domain_generation: str | None = None
+        ) -> NotificationProjectionAuthoritySnapshot:
+            dynamic_names = {item.table_name for item in domain}
+            page = tuple(item for item in page_projections if item.table_name not in dynamic_names)
+            companion = tuple(
+                item for item in companion_projections if item.table_name not in dynamic_names
+            )
+            page_source = NotificationProjectionSourceReceipt.create(
+                dataset_id="signal-page-projections",
+                generation_id=page_generation_id,
+                sequence=int(page_available_at.timestamp() * 1_000_000),
+                event_time=page_available_at,
+                published_at=observed,
+                projections=page,
+            )
+            companion_identity = {"dataset_id": "signal-companion-projections", "projections": companion}
+            companion_at = max(item.available_at for item in companion)
+            companion_source = NotificationProjectionSourceReceipt.create(
+                dataset_id="signal-companion-projections",
+                generation_id=canonical_sha256(companion_identity),
+                sequence=int(companion_at.timestamp() * 1_000_000),
+                event_time=companion_at,
+                published_at=observed,
+                projections=companion,
+            )
+            sources = (page_source, companion_source)
+            if domain:
+                sources += (
+                    NotificationProjectionSourceReceipt.create(
+                        dataset_id="intraday-screen-projections",
+                        generation_id=domain_generation,
+                        sequence=int(observed.timestamp() * 1_000_000),
+                        event_time=observed,
+                        published_at=observed,
+                        projections=domain,
+                    ),
+                )
+            return NotificationProjectionAuthoritySnapshot.create_from_sources(
+                observed_at=observed, sources=sources
+            )
+
+
+        def require_budget(value: NotificationProjectionAuthoritySnapshot) -> None:
+            require_projection_owner_budget(
+                tuple(
+                    ServingProjectionInput.bind(
+                        projection, owner_dataset_id="signals", owner_generation_id=value.generation_id
+                    )
+                    for projection in value.projections
+                )
+            )
+
+
+        authority = candidate(())
+        require_budget(authority)
+        if self.intraday_source is not None:
+            from rquant.screen.intraday_source import intraday_projections
+
+            unavailable = tuple(
+                ServingProjectionPayload(table_name=name, available_at=observed, rows=())
+                for name in ("intraday_screen_source", "intraday_feature_snapshot")
+            )
+            unavailable_generation = canonical_sha256({"unavailable": True, "cutoff": observed})
+            try:
+                intraday_snapshot = self.intraday_source(observed)
+                domain = intraday_projections(intraday_snapshot)
+                domain_generation = intraday_snapshot.source.source_identity
+            except (ValueError, RuntimeError, OSError):
+                logger.warning("盘中选股来源暂不可用")
+                domain, domain_generation = unavailable, unavailable_generation
+            proposed = candidate(domain, domain_generation)
+            try:
+                require_budget(proposed)
+            except ServingOwnerProjectionCapacityError:
+                logger.warning("盘中选股出处超过原共享预算，来源暂不可用")
+                proposed = candidate(unavailable, unavailable_generation)
+                try:
+                    require_budget(proposed)
+                except ServingOwnerProjectionCapacityError:
+                    # Even empty optional metadata cannot displace a full valid legacy owner.
+                    proposed = authority
+            authority = proposed
         return self.store.publish_projection_authority(authority)
+
 
 
 class ScreenBoundsProjectionRow(RuntimeContractModel):
@@ -5137,6 +5426,7 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
             "formula_pool_definition",
             "formula_pool_latest_result",
             "screen_run_receipt",
+            "screen_run_evidence",
             "pool_membership",
             "pool_member_return",
             "pulse_history",
@@ -5150,6 +5440,8 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
             "manual_watchlist",
             "price_alert_rule_state",
             "price_alert_rule",
+            "condition_alert_rule_state",
+            "condition_alert_rule",
             "legacy_notification",
             "legacy_notification_status",
         }
@@ -5161,6 +5453,9 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
         validate_formula_pool_projections({item.table_name: item for item in self.projections})
         validate_manual_watchlist_projections({item.table_name: item for item in self.projections})
         validate_price_alert_rule_projections({item.table_name: item for item in self.projections})
+        from rquant.condition_alert_runtime_projection import validate_condition_rule_projections
+
+        validate_condition_rule_projections({item.table_name: item for item in self.projections})
         expected = canonical_sha256(self.model_dump(mode="python", exclude={"content_sha256"}))
         if self.content_sha256 != expected:
             raise ValueError("signal page projection snapshot hash mismatch")
@@ -5182,6 +5477,7 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
         formula_pool_definition: ServingProjectionPayload | None = None,
         formula_pool_latest_result: ServingProjectionPayload | None = None,
         screen_run_receipt: ServingProjectionPayload | None = None,
+        screen_run_evidence: ServingProjectionPayload | None = None,
         pool_membership: ServingProjectionPayload | None = None,
         pool_member_return: ServingProjectionPayload | None = None,
         pulse_history: PulseHistoryProjectionSource | None = None,
@@ -5195,6 +5491,8 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
         manual_watchlist: ServingProjectionPayload | None = None,
         price_alert_rule_state: ServingProjectionPayload | None = None,
         price_alert_rule: ServingProjectionPayload | None = None,
+        condition_alert_rule_state: ServingProjectionPayload | None = None,
+        condition_alert_rule: ServingProjectionPayload | None = None,
         legacy_notification: ServingProjectionPayload | None = None,
         legacy_notification_status: ServingProjectionPayload | None = None,
     ) -> SignalPageProjectionSnapshot:
@@ -5255,6 +5553,7 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
             ("formula_pool_definition", formula_pool_definition),
             ("formula_pool_latest_result", formula_pool_latest_result),
             ("screen_run_receipt", screen_run_receipt),
+            ("screen_run_evidence", screen_run_evidence),
             ("pool_membership", pool_membership),
             ("pool_member_return", pool_member_return),
             ("monitor_event", monitor_event),
@@ -5265,6 +5564,8 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
             ("manual_watchlist", manual_watchlist),
             ("price_alert_rule_state", price_alert_rule_state),
             ("price_alert_rule", price_alert_rule),
+            ("condition_alert_rule_state", condition_alert_rule_state),
+            ("condition_alert_rule", condition_alert_rule),
             ("legacy_notification", legacy_notification),
             ("legacy_notification_status", legacy_notification_status),
         ):
@@ -5387,10 +5688,14 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
                 raise ValueError("catalog audit schema and projection set disagree")
             if "audit_report_dataset" in names:
                 dataset_projection = projections["audit_report_dataset"]
-                if dataset_projection.available_at != projections["audit_report_overview"].available_at:
+                if (
+                    dataset_projection.available_at
+                    != projections["audit_report_overview"].available_at
+                ):
                     raise ValueError("catalog audit and daily report projection times disagree")
                 results = read_catalog_audit_projection_rows(
-                    tuple(dict(row) for row in dataset_projection.rows), report_hash=str(report_hash)
+                    tuple(dict(row) for row in dataset_projection.rows),
+                    report_hash=str(report_hash),
                 )
                 if any(
                     result.audit_start.isoformat() != summary["audit_start"]
@@ -5546,11 +5851,9 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
                 rows=tuple(_research_gate_row(row) for row in rows),
             ),
         )
-        if (
-            audit_report_projections
-            and {item.table_name for item in audit_report_projections}
-            not in (REPORT_PROJECTION_TABLES, REPORT_PROJECTION_TABLES | {"audit_report_dataset"})
-        ):
+        if audit_report_projections and {
+            item.table_name for item in audit_report_projections
+        } not in (REPORT_PROJECTION_TABLES, REPORT_PROJECTION_TABLES | {"audit_report_dataset"}):
             raise ValueError("audit report projections must be complete")
         if (
             audit_job_projections
@@ -5581,7 +5884,11 @@ class LabPageProjectionSnapshot(RuntimeContractModel):
             != FACTOR_RESULT_PROJECTION_TABLES
         ):
             raise ValueError("factor result projections must be complete")
-        if strategy_definition_projections and {p.table_name for p in strategy_definition_projections} != STRATEGY_TEMPLATE_PROJECTION_TABLES:
+        if (
+            strategy_definition_projections
+            and {p.table_name for p in strategy_definition_projections}
+            != STRATEGY_TEMPLATE_PROJECTION_TABLES
+        ):
             raise ValueError("strategy projections are incomplete")
         projections = tuple(
             sorted(

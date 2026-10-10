@@ -429,8 +429,8 @@ export function PriceAlertRules() {
   return (
     <>
       <Panel
-        title="告警规则"
-        label="告警规则"
+        title="到价规则"
+        label="到价规则"
         actions={
           <>
             <Button size="sm" variant="ghost" onClick={result.refresh}>

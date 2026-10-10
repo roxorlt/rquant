@@ -48,6 +48,15 @@ def _service(tmp_path: Path, *, now: datetime = NOW) -> PageControlService:
     )
 
 
+def _seed_daily_sources(store: DuckDBStore, codes: tuple[str, ...] = ()) -> None:
+    from tests.unit.test_pipeline import _seed_daily_fixture_sources
+    rows=store._conn.execute("SELECT DISTINCT trade_date FROM daily_bar").fetchall()
+    for (day,) in rows:
+        for code in codes:
+            store._conn.execute("INSERT INTO daily_bar(ts_code,trade_date,close,pct_chg) VALUES (?,?,10,1) ON CONFLICT DO NOTHING",[code,day])
+    _seed_daily_fixture_sources(store)
+
+
 def _command(
     command_id: str,
     *,
@@ -186,6 +195,7 @@ def test_v3_unranked_pool_saves_null_and_daily_run_keeps_all_filtered_members(
             "INSERT INTO daily_bar (ts_code, trade_date, close) "
             "VALUES ('000001.SZ', '2026-08-04', 10)"
         )
+        _seed_daily_sources(store,("000001.SZ","000002.SZ"))
         with patch("rquant.pipeline.screen", return_value=frame):
             result = run_daily_screen_stage(
                 "2026-08-04",
@@ -239,6 +249,32 @@ def test_v3_rejects_conditions_daily_writer_cannot_reproduce(
     assert result.status is PageControlStatus.FAILED
     assert "not reproducible" in (result.error or "")
     assert not _pool_path(tmp_path).exists()
+
+
+@pytest.mark.parametrize("rules", [
+    [RuleCall(name="gt", args={"left":"PE_TTM[0]","right":0})],
+    [RuleCall(name="rsi_oversold", args={"period":30,"threshold":30})],
+    [RuleCall(name="above_ma", args={"period":37})],
+])
+def test_v3_extended_conditions_require_exact_published_writer_capability(tmp_path: Path, rules: list[RuleCall]) -> None:
+    from rquant.pool_result_receipt import DailyWriterCapability
+    from rquant.screen.daily_inputs import daily_writer_contract_fingerprint
+    service = _service(tmp_path)
+    command = parse_page_control_command(_v3_payload("writer-supported",rule_calls=[item.model_dump() for item in rules]))
+    service.consumer.daily_writer_capability = lambda: DailyWriterCapability(
+        serving_generation_id="b"*64,writer_contract_fingerprint="0"*64,
+        verified_result_version="c"*64,verified_evidence_version="d"*64,completed_at=NOW,
+        canonical_receipt_id="1"*64,canonical_generation_id="2"*64,source_generation_id="3"*64,
+    )
+    assert service.submit(command).status is PageControlStatus.FAILED
+    service.consumer.daily_writer_capability = lambda: DailyWriterCapability(
+        serving_generation_id="b"*64,writer_contract_fingerprint=daily_writer_contract_fingerprint(),
+        verified_result_version="c"*64,verified_evidence_version="d"*64,completed_at=NOW,
+        canonical_receipt_id="1"*64,canonical_generation_id="2"*64,source_generation_id="3"*64,
+    )
+    accepted = parse_page_control_command(_v3_payload("writer-supported-new",rule_calls=[item.model_dump() for item in rules]))
+    assert service.submit(accepted).status is PageControlStatus.SUCCEEDED
+    assert load_user_presets(_pool_path(tmp_path).parent)["user/breakout"].rule_calls == rules
 
 
 @pytest.mark.parametrize("unranked", [False, True])
@@ -634,6 +670,7 @@ def test_legacy_offset_window_keeps_union_of_previous_trading_days(tmp_path: Pat
             observed.append(kwargs["ts_code_whitelist"])
             return pd.DataFrame(columns=["ts_code", "name", "CLOSE[0]", "PCT_CHG[0]"])
 
+        _seed_daily_sources(store,())
         with patch("rquant.pipeline.screen", side_effect=screen_stub):
             result = run_daily_screen_stage(
                 "2026-08-04",
@@ -678,6 +715,7 @@ def test_daily_screen_uses_exact_prior_trading_day_and_reloads_saved_definition(
                 }
             )
         )
+        _seed_daily_sources(store,("TWO",))
         with patch(
             "rquant.pipeline.screen",
             return_value=pd.DataFrame(
@@ -738,6 +776,7 @@ def test_v2_same_day_rerun_to_zero_atomically_replaces_old_members(tmp_path: Pat
                 }
             )
         )
+        _seed_daily_sources(store,())
         with patch("rquant.pipeline.screen", side_effect=(frame, empty)):
             first = run_daily_screen_stage(
                 "2026-08-04",
@@ -862,7 +901,10 @@ def test_v2_exact_parent_day_with_market_data_and_zero_hits_is_empty_not_error(
             "('X', '2026-08-03', 1,1,1,1,1,0,0,0,0),"
             "('X', '2026-08-04', 1,1,1,1,1,0,0,0,0)"
         )
-        with patch(
+        _seed_daily_sources(store,())
+        from rquant.builtin_presets import BUILTIN_PRESET_SCREENS, builtin_definition_version
+        simplified=ScreenPreset(name="n-shape-pool1",description="input-independent isolated parent",rules=[],definition_version=builtin_definition_version(BUILTIN_PRESET_SCREENS["n-shape-pool1"]))
+        with patch("rquant.pipeline.PRESET_SCREENS",{**BUILTIN_PRESET_SCREENS,"n-shape-pool1":simplified}), patch(
             "rquant.pipeline.screen",
             return_value=pd.DataFrame(columns=["ts_code", "name", "CLOSE[0]", "PCT_CHG[0]"]),
         ):
@@ -908,7 +950,7 @@ def test_saved_three_level_chain_runs_in_topological_order_with_each_prior_resul
                 {
                     "trade_date": ["2026-07-31", "2026-08-03"],
                     "preset_name": ["user/a", "user/b"],
-                    "ts_code": ["FROM_A", "FROM_B"],
+                    "ts_code": ["X", "X"],
                     "name": ["a", "b"],
                     "close": [1.0, 1.0],
                     "pct_chg": [0.0, 0.0],
@@ -916,10 +958,11 @@ def test_saved_three_level_chain_runs_in_topological_order_with_each_prior_resul
                 }
             )
         )
+        _seed_daily_sources(store,())
         with patch(
             "rquant.pipeline.screen",
             return_value=pd.DataFrame(
-                {"ts_code": ["FROM_A"], "name": ["a"],
+                {"ts_code": ["X"], "name": ["a"],
                  "CLOSE[0]": [1.0], "PCT_CHG[0]": [0.0]}
             ),
         ):
@@ -932,7 +975,7 @@ def test_saved_three_level_chain_runs_in_topological_order_with_each_prior_resul
         with patch(
             "rquant.pipeline.screen",
             return_value=pd.DataFrame(
-                {"ts_code": ["FROM_B"], "name": ["b"],
+                {"ts_code": ["X"], "name": ["b"],
                  "CLOSE[0]": [1.0], "PCT_CHG[0]": [0.0]}
             ),
         ):
@@ -955,4 +998,4 @@ def test_saved_three_level_chain_runs_in_topological_order_with_each_prior_resul
                 preset_directory=tmp_path / "data" / "user_presets",
             )
     assert result.preset_hits == {"user/a": 0, "user/b": 0, "user/c": 0}
-    assert observed == [None, ["FROM_A"], ["FROM_B"]]
+    assert observed == [None, ["X"], ["X"]]

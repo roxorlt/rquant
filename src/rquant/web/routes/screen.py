@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from contextlib import contextmanager
 from threading import BoundedSemaphore
-from typing import Annotated
+from typing import Annotated, Literal
 
 import anyio.to_thread
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
@@ -116,6 +116,7 @@ def get_blocks(
     request: Request,
     response: Response,
     _viewer: Annotated[str | None, Depends(current_user)],
+    mode: Literal["daily", "intraday"] = "daily",
 ) -> Envelope[ScreenCatalogData]:
     web = request.app.state.web
     with _screen_slot(web.screen_gate), web.tracker.borrow() as borrowed:
@@ -125,13 +126,14 @@ def get_blocks(
             stale_after=web.settings.stale_after,
             failure=web.tracker.failure,
         )
-        data = web.screen_service.catalog(borrowed)
+        data = web.screen_service.catalog(borrowed, mode=mode)
     if meta.generation_id is not None:
         response.headers["X-Rquant-Generation"] = meta.generation_id
     data = data.model_copy(
         update={
             "nl_generate_available": (
                 web.nl_parser is not None
+                and mode == "daily"
                 and data.available
                 and data.source is not None
                 and bool(data.dates)

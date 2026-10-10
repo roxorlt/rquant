@@ -14,6 +14,11 @@ from urllib.parse import urlsplit
 from weakref import WeakKeyDictionary
 from zoneinfo import ZoneInfo
 
+from rquant.condition_alert_route import ConditionAlertBusEventRecord
+from rquant.condition_alert_runtime_contracts import (
+    ConditionAlertEventEnvelope,
+    parse_condition_alert_event,
+)
 from rquant.delivery_contracts import DeliveryChannel, OutboxRecord
 from rquant.notification_worker import (
     ConfirmedDeliveryFailureError,
@@ -348,6 +353,31 @@ def format_price_alert_notification(event: PriceAlertEventEnvelope) -> tuple[str
     return title, body
 
 
+def format_condition_alert_notification(event: ConditionAlertEventEnvelope) -> tuple[str, str]:
+    value = parse_condition_alert_event(event)
+
+    def clean(value: str) -> str:
+        return " ".join(
+            "".join(
+                " " if unicodedata.category(c).startswith("C") else c
+                for c in value
+                if c not in "[]()*_~<>`!\\"
+            ).split()
+        )[:80]
+
+    name = clean(value.rule_name) or "条件提醒"
+    stock = clean(value.stock_name or "")
+    action = "满足条件" if value.trigger_kind == "matched" else "已恢复"
+    title = f"rQuant 条件提醒 · {value.priority}"
+    body = (
+        f"{name} · {value.ts_code} {stock} · {action} · "
+        f"{value.event_time.astimezone(_SHANGHAI):%H:%M:%S}"
+    )
+    if len((title + body).encode()) > 1024:
+        raise ValueError("condition notification exceeds 1 KiB")
+    return title, body
+
+
 class PriceAlertPreparedNotification:
     __slots__ = ("__weakref__",)
 
@@ -404,6 +434,72 @@ def _consume_prepared_price(
     ):
         raise ValueError("price admission differs from the prepared event and target")
     del _PRICE_PREPARED[prepared]
+    return title, body, credential
+
+
+class ConditionAlertPreparedNotification:
+    __slots__ = ("__weakref__",)
+
+    def __init__(self) -> None:
+        raise TypeError("condition notification preparation belongs to its actual provider")
+
+
+_CONDITION_PREPARED: WeakKeyDictionary[
+    ConditionAlertPreparedNotification,
+    tuple[object, ConditionAlertBusEventRecord, OutboxRecord, str, str, str | None],
+] = WeakKeyDictionary()
+
+
+def _prepare_condition(
+    provider: object,
+    event: ConditionAlertBusEventRecord,
+    record: OutboxRecord,
+    *,
+    credential: str | None,
+) -> ConditionAlertPreparedNotification:
+    if (
+        type(event) is not ConditionAlertBusEventRecord
+        or type(record) is not OutboxRecord
+        or event.event_id != record.signal_id
+    ):
+        raise TypeError(
+            "condition preparation requires the exact sealed event and original leased row"
+        )
+    title, body = format_condition_alert_notification(event.event)
+    value = object.__new__(ConditionAlertPreparedNotification)
+    _CONDITION_PREPARED[value] = provider, event, record, title, body, credential
+    return value
+
+
+def _consume_prepared_condition(
+    provider: object,
+    prepared: object,
+    admitted: object,
+    *,
+    store: object,
+    record: OutboxRecord,
+    now: datetime,
+) -> tuple[str, str, str | None]:
+    from rquant.condition_alert_runtime_projection import consume_condition_alert_admitted_delivery
+
+    if (
+        type(prepared) is not ConditionAlertPreparedNotification
+        or prepared not in _CONDITION_PREPARED
+    ):
+        raise TypeError("condition provider requires its own unconsumed preparation")
+    issuer, event, original, title, body, credential = _CONDITION_PREPARED[prepared]
+    if issuer is not provider or original != record:
+        raise TypeError("condition preparation belongs to a different provider or original lease")
+    receipt = consume_condition_alert_admitted_delivery(
+        admitted, store=store, record=record, now=now
+    )
+    if (receipt.event_id, receipt.payload_sha256, receipt.target) != (
+        event.event_id,
+        event.payload_hash,
+        record.target,
+    ):
+        raise ValueError("condition admission differs from the prepared event and target")
+    del _CONDITION_PREPARED[prepared]
     return title, body, credential
 
 
@@ -523,6 +619,61 @@ class RecipientScopedNotificationProvider(NotificationProvider):
         )
         return f"{self._channel.value}:{receipt}"
 
+    def prepare_condition(
+        self, event: ConditionAlertBusEventRecord, record: OutboxRecord
+    ) -> ConditionAlertPreparedNotification:
+        target = record.target
+        if target.channel is not self._channel:
+            raise ConfirmedDeliveryFailureError("condition channel mismatch")
+        credential = self._capabilities.credential_for(self._channel, target.recipient_id)
+        if credential is None:
+            raise ConfirmedDeliveryFailureError("condition recipient capability is unavailable")
+        return _prepare_condition(self, event, record, credential=credential)
+
+    def deliver_condition(
+        self,
+        prepared: ConditionAlertPreparedNotification,
+        admitted: object,
+        *,
+        store: object,
+        record: OutboxRecord,
+        now: datetime,
+    ) -> str:
+        title, body, credential = _consume_prepared_condition(
+            self, prepared, admitted, store=store, record=record, now=now
+        )
+        if credential is None or record.target.channel is not self._channel:
+            raise ConfirmedDeliveryFailureError("condition recipient preparation is invalid")
+        try:
+            result = self._transport.send(
+                channel=self._channel,
+                endpoint=self._endpoint,
+                credential=credential,
+                title=title,
+                body=body,
+            )
+        except Exception:
+            raise UnknownDeliveryOutcomeError("notification delivery outcome is unknown") from None
+        if (
+            type(result) is not NotificationTransportResult
+            or result.disposition is NotificationTransportDisposition.UNKNOWN
+        ):
+            raise UnknownDeliveryOutcomeError("notification delivery outcome is unknown")
+        if result.disposition is NotificationTransportDisposition.REJECTED:
+            raise ConfirmedDeliveryFailureError("provider rejected delivery")
+        receipt = canonical_sha256(
+            {
+                "contract": "runtime-condition-notification-receipt/v1",
+                "channel": self._channel,
+                "recipient_id": record.target.recipient_id,
+                "outbox_id": record.outbox_id,
+                "event_id": record.signal_id,
+                "title": title,
+                "body": body,
+            }
+        )
+        return f"{self._channel.value}:{receipt}"
+
 
 class SuppressedNotificationProvider(NotificationProvider):
     """The shadow transport: the batch runs in full and no byte leaves the host.
@@ -563,6 +714,23 @@ class SuppressedNotificationProvider(NotificationProvider):
         now: datetime,
     ) -> str:
         _consume_prepared_price(self, prepared, admitted, store=store, record=record, now=now)
+        return f"shadow:{record.outbox_id}"
+
+    def prepare_condition(
+        self, event: ConditionAlertBusEventRecord, record: OutboxRecord
+    ) -> ConditionAlertPreparedNotification:
+        return _prepare_condition(self, event, record, credential=None)
+
+    def deliver_condition(
+        self,
+        prepared: ConditionAlertPreparedNotification,
+        admitted: object,
+        *,
+        store: object,
+        record: OutboxRecord,
+        now: datetime,
+    ) -> str:
+        _consume_prepared_condition(self, prepared, admitted, store=store, record=record, now=now)
         return f"shadow:{record.outbox_id}"
 
 

@@ -37,8 +37,49 @@ NOW = datetime(2026, 7, 31, 2, 30, tzinfo=UTC)
 POLICY = "a" * 64
 
 
+def test_condition_three_family_replication_uses_original_cursor_outbox_and_replays(
+    tmp_path: Path,
+) -> None:
+    from rquant.condition_alert_route import install_condition_alert_history
+    from rquant.signal_route_spool import (
+        ReadonlyNotificationEventRouteSpool,
+        publish_mixed_notification_bus_prefix,
+    )
+    from tests.unit.test_price_alert_event_contracts import AT
+    from tests.unit.test_signal_route_spool import _condition_mixed_world
+
+    producer, bus, spool, _ = _condition_mixed_world(tmp_path)
+    publish_mixed_notification_bus_prefix(bus=bus, spool=spool, limit=100, observed_at=AT)
+    reader = ReadonlyNotificationEventRouteSpool(spool.paths.root)
+    source = reader.source_descriptor()
+    records = reader.routed_after_global_sequence(
+        after_sequence=0, through_sequence=4, limit=100, observed_at=AT
+    )
+    state = NotificationStateStore(tmp_path / "condition-notify.sqlite3")
+    install_condition_alert_history(state)
+    first = state.replicate_mixed_notification_events(
+        source, records, observed_at=AT, source_inspected_at=AT
+    )
+    assert first.replicated_count == 4
+    assert state.replication_cursor().last_global_sequence == 4
+    assert len(state.outbox_records()) == 4
+    assert state.notification_event(records[2].event_id).event == records[2].event
+    assert (
+        state.replicate_mixed_notification_events(
+            source, records, observed_at=AT, source_inspected_at=AT
+        ).replicated_count
+        == 0
+    )
+    reopened = NotificationStateStore(state.path)
+    assert reopened.replication_cursor() == state.replication_cursor()
+    assert reopened.notification_event(records[2].event_id) == state.notification_event(
+        records[2].event_id
+    )
+    producer.close()
+
+
 def test_notification_serving_delivery_fetch_is_sql_bounded() -> None:
-    source = inspect.getsource(NotificationStateStore.serving_snapshot)
+    source = inspect.getsource(NotificationStateStore._serving_snapshot)
 
     delivery_query = source.split("SELECT * FROM delivery_outbox", maxsplit=1)[1]
     assert "LIMIT ?" in delivery_query.split("fetchall()", maxsplit=1)[0]
@@ -689,9 +730,7 @@ def test_a_projection_that_reverts_to_an_earlier_form_is_published_again(
     assert served.projection_generation_id == reverted.generation_id
     assert served.projection_source_receipts == {"market-minute": "1" * 64}
     # And the revert, once published, is idle again.
-    assert not store.publish_projection_authority(
-        content("1", NOW + timedelta(minutes=3))
-    ).written
+    assert not store.publish_projection_authority(content("1", NOW + timedelta(minutes=3))).written
 
 
 def test_the_gate_never_drags_the_payload_through_its_sort(tmp_path: Path) -> None:

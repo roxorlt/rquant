@@ -38,7 +38,7 @@ class FeatureRuntimeConfig(RuntimeContractModel):
     opening_acceleration_block_minutes: StrictInt = Field(default=3, ge=0, le=30)
     bar_timestamp_semantics: Literal["bar_end"] = "bar_end"
     contract_id: StrictStr = Field(default="intraday-pit", min_length=1)
-    contract_version: Literal[3] = 3
+    contract_version: Literal[3, 4] = 3
     schema_version: StrictInt = Field(default=2, ge=2)
 
     def bind_to_manifest(self, manifest: RuntimeServiceManifest) -> IntradayFeatureConfig:

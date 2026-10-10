@@ -70,6 +70,7 @@ FEATURE_COLUMNS = (
     "same_clock_sessions",
 )
 STATUS_COLUMNS = FEATURE_COLUMNS[2:]
+FEATURE_COLUMNS_V4 = (*FEATURE_COLUMNS, "speed_5m_pct", "hist_cumulative_volume_median", "cumulative_volume_ratio")
 #: The published contract's `max_delay_seconds` for every market-minute feature, whose
 #: `late_policy` is `mark_stale` (`runtime_definition_bootstrap` takes it from here). A
 #: code whose newest bar is older than this at the batch's `available_at` has every field
@@ -95,9 +96,23 @@ class IntradayFeatureConfig(RuntimeContractModel):
     opening_acceleration_block_minutes: int = Field(default=3, ge=0, le=30)
     bar_timestamp_semantics: Literal["bar_end"] = "bar_end"
     contract_id: str = Field(default="intraday-pit", min_length=1)
-    contract_version: Literal[3] = 3
+    contract_version: Literal[3, 4] = 3
     schema_version: int = Field(default=2, ge=2)
     producer_commit: CommitSha
+
+    @model_validator(mode="after")
+    def require_explicit_v4_schema(self) -> IntradayFeatureConfig:
+        if self.contract_version == 4 and self.schema_version != 3:
+            raise ValueError("intraday v4 requires schema 3")
+        return self
+
+
+def feature_columns_for_version(version: int) -> tuple[str, ...]:
+    if version == 3:
+        return FEATURE_COLUMNS
+    if version == 4:
+        return FEATURE_COLUMNS_V4
+    raise IntradayFeatureValidationError("unsupported intraday feature contract")
 
 
 class FeatureComputationResult(RuntimeContractModel):
@@ -121,7 +136,7 @@ class FeatureComputationResult(RuntimeContractModel):
     @property
     def frame(self) -> pd.DataFrame:
         payload = json.loads(self.payload_json)
-        frame = pd.DataFrame(payload["rows"], columns=FEATURE_COLUMNS)
+        frame = pd.DataFrame(payload["rows"], columns=feature_columns_for_version(self.envelope.contract_version))
         if not frame.empty:
             frame["feature_time"] = pd.to_datetime(frame["feature_time"], utc=True)
         return frame
@@ -346,6 +361,7 @@ def _compute_code_row(
     decision_date: date,
     lookback_sessions: int,
     opening_acceleration_block_minutes: int,
+    contract_version: int = 3,
 ) -> tuple[dict[str, object], dict[str, str | None]]:
     rows = current[current["ts_code"] == ts_code].sort_values("_utc_time", kind="stable")
     latest = rows.iloc[-1]
@@ -484,6 +500,28 @@ def _compute_code_row(
         "historical_sessions": None,
         "same_clock_sessions": None,
     }
+    if contract_version == 4:
+        window = rows.tail(6)
+        speed: float | None = None
+        if len(window) < 6:
+            speed_reason = "insufficient_prior_minutes"
+        elif not (window["_utc_time"].diff().dropna() == pd.Timedelta(minutes=1)).all():
+            speed_reason = "session_break" if (
+                (window["_clock_minute"] <= 11 * 60 + 30).any()
+                and (window["_clock_minute"] >= 13 * 60).any()
+            ) else "non_contiguous_minutes"
+        elif float(window.iloc[0]["close"]) <= 0:
+            speed_reason = "zero_prior_price"
+        else:
+            speed = 100 * (float(latest["close"]) / float(window.iloc[0]["close"]) - 1)
+            speed_reason = None
+        volume_median = _median(history_to_clock.groupby("_trade_date", sort=True)["vol"].sum())
+        volume_ratio, volume_reason = _divide(cumulative_volume,volume_median,
+            missing_reason="missing_cumulative_volume_history",zero_reason="zero_cumulative_volume_baseline")
+        row.update(speed_5m_pct=speed,hist_cumulative_volume_median=volume_median,cumulative_volume_ratio=volume_ratio)
+        reasons.update(speed_5m_pct=speed_reason,
+            hist_cumulative_volume_median=None if volume_median is not None else "missing_cumulative_volume_history",
+            cumulative_volume_ratio=volume_reason)
     return row, reasons
 
 
@@ -494,6 +532,7 @@ def _field_statuses(
     source_event_times: dict[str, datetime],
     available_at: datetime,
     decision_cutoff: datetime,
+    columns: tuple[str, ...] = STATUS_COLUMNS,
 ) -> tuple[FeatureFieldStatus, ...]:
     statuses: list[FeatureFieldStatus] = []
     for row, reason_map in zip(rows, row_reasons, strict=True):
@@ -501,7 +540,7 @@ def _field_statuses(
         source_event_time = source_event_times[candidate_id]
         delay = (available_at - source_event_time).total_seconds()
         late = delay > MARKET_MINUTE_FEATURE_MAX_DELAY_SECONDS
-        for name in STATUS_COLUMNS:
+        for name in columns:
             present = row[name] is not None
             missing_reason = None if present else reason_map[name] or "missing_value"
             if late:
@@ -599,6 +638,7 @@ def _semantic_compute(
             decision_date=decision_date,
             lookback_sessions=config.lookback_sessions,
             opening_acceleration_block_minutes=config.opening_acceleration_block_minutes,
+            contract_version=config.contract_version,
         )
         rows.append(row)
         reasons.append(row_reasons)
@@ -643,6 +683,7 @@ def _semantic_compute(
             source_event_times=source_event_times,
             available_at=available_at,
             decision_cutoff=decision_utc,
+            columns=feature_columns_for_version(config.contract_version)[2:],
         ),
         producer_commit=config.producer_commit,
     )

@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Literal, Protocol
 
 if TYPE_CHECKING:
+    from rquant.web.condition_alert_commands import ConditionRuleScopeResolver
     from rquant.research_query.saved import SavedResearchQuery
     from rquant.strategy_authoring import StrategyAuthoringPageControlBackend
     from rquant.strategy_authoring_source import StrategySourceCatalog
@@ -41,6 +42,8 @@ from pydantic import (
 )
 
 from rquant.alert_price_rule import PriceAlertRule
+from rquant.alert_rule_contracts import ConditionAlertRuleDefinition
+from rquant.pool_result_receipt import DailyWriterCapability, PublishedDailyScreenEvidence
 from rquant.canvas_publication_receipt import (
     CanvasPublicationCatalogRecord,
     CanvasPublicationCommand,
@@ -92,6 +95,18 @@ from rquant.runtime_contracts import (
     canonical_sha256,
 )
 from rquant.screen.pool_ranking import PoolRankingPlan
+from rquant.screen.query_contracts import (
+    ExecuteScreenQuery,
+    _OwnedExecuteScreenQuery,
+    ScreenPresetDefinition,
+    ScreenQueryDefinition,
+)
+from rquant.screen.query_history import (
+    ScreenQueryHistory,
+    install_screen_query_tables,
+    register_screen_execution,
+)
+from rquant.web.models.screen import ScreenRunData
 from rquant.strategy_authoring_commands import (
     ArchiveStrategyTemplate,
     OwnedArchiveStrategyTemplate,
@@ -100,7 +115,12 @@ from rquant.strategy_authoring_commands import (
     StrategyAuthoringIdentity,
 )
 
-from rquant.strategy_template_run_commands import OwnedRunStrategyTemplate, RunStrategyTemplate, OwnedStrategyTemplateCommandValue as OwnedStrategyTemplateCommand, StrategyTemplateCommandValue as StrategyTemplateCommand
+from rquant.strategy_template_run_commands import (
+    OwnedRunStrategyTemplate,
+    RunStrategyTemplate,
+    OwnedStrategyTemplateCommandValue as OwnedStrategyTemplateCommand,
+    StrategyTemplateCommandValue as StrategyTemplateCommand,
+)
 
 _SAFE_NAME = re.compile(r"^[\w\u4e00-\u9fff-]+$")
 _CANVAS_CATALOG_SCHEMA_VERSION = 1
@@ -123,10 +143,15 @@ _PRICE_RULE_VERSION = 1
 _PRICE_RULE_KINDS = frozenset(
     {"save_price_alert_rule", "set_price_alert_rule_enabled", "delete_price_alert_rule"}
 )
+_CONDITION_RULE_KINDS = frozenset(
+    {"save_alert_rule", "set_alert_rule_enabled", "delete_alert_rule"}
+)
 _FACTOR_DEFINITION_KINDS = frozenset({"save_factor_definition", "archive_factor"})
 _FACTOR_RUN_KINDS = frozenset({"submit_factor_run"})
 _FACTOR_TRACKING_KINDS = frozenset({"set_factor_tracked"})
-_STRATEGY_AUTHORING_KINDS = frozenset({"save_strategy_template", "archive_strategy_template", "run_strategy_template"})
+_STRATEGY_AUTHORING_KINDS = frozenset(
+    {"save_strategy_template", "archive_strategy_template", "run_strategy_template"}
+)
 _FACTOR_REGISTRY_EFFECT_IDENTITY = "factor-registry-identity/v1"
 _LOCAL_FILESYSTEM_FENCE_SCHEMA_VERSION = 1
 _CANVAS_HEAD_CONTRACT = "canvas-current-head/v1"
@@ -203,6 +228,56 @@ class DeletePriceAlertRule(PageControlCommand):
     kind: Literal["delete_price_alert_rule"] = "delete_price_alert_rule"
     rule_id: RuleId
     expected_version: StrictInt = Field(ge=1)
+
+
+class SaveAlertRule(PageControlCommand):
+    kind: Literal["save_alert_rule"] = "save_alert_rule"
+    expected_version: StrictInt | None = Field(default=None, ge=1)
+    rule: ConditionAlertRuleDefinition
+
+
+class SetAlertRuleEnabled(PageControlCommand):
+    kind: Literal["set_alert_rule_enabled"] = "set_alert_rule_enabled"
+    rule_id: RuleId
+    expected_version: StrictInt = Field(ge=1)
+    enabled: StrictBool
+
+
+class DeleteAlertRule(PageControlCommand):
+    kind: Literal["delete_alert_rule"] = "delete_alert_rule"
+    rule_id: RuleId
+    expected_version: StrictInt = Field(ge=1)
+
+
+class _OwnedSaveAlertRule(SaveAlertRule):
+    owner_id: OwnerId
+
+
+class _OwnedSetAlertRuleEnabled(SetAlertRuleEnabled):
+    owner_id: OwnerId
+
+
+class _OwnedDeleteAlertRule(DeleteAlertRule):
+    owner_id: OwnerId
+
+
+ConditionAlertRuleRequestValue = SaveAlertRule | SetAlertRuleEnabled | DeleteAlertRule
+_OwnedConditionAlertRuleValue = (
+    _OwnedSaveAlertRule | _OwnedSetAlertRuleEnabled | _OwnedDeleteAlertRule
+)
+_CONDITION_PUBLIC_TYPES = (SaveAlertRule, SetAlertRuleEnabled, DeleteAlertRule)
+_CONDITION_OWNED_TYPES = (_OwnedSaveAlertRule, _OwnedSetAlertRuleEnabled, _OwnedDeleteAlertRule)
+
+
+def _owned_condition_rule_command(
+    command: ConditionAlertRuleRequestValue, *, authenticated_owner_id: str
+) -> _OwnedConditionAlertRuleValue:
+    if type(command) not in _CONDITION_PUBLIC_TYPES:
+        raise TypeError("condition rule requires an exact ownerless request")
+    model = dict(zip(_CONDITION_PUBLIC_TYPES, _CONDITION_OWNED_TYPES, strict=True))[type(command)]
+    return model.model_validate(
+        {**command.model_dump(mode="python"), "owner_id": authenticated_owner_id}
+    )
 
 
 class _OwnedSavePriceAlertRule(SavePriceAlertRule):
@@ -558,6 +633,32 @@ class AppendNlQueryLog(PageControlCommand):
     error: str | None = None
 
 
+class _OwnedSaveNlPreset(SaveNlPreset):
+    kind: Literal["save_screen_query_preset"] = "save_screen_query_preset"
+    owner_id: OwnerId
+    definition: ScreenPresetDefinition
+    expected_version: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def verify_private_context(self) -> _OwnedSaveNlPreset:
+        if (
+            self.name != self.definition.preset_id
+            or self.description != self.definition.definition.description
+            or self.rule_calls != self.definition.definition.conditions
+        ):
+            raise ValueError("private preset differs from original NL command")
+        if self.overwrite != (self.expected_version is not None):
+            raise ValueError("private preset overwrite requires an explicit current version")
+        return self
+
+
+class _OwnedAppendNlQueryLog(AppendNlQueryLog):
+    owner_id: OwnerId
+
+
+_SCREEN_QUERY_PRIVATE_KINDS = frozenset({"execute_screen_query", "save_screen_query_preset"})
+
+
 class InitializeLabExports(PageControlCommand):
     kind: Literal["initialize_lab_exports"] = "initialize_lab_exports"
     export_root: Path
@@ -684,12 +785,17 @@ class FactorDefinitionPageControlBackend(Protocol):
 
 PageControlCommandValue = Annotated[
     AckAlert
+    | _OwnedExecuteScreenQuery
+    | _OwnedSaveNlPreset
     | _OwnedSaveResearchQuery
     | AddWatchlistItem
     | RemoveWatchlistItem
     | _OwnedSavePriceAlertRule
     | _OwnedSetPriceAlertRuleEnabled
     | _OwnedDeletePriceAlertRule
+    | _OwnedSaveAlertRule
+    | _OwnedSetAlertRuleEnabled
+    | _OwnedDeleteAlertRule
     | _OwnedSaveFactorDefinition
     | _OwnedArchiveFactor
     | _OwnedSubmitFactorRun
@@ -1061,6 +1167,7 @@ class PageControlOutbox:
                 );
                 """
             )
+            install_screen_query_tables(connection)
             self._ensure_column(connection, "processing_owner", "TEXT")
             self._ensure_column(connection, "lease_expires_at", "TEXT")
             self._ensure_column(connection, "attempt_count", "INTEGER NOT NULL DEFAULT 0")
@@ -1163,7 +1270,13 @@ class PageControlOutbox:
         return connection
 
     def enqueue(self, command: PageControlCommandValue) -> PageControlReceipt:
-        if isinstance(command, (SaveStrategyTemplate, ArchiveStrategyTemplate, RunStrategyTemplate)):
+        if isinstance(command, _CONDITION_PUBLIC_TYPES):
+            raise ValueError("condition rule requires trusted submission")
+        if isinstance(command, (ExecuteScreenQuery, _OwnedSaveNlPreset, _OwnedAppendNlQueryLog)):
+            raise ValueError("screen history requires trusted submission")
+        if isinstance(
+            command, (SaveStrategyTemplate, ArchiveStrategyTemplate, RunStrategyTemplate)
+        ):
             raise ValueError("strategy authoring requires trusted submission")
         if isinstance(command, SaveResearchQuery):
             raise ValueError("research queries require trusted submission")
@@ -1202,6 +1315,13 @@ class PageControlOutbox:
             raise TypeError("trusted price rule submission requires an owned command")
         return self._enqueue(command, require_price_rule_activation=True)
 
+    def enqueue_trusted_condition_rule(
+        self, command: _OwnedConditionAlertRuleValue
+    ) -> PageControlReceipt:
+        if type(command) not in _CONDITION_OWNED_TYPES:
+            raise TypeError("condition rule requires an exact owned command")
+        return self._enqueue(command, require_condition_rule_activation=True)
+
     def enqueue_trusted_factor_definition(
         self, command: _OwnedFactorDefinitionValue
     ) -> PageControlReceipt:
@@ -1224,7 +1344,11 @@ class PageControlOutbox:
     def enqueue_trusted_strategy_authoring(
         self, command: OwnedStrategyTemplateCommand
     ) -> PageControlReceipt:
-        if type(command) not in (OwnedSaveStrategyTemplate, OwnedArchiveStrategyTemplate, OwnedRunStrategyTemplate):
+        if type(command) not in (
+            OwnedSaveStrategyTemplate,
+            OwnedArchiveStrategyTemplate,
+            OwnedRunStrategyTemplate,
+        ):
             raise TypeError("strategy authoring requires an owned command")
         return self._enqueue(command, require_strategy_authoring_trust=True)
 
@@ -1234,14 +1358,35 @@ class PageControlOutbox:
         *,
         require_watchlist_activation: bool = False,
         require_price_rule_activation: bool = False,
+        require_condition_rule_activation: bool = False,
         require_factor_definition_trust: bool = False,
         require_factor_run_trust: bool = False,
         require_factor_tracking_trust: bool = False,
         require_research_query_trust: bool = False,
         require_strategy_authoring_trust: bool = False,
+        require_screen_query_trust: bool = False,
     ) -> PageControlReceipt:
-        if isinstance(command, (SaveStrategyTemplate, ArchiveStrategyTemplate, RunStrategyTemplate)) != require_strategy_authoring_trust or (
-            require_strategy_authoring_trust and type(command) not in (OwnedSaveStrategyTemplate, OwnedArchiveStrategyTemplate, OwnedRunStrategyTemplate)
+        if isinstance(command, _CONDITION_PUBLIC_TYPES) != require_condition_rule_activation or (
+            require_condition_rule_activation and type(command) not in _CONDITION_OWNED_TYPES
+        ):
+            raise ValueError("condition rule requires trusted submission")
+        if isinstance(
+            command, (ExecuteScreenQuery, _OwnedSaveNlPreset)
+        ) != require_screen_query_trust or (
+            require_screen_query_trust
+            and type(command) not in (_OwnedExecuteScreenQuery, _OwnedSaveNlPreset)
+        ):
+            raise ValueError("screen history requires trusted submission")
+        if isinstance(
+            command, (SaveStrategyTemplate, ArchiveStrategyTemplate, RunStrategyTemplate)
+        ) != require_strategy_authoring_trust or (
+            require_strategy_authoring_trust
+            and type(command)
+            not in (
+                OwnedSaveStrategyTemplate,
+                OwnedArchiveStrategyTemplate,
+                OwnedRunStrategyTemplate,
+            )
         ):
             raise ValueError("strategy authoring requires trusted submission")
         if isinstance(command, SaveResearchQuery) != require_research_query_trust or (
@@ -1283,6 +1428,8 @@ class PageControlOutbox:
         enqueued_at = command.requested_at.isoformat(timespec="microseconds")
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            if require_condition_rule_activation:
+                self._require_condition_rule_activation(connection, command.owner_id)
             if require_watchlist_activation and not self._manual_watchlist_activated(connection):
                 raise ValueError("manual watchlist is not activated")
             if require_price_rule_activation:
@@ -1304,7 +1451,12 @@ class PageControlOutbox:
                     raise PageControlCommandConflictError(
                         "command_id already exists with different payload"
                     )
-                if require_price_rule_activation or require_factor_definition_trust or require_strategy_authoring_trust:
+                if (
+                    require_condition_rule_activation
+                    or require_price_rule_activation
+                    or require_factor_definition_trust
+                    or require_strategy_authoring_trust
+                ):
                     stored = _COMMAND_ADAPTER.validate_json(existing["payload_json"])
                     if (
                         stored != command
@@ -1331,9 +1483,43 @@ class PageControlOutbox:
                     enqueued_at,
                 ),
             )
+            if type(command) is _OwnedExecuteScreenQuery:
+                register_screen_execution(connection, command)
         receipt = self.receipt(command.command_id)
         assert receipt is not None
         return receipt
+
+    def enqueue_trusted_screen_query(
+        self, command: _OwnedExecuteScreenQuery | _OwnedSaveNlPreset
+    ) -> PageControlReceipt:
+        return self._enqueue(command, require_screen_query_trust=True)
+
+    def lookup_screen_query_command(
+        self, command: _OwnedExecuteScreenQuery | _OwnedSaveNlPreset
+    ) -> PageControlReceipt | None:
+        from contextlib import closing
+
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT * FROM page_control_command WHERE command_id=?", (command.command_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            stored = _COMMAND_ADAPTER.validate_json(row["payload_json"])
+            if (
+                type(stored) not in (_OwnedExecuteScreenQuery, _OwnedSaveNlPreset)
+                or stored.owner_id != command.owner_id
+            ):
+                return None
+            if (
+                stored != command
+                or row["command_hash"] != _command_hash(command)
+                or row["command_kind"] != command.kind
+            ):
+                raise PageControlCommandConflictError(
+                    "screen command conflicts with original payload"
+                )
+            return self._receipt(row)
 
     def enqueue_trusted_research_query(
         self, command: _OwnedSaveResearchQuery
@@ -1448,6 +1634,79 @@ class PageControlOutbox:
         if row["protocol_version"] != _PRICE_RULE_VERSION:
             raise RuntimeError("price rule protocol version is unsupported")
         return datetime.fromisoformat(row["activated_at"])
+
+    @staticmethod
+    def _require_condition_rule_activation(connection: sqlite3.Connection, owner_id: str) -> None:
+        from rquant.condition_alert_rule_store import ConditionAlertRuleRepository
+
+        marker = connection.execute(
+            "SELECT protocol_version,activated_at FROM page_control_protocol_activation WHERE marker_name='condition-alert-rule/v1'"
+        ).fetchone()
+        if (
+            marker is None
+            or marker[0] != 1
+            or not isinstance(marker[1], str)
+            or _normalize_utc(datetime.fromisoformat(marker[1])).isoformat(timespec="microseconds")
+            != marker[1]
+        ):
+            raise ValueError("condition rule protocol is not activated")
+        ConditionAlertRuleRepository(connection).list_current(owner_id)
+
+    def activate_condition_alert_rules(self, activated_at: datetime) -> datetime:
+        from rquant.condition_alert_rule_store import ConditionAlertRuleRepository
+
+        frozen = _normalize_utc(activated_at).isoformat(timespec="microseconds")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            marker = connection.execute(
+                "SELECT protocol_version,activated_at FROM page_control_protocol_activation WHERE marker_name='condition-alert-rule/v1'"
+            ).fetchone()
+            if marker is None:
+                ConditionAlertRuleRepository(connection).install_schema()
+                connection.execute(
+                    "INSERT INTO page_control_protocol_activation(marker_name,protocol_version,activated_at) VALUES('condition-alert-rule/v1',1,?)",
+                    (frozen,),
+                )
+            elif marker[0] != 1 or marker[1] != frozen:
+                raise ValueError("condition rule protocol was activated differently")
+            self._require_condition_rule_activation(connection, "__condition_probe__")
+        return datetime.fromisoformat(frozen)
+
+    def lookup_condition_rule_command(
+        self, command: _OwnedConditionAlertRuleValue
+    ) -> PageControlReceipt | None:
+        if type(command) not in _CONDITION_OWNED_TYPES:
+            raise TypeError("condition lookup requires exact owned request")
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM page_control_command WHERE command_id=?", (command.command_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        stored = _COMMAND_ADAPTER.validate_json(row["payload_json"])
+        if type(stored) not in _CONDITION_OWNED_TYPES or stored.owner_id != command.owner_id:
+            return None
+        if (
+            stored != command
+            or row["command_kind"] != command.kind
+            or row["command_hash"] != _command_hash(command)
+        ):
+            raise PageControlCommandConflictError("condition original request conflicts")
+        return self._receipt(row)
+
+    def _condition_rule_failpoint(self, point: str) -> None:
+        return None
+
+    def complete_condition_rule(
+        self,
+        claim: PageControlClaim,
+        *,
+        now: datetime,
+        resolve_scope: ConditionRuleScopeResolver | None,
+    ) -> PageControlReceipt:
+        from rquant.web.condition_alert_commands import complete_condition_rule
+
+        return complete_condition_rule(self, claim, now=now, resolve_scope=resolve_scope)
 
     def activate_manual_watchlist(self, activated_at: datetime) -> datetime:
         frozen = _normalize_utc(activated_at).isoformat(timespec="microseconds")
@@ -1593,7 +1852,11 @@ class PageControlOutbox:
     def lookup_strategy_authoring_command(
         self, request: StrategyTemplateCommand, *, authenticated_actor_id: str
     ) -> tuple[OwnedStrategyTemplateCommand, PageControlReceipt] | None:
-        if type(request) not in (SaveStrategyTemplate, ArchiveStrategyTemplate, RunStrategyTemplate):
+        if type(request) not in (
+            SaveStrategyTemplate,
+            ArchiveStrategyTemplate,
+            RunStrategyTemplate,
+        ):
             raise TypeError("strategy lookup requires an ownerless original request")
         with self._connect() as connection:
             row = connection.execute(
@@ -1606,13 +1869,18 @@ class PageControlOutbox:
         except ValueError as exc:
             raise PageControlCommandConflictError("stored strategy command is invalid") from exc
         if (
-            not isinstance(stored, (OwnedSaveStrategyTemplate, OwnedArchiveStrategyTemplate, OwnedRunStrategyTemplate))
+            not isinstance(
+                stored,
+                (OwnedSaveStrategyTemplate, OwnedArchiveStrategyTemplate, OwnedRunStrategyTemplate),
+            )
             or stored.owner_id != authenticated_actor_id
             or row["command_kind"] != request.kind
             or stored.original() != request
             or _command_hash(stored) != row["command_hash"]
         ):
-            raise PageControlCommandConflictError("command_id already exists with different payload or actor")
+            raise PageControlCommandConflictError(
+                "command_id already exists with different payload or actor"
+            )
         return stored, self._receipt(row)
 
     def lookup_factor_save_command(
@@ -2196,7 +2464,10 @@ class PageControlOutbox:
                     except ValueError:
                         if (
                             row["command_kind"]
-                            in _PRICE_RULE_KINDS | _FACTOR_DEFINITION_KINDS | _FACTOR_RUN_KINDS
+                            in _CONDITION_RULE_KINDS
+                            | _PRICE_RULE_KINDS
+                            | _FACTOR_DEFINITION_KINDS
+                            | _FACTOR_RUN_KINDS
                         ):
                             continue
                         raise
@@ -2219,6 +2490,20 @@ class PageControlOutbox:
                         except (ValueError, RuntimeError, sqlite3.Error):
                             continue
                     elif row["command_kind"] in _PRICE_RULE_KINDS:
+                        continue
+                    elif type(parsed_command) in _CONDITION_OWNED_TYPES:
+                        try:
+                            if (
+                                parsed_command.kind != row["command_kind"]
+                                or _command_hash(parsed_command) != row["command_hash"]
+                            ):
+                                continue
+                            self._require_condition_rule_activation(
+                                connection, parsed_command.owner_id
+                            )
+                        except (ValueError, RuntimeError, sqlite3.Error):
+                            continue
+                    elif row["command_kind"] in _CONDITION_RULE_KINDS:
                         continue
                     elif isinstance(
                         parsed_command,
@@ -2313,10 +2598,14 @@ class PageControlOutbox:
                 "SELECT command_kind FROM page_control_command WHERE command_id = ?",
                 (command_id,),
             ).fetchone()
+            if kind is not None and kind["command_kind"] in _SCREEN_QUERY_PRIVATE_KINDS:
+                raise ValueError("screen query requires atomic completion")
             if kind is not None and kind["command_kind"] in _MANUAL_WATCHLIST_KINDS:
                 raise ValueError("watchlist command requires atomic completion")
             if kind is not None and kind["command_kind"] in _PRICE_RULE_KINDS:
                 raise ValueError("price rule command requires atomic completion")
+            if kind is not None and kind["command_kind"] in _CONDITION_RULE_KINDS:
+                raise ValueError("condition rule command requires atomic completion")
             changed = connection.execute(
                 f"""
                 UPDATE page_control_command
@@ -2661,6 +2950,11 @@ class PageControlConsumer:
         factor_run_backend: FactorRunPageControlBackend | None = None,
         factor_tracking_backend: FactorTrackingPageControlBackend | None = None,
         strategy_authoring_backend: StrategyAuthoringPageControlBackend | None = None,
+        screen_query_history: ScreenQueryHistory | None = None,
+        screen_query_executor: Callable[[ScreenQueryDefinition], ScreenRunData] | None = None,
+        daily_writer_capability: Callable[[], DailyWriterCapability | None] | None = None,
+        daily_run_evidence: Callable[[], tuple[PublishedDailyScreenEvidence, ...]] | None = None,
+        condition_rule_scope: ConditionRuleScopeResolver | None = None,
         clock: Callable[[], datetime] | None = None,
         lease_seconds: int = _DEFAULT_LEASE_SECONDS,
         consumer_id: str | None = None,
@@ -2684,6 +2978,11 @@ class PageControlConsumer:
         self.factor_run_backend = factor_run_backend
         self.factor_tracking_backend = factor_tracking_backend
         self.strategy_authoring_backend = strategy_authoring_backend
+        self.screen_query_history = screen_query_history
+        self.screen_query_executor = screen_query_executor
+        self.daily_writer_capability = daily_writer_capability
+        self.daily_run_evidence = daily_run_evidence
+        self.condition_rule_scope = condition_rule_scope
         self.clock = clock or (lambda: datetime.now(UTC))
         self.lease_seconds = lease_seconds
         self.consumer_service_id = consumer_service_id
@@ -2693,6 +2992,23 @@ class PageControlConsumer:
         )
         self.canvas_publication_signer = canvas_publication_signer
         self.canvas_publication_keyring = canvas_publication_keyring
+
+    def trusted_daily_writer_capability(self) -> DailyWriterCapability | None:
+        from rquant.screen.daily_inputs import daily_writer_contract_fingerprint
+
+        if self.daily_writer_capability is None:
+            return None
+        try:
+            proof = self.daily_writer_capability()
+            if (
+                type(proof) is not DailyWriterCapability
+                or proof.writer_contract_fingerprint != daily_writer_contract_fingerprint()
+                or proof.completed_at > self.clock()
+            ):
+                return None
+            return proof
+        except (OSError, ValueError, RuntimeError):
+            return None
 
     def drain(self, *, limit: int) -> tuple[PageControlReceipt, ...]:
         with _PageControlExecutionMutex(self._consumer_mutex_path()) as acquired:
@@ -2719,6 +3035,68 @@ class PageControlConsumer:
             if claim.command != command:
                 raise PageControlCommandConflictError("price rule command changed before claim")
             return (self.outbox.complete_price_rule(claim, now=self.clock()),)
+
+    def drain_condition_rule_command(
+        self, command: _OwnedConditionAlertRuleValue
+    ) -> tuple[PageControlReceipt, ...]:
+        with _PageControlExecutionMutex(self._consumer_mutex_path()) as acquired:
+            if not acquired:
+                return ()
+            claims = self.outbox.claim_records(
+                limit=1,
+                owner_id=self.consumer_id,
+                lease_seconds=self.lease_seconds,
+                now=self.clock(),
+                target_command_id=command.command_id,
+            )
+            if not claims:
+                return ()
+            claim = claims[0]
+            if claim.command != command:
+                raise PageControlCommandConflictError("condition request changed before claim")
+            return (
+                self.outbox.complete_condition_rule(
+                    claim, now=self.clock(), resolve_scope=self.condition_rule_scope
+                ),
+            )
+
+    def _complete_screen_query_claim(self, claim: PageControlClaim) -> PageControlReceipt:
+        if self.screen_query_history is None:
+            raise RuntimeError("private screening is not configured")
+        data = None
+        code = None
+        if type(claim.command) is _OwnedExecuteScreenQuery:
+            if self.screen_query_executor is None:
+                raise RuntimeError("private screening executor is not configured")
+            self.screen_query_history.mark_started(claim, now=self.clock())
+            from rquant.web.screen_service import ScreenApplicationError
+
+            try:
+                data = self.screen_query_executor(claim.command.definition)
+            except ScreenApplicationError as error:
+                code = "source_expired" if error.status_code == 409 else "source_unavailable"
+        return self.screen_query_history.complete(
+            claim, now=self.clock(), data=data, failure_code=code
+        )
+
+    def drain_screen_query_command(
+        self, command: _OwnedExecuteScreenQuery | _OwnedSaveNlPreset
+    ) -> tuple[PageControlReceipt, ...]:
+        with _PageControlExecutionMutex(self._consumer_mutex_path()) as acquired:
+            if not acquired:
+                return ()
+            claims = self.outbox.claim_records(
+                limit=1,
+                owner_id=self.consumer_id,
+                lease_seconds=self.lease_seconds,
+                now=self.clock(),
+                target_command_id=command.command_id,
+            )
+            if not claims:
+                return ()
+            if claims[0].command != command:
+                raise PageControlCommandConflictError("screen command changed before claim")
+            return (self._complete_screen_query_claim(claims[0]),)
 
     def drain_research_query_command(
         self, command: _OwnedSaveResearchQuery
@@ -2751,8 +3129,11 @@ class PageControlConsumer:
             if not acquired:
                 return ()
             claims = self.outbox.claim_records(
-                limit=1, owner_id=self.consumer_id, lease_seconds=self.lease_seconds,
-                now=self.clock(), target_command_id=command.command_id,
+                limit=1,
+                owner_id=self.consumer_id,
+                lease_seconds=self.lease_seconds,
+                now=self.clock(),
+                target_command_id=command.command_id,
             )
             if not claims:
                 return ()
@@ -2795,6 +3176,9 @@ class PageControlConsumer:
     ) -> tuple[PageControlReceipt, ...]:
         receipts: list[PageControlReceipt] = []
         for claim in claims:
+            if type(claim.command) in (_OwnedExecuteScreenQuery, _OwnedSaveNlPreset):
+                receipts.append(self._complete_screen_query_claim(claim))
+                continue
             if isinstance(claim.command, _OwnedSaveResearchQuery):
                 receipts.append(self.outbox.complete_research_query(claim, now=self.clock()))
                 continue
@@ -2810,6 +3194,13 @@ class PageControlConsumer:
                 ),
             ):
                 receipts.append(self.outbox.complete_price_rule(claim, now=self.clock()))
+                continue
+            if type(claim.command) in _CONDITION_OWNED_TYPES:
+                receipts.append(
+                    self.outbox.complete_condition_rule(
+                        claim, now=self.clock(), resolve_scope=self.condition_rule_scope
+                    )
+                )
                 continue
             if isinstance(claim.command, AckAlert):
                 try:
@@ -2878,19 +3269,29 @@ class PageControlConsumer:
         terminal = self._outcome_from_effect(effect)
         if terminal is not None:
             return terminal
-        if isinstance(command, (OwnedSaveStrategyTemplate, OwnedArchiveStrategyTemplate, OwnedRunStrategyTemplate)):
-            marker = {"contract": "strategy-authoring-identity/v1", "identity": command.metadata_identity.model_dump(mode="json")}
+        if isinstance(
+            command,
+            (OwnedSaveStrategyTemplate, OwnedArchiveStrategyTemplate, OwnedRunStrategyTemplate),
+        ):
+            marker = {
+                "contract": "strategy-authoring-identity/v1",
+                "identity": command.metadata_identity.model_dump(mode="json"),
+            }
             try:
                 self._strategy_authoring_backend().validate(command)
                 if effect.result is None:
                     effect = self.outbox.record_started_effect_result(
-                        command.command_id, result=marker,
-                        owner_id=claim.owner_id, claim_token=claim.claim_token,
+                        command.command_id,
+                        result=marker,
+                        owner_id=claim.owner_id,
+                        claim_token=claim.claim_token,
                     )
                 if effect.result != marker:
                     raise ValueError("strategy original metadata identity differs")
             except Exception as exc:
-                raise _RetryableUncertainEffectError(f"strategy original identity cannot be verified: {exc}") from exc
+                raise _RetryableUncertainEffectError(
+                    f"strategy original identity cannot be verified: {exc}"
+                ) from exc
         if (
             isinstance(command, (SubmitPortfolioBacktest, ExportPortfolioBacktestZip))
             and effect.result is None
@@ -3221,7 +3622,10 @@ class PageControlConsumer:
     def _must_recover_before_failure(
         self, command: PageControlCommandValue, *, created: bool
     ) -> bool:
-        if isinstance(command, (OwnedSaveStrategyTemplate, OwnedArchiveStrategyTemplate, OwnedRunStrategyTemplate)):
+        if isinstance(
+            command,
+            (OwnedSaveStrategyTemplate, OwnedArchiveStrategyTemplate, OwnedRunStrategyTemplate),
+        ):
             return not created or self.strategy_authoring_backend is not None
         if isinstance(command, (SubmitPortfolioBacktest, ExportPortfolioBacktestZip)):
             effect = self.outbox.effect(command.command_id)
@@ -3294,7 +3698,10 @@ class PageControlConsumer:
         return _ExecutionOutcome(PageControlStatus.FAILED, effect.result, effect.error)
 
     def _execute(self, command: PageControlCommandValue) -> JsonValue:
-        if isinstance(command, (OwnedSaveStrategyTemplate, OwnedArchiveStrategyTemplate, OwnedRunStrategyTemplate)):
+        if isinstance(
+            command,
+            (OwnedSaveStrategyTemplate, OwnedArchiveStrategyTemplate, OwnedRunStrategyTemplate),
+        ):
             return self._strategy_authoring_backend().submit(command)
         if isinstance(command, (SubmitPortfolioBacktest, ExportPortfolioBacktestZip)):
             effect = self.outbox.effect(command.command_id)
@@ -3656,7 +4063,10 @@ class PageControlConsumer:
         return None
 
     def _recover_started_effect(self, command: PageControlCommandValue) -> JsonValue | None:
-        if isinstance(command, (OwnedSaveStrategyTemplate, OwnedArchiveStrategyTemplate, OwnedRunStrategyTemplate)):
+        if isinstance(
+            command,
+            (OwnedSaveStrategyTemplate, OwnedArchiveStrategyTemplate, OwnedRunStrategyTemplate),
+        ):
             return self._strategy_authoring_backend().recover(command)
         if isinstance(command, (SubmitPortfolioBacktest, ExportPortfolioBacktestZip)):
             effect = self.outbox.effect(command.command_id)
@@ -3995,6 +4405,9 @@ class PageControlConsumer:
         )
         columns = required_rule_columns(rules) | frozenset(command.include_columns)
         try:
+            from rquant.screen.daily_inputs import validate_daily_columns
+
+            validate_daily_columns(rules, columns)
             _selected_sources(columns, 500)
             fundamentals = set(FUNDAMENTAL_COLS_MAP.values())
             unsupported = any(column.split("[", 1)[0] in fundamentals for column in columns)
@@ -4005,7 +4418,13 @@ class PageControlConsumer:
         except ValueError as error:
             raise ValueError("pool conditions are not reproducible by the daily writer") from error
         if unsupported or dynamic_rsi or dynamic_ma:
-            raise ValueError("pool conditions are not reproducible by the daily writer")
+            from rquant.screen.daily_inputs import validate_daily_columns
+
+            validate_daily_columns(rules, columns)
+            if self.trusted_daily_writer_capability() is None:
+                raise ValueError(
+                    "pool conditions are not reproducible by the installed daily writer"
+                )
 
         candidate_name = f"user/{command.base_name}"
         if command.depends_on == candidate_name:
@@ -4729,7 +5148,9 @@ class PageControlService:
         self.consumer = consumer
 
     def submit(self, command: PageControlCommandValue) -> PageControlReceipt:
-        if isinstance(command, (SaveStrategyTemplate, ArchiveStrategyTemplate, RunStrategyTemplate)):
+        if isinstance(
+            command, (SaveStrategyTemplate, ArchiveStrategyTemplate, RunStrategyTemplate)
+        ):
             raise ValueError("strategy authoring requires trusted submission")
         if isinstance(command, SaveResearchQuery):
             raise ValueError("research queries require trusted submission")
@@ -4754,6 +5175,86 @@ class PageControlService:
     def _submit_verified_ack(self, command: AckAlert) -> PageControlReceipt:
         """Called only after the local Serving admission checks succeed."""
         return self._settle(command, self.outbox.enqueue_verified_ack(command))
+
+    def _screen_owned(
+        self,
+        command: ExecuteScreenQuery | SaveNlPreset,
+        *,
+        authenticated_actor_id: str,
+        definition: ScreenPresetDefinition | None = None,
+        expected_version: int | None = None,
+    ) -> _OwnedExecuteScreenQuery | _OwnedSaveNlPreset:
+        if self.consumer.screen_query_history is None:
+            raise RuntimeError("private screening is not configured")
+        if type(command) is ExecuteScreenQuery:
+            return _OwnedExecuteScreenQuery(**command.model_dump(), owner_id=authenticated_actor_id)
+        if type(command) is SaveNlPreset and definition is not None:
+            payload = command.model_dump()
+            payload.pop("kind")
+            return _OwnedSaveNlPreset(
+                **payload,
+                owner_id=authenticated_actor_id,
+                definition=definition,
+                expected_version=expected_version,
+            )
+        raise TypeError("screen admission requires an exact ownerless request")
+
+    def _submit_trusted_screen_query(
+        self,
+        command: ExecuteScreenQuery | SaveNlPreset,
+        *,
+        authenticated_actor_id: str,
+        definition: ScreenPresetDefinition | None = None,
+        expected_version: int | None = None,
+    ) -> PageControlReceipt:
+        owned = self._screen_owned(
+            command,
+            authenticated_actor_id=authenticated_actor_id,
+            definition=definition,
+            expected_version=expected_version,
+        )
+        history = self.consumer.screen_query_history
+        history._assert_private_database()
+        existing = self.outbox.lookup_screen_query_command(owned)
+        if existing is not None:
+            return self._settle(owned, existing, screen_query_command=owned)
+        history.ensure_capacity()
+        return self._settle(
+            owned, self.outbox.enqueue_trusted_screen_query(owned), screen_query_command=owned
+        )
+
+    def _lookup_trusted_screen_query(
+        self,
+        command: ExecuteScreenQuery | SaveNlPreset,
+        *,
+        authenticated_actor_id: str,
+        definition: ScreenPresetDefinition | None = None,
+        expected_version: int | None = None,
+    ) -> PageControlReceipt | None:
+        owned = self._screen_owned(
+            command,
+            authenticated_actor_id=authenticated_actor_id,
+            definition=definition,
+            expected_version=expected_version,
+        )
+        return self.outbox.lookup_screen_query_command(owned)
+
+    def _resume_trusted_screen_query(
+        self,
+        command: ExecuteScreenQuery | SaveNlPreset,
+        *,
+        authenticated_actor_id: str,
+        definition: ScreenPresetDefinition | None = None,
+        expected_version: int | None = None,
+    ) -> PageControlReceipt | None:
+        owned = self._screen_owned(
+            command,
+            authenticated_actor_id=authenticated_actor_id,
+            definition=definition,
+            expected_version=expected_version,
+        )
+        receipt = self.outbox.lookup_screen_query_command(owned)
+        return None if receipt is None else self._settle(owned, receipt, screen_query_command=owned)
 
     def _submit_trusted_research_query(
         self, command: SaveResearchQuery, *, authenticated_actor_id: str
@@ -4800,6 +5301,34 @@ class PageControlService:
         return self._settle(
             owned, self.outbox.enqueue_trusted_price_rule(owned), price_rule_command=owned
         )
+
+    def _submit_trusted_condition_rule(
+        self, command: ConditionAlertRuleRequestValue, *, authenticated_owner_id: str
+    ) -> PageControlReceipt:
+        owned = _owned_condition_rule_command(
+            command, authenticated_owner_id=authenticated_owner_id
+        )
+        return self._settle(
+            owned, self.outbox.enqueue_trusted_condition_rule(owned), condition_rule_command=owned
+        )
+
+    def _lookup_trusted_condition_rule(
+        self, command: ConditionAlertRuleRequestValue, *, authenticated_owner_id: str
+    ) -> PageControlReceipt | None:
+        return self.outbox.lookup_condition_rule_command(
+            _owned_condition_rule_command(command, authenticated_owner_id=authenticated_owner_id)
+        )
+
+    def _resume_trusted_condition_rule(
+        self, command: ConditionAlertRuleRequestValue, *, authenticated_owner_id: str
+    ) -> PageControlReceipt:
+        owned = _owned_condition_rule_command(
+            command, authenticated_owner_id=authenticated_owner_id
+        )
+        receipt = self.outbox.lookup_condition_rule_command(owned)
+        if receipt is None:
+            raise KeyError("condition original request not found")
+        return self._settle(owned, receipt, condition_rule_command=owned)
 
     def _submit_trusted_factor_tracking(
         self,
@@ -5065,31 +5594,50 @@ class PageControlService:
         self, request: StrategyTemplateCommand, *, authenticated_actor_id: str
     ) -> PageControlReceipt | None:
         self.consumer._strategy_authoring_backend().authorize(authenticated_actor_id)
-        matched = self.outbox.lookup_strategy_authoring_command(request, authenticated_actor_id=authenticated_actor_id)
+        matched = self.outbox.lookup_strategy_authoring_command(
+            request, authenticated_actor_id=authenticated_actor_id
+        )
         return None if matched is None else matched[1]
 
     def _resume_trusted_strategy_authoring(
         self, request: StrategyTemplateCommand, *, authenticated_actor_id: str
     ) -> PageControlReceipt:
         self.consumer._strategy_authoring_backend().authorize(authenticated_actor_id)
-        matched = self.outbox.lookup_strategy_authoring_command(request, authenticated_actor_id=authenticated_actor_id)
+        matched = self.outbox.lookup_strategy_authoring_command(
+            request, authenticated_actor_id=authenticated_actor_id
+        )
         if matched is None:
             raise KeyError("strategy original command not found")
         owned, receipt = matched
         return self._settle(owned, receipt, strategy_authoring_command=owned)
 
     def _submit_trusted_strategy_authoring(
-        self, request: StrategyTemplateCommand, *, authenticated_actor_id: str,
-        verified_metadata_identity: StrategyAuthoringIdentity, catalog: StrategySourceCatalog,
+        self,
+        request: StrategyTemplateCommand,
+        *,
+        authenticated_actor_id: str,
+        verified_metadata_identity: StrategyAuthoringIdentity,
+        catalog: StrategySourceCatalog,
     ) -> PageControlReceipt:
         backend = self.consumer._strategy_authoring_backend()
         backend.authorize(authenticated_actor_id)
-        matched = self.outbox.lookup_strategy_authoring_command(request, authenticated_actor_id=authenticated_actor_id)
+        matched = self.outbox.lookup_strategy_authoring_command(
+            request, authenticated_actor_id=authenticated_actor_id
+        )
         if matched is not None:
             return self._settle(matched[0], matched[1], strategy_authoring_command=matched[0])
-        owned = backend.compile(request, authenticated_actor_id=authenticated_actor_id, catalog=catalog, expected_identity=verified_metadata_identity)
+        owned = backend.compile(
+            request,
+            authenticated_actor_id=authenticated_actor_id,
+            catalog=catalog,
+            expected_identity=verified_metadata_identity,
+        )
         backend.validate(owned)
-        return self._settle(owned, self.outbox.enqueue_trusted_strategy_authoring(owned), strategy_authoring_command=owned)
+        return self._settle(
+            owned,
+            self.outbox.enqueue_trusted_strategy_authoring(owned),
+            strategy_authoring_command=owned,
+        )
 
     def _resume_trusted_price_rule(
         self, command: PriceAlertRuleRequestValue, *, authenticated_owner_id: str
@@ -5106,20 +5654,31 @@ class PageControlService:
         receipt: PageControlReceipt,
         *,
         price_rule_command: _OwnedPriceAlertRuleValue | None = None,
+        condition_rule_command: _OwnedConditionAlertRuleValue | None = None,
         factor_archive_command: _OwnedFactorDefinitionValue | None = None,
         factor_run_command: _OwnedSubmitFactorRun | None = None,
         factor_tracking_command: _OwnedSetFactorTracked | None = None,
         research_query_command: _OwnedSaveResearchQuery | None = None,
+        screen_query_command: _OwnedExecuteScreenQuery | _OwnedSaveNlPreset | None = None,
         strategy_authoring_command: OwnedStrategyTemplateCommand | None = None,
     ) -> PageControlReceipt:
         for _ in range(100):
             if receipt.status in _PAGE_CONTROL_TERMINAL_STATUSES:
-                if strategy_authoring_command is not None and receipt.status is PageControlStatus.SUCCEEDED:
-                    recovered = self.consumer._strategy_authoring_backend().recover(strategy_authoring_command)
+                if (
+                    strategy_authoring_command is not None
+                    and receipt.status is PageControlStatus.SUCCEEDED
+                ):
+                    recovered = self.consumer._strategy_authoring_backend().recover(
+                        strategy_authoring_command
+                    )
                     if recovered != receipt.result:
-                        raise RuntimeError("strategy original metadata receipt differs from journal")
+                        raise RuntimeError(
+                            "strategy original metadata receipt differs from journal"
+                        )
                 return receipt
-            if strategy_authoring_command is not None:
+            if screen_query_command is not None:
+                drained = self.consumer.drain_screen_query_command(screen_query_command)
+            elif strategy_authoring_command is not None:
                 drained = self.consumer.drain_strategy_authoring_command(strategy_authoring_command)
             elif research_query_command is not None:
                 drained = self.consumer.drain_research_query_command(research_query_command)
@@ -5131,6 +5690,8 @@ class PageControlService:
                 drained = self.consumer.drain_factor_definition_command(factor_archive_command)
             elif price_rule_command is not None:
                 drained = self.consumer.drain_price_rule_command(price_rule_command)
+            elif condition_rule_command is not None:
+                drained = self.consumer.drain_condition_rule_command(condition_rule_command)
             else:
                 drained = self.consumer.drain(limit=100)
             observed = self.outbox.receipt(command.command_id)
@@ -5803,8 +6364,24 @@ def _fsync_descriptor(descriptor: int) -> None:
 
 
 def parse_page_control_command(payload: object) -> PageControlCommandValue:
-    if isinstance(payload, (SaveStrategyTemplate, ArchiveStrategyTemplate, RunStrategyTemplate)) or (
-        isinstance(payload, Mapping) and payload.get("kind") in _STRATEGY_AUTHORING_KINDS
+    if isinstance(payload, _CONDITION_PUBLIC_TYPES) or (
+        isinstance(payload, Mapping)
+        and isinstance(payload.get("kind"), str)
+        and payload.get("kind") in _CONDITION_RULE_KINDS
+    ):
+        raise ValueError("condition rule requires trusted submission")
+    if isinstance(payload, (ExecuteScreenQuery, _OwnedSaveNlPreset, _OwnedAppendNlQueryLog)) or (
+        isinstance(payload, Mapping)
+        and isinstance(payload.get("kind"), str)
+        and payload.get("kind") in _SCREEN_QUERY_PRIVATE_KINDS
+    ):
+        raise ValueError("screen history requires trusted submission")
+    if isinstance(
+        payload, (SaveStrategyTemplate, ArchiveStrategyTemplate, RunStrategyTemplate)
+    ) or (
+        isinstance(payload, Mapping)
+        and isinstance(payload.get("kind"), str)
+        and payload.get("kind") in _STRATEGY_AUTHORING_KINDS
     ):
         raise ValueError("strategy authoring requires trusted submission")
     if isinstance(payload, SaveResearchQuery) or (

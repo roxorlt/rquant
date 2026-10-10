@@ -145,6 +145,10 @@ class WebSettings(BaseModel):
     factor_run_admission_socket_path: Path | None = None
     factor_run_admission_service_uid: StrictInt | None = None
     factor_run_admission_shared_gid: StrictInt | None = None
+    screen_query_users: frozenset[str] = frozenset()
+    screen_query_socket_path: Path | None = None
+    screen_query_service_uid: StrictInt | None = Field(default=None, ge=0)
+    screen_query_shared_gid: StrictInt | None = Field(default=None, ge=0)
     research_query_users: frozenset[str] = frozenset()
     research_query_socket_path: Path | None = None
     research_query_service_uid: StrictInt | None = None
@@ -166,19 +170,86 @@ class WebSettings(BaseModel):
 
     @model_validator(mode="after")
     def validate_sources_and_ingress(self) -> Self:
-        template_fields = (self.strategy_authoring_socket_path, self.strategy_authoring_service_uid, self.strategy_authoring_shared_gid)
-        if self.strategy_authoring_enabled or self.strategy_authoring_users or any(value is not None for value in template_fields):
-            if self.ingress_socket_path is None or self.proxy_proof_file is None or not self.strategy_authoring_users:
-                raise ValueError("strategy templates require private ingress, proof and exact users")
+        screen_fields = (
+            self.screen_query_socket_path,
+            self.screen_query_service_uid,
+            self.screen_query_shared_gid,
+        )
+        if self.screen_query_users or any(value is not None for value in screen_fields):
+            if (
+                not self.screen_query_users
+                or not all(value is not None for value in screen_fields)
+                or self.ingress_socket_path is None
+                or self.proxy_proof_file is None
+            ):
+                raise ValueError(
+                    "private screening requires exact users, ingress proof and peer endpoint IDs"
+                )
+            path = self.screen_query_socket_path
+            if (
+                not path.is_absolute()
+                or ".." in path.parts
+                or len(os.fsencode(path)) >= 100
+                or self.screen_query_service_uid == os.geteuid()
+            ):
+                raise ValueError(
+                    "private screening requires a short canonical socket and distinct service UID"
+                )
+            others = (
+                self.ingress_socket_path,
+                self.ack_admission_socket_path,
+                self.watchlist_admission_socket_path,
+                self.price_alert_admission_socket_path,
+                self.factor_admission_socket_path,
+                self.factor_run_admission_socket_path,
+                self.factor_tracking_admission_socket_path,
+                self.research_query_socket_path,
+                self.research_query_save_socket_path,
+                self.strategy_authoring_socket_path,
+                self.unit_log_socket_path,
+            )
+            if any(other is not None and path.parent == other.parent for other in others):
+                raise ValueError("private screening requires a separate endpoint directory")
+        template_fields = (
+            self.strategy_authoring_socket_path,
+            self.strategy_authoring_service_uid,
+            self.strategy_authoring_shared_gid,
+        )
+        if (
+            self.strategy_authoring_enabled
+            or self.strategy_authoring_users
+            or any(value is not None for value in template_fields)
+        ):
+            if (
+                self.ingress_socket_path is None
+                or self.proxy_proof_file is None
+                or not self.strategy_authoring_users
+            ):
+                raise ValueError(
+                    "strategy templates require private ingress, proof and exact users"
+                )
             if any(value is not None for value in template_fields):
                 if not all(value is not None for value in template_fields):
-                    raise ValueError("strategy template private socket and IDs must be configured together")
+                    raise ValueError(
+                        "strategy template private socket and IDs must be configured together"
+                    )
                 path = self.strategy_authoring_socket_path
                 if not path.is_absolute() or ".." in path.parts or len(os.fsencode(path)) >= 100:
                     raise ValueError("strategy template private socket must be short and canonical")
                 if self.strategy_authoring_service_uid == os.geteuid():
                     raise ValueError("strategy template service UID must differ from Web UID")
-                others = (self.ingress_socket_path, self.ack_admission_socket_path, self.watchlist_admission_socket_path, self.price_alert_admission_socket_path, self.factor_admission_socket_path, self.factor_run_admission_socket_path, self.factor_tracking_admission_socket_path, self.research_query_socket_path, self.research_query_save_socket_path, self.unit_log_socket_path)
+                others = (
+                    self.ingress_socket_path,
+                    self.ack_admission_socket_path,
+                    self.watchlist_admission_socket_path,
+                    self.price_alert_admission_socket_path,
+                    self.factor_admission_socket_path,
+                    self.factor_run_admission_socket_path,
+                    self.factor_tracking_admission_socket_path,
+                    self.research_query_socket_path,
+                    self.research_query_save_socket_path,
+                    self.unit_log_socket_path,
+                )
                 if any(other is not None and path.parent == other.parent for other in others):
                     raise ValueError("strategy template private socket needs a separate directory")
         price_fields = (
@@ -454,6 +525,7 @@ class WebSettings(BaseModel):
         "factor_run_users",
         "factor_tracking_users",
         "research_query_users",
+        "screen_query_users",
         "strategy_authoring_users",
     )
     @classmethod
@@ -566,8 +638,27 @@ class WebSettings(BaseModel):
         raw = source.get("RQUANT_WEB_STRATEGY_AUTHORING_SOCKET", "").strip()
         if raw:
             values["strategy_authoring_socket_path"] = Path(raw)
-        for suffix, field in (("SERVICE_UID", "strategy_authoring_service_uid"), ("SHARED_GID", "strategy_authoring_shared_gid")):
+        for suffix, field in (
+            ("SERVICE_UID", "strategy_authoring_service_uid"),
+            ("SHARED_GID", "strategy_authoring_shared_gid"),
+        ):
             raw = source.get(f"RQUANT_WEB_STRATEGY_AUTHORING_{suffix}", "").strip()
+            if raw:
+                values[field] = int(raw)
+        raw = source.get("RQUANT_WEB_SCREEN_QUERY_USERS", "").strip()
+        if raw:
+            names = tuple(name.strip() for name in raw.split(","))
+            if any(not name for name in names) or len(set(names)) != len(names):
+                raise ValueError("screen users must be exact distinct names")
+            values["screen_query_users"] = frozenset(names)
+        raw = source.get("RQUANT_WEB_SCREEN_QUERY_SOCKET", "").strip()
+        if raw:
+            values["screen_query_socket_path"] = Path(raw)
+        for suffix, field in (
+            ("SERVICE_UID", "screen_query_service_uid"),
+            ("SHARED_GID", "screen_query_shared_gid"),
+        ):
+            raw = source.get(f"RQUANT_WEB_SCREEN_QUERY_{suffix}", "").strip()
             if raw:
                 values[field] = int(raw)
         for suffix, field in (

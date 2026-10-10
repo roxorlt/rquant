@@ -11,9 +11,10 @@ import {
   type ScreenBlock,
   type ScreenOption,
   type ScreenRunRequest,
+  type ScreenQueryReadData,
 } from "@/api/screen";
 import { useCurrentMeta } from "@/api/useMeta";
-import { Button, SideDrawer } from "@/ui";
+import { Button, SideDrawer, Tip } from "@/ui";
 import { describeConditions } from "./ScreenNaturalLanguage";
 import {
   type ScreenPoolSaveCommand,
@@ -64,7 +65,8 @@ function saveableRanking(plan: ScreenRunRequest["ranking"]): PoolRankingPlan | n
   return { top_n: plan.top_n, conditions };
 }
 
-function dailyLimitReason(candidate: ScreenRunRequest): string | null {
+function dailyLimitReason(candidate: ScreenRunRequest, writerReady = false): string | null {
+  if (writerReady) return null;
   for (const condition of candidate.conditions) {
     const values = Object.values(condition.args ?? {});
     if (values.some((value) => isFundamentalScreenField(value)))
@@ -112,24 +114,33 @@ function saveBody(
 
 function ScreenPoolPublication({
   journal,
+  evidence,
+  onCheck,
 }: {
   journal: NonNullable<ReturnType<ScreenPoolSaveSession["snapshot"]>["journal"]>;
+  evidence: ScreenQueryReadData["daily_run_evidence"];
+  onCheck?: () => void;
 }) {
   const meta = useCurrentMeta();
   const editor = usePoolEditor();
   const pools = usePools();
   const stage = publicationStatus(journal, editor, pools, meta.data?.serving.generation_id);
+  const proof = evidence?.find((item) => item.preset_name === `user/${journal.body.base_name}` && item.definition_version === journal.version);
+  const published = pools.data?.pools.find((item) => item.key === `user/${journal.body.base_name}`);
+  const confirmed = stage === "result" && proof != null && proof.unknown_count === 0 && published?.result.trade_date === proof.trade_date && published.result.hit_count === proof.hit_count;
   return (
     <div className="screen-save-publication">
       <p>{stage === "request" ? "等待规则发布" : "规则已发布"}</p>
-      <p>{stage === "result" ? "结果已按新规则更新" : "等待下次选股结果"}</p>
-      {stage !== "result" ? (
+      <p>{confirmed ? "结果已按新规则更新" : "等待日终结果确认"}</p>
+      {proof ? <div><p>{proof.trade_date} · 命中 {proof.hit_count} 只 · 待确认 {proof.unknown_count} 只</p><Tip content={`输入 ${proof.content_digest}；结果 ${proof.result_version}；排名 ${proof.member_rank_digest}`}><span tabIndex={0}>结果出处</span></Tip></div> : null}
+      {!confirmed ? (
         <Button
           size="sm"
           onClick={() => {
             void meta.refetch();
             editor.refetch();
             pools.refetch();
+            onCheck?.();
           }}
         >
           检查更新
@@ -144,11 +155,17 @@ export function ScreenPoolSave({
   blockedReason,
   blocks,
   rankingMetrics,
+  dailyWriterCapability = null,
+  dailyRunEvidence = [],
+  onCheckEvidence,
 }: {
   candidate: ScreenRunRequest | null;
   blockedReason: string | null;
   blocks: ScreenBlock[];
   rankingMetrics: ScreenOption[];
+  dailyWriterCapability?: ScreenQueryReadData["daily_writer_capability"];
+  dailyRunEvidence?: ScreenQueryReadData["daily_run_evidence"];
+  onCheckEvidence?: () => void;
 }) {
   const meta = useCurrentMeta();
   const viewer = meta.data?.data.viewer ?? null;
@@ -173,7 +190,8 @@ export function ScreenPoolSave({
       : null;
   });
   const ranking = saveableRanking(candidate?.ranking);
-  const dailyReason = candidate ? dailyLimitReason(candidate) : null;
+  const writerReady = dailyWriterCapability?.contract === "daily-screen-writer/v1" && dailyWriterCapability.serving_generation_id === meta.data?.serving.generation_id;
+  const dailyReason = candidate ? dailyLimitReason(candidate, writerReady) : null;
   const rankingReason =
     candidate?.ranking && ranking === null ? "这项排名暂不能保存为每日池子。" : null;
   const readable =
@@ -312,7 +330,7 @@ export function ScreenPoolSave({
               </strong>
               <span>{journal.body.display_name}</span>
               {journal.message ? <p>{journal.message}</p> : null}
-              {journal.status === "succeeded" ? <ScreenPoolPublication journal={journal} /> : null}
+              {journal.status === "succeeded" ? <ScreenPoolPublication journal={journal} evidence={dailyRunEvidence} onCheck={onCheckEvidence} /> : null}
             </div>
           ) : (
             <>

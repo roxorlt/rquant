@@ -25,6 +25,8 @@ from pydantic import (
     model_validator,
 )
 
+from rquant.condition_alert_route import ConditionAlertBusRoutedRecord
+from rquant.condition_alert_runtime_contracts import ConditionRuntimeModel
 from rquant.price_alert_route import PriceAlertBusRoutedRecord
 from rquant.price_alert_runtime_contracts import PriceRuntimeModel, PriceSha256
 from rquant.runtime_contracts import (
@@ -1284,8 +1286,63 @@ class PriceAlertRouteSpoolRecord(PriceRuntimeModel):
         return cls(**body, record_hash=_sha256_bytes(canonical_json_bytes(body)), record=record)
 
 
-NotificationRouteSpoolRecord: TypeAlias = SignalRouteSpoolRecord | PriceAlertRouteSpoolRecord
-NotificationBusRoutedRecord: TypeAlias = SignalBusRoutedRecord | PriceAlertBusRoutedRecord
+class ConditionAlertRouteSpoolRecord(ConditionRuntimeModel):
+    schema_version: Literal[5] = 5
+    record_schema: Literal["rquant.condition-alert-route-record/v1"] = (
+        "rquant.condition-alert-route-record/v1"
+    )
+    global_sequence: StrictInt = Field(ge=1)
+    previous_record_hash: PriceSha256 | None = None
+    payload_hash: PriceSha256
+    record_hash: PriceSha256
+    record: ConditionAlertBusRoutedRecord
+
+    @field_validator("record", mode="before")
+    @classmethod
+    def exact_condition_record(cls, value: object) -> ConditionAlertBusRoutedRecord:
+        if isinstance(value, dict):
+            return ConditionAlertBusRoutedRecord.model_validate_json(canonical_json_bytes(value))
+        if type(value) is not ConditionAlertBusRoutedRecord:
+            raise TypeError("condition spool requires an exact committed condition record")
+        return ConditionAlertBusRoutedRecord.model_validate(value)
+
+    @model_validator(mode="after")
+    def verify_condition_chain(self) -> Self:
+        if (
+            self.record.global_sequence != self.global_sequence
+            or self.payload_hash != self.record.sha256
+        ):
+            raise ValueError("condition spool payload hash or sequence differs")
+        expected = _sha256_bytes(
+            canonical_json_bytes(self.model_dump(mode="json", exclude={"record", "record_hash"}))
+        )
+        if expected != self.record_hash:
+            raise ValueError("condition spool chain hash differs")
+        return self
+
+    @classmethod
+    def create(
+        cls, *, record: ConditionAlertBusRoutedRecord, previous_record_hash: str | None
+    ) -> ConditionAlertRouteSpoolRecord:
+        if type(record) is not ConditionAlertBusRoutedRecord:
+            raise TypeError("condition spool requires the exact condition routed record type")
+        record = ConditionAlertBusRoutedRecord.model_validate_json(record.wire_bytes())
+        body = dict(
+            schema_version=5,
+            record_schema="rquant.condition-alert-route-record/v1",
+            global_sequence=record.global_sequence,
+            previous_record_hash=previous_record_hash,
+            payload_hash=record.sha256,
+        )
+        return cls(**body, record_hash=_sha256_bytes(canonical_json_bytes(body)), record=record)
+
+
+NotificationRouteSpoolRecord: TypeAlias = (
+    SignalRouteSpoolRecord | PriceAlertRouteSpoolRecord | ConditionAlertRouteSpoolRecord
+)
+NotificationBusRoutedRecord: TypeAlias = (
+    SignalBusRoutedRecord | PriceAlertBusRoutedRecord | ConditionAlertBusRoutedRecord
+)
 
 
 class NotificationEventObservedPrefixReceipt(PriceRuntimeModel):
@@ -1334,6 +1391,11 @@ def _decode_notification_spool_record(
         entry = PriceAlertRouteSpoolRecord.model_validate_json(payload)
         if entry.wire_bytes() != payload:
             raise ValueError("price spool record is not canonical")
+    elif body.get("schema_version") == 5:
+        strict_canonical_json_loads(payload)
+        entry = ConditionAlertRouteSpoolRecord.model_validate_json(payload)
+        if entry.wire_bytes() != payload:
+            raise ValueError("condition spool record is not canonical")
     else:
         raise TypeError("mixed notification history rejects current v3 or unknown schemas")
     if entry.global_sequence != sequence:
@@ -1380,13 +1442,13 @@ class ReadonlyNotificationEventRouteSpool:
             if entry.previous_record_hash != previous_hash:
                 raise ValueError("mixed notification spool hash chain differs")
             if (
-                type(entry) is PriceAlertRouteSpoolRecord
+                type(entry) in {PriceAlertRouteSpoolRecord, ConditionAlertRouteSpoolRecord}
                 and entry.record.bus_generation_id != identity.generation_id
             ):
                 raise ValueError("price spool proof belongs to another actual bus")
             available = (
                 entry.record.event.available_at
-                if type(entry) is PriceAlertRouteSpoolRecord
+                if type(entry) in {PriceAlertRouteSpoolRecord, ConditionAlertRouteSpoolRecord}
                 else entry.record.signal.available_at
             )
             latest_time = max(
@@ -1463,7 +1525,8 @@ class ReadonlyNotificationEventRouteSpool:
                         record = entry.record
                         available = (
                             record.event.available_at
-                            if type(record) is PriceAlertBusRoutedRecord
+                            if type(record)
+                            in {PriceAlertBusRoutedRecord, ConditionAlertBusRoutedRecord}
                             else record.signal.available_at
                         )
                         if max(available, record.received_at, record.receipt.routed_at) > cutoff:
@@ -1494,6 +1557,7 @@ class ReadonlyNotificationEventRouteSpool:
     def notification_events_after_global_sequence(
         self, *, after_sequence: int, through_sequence: int, observed_at: datetime, limit: int
     ) -> tuple:
+        from rquant.condition_alert_route import ConditionAlertBusEventRecord
         from rquant.price_alert_route import PriceAlertBusEventRecord
 
         records = self.routed_after_global_sequence(
@@ -1508,6 +1572,10 @@ class ReadonlyNotificationEventRouteSpool:
             if type(record) is PriceAlertBusRoutedRecord:
                 output.append(
                     PriceAlertBusEventRecord.model_validate_json(canonical_json_bytes(body))
+                )
+            elif type(record) is ConditionAlertBusRoutedRecord:
+                output.append(
+                    ConditionAlertBusEventRecord.model_validate_json(canonical_json_bytes(body))
                 )
             else:
                 output.append(
@@ -1557,8 +1625,24 @@ def publish_mixed_notification_bus_prefix(
                     limit=limit,
                 )
                 previous_hash = pointer.last_record_hash
-                for record in records:
+                prepared: list[tuple[int, bytes]] = []
+                cutoff = normalize_aware_utc(observed_at)
+                if len(records) > limit:
+                    raise ValueError("mixed prefix exceeds its requested batch limit")
+                for offset, record in enumerate(records, start=1):
+                    if type(record) not in {
+                        SignalBusRoutedRecord,
+                        PriceAlertBusRoutedRecord,
+                        ConditionAlertBusRoutedRecord,
+                    }:
+                        raise TypeError("mixed prefix cannot write a substituted or unknown record")
+                    if (
+                        record.global_sequence != pointer.source.high_watermark + offset
+                        or record.global_sequence > source.high_watermark
+                    ):
+                        raise ValueError("mixed prefix cannot skip or exceed its original source")
                     if type(record) is SignalBusRoutedRecord:
+                        record = SignalBusRoutedRecord.model_validate_json(_canonical_bytes(record))
                         require_legacy_signal_write(
                             record.signal, operation="mixed committed legacy relay"
                         )
@@ -1573,16 +1657,34 @@ def publish_mixed_notification_bus_prefix(
                             record=record, previous_record_hash=previous_hash
                         )
                         payload = entry.wire_bytes()
+                    elif type(record) is ConditionAlertBusRoutedRecord:
+                        if record.bus_generation_id != source.generation_id:
+                            raise ValueError(
+                                "condition routed record belongs to another actual bus"
+                            )
+                        entry = ConditionAlertRouteSpoolRecord.create(
+                            record=record, previous_record_hash=previous_hash
+                        )
+                        payload = entry.wire_bytes()
                     else:
                         raise TypeError("mixed prefix cannot write a substituted or current record")
+                    available = (
+                        record.signal.available_at
+                        if type(record) is SignalBusRoutedRecord
+                        else record.event.available_at
+                    )
+                    if max(available, record.received_at, record.receipt.routed_at) > cutoff:
+                        raise ValueError("mixed prefix contains a future event or route receipt")
+                    prepared.append((record.global_sequence, payload))
+                    previous_hash = entry.record_hash
+                for sequence, payload in prepared:
                     _immutable_write_at(
                         records_descriptor,
-                        spool.paths.record_name(record.global_sequence),
+                        spool.paths.record_name(sequence),
                         payload,
                         label="mixed immutable routed record",
                         max_bytes=_MAX_RECORD_BYTES,
                     )
-                    previous_hash = entry.record_hash
                 high = pointer.source.high_watermark + len(records)
                 updated = SignalRouteSpoolPointer(
                     source=source.model_copy(update={"high_watermark": high}),

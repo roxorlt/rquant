@@ -49,8 +49,8 @@ from rquant.signal_contracts import (
     SignalEnvelopeFamily,
     parse_signal_envelope,
 )
-from rquant.strict_json import canonical_json_bytes, strict_canonical_json_loads
 from rquant.strategy_authoring_projection_contract import STRATEGY_TEMPLATE_PROJECTION_LAYOUTS
+from rquant.strict_json import canonical_json_bytes, strict_canonical_json_loads
 
 GenerationId = Annotated[StrictStr, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 ProjectionScalar = StrictStr | StrictInt | StrictFloat | StrictBool | None
@@ -165,8 +165,21 @@ def _contract(
 PAGE_PROJECTION_CONTRACTS: Mapping[str, ServingProjectionContract] = MappingProxyType(
     {
         **{
-            name: _contract("lab_jobs", columns, keys, max_rows=max_rows, max_bytes=max_bytes, event_time_columns=times)
-            for name, (columns, keys, max_rows, max_bytes, times) in STRATEGY_TEMPLATE_PROJECTION_LAYOUTS.items()
+            name: _contract(
+                "lab_jobs",
+                columns,
+                keys,
+                max_rows=max_rows,
+                max_bytes=max_bytes,
+                event_time_columns=times,
+            )
+            for name, (
+                columns,
+                keys,
+                max_rows,
+                max_bytes,
+                times,
+            ) in STRATEGY_TEMPLATE_PROJECTION_LAYOUTS.items()
         },
         "experiment_attempt": _contract(
             "promotions",
@@ -583,6 +596,51 @@ PAGE_PROJECTION_CONTRACTS: Mapping[str, ServingProjectionContract] = MappingProx
             max_bytes=4096,
             event_time_columns=("activated_at",),
         ),
+        "condition_alert_rule_state": _contract(
+            "signals",
+            (("snapshot_key", "string"), ("state", "string"), ("body_json", "string")),
+            ("snapshot_key",),
+            max_rows=1,
+            max_bytes=4096,
+        ),
+        "condition_alert_rule": _contract(
+            "signals",
+            (
+                ("owner_id", "string"),
+                ("rule_id", "string"),
+                ("version", "int"),
+                ("body_json", "string"),
+            ),
+            ("owner_id", "rule_id"),
+            max_rows=10000,
+            max_bytes=7 * 1024 * 1024,
+        ),
+        "condition_alert_runtime_state": _contract(
+            "signals",
+            (("snapshot_key", "string"), ("body_json", "string")),
+            ("snapshot_key",),
+            max_rows=1,
+            max_bytes=4096,
+        ),
+        "condition_alert_runtime": _contract(
+            "signals",
+            (("owner_id", "string"), ("rule_id", "string"), ("body_json", "string")),
+            ("owner_id", "rule_id"),
+            max_rows=3200,
+            max_bytes=2 * 1024 * 1024,
+        ),
+        "condition_alert_runtime_event": _contract(
+            "signals",
+            (
+                ("owner_id", "string"),
+                ("event_id", "string"),
+                ("global_sequence", "int"),
+                ("body_json", "string"),
+            ),
+            ("owner_id", "global_sequence"),
+            max_rows=100,
+            max_bytes=2 * 1024 * 1024,
+        ),
         "price_alert_runtime_state": _contract(
             "signals",
             (("snapshot_key", "string"), ("body_json", "string")),
@@ -885,6 +943,27 @@ PAGE_PROJECTION_CONTRACTS: Mapping[str, ServingProjectionContract] = MappingProx
             max_rows=8_000,
             max_bytes=3 * 1024 * 1024,
             event_time_columns=("as_of",),
+        ),
+        "intraday_screen_source": _contract(
+            "signals",
+            (
+                ("source_identity", "string"),
+                ("trade_date", "date"),
+                ("cutoff", "timestamp"),
+                ("payload_json", "string"),
+            ),
+            ("source_identity",),
+            max_rows=1,
+            max_bytes=2 * 1024 * 1024,
+            event_date_columns=("trade_date",),
+            event_time_columns=("cutoff",),
+        ),
+        "intraday_feature_snapshot": _contract(
+            "signals",
+            (("source_identity", "string"), ("ts_code", "string"), ("payload_json", "string")),
+            ("source_identity", "ts_code"),
+            max_rows=8_000,
+            max_bytes=32 * 1024 * 1024,
         ),
         "intraday_kline": _contract(
             "signals",
@@ -1615,6 +1694,36 @@ PAGE_PROJECTION_CONTRACTS: Mapping[str, ServingProjectionContract] = MappingProx
             max_bytes=512 * 1024,
             event_date_columns=("trade_date",),
         ),
+        "screen_run_evidence": _contract(
+            "signals",
+            (
+                ("trade_date", "date"),
+                ("preset_name", "string"),
+                ("definition_version", "string"),
+                ("result_version", "string"),
+                ("source_kind", "string"),
+                ("source_identity", "string"),
+                ("content_digest", "string"),
+                ("decision_at", "timestamp"),
+                ("universe_count", "int"),
+                ("hit_count", "int"),
+                ("unknown_count", "int"),
+                ("ranking_plan_digest", "string"),
+                ("member_rank_digest", "string"),
+                ("persisted_extra_digest", "string"),
+                ("writer_contract_fingerprint", "string"),
+                ("evidence_version", "string"),
+                ("completed_at", "timestamp"),
+                ("canonical_receipt_id", "string"),
+                ("canonical_generation_id", "string"),
+                ("source_generation_id", "string"),
+            ),
+            ("preset_name",),
+            max_rows=512,
+            max_bytes=1024 * 1024,
+            event_date_columns=("trade_date",),
+            event_time_columns=("decision_at", "completed_at"),
+        ),
         "screen_run_receipt": _contract(
             "signals",
             (
@@ -1840,6 +1949,26 @@ class ServingProjectionInput(ServingProjectionPayload):
         )
 
 
+class ServingOwnerProjectionCapacityError(ValueError):
+    def __init__(self, owners: tuple[str, ...]) -> None:
+        self.owners = owners
+        super().__init__(
+            "serving owner projections exceed their authority byte budget: " + ", ".join(owners)
+        )
+
+
+def require_projection_owner_budget(projections: tuple[ServingProjectionInput, ...]) -> None:
+    owner_sizes: dict[str, int] = {}
+    for projection in projections:
+        owner_sizes[projection.owner_dataset_id] = owner_sizes.get(
+            projection.owner_dataset_id, 0
+        ) + _projection_json_bytes(projection)
+    oversized = tuple(
+        sorted(owner for owner, size in owner_sizes.items() if size > _MAX_OWNER_PROJECTION_BYTES)
+    )
+    if oversized:
+        raise ServingOwnerProjectionCapacityError(oversized)
+
 class ServingSignalRecord(RuntimeContractModel):
     global_sequence: int = Field(ge=1)
     signal: SignalEnvelope
@@ -1933,7 +2062,6 @@ class ServingReadModelInput(RuntimeContractModel):
         if any(value > self.observed_at for value in times):
             raise ValueError("serving snapshot contains future evidence")
 
-        owner_sizes: dict[str, int] = {}
         price_size = 0
         for projection in self.projections:
             if projection.table_name in {
@@ -1943,10 +2071,6 @@ class ServingReadModelInput(RuntimeContractModel):
                 "price_alert_runtime_attempt",
             }:
                 price_size += _projection_json_bytes(projection)
-            owner_sizes[projection.owner_dataset_id] = owner_sizes.get(
-                projection.owner_dataset_id,
-                0,
-            ) + _projection_json_bytes(projection)
         if price_size > 2 * 1024 * 1024:
             raise ValueError("price runtime projections exceed their 2 MiB domain")
         if price_size:
@@ -1955,16 +2079,7 @@ class ServingReadModelInput(RuntimeContractModel):
             validate_price_runtime_projections(
                 {projection.table_name: projection for projection in self.projections}
             )
-        oversized_owners = tuple(
-            sorted(
-                owner for owner, size in owner_sizes.items() if size > _MAX_OWNER_PROJECTION_BYTES
-            )
-        )
-        if oversized_owners:
-            raise ValueError(
-                "serving owner projections exceed their authority byte budget: "
-                + ", ".join(oversized_owners)
-            )
+        require_projection_owner_budget(self.projections)
 
         if any(
             projection.table_name
@@ -1997,6 +2112,14 @@ class ServingReadModelInput(RuntimeContractModel):
             validate_price_alert_rule_projections(
                 {projection.table_name: projection for projection in self.projections}
             )
+
+        from rquant.condition_alert_runtime_projection import (
+            validate_condition_rule_projections,
+            validate_condition_runtime_projections,
+        )
+
+        validate_condition_rule_projections({p.table_name: p for p in self.projections})
+        validate_condition_runtime_projections({p.table_name: p for p in self.projections})
 
         if any(
             projection.table_name in {"factor_definition_state", "factor_definition"}

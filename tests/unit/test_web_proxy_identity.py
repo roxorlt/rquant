@@ -198,9 +198,16 @@ def test_proxy_proof_path_requires_an_explicit_private_ingress(tmp_path: Path) -
     (
         "/api/v1/pools/editor",
         "/api/v1/paper/accounts",
+        "/api/v1/screen/query/history",
+        "/api/v1/screen/query/presets",
+        "/api/v1/screen/query/executions/synthetic-execution",
+        "/api/v1/screen/query/executions/synthetic-execution/results",
+        "/api/v1/screen/query/alert-drafts/abcdef123456abcdef123456",
         "/api/v1/monitor/timeline",
         "/api/v1/monitor/price-rules",
         "/api/v1/monitor/price-rules/head?rule_id=synthetic-rule",
+        "/api/v1/monitor/condition-rules",
+        "/api/v1/monitor/condition-rules/head?rule_id=synthetic-rule",
         "/api/v1/strategy-templates",
         "/api/v1/strategy-templates/sources",
         "/api/v1/strategy-templates/template_synthetic",
@@ -314,7 +321,7 @@ def test_current_user_route_inventory_matches_documented_categories(tmp_path: Pa
         / "docs/plans/2026-09-29-web-private-identity-route-inventory.md"
     ).read_text(encoding="utf-8")
     documented = re.findall(r"\| (GET|POST) \| `(/api/v1[^`]+)` \|", document)
-    assert len(documented) == len(set(documented)) == 102
+    assert len(documented) == len(set(documented)) == 116
 
     app = create_app(WebSettings(serving_root=tmp_path), background=False)
 

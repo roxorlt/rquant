@@ -16,9 +16,11 @@ from typing import TYPE_CHECKING, Literal, Self
 from pydantic import Field, field_serializer, field_validator, model_validator
 
 from rquant.alert_ack import alert_event_at, alert_window_start
+from rquant.condition_alert_route import ConditionAlertBusRoutedRecord
 from rquant.delivery_contracts import (
     DeliveryChannel,
     DeliveryTarget,
+    OutboxRecord,
     OutboxStatus,
     RouterDisposition,
 )
@@ -51,6 +53,18 @@ from rquant.signal_route_spool import (
 )
 
 if TYPE_CHECKING:
+    from rquant.condition_alert_runtime import (
+        ConditionAlertRuntimeStore,
+        ConditionProducerRuntimeSnapshot,
+    )
+    from rquant.condition_alert_runtime_contracts import ConditionAlertRuntimeActivation
+    from rquant.condition_alert_runtime_projection import (
+        ConditionAlertAdmittedDelivery,
+        ConditionAlertCancellationReceipt,
+        ConditionAlertDeliveryAuthorityInput,
+        ConditionAlertDeliveryAuthoritySnapshot,
+        ConditionAlertSendAdmission,
+    )
     from rquant.price_alert_runtime_contracts import PriceAlertRuntimeActivation
     from rquant.price_alert_runtime_store import (
         PriceProducerRuntimeSnapshot,
@@ -91,10 +105,18 @@ _OPTIONAL_NOTIFICATION_PROJECTION_TABLES = frozenset(
         "manual_watchlist",
         "price_alert_rule_state",
         "price_alert_rule",
+        "condition_alert_rule_state",
+        "condition_alert_rule",
+        "condition_alert_runtime_state",
+        "condition_alert_runtime",
+        "condition_alert_runtime_event",
         "legacy_notification",
         "legacy_notification_status",
         "pool_definition",
         "screen_run_receipt",
+        "screen_run_evidence",
+        "intraday_screen_source",
+        "intraday_feature_snapshot",
         "pool_membership",
         "pool_member_return",
         "formula_pool_state",
@@ -364,6 +386,13 @@ class NotificationProjectionAuthoritySnapshot(RuntimeContractModel):
         validate_price_alert_rule_projections(
             {projection.table_name: projection for projection in self.projections}
         )
+        from rquant.condition_alert_runtime_projection import (
+            validate_condition_rule_projections,
+            validate_condition_runtime_projections,
+        )
+
+        validate_condition_rule_projections({p.table_name: p for p in self.projections})
+        validate_condition_runtime_projections({p.table_name: p for p in self.projections})
         if self.available_at > self.observed_at:
             raise ValueError("notification projection availability exceeds observation time")
         if any(projection.available_at > self.available_at for projection in self.projections):
@@ -1153,11 +1182,14 @@ class NotificationStateStore(SignalBusStore):
     def replicate_mixed_notification_events(
         self,
         source: SignalBusSourceDescriptor,
-        records: tuple[SignalBusRoutedRecord | PriceAlertBusRoutedRecord, ...],
+        records: tuple[
+            SignalBusRoutedRecord | PriceAlertBusRoutedRecord | ConditionAlertBusRoutedRecord, ...
+        ],
         *,
         observed_at: datetime,
         source_inspected_at: datetime,
     ) -> NotificationReplicationSummary:
+        from rquant.condition_alert_route import _condition_record, copy_condition_record
         from rquant.price_alert_route import (
             _history_installed,
             _price_ingest,
@@ -1186,6 +1218,11 @@ class NotificationStateStore(SignalBusStore):
                     record.signal, operation="mixed committed legacy replication"
                 )
                 available = record.signal.available_at
+            elif type(record) is ConditionAlertBusRoutedRecord:
+                record = ConditionAlertBusRoutedRecord.model_validate_json(record.wire_bytes())
+                if record.bus_generation_id != source.generation_id:
+                    raise ValueError("mixed condition proof belongs to another actual bus")
+                available = record.event.available_at
             elif type(record) is PriceAlertBusRoutedRecord:
                 record = PriceAlertBusRoutedRecord.model_validate(record)
                 if record.bus_generation_id != source.generation_id:
@@ -1228,8 +1265,14 @@ class NotificationStateStore(SignalBusStore):
             replicated = 0
             for record in checked:
                 is_price = type(record) is PriceAlertBusRoutedRecord
+                is_condition = type(record) is ConditionAlertBusRoutedRecord
                 if record.global_sequence <= started_after:
-                    if is_price:
+                    if is_condition:
+                        if _condition_record(connection, record.event_id) != record:
+                            raise ValueError(
+                                "mixed condition replay differs from original sealed proof"
+                            )
+                    elif is_price:
                         if _price_record(connection, record.event_id) != record:
                             raise ValueError(
                                 "mixed price replay differs from original sealed proof"
@@ -1241,7 +1284,10 @@ class NotificationStateStore(SignalBusStore):
                     raise ValueError(
                         "mixed replication must advance the original contiguous cursor"
                     )
-                if is_price:
+                if is_condition:
+                    copy_condition_record(connection, record)
+                    last_id = record.event_id
+                elif is_price:
                     sequence, added = _price_ingest(connection, record.event, record.received_at)
                     if not added or sequence != record.global_sequence:
                         raise ValueError(
@@ -1514,6 +1560,125 @@ class NotificationStateStore(SignalBusStore):
             ),
         )
 
+    def _condition_alert_failpoint(self, stage: str) -> None:
+        del stage
+
+    def install_condition_alert_delivery_v1(
+        self, activation: ConditionAlertRuntimeActivation
+    ) -> None:
+        from rquant.condition_alert_runtime_projection import install_condition_alert_delivery
+
+        install_condition_alert_delivery(self, activation)
+
+    def condition_alert_delivery_authority(self) -> ConditionAlertDeliveryAuthoritySnapshot | None:
+        from rquant.condition_alert_runtime_projection import condition_delivery_authority
+
+        with self._read_snapshot() as connection:
+            return condition_delivery_authority(connection)
+
+    def apply_condition_alert_delivery_authority(
+        self,
+        value: ConditionAlertDeliveryAuthorityInput,
+        *,
+        activation: ConditionAlertRuntimeActivation,
+        expected_revision: int,
+        applied_at: datetime,
+    ) -> ConditionAlertDeliveryAuthoritySnapshot:
+        from rquant.condition_alert_runtime_projection import (
+            apply_condition_alert_delivery_authority,
+        )
+
+        return apply_condition_alert_delivery_authority(
+            self,
+            value,
+            activation=activation,
+            expected_revision=expected_revision,
+            applied_at=applied_at,
+        )
+
+    def condition_alert_send_admission(
+        self, outbox_id: str, attempt_no: int
+    ) -> ConditionAlertSendAdmission | None:
+        from rquant.condition_alert_runtime_projection import condition_send_admission
+
+        with self._read_snapshot() as connection:
+            return condition_send_admission(connection, outbox_id, attempt_no)
+
+    def admit_condition_alert_delivery(
+        self,
+        record: OutboxRecord,
+        *,
+        activation: ConditionAlertRuntimeActivation,
+        worker_id: str,
+        expected_revision: int,
+        admitted_at: datetime,
+    ) -> ConditionAlertAdmittedDelivery | None:
+        from rquant.condition_alert_runtime_projection import admit_condition_alert_delivery
+
+        return admit_condition_alert_delivery(
+            self,
+            record,
+            activation=activation,
+            worker_id=worker_id,
+            expected_revision=expected_revision,
+            admitted_at=admitted_at,
+        )
+
+    def cancel_condition_unadmitted(
+        self,
+        outbox_id: str,
+        *,
+        worker_id: str | None,
+        expected_revision: int,
+        cancelled_at: datetime,
+    ) -> ConditionAlertCancellationReceipt | None:
+        from rquant.condition_alert_runtime_projection import cancel_condition_unadmitted
+
+        return cancel_condition_unadmitted(
+            self,
+            outbox_id,
+            worker_id=worker_id,
+            expected_revision=expected_revision,
+            cancelled_at=cancelled_at,
+        )
+
+    def claim_due_with_condition_activation(
+        self,
+        worker_id: str,
+        *,
+        activation: ConditionAlertRuntimeActivation,
+        now: datetime,
+        lease_for: timedelta,
+        limit: int,
+        include_price: bool = False,
+    ) -> tuple[OutboxRecord, ...]:
+        from rquant.condition_alert_runtime_contracts import require_verified_condition_activation
+        from rquant.condition_alert_runtime_projection import (
+            ConditionAlertAuthorityUnavailable,
+            condition_delivery_authority,
+            fresh_condition_authority,
+        )
+
+        binding = require_verified_condition_activation(activation, "notifier")
+        ready = False
+        if binding.delivery_enabled:
+            try:
+                with self._read_snapshot() as connection:
+                    fresh_condition_authority(
+                        condition_delivery_authority(connection), normalize_aware_utc(now)
+                    )
+                ready = True
+            except ConditionAlertAuthorityUnavailable:
+                pass
+        return self._claim_due(
+            worker_id,
+            now=now,
+            lease_for=lease_for,
+            limit=limit,
+            include_price=include_price,
+            include_condition=ready,
+        )
+
     def install_price_alert_delivery_v1(self, activation: object) -> None:
         from rquant.price_alert_runtime_projection import install_price_alert_delivery
 
@@ -1612,6 +1777,49 @@ class NotificationStateStore(SignalBusStore):
     ) -> NotificationServingSnapshot:
         return self._serving_snapshot(observed_at=observed_at, history_limit=history_limit)
 
+    def serving_condition_enabled_snapshot(
+        self,
+        *,
+        condition_producer: ConditionAlertRuntimeStore,
+        condition_activation: ConditionAlertRuntimeActivation,
+        observed_at: datetime,
+        history_limit: int,
+        price_producer: ReadonlyPriceAlertRuntimeStore | None = None,
+        price_activation: PriceAlertRuntimeActivation | None = None,
+        shadow: bool = False,
+    ) -> NotificationServingSnapshot:
+        from rquant.condition_alert_runtime import (
+            ConditionAlertRuntimeStore,
+            condition_producer_snapshot,
+        )
+        from rquant.condition_alert_runtime_contracts import require_verified_condition_activation
+
+        require_verified_condition_activation(condition_activation, "notifier")
+        if type(condition_producer) is not ConditionAlertRuntimeStore:
+            raise TypeError("condition projection needs its actual borrowed producer")
+        try:
+            facts = condition_producer_snapshot(condition_producer, observed_at=observed_at)
+        except (ValueError, OSError, sqlite3.Error):
+            facts = None
+        price_facts = None
+        if price_producer is not None:
+            from rquant.price_alert_runtime_contracts import require_verified_price_alert_activation
+
+            require_verified_price_alert_activation(price_activation, "notifier")
+            try:
+                price_facts = price_producer.runtime_snapshot(observed_at=observed_at)
+            except (ValueError, OSError, sqlite3.Error):
+                price_facts = None
+        return self._serving_snapshot(
+            observed_at=observed_at,
+            history_limit=history_limit,
+            price_facts=price_facts,
+            price_shadow=shadow,
+            price_domain_unavailable=price_producer is not None and price_facts is None,
+            condition_facts=facts,
+            condition_domain_unavailable=facts is None,
+        )
+
     def serving_price_enabled_snapshot(
         self,
         *,
@@ -1648,6 +1856,8 @@ class NotificationStateStore(SignalBusStore):
         price_facts: PriceProducerRuntimeSnapshot | None = None,
         price_shadow: bool = False,
         price_domain_unavailable: bool = False,
+        condition_facts: ConditionProducerRuntimeSnapshot | None = None,
+        condition_domain_unavailable: bool = False,
     ) -> NotificationServingSnapshot:
         from rquant.runtime_serving_snapshot import SignalDeliveryReadPayload
         from rquant.serving_read_models import (
@@ -1845,26 +2055,26 @@ class NotificationStateStore(SignalBusStore):
                 truncated=omitted > 0,
             )
             price_projections = ()
+
+            def require_joint_projection_budget(
+                values: tuple[ServingProjectionPayload, ...],
+            ) -> None:
+                owners: dict[str, int] = {}
+                legacy = () if projection_snapshot is None else projection_snapshot.projections
+                for value in legacy + values:
+                    owner = PAGE_PROJECTION_CONTRACTS[value.table_name].owner_dataset_id
+                    bound = ServingProjectionInput.bind(
+                        value, owner_dataset_id=owner, owner_generation_id="0" * 64
+                    )
+                    owners[owner] = owners.get(owner, 0) + _projection_json_bytes(bound)
+                if any(size > _MAX_OWNER_PROJECTION_BYTES for size in owners.values()):
+                    raise ValueError("notification projections exceed their owner byte budget")
+
             if price_facts is not None or price_domain_unavailable:
                 from rquant.price_alert_runtime_projection import (
                     price_runtime_projections,
                     unavailable_price_runtime_projections,
                 )
-
-                def require_joint_projection_budget(
-                    values: tuple[ServingProjectionPayload, ...],
-                ) -> None:
-                    owners: dict[str, int] = {}
-                    legacy = () if projection_snapshot is None else projection_snapshot.projections
-                    for value in legacy + values:
-                        owner = PAGE_PROJECTION_CONTRACTS[value.table_name].owner_dataset_id
-                        # The real source generation has this exact 64-byte width.
-                        bound = ServingProjectionInput.bind(
-                            value, owner_dataset_id=owner, owner_generation_id="0" * 64
-                        )
-                        owners[owner] = owners.get(owner, 0) + _projection_json_bytes(bound)
-                    if any(size > _MAX_OWNER_PROJECTION_BYTES for size in owners.values()):
-                        raise ValueError("notification projections exceed their owner byte budget")
 
                 try:
                     if price_domain_unavailable:
@@ -1884,6 +2094,37 @@ class NotificationStateStore(SignalBusStore):
                         observed_at=observed, shadow=price_shadow
                     )
                     require_joint_projection_budget(price_projections)
+            condition_projections = ()
+            if condition_facts is not None or condition_domain_unavailable:
+                from rquant.condition_alert_runtime_projection import (
+                    condition_runtime_projections,
+                    unavailable_condition_runtime_projections,
+                )
+
+                try:
+                    condition_projections = (
+                        condition_runtime_projections(
+                            connection,
+                            producer=condition_facts,
+                            observed_at=observed,
+                            history_limit=history_limit,
+                        )
+                        if condition_facts is not None
+                        else unavailable_condition_runtime_projections(observed_at=observed)
+                    )
+                    from rquant.condition_alert_runtime_projection import (
+                        validate_condition_runtime_projections,
+                    )
+
+                    validate_condition_runtime_projections(
+                        {item.table_name: item for item in condition_projections}
+                    )
+                    require_joint_projection_budget(price_projections + condition_projections)
+                except (TypeError, ValueError, sqlite3.Error):
+                    condition_projections = unavailable_condition_runtime_projections(
+                        observed_at=observed
+                    )
+                    require_joint_projection_budget(price_projections + condition_projections)
             connection.execute("COMMIT")
         except BaseException:
             if connection.in_transaction:
@@ -1903,7 +2144,8 @@ class NotificationStateStore(SignalBusStore):
             routes=coherent.routes,
             deliveries=coherent.deliveries,
             projections=(() if projection_snapshot is None else projection_snapshot.projections)
-            + price_projections,
+            + price_projections
+            + condition_projections,
         )
         return NotificationServingSnapshot(
             observed_at=observed,
@@ -1982,7 +2224,8 @@ class NotificationStateStore(SignalBusStore):
                 "SELECT * FROM delivery_outbox WHERE signal_id NOT IN "
                 "(SELECT signal_id FROM signal_envelope WHERE "
                 "json_extract(payload_json,'$.envelope_schema')='rquant.price"
-                "-alert-event/v1') ORDER BY global_sequence, outbox_id"
+                "-alert-event/v1' OR json_extract(payload_json,'$.envelope_schema')="
+                "'rquant.condition-alert-event/v1') ORDER BY global_sequence, outbox_id"
             ).fetchall()
             for row in rows:
                 channel = DeliveryChannel(row["channel"])

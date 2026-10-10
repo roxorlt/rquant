@@ -25,6 +25,197 @@ from tests.unit.test_signal_bus import CommitWatcher
 NOW = datetime(2026, 7, 31, 1, 30, tzinfo=UTC)
 
 
+def _condition_paper_world(tmp_path: Path):
+    from rquant.signal_route_spool import (
+        ReadonlyNotificationEventRouteSpool,
+        publish_mixed_notification_bus_prefix,
+    )
+    from tests.unit.test_price_alert_event_contracts import AT
+    from tests.unit.test_signal_route_spool import _condition_mixed_world
+
+    producer, bus, spool, originals = _condition_mixed_world(tmp_path)
+    publish_mixed_notification_bus_prefix(bus=bus, spool=spool, limit=100, observed_at=AT)
+    reader = ReadonlyNotificationEventRouteSpool(spool.paths.root)
+    queue = _queue(tmp_path / "condition-paper-queue.sqlite3")
+    state = PaperSignalConsumerStateStore(tmp_path / "condition-paper-state.sqlite3")
+    state.install_condition_notification_history()
+    return producer, bus, reader, queue, state
+
+
+def test_condition_paper_receipt_is_non_trading_atomic_and_reopens_before_later_legacy(
+    tmp_path: Path,
+) -> None:
+    from rquant.paper_signal_consumer import consume_notification_events_to_paper
+    from tests.unit.test_price_alert_event_contracts import AT
+
+    producer, bus, reader, queue, state = _condition_paper_world(tmp_path)
+    summary = consume_notification_events_to_paper(reader, queue, state, observed_at=AT, limit=3)
+    assert summary.ended_at_sequence == 3
+    assert summary.ignored_non_trading_count == 2
+    original = state.condition_non_trading_receipt(3)
+    assert original.receipt_schema == "paper-condition-non-trading/v1"
+    assert queue.record(original.record.event_id) is None
+    reopened = PaperSignalConsumerStateStore(state.path)
+    assert reopened.condition_non_trading_receipt(3) == original
+    assert (
+        reopened.complete_condition_non_trading(
+            original.record, reader.source_descriptor(), completed_at=AT + timedelta(seconds=1)
+        )
+        == original
+    )
+    following = consume_notification_events_to_paper(
+        reader, queue, reopened, observed_at=AT, limit=3
+    )
+    assert following.ended_at_sequence == 4
+    assert following.delegated_count == 1
+    assert len(reopened.receipts()) == 2
+    assert queue.record(original.record.event_id) is None
+    producer.close()
+
+
+@pytest.mark.parametrize("failure", ["source", "future", "payload", "gap", "subclass"])
+def test_condition_paper_bad_batch_rejects_before_source_observation_or_any_queue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    from rquant.condition_alert_route import ConditionAlertBusEventRecord
+    from rquant.paper_signal_consumer import consume_notification_events_to_paper
+    from tests.unit.test_price_alert_event_contracts import AT
+
+    producer, bus, reader, queue, state = _condition_paper_world(tmp_path)
+    rows = reader.notification_events_after_global_sequence(
+        after_sequence=0, through_sequence=4, observed_at=AT, limit=4
+    )
+    record = rows[2]
+    if failure == "source":
+        record = record.model_copy(update={"bus_generation_id": "f" * 64})
+    elif failure == "future":
+        record = record.model_copy(update={"received_at": AT + timedelta(seconds=1)})
+    elif failure == "payload":
+        record = record.model_copy(update={"payload_json": "{}"})
+    elif failure == "gap":
+        record = record.model_copy(update={"global_sequence": 4})
+    else:
+
+        class Substitute(ConditionAlertBusEventRecord):
+            pass
+
+        record = Substitute.model_validate_json(record.wire_bytes())
+    monkeypatch.setattr(
+        reader,
+        "notification_events_after_global_sequence",
+        lambda **_: (rows[0], rows[1], record, rows[3]),
+    )
+    before = state.cursor()
+    with pytest.raises((TypeError, ValueError, RuntimeError)):
+        consume_notification_events_to_paper(reader, queue, state, observed_at=AT, limit=4)
+    assert state.cursor() == before
+    assert state.receipts() == ()
+    assert state.condition_non_trading_receipt(3) is None
+    for row in (rows[0], rows[3]):
+        assert queue.record(row.signal_id) is None
+    producer.close()
+
+
+def test_condition_paper_receipt_write_failure_does_not_advance_consumed_cursor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rquant.paper_signal_consumer import consume_notification_events_to_paper
+    from tests.unit.test_price_alert_event_contracts import AT
+
+    producer, bus, reader, queue, state = _condition_paper_world(tmp_path)
+    consume_notification_events_to_paper(reader, queue, state, observed_at=AT, limit=2)
+    before = state.cursor()
+    monkeypatch.setattr(
+        state,
+        "_before_non_trading_commit",
+        lambda: (_ for _ in ()).throw(OSError("receipt commit failure")),
+    )
+    with pytest.raises(OSError):
+        consume_notification_events_to_paper(reader, queue, state, observed_at=AT, limit=1)
+    assert state.cursor() == before
+    assert state.condition_non_trading_receipt(3) is None
+    producer.close()
+
+
+@pytest.mark.parametrize("point", ["before_receipt", "after_commit_ack_loss"])
+def test_condition_paper_native_receipt_insert_and_committed_ack_loss_recover_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, point: str
+) -> None:
+    from collections.abc import Iterator
+    from contextlib import contextmanager
+
+    from rquant.paper_signal_consumer import consume_notification_events_to_paper
+    from tests.unit.test_price_alert_event_contracts import AT
+
+    producer, _, reader, queue, state = _condition_paper_world(tmp_path)
+    try:
+        consume_notification_events_to_paper(reader, queue, state, observed_at=AT, limit=2)
+        original_cursor = state.cursor()
+        record = reader.notification_events_after_global_sequence(
+            after_sequence=2, through_sequence=3, observed_at=AT, limit=1
+        )[0]
+        source = reader.source_descriptor()
+        with monkeypatch.context() as faults:
+            if point == "before_receipt":
+                original_connect = state._connect
+
+                def denied_receipt_connection() -> sqlite3.Connection:
+                    connection = original_connect()
+
+                    def authorizer(
+                        operation: int,
+                        table: str | None,
+                        column: str | None,
+                        database: str | None,
+                        trigger: str | None,
+                    ) -> int:
+                        return (
+                            sqlite3.SQLITE_DENY
+                            if operation == sqlite3.SQLITE_INSERT
+                            and table == "paper_condition_non_trading_receipt"
+                            else sqlite3.SQLITE_OK
+                        )
+
+                    connection.set_authorizer(authorizer)
+                    return connection
+
+                faults.setattr(state, "_connect", denied_receipt_connection)
+            else:
+                original_transaction = state._write_transaction
+
+                @contextmanager
+                def committed_ack_loss() -> Iterator[sqlite3.Connection]:
+                    with original_transaction() as connection:
+                        yield connection
+                    raise OSError("synthetic loss after actual SQLite commit")
+
+                faults.setattr(state, "_write_transaction", committed_ack_loss)
+            with pytest.raises((sqlite3.DatabaseError, OSError)):
+                state.complete_condition_non_trading(record, source, completed_at=AT)
+        reopened = PaperSignalConsumerStateStore(state.path)
+        original_receipt = reopened.condition_non_trading_receipt(3)
+        if point == "before_receipt":
+            assert original_receipt is None and reopened.cursor() == original_cursor
+        else:
+            assert original_receipt is not None and reopened.cursor().last_global_sequence == 3
+        summary = consume_notification_events_to_paper(
+            reader, queue, reopened, observed_at=AT, limit=3
+        )
+        actual = reopened.condition_non_trading_receipt(3)
+        assert actual is not None and (original_receipt is None or actual == original_receipt)
+        assert summary.delegated_count == 1 and reopened.cursor().last_global_sequence == 4
+        assert queue.record(actual.record.event_id) is None
+        replay = consume_notification_events_to_paper(
+            reader, queue, reopened, observed_at=AT, limit=3
+        )
+        assert (
+            replay.delegated_count == replay.ignored_non_trading_count == replay.replayed_count == 0
+        )
+        assert replay.watermark_advanced is False
+    finally:
+        producer.close()
+
+
 def _bus(path: Path) -> SignalBusStore:
     return SignalBusStore(path)
 

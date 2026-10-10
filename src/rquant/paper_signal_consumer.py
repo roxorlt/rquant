@@ -12,6 +12,8 @@ from typing import Annotated, Literal, Protocol, Self
 
 from pydantic import Field, StringConstraints, model_validator
 
+from rquant.condition_alert_route import ConditionAlertBusEventRecord
+from rquant.condition_alert_runtime_contracts import ConditionRuntimeModel
 from rquant.paper_signal_worker import (
     PaperSignalQueueRecord,
     PaperSignalQueueStatus,
@@ -42,6 +44,16 @@ _MIXED_HISTORY_SQL = (
     "event_id TEXT NOT NULL UNIQUE, body_json BLOB NOT NULL)",
 )
 _MIXED_HISTORY_TABLES = ("paper_notification_history", "paper_price_non_trading_receipt")
+_CONDITION_HISTORY_SQL = (
+    "CREATE TABLE paper_condition_notification_history(singleton INTEGER PRIMARY KEY "
+    "CHECK(singleton=1),protocol TEXT NOT NULL,consumer_fingerprint TEXT NOT NULL)",
+    "CREATE TABLE paper_condition_non_trading_receipt(global_sequence INTEGER PRIMARY KEY,"
+    "event_id TEXT NOT NULL UNIQUE,body_json BLOB NOT NULL)",
+)
+_CONDITION_HISTORY_TABLES = (
+    "paper_condition_notification_history",
+    "paper_condition_non_trading_receipt",
+)
 
 
 class PaperSignalConsumerSourceError(RuntimeError):
@@ -153,6 +165,26 @@ class PaperPriceNonTradingReceipt(PriceRuntimeModel):
             or max(self.record.received_at, self.record.event.available_at) > self.completed_at
         ):
             raise ValueError("paper price receipt has an invalid source or visibility")
+        return self
+
+
+class PaperConditionNonTradingReceipt(ConditionRuntimeModel):
+    receipt_schema: Literal["paper-condition-non-trading/v1"] = "paper-condition-non-trading/v1"
+    status: Literal["ignored_non_trading"] = "ignored_non_trading"
+    consumer_fingerprint: Sha256
+    source_id: str = Field(min_length=1)
+    source_generation_id: Sha256
+    record: ConditionAlertBusEventRecord
+    completed_at: AwareUtcDatetime
+
+    @model_validator(mode="after")
+    def source_and_visibility(self) -> Self:
+        if (
+            type(self.record) is not ConditionAlertBusEventRecord
+            or self.record.bus_generation_id != self.source_generation_id
+            or max(self.record.received_at, self.record.event.available_at) > self.completed_at
+        ):
+            raise ValueError("paper condition receipt has an invalid source or visibility")
         return self
 
 
@@ -648,6 +680,143 @@ class PaperSignalConsumerStateStore:
         ):
             raise ValueError("paper mixed history marker conflicts with the original consumer")
 
+    def install_condition_notification_history(self) -> None:
+        self.install_mixed_notification_history()
+        with self._write_transaction() as connection:
+            self._require_mixed_history(connection)
+            tables = {
+                row[0]
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            }
+            if tables & set(_CONDITION_HISTORY_TABLES):
+                self._require_condition_history(connection)
+                return
+            for statement in _CONDITION_HISTORY_SQL:
+                connection.execute(statement)
+            connection.execute(
+                "INSERT INTO paper_condition_notification_history VALUES(1,?,?)",
+                ("condition-notification-history/v1", self.consumer_fingerprint),
+            )
+
+    def _require_condition_history(self, connection: sqlite3.Connection) -> None:
+        self._require_mixed_history(connection)
+        actual = {
+            row[0]
+            for row in connection.execute(
+                "SELECT sql FROM sqlite_master WHERE tbl_name IN (?,?) AND sql IS NOT NULL",
+                _CONDITION_HISTORY_TABLES,
+            )
+        }
+        if actual != set(_CONDITION_HISTORY_SQL):
+            raise ValueError("paper condition installed schema differs")
+        marker = connection.execute(
+            "SELECT protocol,consumer_fingerprint FROM paper_condition_notification_history "
+            "WHERE singleton=1"
+        ).fetchone()
+        if marker is None or tuple(marker) != (
+            "condition-notification-history/v1",
+            self.consumer_fingerprint,
+        ):
+            raise ValueError("paper condition marker conflicts with the original consumer")
+
+    def condition_non_trading_receipt(
+        self, sequence: int
+    ) -> PaperConditionNonTradingReceipt | None:
+        with self._connect() as connection:
+            self._require_condition_history(connection)
+            row = connection.execute(
+                "SELECT body_json FROM paper_condition_non_trading_receipt WHERE global_sequence=?",
+                (sequence,),
+            ).fetchone()
+            return (
+                None if row is None else PaperConditionNonTradingReceipt.model_validate_json(row[0])
+            )
+
+    def complete_condition_non_trading(
+        self,
+        record: ConditionAlertBusEventRecord,
+        descriptor: SignalBusSourceDescriptor,
+        *,
+        completed_at: datetime,
+    ) -> PaperConditionNonTradingReceipt:
+        if (
+            type(record) is not ConditionAlertBusEventRecord
+            or type(descriptor) is not SignalBusSourceDescriptor
+        ):
+            raise TypeError(
+                "condition non-trading completion requires exact event and original source"
+            )
+        record = ConditionAlertBusEventRecord.model_validate_json(record.wire_bytes())
+        receipt = PaperConditionNonTradingReceipt(
+            consumer_fingerprint=self.consumer_fingerprint,
+            source_id=descriptor.source_id,
+            source_generation_id=descriptor.generation_id,
+            record=record,
+            completed_at=completed_at,
+        )
+        with self._write_transaction() as connection:
+            self._require_condition_history(connection)
+            source = self._required_source(connection)
+            self._verify_source_row(source, descriptor)
+            for table, key in (
+                ("paper_consumer_receipt", "signal_id"),
+                ("paper_price_non_trading_receipt", "event_id"),
+            ):
+                if (
+                    connection.execute(
+                        f"SELECT 1 FROM {table} WHERE global_sequence=? OR {key}=?",
+                        (record.global_sequence, record.event_id),
+                    ).fetchone()
+                    is not None
+                ):
+                    raise PaperSignalConsumerSourceError(
+                        "condition non-trading receipt conflicts with another family"
+                    )
+            row = connection.execute(
+                "SELECT body_json FROM paper_condition_non_trading_receipt "
+                "WHERE global_sequence=? OR event_id=?",
+                (record.global_sequence, record.event_id),
+            ).fetchone()
+            if row is not None:
+                original = PaperConditionNonTradingReceipt.model_validate_json(row[0])
+                if (
+                    original.record != record
+                    or original.source_id != descriptor.source_id
+                    or original.source_generation_id != descriptor.generation_id
+                ):
+                    raise PaperSignalConsumerSourceError(
+                        "condition non-trading replay differs from its original bytes"
+                    )
+                return original
+            last = int(source["last_global_sequence"])
+            if record.global_sequence != last + 1 or record.global_sequence > int(
+                source["observed_high_watermark"]
+            ):
+                raise PaperSignalConsumerSourceError(
+                    "condition non-trading cursor cannot skip a sequence"
+                )
+            connection.execute(
+                "INSERT INTO paper_condition_non_trading_receipt VALUES(?,?,?)",
+                (record.global_sequence, record.event_id, receipt.wire_bytes()),
+            )
+            updated = connection.execute(
+                "UPDATE paper_consumer_source "
+                "SET last_global_sequence=?,last_signal_id=?,updated_at=? "
+                "WHERE singleton=1 AND last_global_sequence=?",
+                (
+                    record.global_sequence,
+                    record.event_id,
+                    normalize_aware_utc(completed_at).isoformat(),
+                    last,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise PaperSignalConsumerSourceError(
+                    "condition non-trading cursor moved during commit"
+                )
+            self._before_non_trading_commit()
+        return receipt
+
     def non_trading_receipt(self, sequence: int) -> PaperPriceNonTradingReceipt | None:
         with self._connect() as connection:
             self._require_mixed_history(connection)
@@ -854,7 +1023,19 @@ def consume_notification_events_to_paper(
             or record.received_at > observed
         ):
             raise PaperSignalConsumerSourceError("mixed paper batch has a gap or future row")
-        if type(record) is PriceAlertBusEventRecord:
+        if type(record) is ConditionAlertBusEventRecord:
+            value = ConditionAlertBusEventRecord.model_validate_json(record.wire_bytes())
+            if (
+                value.bus_generation_id != descriptor.generation_id
+                or value.event.available_at > observed
+            ):
+                raise PaperSignalConsumerSourceError(
+                    "mixed paper condition source or visibility differs"
+                )
+            with state._connect() as connection:
+                state._require_condition_history(connection)
+            verified.append(None)
+        elif type(record) is PriceAlertBusEventRecord:
             value = PriceAlertBusEventRecord.model_validate_json(record.wire_bytes())
             if (
                 value.bus_generation_id != descriptor.generation_id
@@ -878,7 +1059,10 @@ def consume_notification_events_to_paper(
     delegated = replayed = ignored = 0
     for record, signal in zip(records, verified, strict=True):
         if signal is None:
-            state.complete_non_trading(record, descriptor, completed_at=observed)
+            if type(record) is ConditionAlertBusEventRecord:
+                state.complete_condition_non_trading(record, descriptor, completed_at=observed)
+            else:
+                state.complete_non_trading(record, descriptor, completed_at=observed)
             ignored += 1
             continue
         binding = state.bind(record, descriptor, bound_at=observed)

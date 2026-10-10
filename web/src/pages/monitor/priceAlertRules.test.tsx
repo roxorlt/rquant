@@ -249,7 +249,7 @@ it.each(["empty", "unavailable", "not_activated"])(
     }
     server.use(http.get(PREFIX, () => HttpResponse.json(response)));
     renderApp("/monitor");
-    const panel = await screen.findByRole("region", { name: "告警规则" });
+    const panel = await screen.findByRole("region", { name: "到价规则" });
     expect(
       await within(panel).findByText(state === "empty" ? "还没有到价规则" : response.data.message),
     ).toBeInTheDocument();

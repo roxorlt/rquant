@@ -24,6 +24,7 @@ from rquant.intraday_feature_engine import (
     FeatureComputationResult,
     IntradayFeatureConfig,
     live_compute,
+    feature_columns_for_version,
 )
 from rquant.live_contracts import (
     BatchQualityStatus,
@@ -186,7 +187,7 @@ def _empty_result(
                 actual_delay_seconds=0.0,
                 reason=reason,
             )
-            for name in STATUS_COLUMNS
+            for name in feature_columns_for_version(config.contract_version)[2:]
         ),
         producer_commit=config.producer_commit,
     )

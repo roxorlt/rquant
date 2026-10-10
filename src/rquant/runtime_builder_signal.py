@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Protocol
 from loguru import logger
 from pydantic import Field, StrictBool, StrictInt, field_validator, model_validator
 
+from rquant.condition_alert_runtime_contracts import ConditionAlertActivationSettings
 from rquant.delivery_contracts import DeliveryChannel, OutboxStatus
 from rquant.formula_pool_serving_projection import FormulaPoolServingConfig
 from rquant.notification_state import NotificationServingSnapshot, NotificationStateStore
@@ -20,6 +21,12 @@ from rquant.notification_worker import (
     run_notification_batch,
 )
 from rquant.price_alert_runtime_contracts import PriceAlertActivationSettings
+from rquant.runtime_builder_condition_alert import (
+    ConditionAlertPeerSettings,
+    apply_condition_role_scope,
+    open_condition_role_peer,
+    route_condition_role,
+)
 from rquant.runtime_builder_price_alert import (
     PriceAlertPeerSettings,
     apply_price_role_scope,
@@ -48,6 +55,7 @@ from rquant.runtime_service_entrypoint import (
     RuntimeServiceStep,
 )
 from rquant.runtime_shadow_validation import ShadowStrategyBinding
+from rquant.screen.intraday_source import IntradaySourceConfig
 from rquant.signal_bus import (
     SignalBusRoutedRecord,
     SignalBusStore,
@@ -76,12 +84,55 @@ if TYPE_CHECKING:
         ServingSourceAuthorityReader,
     )
     from rquant.runtime_serving_snapshot import SourceReadResult
+    from rquant.screen.intraday_source import IntradayScreenProjectionSource
     from rquant.serving_page_projection_source import SignalPageProjectionProducer
 
 _MAX_BATCH_LIMIT = 1_000
 _BUS_PREFIX_LINK_MIN_INTERVAL_SECONDS = 60.0
 _SIGNALS_DATASET_ID = "signals"
 _ACTIVE_OUTBOX_STATUSES = frozenset({OutboxStatus.PENDING, OutboxStatus.RETRY, OutboxStatus.LEASED})
+
+
+def build_intraday_page_source(
+    config: IntradaySourceConfig,
+    *,
+    manifest: RuntimeServiceManifest,
+    control_root: Path,
+) -> IntradayScreenProjectionSource:
+    from rquant.screen.intraday_source import IntradayScreenProjectionSource
+
+    trusted = next(
+        (
+            item
+            for item in config.schema_gate.registry.consumers
+            if item.consumer_id == config.schema_gate.consumer_id
+        ),
+        None,
+    )
+    if (
+        trusted is None
+        or trusted.service_id != manifest.service_id
+        or config.schema_gate.consumer_commit != manifest.producer_commit
+        or config.cursor_root != control_root / "intraday-screen-cursors"
+    ):
+        raise ValueError("intraday publisher capability or cursor ownership changed")
+    if config.quote_source is not None:
+        quote_gate = config.quote_source.schema_gate
+        trusted_quote = next(
+            (
+                item
+                for item in quote_gate.registry.consumers
+                if item.consumer_id == quote_gate.consumer_id
+            ),
+            None,
+        )
+        if (
+            trusted_quote is None
+            or trusted_quote.service_id != manifest.service_id
+            or quote_gate.consumer_commit != manifest.producer_commit
+        ):
+            raise ValueError("quote publisher consumer capability changed")
+    return IntradayScreenProjectionSource(config)
 
 
 class SignalSourceLoader(Protocol):
@@ -175,6 +226,9 @@ class SignalRouterSourceSettings(RuntimeContractModel):
 
 
 class SignalRouterSettings(_SignalBusSettings):
+    condition_alert_runtime: ConditionAlertActivationSettings | None = None
+    condition_alert_runtime_manifest_path: Path | None = None
+    condition_alert_peer: ConditionAlertPeerSettings | None = None
     price_alert_runtime: PriceAlertActivationSettings | None = None
     price_alert_runtime_manifest_path: Path | None = None
     price_alert_peer: PriceAlertPeerSettings | None = None
@@ -283,6 +337,9 @@ class SignalRouterSettings(_SignalBusSettings):
 
 
 class NotifierSettings(RuntimeContractModel):
+    condition_alert_runtime: ConditionAlertActivationSettings | None = None
+    condition_alert_runtime_manifest_path: Path | None = None
+    condition_alert_peer: ConditionAlertPeerSettings | None = None
     price_alert_runtime: PriceAlertActivationSettings | None = None
     price_alert_runtime_manifest_path: Path | None = None
     price_alert_peer: PriceAlertPeerSettings | None = None
@@ -305,6 +362,7 @@ class NotifierSettings(RuntimeContractModel):
     page_projection_canvas_receipt_root: Path | None = None
     page_projection_page_control_outbox_path: Path | None = None
     page_projection_formula_pool_config: FormulaPoolServingConfig | None = None
+    page_projection_intraday: IntradaySourceConfig | None = None
     page_projection_canvas_active_key_id: str | None = Field(
         default=None,
         pattern=r"^[a-z0-9][a-z0-9_.-]{0,127}$",
@@ -633,6 +691,8 @@ def _publish_signal_authority(
     price_activation: PriceAlertRuntimeActivation | None = None,
     price_shadow: bool = False,
     price_paused: bool = False,
+    condition_peer: object | None = None,
+    condition_activation: object | None = None,
 ) -> tuple[str, int]:
     from rquant.runtime_serving_authority import (
         ServingSourceAuthorityIntegrityError,
@@ -640,6 +700,16 @@ def _publish_signal_authority(
     )
 
     def read_snapshot() -> NotificationServingSnapshot:
+        if condition_peer is not None:
+            return store.serving_condition_enabled_snapshot(
+                condition_producer=condition_peer,
+                condition_activation=condition_activation,
+                observed_at=observed_at,
+                history_limit=history_limit,
+                price_producer=price_peer,
+                price_activation=price_activation,
+                shadow=price_shadow,
+            )
         if price_peer is not None:
             return store.serving_price_enabled_snapshot(
                 producer=price_peer,
@@ -779,6 +849,23 @@ def signal_router_builder(
             price_activation, price_peer, price_policy = open_price_role_peer(
                 manifest, settings.price_alert_peer, runtime_root=runtime_root
             )
+        condition_activation, condition_peer, condition_policy = None, None, None
+        fields = (
+            settings.condition_alert_runtime,
+            settings.condition_alert_runtime_manifest_path,
+            settings.condition_alert_peer,
+        )
+        if any(value is not None for value in fields) and not all(
+            value is not None for value in fields
+        ):
+            raise ValueError("condition peer authority must be complete")
+        if settings.condition_alert_peer is not None:
+            condition_activation, condition_peer, condition_policy = open_condition_role_peer(
+                manifest,
+                settings.condition_alert_peer,
+                runtime_root=runtime_root,
+                borrowed=price_peer,
+            )
         injected = source_loader is not None and target_resolver is not None
         if injected and settings.has_manifest_authority:
             raise ValueError(
@@ -830,6 +917,14 @@ def signal_router_builder(
                 ),
             )
         )
+        if condition_peer is not None:
+            if settings.condition_alert_peer.install_namespace:
+                bus.install_condition_alert_route_v1(condition_activation)
+            else:
+                from rquant.condition_alert_route import _require_condition_history
+
+                with bus._read_snapshot() as connection:
+                    _require_condition_history(connection)
         signal_spool = SignalRouteSpool(settings.signal_spool_root)
         cursors = SignalRouteCursorStore(
             settings.signal_bus_path,
@@ -882,11 +977,12 @@ def signal_router_builder(
 
         def step() -> RuntimeStepResult:
             nonlocal last_prefix_attempt_tick
+            observed_at = clock()
             before_publish = publish_mixed_notification_bus_prefix(
                 bus=bus,
                 spool=signal_spool,
                 limit=min(settings.batch_limit, 100),
-                observed_at=clock(),
+                observed_at=observed_at,
             )
             if before_publish.published_high_watermark < before_publish.source_high_watermark:
                 return RuntimeStepResult(
@@ -913,7 +1009,6 @@ def signal_router_builder(
             generations = {
                 "signal_route_spool": before_publish.source_generation_id,
             }
-            observed_at = clock()
             #: True as soon as one source's `observed_high_watermark` actually moves this
             #: iteration; `False` on every idle one, which is most of them (#271).
             watermark_advanced = False
@@ -1017,6 +1112,19 @@ def signal_router_builder(
                 input_sequence += price_high
                 output_sequence += price_last
                 processed_count += price_count
+                remaining -= price_count
+            if condition_peer is not None and remaining > 0:
+                high, last, count = route_condition_role(
+                    bus=bus,
+                    peer=condition_peer,
+                    activation=condition_activation,
+                    policy=condition_policy,
+                    observed_at=observed_at,
+                    limit=min(remaining, 100),
+                )
+                input_sequence += high
+                output_sequence += last
+                processed_count += count
             published = publish_mixed_notification_bus_prefix(
                 bus=bus,
                 spool=signal_spool,
@@ -1054,6 +1162,8 @@ def signal_router_builder(
 
         if price_peer is not None:
             step.close = price_peer.close
+        elif condition_peer is not None:
+            step.close = condition_peer.ledger.close
         return step
 
     return build
@@ -1124,7 +1234,32 @@ def notifier_builder(
             price_activation, price_peer, price_policy = open_price_role_peer(
                 manifest, settings.price_alert_peer, runtime_root=runtime_root
             )
+        condition_activation, condition_peer, condition_policy = None, None, None
+        fields = (
+            settings.condition_alert_runtime,
+            settings.condition_alert_runtime_manifest_path,
+            settings.condition_alert_peer,
+        )
+        if any(value is not None for value in fields) and not all(
+            value is not None for value in fields
+        ):
+            raise ValueError("condition peer authority must be complete")
+        if settings.condition_alert_peer is not None:
+            condition_activation, condition_peer, condition_policy = open_condition_role_peer(
+                manifest,
+                settings.condition_alert_peer,
+                runtime_root=runtime_root,
+                borrowed=price_peer,
+            )
         store = settings.open_store()
+        if condition_peer is not None:
+            if settings.condition_alert_peer.install_namespace:
+                store.install_condition_alert_delivery_v1(condition_activation)
+            else:
+                from rquant.condition_alert_runtime_projection import _require_condition_delivery
+
+                with store._read_snapshot() as connection:
+                    _require_condition_delivery(connection)
         source = ReadonlyNotificationEventRouteSpool(settings.signal_spool_root)
         authority_publisher: ServingSourceAuthorityPublisher | None = None
         authority_reader: ServingSourceAuthorityReader | None = None
@@ -1249,6 +1384,15 @@ def notifier_builder(
                         #: step writes nothing anywhere under the runtime root.
                     ),
                     store=store,
+                    intraday_source=(
+                        build_intraday_page_source(
+                            settings.page_projection_intraday,
+                            manifest=manifest,
+                            control_root=settings.notification_state_path.parent,
+                        )
+                        if settings.page_projection_intraday is not None
+                        else None
+                    ),
                 )
         if provider_loader is None:
             from rquant.runtime_notification_providers import (
@@ -1316,6 +1460,8 @@ def notifier_builder(
                         price_activation=price_activation,
                         price_shadow=settings.suppress_delivery,
                         price_paused=True,
+                        condition_peer=condition_peer,
+                        condition_activation=condition_activation,
                     )
                     source_generations["signals_serving_authority"] = generation_id
                     if omitted:
@@ -1341,6 +1487,15 @@ def notifier_builder(
                     activation=price_activation,
                     policy=price_policy,
                     serving_root=settings.price_alert_peer.scope_serving_root,
+                    observed_at=observed_at,
+                )
+            if condition_peer is not None:
+                apply_condition_role_scope(
+                    store,
+                    peer=condition_peer,
+                    activation=condition_activation,
+                    policy=condition_policy,
+                    serving_root=settings.condition_alert_peer.scope_serving_root,
                     observed_at=observed_at,
                 )
             visible_records = _read_routed_prefix_at(
@@ -1393,6 +1548,7 @@ def notifier_builder(
                 limit=settings.batch_limit,
                 clock=clock,
                 price_activation=price_activation,
+                condition_activation=condition_activation,
             )
             degraded: list[str] = []
             if settings.suppress_delivery:
@@ -1432,6 +1588,8 @@ def notifier_builder(
                     price_peer=price_peer,
                     price_activation=price_activation,
                     price_shadow=settings.suppress_delivery,
+                    condition_peer=condition_peer,
+                    condition_activation=condition_activation,
                 )
                 source_generations["signals_serving_authority"] = generation_id
                 if omitted:
@@ -1469,6 +1627,8 @@ def notifier_builder(
             )
         if price_peer is not None:
             step.close = price_peer.close
+        elif condition_peer is not None:
+            step.close = condition_peer.ledger.close
 
         return step
 

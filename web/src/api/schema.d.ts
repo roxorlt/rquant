@@ -736,6 +736,74 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/monitor/condition-rules": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 我的条件规则 */
+        get: operations["list_condition_rules_api_v1_monitor_condition_rules_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/monitor/condition-rules/commands": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 保存、启停或删除条件规则 */
+        post: operations["submit_condition_rule_api_v1_monitor_condition_rules_commands_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/monitor/condition-rules/commands/resume": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 继续核对原条件规则操作 */
+        post: operations["resume_condition_rule_api_v1_monitor_condition_rules_commands_resume_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/monitor/condition-rules/head": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 条件规则当前设置 */
+        get: operations["condition_head_api_v1_monitor_condition_rules_head_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/monitor/price-rules": {
         parameters: {
             query?: never;
@@ -1240,6 +1308,176 @@ export interface paths {
         put?: never;
         /** 预览一句话选股条件 */
         post: operations["preview_screen_natural_language_api_v1_screen_nl_preview_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/screen/query/alert-draft": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 带入选股条件提醒草稿 */
+        post: operations["create_alert_draft_api_v1_screen_query_alert_draft_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/screen/query/alert-drafts/{draft_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 读取本人提醒草稿 */
+        get: operations["get_alert_draft_api_v1_screen_query_alert_drafts__draft_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/screen/query/execute": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 执行并记录选股 */
+        post: operations["execute_screen_query_api_v1_screen_query_execute_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/screen/query/executions/{execution_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 读取原选股请求 */
+        get: operations["get_screen_execution_api_v1_screen_query_executions__execution_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/screen/query/executions/{execution_id}/results": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 读取原选股结果 */
+        get: operations["get_screen_results_api_v1_screen_query_executions__execution_id__results_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/screen/query/history": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 读取本人选股历史 */
+        get: operations["get_screen_history_api_v1_screen_query_history_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/screen/query/lookup": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 查询原选股命令 */
+        post: operations["lookup_screen_query_api_v1_screen_query_lookup_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/screen/query/presets": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 读取本人常用条件 */
+        get: operations["get_screen_presets_api_v1_screen_query_presets_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/screen/query/presets/save": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 保存本人常用条件 */
+        post: operations["save_screen_preset_api_v1_screen_query_presets_save_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/screen/query/resume": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 恢复原选股命令 */
+        post: operations["resume_screen_query_api_v1_screen_query_resume_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -3072,6 +3310,677 @@ export interface components {
             /** Row Count */
             row_count: number;
         };
+        /** ConditionAlertBarCloseFrequency */
+        ConditionAlertBarCloseFrequency: {
+            /**
+             * Bar Size
+             * @default 1min
+             * @constant
+             */
+            bar_size: "1min";
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "bar_close";
+        };
+        /** ConditionAlertEventEnvelope */
+        ConditionAlertEventEnvelope: {
+            /**
+             * Available At
+             * Format: date-time
+             */
+            available_at: string;
+            /** Channels */
+            channels: components["schemas"]["DeliveryChannel"][];
+            /**
+             * Daily Anchor Date
+             * Format: date
+             */
+            daily_anchor_date: string;
+            /**
+             * Decision Time
+             * Format: date-time
+             */
+            decision_time: string;
+            /**
+             * Envelope Schema
+             * @default rquant.condition-alert-event/v1
+             * @constant
+             */
+            envelope_schema: "rquant.condition-alert-event/v1";
+            /** Evaluation Contract Sha256 */
+            evaluation_contract_sha256: string;
+            /** Event Id */
+            event_id: string;
+            /**
+             * Event Time
+             * Format: date-time
+             */
+            event_time: string;
+            /**
+             * Expires At
+             * Format: date-time
+             */
+            expires_at: string;
+            /** Feature Snapshot Id */
+            feature_snapshot_id: string;
+            /** Frequency Bucket */
+            frequency_bucket: string;
+            /** Frequency Policy Sha256 */
+            frequency_policy_sha256: string;
+            /** Member Digest */
+            member_digest: string;
+            /** Owner Id */
+            owner_id: string;
+            /**
+             * Previous Truth
+             * @enum {string}
+             */
+            previous_truth: "true" | "false" | "unknown";
+            /**
+             * Priority
+             * @enum {string}
+             */
+            priority: "P0" | "P1" | "P2" | "P3";
+            /** Producer Commit */
+            producer_commit: string;
+            /** Producer Manifest Sha256 */
+            producer_manifest_sha256: string;
+            /** Raw Batch Id */
+            raw_batch_id: string;
+            /** Rule Body Hash */
+            rule_body_hash: string;
+            /** Rule Id */
+            rule_id: string;
+            /** Rule Name */
+            rule_name: string;
+            /** Rule Version */
+            rule_version: number;
+            /** Scope Version */
+            scope_version: string;
+            /** Source Epoch */
+            source_epoch: string;
+            /** Source Identity */
+            source_identity: string;
+            /** Stock Name */
+            stock_name: string;
+            /**
+             * Trigger Kind
+             * @enum {string}
+             */
+            trigger_kind: "matched" | "recovered";
+            /**
+             * Truth
+             * @enum {string}
+             */
+            truth: "true" | "false";
+            /** Ts Code */
+            ts_code: string;
+        };
+        /** ConditionAlertEveryEvaluationFrequency */
+        ConditionAlertEveryEvaluationFrequency: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "every_evaluation";
+        };
+        /** ConditionAlertGovernance */
+        ConditionAlertGovernance: {
+            /** Channels */
+            channels: components["schemas"]["DeliveryChannel"][];
+            /**
+             * Dedup Window Seconds
+             * @default 60
+             */
+            dedup_window_seconds: number;
+            /**
+             * Notify Recovery
+             * @default false
+             */
+            notify_recovery: boolean;
+        };
+        /** ConditionAlertMarketScope */
+        ConditionAlertMarketScope: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "market";
+            /**
+             * Universe Policy
+             * @default trusted_current
+             * @constant
+             */
+            universe_policy: "trusted_current";
+        };
+        /** ConditionAlertOrigin */
+        ConditionAlertOrigin: {
+            /** Command Hash */
+            command_hash: string;
+            /** Cutoff */
+            cutoff?: string | null;
+            /** Definition Hash */
+            definition_hash: string;
+            /** Draft Id */
+            draft_id?: string | null;
+            /** Execution Id */
+            execution_id: string;
+            /** Member Rank Digest */
+            member_rank_digest: string;
+            /**
+             * Mode
+             * @enum {string}
+             */
+            mode: "daily" | "intraday";
+            /** Result Digest */
+            result_digest: string;
+            /** Source Identity */
+            source_identity: string;
+            /**
+             * Trade Date
+             * Format: date
+             */
+            trade_date: string;
+        };
+        /** ConditionAlertPerSymbolMinutesFrequency */
+        ConditionAlertPerSymbolMinutesFrequency: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "per_symbol_minutes";
+            /** Minutes */
+            minutes: number;
+        };
+        /** ConditionAlertPoolScope */
+        ConditionAlertPoolScope: {
+            /** Definition Version */
+            definition_version: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "pool";
+            /** Pool Name */
+            pool_name: string;
+            /** Result Version */
+            result_version: string;
+        };
+        /** ConditionAlertRouteReceipt */
+        ConditionAlertRouteReceipt: {
+            /** Decision Fingerprint */
+            decision_fingerprint: string;
+            /**
+             * Disposition
+             * @enum {string}
+             */
+            disposition: "routed" | "no_target" | "expired";
+            /** Event Id */
+            event_id: string;
+            /** Owner Id */
+            owner_id: string;
+            /** Reason Code */
+            reason_code: ("no_owner_target" | "target_capability_unavailable" | "binding_inactive" | "routing_policy_retired") | null;
+            /**
+             * Receipt Schema
+             * @default rquant.condition-alert-route-receipt/v1
+             * @constant
+             */
+            receipt_schema: "rquant.condition-alert-route-receipt/v1";
+            /**
+             * Routed At
+             * Format: date-time
+             */
+            routed_at: string;
+            /** Routing Policy Sha256 */
+            routing_policy_sha256: string;
+            /** Rule Id */
+            rule_id: string;
+            /** Rule Version */
+            rule_version: number;
+            /** Scope Version */
+            scope_version: string;
+            /** Source Id */
+            source_id: string;
+            /**
+             * Source Inspected At
+             * Format: date-time
+             */
+            source_inspected_at: string;
+            /** Source Sequence */
+            source_sequence: number;
+            /** Target Count */
+            target_count: number;
+            /** Target Manifest Hash */
+            target_manifest_hash: string;
+            /** Targets */
+            targets: components["schemas"]["DeliveryTarget"][];
+        };
+        /** ConditionAlertRuleCommandReceipt */
+        ConditionAlertRuleCommandReceipt: {
+            /**
+             * Action
+             * @enum {string}
+             */
+            action: "save" | "set_enabled" | "delete";
+            /** Command Id */
+            command_id: string;
+            /**
+             * Consumer State
+             * @default unknown
+             * @enum {string}
+             */
+            consumer_state: "active" | "unknown";
+            /** Message */
+            message: string;
+            /** Rule Id */
+            rule_id: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "pending" | "processing" | "saved_syncing" | "published" | "superseded" | "conflict" | "capacity" | "scope_invalid" | "failed" | "rejected" | "uncertain" | "not_found";
+            /** Version */
+            version?: number | null;
+        };
+        /** ConditionAlertRuleCommandRequest */
+        ConditionAlertRuleCommandRequest: {
+            /**
+             * Action
+             * @enum {string}
+             */
+            action: "save" | "set_enabled" | "delete";
+            /** Command Id */
+            command_id: string;
+            /** Enabled */
+            enabled?: boolean | null;
+            /** Expected Version */
+            expected_version?: number | null;
+            /** Generation Id */
+            generation_id: string;
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+            rule?: components["schemas"]["ConditionAlertRuleDefinition-Input"] | null;
+            /** Rule Id */
+            rule_id: string;
+        };
+        /** ConditionAlertRuleDefinition */
+        "ConditionAlertRuleDefinition-Input": {
+            /** Conditions */
+            conditions: components["schemas"]["RuleCall"][];
+            /** Enabled */
+            enabled: boolean;
+            /**
+             * Frequency
+             * @default {
+             *       "kind": "every_evaluation"
+             *     }
+             */
+            frequency: components["schemas"]["ConditionAlertEveryEvaluationFrequency"] | components["schemas"]["ConditionAlertPerSymbolMinutesFrequency"] | components["schemas"]["ConditionAlertBarCloseFrequency"];
+            governance: components["schemas"]["ConditionAlertGovernance"];
+            /** Name */
+            name: string;
+            origin?: components["schemas"]["ConditionAlertOrigin"] | null;
+            /**
+             * Priority
+             * @enum {string}
+             */
+            priority: "P0" | "P1" | "P2" | "P3";
+            ranking?: components["schemas"]["ScreenRankingPlan"] | null;
+            /** Rule Id */
+            rule_id: string;
+            /**
+             * Schema Version
+             * @default 1
+             * @constant
+             */
+            schema_version: 1;
+            /** Scope */
+            scope: components["schemas"]["ConditionAlertMarketScope"] | components["schemas"]["ConditionAlertPoolScope"] | components["schemas"]["ConditionAlertWatchlistScope"] | components["schemas"]["ConditionAlertSectorScope"];
+            /**
+             * @default {
+             *       "condition_semantics_version": "screen-registry/v1",
+             *       "daily_anchor": "previous_closed_session",
+             *       "intraday_contract_id": "intraday-pit",
+             *       "minimum_intraday_contract_version": 3
+             *     }
+             */
+            source_policy: components["schemas"]["ConditionAlertSourcePolicy"];
+            /**
+             * @default {
+             *       "timezone": "Asia/Shanghai",
+             *       "windows": [
+             *         {
+             *           "end": "11:30:00",
+             *           "start": "09:30:00"
+             *         },
+             *         {
+             *           "end": "14:57:00",
+             *           "start": "13:00:00"
+             *         }
+             *       ]
+             *     }
+             */
+            trading_hours: components["schemas"]["ConditionAlertTradingHours-Input"];
+        };
+        /** ConditionAlertRuleDefinition */
+        "ConditionAlertRuleDefinition-Output": {
+            /** Conditions */
+            conditions: components["schemas"]["RuleCall"][];
+            /** Enabled */
+            enabled: boolean;
+            /**
+             * Frequency
+             * @default {
+             *       "kind": "every_evaluation"
+             *     }
+             */
+            frequency: components["schemas"]["ConditionAlertEveryEvaluationFrequency"] | components["schemas"]["ConditionAlertPerSymbolMinutesFrequency"] | components["schemas"]["ConditionAlertBarCloseFrequency"];
+            governance: components["schemas"]["ConditionAlertGovernance"];
+            /** Name */
+            name: string;
+            origin?: components["schemas"]["ConditionAlertOrigin"] | null;
+            /**
+             * Priority
+             * @enum {string}
+             */
+            priority: "P0" | "P1" | "P2" | "P3";
+            ranking?: components["schemas"]["ScreenRankingPlan"] | null;
+            /** Rule Id */
+            rule_id: string;
+            /**
+             * Schema Version
+             * @default 1
+             * @constant
+             */
+            schema_version: 1;
+            /** Scope */
+            scope: components["schemas"]["ConditionAlertMarketScope"] | components["schemas"]["ConditionAlertPoolScope"] | components["schemas"]["ConditionAlertWatchlistScope"] | components["schemas"]["ConditionAlertSectorScope"];
+            /**
+             * @default {
+             *       "condition_semantics_version": "screen-registry/v1",
+             *       "daily_anchor": "previous_closed_session",
+             *       "intraday_contract_id": "intraday-pit",
+             *       "minimum_intraday_contract_version": 3
+             *     }
+             */
+            source_policy: components["schemas"]["ConditionAlertSourcePolicy"];
+            /**
+             * @default {
+             *       "timezone": "Asia/Shanghai",
+             *       "windows": [
+             *         {
+             *           "end": "11:30:00",
+             *           "start": "09:30:00"
+             *         },
+             *         {
+             *           "end": "14:57:00",
+             *           "start": "13:00:00"
+             *         }
+             *       ]
+             *     }
+             */
+            trading_hours: components["schemas"]["ConditionAlertTradingHours-Output"];
+        };
+        /** ConditionAlertRuleHeadData */
+        ConditionAlertRuleHeadData: {
+            /**
+             * Availability
+             * @enum {string}
+             */
+            availability: "ready" | "not_activated" | "unavailable";
+            item: components["schemas"]["ConditionAlertRuleItem"] | null;
+            /** Rule Id */
+            rule_id: string;
+            /** Status */
+            status: ("live" | "deleted" | "absent") | null;
+            /** Version */
+            version: number | null;
+        };
+        /** ConditionAlertRuleItem */
+        ConditionAlertRuleItem: {
+            /** Evaluated At */
+            evaluated_at?: string | null;
+            /** Last Triggered At */
+            last_triggered_at?: string | null;
+            /** Matched Count */
+            matched_count?: number | null;
+            /** Ranking Digest */
+            ranking_digest?: string | null;
+            rule: components["schemas"]["ConditionAlertRuleDefinition-Output"];
+            /** Rule Id */
+            rule_id: string;
+            /** Scope Message */
+            scope_message: string;
+            /**
+             * Scope Status
+             * @enum {string}
+             */
+            scope_status: "bound" | "unavailable";
+            /**
+             * Status Label
+             * @default 未运行
+             * @enum {string}
+             */
+            status_label: "正常" | "注意" | "异常" | "未运行" | "等待开盘";
+            /** Unknown Count */
+            unknown_count?: number | null;
+            /**
+             * Updated At
+             * Format: date-time
+             */
+            updated_at: string;
+            /** Version */
+            version: number;
+        };
+        /** ConditionAlertRuleListData */
+        ConditionAlertRuleListData: {
+            /**
+             * Availability
+             * @enum {string}
+             */
+            availability: "ready" | "not_activated" | "unavailable";
+            /** Available At */
+            available_at: string | null;
+            /** Blocks */
+            blocks: components["schemas"]["ScreenBlock"][];
+            /** Can Enable */
+            can_enable: boolean;
+            /** Can Write */
+            can_write: boolean;
+            /** Enable Message */
+            enable_message: string;
+            /** Items */
+            items: components["schemas"]["ConditionAlertRuleItem"][];
+            /** Message */
+            message: string;
+            /** Ranking Metrics */
+            ranking_metrics: components["schemas"]["ScreenOption"][];
+            /** Scopes */
+            scopes: components["schemas"]["ConditionAlertScopeOption"][];
+            /** Triggers */
+            triggers: components["schemas"]["ConditionAlertTriggerItem"][];
+            /** Write Message */
+            write_message: string;
+        };
+        /** ConditionAlertScopeOption */
+        ConditionAlertScopeOption: {
+            /** Available */
+            available: boolean;
+            /** Label */
+            label: string;
+            /** Member Count */
+            member_count?: number | null;
+            /**
+             * Message
+             * @default
+             */
+            message: string;
+            /** Scope */
+            scope: components["schemas"]["ConditionAlertMarketScope"] | components["schemas"]["ConditionAlertPoolScope"] | components["schemas"]["ConditionAlertWatchlistScope"] | components["schemas"]["ConditionAlertSectorScope"];
+        };
+        /** ConditionAlertSectorScope */
+        ConditionAlertSectorScope: {
+            /** Component Source Version */
+            component_source_version: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "sector";
+            /** Sector Code */
+            sector_code: string;
+            /**
+             * Sector System
+             * @enum {string}
+             */
+            sector_system: "industry" | "concept";
+        };
+        /** ConditionAlertSourcePolicy */
+        ConditionAlertSourcePolicy: {
+            /**
+             * Condition Semantics Version
+             * @default screen-registry/v1
+             * @constant
+             */
+            condition_semantics_version: "screen-registry/v1";
+            /**
+             * Daily Anchor
+             * @default previous_closed_session
+             * @constant
+             */
+            daily_anchor: "previous_closed_session";
+            /**
+             * Intraday Contract Id
+             * @default intraday-pit
+             * @constant
+             */
+            intraday_contract_id: "intraday-pit";
+            /**
+             * Minimum Intraday Contract Version
+             * @default 3
+             * @enum {integer}
+             */
+            minimum_intraday_contract_version: 3 | 4;
+        };
+        /** ConditionAlertTargetReceipt */
+        ConditionAlertTargetReceipt: {
+            /** Attempted At */
+            attempted_at: string | null;
+            /**
+             * Channel
+             * @enum {string}
+             */
+            channel: "pushdeer" | "pushplus";
+            /** Provider Receipt */
+            provider_receipt: string | null;
+            /** Recipient Id */
+            recipient_id: string;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "pending" | "succeeded" | "failed" | "unknown" | "cancelled";
+        };
+        /** ConditionAlertTimeWindow */
+        "ConditionAlertTimeWindow-Input": {
+            /**
+             * End
+             * Format: time
+             */
+            end: string;
+            /**
+             * Start
+             * Format: time
+             */
+            start: string;
+        };
+        /** ConditionAlertTimeWindow */
+        "ConditionAlertTimeWindow-Output": {
+            /** End */
+            end: string;
+            /** Start */
+            start: string;
+        };
+        /** ConditionAlertTradingHours */
+        "ConditionAlertTradingHours-Input": {
+            /**
+             * Timezone
+             * @default Asia/Shanghai
+             * @constant
+             */
+            timezone: "Asia/Shanghai";
+            /**
+             * Windows
+             * @default [
+             *       {
+             *         "end": "11:30:00",
+             *         "start": "09:30:00"
+             *       },
+             *       {
+             *         "end": "14:57:00",
+             *         "start": "13:00:00"
+             *       }
+             *     ]
+             */
+            windows: components["schemas"]["ConditionAlertTimeWindow-Input"][];
+        };
+        /** ConditionAlertTradingHours */
+        "ConditionAlertTradingHours-Output": {
+            /**
+             * Timezone
+             * @default Asia/Shanghai
+             * @constant
+             */
+            timezone: "Asia/Shanghai";
+            /**
+             * Windows
+             * @default [
+             *       {
+             *         "end": "11:30:00",
+             *         "start": "09:30:00"
+             *       },
+             *       {
+             *         "end": "14:57:00",
+             *         "start": "13:00:00"
+             *       }
+             *     ]
+             */
+            windows: components["schemas"]["ConditionAlertTimeWindow-Output"][];
+        };
+        /** ConditionAlertTriggerItem */
+        ConditionAlertTriggerItem: {
+            /** Attempted At */
+            attempted_at?: string | null;
+            /**
+             * Delivery State
+             * @enum {string}
+             */
+            delivery_state: "pending" | "succeeded" | "failed" | "unknown" | "cancelled";
+            event: components["schemas"]["ConditionAlertEventEnvelope"];
+            /** Global Sequence */
+            global_sequence: number;
+            /** Provider Receipt */
+            provider_receipt?: string | null;
+            route: components["schemas"]["ConditionAlertRouteReceipt"];
+            /** Targets */
+            targets?: components["schemas"]["ConditionAlertTargetReceipt"][];
+        };
+        /** ConditionAlertWatchlistScope */
+        ConditionAlertWatchlistScope: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "watchlist";
+            /** Membership Version */
+            membership_version: string;
+        };
         /** ConditionTemplateEntry */
         ConditionTemplateEntry: {
             /** Conditions */
@@ -3172,6 +4081,34 @@ export interface components {
             unit?: ("stored_price" | "session_price" | "indicator" | "percent" | "ratio" | "CNY_10000" | "CNY" | "observations" | "binary" | "shares") | null;
             /** Value Semantics */
             value_semantics?: ("stored_not_recomputed" | "history_derived" | "stock_features_derived" | "minute_features_derived" | "market_temperature_stored" | "auction_derived" | "volume_profile_derived") | null;
+        };
+        /** DailyWriterCapability */
+        DailyWriterCapability: {
+            /** Canonical Generation Id */
+            canonical_generation_id: string;
+            /** Canonical Receipt Id */
+            canonical_receipt_id: string;
+            /**
+             * Completed At
+             * Format: date-time
+             */
+            completed_at: string;
+            /**
+             * Contract
+             * @default daily-screen-writer/v1
+             * @constant
+             */
+            contract: "daily-screen-writer/v1";
+            /** Serving Generation Id */
+            serving_generation_id: string;
+            /** Source Generation Id */
+            source_generation_id: string;
+            /** Verified Evidence Version */
+            verified_evidence_version: string;
+            /** Verified Result Version */
+            verified_result_version: string;
+            /** Writer Contract Fingerprint */
+            writer_contract_fingerprint: string;
         };
         /** DataAuditHealthData */
         DataAuditHealthData: {
@@ -3357,6 +4294,17 @@ export interface components {
             /** Total */
             total: number;
         };
+        /**
+         * DeliveryChannel
+         * @enum {string}
+         */
+        DeliveryChannel: "pushdeer" | "pushplus";
+        /** DeliveryTarget */
+        DeliveryTarget: {
+            channel: components["schemas"]["DeliveryChannel"];
+            /** Recipient Id */
+            recipient_id: string;
+        };
         /** DrawdownRule */
         "DrawdownRule-Input": {
             /**
@@ -3479,6 +4427,16 @@ export interface components {
         /** Envelope[CatalogList] */
         Envelope_CatalogList_: {
             data: components["schemas"]["CatalogList"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[ConditionAlertRuleHeadData] */
+        Envelope_ConditionAlertRuleHeadData_: {
+            data: components["schemas"]["ConditionAlertRuleHeadData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[ConditionAlertRuleListData] */
+        Envelope_ConditionAlertRuleListData_: {
+            data: components["schemas"]["ConditionAlertRuleListData"];
             serving: components["schemas"]["ServingMeta"];
         };
         /** Envelope[DailyData] */
@@ -3798,6 +4756,28 @@ export interface components {
             service_id: string;
             /** Summary */
             summary: string;
+        };
+        /** ExecuteScreenQuery */
+        ExecuteScreenQuery: {
+            /** Command Id */
+            command_id: string;
+            definition: components["schemas"]["ScreenQueryDefinition"];
+            /**
+             * Kind
+             * @default execute_screen_query
+             * @constant
+             */
+            kind: "execute_screen_query";
+            /**
+             * Page Size
+             * @default 20
+             */
+            page_size: number;
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
         };
         /**
          * ExecutionCostApplicability
@@ -8260,6 +9240,61 @@ export interface components {
             /** Table Name */
             table_name: string;
         };
+        /** PublishedDailyScreenEvidence */
+        PublishedDailyScreenEvidence: {
+            /** Canonical Generation Id */
+            canonical_generation_id?: string | null;
+            /** Canonical Receipt Id */
+            canonical_receipt_id?: string | null;
+            /**
+             * Completed At
+             * Format: date-time
+             */
+            completed_at: string;
+            /** Content Digest */
+            content_digest: string;
+            /**
+             * Decision At
+             * Format: date-time
+             */
+            decision_at: string;
+            /** Definition Version */
+            definition_version: string;
+            /** Evidence Version */
+            evidence_version: string;
+            /** Hit Count */
+            hit_count: number;
+            /** Member Rank Digest */
+            member_rank_digest: string;
+            /** Persisted Extra Digest */
+            persisted_extra_digest: string;
+            /** Preset Name */
+            preset_name: string;
+            /** Ranking Plan Digest */
+            ranking_plan_digest: string | null;
+            /** Result Version */
+            result_version: string;
+            /** Source Generation Id */
+            source_generation_id?: string | null;
+            /** Source Identity */
+            source_identity: string;
+            /**
+             * Source Kind
+             * @constant
+             */
+            source_kind: "daily_writer";
+            /**
+             * Trade Date
+             * Format: date
+             */
+            trade_date: string;
+            /** Universe Count */
+            universe_count: number;
+            /** Unknown Count */
+            unknown_count: number;
+            /** Writer Contract Fingerprint */
+            writer_contract_fingerprint: string;
+        };
         /** PublishedPool */
         PublishedPool: {
             definition?: components["schemas"]["PoolDefinitionView"] | null;
@@ -8692,6 +9727,18 @@ export interface components {
             /** Win Rate */
             win_rate: number | null;
         };
+        /**
+         * RuleCall
+         * @description 单条积木调用。name 必须存在于 REGISTRY，args 由各 RuleSpec.args_model 校验。
+         */
+        RuleCall: {
+            /** Args */
+            args?: {
+                [key: string]: unknown;
+            };
+            /** Name */
+            name: string;
+        };
         /** RunStrategyTemplate */
         RunStrategyTemplate: {
             /** Command Id */
@@ -8951,6 +9998,80 @@ export interface components {
             /** Source Updated At */
             source_updated_at: string | null;
         };
+        /** ScreenAlertDraft */
+        ScreenAlertDraft: {
+            capabilities: components["schemas"]["ScreenAlertDraftCapabilities"];
+            /** Conditions */
+            conditions: components["schemas"]["RuleCall"][];
+            /** Content Hash */
+            content_hash?: string | null;
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            definition: components["schemas"]["ScreenQueryDefinition"];
+            /** Draft Id */
+            draft_id: string;
+            /**
+             * Expires At
+             * Format: date-time
+             */
+            expires_at: string;
+            origin: components["schemas"]["ConditionAlertOrigin"];
+            /**
+             * @default {
+             *       "kind": "market",
+             *       "universe_policy": "trusted_current"
+             *     }
+             */
+            preferred_scope: components["schemas"]["ConditionAlertMarketScope"];
+            ranking: components["schemas"]["ScreenRankingPlan"] | null;
+            /**
+             * Schema Version
+             * @default 1
+             * @constant
+             */
+            schema_version: 1;
+            /**
+             * @default {
+             *       "condition_semantics_version": "screen-registry/v1",
+             *       "daily_anchor": "previous_closed_session",
+             *       "intraday_contract_id": "intraday-pit",
+             *       "minimum_intraday_contract_version": 3
+             *     }
+             */
+            source_policy: components["schemas"]["ConditionAlertSourcePolicy"];
+            /** Suggested Name */
+            suggested_name: string;
+        };
+        /** ScreenAlertDraftCapabilities */
+        ScreenAlertDraftCapabilities: {
+            /** Condition Count */
+            condition_count: number;
+            /**
+             * Consumer State
+             * @default awaiting_consumer
+             * @constant
+             */
+            consumer_state: "awaiting_consumer";
+            /**
+             * Message
+             * @default 提醒草稿已生成，尚未生效。
+             */
+            message: string;
+            /** Ranking Imported */
+            ranking_imported: boolean;
+        };
+        /** ScreenAlertDraftRequest */
+        ScreenAlertDraftRequest: {
+            /** Command Hash */
+            command_hash: string;
+            /** Command Id */
+            command_id: string;
+            /** Execution Id */
+            execution_id: string;
+        };
         /** ScreenBlock */
         ScreenBlock: {
             /** Category */
@@ -8986,7 +10107,7 @@ export interface components {
              * Source Kind
              * @enum {string}
              */
-            source_kind: "serving" | "replica";
+            source_kind: "serving" | "replica" | "intraday";
         };
         /** ScreenCondition */
         ScreenCondition: {
@@ -8996,6 +10117,88 @@ export interface components {
             };
             /** Key */
             key: string;
+        };
+        /** ScreenExecuteAction */
+        ScreenExecuteAction: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            action: "execute";
+            command: components["schemas"]["ExecuteScreenQuery"];
+        };
+        /** ScreenExecutionResults */
+        ScreenExecutionResults: {
+            /** Artifact Sha256 */
+            artifact_sha256: string;
+            /** Execution Id */
+            execution_id: string;
+            /** Next Cursor */
+            next_cursor: string | null;
+            /** Rows */
+            rows: components["schemas"]["ScreenRow"][];
+        };
+        /** ScreenExecutionView */
+        ScreenExecutionView: {
+            /** Artifact Sha256 */
+            artifact_sha256?: string | null;
+            /** Base Count */
+            base_count?: number | null;
+            /** Command Hash */
+            command_hash: string;
+            /** Completed At */
+            completed_at?: string | null;
+            definition: components["schemas"]["ScreenQueryDefinition"];
+            /** Execution Id */
+            execution_id: string;
+            /** Failure Code */
+            failure_code?: string | null;
+            /** Member Rank Sha256 */
+            member_rank_sha256?: string | null;
+            original_command: components["schemas"]["ExecuteScreenQuery"];
+            /** Plan Hash */
+            plan_hash: string;
+            /** Ranked Count */
+            ranked_count?: number | null;
+            /** Sequence */
+            sequence: number;
+            source?: components["schemas"]["ScreenSourceInfo"] | null;
+            /** Started At */
+            started_at?: string | null;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "pending" | "processing" | "succeeded" | "failed" | "source_expired" | "unknown";
+            /**
+             * Steps
+             * @default []
+             */
+            steps: components["schemas"]["ScreenStep"][];
+            /** Total */
+            total?: number | null;
+            /** Unknown Count */
+            unknown_count?: number | null;
+        };
+        /** ScreenHistoryView */
+        ScreenHistoryView: {
+            /** Items */
+            items: components["schemas"]["ScreenExecutionView"][];
+            /** Next Cursor */
+            next_cursor: string | null;
+            /** Owner Scope Tag */
+            owner_scope_tag: string;
+        };
+        /** ScreenLookupAction */
+        ScreenLookupAction: {
+            /**
+             * Action
+             * @default lookup
+             * @constant
+             */
+            action: "lookup";
+            /** Original */
+            original: components["schemas"]["ScreenExecuteAction"] | components["schemas"]["ScreenPresetSaveAction"];
         };
         /** ScreenNlPreviewData */
         ScreenNlPreviewData: {
@@ -9072,6 +10275,116 @@ export interface components {
              */
             scale: number;
         };
+        /** ScreenPresetDefinition */
+        ScreenPresetDefinition: {
+            definition: components["schemas"]["ScreenQueryDefinition"];
+            /** Name */
+            name: string;
+            /** Preset Id */
+            preset_id: string;
+        };
+        /** ScreenPresetSaveAction */
+        ScreenPresetSaveAction: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            action: "presets_save";
+            request: components["schemas"]["ScreenPresetSaveRequest"];
+        };
+        /** ScreenPresetSaveRequest */
+        ScreenPresetSaveRequest: {
+            /** Command Id */
+            command_id: string;
+            /** Expected Version */
+            expected_version?: number | null;
+            preset: components["schemas"]["ScreenPresetDefinition"];
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+        };
+        /** ScreenQueryDefinition */
+        ScreenQueryDefinition: {
+            /** Conditions */
+            conditions: components["schemas"]["RuleCall"][];
+            /** Cutoff */
+            cutoff?: string | null;
+            /**
+             * Description
+             * @default
+             */
+            description: string;
+            /**
+             * Mode
+             * @default daily
+             * @enum {string}
+             */
+            mode: "daily" | "intraday";
+            ranking?: components["schemas"]["ScreenRankingPlan"] | null;
+            /**
+             * Schema Version
+             * @default 1
+             * @constant
+             */
+            schema_version: 1;
+            /** Source Identity */
+            source_identity: string;
+            /**
+             * Source Kind
+             * @enum {string}
+             */
+            source_kind: "serving" | "replica" | "intraday";
+            /**
+             * Trade Date
+             * Format: date
+             */
+            trade_date: string;
+        };
+        /** ScreenQueryPreset */
+        ScreenQueryPreset: {
+            /** Command Hash */
+            command_hash: string;
+            definition: components["schemas"]["ScreenQueryDefinition"];
+            /** Name */
+            name: string;
+            /** Preset Id */
+            preset_id: string;
+            /**
+             * Updated At
+             * Format: date-time
+             */
+            updated_at: string;
+            /** Version */
+            version: number;
+        };
+        /** ScreenQueryReadData */
+        ScreenQueryReadData: {
+            alert_draft?: components["schemas"]["ScreenAlertDraft"] | null;
+            /**
+             * Available
+             * @default true
+             */
+            available: boolean;
+            /**
+             * Daily Run Evidence
+             * @default []
+             */
+            daily_run_evidence: components["schemas"]["PublishedDailyScreenEvidence"][];
+            daily_writer_capability?: components["schemas"]["DailyWriterCapability"] | null;
+            execution?: components["schemas"]["ScreenExecutionView"] | null;
+            history?: components["schemas"]["ScreenHistoryView"] | null;
+            /** Owner Scope Tag */
+            owner_scope_tag: string;
+            /**
+             * Presets
+             * @default []
+             */
+            presets: components["schemas"]["ScreenQueryPreset"][];
+            receipt?: components["schemas"]["PageControlReceipt"] | null;
+            results?: components["schemas"]["ScreenExecutionResults"] | null;
+        };
         /** ScreenRankingCondition */
         ScreenRankingCondition: {
             /** Ascending */
@@ -9087,6 +10400,17 @@ export interface components {
             conditions: components["schemas"]["ScreenRankingCondition"][];
             /** Top N */
             top_n: number;
+        };
+        /** ScreenResumeAction */
+        ScreenResumeAction: {
+            /**
+             * Action
+             * @default resume
+             * @constant
+             */
+            action: "resume";
+            /** Original */
+            original: components["schemas"]["ScreenExecuteAction"] | components["schemas"]["ScreenPresetSaveAction"];
         };
         /** ScreenRow */
         ScreenRow: {
@@ -9140,6 +10464,16 @@ export interface components {
             conditions: components["schemas"]["ScreenCondition"][];
             /** Cursor */
             cursor?: string | null;
+            /** Decision Cutoff */
+            decision_cutoff?: string | null;
+            /** Intraday Source Identity */
+            intraday_source_identity?: string | null;
+            /**
+             * Mode
+             * @default daily
+             * @enum {string}
+             */
+            mode: "daily" | "intraday";
             /**
              * Page Size
              * @default 20
@@ -9156,8 +10490,24 @@ export interface components {
         };
         /** ScreenSourceInfo */
         ScreenSourceInfo: {
+            /** Coverage Count */
+            coverage_count?: number | null;
+            /** Cutoff */
+            cutoff?: string | null;
+            /** Daily Anchor Date */
+            daily_anchor_date?: string | null;
             /** Identity */
             identity: string;
+            /** Intraday Source Identity */
+            intraday_source_identity?: string | null;
+            /** Missing Count */
+            missing_count?: number | null;
+            /**
+             * Mode
+             * @default daily
+             * @enum {string}
+             */
+            mode: "daily" | "intraday";
             /**
              * Updated At
              * Format: date-time
@@ -11409,6 +12759,123 @@ export interface operations {
             };
         };
     };
+    list_condition_rules_api_v1_monitor_condition_rules_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_ConditionAlertRuleListData_"];
+                };
+            };
+        };
+    };
+    submit_condition_rule_api_v1_monitor_condition_rules_commands_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ConditionAlertRuleCommandRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConditionAlertRuleCommandReceipt"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    resume_condition_rule_api_v1_monitor_condition_rules_commands_resume_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ConditionAlertRuleCommandRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConditionAlertRuleCommandReceipt"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    condition_head_api_v1_monitor_condition_rules_head_get: {
+        parameters: {
+            query: {
+                rule_id: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_ConditionAlertRuleHeadData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     list_price_rules_api_v1_monitor_price_rules_get: {
         parameters: {
             query?: never;
@@ -12192,7 +13659,9 @@ export interface operations {
     };
     get_blocks_api_v1_screen_blocks_get: {
         parameters: {
-            query?: never;
+            query?: {
+                mode?: "daily" | "intraday";
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -12206,6 +13675,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_ScreenCatalogData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };
@@ -12230,6 +13708,319 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ScreenNlPreviewData"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    create_alert_draft_api_v1_screen_query_alert_draft_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ScreenAlertDraftRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ScreenQueryReadData"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_alert_draft_api_v1_screen_query_alert_drafts__draft_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                draft_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ScreenQueryReadData"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    execute_screen_query_api_v1_screen_query_execute_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ExecuteScreenQuery"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ScreenQueryReadData"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_screen_execution_api_v1_screen_query_executions__execution_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                execution_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ScreenQueryReadData"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_screen_results_api_v1_screen_query_executions__execution_id__results_get: {
+        parameters: {
+            query?: {
+                limit?: number;
+                cursor?: string | null;
+            };
+            header?: never;
+            path: {
+                execution_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ScreenQueryReadData"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_screen_history_api_v1_screen_query_history_get: {
+        parameters: {
+            query?: {
+                limit?: number;
+                cursor?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ScreenQueryReadData"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    lookup_screen_query_api_v1_screen_query_lookup_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ScreenLookupAction"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ScreenQueryReadData"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_screen_presets_api_v1_screen_query_presets_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ScreenQueryReadData"];
+                };
+            };
+        };
+    };
+    save_screen_preset_api_v1_screen_query_presets_save_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ScreenPresetSaveRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ScreenQueryReadData"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    resume_screen_query_api_v1_screen_query_resume_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ScreenResumeAction"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ScreenQueryReadData"];
                 };
             };
             /** @description Validation Error */

@@ -1207,6 +1207,17 @@ FUNDAMENTAL_DAILY_VERSION_DDLS: tuple[str, ...] = (
     """,
 )
 
+SCREEN_RUN_EVIDENCE_DDL = """
+CREATE TABLE screen_run_evidence (
+    trade_date DATE NOT NULL,
+    preset_name VARCHAR NOT NULL,
+    result_version VARCHAR NOT NULL,
+    evidence_version VARCHAR NOT NULL,
+    payload_json VARCHAR NOT NULL,
+    PRIMARY KEY (trade_date, preset_name)
+);
+"""
+
 BASE_DDL = [
     DAILY_BAR_DDL, INDEX_DAILY_BAR_DDL, STOCK_BASIC_DDL, ADJ_FACTOR_DDL,
     DAILY_INDICATOR_DDL, DAILY_STATE_DDL, DAILY_BASIC_DDL,

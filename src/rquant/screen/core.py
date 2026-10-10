@@ -7,9 +7,10 @@ from typing import TYPE_CHECKING
 import pandas as pd
 
 from rquant.screen.loader import load_universe
-from rquant.screen.rules import AggregateRequest, Rule
+from rquant.screen.rules import AggregateRequest, Rule, required_rule_columns
 
 if TYPE_CHECKING:
+    from rquant.screen.daily_inputs import DailyScreenInputs
     from rquant.storage.duckdb import DuckDBStore
 
 BASE_COLUMNS = ["ts_code", "name", "CLOSE[0]", "PCT_CHG[0]"]
@@ -31,6 +32,43 @@ def _collect_aggregates(rules: list[Rule]) -> list[AggregateRequest]:
     return result
 
 
+def _boolean_rule_mask(rule: Rule, frame: pd.DataFrame) -> pd.Series:
+    value = rule(frame)
+    if type(value) is bool:
+        value = pd.Series(value, index=frame.index, dtype="boolean")
+    if not isinstance(value, pd.Series) or not value.index.equals(frame.index):
+        raise ValueError("screen rule result must match its actual universe")
+    return value.astype("boolean").fillna(False)
+
+
+def rule_state(universe: pd.DataFrame, rules: list[Rule]) -> tuple[list[Rule], list[int]]:
+    """Keep missing dependencies unknown using the original rule functions."""
+    confirmed = pd.Series(True, index=universe.index, dtype="boolean")
+    possible = confirmed.copy()
+    safe_rules: list[Rule] = []
+    unknown_counts: list[int] = []
+    for rule in rules:
+        dependencies = tuple(
+            sorted(
+                required_rule_columns([rule])
+                | {request.name for request in _collect_aggregates([rule])}
+            )
+        )
+        present = universe.loc[:, dependencies].notna().all(axis=1)
+        passed = _boolean_rule_mask(rule, universe) & present
+        confirmed &= passed
+        possible &= passed | ~present
+        unknown_counts.append(int((possible & ~confirmed).sum()))
+
+        def known(
+            frame: pd.DataFrame, original: Rule = rule, columns: tuple[str, ...] = dependencies
+        ) -> pd.Series:
+            return _boolean_rule_mask(original, frame) & frame.loc[:, columns].notna().all(axis=1)
+
+        safe_rules.append(known)
+    return safe_rules, unknown_counts
+
+
 def screen(
     trade_date: str,
     rules: list[Rule],
@@ -38,6 +76,7 @@ def screen(
     include_columns: list[str] | None = None,
     store: DuckDBStore | None = None,
     ts_code_whitelist: list[str] | None = None,
+    prepared: DailyScreenInputs | None = None,
 ) -> pd.DataFrame:
     """筛选：给定 trade_date 和 rules，返回命中股票。
 
@@ -50,7 +89,15 @@ def screen(
 
     aggregates = _collect_aggregates(rules)
 
-    df = load_universe(trade_date, lookback=lookback, store=store, aggregate_requests=aggregates)
+    if prepared is None:
+        df = load_universe(
+            trade_date, lookback=lookback, store=store, aggregate_requests=aggregates
+        )
+    else:
+        if prepared.evidence.trade_date.isoformat() != trade_date:
+            raise ValueError("daily input date differs from screening date")
+        df = prepared.frame
+        rules, _ = rule_state(df, rules)
 
     if df.empty:
         cols = list(BASE_COLUMNS)

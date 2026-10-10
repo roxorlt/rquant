@@ -32,6 +32,7 @@ from rquant.pipeline import (
     run_daily_pool_stage,
     run_daily_screen_stage,
 )
+from rquant.pool_result_receipt import DailyScreenAuthority
 from rquant.runtime_contracts import (
     AwareUtcDatetime,
     RuntimeContractModel,
@@ -382,6 +383,13 @@ class DailyScreenStage(_DailyDownstreamStage):
                     preset_names=preset_names,
                     store=store,
                     transaction_open=True,
+                    canonical_authority=DailyScreenAuthority(
+                        trade_date=canonical.trade_date,
+                        canonical_receipt_id=canonical.receipt_id,
+                        canonical_generation_id=canonical.generation_id,
+                        source_generation_id=canonical.source_generation_id,
+                        available_at=canonical.available_at,
+                    ),
                 )
                 self._assert_boundary(store, canonical, fence, ledger_input_identity)
                 store._conn.execute("COMMIT")

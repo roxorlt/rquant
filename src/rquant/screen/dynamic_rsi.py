@@ -20,9 +20,11 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 from pydantic import BaseModel, ConfigDict, Field
 from ta.momentum import RSIIndicator
+from rquant.runtime_contracts import canonical_sha256
 
 if TYPE_CHECKING:
     from rquant.screen.replica_source import VerifiedReplicaScreenSource
+    from rquant.storage.duckdb import DuckDBStore
 
 MIN_PERIOD = 2
 MAX_PERIOD = 60
@@ -94,6 +96,102 @@ def requested_dynamic_rsi(columns: set[str] | frozenset[str]) -> dict[str, tuple
             raise ValueError("unsupported dynamic RSI dependency")
         selected[column] = period, offset
     return selected
+
+
+def full_history_rsi_values(
+    history: list[tuple[date, float | None]], dates: list[date], periods: list[int],
+) -> dict[date, list[float | None]]:
+    """The projection and daily writer share the original uninterrupted EWM history."""
+    if any(not MIN_PERIOD <= period <= MAX_PERIOD for period in periods):
+        raise ValueError("unsupported RSI period")
+    indexed = {day: index for index, (day, _) in enumerate(history)}
+    if len(indexed) != len(history) or len(history) > MAX_STOCK_BARS:
+        raise DynamicRsiProjectionUnavailableError("ambiguous RSI stock history")
+    first_valid = next((i for i, (_, value) in enumerate(history) if value is not None), len(history))
+    first_bad = next((i for i in range(first_valid, len(history)) if history[i][1] is None), len(history))
+    valid = pd.Series([value for _, value in history[first_valid:first_bad]], dtype="float64")
+    calculated = {period: RSIIndicator(valid, window=period).rsi().tolist() for period in periods}
+    output: dict[date, list[float | None]] = {}
+    for day in dates:
+        position = indexed.get(day)
+        slot = position - first_valid if position is not None else -1
+        output[day] = [float(values[slot]) if 0 <= slot < len(values) and math.isfinite(values[slot])
+                       else None for values in calculated.values()]
+    return output
+
+
+def daily_rsi_values(
+    store: DuckDBStore, trade_date: date, ts_codes: list[str], columns: dict[str, tuple[int, int]],
+) -> tuple[pd.DataFrame, str]:
+    """Read full adjusted history from the daily writer's existing transaction."""
+    if len(ts_codes) > MAX_STOCKS or len(set(ts_codes)) != len(ts_codes):
+        raise DynamicRsiProjectionBudgetError("RSI stock budget exceeded")
+    if len(ts_codes) * (len(columns) + 5) > MAX_QUERY_CELLS:
+        raise DynamicRsiProjectionBudgetError("RSI wide budget exceeded")
+    if requested_dynamic_rsi(frozenset(columns)) != columns:
+        raise ValueError("unsupported dynamic RSI dependency")
+    calendar = store._conn.execute(
+        "SELECT cal_date, is_open FROM trade_calendar WHERE exchange='SSE' AND cal_date<=? ORDER BY cal_date",
+        [trade_date],
+    ).fetchall()
+    if not calendar or calendar[-1] != (trade_date, True):
+        raise DynamicRsiProjectionUnavailableError("RSI calendar is incomplete")
+    oldest = calendar[0][0]
+    if len(calendar) != (trade_date - oldest).days + 1 or any(
+        day != oldest + timedelta(days=index) or flag is None
+        for index, (day, flag) in enumerate(calendar)
+    ):
+        raise DynamicRsiProjectionUnavailableError("RSI calendar coverage is incomplete")
+    open_days = {day for day, flag in calendar if flag}
+    dates = sorted(open_days, reverse=True)
+    target_days = {column: dates[offset] if offset < len(dates) else None for column, (_, offset) in columns.items()}
+    cursor = store._conn.execute(
+        "SELECT daily.ts_code, daily.trade_date, daily.close, adj.adj_factor FROM daily_bar daily "
+        "LEFT JOIN adj_factor adj ON adj.ts_code=daily.ts_code AND adj.trade_date=daily.trade_date "
+        "WHERE daily.trade_date<=? AND daily.ts_code IN (SELECT unnest(?)) ORDER BY daily.ts_code,daily.trade_date",
+        [trade_date, ts_codes],
+    )
+    digest = hashlib.sha256()
+    digest.update(canonical_sha256(calendar).encode())
+    periods = sorted({period for period, _ in columns.values()})
+    requested_dates = sorted({day for day in target_days.values() if day is not None})
+    values_by_code: dict[str, dict[str, float | None]] = {}
+    code: str | None = None
+    history: list[tuple[date, float | None]] = []
+    count = 0
+
+    def flush() -> None:
+        if code is None:
+            return
+        values = full_history_rsi_values(history, requested_dates, periods)
+        values_by_code[code] = {
+            column: values[day][periods.index(period)] if day is not None else None
+            for column, (period, _) in columns.items() for day in [target_days[column]]
+        }
+
+    while batch := cursor.fetchmany(4096):
+        for stock, day, close, factor in batch:
+            count += 1
+            if count > MAX_SOURCE_BARS:
+                raise DynamicRsiProjectionBudgetError("RSI source exceeds bar budget")
+            if code != stock:
+                flush()
+                code, history = stock, []
+            if day not in open_days or (history and day <= history[-1][0]):
+                raise DynamicRsiProjectionUnavailableError("ambiguous RSI source bar")
+            price = float(close) if close is not None else float("nan")
+            adjustment = float(factor) if factor is not None else float("nan")
+            adjusted = price * adjustment
+            value = adjusted if price > 0 and adjustment > 0 and math.isfinite(adjusted) else None
+            digest.update(canonical_sha256((code, day, price if math.isfinite(price) else None,
+                                            adjustment if math.isfinite(adjustment) else None)).encode())
+            history.append((day, value))
+            if len(history) > MAX_STOCK_BARS:
+                raise DynamicRsiProjectionBudgetError("RSI stock history exceeds budget")
+    flush()
+    rows = [{"ts_code": code, **values_by_code.get(code, {column: None for column in columns})}
+            for code in ts_codes]
+    return pd.DataFrame(rows, columns=["ts_code", *columns]), digest.hexdigest()
 
 
 def _identity(observed: os.stat_result) -> tuple[int, int, int, int, int]:
@@ -389,31 +487,8 @@ def publish_dynamic_rsi_projection(
                 stock_count += 1
                 if stock_count > MAX_STOCKS:
                     raise DynamicRsiProjectionBudgetError("RSI stock budget exceeded")
-                indexed = {day: index for index, (day, _) in enumerate(history)}
-                first_valid = next(
-                    (i for i, (_, value) in enumerate(history) if value is not None), len(history)
-                )
-                first_bad = next(
-                    (i for i in range(first_valid, len(history)) if history[i][1] is None),
-                    len(history),
-                )
-                valid = pd.Series(
-                    [value for _, value in history[first_valid:first_bad]], dtype="float64"
-                )
-                calculated = {
-                    period: RSIIndicator(valid, window=period).rsi().tolist() for period in _PERIODS
-                }
-                rows = []
-                for day in dates:
-                    position = indexed.get(day)
-                    slot = position - first_valid if position is not None else -1
-                    numbers = [
-                        float(values[slot])
-                        if 0 <= slot < len(values) and math.isfinite(values[slot])
-                        else None
-                        for values in calculated.values()
-                    ]
-                    rows.append((code, day.isoformat(), *numbers))
+                calculated = full_history_rsi_values(history, dates, list(_PERIODS))
+                rows = [(code, day.isoformat(), *calculated[day]) for day in dates]
                 slots = ",".join("?" for _ in range(2 + len(_PERIODS)))
                 output.executemany(f"INSERT INTO rsi VALUES ({slots})", rows)
                 row_count += len(rows)

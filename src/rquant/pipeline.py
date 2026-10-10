@@ -12,11 +12,12 @@ from loguru import logger
 from pydantic import Field
 
 from rquant.builtin_presets import builtin_definition_version
-from rquant.pool_result_receipt import ScreenRunReceipt, ScreenRunReceiptDraft, member_set_digest
+from rquant.pool_result_receipt import DailyScreenAuthority, ScreenRunReceipt, ScreenRunReceiptDraft, ScreenRunEvidenceDraft, member_set_digest
 from rquant.presets import PRESET_SCREENS, ScreenPreset, load_user_presets
 from rquant.risk.blacklist import load_active_blacklist
-from rquant.runtime_contracts import RuntimeContractModel
+from rquant.runtime_contracts import RuntimeContractModel, canonical_sha256
 from rquant.screen.core import screen
+from rquant.screen.daily_inputs import prepare_daily_screen_inputs
 from rquant.screen.ranking import (
     RETURN_20D_COLUMN,
     RankingCondition,
@@ -168,7 +169,7 @@ def _to_screen_result_df(
     if extra_cols:
         result["extra"] = screen_df[extra_cols].apply(
             lambda row: json.dumps(
-                {k: v for k, v in row.items() if pd.notna(v)},
+                {k: int(v) if k == "rank_position" else v for k, v in row.items() if pd.notna(v)},
                 ensure_ascii=False,
             ),
             axis=1,
@@ -281,6 +282,7 @@ def run_daily_screen_stage(
     store: DuckDBStore,
     preset_directory: Path | None = None,
     transaction_open: bool = False,
+    canonical_authority: DailyScreenAuthority | None = None,
 ) -> DailyScreenPipelineResult:
     """Run only screen materialization. Notification is deliberately out of band."""
     count = store._conn.execute(
@@ -361,6 +363,9 @@ def run_daily_screen_stage(
                         f"在 {lookback} 无命中，跳过"
                     )
                     empty = _to_screen_result_df(pd.DataFrame(), trade_date, name)
+                    prepared_empty=prepare_daily_screen_inputs(trade_date,preset.rules,store=store,
+                        include_columns=list(preset.include_columns),ts_code_whitelist=[],
+                        parent_scope_result_version=parent_result_version,canonical_authority=canonical_authority)
                     receipt = ScreenRunReceiptDraft(
                         trade_date=date.fromisoformat(trade_date),
                         preset_name=name,
@@ -376,6 +381,8 @@ def run_daily_screen_stage(
                     store.replace_screen_result_with_receipt(
                         trade_date, name, empty, receipt,
                         manage_transaction=False,
+                        evidence=ScreenRunEvidenceDraft(input=prepared_empty.evidence,definition_version=receipt.definition_version,
+                            ranking_plan_digest=canonical_sha256(preset.ranking) if preset.ranking is not None else None),
                     )
                     writing = False
                     if transaction_started:
@@ -391,16 +398,24 @@ def run_daily_screen_stage(
                 screen_columns.extend(
                     condition.metric
                     for condition in preset.ranking.conditions
-                    if condition.metric != RETURN_20D_COLUMN
-                    and condition.metric not in screen_columns
+                    if condition.metric not in screen_columns
                 )
+            prepared = prepare_daily_screen_inputs(
+                trade_date, preset.rules, include_columns=screen_columns, store=store,
+                ts_code_whitelist=ts_whitelist,
+                parent_scope_result_version=parent_result_version,
+                canonical_authority=canonical_authority,
+            )
             result_df = screen(
                 trade_date=trade_date,
                 rules=preset.rules,
                 include_columns=screen_columns or None,
                 store=store,
                 ts_code_whitelist=ts_whitelist,
+                prepared=prepared,
             )
+            if not set(result_df["ts_code"]).issubset(set(prepared.frame["ts_code"])):
+                raise ValueError("screen result contains members outside its actual inputs")
             if preset.ranking is not None:
                 if blacklist and not result_df.empty:
                     hit_mask = result_df["ts_code"].isin(blacklist.keys())
@@ -408,17 +423,12 @@ def run_daily_screen_stage(
                         removed = result_df.loc[hit_mask, "ts_code"].tolist()
                         result_df = result_df.loc[~hit_mask].reset_index(drop=True)
                         logger.warning(f"  {name}: 黑名单过滤剔除 {len(removed)} 只 → {removed}")
-                if RETURN_20D_COLUMN in {
-                    condition.metric for condition in preset.ranking.conditions
-                }:
-                    returns = load_twenty_day_adjusted_returns(
-                        store._conn,
-                        date.fromisoformat(trade_date),
-                        result_df["ts_code"].tolist(),
-                    )
-                    result_df = result_df.merge(
-                        returns, on="ts_code", how="left", validate="one_to_one"
-                    )
+                ranking_columns = [condition.metric for condition in preset.ranking.conditions if condition.weight > 0]
+                ranking_unknown = int(result_df[ranking_columns].isna().any(axis=1).sum())
+                prepared = prepared.model_copy(update={"evidence": prepared.evidence.model_copy(update={
+                    "ranking_unknown_count": ranking_unknown,
+                    "unknown_count": prepared.evidence.unknown_count + ranking_unknown,
+                })})
                 ranked = rank_screen_results(
                     result_df,
                     [
@@ -427,11 +437,13 @@ def run_daily_screen_stage(
                     ],
                     top_n=preset.ranking.top_n,
                 )
+                ranked["rank_position"] = range(1, len(ranked) + 1)
                 visible_columns = [
                     column
                     for column in ranked.columns
                     if column in {"ts_code", "name", "CLOSE[0]", "PCT_CHG[0]"}
                     or column in preset.include_columns
+                    or column in {"ranking_score", "rank_position"}
                 ]
                 result_df = ranked[visible_columns]
             sr_df = _to_screen_result_df(result_df, trade_date, name)
@@ -449,13 +461,17 @@ def run_daily_screen_stage(
                 parent_result_version=parent_result_version,
                 hit_count=len(sr_df),
                 member_digest=member_set_digest(sr_df["ts_code"].tolist()),
-                lineage_complete=lineage_complete,
+                lineage_complete=lineage_complete and prepared.evidence.unknown_count == 0,
                 completed_at=datetime.now(UTC),
             )
             writing = True
             store.replace_screen_result_with_receipt(
                 trade_date, name, sr_df, receipt,
                 manage_transaction=False,
+                evidence=ScreenRunEvidenceDraft(
+                    input=prepared.evidence, definition_version=receipt.definition_version,
+                    ranking_plan_digest=canonical_sha256(preset.ranking) if preset.ranking is not None else None,
+                ),
             )
             writing = False
             if transaction_started:

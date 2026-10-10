@@ -157,6 +157,26 @@ export const manualWatchlistExactUnavailableHandler = () =>
 
 /** MSW server for component tests; every test starts with ready responses. */
 export const server = setupServer(
+  http.get("*/api/v1/monitor/condition-rules", () => {
+    const envelope: Schemas["Envelope_ConditionAlertRuleListData_"] = {
+      serving: metaEnvelope().serving,
+      data: {
+        availability: "not_activated",
+        available_at: null,
+        message: "规则尚未开放。",
+        can_write: false,
+        can_enable: false,
+        write_message: "规则操作暂未开放。",
+        enable_message: "提醒暂不可运行，可先保存为停用。",
+        items: [],
+        scopes: [],
+        blocks: [],
+        ranking_metrics: [],
+        triggers: [],
+      },
+    };
+    return HttpResponse.json(envelope);
+  }),
   metaHandler(),
   overviewHandler(),
   healthHandler(),
