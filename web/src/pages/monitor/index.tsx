@@ -1,4 +1,3 @@
-import { useState } from "react";
 import { type AlertItem, useAckAlert, useAlerts } from "@/api/endpoints";
 import { formatPrice } from "@/format/number";
 import { formatShanghaiDateTime } from "@/format/time";
@@ -10,16 +9,11 @@ export default function MonitorPage() {
   const query = useAlerts();
   const ack = useAckAlert();
   const toast = useToast();
-  // Acks are applied by the page-control service; until Serving republishes we remember
-  // which ones this tab already sent.
-  const [sent, setSent] = useState<ReadonlySet<string>>(new Set());
-
+  // Ack state comes back from Serving (alert_ack projection); after a successful
+  // submit the alerts query is refetched, and the row flips once the new generation lands.
   const acknowledge = (row: AlertItem) =>
     ack.mutate(row.alert_id, {
-      onSuccess: (r) => {
-        setSent((prev) => new Set(prev).add(row.alert_id));
-        toast(`已提交确认：${r.status}`);
-      },
+      onSuccess: (r) => toast(`已提交确认（${r.status}），数据刷新后显示`),
       onError: (e) => toast(`确认失败：${e.message}`),
     });
 
@@ -60,10 +54,17 @@ export default function MonitorPage() {
                   sortable: false,
                   value: () => null,
                   cell: (row) =>
-                    sent.has(row.alert_id) ? (
-                      <Pill kind="ok">已提交</Pill>
+                    row.acked_at ? (
+                      <Pill kind="ok">已确认{row.acked_by ? ` · ${row.acked_by}` : ""}</Pill>
                     ) : (
-                      <Button size="sm" variant="ghost" onClick={() => acknowledge(row)}>
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        onClick={() => acknowledge(row)}
+                        disabledReason={
+                          ack.isPending && ack.variables === row.alert_id ? "提交中" : undefined
+                        }
+                      >
                         确认
                       </Button>
                     ),

@@ -43,7 +43,7 @@ from rquant.web.models import (
     ServingMeta,
     SignalItem,
 )
-from rquant.web.source import Source
+from rquant.web.source import Source, table_missing
 
 router = APIRouter(prefix="/api/v1")
 T = TypeVar("T")
@@ -239,11 +239,28 @@ def alerts(source: SourceDep, limit: int = 200) -> Envelope[AlertsData]:
         "SELECT trade_date, trigger_time, ts_code, level, trigger_price, level_price, "
         "trigger_type, pool FROM monitor_event ORDER BY trigger_time DESC LIMIT ?",
         [max(1, min(limit, 1000))])
-    items = [AlertItem(alert_id=alert_id(r), trade_date=r["trade_date"], at=r["trigger_time"],
-                       code=r["ts_code"], name=names.get(r["ts_code"]), level=r["level"],
-                       trigger_type=r["trigger_type"], trigger_price=_f(r["trigger_price"]),
-                       level_price=_f(r["level_price"]), pool=r["pool"]) for r in rows]
+    acks = _acks(source)
+    items = []
+    for r in rows:
+        aid = alert_id(r)
+        ack = acks.get(aid, {})
+        items.append(AlertItem(
+            alert_id=aid, trade_date=r["trade_date"], at=r["trigger_time"], code=r["ts_code"],
+            name=names.get(r["ts_code"]), level=r["level"], trigger_type=r["trigger_type"],
+            trigger_price=_f(r["trigger_price"]), level_price=_f(r["level_price"]),
+            pool=r["pool"], acked_at=ack.get("acked_at"), acked_by=ack.get("actor_id")))
     return _envelope(source, AlertsData(items=items))
+
+
+def _acks(source: Source) -> dict[str, dict[str, Any]]:
+    try:
+        rows = source.query(
+            "SELECT alert_id, acked_at, actor_id FROM alert_ack LIMIT 20000")
+    except Exception as exc:  # noqa: BLE001 - only "not published yet" is tolerated
+        if table_missing(exc):
+            return {}
+        raise
+    return {r["alert_id"]: r for r in rows}
 
 
 @router.get("/paper", response_model=Envelope[PaperData], summary="模拟盘")

@@ -305,6 +305,19 @@ PAGE_PROJECTION_CONTRACTS: Mapping[str, ServingProjectionContract] = MappingProx
             event_date_columns=("trade_date",),
             event_time_columns=("as_of",),
         ),
+        "alert_ack": _contract(
+            "signals",
+            (
+                ("alert_id", "string"),
+                ("acked_at", "timestamp"),
+                ("actor_id", "string"),
+                ("command_id", "string"),
+            ),
+            ("alert_id",),
+            max_rows=20_000,
+            max_bytes=4 * 1024 * 1024,
+            event_time_columns=("acked_at",),
+        ),
         "surge_runtime_config": _contract(
             "signals",
             (

@@ -204,6 +204,31 @@ class DiscardLabArtifactZip(PageControlCommand):
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
+class AckAlert(PageControlCommand):
+    """Acknowledge one alert from the web app (appended to ``alert_acks/acks.jsonl``)."""
+
+    kind: Literal["ack_alert"] = "ack_alert"
+    alert_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    generation_id: str = Field(min_length=1, max_length=128)
+    actor_id: str = Field(min_length=1, max_length=256)
+
+
+class WatchlistItem(RuntimeContractModel):
+    ts_code: str = Field(pattern=r"^\d{6}\.(SH|SZ|BJ)$")
+    note: str = Field(default="", max_length=200)
+
+
+class AddWatchlistItem(PageControlCommand):
+    """Add a stock to the manual watchlist (appended to ``watchlist/items.jsonl``)."""
+
+    kind: Literal["add_watchlist_item"] = "add_watchlist_item"
+    item: WatchlistItem
+
+
+ALERT_ACK_LOG = Path("alert_acks") / "acks.jsonl"
+WATCHLIST_LOG = Path("watchlist") / "items.jsonl"
+
+
 class LabArtifactZipResult(RuntimeContractModel):
     request_id: UUID
     job_id: UUID
@@ -237,7 +262,9 @@ PageControlCommandValue = Annotated[
     | InitializeLabExports
     | SubmitLabCommand
     | ExportLabArtifactZip
-    | DiscardLabArtifactZip,
+    | DiscardLabArtifactZip
+    | AckAlert
+    | AddWatchlistItem,
     Field(discriminator="kind"),
 ]
 _COMMAND_ADAPTER = TypeAdapter(PageControlCommandValue)
@@ -1532,6 +1559,8 @@ class PageControlConsumer:
             return self._lab_backend().export_zip(command.job_id)
         if isinstance(command, DiscardLabArtifactZip):
             return self._lab_backend().discard_zip(command)
+        if isinstance(command, (AckAlert, AddWatchlistItem)):
+            return self._append_web_record(command)
         raise TypeError(f"unsupported page control command: {type(command).__name__}")
 
     def _lab_backend(self) -> LabPageControlBackend:
@@ -1585,6 +1614,13 @@ class PageControlConsumer:
             return self._canvas_publication_fence_targets(
                 command.name,
                 create_canvas=False,
+            )
+        if isinstance(command, (AckAlert, AddWatchlistItem)):
+            return (
+                _LocalEffectFenceTarget(
+                    role="web_record_directory",
+                    path=self._web_record_path(command).parent,
+                ),
             )
         if isinstance(command, DeleteUserPool):
             return (
@@ -1792,6 +1828,11 @@ class PageControlConsumer:
             return self._recover_delete_result(self._user_pool_path(command.base_name))
         if isinstance(command, InitializeLabExports):
             return self._recover_lab_exports(command)
+        if isinstance(command, (AckAlert, AddWatchlistItem)):
+            path = self._web_record_path(command)
+            if _managed_jsonl_contains_command_id(path, command.command_id):
+                return {"path": str(path)}
+            return None
         return None
 
     def _save_canvas(
@@ -2351,6 +2392,27 @@ class PageControlConsumer:
             "outcome": command.outcome,
             "error": command.error,
         }
+        _append_managed_jsonl(path, record, command_id=command.command_id)
+        return {"path": str(path)}
+
+    def _web_record_path(self, command: AckAlert | AddWatchlistItem) -> Path:
+        return self.data_dir / (ALERT_ACK_LOG if isinstance(command, AckAlert) else WATCHLIST_LOG)
+
+    def _append_web_record(self, command: AckAlert | AddWatchlistItem) -> JsonValue:
+        """Append-only, idempotent by command_id. Later readers take the latest row per key."""
+        path = self._web_record_path(command)
+        record: dict[str, object] = {
+            "command_id": command.command_id,
+            "ts": command.requested_at.astimezone(UTC).isoformat(timespec="seconds"),
+        }
+        if isinstance(command, AckAlert):
+            record.update(
+                alert_id=command.alert_id,
+                generation_id=command.generation_id,
+                actor_id=command.actor_id,
+            )
+        else:
+            record.update(ts_code=command.item.ts_code, note=command.item.note)
         _append_managed_jsonl(path, record, command_id=command.command_id)
         return {"path": str(path)}
 
@@ -3115,7 +3177,12 @@ def parse_page_control_command(payload: object) -> PageControlCommandValue:
 
 
 __all__ = [
+    "ALERT_ACK_LOG",
+    "AckAlert",
+    "AddWatchlistItem",
     "AppendNlQueryLog",
+    "WATCHLIST_LOG",
+    "WatchlistItem",
     "DEFAULT_PAGE_CONTROL_SERVICE_ID",
     "DeleteCanvas",
     "DeleteUserPool",

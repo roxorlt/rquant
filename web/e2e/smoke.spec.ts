@@ -20,5 +20,5 @@ test("every MVP page opens from the rail", async ({ page }) => {
 test("acknowledging an alert goes through page control", async ({ page }) => {
   await page.goto("./#/monitor");
   await page.getByRole("button", { name: "确认" }).first().click();
-  await expect(page.getByText("已提交").first()).toBeVisible();
+  await expect(page.getByText("已确认 · owner").first()).toBeVisible();
 });

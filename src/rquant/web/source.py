@@ -87,6 +87,8 @@ CREATE TABLE signals(global_sequence BIGINT, signal_id VARCHAR, strategy_id VARC
 CREATE TABLE paper_accounts(account_id VARCHAR, as_of_time TIMESTAMPTZ, cash DECIMAL(18,2),
   available_cash DECIMAL(18,2), nav DECIMAL(18,2), unrealized_pnl DECIMAL(18,2),
   realized_pnl DECIMAL(18,2));
+CREATE TABLE alert_ack(alert_id VARCHAR, acked_at TIMESTAMPTZ, actor_id VARCHAR,
+  command_id VARCHAR);
 CREATE TABLE paper_holdings(account_id VARCHAR, ts_code VARCHAR, quantity DECIMAL(18,2),
   available_quantity DECIMAL(18,2), average_cost DECIMAL(18,4), market_price DECIMAL(18,4),
   market_value DECIMAL(18,2), unrealized_pnl DECIMAL(18,2), as_of_time TIMESTAMPTZ);
@@ -148,6 +150,12 @@ def _seed(con: duckdb.DuckDBPyConnection, today: date) -> None:
         "152500, 2500, now())")
 
 
+def table_missing(exc: Exception) -> bool:
+    """A projection that was never published (e.g. no ack yet) reads as empty."""
+    text = str(exc).lower()
+    return "does not exist" in text or "not published" in text or "catalog error" in text
+
+
 class FixtureSource:
     """Small invented dataset with Serving's table names. Never production data."""
 
@@ -156,6 +164,14 @@ class FixtureSource:
         self.con.execute(_FIXTURE_DDL)
         _seed(self.con, today or datetime.now(UTC).date())
         self.built_at = datetime.now(UTC)
+
+    def record_ack(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Fixture stand-in for page control + Serving republish of ``ack_alert``."""
+        self.con.execute(
+            "INSERT INTO alert_ack VALUES (?, now(), ?, ?)",
+            [payload["alert_id"], payload["actor_id"], payload["command_id"]],
+        )
+        return {"command_id": payload["command_id"], "status": "succeeded"}
 
     def generation(self) -> tuple[str | None, datetime | None]:
         return "fixture", self.built_at

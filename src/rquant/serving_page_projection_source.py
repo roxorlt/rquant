@@ -983,6 +983,7 @@ class DuckDBSignalPageProjectionSource:
         canvas_publication_keyring: CanvasPublicationKeyring | None = None,
         page_control_outbox: PageControlOutbox | Path | None = None,
         surge_live_root: Path | None = None,
+        alert_ack_log: Path | None = None,
         control_root: Path | None = None,
         atomically_published: bool = False,
         read_profile: ReplicaReadProfile = UNLIMITED_READ_PROFILE,
@@ -1005,6 +1006,8 @@ class DuckDBSignalPageProjectionSource:
         self.surge_live_root = (
             None if surge_live_root is None else Path(os.path.abspath(surge_live_root))
         )
+        #: page control's append-only ack log (web 告警确认); None publishes no alert_ack
+        self.alert_ack_log = None if alert_ack_log is None else Path(os.path.abspath(alert_ack_log))
         if page_control_outbox is None:
             self.page_control_outbox = None
         else:
@@ -1122,6 +1125,7 @@ class DuckDBSignalPageProjectionSource:
             pulse_history=pulse_history,
             pulse_alerts=pulse_alerts,
             surge_runtime_config=runtime_config,
+            alert_acks=read_alert_ack_projection_source(self.alert_ack_log, observed=observed),
         )
 
     def _read_database_projection(
@@ -2293,6 +2297,59 @@ class PulseAlertProjectionSource(RuntimeContractModel):
     rows: tuple[PulseAlertProjectionRow, ...] = Field(max_length=_MAX_PULSE_ROWS)
 
 
+class AlertAckProjectionRow(RuntimeContractModel):
+    alert_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    acked_at: AwareUtcDatetime
+    actor_id: str
+    command_id: str
+
+
+class AlertAckProjectionSource(RuntimeContractModel):
+    available_at: AwareUtcDatetime
+    rows: tuple[AlertAckProjectionRow, ...] = Field(max_length=20_000)
+
+
+_MAX_ALERT_ACK_LOG_BYTES = 16 * 1024 * 1024
+
+
+def read_alert_ack_projection_source(
+    path: Path | None,
+    *,
+    observed: datetime,
+) -> AlertAckProjectionSource | None:
+    """Latest ack per alert from page control's append-only ``alert_acks/acks.jsonl``.
+
+    Missing file means nothing was acknowledged yet (no projection is published);
+    acks newer than ``observed`` are left for the next generation.
+    """
+
+    if path is None:
+        return None
+    try:
+        item = os.stat(path, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(item.st_mode) or item.st_size > _MAX_ALERT_ACK_LOG_BYTES:
+        raise PageProjectionSourceIntegrityError("alert ack log is not a bounded regular file")
+    latest: dict[str, AlertAckProjectionRow] = {}
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            row = AlertAckProjectionRow(
+                alert_id=record["alert_id"],
+                acked_at=datetime.fromisoformat(record["ts"]),
+                actor_id=record["actor_id"],
+                command_id=record["command_id"],
+            )
+            if row.acked_at <= observed:
+                latest[row.alert_id] = row
+    rows = tuple(sorted(latest.values(), key=lambda r: r.alert_id))
+    available = max((r.acked_at for r in rows), default=observed)
+    return AlertAckProjectionSource(available_at=available, rows=rows)
+
+
 class SurgeRuntimeConfigProjectionSource(RuntimeContractModel):
     available_at: AwareUtcDatetime
     row: SurgeRuntimeConfigProjectionRow
@@ -2571,7 +2628,7 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
             "canvas_hit",
             "canvas_definition",
         }
-        optional_names = {"pulse_history", "pulse_alert", "surge_runtime_config"}
+        optional_names = {"pulse_history", "pulse_alert", "surge_runtime_config", "alert_ack"}
         published_names = {item.table_name for item in self.projections}
         if not required_names.issubset(published_names) or not published_names.issubset(
             required_names | optional_names
@@ -2596,6 +2653,7 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
         pulse_history: PulseHistoryProjectionSource | None = None,
         pulse_alerts: PulseAlertProjectionSource | None = None,
         surge_runtime_config: SurgeRuntimeConfigProjectionSource | None = None,
+        alert_acks: AlertAckProjectionSource | None = None,
     ) -> SignalPageProjectionSnapshot:
         available = normalize_aware_utc(available_at)
         rows = {
@@ -2646,6 +2704,22 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
                     table_name="surge_runtime_config",
                     available_at=surge_runtime_config.available_at,
                     rows=(_surge_runtime_config_row(surge_runtime_config.row),),
+                )
+            )
+        if alert_acks is not None:
+            optional.append(
+                ServingProjectionPayload(
+                    table_name="alert_ack",
+                    available_at=alert_acks.available_at,
+                    rows=tuple(
+                        {
+                            "alert_id": row.alert_id,
+                            "acked_at": row.acked_at.isoformat(),
+                            "actor_id": row.actor_id,
+                            "command_id": row.command_id,
+                        }
+                        for row in alert_acks.rows
+                    ),
                 )
             )
         projections = tuple(sorted((*projections, *optional), key=lambda item: item.table_name))

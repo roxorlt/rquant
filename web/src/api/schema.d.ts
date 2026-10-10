@@ -230,6 +230,10 @@ export interface components {
         };
         /** AlertItem */
         AlertItem: {
+            /** Acked At */
+            acked_at?: string | null;
+            /** Acked By */
+            acked_by?: string | null;
             /** Alert Id */
             alert_id: string;
             /** At */

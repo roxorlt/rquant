@@ -103,3 +103,14 @@ def test_forward_builds_command() -> None:
                                    lambda p: seen.append(p) or {"status": "accepted"})
     assert receipt == {"status": "accepted"}
     assert seen[0]["kind"] == "save_canvas" and seen[0]["command_id"] and seen[0]["requested_at"]
+
+
+def test_alert_ack_state_is_read_back() -> None:
+    source = FixtureSource()
+    client = TestClient(create_app(source, dist=None))
+    first = client.get("/api/v1/alerts").json()["data"]["items"][0]
+    assert first["acked_at"] is None
+    source.record_ack({"alert_id": first["alert_id"], "actor_id": "owner", "command_id": "c1"})
+    items = {i["alert_id"]: i for i in client.get("/api/v1/alerts").json()["data"]["items"]}
+    assert items[first["alert_id"]]["acked_by"] == "owner"
+    assert items[first["alert_id"]]["acked_at"] is not None

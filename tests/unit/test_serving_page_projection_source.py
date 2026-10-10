@@ -3140,3 +3140,21 @@ def test_a_sealed_generation_publishes_the_same_totals_as_an_unsealed_one(
 
     assert coverage(sealed) == coverage(unsealed)
     assert coverage(sealed), "the fixture must publish something for this to mean anything"
+
+
+def test_duckdb_signal_source_publishes_alert_acks_from_page_control_log(tmp_path: Path) -> None:
+    database = tmp_path / "rquant_ro.duckdb"
+    _signal_projection_database(database)
+    log = tmp_path / "page-control" / "alert_acks" / "acks.jsonl"
+    log.parent.mkdir(parents=True)
+    log.write_text(
+        json.dumps({"alert_id": "c" * 64, "ts": (NOW - timedelta(minutes=1)).isoformat(),
+                    "actor_id": "owner", "command_id": "k", "generation_id": "g"}) + "\n"
+    )
+
+    without = DuckDBSignalPageProjectionSource(database)(NOW)
+    with_acks = DuckDBSignalPageProjectionSource(database, alert_ack_log=log)(NOW)
+
+    assert "alert_ack" not in {item.table_name for item in without.projections}
+    acks = {item.table_name: item for item in with_acks.projections}["alert_ack"]
+    assert [row["alert_id"] for row in acks.rows] == ["c" * 64]

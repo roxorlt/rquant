@@ -25,11 +25,17 @@ def main(argv: list[str] | None = None) -> None:
         return
     import uvicorn
 
-    app = create_app(FixtureSource() if args.fixture else None)
-    if args.fixture:
-        # Demo mode: pretend page control accepted every command; nothing is written.
-        app.state.page_control_transport = lambda payload: {
-            "command_id": payload["command_id"], "status": "accepted", "detail": "fixture"}
+    fixture = FixtureSource() if args.fixture else None
+    app = create_app(fixture)
+    if fixture is not None:
+        # Demo mode: acks land in the in-memory fixture (as if page control + Serving
+        # republished); other commands are accepted and dropped. Nothing touches disk.
+        def transport(payload: dict) -> dict:
+            if payload["kind"] == "ack_alert":
+                return fixture.record_ack(payload)
+            return {"command_id": payload["command_id"], "status": "succeeded"}
+
+        app.state.page_control_transport = transport
     uvicorn.run(app, host=args.host, port=args.port)
 
 

@@ -110,6 +110,7 @@ export function useSavePool() {
 }
 
 export function useAckAlert() {
+  const client = useQueryClient();
   return useMutation({
     mutationFn: async (alertId: string) => {
       const { data, response } = await apiClient().POST("/api/v1/alerts/ack", {
@@ -117,6 +118,7 @@ export function useAckAlert() {
       });
       return unwrap(data, response);
     },
+    onSuccess: () => client.invalidateQueries({ queryKey: ["alerts"] }),
   });
 }
 

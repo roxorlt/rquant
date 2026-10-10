@@ -182,6 +182,8 @@ class AlertItem(BaseModel):
     trigger_price: float | None
     level_price: float | None
     pool: str | None
+    acked_at: datetime | None = None
+    acked_by: str | None = None
 
 
 class AlertsData(BaseModel):
