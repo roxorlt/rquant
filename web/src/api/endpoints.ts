@@ -204,3 +204,21 @@ export function useStrategies(): ServingQueryResult<Schemas["StrategyListData"]>
     return unwrap(data, response);
   });
 }
+
+export function useAlertRules(): ServingQueryResult<Schemas["AlertRulesData"]> {
+  return useServingQuery(["alert-rules"], async () => {
+    const { data, response } = await apiClient().GET("/api/v1/alert-rules");
+    return unwrap(data, response);
+  });
+}
+
+export function useSaveAlertRule() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: async (body: Schemas["AlertRuleBody"]) => {
+      const { data, response } = await apiClient().POST("/api/v1/alert-rules", { body });
+      return unwrap(data, response);
+    },
+    onSuccess: () => client.invalidateQueries({ queryKey: ["alert-rules"] }),
+  });
+}

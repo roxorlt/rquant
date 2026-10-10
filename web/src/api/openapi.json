@@ -159,6 +159,144 @@
         "title": "AlertItem",
         "type": "object"
       },
+      "AlertRuleBody": {
+        "properties": {
+          "cooldown_minutes": {
+            "default": 0,
+            "maximum": 1440.0,
+            "minimum": 0.0,
+            "title": "Cooldown Minutes",
+            "type": "integer"
+          },
+          "enabled": {
+            "default": true,
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "levels": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 10,
+            "title": "Levels",
+            "type": "array"
+          },
+          "pools": {
+            "default": [],
+            "items": {
+              "enum": [
+                "pool1",
+                "pool2",
+                "manual"
+              ],
+              "type": "string"
+            },
+            "title": "Pools",
+            "type": "array"
+          },
+          "rule_id": {
+            "pattern": "^[a-z0-9_-]{1,40}$",
+            "title": "Rule Id",
+            "type": "string"
+          },
+          "title": {
+            "maxLength": 60,
+            "minLength": 1,
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "rule_id",
+          "title"
+        ],
+        "title": "AlertRuleBody",
+        "type": "object"
+      },
+      "AlertRuleRow": {
+        "properties": {
+          "cooldown_minutes": {
+            "default": 0,
+            "maximum": 1440.0,
+            "minimum": 0.0,
+            "title": "Cooldown Minutes",
+            "type": "integer"
+          },
+          "enabled": {
+            "default": true,
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "levels": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 10,
+            "title": "Levels",
+            "type": "array"
+          },
+          "pools": {
+            "default": [],
+            "items": {
+              "enum": [
+                "pool1",
+                "pool2",
+                "manual"
+              ],
+              "type": "string"
+            },
+            "title": "Pools",
+            "type": "array"
+          },
+          "rule_id": {
+            "pattern": "^[a-z0-9_-]{1,40}$",
+            "title": "Rule Id",
+            "type": "string"
+          },
+          "saved_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Saved At"
+          },
+          "title": {
+            "maxLength": 60,
+            "minLength": 1,
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "rule_id",
+          "title"
+        ],
+        "title": "AlertRuleRow",
+        "type": "object"
+      },
+      "AlertRulesData": {
+        "properties": {
+          "rules": {
+            "items": {
+              "$ref": "#/components/schemas/AlertRuleRow"
+            },
+            "title": "Rules",
+            "type": "array"
+          }
+        },
+        "required": [
+          "rules"
+        ],
+        "title": "AlertRulesData",
+        "type": "object"
+      },
       "AlertsData": {
         "properties": {
           "items": {
@@ -1107,6 +1245,22 @@
           "mean_ic"
         ],
         "title": "DecayPoint",
+        "type": "object"
+      },
+      "Envelope_AlertRulesData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/AlertRulesData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[AlertRulesData]",
         "type": "object"
       },
       "Envelope_AlertsData_": {
@@ -3076,6 +3230,60 @@
   },
   "openapi": "3.1.0",
   "paths": {
+    "/api/v1/alert-rules": {
+      "get": {
+        "operationId": "alert_rules_api_v1_alert_rules_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_AlertRulesData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "告警规则"
+      },
+      "post": {
+        "operationId": "save_alert_rule_api_v1_alert_rules_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AlertRuleBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandReceipt"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "保存告警规则"
+      }
+    },
     "/api/v1/alerts": {
       "get": {
         "operationId": "alerts_api_v1_alerts_get",

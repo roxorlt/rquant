@@ -4,6 +4,7 @@ import { formatShanghaiDateTime } from "@/format/time";
 import { DataTable } from "@/table/DataTable";
 import { Button, PageHeader, Panel, Pill, useToast } from "@/ui";
 import { QueryView } from "../shared";
+import { AlertRules } from "./Rules";
 
 export default function MonitorPage() {
   const query = useAlerts();
@@ -74,6 +75,7 @@ export default function MonitorPage() {
           </Panel>
         )}
       </QueryView>
+      <AlertRules />
     </>
   );
 }

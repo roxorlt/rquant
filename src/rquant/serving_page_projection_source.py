@@ -992,6 +992,7 @@ class DuckDBSignalPageProjectionSource:
         surge_live_root: Path | None = None,
         alert_ack_log: Path | None = None,
         watchlist_log: Path | None = None,
+        alert_rule_log: Path | None = None,
         control_root: Path | None = None,
         atomically_published: bool = False,
         read_profile: ReplicaReadProfile = UNLIMITED_READ_PROFILE,
@@ -1018,6 +1019,9 @@ class DuckDBSignalPageProjectionSource:
         self.alert_ack_log = None if alert_ack_log is None else Path(os.path.abspath(alert_ack_log))
         #: page control's append-only manual watchlist (web 加自选), read by the monitor
         self.watchlist_log = None if watchlist_log is None else Path(os.path.abspath(watchlist_log))
+        self.alert_rule_log = (
+            None if alert_rule_log is None else Path(os.path.abspath(alert_rule_log))
+        )
         if page_control_outbox is None:
             self.page_control_outbox = None
         else:
@@ -1139,6 +1143,7 @@ class DuckDBSignalPageProjectionSource:
             manual_watchlist=read_manual_watchlist_projection_source(
                 self.watchlist_log, observed=observed
             ),
+            alert_rules=read_alert_rule_projection_source(self.alert_rule_log, observed=observed),
             benchmark_daily=database.benchmarks,
         )
 
@@ -2416,6 +2421,41 @@ def read_manual_watchlist_projection_source(
     return ManualWatchlistProjectionSource(available_at=available, rows=rows)
 
 
+class AlertRuleProjectionSource(RuntimeContractModel):
+    available_at: AwareUtcDatetime
+    rows: tuple[dict[str, object], ...] = Field(max_length=200)
+
+
+def read_alert_rule_projection_source(
+    path: Path | None,
+    *,
+    observed: datetime,
+) -> AlertRuleProjectionSource | None:
+    """Current alert rules from ``alert_rules/rules.jsonl`` (latest row per rule_id)."""
+
+    records = _read_page_control_log(path, label="alert rule log")
+    if records is None:
+        return None
+    latest: dict[str, dict[str, object]] = {}
+    for record in records:
+        saved = datetime.fromisoformat(record["ts"])
+        if saved > observed:
+            continue
+        latest[record["rule_id"]] = {
+            "rule_id": record["rule_id"],
+            "title": record["title"],
+            "enabled": bool(record.get("enabled", True)),
+            "pools": ",".join(record.get("pools") or ()),
+            "levels": ",".join(record.get("levels") or ()),
+            "cooldown_minutes": int(record.get("cooldown_minutes", 0)),
+            "saved_at": saved.isoformat(),
+            "command_id": record["command_id"],
+        }
+    rows = tuple(latest[k] for k in sorted(latest))
+    available = max((datetime.fromisoformat(str(r["saved_at"])) for r in rows), default=observed)
+    return AlertRuleProjectionSource(available_at=available, rows=rows)
+
+
 def _read_page_control_log(path: Path | None, *, label: str) -> list[dict] | None:
     if path is None:
         return None
@@ -2708,7 +2748,7 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
             "canvas_definition",
         }
         optional_names = {"pulse_history", "pulse_alert", "surge_runtime_config", "alert_ack",
-                          "manual_watchlist", "benchmark_daily"}
+                          "manual_watchlist", "benchmark_daily", "alert_rule"}
         published_names = {item.table_name for item in self.projections}
         if not required_names.issubset(published_names) or not published_names.issubset(
             required_names | optional_names
@@ -2735,6 +2775,7 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
         surge_runtime_config: SurgeRuntimeConfigProjectionSource | None = None,
         alert_acks: AlertAckProjectionSource | None = None,
         manual_watchlist: ManualWatchlistProjectionSource | None = None,
+        alert_rules: AlertRuleProjectionSource | None = None,
         benchmark_daily: tuple[dict[str, object], ...] = (),
     ) -> SignalPageProjectionSnapshot:
         available = normalize_aware_utc(available_at)
@@ -2818,6 +2859,14 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
                         }
                         for row in manual_watchlist.rows
                     ),
+                )
+            )
+        if alert_rules is not None:
+            optional.append(
+                ServingProjectionPayload(
+                    table_name="alert_rule",
+                    available_at=alert_rules.available_at,
+                    rows=alert_rules.rows,
                 )
             )
         # Index closes dated after this snapshot's evidence would be "future" rows;

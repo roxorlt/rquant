@@ -25,6 +25,9 @@ from rquant.web.models import (
     AckAlertRequest,
     AddWatchRequest,
     AlertItem,
+    AlertRuleBody,
+    AlertRuleRow,
+    AlertRulesData,
     AlertsData,
     BacktestDetailData,
     BacktestListData,
@@ -480,6 +483,27 @@ def ack_alert(body: AckAlertRequest, request: Request, source: SourceDep) -> Com
     actor = request.headers.get("X-Forwarded-User", "owner")
     return _send(request, "ack_alert",
                  {"alert_id": body.alert_id, "generation_id": gen, "actor_id": actor})
+
+
+@router.get("/alert-rules", response_model=Envelope[AlertRulesData], summary="告警规则")
+def alert_rules(source: SourceDep) -> Envelope[AlertRulesData]:
+    try:
+        rows = source.query(
+            "SELECT rule_id, title, enabled, pools, levels, cooldown_minutes, saved_at "
+            "FROM alert_rule ORDER BY rule_id LIMIT 200")
+    except Exception as exc:  # noqa: BLE001 - optional projection
+        if not table_missing(exc):
+            raise
+        rows = []
+    rules = [AlertRuleRow(**{**r, "pools": [p for p in str(r["pools"]).split(",") if p],
+                             "levels": [x for x in str(r["levels"]).split(",") if x]})
+             for r in rows]
+    return _envelope(source, AlertRulesData(rules=rules))
+
+
+@router.post("/alert-rules", response_model=CommandReceipt, summary="保存告警规则")
+def save_alert_rule(body: AlertRuleBody, request: Request) -> CommandReceipt:
+    return _send(request, "save_alert_rule", {"rule": body.model_dump()})
 
 
 @router.post("/watchlist", response_model=CommandReceipt, summary="加入自选")

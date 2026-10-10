@@ -4,6 +4,24 @@
  */
 
 export interface paths {
+    "/api/v1/alert-rules": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 告警规则 */
+        get: operations["alert_rules_api_v1_alert_rules_get"];
+        put?: never;
+        /** 保存告警规则 */
+        post: operations["save_alert_rule_api_v1_alert_rules_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/alerts": {
         parameters: {
             query?: never;
@@ -377,6 +395,67 @@ export interface components {
             /** Trigger Type */
             trigger_type: string | null;
         };
+        /** AlertRuleBody */
+        AlertRuleBody: {
+            /**
+             * Cooldown Minutes
+             * @default 0
+             */
+            cooldown_minutes: number;
+            /**
+             * Enabled
+             * @default true
+             */
+            enabled: boolean;
+            /**
+             * Levels
+             * @default []
+             */
+            levels: string[];
+            /**
+             * Pools
+             * @default []
+             */
+            pools: ("pool1" | "pool2" | "manual")[];
+            /** Rule Id */
+            rule_id: string;
+            /** Title */
+            title: string;
+        };
+        /** AlertRuleRow */
+        AlertRuleRow: {
+            /**
+             * Cooldown Minutes
+             * @default 0
+             */
+            cooldown_minutes: number;
+            /**
+             * Enabled
+             * @default true
+             */
+            enabled: boolean;
+            /**
+             * Levels
+             * @default []
+             */
+            levels: string[];
+            /**
+             * Pools
+             * @default []
+             */
+            pools: ("pool1" | "pool2" | "manual")[];
+            /** Rule Id */
+            rule_id: string;
+            /** Saved At */
+            saved_at?: string | null;
+            /** Title */
+            title: string;
+        };
+        /** AlertRulesData */
+        AlertRulesData: {
+            /** Rules */
+            rules: components["schemas"]["AlertRuleRow"][];
+        };
         /** AlertsData */
         AlertsData: {
             /** Items */
@@ -620,6 +699,11 @@ export interface components {
             horizon: number;
             /** Mean Ic */
             mean_ic: number | null;
+        };
+        /** Envelope[AlertRulesData] */
+        Envelope_AlertRulesData_: {
+            data: components["schemas"]["AlertRulesData"];
+            serving: components["schemas"]["ServingMeta"];
         };
         /** Envelope[AlertsData] */
         Envelope_AlertsData_: {
@@ -1260,6 +1344,59 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    alert_rules_api_v1_alert_rules_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_AlertRulesData_"];
+                };
+            };
+        };
+    };
+    save_alert_rule_api_v1_alert_rules_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AlertRuleBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommandReceipt"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     alerts_api_v1_alerts_get: {
         parameters: {
             query?: {

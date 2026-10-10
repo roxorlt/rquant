@@ -40,8 +40,17 @@ jobs:
 
       - name: Python lint + API tests
         run: |
-          uv run ruff check src/rquant/web tests/web
+          uv run ruff check src/rquant/web src/rquant/backtest src/rquant/factor \
+            src/rquant/data_catalog src/rquant/alert_rules.py tests/web
           uv run pytest -q tests/web
+      - name: Roadmap module unit tests
+        run: |
+          uv run pytest -q tests/unit/test_perf_metrics.py tests/unit/test_portfolio_*.py \
+            tests/unit/test_backtest_*.py tests/unit/test_overfit*.py \
+            tests/unit/test_data_catalog.py tests/unit/test_data_audit.py \
+            tests/unit/test_factor.py tests/unit/test_alert_rules.py \
+            tests/unit/test_page_control_web_commands.py tests/unit/test_alert_ack_projection.py \
+            tests/unit/test_monitor_manual_watchlist.py tests/unit/test_serving_read_models.py
 
       - uses: pnpm/action-setup@v4
         with:

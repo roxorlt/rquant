@@ -69,3 +69,26 @@ def test_wire_format_matches_web_forwarder() -> None:
         parse_page_control_command({
             "kind": "ack_alert", "command_id": "c", "requested_at": NOW.isoformat(),
             "alert_id": "not-hex", "generation_id": "g", "actor_id": "o"})
+
+
+def test_alert_rule_save_appends_and_projects_latest(tmp_path: Path) -> None:
+    from rquant.page_control import AlertRule, SaveAlertRule
+    from rquant.serving_page_projection_source import read_alert_rule_projection_source
+
+    service = _service_for(outbox=PageControlOutbox(tmp_path / "c.sqlite3"), tmp_path=tmp_path)
+    for i, enabled in enumerate((True, False)):
+        rule = AlertRule(rule_id="pool2-l1", title="二号池一档", enabled=enabled,
+                         pools=("pool2",), levels=("L1",), cooldown_minutes=30)
+        cmd = SaveAlertRule(command_id=f"r-{i}", requested_at=NOW + timedelta(seconds=i),
+                            rule=rule)
+        assert service.submit(cmd).status is PageControlStatus.SUCCEEDED
+    log = tmp_path / "data" / "alert_rules" / "rules.jsonl"
+    assert len(_rows(log)) == 2
+    projected = read_alert_rule_projection_source(log, observed=NOW + timedelta(minutes=1))
+    assert projected is not None
+    (row,) = projected.rows
+    assert (row["enabled"], row["pools"], row["levels"]) == (False, "pool2", "L1")
+    with pytest.raises(ValidationError):
+        parse_page_control_command({"kind": "save_alert_rule", "command_id": "x",
+                                    "requested_at": NOW.isoformat(),
+                                    "rule": {"rule_id": "Bad Id", "title": "t"}})
