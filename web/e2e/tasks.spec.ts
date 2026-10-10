@@ -1,7 +1,9 @@
+import { execSync } from "node:child_process";
 import { expect, test } from "@playwright/test";
+import type { MetaEnvelope } from "../src/api/client.ts";
 import type { components } from "../src/api/schema";
 import { findJargon } from "../src/test/jargon.ts";
-import { API_NOW } from "./env.ts";
+import { API_NOW, REPLAY_ROOT, REPO_ROOT, SERVING_ROOT, UV_RUN } from "./env.ts";
 import { expectNoHorizontalOverflow, watch } from "./watch.ts";
 
 const JOBS_ENVELOPE: components["schemas"]["Envelope_ResearchJobsData_"] = {
@@ -287,6 +289,15 @@ for (const viewport of [
 
     test("real published empty queue explains why there are no rows", async ({ page }) => {
       const watcher = watch(page);
+      if (!REPLAY_ROOT) {
+        const response = await page.request.get("./api/v1/meta");
+        expect(response.ok()).toBe(true);
+        const meta = (await response.json()) as MetaEnvelope;
+        execSync(
+          `${UV_RUN} python scripts/build_web_fixture.py --out "${SERVING_ROOT}" --scenario panorama --publish-next --built-at "${meta.data.server_time}"`,
+          { cwd: REPO_ROOT, env: { ...process.env, RQUANT_DISABLE_DOTENV: "1" }, encoding: "utf8" },
+        );
+      }
       await page.goto("./#/tasks");
       await expect(page.getByRole("heading", { level: 1, name: "任务与调度" })).toBeVisible();
       await expect(page.getByText("还没有研究任务")).toBeVisible();

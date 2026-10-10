@@ -33,6 +33,7 @@ async function fixture(page: Page, baseURL: string | undefined) {
   let generation = taskGeneration;
   let viewer = "alice";
   let metaViewer = viewer;
+  let metaGeneration = generation;
   let lost = false;
   let rejectNext = false;
   let disabled = false;
@@ -68,13 +69,14 @@ async function fixture(page: Page, baseURL: string | undefined) {
     const path = url.pathname.replace(/^\/app/, "");
     const json = (value: unknown) => route.fulfill({ json: value });
     if (path === "/api/v1/meta") {
-      if (viewer !== metaViewer) {
+      if (viewer !== metaViewer || generation !== metaGeneration) {
         const response = await page.waitForResponse(
           (response) =>
             new URL(response.url()).pathname.replace(/^\/app/, "") === "/api/v1/collaboration/me",
         );
         await response.finished();
         metaViewer = viewer;
+        metaGeneration = generation;
       }
       const meta = structuredClone(taskMeta);
       meta.data.viewer = viewer;

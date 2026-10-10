@@ -519,7 +519,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             "client_uid": lambda: synthetic_web_uid,
         }
         collaboration = CollaborationGateway(collaboration_socket, **client_options)
-        strategy_client = StrategyAuthoringAdmissionClient(strategy_socket, **client_options)
+        strategy_client = StrategyAuthoringAdmissionClient(
+            strategy_socket, timeout_seconds=5.0, **client_options
+        )
         app = create_app(
             WebSettings(
                 serving_root=root / "serving",

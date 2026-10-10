@@ -351,7 +351,11 @@ export function FactorEditor({
                   >
                     {factorFieldName(field)}
                   </Button>
-                  <Tip content={<FactorFieldInfo field={field} />} interactive>
+                  <Tip
+                    key={draft.expression}
+                    content={<FactorFieldInfo field={field} />}
+                    interactive
+                  >
                     <Button
                       size="sm"
                       variant="ghost"

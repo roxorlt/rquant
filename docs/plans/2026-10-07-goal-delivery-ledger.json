@@ -1,26 +1,26 @@
 {
   "schema_version": 1,
-  "revision": 194,
-  "updated_at": "2026-10-10T12:42:57+08:00",
+  "revision": 196,
+  "updated_at": "2026-10-10T13:38:00+08:00",
   "thread_id": "01a0dd53-e9c9-7b73-a7b5-843473fcd6ac",
   "worktree": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-source-integration",
   "branch": "cdx/20260929-factor-source-integration",
   "goal_state": {
     "reported_status": "active",
-    "last_updated_at": "2026-10-10T11:31:00+08:00",
-    "current_turn": "R12_exact_candidate_three_unit_failures_original_author_scoped_followup",
+    "last_updated_at": "2026-10-10T13:38:00+08:00",
+    "current_turn": "R12_original_six_failures_focused_green_combined_delta_freeze",
     "stored_block_reason": "正式指数来源及32日资料仍缺；生产安装切流授权和实际开市日观察按固定6项处理。",
     "explicit_goal_token_budget": null,
     "resume_control": "get_goal已实际返回active；当前无需再点Target继续。",
     "completion_audit": "固定25项，19本地完成、6剩余；参数和三策略最终集成本地验收结束。",
     "previous_goal_turn_classification": "actual_progress",
-    "previous_goal_turn_evidence": "r12-auction-python311312-accepted-20261009-01.json：两版本原54节点通过并核原记录；集中审查形成唯一FCR-001并交原实现者。",
+    "previous_goal_turn_evidence": "data/verification/goal-progress-root/release-preconditions-20261009-01/web-owner-ready-ci180-01/implementation-01/root-candidate-01/browser-failures/root-grouped-candidate-01/published-82f1-01/final-delta-01/MANIFEST.json",
     "last_observation": {
       "classification": "actual_progress",
-      "observed_at": "2026-10-10T11:31:00+08:00",
-      "actual": "两处测试等待改动及三份进度记录已一次发布原PR323，精确候选7df51ab0。新前端CI38020051932格式、类型通过；单元1205通过、3失败，分别为回测标题、模拟盘持仓表和模拟账户按钮首次查找，原因未证实。构建和浏览器未执行，300秒启动仍待验证。完整日志和原始回执已保存，前端监听63880自然退出1并回收。原模拟盘作者仅核这三节点及直接共同接点，产品和共享助手先只读；只做证据明确的局部准备补修及原节点验证，复用有效证据。旧后端20通过、10取消、2汇总门禁失败、1跳过，59725已自然结束并回收；新后端38020051858/39989继续。Target active，固定25项、19本地完成、6剩余、生产0/15，0追加；不限时长次数不扩范围。",
-      "evidence": "data/verification/goal-progress-root/release-preconditions-20261009-01/web-owner-ready-ci180-01/implementation-01/root-candidate-01/WEB-COMPLETION.json",
-      "next": "原作者对照本次三个失败DOM、实际调用及共同接点；只处理证据明确的准备问题并验证原节点。新后端正式CI继续；无新源码补修时不重复猜测性测试，不另开全仓审计、重构、完整本地重跑或审查阶段。"
+      "observed_at": "2026-10-10T13:38:00+08:00",
+      "actual": "六个正式失败节点均本地定向通过，含一个直接受影响桌面节点和必要setup共8通过、0跳过/重试。Root已核三作者实际结果、原断言等价、源SHA及清理证据。仅4源文件补修与必要dist整合，79产物与作者私有新版构建逐字节相等，构建和大小门禁通过；三作者已冻结归还写权。正式前端原191P/6F/10skip仍是失败，后端20作业通过、10分片继续。只做一次本轮新增差异审查和必要发布，不追加本地完整测试。",
+      "evidence": "data/verification/goal-progress-root/release-preconditions-20261009-01/web-owner-ready-ci180-01/implementation-01/root-candidate-01/browser-failures/root-grouped-candidate-01/published-82f1-01/final-delta-01/MANIFEST.json",
+      "next": "原审查者一次集中复核这批新增差异；通过后一次发布必要补修至原PR323，正式验收不把既有失败、取消或跳过计通过。其余有效证据复用。"
     },
     "previous_blocked_audit": {
       "consecutive_goal_turns_without_available_safe_implementation": 3,
@@ -65,7 +65,7 @@
       1,
       3
     ],
-    "confidence": "第二份测试单叶原33项补修通过；后端原一个节点在所记录的诊断环境完整通过，原245未复现、源码补修为空。正式同候选CI仍待，不据此承诺完成时间。正式资料、生产授权和20个开市日另计。",
+    "confidence": "六个原失败本地定向绿、4源文件和必要产物冻结；只做一次新增差异审查及正式CI。整体候选仍须实际门禁通过，不以局部绿承诺完成时点；原窗口保持不重置，资料、生产授权及20个实际开市日另计。",
     "assumptions": [
       "本地19项已验收，14个模块已本地验证；正式市场资料不由合成资料替代。",
       "唯一集中候选审查及原19叶CI补修复核已通过；本批实际阻断修复已冻；只作组合增量复核，复用有效测试。",
@@ -90,7 +90,7 @@
       "earliest": "2026-10-08T10:59:10+08:00",
       "latest": "2026-10-10T10:59:10+08:00",
       "basis": "原10月7日基线的1–3连续运行日；外部等待另列",
-      "status": "at_risk_not_reset"
+      "status": "missed_not_reset"
     },
     "shared_work_estimates": [
       {
@@ -2430,7 +2430,7 @@
       "title": "整体候选最终验收",
       "category": "acceptance",
       "status": "in_progress",
-      "owner": "Root集中提交必要补修并跟踪修后正式门禁",
+      "owner": "Root整合；原审查者一次集中复核本轮新增差异",
       "modules": [
         "M1",
         "M2",
@@ -2582,10 +2582,15 @@
         "data/verification/goal-progress-root/release-preconditions-20261009-01/web-owner-ready-ci180-01/implementation-01/root-candidate-01/web-attempt2-run.json",
         "data/verification/goal-progress-root/release-preconditions-20261009-01/web-owner-ready-ci180-01/implementation-01/root-candidate-01/WEB-ATTEMPT2-COMPLETION.json",
         "data/verification/goal-progress-root/release-preconditions-20261009-01/web-owner-ready-ci180-01/implementation-01/root-candidate-01/browser-failures/root-grouped-candidate-01/MANIFEST.json",
-        "data/verification/goal-progress-root/release-preconditions-20261009-01/web-owner-ready-ci180-01/implementation-01/root-candidate-01/browser-failures/root-grouped-candidate-01/REVIEW-ACCEPTED.json"
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/web-owner-ready-ci180-01/implementation-01/root-candidate-01/browser-failures/root-grouped-candidate-01/REVIEW-ACCEPTED.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/web-owner-ready-ci180-01/implementation-01/root-candidate-01/browser-failures/root-grouped-candidate-01/published-82f1-01/WEB-COMPLETION.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/web-owner-ready-ci180-01/implementation-01/root-candidate-01/browser-failures/root-grouped-candidate-01/published-82f1-01/final-delta-01/VOLUME-ACCEPTED.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/web-owner-ready-ci180-01/implementation-01/root-candidate-01/browser-failures/root-grouped-candidate-01/published-82f1-01/final-delta-01/TASKS-ACCEPTED.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/web-owner-ready-ci180-01/implementation-01/root-candidate-01/browser-failures/root-grouped-candidate-01/published-82f1-01/final-delta-01/PROMOTION-ACCEPTED.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/web-owner-ready-ci180-01/implementation-01/root-candidate-01/browser-failures/root-grouped-candidate-01/published-82f1-01/final-delta-01/BUILD-RESULT.json"
       ],
       "closure_level": "pending",
-      "last_progress": "四测试叶冻结增量经原审查者一次复核PASS、0新增阻断。Root已核四源SHA与回执，直接一次提交原PR；前端原190P/7F/10skip及未知原因保留，旧后端20作业通过、10分片运行、1跳过不计整体通过。新候选正式门禁待启动，发布后的精确提交与运行记录见PUBLISHED.json。固定25项、19本地完成、6剩余、生产0/15、0追加。",
+      "last_progress": "六个正式失败节点均本地定向通过，含一个直接受影响桌面节点和必要setup共8通过、0跳过/重试。Root已核三作者实际结果、原断言等价、源SHA及清理证据。仅4源文件补修与必要dist整合，79产物与作者私有新版构建逐字节相等，构建和大小门禁通过；三作者已冻结归还写权。正式前端原191P/6F/10skip仍是失败，后端20作业通过、10分片继续。只做一次本轮新增差异审查和必要发布，不追加本地完整测试。",
       "submilestones": [
         {
           "name": "网页最终候选准备门禁",
@@ -2737,9 +2742,9 @@
         }
       ],
       "pull_request": "https://github.com/roxorlt/rquant/pull/323",
-      "candidate_commit": "7df51ab0b9ddc4d159523107472ef3c0ab294c09",
+      "candidate_commit": "82f1f3bbbac9990bc09edae2be9cbc24201f613a",
       "remaining_hours_note": "四叶增量复核已通过；修后正式CI及既有真实资料/Linux/合法正面链仍待，不追加本地测试或审查。",
-      "published_candidate_commit": "7df51ab0b9ddc4d159523107472ef3c0ab294c09"
+      "published_candidate_commit": "82f1f3bbbac9990bc09edae2be9cbc24201f613a"
     },
     {
       "id": "R13",
@@ -4088,6 +4093,18 @@
       "delivery_unit_added": false,
       "actual": "四测试叶冻结增量经原审查者一次复核PASS、0新增阻断。Root已核四源SHA与回执，直接一次提交原PR；前端原190P/7F/10skip及未知原因保留，旧后端20作业通过、10分片运行、1跳过不计整体通过。新候选正式门禁待启动，发布后的精确提交与运行记录见PUBLISHED.json。固定25项、19本地完成、6剩余、生产0/15、0追加。",
       "scope": "只发布已冻结的四叶补修及三进度记录，复用有效结果；保留原失败/取消/未知资料，不扩展实现、诊断或审查范围。"
+    },
+    {
+      "date": "2026-10-10",
+      "type": "formal_browser_trace_scoped_repairs",
+      "added_ids": [],
+      "description": "正式191P/6F/10skip、trace上传成功。协作和导航旧失败通过；三个原作者仅核剩余真实失败并补修。目标、25/19/6和生产0/15保持，不增加审计或重构。"
+    },
+    {
+      "date": "2026-10-10",
+      "type": "original_six_failures_focused_green_freeze",
+      "added_ids": [],
+      "description": "仅4源文件必要补修；六原失败含直接相关节点共8P，原断言及失败保留，必要79产物已构建核对。三作者停写，仅集中新增差异复核和正式验收；25/19/6、生产0/15不变。"
     }
   ],
   "update_policy": [
@@ -4128,9 +4145,9 @@
         "tasks": [
           "R12"
         ],
-        "work": "原晋级两业务+setup一次3P、源码零改。正式empty未复现，原失败保留；全部自有资源清理并停写。",
+        "work": "仅fixture已有客户端构造显式5秒；原2业务+setup3P、每例review仅一次且成功原UUID回执恢复。产品默认/TTL/断言保持，全部自有资源清理并停写。",
         "status": "frozen_completed_or_waiting_final_candidate",
-        "baseline_commit": "7df51ab0b9ddc4d159523107472ef3c0ab294c09"
+        "baseline_commit": "82f1f3bbbac9990bc09edae2be9cbc24201f613a"
       },
       {
         "agent": "/root/parameter_family_acceptance",
@@ -4183,8 +4200,8 @@
           "R12"
         ],
         "status": "frozen_completed_or_waiting_final_candidate",
-        "work": "成交分布原手机可比较一次1P；仅两截图输出路径迁移。原401由私有proof祖先导致，正式tooltip失败未复现；冻结停写。",
-        "baseline_commit": "7df51ab0b9ddc4d159523107472ef3c0ab294c09"
+        "work": "字段说明生命周期补修；原双视口2P、严格断言保持。产品叶和证据冻结，全部自有资源清理；Root新版dist与私有79文件逐字节相同。",
+        "baseline_commit": "82f1f3bbbac9990bc09edae2be9cbc24201f613a"
       },
       {
         "agent": "/root/ci_task_entrypoints",
@@ -4192,8 +4209,8 @@
           "R12"
         ],
         "status": "frozen_completed_or_waiting_final_candidate",
-        "work": "导航请求取消在本地原trace复现；仅十行完整响应等待，原桌面一次1P。两空态本地通过但正式原因未证；冻结停写。",
-        "baseline_commit": "7df51ab0b9ddc4d159523107472ef3c0ab294c09"
+        "work": "同owner换代Me门、真实空队列发布时间两测试叶补修；原3节点3P。旧HEAD82 dist输入明确、首次启动0节点记录保留；所有自有资源清理并停写。",
+        "baseline_commit": "82f1f3bbbac9990bc09edae2be9cbc24201f613a"
       },
       {
         "agent": "/root/ci_worker_resource_failures",
