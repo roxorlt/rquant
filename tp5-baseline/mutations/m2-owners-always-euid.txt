@@ -1,0 +1,9 @@
+===== m2-owners-always-euid =====
+=========================== short test summary info ============================
+FAILED tests/unit/test_legacy_shadow_export.py::test_session_mode_admits_the_root_signer_that_sealed_the_directory
+FAILED tests/unit/test_legacy_shadow_export.py::test_directory_owner_predicate_truth_table[session-mode-365-root-True]
+FAILED tests/unit/test_legacy_shadow_export.py::test_directory_owner_predicate_truth_table[root-and-session-mode-448-root-True]
+FAILED tests/unit/test_legacy_shadow_export.py::test_directory_owner_predicate_truth_table[root-and-session-mode-365-root-True]
+FAILED tests/unit/test_legacy_shadow_export.py::test_directory_owner_predicate_truth_table[signed-session-modes-production-365-root-True]
+FAILED tests/unit/test_legacy_shadow_export.py::test_root_sealed_session_loads_the_same_batch_as_a_publisher_owned_session
+========================= 6 failed, 68 passed in 1.05s =========================

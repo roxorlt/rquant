@@ -1,0 +1,9 @@
+# after S1 (group-writable case added to C4), HEAD tree
+## C8 python 3.11 (uv run pytest)
+
+============================== 74 passed in 0.91s ==============================
+## C8 python 3.12 (.venv312/bin/python -m pytest)
+
+============================== 74 passed in 2.26s ==============================
+## C10 ruff
+All checks passed!

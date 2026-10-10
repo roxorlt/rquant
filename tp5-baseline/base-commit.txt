@@ -1,0 +1,2 @@
+16a1f019dbc5e081f3742018659489bb28f99baa
+16a1f01 Merge PR #176: classify CLAUDE.md in the R07 gate and commit the local CLAUDE.md sections (#175)

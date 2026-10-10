@@ -1,0 +1,7 @@
+===== m3-owners-always-root-and-euid =====
+=========================== short test summary info ============================
+FAILED tests/unit/test_legacy_shadow_export.py::test_build_phase_modes_keep_the_owner_set_pinned_to_the_effective_uid
+FAILED tests/unit/test_legacy_shadow_export.py::test_directory_owner_predicate_truth_table[root-mode-448-root-False]
+FAILED tests/unit/test_legacy_shadow_export.py::test_directory_owner_predicate_truth_table[signed-session-modes-offline-448-root-False]
+FAILED tests/unit/test_legacy_shadow_export.py::test_root_sealed_session_loads_the_same_batch_as_a_publisher_owned_session
+========================= 4 failed, 70 passed in 0.96s =========================

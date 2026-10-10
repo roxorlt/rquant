@@ -1,0 +1,31 @@
+# Attribution for the single red outside the change surface
+#
+# FAILED tests/unit/test_signal_family_verifier_harness.py
+#        ::TestRecomputeExpectations::test_the_recomputation_reports_a_correct_tree_as_current
+#
+# Not a pre-existing red and not a defect: the R07 policy fixture is derived from the
+# `baseline..candidate` raw git diff (baseline = v0.30.0 = 2b26280), so it moves whenever a
+# work package edits any repository file. `scripts/r07_policy_regenerate.py`'s own docstring
+# says every such package must run it again, and coordinator-rulings.md §S2 "过程" assigns
+# `manifest / R07 不动点` to the integration step, not to the implementer.
+#
+# Proof it is green on the untouched base, run in a detached worktree of 16a1f01
+# (/Users/roxor/rq-tp5-baseline-wt, clean tree):
+#
+#   .venv/bin/python -m pytest \
+#     tests/unit/test_signal_family_verifier_harness.py::TestRecomputeExpectations \
+#     tests/unit/test_assert_full_suite_shards.py -q
+#   ============================== 25 passed in 6.05s ==============================
+#
+# tests/unit/test_assert_full_suite_shards.py is the same shape: it pins the frozen shard
+# manifest and the case count (13331 at base; this package adds 30 cases). It is NOT in the
+# PR-C acceptance list (C9) but it will also be red until the shards are regenerated.
+#
+# Both are deliberately left for integration: regenerating them now would go stale again as
+# soon as the integrator adds the CHANGELOG.md / DEPLOY.md entries that §7 assigns to PR-C.
+#
+# Observed on this branch (d69fa93):
+#   .venv/bin/python -m pytest tests/unit/test_assert_full_suite_shards.py -q
+#   FAILED ...::test_checked_in_manifest_matches_exact_collection_without_missing_or_duplicate_cases
+#   ========================= 1 failed, 12 passed in 6.42s =========================
+#   (scripts/full_suite_shards.py:752: ContractError -- 13331 frozen cases vs 13361 collected)

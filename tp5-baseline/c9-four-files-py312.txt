@@ -1,0 +1,4 @@
+# C9 python 3.12 (.venv312) : the four listed files
+=========================== short test summary info ============================
+FAILED tests/unit/test_signal_family_verifier_harness.py::TestRecomputeExpectations::test_the_recomputation_reports_a_correct_tree_as_current
+================== 1 failed, 343 passed, 7 skipped in 14.71s ===================

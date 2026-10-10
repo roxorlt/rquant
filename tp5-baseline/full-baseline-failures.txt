@@ -1,0 +1,141 @@
+# 60 pre-existing failures on the untouched base commit 16a1f01 (macOS, python 3.11.15),
+# from `uv run pytest -q` in a clean detached worktree. Every line below carries its
+# truncated pytest message, which is what the clustering is computed from.
+#
+# Clustered by error shape (the six buckets sum to 60):
+#
+#    13  os.waitid missing (macOS platform gap)
+#    13  Regex pattern did not match
+#    12  other domain-specific assertions/errors
+#     9  subprocess exit code mismatch  <- the #179 shape
+#     8  DID NOT RAISE
+#     5  IPC / timeout (EOFError, queue.Empty, wait timeout)
+#
+# Only the 9 subprocess-exit-code failures match issue #179. The rest are local macOS
+# environment state -- `os.waitid` does not exist in macOS's `os` module at all -- and
+# must NOT be filed under that issue. The authoritative signal is the Linux CI run at
+# integration time; this local baseline exists to give G0-2 a comparison basis.
+#
+# None of the five files this package touches or asserts on appears below:
+#   test_legacy_shadow_export.py / test_runtime_builder_shadow.py /
+#   test_signal_family_verifier_harness.py / test_signal_family_verification_reset.py /
+#   test_assert_full_suite_shards.py
+FAILED tests/integration/test_formal_smoke_generation_execution.py::test_receipt_fd_holder_times_out_reaps_process_group_and_cleans_staging - AttributeError: module 'os' has no attribute 'waitid'
+
+FAILED tests/integration/test_formal_smoke_generation_execution.py::test_parent_final_group_kill_removes_descendant_after_supervisor_self_kill_mutation - AttributeError: module 'os' has no attribute 'waitid'
+
+FAILED tests/integration/test_formal_smoke_generation_execution.py::test_supervisor_cleanup_state_matrix_preserves_or_loses_group_anchor_once - AttributeError: <module 'os' (frozen)> has no attribute 'waitid'
+
+FAILED tests/integration/test_formal_smoke_generation_execution.py::test_supervisor_owned_teardown_still_gets_parent_final_group_kill_before_reap - AttributeError: <module 'os' (frozen)> has no attribute 'waitid'
+
+FAILED tests/integration/test_formal_smoke_generation_execution.py::test_cleanup_value_error_still_kills_real_group_and_reaps_supervisor[teardown-wait-cleanup_teardown_wait-selector_contract] - AttributeError: module 'os' has no attribute 'waitid'
+
+FAILED tests/integration/test_formal_smoke_generation_execution.py::test_cleanup_value_error_still_kills_real_group_and_reaps_supervisor[kill-cleanup_kill-process_group_contract] - AttributeError: module 'os' has no attribute 'waitid'
+
+FAILED tests/integration/test_formal_smoke_generation_execution.py::test_cleanup_value_error_still_kills_real_group_and_reaps_supervisor[reap-cleanup_reap-process_reap_contract] - AttributeError: module 'os' has no attribute 'waitid'
+
+FAILED tests/integration/test_formal_smoke_generation_execution.py::test_post_spawn_initialization_failure_cleans_group_and_all_descriptors[selector-constructor] - AttributeError: module 'os' has no attribute 'waitid'
+
+FAILED tests/integration/test_formal_smoke_generation_execution.py::test_post_spawn_initialization_failure_cleans_group_and_all_descriptors[register-request] - AttributeError: module 'os' has no attribute 'waitid'
+
+FAILED tests/integration/test_formal_smoke_generation_execution.py::test_post_spawn_initialization_failure_cleans_group_and_all_descriptors[register-receipt] - AttributeError: module 'os' has no attribute 'waitid'
+
+FAILED tests/integration/test_formal_smoke_generation_execution.py::test_post_spawn_initialization_failure_cleans_group_and_all_descriptors[register-status] - AttributeError: module 'os' has no attribute 'waitid'
+
+FAILED tests/integration/test_formal_smoke_generation_execution.py::test_post_spawn_initialization_failure_cleans_group_and_all_descriptors[set-blocking] - AttributeError: module 'os' has no attribute 'waitid'
+
+FAILED tests/integration/test_formal_smoke_generation_execution.py::test_post_spawn_initialization_failure_cleans_group_and_all_descriptors[close-child-end] - AttributeError: module 'os' has no attribute 'waitid'
+
+FAILED tests/integration/test_formal_smoke_generation_execution.py::test_formal_smoke_child_launch_has_no_fork_window_when_thread_starts_after_pipe - rquant.formal_smoke_execution.FormalSmokeExecutionError: formal smoke super...
+
+FAILED tests/unit/test_artifact_retention_catalog.py::test_reference_store_checks_every_descendant_of_explicit_trust_root - Failed: DID NOT RAISE <class 'ValueError'>
+
+FAILED tests/unit/test_authority_runtime_installer.py::test_secure_publisher_copies_normal_payload_and_signs_manifest - authority_runtime_installer.AuthorityRuntimeInstallError: authority runtime...
+
+FAILED tests/unit/test_authority_runtime_installer.py::test_secure_publisher_rejects_every_payload_symlink[external-file] - AssertionError: Regex pattern did not match.
+
+FAILED tests/unit/test_authority_runtime_installer.py::test_secure_publisher_rejects_every_payload_symlink[external-directory] - AssertionError: Regex pattern did not match.
+
+FAILED tests/unit/test_authority_runtime_installer.py::test_secure_publisher_rejects_every_payload_symlink[private-key] - AssertionError: Regex pattern did not match.
+
+FAILED tests/unit/test_authority_runtime_installer.py::test_secure_publisher_rejects_every_payload_symlink[internal] - AssertionError: Regex pattern did not match.
+
+FAILED tests/unit/test_authority_runtime_installer.py::test_secure_publisher_rejects_payload_hardlinks - AssertionError: Regex pattern did not match.
+
+FAILED tests/unit/test_authority_runtime_installer.py::test_secure_publisher_rejects_special_files[fifo] - AssertionError: Regex pattern did not match.
+
+FAILED tests/unit/test_authority_runtime_installer.py::test_secure_publisher_rejects_special_files[socket] - AssertionError: Regex pattern did not match.
+
+FAILED tests/unit/test_authority_runtime_installer.py::test_secure_publisher_rejects_unsafe_or_conflicting_manifest_paths[paths1-case] - AssertionError: Regex pattern did not match.
+
+FAILED tests/unit/test_authority_runtime_installer.py::test_secure_publisher_rejects_unsafe_or_conflicting_manifest_paths[paths2-duplicate] - AssertionError: Regex pattern did not match.
+
+FAILED tests/unit/test_authority_runtime_installer.py::test_secure_publisher_rejects_file_replaced_between_inventory_and_open - AssertionError: Regex pattern did not match.
+
+FAILED tests/unit/test_authority_runtime_installer.py::test_secure_publisher_rejects_candidate_entry_replaced_after_open[manifest] - AssertionError: Regex pattern did not match.
+
+FAILED tests/unit/test_authority_runtime_installer.py::test_secure_publisher_rejects_candidate_entry_replaced_after_open[payload] - AssertionError: Regex pattern did not match.
+
+FAILED tests/unit/test_authority_runtime_installer.py::test_real_prepare_publish_verify_roundtrip - authority_runtime_installer.AuthorityRuntimeInstallError: authority runtime...
+
+FAILED tests/unit/test_contained_subprocess.py::test_post_install_handoff_failure_restores_signal_ownership - assert False
+
+FAILED tests/unit/test_contained_subprocess.py::test_signal_latch_install_failure_retries_rollback_while_blocked - Failed: DID NOT RAISE <class 'OSError'>
+
+FAILED tests/unit/test_contained_subprocess.py::test_persistent_signal_latch_install_rollback_fails_closed - Failed: DID NOT RAISE <class 'OSError'>
+
+FAILED tests/unit/test_contained_subprocess.py::test_signal_arbiter_install_fails_before_tracker_pipe_or_popen[failure2-2] - AssertionError: tracker created before signal authority
+
+FAILED tests/unit/test_contained_subprocess.py::test_installation_terminates_when_latch_is_unblocked_and_cannot_be_recovered - OSError: release verification boom
+
+FAILED tests/unit/test_contained_subprocess.py::test_first_signal_arriving_during_cleanup_is_replayed_after_all_cleanup[kernel_close] - assert False
+
+FAILED tests/unit/test_experiment_registry.py::test_writable_registry_rejects_non_private_intermediate_managed_parent - Failed: DID NOT RAISE <class 'ValueError'>
+
+FAILED tests/unit/test_experiment_registry.py::test_writable_registry_checks_every_descendant_of_explicit_trust_root - Failed: DID NOT RAISE <class 'ValueError'>
+
+FAILED tests/unit/test_lab_artifact_catalog.py::test_rejects_artifact_root_without_private_exact_mode - Failed: DID NOT RAISE <class 'ValueError'>
+
+FAILED tests/unit/test_lab_artifacts.py::test_legacy_journal_inode_swap_fails_closed_without_touching_replacement - AssertionError: Regex pattern did not match.
+
+FAILED tests/unit/test_lab_claim_finalizer_runtime_stage7.py::test_installer_is_atomic_idempotent_and_never_persists_offline_root_private - rquant.authority_path_security.AuthorityPathSecurityError: protected file o...
+
+FAILED tests/unit/test_lab_claim_finalizer_runtime_stage7.py::test_installer_rejects_replaced_database_and_preserves_current_pointer - rquant.authority_path_security.AuthorityPathSecurityError: protected file o...
+
+FAILED tests/unit/test_lab_daemon.py::test_private_directory_runtime_ensure_does_not_repair_public_directory - Failed: DID NOT RAISE <class 'rquant.lab_daemon.LabDaemonConfigurationError'>
+
+FAILED tests/unit/test_live_spool.py::test_readonly_cursor_reader_rejects_unsafe_root_without_chmod - Failed: DID NOT RAISE <class 'rquant.live_spool.LiveSpoolIntegrityError'>
+
+FAILED tests/unit/test_production_deploy_bootstrap.py::test_bootstrap_process_runner_reaps_group_before_signal_exit[2] - AssertionError: assert not True
+
+FAILED tests/unit/test_replay_lineage_authority.py::test_competing_processes_commit_one_operation_exactly_once - AssertionError: no competitor reported for 120s; still waiting on [0, 1, 2, 3]
+
+FAILED tests/unit/test_runtime_builder_retention.py::test_retention_builder_fails_closed_in_race_when_processes_use_uncontrolled_credential - AssertionError: assert 1 == 0
+
+FAILED tests/unit/test_runtime_recovery_artifacts.py::test_sqlite_oversized_blob_rejection_stays_below_rss_hard_limit - EOFError
+
+FAILED tests/unit/test_runtime_recovery_artifacts.py::test_concurrent_restore_serializes_and_publishes_one_immutable_generation - rquant.runtime_recovery_artifacts.RealRecoveryIntegrityError: recovery fixe...
+
+FAILED tests/unit/test_runtime_recovery_coordinator.py::test_parent_and_fresh_spawn_child_use_identical_n_shape_fingerprint - EOFError
+
+FAILED tests/unit/test_runtime_recovery_coordinator.py::test_four_hundred_thousand_rows_use_bounded_replay_and_verifier_memory - EOFError
+
+FAILED tests/unit/test_runtime_resource_admission.py::test_cross_process_resource_reservation_admits_exactly_one_last_capacity_contender - _queue.Empty
+
+FAILED tests/unit/test_runtime_resource_admission.py::test_abandoned_resource_reservation_expires_and_is_recovered - AssertionError: assert 1 == 17
+
+FAILED tests/unit/test_runtime_shadow_job.py::test_production_shadow_process_recovers_each_publication_stage_exactly_once[after_intent_write-False] - AssertionError: assert 1 == 73
+
+FAILED tests/unit/test_runtime_shadow_job.py::test_production_shadow_process_recovers_each_publication_stage_exactly_once[after_temporary_write-False] - AssertionError: assert 1 == 73
+
+FAILED tests/unit/test_runtime_shadow_job.py::test_production_shadow_process_recovers_each_publication_stage_exactly_once[after_link-True] - AssertionError: assert 1 == 73
+
+FAILED tests/unit/test_runtime_shadow_job.py::test_production_shadow_process_recovers_each_publication_stage_exactly_once[after_receipt_write-True] - AssertionError: assert 1 == 73
+
+FAILED tests/unit/test_runtime_shadow_validation.py::test_publication_recovers_after_hard_exit_between_link_and_cleanup - AssertionError: assert 1 == 91
+
+FAILED tests/unit/test_watchlist_quote_provider.py::test_timeout_while_ready_is_unconsumed_never_starts_loader_and_reaps_worker - AssertionError: assert not True
+
+FAILED tests/unit/test_workload_isolation_migration.py::test_catchable_signal_uses_the_same_transaction_rollback[INT-130] - AssertionError: assert 0 == 130
+
+FAILED tests/unit/test_workload_isolation_migration.py::test_catchable_signal_uses_the_same_transaction_rollback[HUP-129] - AssertionError: assert 0 == 129

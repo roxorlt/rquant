@@ -1,0 +1,4 @@
+===== m5-guard-other-only =====
+=========================== short test summary info ============================
+FAILED tests/unit/test_legacy_shadow_export.py::test_group_or_other_writable_directories_are_refused_even_when_allowed
+========================= 1 failed, 73 passed in 0.94s =========================

@@ -1,0 +1,12 @@
+[1m[31mE           rquant.legacy_shadow_export.LegacyShadowExportUnavailableError: legacy shadow session is unsafe[0m
+
+[1m[31msrc/rquant/legacy_shadow_export.py[0m:1506: LegacyShadowExportUnavailableError
+[36m[1m=========================== short test summary info ============================[0m
+[31mFAILED[0m tests/unit/test_legacy_shadow_export.py::[1mtest_session_mode_admits_the_root_signer_that_sealed_the_directory[0m - AssertionError: assert False
+[31mFAILED[0m tests/unit/test_legacy_shadow_export.py::[1mtest_group_or_other_writable_directories_are_refused_even_when_allowed[0m - AssertionError: assert not True
+[31mFAILED[0m tests/unit/test_legacy_shadow_export.py::[1mtest_directory_owner_predicate_truth_table[session-mode-365-root-True][0m - AssertionError: assert False is True
+[31mFAILED[0m tests/unit/test_legacy_shadow_export.py::[1mtest_directory_owner_predicate_truth_table[root-and-session-mode-448-root-True][0m - AssertionError: assert False is True
+[31mFAILED[0m tests/unit/test_legacy_shadow_export.py::[1mtest_directory_owner_predicate_truth_table[root-and-session-mode-365-root-True][0m - AssertionError: assert False is True
+[31mFAILED[0m tests/unit/test_legacy_shadow_export.py::[1mtest_directory_owner_predicate_truth_table[signed-session-modes-production-365-root-True][0m - AssertionError: assert False is True
+[31mFAILED[0m tests/unit/test_legacy_shadow_export.py::[1mtest_root_sealed_session_loads_the_same_batch_as_a_publisher_owned_session[0m - rquant.legacy_shadow_export.LegacyShadowExportUnavailableError: legacy shad...
+[31m================= [31m[1m7 failed[0m, [32m23 passed[0m, [33m44 deselected[0m[31m in 0.61s[0m[31m ==================[0m

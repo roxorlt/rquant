@@ -1,0 +1,7 @@
+# python 3.11 (.venv, Python 3.11.15) : C8 + C9 + downstream consumers
+Python 3.11.15
+=========================== short test summary info ============================
+FAILED tests/unit/test_signal_family_verifier_harness.py::TestRecomputeExpectations::test_the_recomputation_reports_a_correct_tree_as_current
+============= 1 failed, 859 passed, 7 skipped in 471.53s (0:07:51) =============
+
+# Re-checked at 10141b6 (review S1 test addition); the same single R07 red, nothing else moved.
