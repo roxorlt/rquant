@@ -31,6 +31,10 @@ class StoredRun(BaseModel):
     start: date
     end: date
     result: BacktestResult
+    #: ts_code → industry (stock_basic) for the codes that were candidates
+    industries: dict[str, str] = {}
+    #: candidate codes of the last signal day (the pool the portfolio picked from)
+    pool_last: list[str] = []
 
 
 def research_root() -> Path:
@@ -71,6 +75,18 @@ def load_inputs(
     return days, dict(bars), dict(signals)
 
 
+def load_industries(con: duckdb.DuckDBPyConnection, codes: list[str]) -> dict[str, str]:
+    if not codes:
+        return {}
+    try:
+        rows = con.execute(
+            f"SELECT ts_code, COALESCE(NULLIF(industry, ''), '未分类') FROM stock_basic "
+            f"WHERE ts_code IN ({','.join('?' * len(codes))})", codes).fetchall()
+    except duckdb.CatalogException:  # replica without stock_basic
+        return {}
+    return {str(code): str(industry) for code, industry in rows}
+
+
 def run_and_save(
     database: Path, preset: str, start: date, end: date, config: BacktestConfig,
     *, root: Path | None = None, title: str | None = None,
@@ -78,20 +94,27 @@ def run_and_save(
     con = duckdb.connect(str(database), read_only=True)
     try:
         days, bars, signals = load_inputs(con, preset, start, end)
+        industries = load_industries(
+            con, sorted({c.ts_code for items in signals.values() for c in items}))
     finally:
         con.close()
     result = run_backtest(days, bars, signals, config)
-    return save(result, preset=preset, start=start, end=end, root=root, title=title)
+    pool = [c.ts_code for c in signals[max(signals)]] if signals else []
+    return save(result, preset=preset, start=start, end=end, root=root, title=title,
+                industries=industries, pool_last=pool)
 
 
 def save(result: BacktestResult, *, preset: str, start: date, end: date,
-         root: Path | None = None, title: str | None = None) -> StoredRun:
+         root: Path | None = None, title: str | None = None,
+         industries: dict[str, str] | None = None,
+         pool_last: list[str] | None = None) -> StoredRun:
     params = json.dumps([preset, str(start), str(end), result.config.model_dump(mode="json")],
                         sort_keys=True)
     run_id = hashlib.sha256(params.encode()).hexdigest()[:12]
     run = StoredRun(run_id=run_id, created_at=datetime.now(UTC),
                     title=title or f"{preset} {start}~{end}", preset=preset,
-                    start=start, end=end, result=result)
+                    start=start, end=end, result=result, industries=industries or {},
+                    pool_last=pool_last or [])
     folder = (root or research_root()) / KIND / run_id
     folder.mkdir(parents=True, exist_ok=True)
     tmp = folder / "result.json.tmp"
