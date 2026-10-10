@@ -58,7 +58,8 @@ def test_load_codes_from_serving(tmp_path: Path) -> None:
         {"manual_watchlist": pd.DataFrame({
             "ts_code": ["600519.SH"], "note": [""], "added_at": [built], "command_id": ["c"]})},
         watermarks=(ServingDatasetWatermark(
-            dataset_id="manual_watchlist", generation_id="s", event_time=built - timedelta(seconds=1),
+            dataset_id="manual_watchlist", generation_id="s",
+            event_time=built - timedelta(seconds=1),
             published_at=built, sequence=1, status=FreshnessStatus.FRESH),),
         source_generations={"manual_watchlist": "s"},
         built_at=built,
