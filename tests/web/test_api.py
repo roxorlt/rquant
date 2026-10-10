@@ -187,3 +187,17 @@ def test_factor_results_are_listed_and_read(tmp_path) -> None:
     assert len(detail["result"]["decay"]) == 6
     assert detail["tracking"]["points"] and items[0]["tracked_to"]
     assert client.get("/api/v1/factors/x").status_code == 404
+
+
+def test_strategies_list_latest_version(tmp_path) -> None:
+    from fastapi.testclient import TestClient
+
+    from rquant.web.app import create_app
+    from rquant.web.source import FixtureSource, write_demo_research
+
+    write_demo_research(tmp_path)
+    client = TestClient(create_app(FixtureSource(), dist=None, research_root=tmp_path))
+    (row,) = client.get("/api/v1/strategies").json()["data"]["strategies"]
+    assert (row["slug"], row["version"]) == ("demo-breakout", 1)
+    runs = client.get("/api/v1/portfolio-backtests").json()["data"]["runs"]
+    assert runs[0]["strategy"] == "demo-breakout@1"

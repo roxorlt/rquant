@@ -235,6 +235,7 @@ class PortfolioRunSummary(BaseModel):
     final_nav: float | None
     filled: int
     rejected: int
+    strategy: str | None = None
 
 
 class PortfolioOrder(BaseModel):
@@ -366,3 +367,20 @@ class FactorDetailData(BaseModel):
     factor: FactorSummary
     result: FactorTestResult
     tracking: FactorTracking | None = None
+
+
+class StrategyRow(BaseModel):
+    slug: str
+    title: str
+    version: int
+    versions: int
+    preset: str
+    max_positions: int
+    method: str
+    rebalance_every: int
+    created_at: datetime
+    note: str
+
+
+class StrategyListData(BaseModel):
+    strategies: list[StrategyRow]

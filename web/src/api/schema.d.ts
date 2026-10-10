@@ -294,6 +294,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/strategies": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 策略与版本 */
+        get: operations["strategies_api_v1_strategies_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/watchlist": {
         parameters: {
             query?: never;
@@ -682,6 +699,11 @@ export interface components {
         /** Envelope[ScreenData] */
         Envelope_ScreenData_: {
             data: components["schemas"]["ScreenData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[StrategyListData] */
+        Envelope_StrategyListData_: {
+            data: components["schemas"]["StrategyListData"];
             serving: components["schemas"]["ServingMeta"];
         };
         /** FactorDetailData */
@@ -1074,6 +1096,8 @@ export interface components {
              * Format: date
              */
             start: string;
+            /** Strategy */
+            strategy?: string | null;
             /** Title */
             title: string;
         };
@@ -1170,6 +1194,37 @@ export interface components {
             sequence: number;
             /** Strategy Id */
             strategy_id: string;
+        };
+        /** StrategyListData */
+        StrategyListData: {
+            /** Strategies */
+            strategies: components["schemas"]["StrategyRow"][];
+        };
+        /** StrategyRow */
+        StrategyRow: {
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /** Max Positions */
+            max_positions: number;
+            /** Method */
+            method: string;
+            /** Note */
+            note: string;
+            /** Preset */
+            preset: string;
+            /** Rebalance Every */
+            rebalance_every: number;
+            /** Slug */
+            slug: string;
+            /** Title */
+            title: string;
+            /** Version */
+            version: number;
+            /** Versions */
+            versions: number;
         };
         /** TrackingPoint */
         TrackingPoint: {
@@ -1661,6 +1716,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    strategies_api_v1_strategies_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_StrategyListData_"];
                 };
             };
         };
