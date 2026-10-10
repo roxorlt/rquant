@@ -39,13 +39,18 @@ class TestBuildParser:
 
     def test_run_daily_with_args(self) -> None:
         parser = build_parser()
-        args = parser.parse_args([
-            "run-daily",
-            "--date", "2026-04-18",
-            "--preset", "n-shape-pool1",
-            "--skip-minute-backfill",
-            "--minute-lookback-days", "60",
-        ])
+        args = parser.parse_args(
+            [
+                "run-daily",
+                "--date",
+                "2026-04-18",
+                "--preset",
+                "n-shape-pool1",
+                "--skip-minute-backfill",
+                "--minute-lookback-days",
+                "60",
+            ]
+        )
         assert args.date == "2026-04-18"
         assert args.preset == "n-shape-pool1"
         assert args.skip_minute_backfill
@@ -166,7 +171,8 @@ class TestCLISmoke:
     def test_help_exits_0(self) -> None:
         result = subprocess.run(
             [sys.executable, "-m", "rquant.cli", "--help"],
-            capture_output=True, text=True,
+            capture_output=True,
+            text=True,
         )
         assert result.returncode == 0
         assert "rquant" in result.stdout
@@ -174,7 +180,8 @@ class TestCLISmoke:
     def test_run_daily_help(self) -> None:
         result = subprocess.run(
             [sys.executable, "-m", "rquant.cli", "run-daily", "--help"],
-            capture_output=True, text=True,
+            capture_output=True,
+            text=True,
         )
         assert result.returncode == 0
         assert "--date" in result.stdout
@@ -218,6 +225,8 @@ class TestDailyIndicatorBackfill:
             "start_date": "2026-04-01",
             "end_date": "2026-07-14",
             "dry_run": True,
+            "consistency_mode": "primary_snapshot_plus_serial_writer_contract",
+            "toctou_status": "not_applicable",
         }
         writer.assert_not_called()
 
@@ -229,23 +238,67 @@ class TestDailyIndicatorBackfill:
     ) -> None:
         from unittest.mock import MagicMock
 
+        import pandas as pd
+
         import rquant.cli as cli
         import rquant.indicator_backfill as backfill_module
         from rquant.storage.duckdb import DuckDBStore
 
-        store = DuckDBStore(tmp_path / "indicator-apply.duckdb")
-        context = MagicMock()
-        context.__enter__.return_value = store
-        context.__exit__.side_effect = lambda *_: store.close()
-        writer = MagicMock(return_value=context)
-        readonly = MagicMock(side_effect=AssertionError("readonly opened"))
+        db_path = tmp_path / "indicator-apply.duckdb"
+        with DuckDBStore(db_path):
+            pass
+        events: list[str] = []
+
+        class _Context:
+            def __init__(
+                self,
+                store: DuckDBStore,
+                role: str,
+            ) -> None:
+                self.store = store
+                self.role = role
+
+            def __enter__(self) -> DuckDBStore:
+                events.append(f"{self.role}_enter")
+                return self.store
+
+            def __exit__(self, *args: object) -> None:
+                del args
+                events.append(f"{self.role}_exit")
+                self.store.close()
+
+        class _WriterStore(DuckDBStore):
+            def upsert_indicators(self, df: pd.DataFrame) -> int:
+                events.append("short_apply")
+                return super().upsert_indicators(df)
+
+        def _readonly() -> _Context:
+            events.append("readonly_construct")
+            return _Context(DuckDBStore(db_path, read_only=True), "readonly")
+
+        def _writer() -> _Context:
+            events.append("writer_construct")
+            return _Context(_WriterStore(db_path), "writer")
+
+        def _guard(now: datetime | None = None) -> None:
+            del now
+            events.append("guard")
+
+        writer = MagicMock(side_effect=_writer)
+        readonly = MagicMock(side_effect=_readonly)
         monkeypatch.setattr(cli, "DuckDBStore", writer)
         monkeypatch.setattr(cli, "open_readonly_store", readonly)
         monkeypatch.setattr(cli, "setup_logging", lambda: None)
         monkeypatch.setattr(
             backfill_module,
-            "_now",
-            lambda: datetime(2026, 7, 18, 10, tzinfo=ZoneInfo("Asia/Shanghai")),
+            "open_primary_daily_indicator_store",
+            _readonly,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            backfill_module,
+            "require_daily_indicator_write_window",
+            _guard,
         )
         args = build_parser().parse_args(
             [
@@ -260,8 +313,17 @@ class TestDailyIndicatorBackfill:
 
         assert cli.cmd_daily_indicator_backfill(args) == 0
         assert json.loads(capsys.readouterr().out)["dry_run"] is False
-        writer.assert_called_once_with()
-        readonly.assert_not_called()
+        assert events == [
+            "guard",
+            "readonly_construct",
+            "readonly_enter",
+            "readonly_exit",
+            "guard",
+            "writer_construct",
+            "writer_enter",
+            "short_apply",
+            "writer_exit",
+        ]
 
     def test_apply_returns_two_inside_protected_window(
         self,
@@ -331,9 +393,7 @@ class TestResearchExport:
         monkeypatch.setattr(config_module.settings, "research_db_path", None)
         monkeypatch.setattr(config_module.settings, "research_lake_dir", None)
         monkeypatch.setattr(duckdb_module, "open_readonly_connection", open_replica)
-        monkeypatch.setattr(
-            catalog_module, "exclusive_file_lock", publish_lock_factory
-        )
+        monkeypatch.setattr(catalog_module, "exclusive_file_lock", publish_lock_factory)
         monkeypatch.setattr(lake_module, "export_research_dataset", export_dataset)
         monkeypatch.setattr(manifest_module, "detect_code_commit", lambda: "a" * 40)
         args = build_parser().parse_args(
@@ -356,9 +416,7 @@ class TestResearchExport:
         assert observed["end_date"] == date(2026, 7, 15)
         assert observed["dry_run"] is False
         assert observed["code_commit"] == "a" * 40
-        publish_lock_factory.assert_called_once_with(
-            tmp_path / "research-publish.lock"
-        )
+        publish_lock_factory.assert_called_once_with(tmp_path / "research-publish.lock")
         connection.close.assert_called_once_with()
         assert capsys.readouterr().out.strip() == '{"status":"planned"}'
 
@@ -378,9 +436,7 @@ class TestResearchExport:
         connection = MagicMock()
         export_dataset = MagicMock()
         publish_lock = MagicMock()
-        (tmp_path / "research-authority-candidate.json").write_text(
-            "{}\n", encoding="utf-8"
-        )
+        (tmp_path / "research-authority-candidate.json").write_text("{}\n", encoding="utf-8")
         monkeypatch.setattr(config_module.settings, "data_dir", tmp_path)
         monkeypatch.setattr(config_module.settings, "research_db_path", None)
         monkeypatch.setattr(config_module.settings, "research_lake_dir", None)
@@ -429,13 +485,9 @@ class TestResearchIngest:
         is_open = MagicMock(return_value=False)
         adapter_factory = MagicMock()
         monkeypatch.setattr(config_module.settings, "duckdb_readonly_path", source)
-        monkeypatch.setattr(
-            config_module.settings, "research_cloud_ingest_enabled", True
-        )
+        monkeypatch.setattr(config_module.settings, "research_cloud_ingest_enabled", True)
         monkeypatch.setattr(ingest_module, "research_trade_date_is_open", is_open)
-        monkeypatch.setattr(
-            "rquant.adapter.tushare.TushareAdapter", adapter_factory
-        )
+        monkeypatch.setattr("rquant.adapter.tushare.TushareAdapter", adapter_factory)
         args = build_parser().parse_args(["research-ingest"])
         expected_date = datetime.now(ZoneInfo("Asia/Shanghai")).date()
 
@@ -464,13 +516,9 @@ class TestResearchIngest:
         is_open = MagicMock(return_value=False)
         adapter_factory = MagicMock()
         monkeypatch.setattr(config_module.settings, "duckdb_readonly_path", source)
-        monkeypatch.setattr(
-            config_module.settings, "research_cloud_ingest_enabled", True
-        )
+        monkeypatch.setattr(config_module.settings, "research_cloud_ingest_enabled", True)
         monkeypatch.setattr(ingest_module, "research_trade_date_is_open", is_open)
-        monkeypatch.setattr(
-            "rquant.adapter.tushare.TushareAdapter", adapter_factory
-        )
+        monkeypatch.setattr("rquant.adapter.tushare.TushareAdapter", adapter_factory)
         args = build_parser().parse_args(
             [
                 "research-ingest",
@@ -494,13 +542,9 @@ class TestResearchIngest:
         from rquant import config as config_module
 
         adapter = MagicMock()
-        monkeypatch.setattr(
-            config_module.settings, "research_cloud_ingest_enabled", False
-        )
+        monkeypatch.setattr(config_module.settings, "research_cloud_ingest_enabled", False)
         monkeypatch.setattr("rquant.adapter.tushare.TushareAdapter", adapter)
-        args = build_parser().parse_args(
-            ["research-ingest", "--date", "2026-07-17"]
-        )
+        args = build_parser().parse_args(["research-ingest", "--date", "2026-07-17"])
 
         assert cli.cmd_research_ingest(args) == 3
         adapter.assert_not_called()
@@ -526,21 +570,11 @@ class TestResearchIngest:
         source = tmp_path / "rquant_ro.duckdb"
         monkeypatch.setattr(config_module.settings, "data_dir", tmp_path)
         monkeypatch.setattr(config_module.settings, "duckdb_readonly_path", source)
-        monkeypatch.setattr(
-            config_module.settings, "research_cloud_ingest_enabled", True
-        )
-        monkeypatch.setattr(
-            "rquant.adapter.tushare.TushareAdapter", adapter_factory
-        )
-        monkeypatch.setattr(
-            ingest_module, "run_daily_research_ingest", run_ingest
-        )
-        monkeypatch.setattr(
-            manifest_module, "detect_code_commit", lambda: "a" * 40
-        )
-        args = build_parser().parse_args(
-            ["research-ingest", "--date", "2026-07-17"]
-        )
+        monkeypatch.setattr(config_module.settings, "research_cloud_ingest_enabled", True)
+        monkeypatch.setattr("rquant.adapter.tushare.TushareAdapter", adapter_factory)
+        monkeypatch.setattr(ingest_module, "run_daily_research_ingest", run_ingest)
+        monkeypatch.setattr(manifest_module, "detect_code_commit", lambda: "a" * 40)
+        args = build_parser().parse_args(["research-ingest", "--date", "2026-07-17"])
 
         assert cli.cmd_research_ingest(args) == 2
         run_ingest.assert_called_once_with(
@@ -569,12 +603,8 @@ class TestResearchIngest:
         result.model_dump_json.return_value = '{"status":"planned"}'
         run_ingest = MagicMock(return_value=result)
         monkeypatch.setattr(config_module.settings, "data_dir", tmp_path)
-        monkeypatch.setattr(
-            config_module.settings, "research_cloud_ingest_enabled", False
-        )
-        monkeypatch.setattr(
-            ingest_module, "run_daily_research_ingest", run_ingest
-        )
+        monkeypatch.setattr(config_module.settings, "research_cloud_ingest_enabled", False)
+        monkeypatch.setattr(ingest_module, "run_daily_research_ingest", run_ingest)
         args = build_parser().parse_args(
             [
                 "research-ingest",
@@ -605,17 +635,13 @@ class TestResearchIngest:
         source = tmp_path / "rquant_ro.duckdb"
         monkeypatch.setattr(config_module.settings, "data_dir", tmp_path)
         monkeypatch.setattr(config_module.settings, "duckdb_readonly_path", source)
-        monkeypatch.setattr(
-            config_module.settings, "research_cloud_ingest_enabled", True
-        )
+        monkeypatch.setattr(config_module.settings, "research_cloud_ingest_enabled", True)
         monkeypatch.setattr(ingest_module, "run_daily_research_ingest", run_ingest)
         monkeypatch.setattr(manifest_module, "detect_code_commit", lambda: "a" * 40)
         monkeypatch.setattr(
             "rquant.adapter.tushare.TushareAdapter", MagicMock(return_value=MagicMock())
         )
-        args = build_parser().parse_args(
-            ["research-ingest", "--date", "2026-07-16", "--recover"]
-        )
+        args = build_parser().parse_args(["research-ingest", "--date", "2026-07-16", "--recover"])
 
         assert cli.cmd_research_ingest(args) == 0
         assert run_ingest.call_args.kwargs["trade_date"] == date(2026, 7, 16)
@@ -646,12 +672,8 @@ class TestResearchIngest:
         assess = MagicMock(return_value=result)
         source = tmp_path / "rquant_ro.duckdb"
         monkeypatch.setattr(config_module.settings, "duckdb_readonly_path", source)
-        monkeypatch.setattr(
-            ingest_module, "assess_research_ingest_readiness", assess
-        )
-        args = build_parser().parse_args(
-            ["research-ingest-readiness", "--date", "2026-07-17"]
-        )
+        monkeypatch.setattr(ingest_module, "assess_research_ingest_readiness", assess)
+        args = build_parser().parse_args(["research-ingest-readiness", "--date", "2026-07-17"])
 
         assert cli.cmd_research_ingest_readiness(args) == 1
         assess.assert_called_once_with(source, date(2026, 7, 17))
@@ -671,17 +693,11 @@ class TestResearchIngest:
         status = MagicMock()
         status.model_dump_json.return_value = '{"status":"candidate"}'
         inspect = MagicMock(return_value=status)
-        monkeypatch.setattr(
-            ingest_module, "inspect_research_authority", inspect
-        )
-        args = build_parser().parse_args(
-            ["research-authority-status", "--data-dir", str(tmp_path)]
-        )
+        monkeypatch.setattr(ingest_module, "inspect_research_authority", inspect)
+        args = build_parser().parse_args(["research-authority-status", "--data-dir", str(tmp_path)])
 
         assert cli.cmd_research_authority_status(args) == 0
-        inspect.assert_called_once_with(
-            ingest_module.ResearchIngestPaths.from_data_dir(tmp_path)
-        )
+        inspect.assert_called_once_with(ingest_module.ResearchIngestPaths.from_data_dir(tmp_path))
         assert capsys.readouterr().out.strip() == '{"status":"candidate"}'
 
 
@@ -710,9 +726,7 @@ class TestResearchMigration:
         )
 
         assert cli.cmd_research_migration(args) == 0
-        verify.assert_called_once_with(
-            Path("/staging/research-20260716T160000Z-a1b2c3d4")
-        )
+        verify.assert_called_once_with(Path("/staging/research-20260716T160000Z-a1b2c3d4"))
         assert capsys.readouterr().out.strip() == '{"status":"verified"}'
 
     def test_publish_command_delegates_only_with_apply(
@@ -776,9 +790,7 @@ class TestTradeCalendarBootstrap:
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         with pytest.raises(SystemExit) as exc:
-            build_parser().parse_args(
-                ["trade-calendar-bootstrap", "--start-date", "20240201"]
-            )
+            build_parser().parse_args(["trade-calendar-bootstrap", "--start-date", "20240201"])
 
         assert exc.value.code == 2
         assert "--start-date" in capsys.readouterr().err
@@ -1009,9 +1021,7 @@ class TestLimitUpPoolCommands:
     def test_repair_apply_requires_both_explicit_flags(self) -> None:
         plan_id = "a" * 64
 
-        accepted = build_parser().parse_args(
-            ["zt-pool-repair", "--apply", "--plan-id", plan_id]
-        )
+        accepted = build_parser().parse_args(["zt-pool-repair", "--apply", "--plan-id", plan_id])
         assert accepted.apply is True
         assert accepted.plan_id == plan_id
 
@@ -1025,9 +1035,7 @@ class TestLimitUpPoolCommands:
 
     def test_repair_rejects_non_sha256_plan_id(self) -> None:
         with pytest.raises(SystemExit) as caught:
-            build_parser().parse_args(
-                ["zt-pool-repair", "--apply", "--plan-id", "not-a-plan"]
-            )
+            build_parser().parse_args(["zt-pool-repair", "--apply", "--plan-id", "not-a-plan"])
 
         assert caught.value.code == 2
 
@@ -1072,18 +1080,14 @@ class TestLimitUpPoolCommands:
         monkeypatch.setattr(cli, "DuckDBStore", _StoreContext)
         monkeypatch.setattr(cli, "setup_logging", lambda: None)
 
-        assert cli.cmd_zt_pool_repair(
-            SimpleNamespace(apply=False, plan_id=None)
-        ) == 0
+        assert cli.cmd_zt_pool_repair(SimpleNamespace(apply=False, plan_id=None)) == 0
         assert store._conn.execute(  # noqa: SLF001
             "SELECT COUNT(*) FROM limit_up_pool_daily"
         ).fetchone() == (1,)
         plan = build_limit_up_pool_closed_day_repair_plan(store)
         assert plan.plan_id is not None
 
-        assert cli.cmd_zt_pool_repair(
-            SimpleNamespace(apply=True, plan_id=plan.plan_id)
-        ) == 0
+        assert cli.cmd_zt_pool_repair(SimpleNamespace(apply=True, plan_id=plan.plan_id)) == 0
         assert store._conn.execute(  # noqa: SLF001
             "SELECT COUNT(*) FROM limit_up_pool_daily"
         ).fetchone() == (0,)
@@ -1119,9 +1123,7 @@ class TestLimitUpPoolCommands:
         monkeypatch.setattr(cli, "DuckDBStore", _StoreContext)
         monkeypatch.setattr(cli, "setup_logging", lambda: None)
 
-        assert cli.cmd_zt_pool_repair(
-            SimpleNamespace(apply=False, plan_id=None)
-        ) == 1
+        assert cli.cmd_zt_pool_repair(SimpleNamespace(apply=False, plan_id=None)) == 1
         assert store._conn.execute(  # noqa: SLF001
             "SELECT COUNT(*) FROM limit_up_pool_daily"
         ).fetchone() == (1,)
@@ -1156,9 +1158,7 @@ class TestLimitUpPoolCommands:
         monkeypatch.setattr(cli, "DuckDBStore", _StoreContext)
         monkeypatch.setattr(cli, "setup_logging", lambda: None)
 
-        assert cli.cmd_zt_pool_repair(
-            SimpleNamespace(apply=True, plan_id=plan.plan_id)
-        ) == 1
+        assert cli.cmd_zt_pool_repair(SimpleNamespace(apply=True, plan_id=plan.plan_id)) == 1
         assert store._conn.execute(  # noqa: SLF001
             "SELECT COUNT(*) FROM data_repair_audit"
         ).fetchone() == (0,)
@@ -1350,12 +1350,8 @@ esac
     env["PATH"] = f"{fake_bin}:{env['PATH']}"
     env["SYNC_TEST_CALLS"] = str(calls)
     env["SYNC_TEST_CURL_CALLS"] = str(curl_calls)
-    env["SYNC_TEST_COMPLETION_FILE"] = str(
-        project / "data" / ".last-research-sync-date"
-    )
-    env["SYNC_TEST_LOCK_PID_FILE"] = str(
-        project / "data" / ".sync-from-cloud.lock" / "pid"
-    )
+    env["SYNC_TEST_COMPLETION_FILE"] = str(project / "data" / ".last-research-sync-date")
+    env["SYNC_TEST_LOCK_PID_FILE"] = str(project / "data" / ".sync-from-cloud.lock" / "pid")
     env["SYNC_TEST_LOCK_PUBLISH_CALLS"] = str(project / "lock-publish.log")
     return script, env, calls
 
@@ -1616,8 +1612,10 @@ class TestSyncFromCloudFlags:
 
         assert result.returncode == 0, result.stdout + result.stderr
         assert "stale lock" in result.stdout
-        assert calls_path.read_text(encoding="utf-8").splitlines()[0].startswith(
-            "research-sync --backup"
+        assert (
+            calls_path.read_text(encoding="utf-8")
+            .splitlines()[0]
+            .startswith("research-sync --backup")
         )
         assert not lock_dir.exists()
 
@@ -1667,9 +1665,9 @@ class TestSyncFromCloudFlags:
         ]
         assert len(lock_observations) == 1
         assert lock_observations[0].removeprefix("lock-pid:").isdigit()
-        publish_observations = Path(
-            env["SYNC_TEST_LOCK_PUBLISH_CALLS"]
-        ).read_text(encoding="utf-8").splitlines()
+        publish_observations = (
+            Path(env["SYNC_TEST_LOCK_PUBLISH_CALLS"]).read_text(encoding="utf-8").splitlines()
+        )
         assert publish_observations == [
             "destination-before:missing",
             f"source:{lock_observations[0].removeprefix('lock-pid:')}",
@@ -1875,9 +1873,7 @@ class TestMiddayBriefingParser:
         assert args.dry_run
 
     def test_midday_report_args(self) -> None:
-        args = build_parser().parse_args(
-            ["midday-report", "--date", "2026-07-06", "--dry-run"]
-        )
+        args = build_parser().parse_args(["midday-report", "--date", "2026-07-06", "--dry-run"])
         assert args.command == "midday-report"
         assert args.date == "2026-07-06"
         assert args.dry_run
@@ -1886,22 +1882,30 @@ class TestMiddayBriefingParser:
 class TestRtMinuteFetchParser:
     def test_rt_minute_fetch_defaults(self) -> None:
         parser = build_parser()
-        args = parser.parse_args([
-            "rt-minute-fetch",
-            "--ts-code", "605366.SH,301051.SZ",
-        ])
+        args = parser.parse_args(
+            [
+                "rt-minute-fetch",
+                "--ts-code",
+                "605366.SH,301051.SZ",
+            ]
+        )
         assert args.command == "rt-minute-fetch"
         assert args.ts_code == ["605366.SH,301051.SZ"]
         assert args.freq == "1min"
 
     def test_rt_minute_fetch_accepts_repeated_codes(self) -> None:
         parser = build_parser()
-        args = parser.parse_args([
-            "rt-minute-fetch",
-            "--ts-code", "605366.SH",
-            "--ts-code", "301051.SZ",
-            "--freq", "5min",
-        ])
+        args = parser.parse_args(
+            [
+                "rt-minute-fetch",
+                "--ts-code",
+                "605366.SH",
+                "--ts-code",
+                "301051.SZ",
+                "--freq",
+                "5min",
+            ]
+        )
         assert args.ts_code == ["605366.SH", "301051.SZ"]
         assert args.freq == "5min"
 
@@ -1909,22 +1913,30 @@ class TestRtMinuteFetchParser:
 class TestRtMinuteDailyFetchParser:
     def test_rt_minute_daily_fetch_defaults(self) -> None:
         parser = build_parser()
-        args = parser.parse_args([
-            "rt-minute-daily-fetch",
-            "--ts-code", "605366.SH,301051.SZ",
-        ])
+        args = parser.parse_args(
+            [
+                "rt-minute-daily-fetch",
+                "--ts-code",
+                "605366.SH,301051.SZ",
+            ]
+        )
         assert args.command == "rt-minute-daily-fetch"
         assert args.ts_code == ["605366.SH,301051.SZ"]
         assert args.freq == "1min"
 
     def test_rt_minute_daily_fetch_accepts_repeated_codes(self) -> None:
         parser = build_parser()
-        args = parser.parse_args([
-            "rt-minute-daily-fetch",
-            "--ts-code", "605366.SH",
-            "--ts-code", "301051.SZ",
-            "--freq", "5min",
-        ])
+        args = parser.parse_args(
+            [
+                "rt-minute-daily-fetch",
+                "--ts-code",
+                "605366.SH",
+                "--ts-code",
+                "301051.SZ",
+                "--freq",
+                "5min",
+            ]
+        )
         assert args.ts_code == ["605366.SH", "301051.SZ"]
         assert args.freq == "5min"
 
@@ -1932,11 +1944,15 @@ class TestRtMinuteDailyFetchParser:
 class TestGrowthBoardSurgeReplayParser:
     def test_growth_board_surge_replay_defaults(self) -> None:
         parser = build_parser()
-        args = parser.parse_args([
-            "growth-board-surge-replay",
-            "--start-date", "2026-06-25",
-            "--end-date", "2026-06-26",
-        ])
+        args = parser.parse_args(
+            [
+                "growth-board-surge-replay",
+                "--start-date",
+                "2026-06-25",
+                "--end-date",
+                "2026-06-26",
+            ]
+        )
         assert args.command == "growth-board-surge-replay"
         assert args.freq == "1min"
         assert args.min_signal_time == "09:30"
@@ -1955,25 +1971,40 @@ class TestGrowthBoardSurgeReplayParser:
 
     def test_growth_board_surge_replay_custom_args(self) -> None:
         parser = build_parser()
-        args = parser.parse_args([
-            "growth-board-surge-replay",
-            "--start-date", "2026-06-25",
-            "--end-date", "2026-06-26",
-            "--freq", "5min",
-            "--min-signal-time", "09:35",
-            "--lookback-days", "30",
-            "--min-hist-days", "15",
-            "--min-cum-amount-ratio", "1.8",
-            "--min-same-minute-amount-ratio", "3.0",
-            "--max-hold-days", "2",
-            "--require-inner-outer",
-            "--min-inner-outer-ratio", "1.2",
-            "--require-large-net-vol",
-            "--min-large-net-vol", "100",
-            "--factor-confirm",
-            "--factor-score-threshold", "50",
-            "--output", "/tmp/growth.csv",
-        ])
+        args = parser.parse_args(
+            [
+                "growth-board-surge-replay",
+                "--start-date",
+                "2026-06-25",
+                "--end-date",
+                "2026-06-26",
+                "--freq",
+                "5min",
+                "--min-signal-time",
+                "09:35",
+                "--lookback-days",
+                "30",
+                "--min-hist-days",
+                "15",
+                "--min-cum-amount-ratio",
+                "1.8",
+                "--min-same-minute-amount-ratio",
+                "3.0",
+                "--max-hold-days",
+                "2",
+                "--require-inner-outer",
+                "--min-inner-outer-ratio",
+                "1.2",
+                "--require-large-net-vol",
+                "--min-large-net-vol",
+                "100",
+                "--factor-confirm",
+                "--factor-score-threshold",
+                "50",
+                "--output",
+                "/tmp/growth.csv",
+            ]
+        )
         assert args.freq == "5min"
         assert args.min_signal_time == "09:35"
         assert args.lookback_days == 30
@@ -2012,15 +2043,22 @@ class TestMinuteBackfillParser:
 
     def test_minute_backfill_custom_args(self) -> None:
         parser = build_parser()
-        args = parser.parse_args([
-            "minute-backfill",
-            "--date", "2026-06-24",
-            "--lookback-days", "90",
-            "--freq", "5min",
-            "--preset", "n-shape-pool2",
-            "--ts-code", "600000.SH",
-            "--dry-run",
-        ])
+        args = parser.parse_args(
+            [
+                "minute-backfill",
+                "--date",
+                "2026-06-24",
+                "--lookback-days",
+                "90",
+                "--freq",
+                "5min",
+                "--preset",
+                "n-shape-pool2",
+                "--ts-code",
+                "600000.SH",
+                "--dry-run",
+            ]
+        )
         assert args.lookback_days == 90
         assert args.freq == "5min"
         assert args.preset == "n-shape-pool2"
@@ -2031,11 +2069,15 @@ class TestMinuteBackfillParser:
 class TestMinuteReplayParser:
     def test_minute_replay_defaults(self) -> None:
         parser = build_parser()
-        args = parser.parse_args([
-            "minute-replay",
-            "--start-date", "2026-06-01",
-            "--end-date", "2026-06-24",
-        ])
+        args = parser.parse_args(
+            [
+                "minute-replay",
+                "--start-date",
+                "2026-06-01",
+                "--end-date",
+                "2026-06-24",
+            ]
+        )
         assert args.command == "minute-replay"
         assert args.start_date == "2026-06-01"
         assert args.end_date == "2026-06-24"
@@ -2050,18 +2092,28 @@ class TestMinuteReplayParser:
 
     def test_minute_replay_custom_args(self) -> None:
         parser = build_parser()
-        args = parser.parse_args([
-            "minute-replay",
-            "--start-date", "2026-06-01",
-            "--end-date", "2026-06-24",
-            "--preset", "n-shape-pool2",
-            "--freq", "5min",
-            "--entry-mode", "amount_surge",
-            "--max-hold-days", "3",
-            "--volume-profile",
-            "--volume-profile-lookbacks", "90",
-            "--output", "/private/tmp/replay.csv",
-        ])
+        args = parser.parse_args(
+            [
+                "minute-replay",
+                "--start-date",
+                "2026-06-01",
+                "--end-date",
+                "2026-06-24",
+                "--preset",
+                "n-shape-pool2",
+                "--freq",
+                "5min",
+                "--entry-mode",
+                "amount_surge",
+                "--max-hold-days",
+                "3",
+                "--volume-profile",
+                "--volume-profile-lookbacks",
+                "90",
+                "--output",
+                "/private/tmp/replay.csv",
+            ]
+        )
         assert args.preset == "n-shape-pool2"
         assert args.freq == "5min"
         assert args.entry_mode == "amount_surge"
@@ -2072,13 +2124,19 @@ class TestMinuteReplayParser:
 
     def test_minute_replay_factor_confirm_args(self) -> None:
         parser = build_parser()
-        args = parser.parse_args([
-            "minute-replay",
-            "--start-date", "2026-06-01",
-            "--end-date", "2026-06-24",
-            "--entry-mode", "factor_confirm",
-            "--factor-score-threshold", "65",
-        ])
+        args = parser.parse_args(
+            [
+                "minute-replay",
+                "--start-date",
+                "2026-06-01",
+                "--end-date",
+                "2026-06-24",
+                "--entry-mode",
+                "factor_confirm",
+                "--factor-score-threshold",
+                "65",
+            ]
+        )
         assert args.entry_mode == "factor_confirm"
         assert args.factor_score_threshold == 65.0
 
@@ -2086,11 +2144,15 @@ class TestMinuteReplayParser:
 class TestMinuteReplayBackfillParser:
     def test_minute_replay_backfill_defaults(self) -> None:
         parser = build_parser()
-        args = parser.parse_args([
-            "minute-replay-backfill",
-            "--start-date", "2026-06-01",
-            "--end-date", "2026-06-24",
-        ])
+        args = parser.parse_args(
+            [
+                "minute-replay-backfill",
+                "--start-date",
+                "2026-06-01",
+                "--end-date",
+                "2026-06-24",
+            ]
+        )
         assert args.command == "minute-replay-backfill"
         assert args.start_date == "2026-06-01"
         assert args.end_date == "2026-06-24"
@@ -2102,16 +2164,24 @@ class TestMinuteReplayBackfillParser:
 
     def test_minute_replay_backfill_custom_args(self) -> None:
         parser = build_parser()
-        args = parser.parse_args([
-            "minute-replay-backfill",
-            "--start-date", "2026-06-01",
-            "--end-date", "2026-06-24",
-            "--preset", "n-shape-pool2",
-            "--freq", "5min",
-            "--max-hold-days", "3",
-            "--ts-code", "600000.SH",
-            "--dry-run",
-        ])
+        args = parser.parse_args(
+            [
+                "minute-replay-backfill",
+                "--start-date",
+                "2026-06-01",
+                "--end-date",
+                "2026-06-24",
+                "--preset",
+                "n-shape-pool2",
+                "--freq",
+                "5min",
+                "--max-hold-days",
+                "3",
+                "--ts-code",
+                "600000.SH",
+                "--dry-run",
+            ]
+        )
         assert args.preset == "n-shape-pool2"
         assert args.freq == "5min"
         assert args.max_hold_days == 3
@@ -2122,11 +2192,15 @@ class TestMinuteReplayBackfillParser:
 class TestAuctionBackfillParser:
     def test_auction_backfill_defaults(self) -> None:
         parser = build_parser()
-        args = parser.parse_args([
-            "auction-backfill",
-            "--start-date", "2025-01-01",
-            "--end-date", "2025-02-18",
-        ])
+        args = parser.parse_args(
+            [
+                "auction-backfill",
+                "--start-date",
+                "2025-01-01",
+                "--end-date",
+                "2025-02-18",
+            ]
+        )
         assert args.command == "auction-backfill"
         assert args.start_date == "2025-01-01"
         assert args.end_date == "2025-02-18"
@@ -2134,22 +2208,29 @@ class TestAuctionBackfillParser:
 
     def test_auction_backfill_dry_run(self) -> None:
         parser = build_parser()
-        args = parser.parse_args([
-            "auction-backfill",
-            "--start-date", "2025-01-01",
-            "--end-date", "2025-02-18",
-            "--dry-run",
-        ])
+        args = parser.parse_args(
+            [
+                "auction-backfill",
+                "--start-date",
+                "2025-01-01",
+                "--end-date",
+                "2025-02-18",
+                "--dry-run",
+            ]
+        )
         assert args.dry_run
 
 
 class TestAuctionMinuteFallbackParser:
     def test_auction_minute_fallback_defaults(self) -> None:
         parser = build_parser()
-        args = parser.parse_args([
-            "auction-minute-fallback",
-            "--date", "2026-06-26",
-        ])
+        args = parser.parse_args(
+            [
+                "auction-minute-fallback",
+                "--date",
+                "2026-06-26",
+            ]
+        )
         assert args.command == "auction-minute-fallback"
         assert args.date == "2026-06-26"
         assert not args.dry_run
@@ -2158,11 +2239,15 @@ class TestAuctionMinuteFallbackParser:
 class TestAuctionGapReplayParser:
     def test_auction_gap_replay_defaults(self) -> None:
         parser = build_parser()
-        args = parser.parse_args([
-            "auction-gap-replay",
-            "--start-date", "2025-01-16",
-            "--end-date", "2026-06-24",
-        ])
+        args = parser.parse_args(
+            [
+                "auction-gap-replay",
+                "--start-date",
+                "2025-01-16",
+                "--end-date",
+                "2026-06-24",
+            ]
+        )
         assert args.command == "auction-gap-replay"
         assert args.start_date == "2025-01-16"
         assert args.end_date == "2026-06-24"
@@ -2174,16 +2259,25 @@ class TestAuctionGapReplayParser:
 
     def test_auction_gap_replay_custom_args(self) -> None:
         parser = build_parser()
-        args = parser.parse_args([
-            "auction-gap-replay",
-            "--start-date", "2025-01-16",
-            "--end-date", "2026-06-24",
-            "--gap-mode", "strict_high",
-            "--st-filter", "literal_lower",
-            "--min-ratio", "0.2",
-            "--max-ratio", "2",
-            "--output", "/private/tmp/auction-gap.csv",
-        ])
+        args = parser.parse_args(
+            [
+                "auction-gap-replay",
+                "--start-date",
+                "2025-01-16",
+                "--end-date",
+                "2026-06-24",
+                "--gap-mode",
+                "strict_high",
+                "--st-filter",
+                "literal_lower",
+                "--min-ratio",
+                "0.2",
+                "--max-ratio",
+                "2",
+                "--output",
+                "/private/tmp/auction-gap.csv",
+            ]
+        )
         assert args.gap_mode == "strict_high"
         assert args.st_filter == "literal_lower"
         assert args.min_ratio == 0.2
@@ -2194,11 +2288,15 @@ class TestAuctionGapReplayParser:
 class TestAuctionGapMinuteReplayParser:
     def test_auction_gap_minute_replay_defaults(self) -> None:
         parser = build_parser()
-        args = parser.parse_args([
-            "auction-gap-minute-replay",
-            "--start-date", "2025-01-16",
-            "--end-date", "2026-06-24",
-        ])
+        args = parser.parse_args(
+            [
+                "auction-gap-minute-replay",
+                "--start-date",
+                "2025-01-16",
+                "--end-date",
+                "2026-06-24",
+            ]
+        )
         assert args.command == "auction-gap-minute-replay"
         assert args.start_date == "2025-01-16"
         assert args.end_date == "2026-06-24"
@@ -2214,20 +2312,33 @@ class TestAuctionGapMinuteReplayParser:
 
     def test_auction_gap_minute_replay_custom_args(self) -> None:
         parser = build_parser()
-        args = parser.parse_args([
-            "auction-gap-minute-replay",
-            "--start-date", "2025-01-16",
-            "--end-date", "2026-06-24",
-            "--gap-mode", "strict_high",
-            "--st-filter", "literal_lower",
-            "--min-ratio", "0.2",
-            "--max-ratio", "2",
-            "--max-hold-days", "2",
-            "--seal-hold-days", "3",
-            "--seal-hold-max-open-times", "1",
-            "--factor-score-threshold", "45",
-            "--output", "/private/tmp/auction-gap-minute.csv",
-        ])
+        args = parser.parse_args(
+            [
+                "auction-gap-minute-replay",
+                "--start-date",
+                "2025-01-16",
+                "--end-date",
+                "2026-06-24",
+                "--gap-mode",
+                "strict_high",
+                "--st-filter",
+                "literal_lower",
+                "--min-ratio",
+                "0.2",
+                "--max-ratio",
+                "2",
+                "--max-hold-days",
+                "2",
+                "--seal-hold-days",
+                "3",
+                "--seal-hold-max-open-times",
+                "1",
+                "--factor-score-threshold",
+                "45",
+                "--output",
+                "/private/tmp/auction-gap-minute.csv",
+            ]
+        )
         assert args.gap_mode == "strict_high"
         assert args.st_filter == "literal_lower"
         assert args.min_ratio == 0.2
@@ -2242,11 +2353,15 @@ class TestAuctionGapMinuteReplayParser:
 class TestAuctionGapMinuteBackfillParser:
     def test_auction_gap_minute_backfill_defaults(self) -> None:
         parser = build_parser()
-        args = parser.parse_args([
-            "auction-gap-minute-backfill",
-            "--start-date", "2025-01-16",
-            "--end-date", "2026-06-24",
-        ])
+        args = parser.parse_args(
+            [
+                "auction-gap-minute-backfill",
+                "--start-date",
+                "2025-01-16",
+                "--end-date",
+                "2026-06-24",
+            ]
+        )
         assert args.command == "auction-gap-minute-backfill"
         assert args.start_date == "2025-01-16"
         assert args.end_date == "2026-06-24"
@@ -2293,14 +2408,16 @@ class TestCmdAuctionGapReplay:
         rc = cmd_auction_gap_replay(args)
 
         assert rc == 0
-        assert calls == [{
-            "required_tables": [
-                "auction_bar",
-                "daily_bar",
-                "daily_state",
-                "stock_status_daily",
-            ]
-        }]
+        assert calls == [
+            {
+                "required_tables": [
+                    "auction_bar",
+                    "daily_bar",
+                    "daily_state",
+                    "stock_status_daily",
+                ]
+            }
+        ]
         replay_mock.assert_called_once()
         assert replay_mock.call_args.args[0] is store
 
@@ -2350,15 +2467,17 @@ class TestCmdAuctionGapMinuteReplay:
         rc = cmd_auction_gap_minute_replay(args)
 
         assert rc == 0
-        assert calls == [{
-            "required_tables": [
-                "auction_bar",
-                "daily_bar",
-                "daily_state",
-                "minute_bar",
-                "stock_status_daily",
-            ]
-        }]
+        assert calls == [
+            {
+                "required_tables": [
+                    "auction_bar",
+                    "daily_bar",
+                    "daily_state",
+                    "minute_bar",
+                    "stock_status_daily",
+                ]
+            }
+        ]
         candidate_mock.assert_called_once()
         replay_mock.assert_called_once()
 
@@ -2446,20 +2565,22 @@ class TestCmdRtMinuteFetch:
         from rquant.cli import cmd_rt_minute_fetch
 
         adapter = MagicMock()
-        adapter.rt_min.return_value = pd.DataFrame([
-            {
-                "ts_code": "605366.SH",
-                "trade_time": pd.Timestamp("2026-07-01 15:00:00"),
-                "freq": "1min",
-                "open": 12.85,
-                "high": 12.85,
-                "low": 12.85,
-                "close": 12.85,
-                "vol": 1110200.0,
-                "amount": 14266070.0,
-                "source": "tushare_rt",
-            }
-        ])
+        adapter.rt_min.return_value = pd.DataFrame(
+            [
+                {
+                    "ts_code": "605366.SH",
+                    "trade_time": pd.Timestamp("2026-07-01 15:00:00"),
+                    "freq": "1min",
+                    "open": 12.85,
+                    "high": 12.85,
+                    "low": 12.85,
+                    "close": 12.85,
+                    "vol": 1110200.0,
+                    "amount": 14266070.0,
+                    "source": "tushare_rt",
+                }
+            ]
+        )
         store = MagicMock()
         store.__enter__.return_value = store
         store.__exit__.return_value = None
@@ -2491,20 +2612,22 @@ class TestCmdRtMinuteDailyFetch:
         from rquant.cli import cmd_rt_minute_daily_fetch
 
         adapter = MagicMock()
-        adapter.rt_min_daily.return_value = pd.DataFrame([
-            {
-                "ts_code": "605366.SH",
-                "trade_time": pd.Timestamp("2026-07-01 09:30:00"),
-                "freq": "1min",
-                "open": 12.80,
-                "high": 12.80,
-                "low": 12.80,
-                "close": 12.80,
-                "vol": 777300.0,
-                "amount": 9949440.0,
-                "source": "tushare_rt_daily",
-            }
-        ])
+        adapter.rt_min_daily.return_value = pd.DataFrame(
+            [
+                {
+                    "ts_code": "605366.SH",
+                    "trade_time": pd.Timestamp("2026-07-01 09:30:00"),
+                    "freq": "1min",
+                    "open": 12.80,
+                    "high": 12.80,
+                    "low": 12.80,
+                    "close": 12.80,
+                    "vol": 777300.0,
+                    "amount": 9949440.0,
+                    "source": "tushare_rt_daily",
+                }
+            ]
+        )
         store = MagicMock()
         store.__enter__.return_value = store
         store.__exit__.return_value = None
@@ -2536,19 +2659,21 @@ class TestCmdMoneyflowBackfill:
         from rquant.cli import cmd_moneyflow_backfill
 
         adapter = MagicMock()
-        adapter.moneyflow.return_value = pd.DataFrame([
-            {
-                "ts_code": "300001.SZ",
-                "trade_date": pd.Timestamp("2026-06-26").date(),
-                "buy_lg_vol": 1200.0,
-                "sell_lg_vol": 700.0,
-                "buy_elg_vol": 500.0,
-                "sell_elg_vol": 100.0,
-                "large_net_vol": 900.0,
-                "large_net_amount": 1234.56,
-                "source": "tushare",
-            }
-        ])
+        adapter.moneyflow.return_value = pd.DataFrame(
+            [
+                {
+                    "ts_code": "300001.SZ",
+                    "trade_date": pd.Timestamp("2026-06-26").date(),
+                    "buy_lg_vol": 1200.0,
+                    "sell_lg_vol": 700.0,
+                    "buy_elg_vol": 500.0,
+                    "sell_elg_vol": 100.0,
+                    "large_net_vol": 900.0,
+                    "large_net_amount": 1234.56,
+                    "source": "tushare",
+                }
+            ]
+        )
         store = MagicMock()
         store.__enter__.return_value = store
         store.__exit__.return_value = None
@@ -2580,17 +2705,21 @@ class TestCmdGrowthBoardSurgeReplay:
         store = MagicMock()
         store.__enter__.return_value = store
         store.__exit__.return_value = None
-        trades = pd.DataFrame([{
-            "signal_date": "2026-06-25",
-            "ts_code": "300001.SZ",
-            "name": "创业样本",
-            "entry_time": "2026-06-25 09:34:00",
-            "entry_price": 10.8,
-            "exit_time": "2026-06-26 15:00:00",
-            "exit_price": 11.6,
-            "exit_reason": "time_1d",
-            "ret_pct": 7.4074,
-        }])
+        trades = pd.DataFrame(
+            [
+                {
+                    "signal_date": "2026-06-25",
+                    "ts_code": "300001.SZ",
+                    "name": "创业样本",
+                    "entry_time": "2026-06-25 09:34:00",
+                    "entry_price": 10.8,
+                    "exit_time": "2026-06-26 15:00:00",
+                    "exit_price": 11.6,
+                    "exit_reason": "time_1d",
+                    "ret_pct": 7.4074,
+                }
+            ]
+        )
 
         open_store = MagicMock(return_value=store)
         replay = MagicMock(return_value=trades)
@@ -2667,6 +2796,7 @@ class TestCmdNotifyTest:
         # Empty key_list -> should fail fast
         import rquant.config as cfg_mod
         from rquant.cli import cmd_notify_test
+
         monkeypatch.setattr(cfg_mod.settings, "pushdeer_keys", "")
 
         rc = cmd_notify_test(MagicMock())
@@ -2677,6 +2807,7 @@ class TestCmdNotifyTest:
 
         import rquant.config as cfg_mod
         from rquant.cli import cmd_notify_test
+
         monkeypatch.setattr(cfg_mod.settings, "pushdeer_keys", "k1,k2")
 
         with patch("rquant.notify.client.requests.post") as mock_post:
@@ -2686,13 +2817,12 @@ class TestCmdNotifyTest:
         assert rc == 0
         assert mock_post.call_count == 2  # 两个 key 都推
 
-    def test_partial_failure_returns_0_when_any_success(
-        self, monkeypatch
-    ) -> None:
+    def test_partial_failure_returns_0_when_any_success(self, monkeypatch) -> None:
         from unittest.mock import MagicMock, patch
 
         import rquant.config as cfg_mod
         from rquant.cli import cmd_notify_test
+
         monkeypatch.setattr(cfg_mod.settings, "pushdeer_keys", "k1,k2")
 
         responses = [
@@ -2708,6 +2838,7 @@ class TestCmdNotifyTest:
 
         import rquant.config as cfg_mod
         from rquant.cli import cmd_notify_test
+
         monkeypatch.setattr(cfg_mod.settings, "pushdeer_keys", "k1")
 
         with patch("rquant.notify.client.requests.post") as mock_post:

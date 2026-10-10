@@ -15,7 +15,7 @@ import tushare as ts
 from loguru import logger
 
 from rquant.config import settings
-from rquant.indicator_backfill import derive_daily_indicators
+from rquant.indicator_backfill import derive_target_daily_indicators
 from rquant.market_context import sync_market_sentiment
 from rquant.security_status import (
     DailySecurityKey,
@@ -53,6 +53,10 @@ class DailyIngestClient(Protocol):
     def adj_factor(self, **kwargs: object) -> pd.DataFrame: ...
 
     def daily_basic(self, **kwargs: object) -> pd.DataFrame: ...
+
+
+def _open_primary_indicator_reader() -> DuckDBStore:
+    return DuckDBStore(settings.duckdb_path, read_only=True)
 
 
 def _load_daily_state_inputs(
@@ -124,9 +128,7 @@ def _load_daily_state_inputs(
         "status_available_at",
         "status_conflict_reason",
     ]
-    status = joined.loc[
-        joined["status_ts_code"].notna(), status_source_columns
-    ].rename(
+    status = joined.loc[joined["status_ts_code"].notna(), status_source_columns].rename(
         columns={
             "status_ts_code": "ts_code",
             "status_trade_date": "trade_date",
@@ -237,12 +239,8 @@ def _load_target_daily_state_inputs(
         seed_count = row["seed_consecutive_limit_ups"]
         seeds[str(row["ts_code"])] = DailyStateSeed(
             trade_date=pd.Timestamp(seed_trade_date).date(),
-            is_limit_up=(
-                None if pd.isna(seed_is_limit_up) else bool(seed_is_limit_up)
-            ),
-            consecutive_limit_ups=(
-                None if pd.isna(seed_count) else int(seed_count)
-            ),
+            is_limit_up=(None if pd.isna(seed_is_limit_up) else bool(seed_is_limit_up)),
+            consecutive_limit_ups=(None if pd.isna(seed_count) else int(seed_count)),
         )
     return joined, seeds
 
@@ -294,11 +292,7 @@ def _derive_target_daily_states(
                 seed=seeds.get(ts_code),
             )
         )
-    return (
-        pd.concat(state_frames, ignore_index=True)
-        if state_frames
-        else pd.DataFrame()
-    )
+    return pd.concat(state_frames, ignore_index=True) if state_frames else pd.DataFrame()
 
 
 def ingest_daily(
@@ -307,6 +301,7 @@ def ingest_daily(
     pro: DailyIngestClient | None = None,
     status_adapter: SecurityStatusAdapter | None = None,
     suspension_adapter: SuspensionAdapter | None = None,
+    indicator_reader_factory: Callable[[], DuckDBStore] = _open_primary_indicator_reader,
     writer_factory: Callable[[], DuckDBStore] = DuckDBStore,
     ingested_at: datetime | None = None,
     api_sleep: float = _API_SLEEP,
@@ -319,9 +314,7 @@ def ingest_daily(
     返回 daily_bar 行数（0 表示非交易日或数据未就绪）。
     """
     if state_mode not in {"recompute_tail", "invalidate_tail"}:
-        raise ValueError(
-            "state_mode must be 'recompute_tail' or 'invalidate_tail'"
-        )
+        raise ValueError("state_mode must be 'recompute_tail' or 'invalidate_tail'")
     pro = pro or ts.pro_api(settings.tushare_token_main)
     ds = trade_date.replace("-", "")
     target_date = datetime.strptime(trade_date, "%Y-%m-%d").date()
@@ -342,9 +335,7 @@ def ingest_daily(
         logger.info(f"{trade_date} 无 daily_bar 数据（非交易日或未就绪）")
         return 0
     df_daily = df_daily.copy()
-    df_daily["trade_date"] = pd.to_datetime(
-        df_daily["trade_date"], format="%Y%m%d"
-    ).dt.date
+    df_daily["trade_date"] = pd.to_datetime(df_daily["trade_date"], format="%Y%m%d").dt.date
     df_daily = df_daily.loc[df_daily["trade_date"] == target_date].copy()
     if df_daily.empty:
         logger.warning(f"{trade_date} daily_bar 响应不含请求日期，未写库")
@@ -359,8 +350,7 @@ def ingest_daily(
     if suspension_adapter is None:
         if not hasattr(status_adapter, "suspend_d_raw"):
             raise TypeError(
-                "status_adapter must implement suspend_d_raw or "
-                "suspension_adapter must be provided"
+                "status_adapter must implement suspend_d_raw or suspension_adapter must be provided"
             )
         suspension_adapter = cast(SuspensionAdapter, status_adapter)
     status_keys = [
@@ -390,31 +380,21 @@ def ingest_daily(
                 end_date=ds,
             )
         except Exception as error:
-            logger.warning(
-                f"index_daily {index_code} {trade_date} 拉取失败: {error}"
-            )
+            logger.warning(f"index_daily {index_code} {trade_date} 拉取失败: {error}")
             continue
         if index_df is not None and not index_df.empty:
             index_frames.append(index_df)
         sleep(api_sleep)
-    df_index = (
-        pd.concat(index_frames, ignore_index=True)
-        if index_frames
-        else pd.DataFrame()
-    )
+    df_index = pd.concat(index_frames, ignore_index=True) if index_frames else pd.DataFrame()
     if not df_index.empty:
-        df_index["trade_date"] = pd.to_datetime(
-            df_index["trade_date"], format="%Y%m%d"
-        ).dt.date
+        df_index["trade_date"] = pd.to_datetime(df_index["trade_date"], format="%Y%m%d").dt.date
 
     logger.info(f"拉取 adj_factor {trade_date}...")
     try:
         df_factor = pro.adj_factor(trade_date=ds)
     except Exception as error:
         df_factor = None
-        logger.warning(
-            f"adj_factor {trade_date} 拉取失败，今日复权因子跳过: {error}"
-        )
+        logger.warning(f"adj_factor {trade_date} 拉取失败，今日复权因子跳过: {error}")
     if df_factor is not None and not df_factor.empty:
         factor_cols = ["ts_code", "trade_date", "adj_factor"]
         required_factor_cols = set(factor_cols)
@@ -442,8 +422,16 @@ def ingest_daily(
             df_basic_mkt["trade_date"], format="%Y%m%d"
         ).dt.date
 
+    codes = sorted(df_daily["ts_code"].astype(str).unique().tolist())
+    with indicator_reader_factory() as indicator_reader:
+        target_indicators = derive_target_daily_indicators(
+            indicator_reader,
+            target_date=target_date,
+            daily_rows=df_daily,
+            factor_rows=df_factor,
+        )
+
     with writer_factory() as writer:
-        codes = sorted(df_daily["ts_code"].astype(str).unique().tolist())
         transaction_open = False
         try:
             writer._conn.execute("BEGIN")
@@ -480,24 +468,13 @@ def ingest_daily(
                 writer.upsert_adj_factor(df_factor)
                 logger.info(f"adj_factor: {len(df_factor)} 行")
             else:
-                logger.warning(
-                    f"adj_factor {trade_date} 返回空，分钟复权将使用已有因子"
-                )
-            target_indicators = derive_daily_indicators(
-                writer,
-                start_date=target_date,
-                end_date=target_date,
-                ts_codes=codes,
-            )
+                logger.warning(f"adj_factor {trade_date} 返回空，分钟复权将使用已有因子")
             writer._conn.execute(
-                "DELETE FROM daily_indicator "
-                "WHERE trade_date >= ? AND ts_code = ANY(?)",
+                "DELETE FROM daily_indicator WHERE trade_date >= ? AND ts_code = ANY(?)",
                 [target_date, codes],
             )
             indicator_rows = writer.upsert_indicators(target_indicators)
-            logger.info(
-                f"daily_indicator: {indicator_rows} 行, {len(codes)} 只"
-            )
+            logger.info(f"daily_indicator: {indicator_rows} 行, {len(codes)} 只")
             if df_basic_mkt is not None and not df_basic_mkt.empty:
                 writer.upsert_daily_basic(df_basic_mkt)
                 logger.info(f"daily_basic: {len(df_basic_mkt)} 行")
@@ -508,8 +485,7 @@ def ingest_daily(
                 )
 
             writer._conn.execute(
-                "DELETE FROM daily_state "
-                "WHERE trade_date >= ? AND ts_code = ANY(?)",
+                "DELETE FROM daily_state WHERE trade_date >= ? AND ts_code = ANY(?)",
                 [target_date, codes],
             )
             if state_mode == "recompute_tail":
@@ -524,9 +500,7 @@ def ingest_daily(
                 sentiment_rows = sync_market_sentiment(writer, trade_date)
                 logger.info(f"market_sentiment_daily: {sentiment_rows} 行")
             else:
-                logger.info(
-                    f"state tail 已失效: {target_date}, {len(codes)} 只"
-                )
+                logger.info(f"state tail 已失效: {target_date}, {len(codes)} 只")
             writer._conn.execute("COMMIT")
             transaction_open = False
         except BaseException as error:
