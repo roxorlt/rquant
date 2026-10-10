@@ -222,3 +222,21 @@ export function useSaveAlertRule() {
     onSuccess: () => client.invalidateQueries({ queryKey: ["alert-rules"] }),
   });
 }
+
+export function useConditions(): ServingQueryResult<Schemas["ConditionListData"]> {
+  return useServingQuery(["conditions"], async () => {
+    const { data, response } = await apiClient().GET("/api/v1/conditions");
+    return unwrap(data, response);
+  });
+}
+
+export function useTranslateTdx() {
+  return useMutation({
+    mutationFn: async (tdx: string) => {
+      const { data, response } = await apiClient().POST("/api/v1/formula/translate", {
+        body: { tdx },
+      });
+      return unwrap(data, response);
+    },
+  });
+}

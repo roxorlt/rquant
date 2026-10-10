@@ -149,6 +149,10 @@ def track_all(database: Path, end: date, root: Path | None = None) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = list(argv if argv is not None else __import__("sys").argv[1:])
+    if args[:1] == ["screen"]:
+        from rquant.factor.condition import main as screen_main
+
+        return screen_main(args[1:])
     if args[:1] == ["track"]:
         p = argparse.ArgumentParser(prog="python -m rquant.factor track")
         p.add_argument("--db", type=Path,

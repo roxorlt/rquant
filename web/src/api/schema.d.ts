@@ -90,6 +90,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/conditions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 条件选股结果 */
+        get: operations["conditions_api_v1_conditions_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/data-center": {
         parameters: {
             query?: never;
@@ -135,6 +152,23 @@ export interface paths {
         get: operations["factor_detail_api_v1_factors__factor_id__get"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/formula/translate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 通达信公式翻译（只校验，不执行） */
+        post: operations["translate_formula_api_v1_formula_translate_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -670,6 +704,42 @@ export interface components {
             /** Status */
             status: string;
         };
+        /** ConditionHit */
+        ConditionHit: {
+            /** Close */
+            close: number | null;
+            /** Code */
+            code: string;
+            /** Pct Chg */
+            pct_chg: number | null;
+        };
+        /** ConditionListData */
+        ConditionListData: {
+            /** Runs */
+            runs: components["schemas"]["ConditionRun"][];
+        };
+        /** ConditionRun */
+        ConditionRun: {
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /** Expression */
+            expression: string;
+            /** Hits */
+            hits: components["schemas"]["ConditionHit"][];
+            /** Name */
+            name: string;
+            /** Run Id */
+            run_id: string;
+            /** Source Formula */
+            source_formula: string | null;
+            /** Trade Date */
+            trade_date: string | null;
+            /** Universe */
+            universe: number;
+        };
         /** DataCenterData */
         DataCenterData: {
             audit: components["schemas"]["AuditReport"] | null;
@@ -718,6 +788,11 @@ export interface components {
         /** Envelope[BacktestListData] */
         Envelope_BacktestListData_: {
             data: components["schemas"]["BacktestListData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[ConditionListData] */
+        Envelope_ConditionListData_: {
+            data: components["schemas"]["ConditionListData"];
             serving: components["schemas"]["ServingMeta"];
         };
         /** Envelope[DataCenterData] */
@@ -1322,6 +1397,18 @@ export interface components {
             /** Rolling */
             rolling: number | null;
         };
+        /** TranslateData */
+        TranslateData: {
+            /** Error */
+            error: string | null;
+            /** Expression */
+            expression: string | null;
+        };
+        /** TranslateRequest */
+        TranslateRequest: {
+            /** Tdx */
+            tdx: string;
+        };
         /** ValidationError */
         ValidationError: {
             /** Context */
@@ -1515,6 +1602,26 @@ export interface operations {
             };
         };
     };
+    conditions_api_v1_conditions_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_ConditionListData_"];
+                };
+            };
+        };
+    };
     data_center_api_v1_data_center_get: {
         parameters: {
             query?: never;
@@ -1573,6 +1680,39 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_FactorDetailData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    translate_formula_api_v1_formula_translate_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TranslateRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TranslateData"];
                 };
             };
             /** @description Validation Error */

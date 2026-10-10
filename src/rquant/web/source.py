@@ -254,3 +254,11 @@ def write_demo_research(root: Path) -> None:
     from rquant.factor.store import save_tracking, track
 
     save_tracking(track(demo, panel, today, lookback_days=60), root)
+
+    from rquant.factor.condition import save as save_condition
+    from rquant.factor.condition import screen
+    from rquant.factor.tdx import translate
+
+    tdx = "C>MA(C,5) AND C>REF(C,1)"
+    save_condition("演示条件：站上5日线且上涨", translate(tdx), tdx,
+                   screen(panel, translate(tdx)), root=root)
