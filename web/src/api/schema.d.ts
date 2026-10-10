@@ -346,6 +346,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/portfolio-backtests/{run_id}/explain": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** AI 解读回测（数字逐个核对） */
+        post: operations["portfolio_explain_api_v1_portfolio_backtests__run_id__explain_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/screen": {
         parameters: {
             query?: never;
@@ -906,6 +923,19 @@ export interface components {
         Envelope_StrategyListData_: {
             data: components["schemas"]["StrategyListData"];
             serving: components["schemas"]["ServingMeta"];
+        };
+        /** Explanation */
+        Explanation: {
+            /** Facts */
+            facts: {
+                [key: string]: string;
+            };
+            /** Model */
+            model: string;
+            /** Text */
+            text: string;
+            /** Unverified */
+            unverified: string[];
         };
         /** FactorDetailData */
         FactorDetailData: {
@@ -2027,6 +2057,37 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_BandData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    portfolio_explain_api_v1_portfolio_backtests__run_id__explain_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                run_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Explanation"];
                 };
             };
             /** @description Validation Error */

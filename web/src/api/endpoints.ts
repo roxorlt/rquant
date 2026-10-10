@@ -257,3 +257,15 @@ export function usePortfolioBand(
     { enabled: runId !== null && days > 0 },
   );
 }
+
+export function useExplainBacktest() {
+  return useMutation({
+    mutationFn: async (runId: string) => {
+      const { data, response } = await apiClient().POST(
+        "/api/v1/portfolio-backtests/{run_id}/explain",
+        { params: { path: { run_id: runId } } },
+      );
+      return unwrap(data, response);
+    },
+  });
+}

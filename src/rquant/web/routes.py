@@ -24,6 +24,7 @@ from rquant.factor.store import list_factors, read_factor, read_tracking
 from rquant.factor.tdx import TdxFormulaError
 from rquant.factor.tdx import translate as translate_tdx
 from rquant.web import page_control
+from rquant.web.ai_explain import Explanation, build_facts, deepseek_complete, explain
 from rquant.web.backtest_perf import backtest_perf, perf_from_returns
 from rquant.web.models import (
     AckAlertRequest,
@@ -348,6 +349,21 @@ def portfolio_band(run_id: str, request: Request, source: SourceDep,
         raise HTTPException(404, "portfolio backtest not found")
     return _envelope(source, BandData(run_id=run_id, days=days,
                                       points=bootstrap_band(_nav_returns(run), days)))
+
+
+@router.post("/portfolio-backtests/{run_id}/explain", response_model=Explanation,
+             summary="AI 解读回测（数字逐个核对）")
+def portfolio_explain(run_id: str, request: Request, source: SourceDep) -> Explanation:
+    detail = portfolio_backtest(run_id, request, source).data
+    llm = getattr(request.app.state, "llm", None) or deepseek_complete()
+    if llm is None:
+        raise HTTPException(503, "AI 未配置（DEEPSEEK_API_KEY）")
+    complete, model = llm
+    facts = build_facts(detail.run, detail.perf, detail.overfit)
+    try:
+        return explain(facts, complete, model)
+    except Exception as exc:  # noqa: BLE001 - upstream model/network failure
+        raise HTTPException(502, f"AI 调用失败：{type(exc).__name__}") from exc
 
 
 @router.get("/portfolio-backtests/{run_id}", response_model=Envelope[PortfolioRunDetailData],

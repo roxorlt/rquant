@@ -1,5 +1,6 @@
 import { useState } from "react";
 import {
+  useExplainBacktest,
   usePortfolioBacktest,
   usePortfolioBacktests,
   usePortfolioCompare,
@@ -58,6 +59,37 @@ function Compare({ a, b }: { a: string; b: string }) {
   );
 }
 
+function Explain({ runId }: { runId: string }) {
+  const explain = useExplainBacktest();
+  const result = explain.data;
+  return (
+    <Panel
+      title="AI 解读"
+      sub="只用上面的指标；回答里的每个数字都会和指标核对"
+      actions={
+        <Button size="sm" variant="ghost" onClick={() => explain.mutate(runId)}>
+          {explain.isPending ? "解读中…" : "生成解读"}
+        </Button>
+      }
+    >
+      {explain.error ? <p className="sub">{`解读失败：${explain.error.message}`}</p> : null}
+      {result ? (
+        <>
+          {result.unverified.length ? (
+            <Pill kind="warn">{`有 ${result.unverified.length} 个数字无法核对：${result.unverified.join("、")}`}</Pill>
+          ) : (
+            <Pill kind="ok">数字已全部核对</Pill>
+          )}
+          <p aria-live="polite" style={{ whiteSpace: "pre-wrap" }}>
+            {result.text}
+          </p>
+          <span className="sub">{`模型：${result.model}`}</span>
+        </>
+      ) : null}
+    </Panel>
+  );
+}
+
 function Detail({ runId, onCompare }: { runId: string; onCompare: () => void }) {
   const query = usePortfolioBacktest(runId);
   return (
@@ -90,6 +122,7 @@ function Detail({ runId, onCompare }: { runId: string; onCompare: () => void }) 
               ]}
             />
           </Panel>
+          <Explain runId={runId} />
           {data.exposure.length ? (
             <Panel title="行业暴露" sub="期末权重 vs 最后一次候选池等权" flush>
               <table className="tbl" aria-label="行业暴露">
