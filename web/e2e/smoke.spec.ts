@@ -34,6 +34,7 @@ test("a backtest run shows its performance block", async ({ page }) => {
 
 test("a portfolio backtest shows orders and performance", async ({ page }) => {
   await page.goto("./#/backtest");
+  await expect(page.getByText("demo-breakout@1（共 1 版）")).toBeVisible();
   await page.getByText("演示组合回测").click();
   await expect(page.getByLabel("组合回测委托")).toBeVisible();
   await expect(page.getByText("组合回测逐日净值")).toBeVisible();

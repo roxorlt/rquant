@@ -204,9 +204,13 @@ def write_demo_research(root: Path) -> None:
     }
     signals = {days[0]: [PortfolioCandidate(ts_code="600519.SH"),
                          PortfolioCandidate(ts_code="000001.SZ")]}
+    from rquant.backtest.strategy import StrategySpec, save_version
+
     config = BacktestConfig(weights=PortfolioWeightRule(max_positions=2))
+    version = save_version(StrategySpec(slug="demo-breakout", title="演示突破策略",
+                                        preset="breakout", config=config), root)
     save(run_backtest(days, bars, signals, config), preset="breakout", start=days[0],
-         end=days[-1], root=root, title="演示组合回测",
+         end=days[-1], root=root, title="演示组合回测", strategy=f"demo-breakout@{version.version}",
          industries={"600519.SH": "白酒", "000001.SZ": "银行"},
          pool_last=["600519.SH", "000001.SZ"])
     from rquant.data_catalog.audit import AuditReport, DatasetCoverage, write_report

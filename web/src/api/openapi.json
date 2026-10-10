@@ -1365,6 +1365,22 @@
         "title": "Envelope[ScreenData]",
         "type": "object"
       },
+      "Envelope_StrategyListData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/StrategyListData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[StrategyListData]",
+        "type": "object"
+      },
       "FactorDetailData": {
         "properties": {
           "factor": {
@@ -2563,6 +2579,17 @@
             "title": "Start",
             "type": "string"
           },
+          "strategy": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Strategy"
+          },
           "title": {
             "title": "Title",
             "type": "string"
@@ -2893,6 +2920,81 @@
           "action"
         ],
         "title": "SignalItem",
+        "type": "object"
+      },
+      "StrategyListData": {
+        "properties": {
+          "strategies": {
+            "items": {
+              "$ref": "#/components/schemas/StrategyRow"
+            },
+            "title": "Strategies",
+            "type": "array"
+          }
+        },
+        "required": [
+          "strategies"
+        ],
+        "title": "StrategyListData",
+        "type": "object"
+      },
+      "StrategyRow": {
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "max_positions": {
+            "title": "Max Positions",
+            "type": "integer"
+          },
+          "method": {
+            "title": "Method",
+            "type": "string"
+          },
+          "note": {
+            "title": "Note",
+            "type": "string"
+          },
+          "preset": {
+            "title": "Preset",
+            "type": "string"
+          },
+          "rebalance_every": {
+            "title": "Rebalance Every",
+            "type": "integer"
+          },
+          "slug": {
+            "title": "Slug",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          },
+          "version": {
+            "title": "Version",
+            "type": "integer"
+          },
+          "versions": {
+            "title": "Versions",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "slug",
+          "title",
+          "version",
+          "versions",
+          "preset",
+          "max_positions",
+          "method",
+          "rebalance_every",
+          "created_at",
+          "note"
+        ],
+        "title": "StrategyRow",
         "type": "object"
       },
       "TrackingPoint": {
@@ -3540,6 +3642,24 @@
           }
         },
         "summary": "选股结果与排序"
+      }
+    },
+    "/api/v1/strategies": {
+      "get": {
+        "operationId": "strategies_api_v1_strategies_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_StrategyListData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "策略与版本"
       }
     },
     "/api/v1/watchlist": {

@@ -15,6 +15,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 
 from rquant.backtest.exposure import industry_exposure
 from rquant.backtest.store import list_runs, read_run
+from rquant.backtest.strategy import list_strategies
 from rquant.data_catalog.audit import read_report
 from rquant.data_catalog.models import CatalogDocument
 from rquant.factor.store import list_factors, read_factor, read_tracking
@@ -61,6 +62,8 @@ from rquant.web.models import (
     ServiceItem,
     ServingMeta,
     SignalItem,
+    StrategyListData,
+    StrategyRow,
 )
 from rquant.web.overfit_stats import overfit_stats, sharpe_per_period
 from rquant.web.source import Source, table_missing
@@ -275,7 +278,24 @@ def _portfolio_summary(run: Any) -> PortfolioRunSummary:
         final_nav=run.result.days[-1].nav if run.result.days else None,
         filled=sum(o.status == "filled" for o in orders),
         rejected=sum(o.status == "rejected" for o in orders),
+        strategy=run.strategy,
     )
+
+
+@router.get("/strategies", response_model=Envelope[StrategyListData], summary="策略与版本")
+def strategies(request: Request, source: SourceDep) -> Envelope[StrategyListData]:
+    rows = []
+    for slug, items in list_strategies(_research_root(request)).items():
+        if not items:
+            continue
+        latest = items[-1]
+        spec = latest.spec
+        rows.append(StrategyRow(
+            slug=slug, title=spec.title, version=latest.version, versions=len(items),
+            preset=spec.preset, max_positions=spec.config.weights.max_positions,
+            method=spec.config.weights.method, rebalance_every=spec.config.rebalance_every,
+            created_at=latest.created_at, note=spec.note))
+    return _envelope(source, StrategyListData(strategies=rows))
 
 
 @router.get("/portfolio-backtests", response_model=Envelope[PortfolioRunListData],

@@ -35,3 +35,16 @@ def test_run_from_replica_and_read_back(tmp_path: Path) -> None:
     assert [r.run_id for r in list_runs(tmp_path)] == [run.run_id]
     assert read_run(run.run_id, tmp_path) == run
     assert read_run("../x", tmp_path) is None
+
+
+def test_cli_runs_a_saved_strategy_version(tmp_path, monkeypatch) -> None:
+    from rquant.backtest.store import _main
+
+    test_run_from_replica_and_read_back(tmp_path)  # builds ro.duckdb
+    monkeypatch.setenv("RQUANT_RESEARCH_ROOT", str(tmp_path / "r"))
+    assert _main(["strategy", "save", "--slug", "s1", "--title", "T", "--preset", "p",
+                  "--max-positions", "3"]) == 0
+    assert _main(["--db", str(tmp_path / "ro.duckdb"), "--strategy", "s1",
+                  "--start", "2026-01-05", "--end", "2026-01-07"]) == 0
+    (run,) = list_runs(tmp_path / "r")
+    assert run.strategy == "s1@1" and run.result.config.weights.max_positions == 3

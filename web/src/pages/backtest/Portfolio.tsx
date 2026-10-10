@@ -1,5 +1,10 @@
 import { useState } from "react";
-import { usePortfolioBacktest, usePortfolioBacktests, usePortfolioCompare } from "@/api/endpoints";
+import {
+  usePortfolioBacktest,
+  usePortfolioBacktests,
+  usePortfolioCompare,
+  useStrategies,
+} from "@/api/endpoints";
 import type { components } from "@/api/schema";
 import { formatPrice } from "@/format/number";
 import { DataTable } from "@/table/DataTable";
@@ -175,6 +180,7 @@ export function PortfolioRuns() {
               emptyText="还没有组合回测结果"
               columns={[
                 { id: "title", header: "名称", value: (row) => row.title },
+                { id: "strategy", header: "策略版本", value: (row) => row.strategy ?? "—" },
                 {
                   id: "range",
                   header: "区间",
@@ -207,6 +213,51 @@ export function PortfolioRuns() {
             <Panel title="对比">再选一条回测，点「加入对比」</Panel>
           ) : null}
         </>
+      )}
+    </QueryView>
+  );
+}
+
+export function StrategyList() {
+  const query = useStrategies();
+  return (
+    <QueryView query={query}>
+      {(data) => (
+        <Panel
+          title="策略版本"
+          sub="python -m rquant.backtest strategy save 保存；--strategy slug@N 复现"
+          flush
+        >
+          <DataTable
+            label="策略版本"
+            rows={data.strategies}
+            rowKey={(row) => row.slug}
+            emptyText="还没有保存的策略"
+            columns={[
+              { id: "title", header: "策略", value: (row) => row.title },
+              {
+                id: "ver",
+                header: "当前版本",
+                value: (row) => row.version,
+                cell: (row) => `${row.slug}@${row.version}（共 ${row.versions} 版）`,
+              },
+              { id: "preset", header: "入场池", value: (row) => row.preset },
+              { id: "n", header: "持股数", numeric: true, value: (row) => row.max_positions },
+              {
+                id: "method",
+                header: "权重",
+                value: (row) => row.method,
+                cell: (row) => (row.method === "equal" ? "等权" : "按分"),
+              },
+              {
+                id: "every",
+                header: "调仓间隔",
+                numeric: true,
+                value: (row) => row.rebalance_every,
+              },
+            ]}
+          />
+        </Panel>
       )}
     </QueryView>
   );

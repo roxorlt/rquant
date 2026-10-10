@@ -197,3 +197,10 @@ export function useFactor(id: string | null): ServingQueryResult<Schemas["Factor
     { enabled: id !== null },
   );
 }
+
+export function useStrategies(): ServingQueryResult<Schemas["StrategyListData"]> {
+  return useServingQuery(["strategies"], async () => {
+    const { data, response } = await apiClient().GET("/api/v1/strategies");
+    return unwrap(data, response);
+  });
+}
