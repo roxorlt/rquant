@@ -1,6 +1,7 @@
 import { type FormEvent, useState } from "react";
 import type { Schemas } from "@/api/client";
 import { useAlertRules, useSaveAlertRule } from "@/api/endpoints";
+import { useReadOnlyReason } from "@/api/useMeta";
 import { DataTable } from "@/table/DataTable";
 import { Button, Panel, Pill, useToast } from "@/ui";
 import { QueryView } from "../shared";
@@ -13,6 +14,7 @@ export function AlertRules() {
   const query = useAlertRules();
   const save = useSaveAlertRule();
   const toast = useToast();
+  const readOnly = useReadOnlyReason();
   const [draft, setDraft] = useState<Rule>({
     rule_id: "",
     title: "",
@@ -73,6 +75,7 @@ export function AlertRules() {
                     size="sm"
                     variant="ghost"
                     onClick={() => submit({ ...row, enabled: !row.enabled })}
+                    disabledReason={readOnly}
                   >
                     {row.enabled ? <Pill kind="ok">启用</Pill> : <Pill kind="warn">停用</Pill>}
                   </Button>
@@ -132,7 +135,12 @@ export function AlertRules() {
               value={draft.cooldown_minutes ?? 0}
               onChange={(e) => setDraft({ ...draft, cooldown_minutes: Number(e.target.value) })}
             />
-            <Button type="submit" size="sm" disabled={!draft.rule_id || !draft.title}>
+            <Button
+              type="submit"
+              size="sm"
+              disabled={!draft.rule_id || !draft.title}
+              disabledReason={readOnly}
+            >
               保存规则
             </Button>
           </form>

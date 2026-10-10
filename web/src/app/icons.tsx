@@ -41,6 +41,7 @@ const NAV_ICONS: Record<IconName, ReactNode> = {
     </>
   ),
   health: <path d="M3 12h4l2.5-6.5 5 13 2.5-6.5h4" />,
+  ops: <path d="M9 4h6M9 4a1 1 0 0 0-1 1v1h8V5a1 1 0 0 0-1-1M8 6H6v14h12V6h-2M9 11h6M9 15h4" />,
   factor: <path d="M4 20V10M10 20V4M16 20v-7M22 20H2" />,
   data: (
     <path d="M4 6c0-1.7 3.6-3 8-3s8 1.3 8 3v12c0 1.7-3.6 3-8 3s-8-1.3-8-3zM4 6c0 1.7 3.6 3 8 3s8-1.3 8-3M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3" />

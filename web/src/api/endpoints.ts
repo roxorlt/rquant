@@ -269,3 +269,10 @@ export function useExplainBacktest() {
     },
   });
 }
+
+export function useOperations(): ServingQueryResult<Schemas["OperationsData"]> {
+  return useServingQuery(["operations"], async () => {
+    const { data, response } = await apiClient().GET("/api/v1/operations");
+    return unwrap(data, response);
+  });
+}

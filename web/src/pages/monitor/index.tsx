@@ -1,4 +1,5 @@
 import { type AlertItem, useAckAlert, useAlerts } from "@/api/endpoints";
+import { useReadOnlyReason } from "@/api/useMeta";
 import { formatPrice } from "@/format/number";
 import { formatShanghaiDateTime } from "@/format/time";
 import { DataTable } from "@/table/DataTable";
@@ -10,6 +11,7 @@ export default function MonitorPage() {
   const query = useAlerts();
   const ack = useAckAlert();
   const toast = useToast();
+  const readOnly = useReadOnlyReason();
   // Ack state comes back from Serving (alert_ack projection); after a successful
   // submit the alerts query is refetched, and the row flips once the new generation lands.
   const acknowledge = (row: AlertItem) =>
@@ -63,7 +65,8 @@ export default function MonitorPage() {
                         variant="ghost"
                         onClick={() => acknowledge(row)}
                         disabledReason={
-                          ack.isPending && ack.variables === row.alert_id ? "提交中" : undefined
+                          readOnly ??
+                          (ack.isPending && ack.variables === row.alert_id ? "提交中" : undefined)
                         }
                       >
                         确认

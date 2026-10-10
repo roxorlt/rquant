@@ -1597,6 +1597,22 @@
         "title": "Envelope[MetaData]",
         "type": "object"
       },
+      "Envelope_OperationsData_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/OperationsData"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[OperationsData]",
+        "type": "object"
+      },
       "Envelope_OverviewData_": {
         "properties": {
           "data": {
@@ -2366,6 +2382,26 @@
             ],
             "title": "Notice"
           },
+          "role": {
+            "default": "admin",
+            "enum": [
+              "admin",
+              "viewer"
+            ],
+            "title": "Role",
+            "type": "string"
+          },
+          "user": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "User"
+          },
           "version": {
             "title": "Version",
             "type": "string"
@@ -2434,6 +2470,75 @@
           "drawdown"
         ],
         "title": "NavPoint",
+        "type": "object"
+      },
+      "OperationRow": {
+        "properties": {
+          "actor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actor"
+          },
+          "at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "At"
+          },
+          "command_id": {
+            "title": "Command Id",
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "ack_alert",
+              "add_watchlist_item",
+              "save_alert_rule"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "summary": {
+            "title": "Summary",
+            "type": "string"
+          }
+        },
+        "required": [
+          "at",
+          "kind",
+          "summary",
+          "actor",
+          "command_id"
+        ],
+        "title": "OperationRow",
+        "type": "object"
+      },
+      "OperationsData": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/OperationRow"
+            },
+            "title": "Items",
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "OperationsData",
         "type": "object"
       },
       "OverfitStats": {
@@ -3897,6 +4002,25 @@
           }
         },
         "summary": "Meta"
+      }
+    },
+    "/api/v1/operations": {
+      "get": {
+        "description": "Web writes as page control recorded them (read back from their Serving projections).",
+        "operationId": "operations_api_v1_operations_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_OperationsData_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "操作记录"
       }
     },
     "/api/v1/overview": {
