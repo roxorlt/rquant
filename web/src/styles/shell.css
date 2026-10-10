@@ -525,3 +525,9 @@
     font-size: 20px;
   }
 }
+.tb-date {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--ink-2);
+  white-space: nowrap;
+}

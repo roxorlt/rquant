@@ -22,7 +22,7 @@ export default function MonitorPage() {
 
   return (
     <>
-      <PageHeader eyebrow="跟踪与告警" title="告警时间线" />
+      <PageHeader eyebrow="跟踪与告警" title="盯盘与告警" />
       <QueryView query={query}>
         {(data) => (
           <Panel title={`${data.items.length} 条`} flush>
