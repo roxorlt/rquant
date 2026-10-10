@@ -82,9 +82,17 @@ class FreshnessItem(BaseModel):
     value: str | None
 
 
+class HealthLayer(BaseModel):
+    key: str
+    title: str
+    state: Literal["ok", "warn", "crit", "unknown"]
+    detail: list[str]
+
+
 class HealthData(BaseModel):
     services: list[ServiceItem]
     freshness: list[FreshnessItem]
+    layers: list[HealthLayer] = []
 
 
 class BoardItem(BaseModel):

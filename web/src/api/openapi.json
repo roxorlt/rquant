@@ -2172,6 +2172,14 @@
             "title": "Freshness",
             "type": "array"
           },
+          "layers": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/HealthLayer"
+            },
+            "title": "Layers",
+            "type": "array"
+          },
           "services": {
             "items": {
               "$ref": "#/components/schemas/ServiceItem"
@@ -2185,6 +2193,43 @@
           "freshness"
         ],
         "title": "HealthData",
+        "type": "object"
+      },
+      "HealthLayer": {
+        "properties": {
+          "detail": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Detail",
+            "type": "array"
+          },
+          "key": {
+            "title": "Key",
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "ok",
+              "warn",
+              "crit",
+              "unknown"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "title",
+          "state",
+          "detail"
+        ],
+        "title": "HealthLayer",
         "type": "object"
       },
       "HoldingItem": {

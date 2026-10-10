@@ -87,3 +87,9 @@ test("paper page compares against a backtest band", async ({ page }) => {
   await page.getByLabel("模拟起始日").fill(start);
   await expect(page.getByRole("table", { name: "区间对照" })).toBeVisible();
 });
+
+test("health page shows the six layers", async ({ page }) => {
+  await page.goto("./#/health");
+  const layers = page.getByRole("list", { name: "分层健康" });
+  await expect(layers.getByRole("listitem")).toHaveCount(6);
+});
