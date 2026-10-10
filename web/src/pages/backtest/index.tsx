@@ -6,6 +6,7 @@ import { DataTable } from "@/table/DataTable";
 import { ChangeText, PageHeader, Panel } from "@/ui";
 import { QueryView } from "../shared";
 import { PerfPanel } from "./Perf";
+import { PortfolioRuns } from "./Portfolio";
 
 function Trades({ runId }: { runId: string }) {
   const query = useBacktestDetail(runId);
@@ -102,6 +103,7 @@ export default function BacktestPage() {
         )}
       </QueryView>
       {runId ? <Trades runId={runId} /> : null}
+      <PortfolioRuns />
     </>
   );
 }

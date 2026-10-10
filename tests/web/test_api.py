@@ -125,3 +125,19 @@ def test_meta_carries_deploy_notice(monkeypatch) -> None:
     monkeypatch.setenv("RQUANT_WEB_NOTICE", "回放数据 2026-09-25")
     body = TestClient(create_app(FixtureSource(), dist=None)).get("/api/v1/meta").json()
     assert body["data"]["notice"] == "回放数据 2026-09-25"
+
+
+def test_portfolio_backtests_are_read_from_result_files(tmp_path) -> None:
+    from fastapi.testclient import TestClient
+
+    from rquant.web.app import create_app
+    from rquant.web.source import FixtureSource, write_demo_research
+
+    write_demo_research(tmp_path)
+    client = TestClient(create_app(FixtureSource(), dist=None, research_root=tmp_path))
+    runs = client.get("/api/v1/portfolio-backtests").json()["data"]["runs"]
+    assert [r["title"] for r in runs] == ["演示组合回测"]
+    detail = client.get(f"/api/v1/portfolio-backtests/{runs[0]['run_id']}").json()["data"]
+    assert detail["perf"]["days"] == 4
+    assert {o["code"] for o in detail["orders"]} == {"600519.SH", "000001.SZ"}
+    assert client.get("/api/v1/portfolio-backtests/nope").status_code == 404

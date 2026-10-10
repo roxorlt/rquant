@@ -187,3 +187,23 @@ class FixtureSource:
         cur = self.con.cursor().execute(sql, list(params))
         cols = [c[0] for c in cur.description]
         return [dict(zip(cols, row, strict=True)) for row in cur.fetchall()]
+
+
+def write_demo_research(root: Path) -> None:
+    """A tiny portfolio backtest result for fixture mode / e2e (three days, two stocks)."""
+    from rquant.backtest import BacktestConfig, Bar, run_backtest
+    from rquant.backtest.store import save
+    from rquant.portfolio import PortfolioCandidate, PortfolioWeightRule
+
+    today = date.today()
+    days = [today - timedelta(days=k) for k in (4, 3, 2, 1)]
+    bars = {
+        d: {"600519.SH": Bar(open=1500 + 5 * i, close=1505 + 5 * i, pre_close=1500 + 5 * i),
+            "000001.SZ": Bar(open=10 + 0.1 * i, close=10.05 + 0.1 * i, pre_close=10 + 0.1 * i)}
+        for i, d in enumerate(days)
+    }
+    signals = {days[0]: [PortfolioCandidate(ts_code="600519.SH"),
+                         PortfolioCandidate(ts_code="000001.SZ")]}
+    config = BacktestConfig(weights=PortfolioWeightRule(max_positions=2))
+    save(run_backtest(days, bars, signals, config), preset="breakout", start=days[0],
+         end=days[-1], root=root, title="演示组合回测")

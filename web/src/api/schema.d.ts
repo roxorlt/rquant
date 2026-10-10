@@ -175,6 +175,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/portfolio-backtests": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 组合回测列表 */
+        get: operations["portfolio_backtests_api_v1_portfolio_backtests_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/portfolio-backtests/{run_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 组合回测详情 */
+        get: operations["portfolio_backtest_api_v1_portfolio_backtests__run_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/screen": {
         parameters: {
             query?: never;
@@ -450,6 +484,16 @@ export interface components {
             data: components["schemas"]["PoolsData"];
             serving: components["schemas"]["ServingMeta"];
         };
+        /** Envelope[PortfolioRunDetailData] */
+        Envelope_PortfolioRunDetailData_: {
+            data: components["schemas"]["PortfolioRunDetailData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[PortfolioRunListData] */
+        Envelope_PortfolioRunListData_: {
+            data: components["schemas"]["PortfolioRunListData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
         /** Envelope[ScreenData] */
         Envelope_ScreenData_: {
             data: components["schemas"]["ScreenData"];
@@ -624,6 +668,78 @@ export interface components {
             pools: components["schemas"]["PoolItem"][];
             /** Trade Date */
             trade_date: string | null;
+        };
+        /** PortfolioOrder */
+        PortfolioOrder: {
+            /** Code */
+            code: string;
+            /** Fee */
+            fee: number;
+            /** Price */
+            price: number | null;
+            /** Quantity */
+            quantity: number;
+            /** Reason */
+            reason: string | null;
+            /** Side */
+            side: string;
+            /** Status */
+            status: string;
+            /**
+             * Trade Date
+             * Format: date
+             */
+            trade_date: string;
+        };
+        /** PortfolioRunDetailData */
+        PortfolioRunDetailData: {
+            /** Holdings */
+            holdings: {
+                [key: string]: number;
+            };
+            /** Orders */
+            orders: components["schemas"]["PortfolioOrder"][];
+            perf: components["schemas"]["BacktestPerf"] | null;
+            run: components["schemas"]["PortfolioRunSummary"];
+        };
+        /** PortfolioRunListData */
+        PortfolioRunListData: {
+            /** Runs */
+            runs: components["schemas"]["PortfolioRunSummary"][];
+        };
+        /** PortfolioRunSummary */
+        PortfolioRunSummary: {
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /**
+             * End
+             * Format: date
+             */
+            end: string;
+            /** Filled */
+            filled: number;
+            /** Final Nav */
+            final_nav: number | null;
+            /** Max Positions */
+            max_positions: number;
+            /** Preset */
+            preset: string;
+            /** Rebalance Every */
+            rebalance_every: number;
+            /** Rejected */
+            rejected: number;
+            /** Run Id */
+            run_id: string;
+            /**
+             * Start
+             * Format: date
+             */
+            start: string;
+            /** Title */
+            title: string;
         };
         /** SavePoolRequest */
         SavePoolRequest: {
@@ -992,6 +1108,59 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["CommandReceipt"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    portfolio_backtests_api_v1_portfolio_backtests_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_PortfolioRunListData_"];
+                };
+            };
+        };
+    };
+    portfolio_backtest_api_v1_portfolio_backtests__run_id__get: {
+        parameters: {
+            query?: {
+                benchmark?: string;
+            };
+            header?: never;
+            path: {
+                run_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_PortfolioRunDetailData_"];
                 };
             };
             /** @description Validation Error */

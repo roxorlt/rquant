@@ -67,6 +67,28 @@ export function useBacktests(): ServingQueryResult<Schemas["BacktestListData"]> 
   });
 }
 
+export function usePortfolioBacktests(): ServingQueryResult<Schemas["PortfolioRunListData"]> {
+  return useServingQuery(["portfolio-backtests"], async () => {
+    const { data, response } = await apiClient().GET("/api/v1/portfolio-backtests");
+    return unwrap(data, response);
+  });
+}
+
+export function usePortfolioBacktest(
+  runId: string | null,
+): ServingQueryResult<Schemas["PortfolioRunDetailData"]> {
+  return useServingQuery(
+    ["portfolio-backtests", runId],
+    async () => {
+      const { data, response } = await apiClient().GET("/api/v1/portfolio-backtests/{run_id}", {
+        params: { path: { run_id: runId ?? "" } },
+      });
+      return unwrap(data, response);
+    },
+    { enabled: runId !== null },
+  );
+}
+
 export function useBacktestDetail(
   runId: string | null,
 ): ServingQueryResult<Schemas["BacktestDetailData"]> {
