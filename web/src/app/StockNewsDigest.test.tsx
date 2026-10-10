@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { HttpResponse, http } from "msw";
 import type { Schemas } from "@/api/client";
@@ -110,6 +110,11 @@ it("separates disclosed facts and forecasts, opens exact evidence, and clears a 
 });
 it("only reads a candidate summary after the user chooses the actual stock on overview", async () => {
   const selected: string[] = [];
+  let available = false;
+  let releaseCapability: () => void = () => undefined;
+  const capabilityReady = new Promise<void>((resolve) => {
+    releaseCapability = resolve;
+  });
   server.use(
     http.get("*/api/v1/ai/news/:code", ({ params }) => {
       selected.push(String(params.code));
@@ -124,20 +129,41 @@ it("only reads a candidate summary after the user chooses the actual stock on ov
         },
       });
     }),
-    http.get("*/api/v1/ai/capabilities", () =>
-      HttpResponse.json({
+    http.get("*/api/v1/ai/capabilities", async () => {
+      await capabilityReady;
+      return HttpResponse.json({
         serving: metaEnvelope().serving,
-        data: { available: false, can_generate: false },
-      }),
-    ),
+        data: {
+          available,
+          can_generate: false,
+          message: "助手尚未配置，可继续手动编辑。",
+        },
+      });
+    }),
   );
   const user = userEvent.setup();
-  renderApp("/overview");
+  const { queryClient } = renderApp("/overview");
   const select = await screen.findByRole("combobox", { name: "选择候选股票" });
   expect(selected).toEqual([]);
   await user.selectOptions(select, "001268.SZ");
+  const refresh = screen.getByRole("button", { name: "刷新摘要" });
+  try {
+    expect(refresh).toBeDisabled();
+    expect(screen.getByText("正在读取助手状态")).toBeInTheDocument();
+  } finally {
+    releaseCapability();
+  }
+  expect(await screen.findByText("助手尚未配置，可继续手动编辑。")).toBeInTheDocument();
+  expect(refresh).toBeDisabled();
+  await user.click(refresh);
+  expect(selected).toEqual([]);
+  available = true;
+  await act(async () => {
+    await queryClient.invalidateQueries({ queryKey: ["ai", "capabilities"] });
+  });
   expect(await screen.findByText("尚未采集这只股票。")).toBeInTheDocument();
   expect(selected).toEqual(["001268.SZ"]);
+  expect(screen.getByRole("button", { name: "刷新摘要" })).toBeEnabled();
 });
 it.each(["not_dispatched", "completed"] as const)(
   "FCR-001 news preserves a missing original until confirmed %s",

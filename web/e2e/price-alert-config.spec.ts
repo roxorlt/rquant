@@ -1,5 +1,6 @@
-import { expect, test } from "@playwright/test";
+import { expect, type Page, test } from "@playwright/test";
 import type { MetaEnvelope, Schemas } from "../src/api/client.ts";
+import { API_NOW } from "./env.ts";
 import { expectNoHorizontalOverflow, watch } from "./watch.ts";
 
 type List = Schemas["Envelope_PriceAlertRuleListData_"];
@@ -8,8 +9,19 @@ type Item = Schemas["PriceAlertRuleItem"];
 const PATH = "**/api/v1/monitor/price-rules";
 const JOURNAL = "rquant.price-rule-command.v1";
 
-function listing(meta: MetaEnvelope): List {
-  return {
+async function listing(page: Page) {
+  const meta = (await (await page.request.get("api/v1/meta")).json()) as MetaEnvelope;
+  if (meta.serving.built_at === null) throw new Error("synthetic generation is missing");
+  // Pin this routed business scenario independently of the shared API's elapsed clock.
+  meta.serving = {
+    ...meta.serving,
+    state: "ready",
+    age_seconds: (Date.parse(API_NOW) - Date.parse(meta.serving.built_at)) / 1_000,
+    message: null,
+  };
+  meta.data.server_time = API_NOW;
+  await page.route("**/api/v1/meta", (route) => route.fulfill({ json: meta }));
+  const state: List = {
     serving: meta.serving,
     data: {
       availability: "ready",
@@ -46,6 +58,7 @@ function listing(meta: MetaEnvelope): List {
       ],
     },
   };
+  return { meta, state };
 }
 function updatedItem(body: Command, version: number, meta: MetaEnvelope): Item {
   if (!body.rule || !body.ts_code || !body.membership_version)
@@ -73,8 +86,7 @@ for (const width of [1440, 390])
     });
     test("新建、精确编辑、启停和删除，键盘焦点与手机布局", async ({ page }, testInfo) => {
       const watcher = watch(page);
-      const meta = (await (await page.request.get("api/v1/meta")).json()) as MetaEnvelope;
-      const state = listing(meta);
+      const { meta, state } = await listing(page);
       const seen: Command[] = [];
       await page.route(PATH, (route) => route.fulfill({ json: state }));
       // These routed responses exercise browser behavior; real Web/CAS proof is separate.
@@ -110,7 +122,7 @@ for (const width of [1440, 390])
         });
       });
       await page.goto("./#/monitor");
-      const panel = page.getByRole("region", { name: "告警规则" });
+      const panel = page.getByRole("region", { name: "到价规则" });
       const edit = panel.getByRole("button", { name: "编辑 突破提醒" });
       await expect(edit).toBeVisible();
       await edit.focus();
@@ -177,8 +189,7 @@ for (const width of [1440, 390])
 
     test("未知回执刷新后只恢复原请求，等待同步与失效状态准确", async ({ page }, testInfo) => {
       const watcher = watch(page);
-      const meta = (await (await page.request.get("api/v1/meta")).json()) as MetaEnvelope;
-      const state = listing(meta);
+      const { meta, state } = await listing(page);
       const sent: Command[] = [];
       const resumed: Command[] = [];
       await page.route(PATH, (route) => route.fulfill({ json: state }));
@@ -209,7 +220,7 @@ for (const width of [1440, 390])
       await page.getByRole("button", { name: "编辑 突破提醒" }).click();
       const drawer = page.getByRole("dialog", { name: "编辑到价规则" });
       await drawer.getByRole("button", { name: "保存规则" }).click();
-      await expect(page.getByRole("region", { name: "告警规则" })).toContainText("状态待核对");
+      await expect(page.getByRole("region", { name: "到价规则" })).toContainText("状态待核对");
       expect(sent).toHaveLength(1);
       const stored = await page.evaluate(
         ({ key, owner, id }) => localStorage.getItem(`${key}:${owner}:${id}`),
@@ -221,7 +232,7 @@ for (const width of [1440, 390])
       );
       expect(JSON.parse(stored ?? "{}").body).toEqual(sent[0]);
       await page.reload();
-      const panel = page.getByRole("region", { name: "告警规则" });
+      const panel = page.getByRole("region", { name: "到价规则" });
       await expect(panel).toContainText("设置已写入，等待同步");
       expect(resumed.length).toBeGreaterThan(0);
       expect(resumed.every((body) => JSON.stringify(body) === JSON.stringify(sent[0]))).toBe(true);

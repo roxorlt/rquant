@@ -166,6 +166,7 @@ for (const mode of ["desktop", "phone"] as const) {
       await expect(page.getByLabel("操作人", { exact: true })).toBeDisabled();
       await expect(page.getByText(original.command.command_id, { exact: true })).not.toBeVisible();
       await expectNoHorizontalOverflow(page, `${mode} own audit`);
+      await page.unrouteAll({ behavior: "wait" });
       expect(failures).toEqual([]);
     });
     test("filters original commands and Shanghai times in UTC and Shanghai browsers", async ({

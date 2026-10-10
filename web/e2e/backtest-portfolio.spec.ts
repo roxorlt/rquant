@@ -88,6 +88,38 @@ async function syntheticApi(page: Page, unavailable = false): Promise<string[]> 
     const url = new URL(request.url());
     const respond = (value: unknown) => route.fulfill({ status: 200, json: value });
     if (url.pathname === "/app/api/v1/meta") return respond(metaEnvelope());
+    if (url.pathname === "/app/api/v1/collaboration/me") {
+      const envelope: Schemas["Envelope_CollaborationMe_"] = {
+        serving: { ...metaEnvelope().serving, generation_id: null },
+        data: {
+          available: false,
+          mode: "legacy",
+          username: metaEnvelope().data.viewer,
+          role: null,
+          revision: null,
+          state_sha256: null,
+          can_manage_users: false,
+          can_research: false,
+          can_read_audit: false,
+          message: "协作权限尚未启用。",
+        },
+      };
+      return respond(envelope);
+    }
+    if (url.pathname === "/app/api/v1/ai/capabilities") {
+      const envelope: Schemas["Envelope_AICapabilities_"] = {
+        serving: metaEnvelope().serving,
+        data: {
+          available: false,
+          can_generate: false,
+          can_prepare_backtest: false,
+          daily_limit: null,
+          remaining_calls: null,
+          message: "助手尚未配置，可继续手动编辑。",
+        },
+      };
+      return respond(envelope);
+    }
     if (url.pathname === `${base}/capabilities`)
       return respond({
         ...portfolioCapabilities,

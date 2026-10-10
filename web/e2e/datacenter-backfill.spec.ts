@@ -69,6 +69,22 @@ async function installPlans(page: Page) {
   await page.route("**/api/v1/meta", (route) =>
     route.fulfill({ json: { ...meta, data: { ...meta.data, viewer: "tester" } } }),
   );
+  await page.route("**/api/v1/data/audit-report/calendar*", async (route) => {
+    expect(new URL(route.request().url()).searchParams.get("generation")).toBe(
+      meta.serving.generation_id,
+    );
+    await route.fulfill({
+      json: {
+        data: {
+          availability: "ready",
+          earliest_selectable_date: "2024-09-02",
+          latest_closed_date: "2026-09-23",
+          open_dates: ["2024-09-02", "2026-09-18", "2026-09-22", "2026-09-23"],
+        },
+        serving: meta.serving,
+      },
+    });
+  });
   await page.route("**/api/v1/data/backfill-plans?*", (route) =>
     route.fulfill({
       json: {

@@ -9,7 +9,11 @@ from uuid import UUID
 import pytest
 
 from rquant.definition_registry import ImmutableDefinitionRegistry
-from rquant.experiment_platform import ExperimentPlatformStore, ExperimentSourceProfile
+from rquant.experiment_platform import (
+    ExperimentFamilyRequest,
+    ExperimentPlatformStore,
+    ExperimentSourceProfile,
+)
 from rquant.experiment_platform_commands import (
     ExperimentCommandWriter,
     ExperimentFamilyPreparer,
@@ -117,6 +121,11 @@ def test_exp13_definite_preparation_rejection_stays_failed(
 
     class RejectedPreparation:
         clock = staticmethod(lambda: NOW)
+
+        def template_baseline(
+            self, owner: str, request: ExperimentFamilyRequest
+        ) -> None:
+            return None
 
         def __call__(self, record, *, grant=None):
             calls.append(record)

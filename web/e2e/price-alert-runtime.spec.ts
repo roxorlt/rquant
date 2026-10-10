@@ -1,12 +1,24 @@
-import { expect, test } from "@playwright/test";
+import { expect, type Page, test } from "@playwright/test";
 import type { MetaEnvelope, Schemas } from "../src/api/client.ts";
+import { API_NOW } from "./env.ts";
 import { expectNoHorizontalOverflow, watch } from "./watch.ts";
 
 const PATH = "**/api/v1/monitor/price-rules";
 type Runtime = Schemas["Envelope_PriceAlertRuntimeData_"];
 type Events = Schemas["Envelope_PriceAlertRecentEventsData_"];
 
-function fixtures(meta: MetaEnvelope) {
+async function fixtures(page: Page) {
+  const meta = (await (await page.request.get("api/v1/meta")).json()) as MetaEnvelope;
+  if (meta.serving.built_at === null) throw new Error("synthetic generation is missing");
+  // Pin this routed business scenario independently of the shared API's elapsed clock.
+  meta.serving = {
+    ...meta.serving,
+    state: "ready",
+    age_seconds: (Date.parse(API_NOW) - Date.parse(meta.serving.built_at)) / 1_000,
+    message: null,
+  };
+  meta.data.server_time = API_NOW;
+  await page.route("**/api/v1/meta", (route) => route.fulfill({ json: meta }));
   const at = meta.data.server_time;
   const runtime: Runtime = {
     serving: meta.serving,
@@ -100,7 +112,7 @@ function fixtures(meta: MetaEnvelope) {
       ],
     },
   };
-  return { runtime, events, rules };
+  return { meta, runtime, events, rules };
 }
 
 for (const width of [1440, 390]) {
@@ -113,8 +125,8 @@ for (const width of [1440, 390]) {
 
     test("运行、最近提醒、准确价格提示和刷新期间保留编辑", async ({ page }, testInfo) => {
       const watcher = watch(page);
-      const meta = (await (await page.request.get("api/v1/meta")).json()) as MetaEnvelope;
-      const values = fixtures(meta);
+      const values = await fixtures(page);
+      const { meta } = values;
       let polls = 0;
       await page.clock.install({ time: new Date(meta.data.server_time) });
       await page.route(PATH, (route) => route.fulfill({ json: values.rules }));
@@ -124,7 +136,7 @@ for (const width of [1440, 390]) {
       });
       await page.route(`${PATH}/events`, (route) => route.fulfill({ json: values.events }));
       await page.goto("./#/monitor");
-      const rules = page.getByRole("region", { name: "告警规则" });
+      const rules = page.getByRole("region", { name: "到价规则" });
       const recent = page.getByRole("region", { name: "最近到价提醒" });
       await expect(rules.getByRole("row", { name: /突破提醒/ })).toContainText("正常");
       await expect(recent).toContainText("最近 20 条");
@@ -160,8 +172,7 @@ for (const width of [1440, 390]) {
     });
 
     test("新旧代冲突隐藏统计，正常等待与空记录不冒称通知成功", async ({ page }, testInfo) => {
-      const meta = (await (await page.request.get("api/v1/meta")).json()) as MetaEnvelope;
-      const values = fixtures(meta);
+      const values = await fixtures(page);
       values.runtime.data.status = "not_running";
       values.runtime.data.status_label = "未运行";
       values.runtime.data.message = "等待交易时段。";

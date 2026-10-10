@@ -9,11 +9,11 @@ for (const viewport of [
 ] as const) {
   test(`最新筛选结果可在 ${viewport.name} 命名保存为无排名池子`, async ({ page }, testInfo) => {
     const watcher = watch(page);
-    const runs: Schemas["ScreenRunRequest"][] = [];
+    const runs: Schemas["ExecuteScreenQuery"][] = [];
     const saves: Schemas["SaveRankedPoolCommand"][] = [];
     await page.setViewportSize({ width: viewport.width, height: viewport.height });
-    await page.route("**/api/v1/screen/run", async (route) => {
-      runs.push(route.request().postDataJSON() as Schemas["ScreenRunRequest"]);
+    await page.route("**/api/v1/screen/query/execute", async (route) => {
+      runs.push(route.request().postDataJSON() as Schemas["ExecuteScreenQuery"]);
       await route.continue();
     });
     await page.route("**/api/v1/pools/editor/commands", async (route) => {
@@ -29,8 +29,8 @@ for (const viewport of [
         delay_days: 0,
         expected_version: null,
         ranking: null,
-        rule_calls: latest.conditions.map((condition) => ({
-          name: condition.key,
+        rule_calls: latest.definition.conditions.map((condition) => ({
+          name: condition.name,
           args: condition.args ?? {},
         })),
       });
@@ -69,7 +69,7 @@ for (const viewport of [
     await dialog.getByRole("button", { name: "保存池子" }).click();
     await expect(dialog.getByText("保存请求已完成")).toBeVisible();
     await expect(dialog.getByText("等待规则发布")).toBeVisible();
-    await expect(dialog.getByText("等待下次选股结果")).toBeVisible();
+    await expect(dialog.getByText("等待日终结果确认")).toBeVisible();
     expect(runs).toHaveLength(1);
     expect(saves).toHaveLength(1);
     expect(findJargon(await page.locator("main").innerText())).toEqual([]);

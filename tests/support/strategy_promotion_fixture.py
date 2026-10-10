@@ -1062,7 +1062,7 @@ def seal_original_promotion_jobs(
     foundation.scheduler.run_once()
     if any(foundation.reader.get_job(job_id) is None for job_id in jobs):
         raise ValueError("original Lab job must already be admitted")
-    ipc_root = Path(tempfile.mkdtemp(prefix="rqc5-", dir="/private/tmp"))
+    ipc_root = Path(tempfile.mkdtemp(prefix="rqc5-", dir=Path("/tmp").resolve()))
     ipc_root.chmod(0o700)
     previous_tempdir, previous_env = tempfile.tempdir, os.environ.get("TMPDIR")
     tempfile.tempdir, os.environ["TMPDIR"] = str(ipc_root), str(ipc_root)

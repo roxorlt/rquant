@@ -10,6 +10,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from pathlib import Path
 from threading import Event
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -120,6 +121,7 @@ def build_native_health_input(work_root: Path, *, at: datetime = NOW) -> Serving
     )
     _publish_candidates(
         work_root / "strategy/candidates",
+        trade_date=at.astimezone(ZoneInfo("Asia/Shanghai")).date(),
         captured_at=at,
         definition_fingerprint=strategy.settings["strategy_registration_fingerprint"],
         executable_fingerprint=strategy.settings["strategy_executable_fingerprint"],

@@ -14,6 +14,7 @@ from uuid import UUID
 import pytest
 
 from tests.integration.test_minute_backtest_parameter_installed import installed_parameters, sealed_parameters
+from tests.support.minute_backtest_installed import installed_minute as installed_minute
 
 
 @pytest.fixture(scope="module")

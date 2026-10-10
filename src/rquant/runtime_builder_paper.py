@@ -367,11 +367,7 @@ def paper_broker_builder(
             )
             if mixed_installed:
                 state._require_mixed_history(connection)
-        source = (
-            ReadonlyNotificationEventRouteSpool(settings.signal_spool_root)
-            if mixed_installed
-            else ReadonlySignalRouteSpool(settings.signal_spool_root)
-        )
+        source: ReadonlyNotificationEventRouteSpool | ReadonlySignalRouteSpool | None = None
         consume = (
             consume_notification_events_to_paper if mixed_installed else consume_signal_bus_to_paper
         )
@@ -529,7 +525,14 @@ def paper_broker_builder(
             return publication.pointer.generation_id
 
         def step() -> RuntimeStepResult:
+            nonlocal source
             observed_at = clock()
+            if source is None:
+                source = (
+                    ReadonlyNotificationEventRouteSpool(settings.signal_spool_root)
+                    if mixed_installed
+                    else ReadonlySignalRouteSpool(settings.signal_spool_root)
+                )
             descriptor = source.source_descriptor()
             constraint_generation = (
                 {"paper_execution_constraints": constraint_generation_resolver(observed_at)}

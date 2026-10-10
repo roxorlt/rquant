@@ -94,10 +94,15 @@ def test_industry_weights_use_actual_cash_and_original_bf_period_source(tmp_path
     assert value.attribution.rows[-1].selection_and_interaction == 0
 
 
-def test_unknown_industry_has_explicit_exposure_gap_and_no_estimated_attribution(tmp_path: Path) -> None:
+def test_unknown_industry_has_explicit_exposure_gap_and_no_estimated_attribution(
+    tmp_path: Path, request: pytest.FixtureRequest
+) -> None:
     from rquant.paper_portfolio_exposure import calculate_paper_exposure
 
     broker, basis, _, _ = filled(tmp_path)
+    owner_connection = broker._connect()
+    request.addfinalizer(owner_connection.close)
+    assert not owner_connection.in_transaction
     frame = ledger_source(broker).read(configuration=basis.configuration, as_of=EXECUTION_TIME, prices={"600000.SH": Decimal("1")})
     value = calculate_paper_exposure(frame, industry_material(basis.configuration, frame, industry=None), as_of=frame.as_of)
     assert value.status == "unavailable" and value.attribution is None and "行业" in value.reason

@@ -34,7 +34,7 @@ def test_private_run_socket_allowlist_framing_and_cleanup(tmp_path: Path) -> Non
             clock=lambda: _AS_OF,
         ),
     )
-    directory = Path(tempfile.mkdtemp(prefix="fre-", dir="/private/tmp"))
+    directory = Path(tempfile.mkdtemp(prefix="fre-", dir=tempfile.gettempdir()))
     os.chown(directory, os.geteuid(), os.getegid())
     directory.chmod(0o710)
     socket = directory / "run.sock"

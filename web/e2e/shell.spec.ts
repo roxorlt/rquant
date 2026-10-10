@@ -1,5 +1,6 @@
 import { execSync } from "node:child_process";
 import { expect, type Page, test } from "@playwright/test";
+import type { MetaEnvelope, Schemas } from "../src/api/client.ts";
 import { NAV_GROUPS, PAGES } from "../src/app/pages.ts";
 import { REPLAY_ROOT, REPO_ROOT, SERVING_ROOT, UV_RUN } from "./env.ts";
 import { expectNoHorizontalOverflow, watch } from "./watch.ts";
@@ -22,6 +23,62 @@ for (const viewport of VIEWPORTS) {
     test("loads under /app/ and reaches every page with no errors or overflow", async ({
       page,
     }) => {
+      if (!REPLAY_ROOT) {
+        const response = await page.request.get("./api/v1/meta");
+        expect(response.ok()).toBe(true);
+        const meta = (await response.json()) as MetaEnvelope;
+        execSync(
+          `${UV_RUN} python scripts/build_web_fixture.py --out "${SERVING_ROOT}" --scenario panorama --publish-next --built-at "${meta.data.server_time}"`,
+          { cwd: REPO_ROOT, env: { ...process.env, RQUANT_DISABLE_DOTENV: "1" }, encoding: "utf8" },
+        );
+      }
+      const publishedMetaResponse = await page.request.get("./api/v1/meta");
+      expect(publishedMetaResponse.ok()).toBe(true);
+      const publishedMeta: MetaEnvelope = await publishedMetaResponse.json();
+      expect(publishedMeta.data.viewer).not.toBeNull();
+      expect(publishedMeta.data.generation?.generation_id).toBe(
+        publishedMeta.serving.generation_id,
+      );
+      const serving = publishedMeta.serving;
+      const catalog: Schemas["Envelope_QueryCatalogData_"] = {
+        serving,
+        data: {
+          available: false,
+          source_at: null,
+          tables: [],
+          save_enabled: false,
+          message: "查询服务尚未启用。",
+        },
+      };
+      const queries: Schemas["Envelope_QuerySavedList_"] = {
+        serving,
+        data: { available: false, items: [], message: "查询保存尚未启用。" },
+      };
+      const capabilities: Schemas["Envelope_ExperimentCapabilities_"] = {
+        serving,
+        data: {
+          available: false,
+          can_search: false,
+          can_unseal: false,
+          can_edit_policy: false,
+          can_search_templates: false,
+          message: "正式实验尚未启用，请先准备受限来源。",
+          sources: [],
+          default_config: null,
+          policy: null,
+        },
+      };
+      await page.route("**/app/api/v1/research/catalog", (route) =>
+        route.request().method() === "GET" ? route.fulfill({ json: catalog }) : route.continue(),
+      );
+      await page.route("**/app/api/v1/research/queries", (route) =>
+        route.request().method() === "GET" ? route.fulfill({ json: queries }) : route.continue(),
+      );
+      await page.route("**/app/api/v1/experiments/capabilities", (route) =>
+        route.request().method() === "GET"
+          ? route.fulfill({ json: capabilities })
+          : route.continue(),
+      );
       const watcher = watch(page);
       await page.goto("./");
       await expectPage(page, "/overview", "总览");

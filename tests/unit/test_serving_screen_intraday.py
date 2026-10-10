@@ -608,15 +608,8 @@ def test_new_domain_overflow_preserves_old_market_and_shared_page(
     }
     assert not after["intraday_screen_source"].rows and not after["intraday_feature_snapshot"].rows
     assert after["market_snapshot"] == old_market and after["screen_result"] == old_results
-    moving_clock = {"condition_alert_rule", "condition_alert_rule_state"}
     for name, projection in before.items():
-        if name in moving_clock:
-            assert after[name].model_dump(exclude={"available_at"}) == projection.model_dump(
-                exclude={"available_at"}
-            )
-            assert after[name].available_at == cutoff + timedelta(seconds=1)
-        else:
-            assert after[name] == projection
+        assert after[name] == projection
 
 
 def test_quote_and_exact_closed_bar_keep_all_original_values_and_provenance(

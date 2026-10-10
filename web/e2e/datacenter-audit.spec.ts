@@ -8,7 +8,18 @@ for (const width of [1440, 390]) {
     test.skip(Boolean(REPLAY_ROOT), "回放副本只读，使用合成研究元数据验证审计链路");
     execSync(
       `${UV_RUN} python scripts/build_web_fixture.py --out "${SERVING_ROOT}" --scenario panorama --publish-next --audit`,
-      { cwd: REPO_ROOT, env: { ...process.env, RQUANT_DISABLE_DOTENV: "1" } },
+      {
+        cwd: REPO_ROOT,
+        env: {
+          ...process.env,
+          RQUANT_DISABLE_DOTENV: "1",
+          TUSHARE_TOKEN_MAIN: "0000000000000000000000000000000000000000",
+          DATA_DIR: SERVING_ROOT,
+          DUCKDB_PATH: `${SERVING_ROOT}/audit-fixture.duckdb`,
+          PARQUET_DIR: `${SERVING_ROOT}/parquet`,
+          LOG_DIR: `${SERVING_ROOT}/logs`,
+        },
+      },
     );
     await expect
       .poll(async () => {

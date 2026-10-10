@@ -1,4 +1,4 @@
-import { expect, type Page } from "@playwright/test";
+import { expect, type Page, test } from "@playwright/test";
 import { APP_URL } from "./env.ts";
 
 export interface PageWatch {
@@ -17,7 +17,7 @@ const TRACE_SANDBOX_NOISE =
 /** Collects console errors, uncaught errors, failed and cross-origin requests. */
 export function watch(page: Page): PageWatch {
   const problems: string[] = [];
-  const origin = new URL(APP_URL).origin;
+  const origin = new URL(test.info().project.use.baseURL ?? APP_URL).origin;
   page.on("console", (message) => {
     if (message.type() === "error" && !TRACE_SANDBOX_NOISE.test(message.text())) {
       problems.push(`console error: ${message.text()}`);

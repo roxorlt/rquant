@@ -69,9 +69,11 @@ for (const viewport of [
         };
         await route.fulfill({ response: upstream, body: JSON.stringify(body) });
       });
-      await page.route("**/api/v1/screen/blocks", async (route) => {
+      await page.route("**/api/v1/screen/blocks?*", async (route) => {
+        expect(new URL(route.request().url()).searchParams.get("mode")).toBe("daily");
         const upstream = await route.fetch();
         const body = (await upstream.json()) as Schemas["Envelope_ScreenCatalogData_"];
+        expect(body.data.available).toBe(true);
         body.serving.generation_id = published ? "canvas-published" : "canvas-old";
         body.data.blocks = [
           {

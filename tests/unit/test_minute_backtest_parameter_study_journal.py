@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -662,6 +663,7 @@ def test_physical_metadata_change_is_not_trusted_from_a_saved_private_marker(
     control = original_control(actual_carrier, tmp_path)
     original_persist(control, command, marker)
     path = actual_carrier.catalog.fact_sources[0].metadata_identity.source_path
+    original_stat = path.stat()
     original = path.read_bytes()
     before = len(actual_carrier.installed.commands.spool.pending())
     monkeypatch.setattr(control.writer, "submit", lambda *_: pytest.fail("changed metadata submit"))
@@ -672,3 +674,4 @@ def test_physical_metadata_change_is_not_trusted_from_a_saved_private_marker(
         assert len(actual_carrier.installed.commands.spool.pending()) == before
     finally:
         path.write_bytes(original)
+        os.utime(path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))

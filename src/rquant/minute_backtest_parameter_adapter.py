@@ -19,6 +19,7 @@ from rquant.minute_backtest_parameter_contracts import (
     FrozenMinuteParameterResearchInput,
     MinuteParameterRuntimeReceipt,
 )
+from rquant.minute_backtest_parameter_definition import minute_parameter_validation_request
 from rquant.minute_backtest_parameter_producer import (
     MinuteParameterPreparedPublication,
     MinuteParameterPublicationReceipt,
@@ -181,6 +182,7 @@ class MinuteParameterFormalReplayAdapter(MinuteFormalReplayAdapter):
         super().__init__(catalog)
         self.resolved_read_unit = resolved_read_unit
 
+    @minute_parameter_validation_request
     def expected(
         self, parameters: MinuteParameterFormalParameters
     ) -> MinuteParameterPublicationReceipt:

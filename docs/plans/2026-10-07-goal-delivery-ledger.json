@@ -1,14 +1,14 @@
 {
   "schema_version": 1,
-  "revision": 168,
-  "updated_at": "2026-10-10T00:41:04+08:00",
+  "revision": 181,
+  "updated_at": "2026-10-10T08:08:14+08:00",
   "thread_id": "01a0dd53-e9c9-7b73-a7b5-843473fcd6ac",
   "worktree": "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-source-integration",
   "branch": "cdx/20260929-factor-source-integration",
   "goal_state": {
     "reported_status": "active",
-    "last_updated_at": "2026-10-10T00:41:04+08:00",
-    "current_turn": "R12_actual_CI_repairs_frozen_derived_metadata_and_one_combined_review",
+    "last_updated_at": "2026-10-10T08:08:14+08:00",
+    "current_turn": "R12_original_Linux_report_ready_verified_final_candidate_CI_preparation",
     "stored_block_reason": "正式指数来源及32日资料仍缺；生产安装切流授权和实际开市日观察按固定6项处理。",
     "explicit_goal_token_budget": null,
     "resume_control": "get_goal已实际返回active；当前无需再点Target继续。",
@@ -17,10 +17,10 @@
     "previous_goal_turn_evidence": "r12-auction-python311312-accepted-20261009-01.json：两版本原54节点通过并核原记录；集中审查形成唯一FCR-001并交原实现者。",
     "last_observation": {
       "classification": "actual_progress",
-      "observed_at": "2026-10-10T00:41:04+08:00",
-      "actual": "本批实际CI补修已停写。事件兼容、精确导入边界和独立参考已验；notifier消息保留完整异常。原4096条调度用例一次通过，221秒。清单23,091项，保留全部原场景；新增19个拒绝场景合并执行后通过既定6MiB容量。待一次组合增量审查和正式CI。",
-      "evidence": "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-collection-01/EV.json",
-      "next": "标准派生元数据、一次组合增量审查、同一PR必要CI；正式资料和上线条件保持。"
+      "observed_at": "2026-10-10T08:08:14+08:00",
+      "actual": "报告原Linux链在普通UID502环境159.26秒取得Alice认证meta200，低于原180秒；原准备、worker、封存、审批、完整读取和发布均执行，7份worker与全部自有资源清理通过。AI原Linux启动24.81秒通过。源码和829叶快照不变；UID0旧失败及WAL元数据观察保留，底层机制未证明，停止追加诊断。原17个浏览器失败定向通过，六叶代码复核无新增阻断，固定25项、19本地完成、6剩余；正式CI和R12整体仍待。",
+      "evidence": "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-candidate-02/native-tmp-fix-01/linux311-07/RUN-EV.json",
+      "next": "只更新R07派生元数据并核精确候选，原审查者补核实际启动证据，提交同一PR并运行正式CI；复用有效结果，不再完整本地重跑。"
     },
     "previous_blocked_audit": {
       "consecutive_goal_turns_without_available_safe_implementation": 3,
@@ -30,7 +30,7 @@
     },
     "blocked_audit": {
       "consecutive_goal_turns_without_available_safe_implementation": 0,
-      "condition": "本批已验补修正在整合，存在元数据、增量审查和正式CI的必要路径。",
+      "condition": "Linux原启动通过；候选整理、原finding证据复核和同候选正式CI可继续。",
       "update_goal_blocked_threshold": 3
     }
   },
@@ -53,7 +53,7 @@
     "production_modules_migrated": 0,
     "production_modules_total": 15,
     "running_workflows": 1,
-    "waiting_workflows": 0
+    "waiting_workflows": 1
   },
   "forecast": {
     "implementation_staff_hours": [
@@ -65,14 +65,15 @@
       1,
       3
     ],
-    "confidence": "原6–12小时及R12的3–6小时已失效。本批补修已冻；一次增量审查和正式CI仍待实测。不重置原目标窗口。",
+    "confidence": "原17个网页失败、Linux原3项、报告与AI启动均有实际通过证据，六叶代码复核无新增阻断。只待实际证据补核与同候选正式CI；正式资料、生产授权和20个实际开市日另计。",
     "assumptions": [
       "本地19项已验收，14个模块已本地验证；正式市场资料不由合成资料替代。",
       "唯一集中候选审查及原19叶CI补修复核已通过；本批实际阻断修复已冻；只作组合增量复核，复用有效测试。",
       "不增加新的设计、重构或审查阶段；必要验收完成后收尾。",
       "原10月8–10日候选目标窗口保持，不因更新重置日期。",
-      "完整CI33项已有终态：18通过、10失败、4取消、1跳过。取消的完整分片不算通过；修后双版本门禁仍待。",
-      "资料、生产授权和20个实际开市日另计。原工程工时估计保留在retired_estimates。"
+      "前一轮完整CI33项已有终态：18通过、10失败、4取消、1跳过。取消的完整分片不算通过；修后双版本门禁仍待。",
+      "资料、生产授权和20个实际开市日另计。原工程工时估计保留在retired_estimates。",
+      "2026-10-10 03:50：本轮308后端CI18通过、6失败、8取消、1跳过；完整包两版本各2项局部通过。原6项交付和日期窗口保持，不因修复、测试或代理运行增加计数。"
     ],
     "excluded_waits": [
       "CSI 与正式供应商来源获取",
@@ -193,7 +194,7 @@
       "完整输入读取方案已批准并冻结：可信首验加全部当前文件、权限、记录和live规则，替代同一链重复input unit/expected/registry/plan装配。六处现有接点，公有正式权限正文保持。原审查者集中核新设计边界，实现者并行固定接口，尚未写新产品代码。当前代码仍source05，原21.782/20.997秒证据复用，12秒未过。 下一普通候选3–6h非达标承诺；首个45–90分钟检查点从SPEC后实际实施起算。",
       "00:42：完整输入证明的冻结候选普通两GET均过12秒，原四组事实和控制资料保持。R08/R09原安装联验已交回pages，原交付标准有限事实映射并行；不增加交付数、逐子项审查或重复全量验证。"
     ],
-    "estimate_status": "pending_measured_CI_completion"
+    "estimate_status": "pending_actual_blocker_closure_and_same_candidate_CI"
   },
   "tasks": [
     {
@@ -2429,7 +2430,7 @@
       "title": "整体候选最终验收",
       "category": "acceptance",
       "status": "in_progress",
-      "owner": "Root整合四个互不覆盖写集；原审查者只核冻结后的组合增量",
+      "owner": "Root整合；原实现者局部补修和Linux启动验证；原审查者定向复核",
       "modules": [
         "M1",
         "M2",
@@ -2500,10 +2501,62 @@
         "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave02-audit-driver-reference-01/HANDOFF.md",
         "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave02-replay-notifier-cause-01/assertion-message-01/EV.json",
         "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave02-cancelled-shard-cause-01/expected-only-cache-fix-01/EV.json",
-        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-collection-01/EV.json"
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-collection-01/EV.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-candidate-01/reviewer/EV.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-candidate-01/root-acceptance.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-candidate-01/official-ci-start.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-real-smoke-311-failure-01/download.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-real-smoke-311-failure-01/shared-ancestors-fix-01/EV.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-real-smoke-311-failure-01/limit-diagnostic-fix-01/verification.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-real-smoke-311-failure-01/spec-review-01/EV.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-web-browser-cancelled-01/download.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-candidate-01/official-ci-37965529140-20261009T192830Z.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-full-shard-failures-01/terminal-job-logs-01/index.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-real-smoke-311-failure-01/real-linux-smoke-01/EV.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-web-browser-cancelled-01/browser-diagnosis-01/seed-fix-01/EV.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-web-browser-cancelled-01/portfolio-diagnosis-01/fix-03/EV.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-web-browser-cancelled-01/collaboration-start-repair-01/audit-seed-repair-02/EV.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-web-browser-cancelled-01/minute-backtest-diagnosis-01/browser-green-01/EV.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-web-browser-cancelled-01/datacenter-diagnosis-01/env-fix-01/EV.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-full-shard-failures-01/implementation-spool-01/EV.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-full-shard-failures-01/diagnosis-paper-01/HANDOFF.md",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-full-shard-failures-01/diagnosis-intraday-01/implementation-01/EV.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-full-shard-failures-01/linux311-shard1/diagnosis-crash-01/EV.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-web-browser-cancelled-01/browser-final-candidate-01/EV.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-web-browser-cancelled-01/web206-experiment-fix-01/EV.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-full-shard-failures-01/linux311-shard1/diagnosis-snapshot-cost-01/EV.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-full-shard-failures-01/CR01-fix-01/EV.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-web-browser-cancelled-01/web206-pools-create-canvas-fix-01/EV.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-web-browser-cancelled-01/skip10-evidence-reuse-01/EV.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-web-browser-cancelled-01/generic-fixture-repair-02/INTERFACE-CHECKPOINT.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-web-browser-cancelled-01/generic-fixture-repair-02/EV.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-web-browser-cancelled-01/watchlist-batch-regression-01/EV.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-web-browser-cancelled-01/web206-shell-clock-fix-01/navigation-unavailable-fix-01/freeze.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-web-browser-cancelled-01/owned-report-promotion-config-03/FREEZE.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-web-browser-cancelled-01/browser-final-candidate-01/monitor-native-four-preconditions-01/EV.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-web-browser-cancelled-01/browser-final-candidate-01/monitor-native-two-evidence-01/EV.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-web-browser-cancelled-01/browser-whole-final-candidate-02/PREPARATION.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-web-browser-cancelled-01/owned-report-promotion-diagnosis-01/shared-owner-implementation-01/EV.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-candidate-02/MANIFEST.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-candidate-02/policy-generation.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-candidate-02/policy-check.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-web-browser-cancelled-01/browser-whole-final-candidate-02/START-INPUT-CHECKPOINT.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-web-browser-cancelled-01/browser-whole-final-candidate-02/EV.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-web-browser-cancelled-01/browser-whole-final-candidate-02/factors-partial-diagnosis-01/EV.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-candidate-02/reviewer/EV.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-candidate-02/whole-browser-02-root-receipt.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-web-browser-cancelled-01/browser-whole-final-candidate-02/generic-clock-fix-01/EV.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-web-browser-cancelled-01/browser-whole-final-candidate-02/collaboration-drain-fix-01/EV.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-candidate-02/native-tmp-fix-01/BOOTSTRAP-EV.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-candidate-02/native-tmp-fix-01/LINUX311-03-FAILURE-EV.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-candidate-02/native-tmp-fix-01/prepared-context-observation-01/EV.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-candidate-02/ai-tmp-fix-01/EV.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-candidate-02/post-whole-repair-final-01/reviewer/EV.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-candidate-02/native-tmp-fix-01/linux311-05/RUN-EV.json",
+        "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-candidate-02/native-tmp-fix-01/linux311-07/RUN-EV.json"
       ],
       "closure_level": "pending",
-      "last_progress": "本批实际CI补修已停写。事件兼容、精确导入边界和独立参考已验；notifier消息保留完整异常。原4096条调度用例一次通过，221秒。清单23,091项，保留全部原场景；新增19个拒绝场景合并执行后通过既定6MiB容量。待一次组合增量审查和正式CI。",
+      "last_progress": "报告原Linux链在普通UID502环境159.26秒取得Alice认证meta200，低于原180秒；原准备、worker、封存、审批、完整读取和发布均执行，7份worker与全部自有资源清理通过。AI原Linux启动24.81秒通过。源码和829叶快照不变；UID0旧失败及WAL元数据观察保留，底层机制未证明，停止追加诊断。原17个浏览器失败定向通过，六叶代码复核无新增阻断，固定25项、19本地完成、6剩余；正式CI和R12整体仍待。",
       "submilestones": [
         {
           "name": "网页最终候选准备门禁",
@@ -2610,6 +2663,15 @@
           "trigger": "按原门获得合法批准的候选/版本；当前三条负Sharpe不满足。",
           "evidence": "data/verification/minute-engine-completion-20261007/r03-scope-closure-01/EV.json",
           "existing_limits": "组件和原2048诊断消费不等于此联合正面链通过。"
+        },
+        {
+          "id": "R12-MONITOR-NATIVE-OS-01",
+          "state": "pending_real_Linux_systemd_same_read_environment",
+          "origin_task": "R12",
+          "new_delivery_unit": false,
+          "requirement": "两个原mode prepare/cancel浏览器节点须保留原executor.read_manual_state的同读OS guard、签名profile及零commit/零physical POST断言。",
+          "trigger": "既定真实Linux安装验收路径具备原systemd/boot_id/busctl前提；当前Mac缺失，不伪造OS状态或新增读取源替换。",
+          "evidence": "data/verification/goal-progress-root/release-preconditions-20261009-01/ci-full-wave03-web-browser-cancelled-01/browser-final-candidate-01/monitor-native-four-preconditions-01/EV.json"
         }
       ],
       "explicit_remaining_gates": [
@@ -2646,9 +2708,9 @@
         }
       ],
       "pull_request": "https://github.com/roxorlt/rquant/pull/323",
-      "candidate_commit": "a73c04c31efb1b8ad5ffd333b73a442249f648b1",
-      "remaining_hours_note": "原估已失效；本批补修已停写，组合增量审查及修后正式CI耗时待实测。",
-      "published_candidate_commit": "188af2261ace57270e30424394e1402f8e4e6cbc"
+      "candidate_commit": "308708b4dbf6cdd722a5a45be93ba1c84924dcba",
+      "remaining_hours_note": "原Linux启动已通过；同候选正式CI及既定条件验收仍待，不据局部通过承诺日期。",
+      "published_candidate_commit": "308708b4dbf6cdd722a5a45be93ba1c84924dcba"
     },
     {
       "id": "R13",
@@ -3815,6 +3877,97 @@
       "delivery_unit_added": false,
       "actual": "本批实际CI补修已停写。事件兼容、精确导入边界和独立参考已验；notifier消息保留完整异常。原4096条调度用例一次通过，221秒。清单23,091项，保留全部原场景；新增19个拒绝场景合并执行后通过既定6MiB容量。待一次组合增量审查和正式CI。",
       "scope": "实际阻断修复及必要派生清单；规则已重读并同步，时长次数授权不扩大范围。"
+    },
+    {
+      "at": "2026-10-10T01:25:36+08:00",
+      "task_id": "R12",
+      "delivery_unit_added": false,
+      "actual": "75个冻结文件的组合增量审查通过，0新增阻断。版本308708b4已推送至同一PR，后端CI及网页验收启动，未整体通过。Linux3.11真实生成原两节点1失败、1通过，日志确认文件句柄耗尽；原资源实现者只做限定诊断，产品和测试暂不写入。其余CI继续运行。",
+      "scope": "原六项交付；不限时长和次数不扩大范围。只有真实CI阻断的限定诊断和必要补修，不另开全仓审计、重构或重复验证。"
+    },
+    {
+      "at": "2026-10-10T02:10:32+08:00",
+      "task_id": "R12",
+      "delivery_unit_added": false,
+      "actual": "句柄重复占用补修四叶已冻结，原9项安全用例和固定1024限额的160文件复现通过；两日志叶保留原异常。原两版本完整包验收准备中。网页类型、1208项单测、构建及API类型核验通过，浏览器阶段失败后取消，整体未过；原网页实现者仅定位首个失败及一个代表场景。后端10个完整分片继续运行。",
+      "scope": "原目标和六项交付不变；只保留必要局部补修、原用例验证与集中增量复核。不限时长/次数不扩大范围；原工作和失败保留。"
+    },
+    {
+      "at": "2026-10-10T03:50:00+08:00",
+      "task_id": "R12",
+      "delivery_unit_added": false,
+      "actual": "版本308708b4原后端CI已结束：18通过、6失败、8取消、1跳过。原完整包Linux两版本各2项通过；网页补修原场景通过，完整206验收中。spool、paper与盘中原失败已聚焦验证；journal顺序红已复现并补修验证中。新增fixture/接口/指纹耗时只做直接原因诊断。正式CI尚未通过。",
+      "scope": "新反过度工程规则同步活动子代理；只做原目标实现、真实阻断补修、必要验收和组合增量复核。不限时长次数不扩大范围，旧工作、原失败和有效结果保留。"
+    },
+    {
+      "at": "2026-10-10T04:28:00+08:00",
+      "task_id": "R12",
+      "delivery_unit_added": false,
+      "actual": "原206结束：141通过、55失败、10跳过，875秒。55个失败按19组症状归并；已确认接线、时钟和定位问题按独立文件并行补修，实验页原5节点通过。后端局部补修已冻结；原533秒节点的重复指纹成本已证，只拟单入口复用现有作用域，前置模型核对中。原CI仍未通过。",
+      "scope": "执行新增反过度工程规则；原目标、验收、25项计数不变。无全仓审计、重构或逐项重复审查。无限时长次数不扩范围，已有工作及失败保留。"
+    },
+    {
+      "at": "2026-10-10T05:03:00+08:00",
+      "task_id": "R12",
+      "delivery_unit_added": false,
+      "actual": "原网页55失败中47个已定向通过，余8个加入盯盘、外框和真实报告/阶段评估继续。健康/保存/公式原7节点通过。后端两行既有作用域补修冻结，7原节点通过，普通原节点533.60→279.69秒；候选含其他已知改动，不作全部差额单一归因。原完整206为141通过/55失败/10跳过；正式CI仍未通过。",
+      "scope": "新增反过度工程规则已同步；固定25项、19完成6剩余。旧失败和有效结果保留，只做交付所需接线、修复、验证和增量审查。无限时长次数不扩大范围。"
+    },
+    {
+      "at": "2026-10-10T05:26:00+08:00",
+      "task_id": "R12",
+      "delivery_unit_added": false,
+      "actual": "原55网页失败中51个已定向通过，余4个真实报告/阶段评估owner验收中。watchlist与shell各原2节点通过；shell结论仅未启用分支导航。原206业务保留，报告时钟1dependency setup另列。monitor原native2仅复用既有pipeline/Serving作EV补证；control2需真实Linux/systemd同读，Mac无此前提。原完整206/10skip与正式CI状态保持，未计整体PASS。",
+      "scope": "固定25项、19完成6剩余。反过度工程规则有效；只补真实验收缺口，优先现有API的EV组合，不新建监控永久分支、框架或审查阶段。"
+    },
+    {
+      "at": "2026-10-10T05:51:00+08:00",
+      "task_id": "R12",
+      "delivery_unit_added": false,
+      "actual": "原监控native2一次2P/17.66秒，永久源码零改；control2保持真实Linux前提。报告准备链137秒完成，4浏览器节点尚未通过；完整浏览器驱动就绪，等待两新源冻结。原55失败仍51个定向通过，原完整及CI终态不改写。",
+      "scope": "原25项与全部验收标准保持。只修真实验收的直接接点，旧结果及失败保留，不增加永久代码、审计或重构阶段。"
+    },
+    {
+      "at": "2026-10-10T06:22:11+08:00",
+      "task_id": "R12",
+      "delivery_unit_added": false,
+      "actual": "原55个网页失败均有定向通过证据；最后导出2项及阶段评估2项通过，原任务、完整读取、权限和时限保持。53个源码叶及必要派生输入已冻结，标准元数据生成和check通过。一次完整207项浏览器验证与原审查者一次组合增量审查并行中，均未计最终通过。监控告警管线原2项另有实际通过证据，切换2项仍需真实Linux/systemd同读。原失败、skip和CI终态保留。",
+      "scope": "原25项和验收标准保持；复用有效结果，只做交付必需验证、一次组合增量审查及同候选CI，不新增审计、重构或任务。"
+    },
+    {
+      "at": "2026-10-10T06:38:24+08:00",
+      "task_id": "R12",
+      "delivery_unit_added": false,
+      "actual": "新完整206业务=179通过、17失败、10跳过，另setup1通过，1024秒；2560输入及2张原PNG起终一致，自有进程/端口/临时根全清。11个因子失败已证原600秒新鲜度门正确拒绝，另外名单/本页盯盘/外框5项核同接点；协作1项是跨节点在途route，精确清理继续。组合审查唯一FCR-CI-02-001为Linux启动路径，两原作者最小补修。三条独立写集并行，原55个定向通过与旧完整失败记录保留，不计R12整体通过。",
+      "scope": "只修实际17失败与唯一Linux启动finding；保留原guards/预算/断言，复用有效结果，不新增完整本地重跑、审查或重构阶段。"
+    },
+    {
+      "at": "2026-10-10T07:04:02+08:00",
+      "task_id": "R12",
+      "delivery_unit_added": false,
+      "actual": "原完整17个失败均已定向通过：私有时钟修后原16项通过，协作在途清理修后原4项通过（其中3项为相关原场景）；原完整179通过、17失败、10跳过仍保留，不计R12整体通过。Linux临时路径已最小修补，但真实定义登记目录fd枚举为空，同inode独立只读fd读到完整expected。只拟调整现有_directory_names句柄生命周期，保留原完整性校验；原审查者核冻结局部方案，原作者准备直接红测。源码及验收范围不扩大，固定25项、19完成、6剩余。",
+      "scope": "反过度工程规则已同步活动原作者及原审查者。仅Linux启动现有目录函数和原实际增量，复用有效结果，不增加完整本地重跑、全仓审计、重构或交付项。"
+    },
+    {
+      "at": "2026-10-10T07:29:16+08:00",
+      "task_id": "R12",
+      "delivery_unit_added": false,
+      "actual": "原17个浏览器失败均已定向通过。定义目录枚举只修现有函数，Linux原3节点实际3P/12.79秒；六叶定向复核无新增代码阻断。AI原Linux启动meta200/24.81秒，worker和完整reader已执行、自有资源全清。报告原启动65.88秒失败，未耗尽180秒；包装回执未保留底层ValueError。一次prepare+context_read观察37.06秒成功未复现审批失败，64已处理分类事件不作原因。仅在原审批处取证，产品/guard和当前六叶冻结，原失败及cleanup.pass=false保留、资源已收尾。固定25项/19完成/6剩余，R12未整体通过。",
+      "scope": "只继续同一报告审批实际阻断；有效原测试和六叶复核复用，不增加审计/重构/交付项或额外全套测试。"
+    },
+    {
+      "at": "2026-10-10T07:45:11+08:00",
+      "task_id": "R12",
+      "delivery_unit_added": false,
+      "actual": "原17个浏览器失败已有定向通过证据，六叶代码复核无新增阻断；Linux原3项和AI原启动继续有效。报告在121.54秒实际退出，底层ValueError来自完整读取结束时的Lab版本复验；已采入读DB/WAL版本，退出版本仍缺，不猜变化分量。原65.88秒失败及180秒诊断超时保留，清理验收false不改；进程、容器、线程、端口、根和IPC已清。只补采原两次版本返回值，产品、guard和时限保持冻结。固定25项、19完成、6剩余，R12未整体通过。",
+      "scope": "只补齐同一报告读取版本复验的必要证据；复用有效原测试及六叶复核，不新增审计、重构、交付项或完整本地重跑。"
+    },
+    {
+      "at": "2026-10-10T08:08:14+08:00",
+      "task_id": "R12",
+      "delivery_unit_added": false,
+      "actual": "报告原Linux链在普通UID502环境159.26秒取得Alice认证meta200，低于原180秒；原准备、worker、封存、审批、完整读取和发布均执行，7份worker与全部自有资源清理通过。AI原Linux启动24.81秒通过。源码和829叶快照不变；UID0旧失败及WAL元数据观察保留，底层机制未证明，停止追加诊断。原17个浏览器失败定向通过，六叶代码复核无新增阻断，固定25项、19本地完成、6剩余；正式CI和R12整体仍待。",
+      "scope": "只补核原启动证据、必要派生元数据与同候选正式CI；停止追加底层诊断，无新增源码、审计、重构或完整本地重跑。"
     }
   ],
   "update_policy": [
@@ -3829,7 +3982,7 @@
   "parallelism": {
     "user_authorized_subagents": 15,
     "runtime_slots_including_root": 16,
-    "running_subagents": 0,
+    "running_subagents": 1,
     "policy": "全部可独立写入的工作按依赖并行；共享接口单一负责人整合；空出槽位立即接下一个具备条件的交付。",
     "workers": [
       {
@@ -3837,80 +3990,126 @@
         "tasks": [
           "R12"
         ],
-        "work": "精确Error-only/纯定义导入边界；保留零配置及零连接验证。",
-        "status": "completed"
+        "work": "原协作4项及原Linux AI ready通过，所有自有资源全清、源码冻结停写。",
+        "status": "frozen_completed_or_waiting_final_candidate",
+        "baseline_commit": "308708b4dbf6cdd722a5a45be93ba1c84924dcba"
       },
       {
         "agent": "/root/r03_scope_closure",
         "tasks": [
           "R12"
         ],
-        "work": "只读定位R07-B06与Linuxgeneration实际失败，给最小接点后停止。",
-        "status": "completed"
+        "work": "原price7节点通过，两测试叶冻结。",
+        "status": "frozen_completed_or_waiting_final_candidate",
+        "baseline_commit": "308708b4dbf6cdd722a5a45be93ba1c84924dcba"
       },
       {
         "agent": "/root/native_completion_resume",
         "tasks": [
           "R12"
         ],
-        "work": "只读定位跨平台1个测试节点身份差异，不全收集或改门禁。",
-        "status": "completed"
+        "work": "报告原Linux链159.26秒通过，源码和快照不变，自有资源全清，冻结停写。",
+        "status": "frozen_completed_or_waiting_final_candidate",
+        "baseline_commit": "308708b4dbf6cdd722a5a45be93ba1c84924dcba"
       },
       {
         "agent": "/root/parameter_family_acceptance",
         "tasks": [
           "R12"
         ],
-        "work": "只取得一个原回放的完整notifier异常；冻结其它叶，未授权猜测修复。",
-        "status": "completed"
+        "work": "原screener5P冻结；10skip只读映射完成，不增加PASS。",
+        "status": "frozen_completed_or_waiting_final_candidate",
+        "baseline_commit": "308708b4dbf6cdd722a5a45be93ba1c84924dcba"
       },
       {
         "agent": "/root/study_pages_completion",
         "tasks": [
           "R12"
         ],
-        "work": "API导入副作用单叶修复已冻；快照一致、原日终22项通过。",
-        "status": "completed"
+        "work": "原minute4个唯一节点通过，单叶冻结。",
+        "status": "frozen_completed_or_waiting_final_candidate",
+        "baseline_commit": "308708b4dbf6cdd722a5a45be93ba1c84924dcba"
       },
       {
         "agent": "/root/final_candidate_review",
         "tasks": [
           "R12"
         ],
-        "work": "原19个文件复核通过；下一步只复核两处新增改动及派生路径。",
-        "status": "waiting_for_frozen_delta"
+        "work": "复用原53叶和六叶复核，只补核实际Linux启动及R07派生元数据，裁定FCR-CI-02-001。",
+        "status": "active_original_finding_evidence_and_derived_metadata_review",
+        "baseline_commit": "308708b4dbf6cdd722a5a45be93ba1c84924dcba"
       },
       {
         "agent": "/root/ai_assistance_completion_impl",
         "tasks": [
           "R12"
         ],
-        "work": "定位Linux三UID测试缺既有依赖，仅授权原测试叶补齐。",
-        "status": "completed"
+        "work": "ownerconfig3fad冻结，206业务+1setup，原7P保持；无monitor永久分支。",
+        "status": "frozen_completed_or_waiting_final_candidate",
+        "baseline_commit": "308708b4dbf6cdd722a5a45be93ba1c84924dcba"
       },
       {
         "agent": "/root/ci_fixture_portability",
         "tasks": [
           "R12"
         ],
-        "status": "completed",
-        "work": "仅补测试入口异常日志；原调用保持，本地原两条Linux验收通过。"
+        "status": "frozen_completed_or_waiting_final_candidate",
+        "work": "显式private时钟选择单点修补冻结，原16失败一次通过；资源清理完成。",
+        "baseline_commit": "308708b4dbf6cdd722a5a45be93ba1c84924dcba"
       },
       {
         "agent": "/root/r07_candidate_metadata",
         "tasks": [
           "R12"
         ],
-        "status": "completed",
-        "work": "事件owner原v1与mixed路径兼容；两产品叶和两直接测试叶。"
+        "status": "frozen_completed_or_waiting_final_candidate",
+        "work": "原stock2节点通过，单叶冻结。",
+        "baseline_commit": "308708b4dbf6cdd722a5a45be93ba1c84924dcba"
       },
       {
         "agent": "/root/ci_task_entrypoints",
         "tasks": [
           "R12"
         ],
-        "status": "completed",
-        "work": "按既有规则恢复缺失独立审计参考；保留原失败和只读/清理约束。"
+        "status": "frozen_completed_or_waiting_final_candidate",
+        "work": "原task6个唯一节点通过，单叶冻结。",
+        "baseline_commit": "308708b4dbf6cdd722a5a45be93ba1c84924dcba"
+      },
+      {
+        "agent": "/root/ci_worker_resource_failures",
+        "tasks": [
+          "R12"
+        ],
+        "status": "frozen_completed_or_waiting_final_candidate",
+        "work": "原pool2P冻结，自有清理错误已收尾并保留。",
+        "baseline_commit": "308708b4dbf6cdd722a5a45be93ba1c84924dcba"
+      },
+      {
+        "agent": "/root/ci_shard0_contracts",
+        "tasks": [
+          "R12"
+        ],
+        "status": "frozen_completed_or_waiting_final_candidate",
+        "work": "两行既有scope补修冻结，原7节点通过，交集中审查。",
+        "baseline_commit": "308708b4dbf6cdd722a5a45be93ba1c84924dcba"
+      },
+      {
+        "agent": "/root/ci_native_family_inputs",
+        "tasks": [
+          "R12"
+        ],
+        "status": "frozen_completed_or_waiting_final_candidate",
+        "work": "原legacy历史单节点通过，单叶冻结。",
+        "baseline_commit": "308708b4dbf6cdd722a5a45be93ba1c84924dcba"
+      },
+      {
+        "agent": "/root/ci_paper_view_failures",
+        "tasks": [
+          "R12"
+        ],
+        "status": "frozen_completed_or_waiting_final_candidate",
+        "work": "原native2独立一次2P冻结，永久源码零改；control2保存真实Linux前提。",
+        "baseline_commit": "308708b4dbf6cdd722a5a45be93ba1c84924dcba"
       }
     ],
     "configured_max_threads": 15,
@@ -3919,15 +4118,12 @@
       "/Users/roxor/brain/30-projects/rQuant/.worktrees/cdx-factor-source-integration/.codex/config.toml"
     ],
     "live_reload_verified": true,
-    "root_work": "核冻结输入和有效证据，维护固定清单；完成后一次增量复核与同PR必要CI。",
-    "waiting_subagents": 0,
+    "root_work": "维护固定25项与明确文件归属，复用原证据；冻结必要差异，统一元数据和同候选CI。",
+    "waiting_subagents": 1,
     "runtime_capacity_evidence": "本轮app运行环境重新初始化后的原生元数据明确提供16个并发槽位，包含Root；不是修改配置后推断即时生效。",
     "active_subagents": [
-      "/root/r07_candidate_metadata",
-      "/root/study_perf_resume",
-      "/root/ci_task_entrypoints",
-      "/root/parameter_family_acceptance"
+      "/root/final_candidate_review"
     ],
-    "next": "Root统一派生元数据后，原审查者只审组合增量；不增加逐子任务审查。"
+    "next": "只更新R07派生元数据并核精确候选，原审查者补核实际启动证据，提交同一PR并运行正式CI；复用有效结果，不再完整本地重跑。"
   }
 }

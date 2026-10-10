@@ -34,7 +34,7 @@ def test_original_private_transport_owner_confirmation_recovery_and_cleanup(tmp_
         # macOS cannot create a distinct OS identity here. Transport and filesystem
         # checks are real; only the trusted peer identity is supplied by the fixture.
         web_uid = os.geteuid() + 1
-        with tempfile.TemporaryDirectory(prefix="pp-", dir="/private/tmp") as directory:
+        with tempfile.TemporaryDirectory(prefix="pp-", dir=Path(tempfile.gettempdir()).resolve()) as directory:
             socket_root = Path(directory)
             os.chown(socket_root, os.geteuid(), os.getegid(), follow_symlinks=False)
             socket_root.chmod(0o710)

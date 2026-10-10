@@ -14,8 +14,23 @@ export function StockNewsDigest({
   return <News key={`${viewer}:${stockCode}`} viewer={viewer} stockCode={stockCode} />;
 }
 function News({ viewer, stockCode }: { viewer: string | null; stockCode: string | null }) {
-  const query = useAiNews(viewer, stockCode);
   const capability = useAiCapabilities(viewer, stockCode !== null);
+  const waiting =
+    capability.isFetching || (capability.data === undefined && capability.error === null);
+  const canRead =
+    viewer !== null &&
+    stockCode !== null &&
+    !waiting &&
+    capability.error === null &&
+    capability.data?.available === true;
+  const query = useAiNews(viewer, stockCode, canRead);
+  const readMessage = !viewer
+    ? "请先登录"
+    : !stockCode
+      ? "先选择一只股票"
+      : waiting
+        ? "正在读取助手状态"
+        : (capability.error?.message ?? capability.data?.message ?? "原文摘要暂不可用。");
   const request = useAiGeneration(viewer, `news:${stockCode}`);
   const data = query.data;
   const content = data?.content?.digest.owner_uid === viewer ? data.content : null;
@@ -24,7 +39,14 @@ function News({ viewer, stockCode }: { viewer: string | null; stockCode: string 
     <Panel
       title="原文摘要"
       actions={
-        <Button size="sm" variant="ghost" onClick={query.refetch}>
+        <Button
+          size="sm"
+          variant="ghost"
+          disabledReason={canRead ? undefined : readMessage}
+          onClick={() => {
+            if (canRead) query.refetch();
+          }}
+        >
           刷新摘要
         </Button>
       }
@@ -33,6 +55,8 @@ function News({ viewer, stockCode }: { viewer: string | null; stockCode: string 
         <EmptyState title="请先登录" />
       ) : !stockCode ? (
         <EmptyState title="先选择一只股票" />
+      ) : !canRead ? (
+        <EmptyState title={readMessage} />
       ) : query.isLoading ? (
         <SkeletonRows rows={3} />
       ) : query.error ? (

@@ -46,6 +46,10 @@ for (const mode of ["desktop", "phone"] as const) {
         if (new URL(request.url()).pathname.endsWith("/screen/query/execute"))
           executions.push(request.postDataJSON());
       });
+      const metaResponse = await page.request.get("/app/api/v1/meta");
+      expect(metaResponse.ok()).toBeTruthy();
+      const meta: Schemas["MetaData"] = (await metaResponse.json()).data;
+      await page.clock.setFixedTime(new Date(meta.server_time));
       const jobsResponse = await page.request.get("/app/api/v1/backtests/portfolio/runs");
       expect(jobsResponse.ok()).toBeTruthy();
       const jobs: Schemas["PortfolioJobsData"] = (await jobsResponse.json()).data;

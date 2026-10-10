@@ -72,10 +72,15 @@ def test_missing_or_stale_mark_preserves_history_without_substitute_nav(
     assert "估值" in stale.reason and stale.frame.history == value.frame.history
 
 
-def test_real_close_is_recorded_once_and_intraday_material_is_not_a_close(tmp_path: Path) -> None:
+def test_real_close_is_recorded_once_and_intraday_material_is_not_a_close(
+    tmp_path: Path, request: pytest.FixtureRequest
+) -> None:
     from rquant.paper_portfolio_view_source import PaperPortfolioViewSource
 
     broker, basis, _, runtime = filled(tmp_path)
+    owner_connection = broker._connect()
+    request.addfinalizer(owner_connection.close)
+    assert not owner_connection.in_transaction
     material = close_material(basis.configuration)
     runtime.calendar = material.calendar
     market(runtime, at=material.close_at-timedelta(minutes=1))

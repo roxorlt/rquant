@@ -64,7 +64,7 @@ class PortfolioFoundation:
         import shutil
         from rquant.lab_finalizer import LabFinalizer
         from rquant.lab_worker import LabWorker, build_builtin_shard_runtime_manifest
-        ipc_root = Path(tempfile.mkdtemp(prefix='rqai-', dir='/private/tmp'))
+        ipc_root = Path(tempfile.mkdtemp(prefix='rqai-', dir=Path('/tmp').resolve()))
         os.chmod(ipc_root, 0o700)
         previous_tempdir, previous_env = tempfile.tempdir, os.environ.get('TMPDIR')
         tempfile.tempdir, os.environ['TMPDIR'] = str(ipc_root), str(ipc_root)

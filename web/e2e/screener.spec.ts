@@ -279,9 +279,24 @@ test("中文条件筛选、翻页和个股详情在桌面与手机宽度可用",
 
 test("一句话建议经键盘预览和人工应用，手机手改后才运行真实筛选", async ({ page }, testInfo) => {
   const watcher = watch(page);
-  const previews: Schemas["ScreenNlPreviewRequest"][] = [];
+  const previews: Schemas["AIScreenRequest"][] = [];
   const runs: Execute[] = [];
+  const suggestions = new Map<
+    string,
+    { request: Schemas["AIScreenRequest"]; view: Schemas["AIRequestView"] }
+  >();
+  let serving: Schemas["ServingMeta"] | null = null;
   let sourceIdentity: string | null = null;
+  await page.route("**/api/v1/ai/capabilities", async (route) => {
+    const response = await route.fetch();
+    expect(response.ok()).toBe(true);
+    const body = (await response.json()) as Schemas["Envelope_AICapabilities_"];
+    serving = body.serving;
+    body.data.available = true;
+    body.data.can_generate = true;
+    body.data.message = null;
+    await route.fulfill({ response, json: body });
+  });
   await page.route(/\/api\/v1\/screen\/blocks\?mode=daily$/, async (route) => {
     const response = await route.fetch();
     const body = (await response.json()) as Schemas["Envelope_ScreenCatalogData_"];
@@ -289,22 +304,50 @@ test("一句话建议经键盘预览和人工应用，手机手改后才运行�
     sourceIdentity = body.data.source?.identity ?? null;
     await route.fulfill({ response, json: body });
   });
-  await page.route("**/api/v1/screen/nl-preview", async (route) => {
-    const request = route.request().postDataJSON() as Schemas["ScreenNlPreviewRequest"];
+  await page.route("**/api/v1/ai/requests", async (route) => {
+    const request = route.request().postDataJSON() as Schemas["AIScreenRequest"];
     expect(route.request().headers()["x-rquant-csrf"]).toBe("1");
+    expect(request.purpose).toBe("screen");
     expect(request.source_identity).toBe(sourceIdentity);
+    if (!serving) throw new Error("Original capability Serving is required for this fixture.");
     previews.push(request);
+    const view: Schemas["AIRequestView"] = {
+      request_id: request.request_id,
+      purpose: "screen",
+      state: "completed",
+      created_at: "2026-09-24T07:36:00Z",
+      message: null,
+      result: {
+        purpose: "screen",
+        definition: {
+          schema_version: 1,
+          mode: "daily",
+          description: request.instruction,
+          source_kind: request.source_kind,
+          source_identity: request.source_identity,
+          trade_date: request.trade_date,
+          conditions: [
+            { name: "not_st", args: {} },
+            { name: "circ_mv_lt", args: { threshold_yi: 80 } },
+          ],
+          ranking: null,
+        },
+      },
+    };
+    suggestions.set(request.request_id, { request, view });
     await route.fulfill({
       status: 200,
-      json: {
-        source_kind: request.source_kind,
-        source_identity: request.source_identity,
-        trade_date: request.trade_date,
-        conditions: [
-          { key: "not_st", args: {} },
-          { key: "circ_mv_lt", args: { threshold_yi: 80 } },
-        ],
-      } satisfies Schemas["ScreenNlPreviewData"],
+      json: { data: view, serving } satisfies Schemas["Envelope_AIRequestView_"],
+    });
+  });
+  await page.route("**/api/v1/ai/requests/lookup", async (route) => {
+    const request = route.request().postDataJSON() as Schemas["AIScreenRequest"];
+    expect(route.request().headers()["x-rquant-csrf"]).toBe("1");
+    const record = suggestions.get(request.request_id);
+    if (!record || !serving) throw new Error("Only the original synthetic request can be read.");
+    expect(request).toEqual(record.request);
+    await route.fulfill({
+      json: { data: record.view, serving } satisfies Schemas["Envelope_AIRequestView_"],
     });
   });
   await screenCommands(page, (request) => {
@@ -322,7 +365,7 @@ test("一句话建议经键盘预览和人工应用，手机手改后才运行�
   await description.focus();
   await page.keyboard.type("排除 ST，流通市值低于 80 亿");
   await page.keyboard.press("Tab");
-  await expect(page.getByRole("button", { name: "生成条件" })).toBeFocused();
+  await expect(page.getByRole("button", { name: "生成建议" })).toBeFocused();
   await page.keyboard.press("Enter");
   const preview = page.getByRole("region", { name: "建议条件" });
   await expect(preview).toContainText("排除 ST");
@@ -428,6 +471,10 @@ test("自定义 RSI 周期和偏移在桌面与手机可输入并提交", async 
 
 test("排名条件可编辑、折算并按分数稳定翻页，手机上可修改前 N", async ({ page }) => {
   const watcher = watch(page);
+  const resultStatus = page
+    .locator("section.panel")
+    .filter({ has: page.getByRole("heading", { level: 2, name: /^结果(?: ·|$)/ }) })
+    .getByRole("status");
   await page.setViewportSize({ width: 1440, height: 900 });
   await page.goto("./#/screener");
   await expect(page.getByRole("button", { name: "添加排名" })).toBeVisible();
@@ -456,7 +503,7 @@ test("排名条件可编辑、折算并按分数稳定翻页，手机上可修�
   await page.setViewportSize({ width: 390, height: 844 });
   await expect(page.getByRole("spinbutton", { name: "取前 N 只" })).toBeVisible();
   await page.getByRole("spinbutton", { name: "取前 N 只" }).fill("24");
-  await expect(page.getByRole("status")).toContainText("条件已改，请重新运行");
+  await expect(resultStatus).toContainText("条件已改，请重新运行");
   await expect(page.getByRole("button", { name: "下一页" })).toBeDisabled();
   await expectNoHorizontalOverflow(page, "ranked screener phone");
   expect(findJargon(await page.locator("main").innerText())).toEqual([]);
@@ -486,6 +533,10 @@ test("手机宽度明确展示未判定股票，不把未知写成零命中", as
 
 test("选股来源独立换代后保留条件，失效时桌面与手机都要求重试", async ({ page }, testInfo) => {
   const watcher = watch(page);
+  const resultStatus = page
+    .locator("section.panel")
+    .filter({ has: page.getByRole("heading", { level: 2, name: /^结果(?: ·|$)/ }) })
+    .getByRole("status");
   let identity = "a".repeat(64);
   let unavailable = false;
   let catalogReads = 0;
@@ -522,12 +573,12 @@ test("选股来源独立换代后保留条件，失效时桌面与手机都要�
   identity = "b".repeat(64);
   await page.getByRole("button", { name: "刷新选股数据" }).click();
   await expect.poll(() => catalogReads).toBe(2);
-  await expect(page.getByRole("status")).toContainText("选股数据已更新，请重新筛选");
+  await expect(resultStatus).toContainText("选股数据已更新，请重新筛选");
   await expect(page.getByRole("table", { name: "选股结果" })).toHaveCount(0);
   await expect(page.getByRole("combobox", { name: "条件目录" })).toHaveValue("not_st");
   await page.getByRole("button", { name: "运行筛选" }).click();
   await expect(page.getByText("命中 27 只")).toBeVisible();
-  await expect(page.getByRole("status")).toHaveCount(0);
+  await expect(resultStatus).toHaveCount(0);
 
   unavailable = true;
   await page.getByRole("button", { name: "刷新选股数据" }).click();
@@ -535,7 +586,7 @@ test("选股来源独立换代后保留条件，失效时桌面与手机都要�
   await expect(page.getByText("选股数据暂不可用")).toBeVisible();
   await expect(page.getByRole("button", { name: "运行筛选" })).toBeDisabled();
   await page.setViewportSize({ width: 390, height: 844 });
-  await expect(page.getByRole("status")).toContainText("选股数据已更新，请重新筛选");
+  await expect(resultStatus).toContainText("选股数据已更新，请重新筛选");
   await expectNoHorizontalOverflow(page, "screen source unavailable phone");
   expect(findJargon(await page.locator("main").innerText())).toEqual([]);
   expect(await page.locator("main").innerText()).not.toContain(identity);
@@ -545,6 +596,10 @@ test("选股来源独立换代后保留条件，失效时桌面与手机都要�
 
 test("基本面条件在桌面和手机按单位输入，来源更新会清掉旧结果", async ({ page }) => {
   const watcher = watch(page);
+  const resultStatus = page
+    .locator("section.panel")
+    .filter({ has: page.getByRole("heading", { level: 2, name: /^结果(?: ·|$)/ }) })
+    .getByRole("status");
   let identity = "a".repeat(64);
   const requests: Execute[] = [];
   await page.route(/\/api\/v1\/screen\/blocks\?mode=daily$/, async (route) => {
@@ -614,7 +669,7 @@ test("基本面条件在桌面和手机按单位输入，来源更新会清掉�
 
   identity = "c".repeat(64);
   await page.getByRole("button", { name: "刷新选股数据" }).click();
-  await expect(page.getByRole("status")).toContainText("选股数据已更新，请重新筛选");
+  await expect(resultStatus).toContainText("选股数据已更新，请重新筛选");
   await expect(page.getByRole("table", { name: "选股结果" })).toHaveCount(0);
   expect(findJargon(await page.locator("main").innerText())).toEqual([]);
   expect(watcher.problems).toEqual([]);
@@ -643,6 +698,10 @@ async function advanceServingClock(page: Page): Promise<void> {
 
 test("默认 Serving 换代重取选股目录，并要求旧结果重新筛选", async ({ page }) => {
   const watcher = watch(page);
+  const resultStatus = page
+    .locator("section.panel")
+    .filter({ has: page.getByRole("heading", { level: 2, name: /^结果(?: ·|$)/ }) })
+    .getByRole("status");
   let generationId = "a".repeat(64);
   let catalogReads = 0;
   await page.route("**/api/v1/meta", async (route) => {
@@ -681,7 +740,7 @@ test("默认 Serving 换代重取选股目录，并要求旧结果重新筛选",
   generationId = "b".repeat(64);
   await advanceServingClock(page);
   await expect.poll(() => catalogReads).toBe(2);
-  await expect(page.getByRole("status")).toContainText("选股数据已更新，请重新筛选");
+  await expect(resultStatus).toContainText("选股数据已更新，请重新筛选");
   await expect(page.getByRole("table", { name: "选股结果" })).toHaveCount(0);
   await expect(page.getByRole("combobox", { name: "条件目录" })).toHaveValue("not_st");
   expect(watcher.problems).toEqual([]);

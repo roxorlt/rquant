@@ -1,4 +1,5 @@
 import { expect, type Page, test } from "@playwright/test";
+import type { Schemas } from "../src/api/client.ts";
 import type { ExperimentWrite } from "../src/api/experiments.ts";
 import { experimentFixture as fixture } from "../src/pages/experiments/formal.fixture.ts";
 import { experimentTemplateFixture as template } from "../src/pages/experiments/template.fixture.ts";
@@ -32,6 +33,25 @@ async function api(page: Page, baseURL: string | undefined, preparing = false) {
     const respond = (value: unknown) => route.fulfill({ status: 200, json: value });
     if (url.pathname === "/app/api/v1/meta")
       return respond(metaEnvelope({ viewer: "alice", generationId: fixture.generation_id }));
+    if (url.pathname === "/app/api/v1/collaboration/me") {
+      const meta = metaEnvelope({ viewer: "alice", generationId: fixture.generation_id });
+      const envelope: Schemas["Envelope_CollaborationMe_"] = {
+        serving: { ...meta.serving, generation_id: null },
+        data: {
+          available: false,
+          mode: "legacy",
+          username: meta.data.viewer,
+          role: null,
+          revision: null,
+          state_sha256: null,
+          can_manage_users: false,
+          can_research: false,
+          can_read_audit: false,
+          message: "协作权限尚未启用。",
+        },
+      };
+      return respond(envelope);
+    }
     if (url.pathname === "/app/api/v1/strategy-templates") return respond(template.catalog);
     if (url.pathname === "/app/api/v1/strategy-templates/sources") return respond(template.sources);
     if (

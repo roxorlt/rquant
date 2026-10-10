@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import type { Schemas } from "../src/api/client.ts";
 import { findJargon } from "../src/test/jargon.ts";
 import { APP_URL } from "./env.ts";
 import { expectNoHorizontalOverflow, watch } from "./watch.ts";
@@ -7,9 +8,32 @@ test("实验记录可跨页对比真实结果，桌面与手机可读", async ({
   const watcher = watch(page);
   const meta = await page.request.get(`${APP_URL}api/v1/meta`);
   expect(meta.ok()).toBeTruthy();
-  const serving = (await meta.json()).serving;
+  const envelope: Schemas["Envelope_MetaData_"] = await meta.json();
+  const serving = envelope.serving;
+  expect(envelope.data.viewer).not.toBeNull();
+  expect(envelope.data.generation?.generation_id).toBe(serving.generation_id);
+  await page.route("**/api/v1/meta", (route) => route.fulfill({ json: envelope }));
+  const capabilities: Schemas["Envelope_ExperimentCapabilities_"] = {
+    serving,
+    data: {
+      available: false,
+      can_search: false,
+      can_unseal: false,
+      can_edit_policy: false,
+      can_search_templates: false,
+      message: "正式实验尚未启用，请先准备受限来源。",
+      sources: [],
+      default_config: null,
+      policy: null,
+    },
+  };
+  await page.route("**/api/v1/experiments/capabilities", (route) =>
+    route.fulfill({ json: capabilities }),
+  );
   await page.route("**/api/v1/experiments*", async (route) => {
-    const more = new URL(route.request().url()).searchParams.has("cursor");
+    const url = new URL(route.request().url());
+    expect(url.searchParams.get("generation_id")).toBe(serving.generation_id);
+    const more = url.searchParams.has("cursor");
     await route.fulfill({
       json: {
         serving,

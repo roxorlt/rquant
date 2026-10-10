@@ -17,6 +17,7 @@ import os
 import shutil
 import stat
 import sys
+from datetime import datetime
 from pathlib import Path
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -49,6 +50,7 @@ def main(arguments: list[str] | None = None) -> int:
     parser.add_argument("--publish-next", action="store_true")
     parser.add_argument("--replace", action="store_true")
     parser.add_argument("--audit", action="store_true", help="include synthetic audit results")
+    parser.add_argument("--built-at", type=datetime.fromisoformat, help="explicit generation time")
     args = parser.parse_args(arguments)
 
     root: Path = args.out
@@ -70,7 +72,9 @@ def main(arguments: list[str] | None = None) -> int:
     else:
         sequence = 0
 
-    manifest = build_web_fixture(root, args.scenario, sequence=sequence, audit=args.audit)
+    manifest = build_web_fixture(
+        root, args.scenario, sequence=sequence, audit=args.audit, built_at=args.built_at
+    )
     marker.write_text(json.dumps({"scenario": args.scenario}) + "\n", encoding="utf-8")
     report = {
         "serving_root": str(root),

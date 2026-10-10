@@ -32,6 +32,7 @@ async function fixture(page: Page, baseURL: string | undefined) {
   const expectedHttpErrors = new Map<string, number>();
   let generation = taskGeneration;
   let viewer = "alice";
+  let metaViewer = viewer;
   let lost = false;
   let rejectNext = false;
   let disabled = false;
@@ -67,11 +68,37 @@ async function fixture(page: Page, baseURL: string | undefined) {
     const path = url.pathname.replace(/^\/app/, "");
     const json = (value: unknown) => route.fulfill({ json: value });
     if (path === "/api/v1/meta") {
+      if (viewer !== metaViewer) {
+        const response = await page.waitForResponse(
+          (response) =>
+            new URL(response.url()).pathname.replace(/^\/app/, "") === "/api/v1/collaboration/me",
+        );
+        await response.finished();
+        metaViewer = viewer;
+      }
       const meta = structuredClone(taskMeta);
       meta.data.viewer = viewer;
       meta.serving.generation_id = generation;
       if (meta.data.generation) meta.data.generation.generation_id = generation;
       return json(meta);
+    }
+    if (request.method() === "GET" && path === "/api/v1/collaboration/me") {
+      const envelope: Schemas["Envelope_CollaborationMe_"] = {
+        serving: { ...taskMeta.serving, generation_id: null },
+        data: {
+          available: false,
+          mode: "legacy",
+          username: viewer,
+          role: null,
+          revision: null,
+          state_sha256: null,
+          can_manage_users: false,
+          can_research: false,
+          can_read_audit: false,
+          message: "协作权限尚未启用。",
+        },
+      };
+      return json(envelope);
     }
     if (path === "/api/v1/health")
       return json({ serving: overview.serving, data: { available: false, units: [] } });

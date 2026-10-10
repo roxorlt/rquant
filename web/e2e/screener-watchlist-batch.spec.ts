@@ -13,14 +13,22 @@ for (const width of [1440, 390]) {
     const meta = (await metaResponse.json()) as MetaEnvelope;
     let codes: string[] = [];
     const sent: Schemas["ManualWatchlistCommandRequest"][] = [];
-    await page.route("**/api/v1/screen/run", async (route) => {
-      const response = await route.fetch();
-      const body = (await response.json()) as Schemas["Envelope_ScreenRunData_"];
-      body.data.rows = body.data.rows.slice(0, 2);
-      body.data.total = 43;
-      codes = body.data.rows.map((row) => row.ts_code);
-      await route.fulfill({ response, json: body });
-    });
+    await page.route(
+      /\/api\/v1\/screen\/query\/executions\/[^/?]+(?:\/results)?(?:\?.*)?$/,
+      async (route) => {
+        const response = await route.fetch();
+        const body = (await response.json()) as Schemas["ScreenQueryReadData"];
+        if (new URL(route.request().url()).pathname.endsWith("/results")) {
+          if (!body.results) throw new Error("original screen results missing");
+          body.results.rows = body.results.rows.slice(0, 2);
+          codes = body.results.rows.map((row) => row.ts_code);
+        } else {
+          if (!body.execution) throw new Error("original screen execution missing");
+          body.execution.total = 43;
+        }
+        await route.fulfill({ response, json: body });
+      },
+    );
     await page.route("**/api/v1/watchlist", (route) =>
       route.fulfill({
         json: {

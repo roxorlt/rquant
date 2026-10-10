@@ -15,11 +15,11 @@ import { experimentFixture } from "../src/pages/experiments/formal.fixture.ts";
 import { nativeExperimentFixture } from "../src/pages/experiments/native.fixture.ts";
 import { metaEnvelope } from "../src/test/fixtures.ts";
 import { findJargon } from "../src/test/jargon.ts";
+import { APP_URL } from "./env.ts";
 import { expectNoHorizontalOverflow } from "./watch.ts";
 
 // Synthetic browser projections only. Original owner/worker/seal proofs remain
 // separate. Minute source/NAV literals follow the frozen C6 frontend checkpoint02.
-const origin = "http://127.0.0.1:19369";
 const api = "/app/api/v1";
 const portfolioBase = `${api}/backtests/portfolio`;
 const minuteBase = `${api}/backtests/minute-runtime`;
@@ -203,6 +203,7 @@ const tableCopy: Record<Schemas["MinuteRowsData"]["table"], string> = {
 type Scenario = "monthly" | "native" | "portfolio" | "minute";
 
 async function projectionApi(page: Page, scenario: Scenario) {
+  const origin = new URL(test.info().project.use.baseURL ?? APP_URL).origin;
   const problems: string[] = [];
   const expectedLosses: string[] = [];
   const monthOffsets: number[] = [];
@@ -542,7 +543,10 @@ test("原组合实验参数和净值仍可读", async ({ page }, info) => {
 test("原分钟来源、同UUID丢回执刷新恢复、八表与净值缺口", async ({ page }, info) => {
   const state = await projectionApi(page, "minute");
   await page.goto("./#/backtest?view=minute");
-  await expect(page.getByLabel("策略版本与输入")).toContainText("N字形 · 版本 1");
+  await page.getByRole("button", { name: "打开分钟回放", exact: true }).click();
+  await expect(page.getByLabel("策略版本与输入")).toContainText(
+    `${source.native_name} · 版本 ${source.native_version}`,
+  );
   for (const [label, value] of [
     ["训练开始", "2026-07-01"],
     ["训练结束", "2026-07-15"],
@@ -562,7 +566,9 @@ test("原分钟来源、同UUID丢回执刷新恢复、八表与净值缺口", a
   await page.getByRole("button", { name: "重试原请求", exact: true }).click();
   await expect(page.getByText("已提交分钟回测。", { exact: true })).toBeVisible();
   expect(state.submitted).toHaveLength(2);
-  expect(state.submitted[1]).toBe(state.submitted[0]);
+  expect(JSON.parse(state.submitted[1] ?? "null")).toEqual(
+    JSON.parse(state.submitted[0] ?? "null"),
+  );
   const body: Schemas["MinuteCreateRequest"] = JSON.parse(state.submitted[0] ?? "null");
   expect(body.command_id).toMatch(/^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/);
   expect(body.config).toMatchObject({

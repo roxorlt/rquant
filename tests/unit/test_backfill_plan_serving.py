@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -43,6 +43,12 @@ TABLES = {
     "backfill_plan_job",
     "backfill_plan_event",
 }
+
+
+@pytest.fixture(autouse=True)
+def _current_observation(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Collection can precede the real inode publication in this test by hours.
+    monkeypatch.setattr(f"{__name__}.OBSERVED", datetime.now(UTC) + timedelta(minutes=5))
 
 
 def _source(
@@ -280,8 +286,8 @@ def test_tampered_or_future_task_state_refuses_generation(tmp_path: Path) -> Non
     with sqlite3.connect(state_path) as connection:
         connection.execute(
             "UPDATE backfill_plan_job SET status='queued', attempts=0, "
-            "updated_at='2026-10-02T00:00:00+00:00' WHERE task_id=?",
-            (task.task_id,),
+            "updated_at=? WHERE task_id=?",
+            ((OBSERVED + timedelta(days=1)).isoformat(), task.task_id),
         )
     with pytest.raises(PageProjectionSourceIntegrityError, match="newer than observation"):
         source(OBSERVED)

@@ -65,6 +65,25 @@ async function syntheticApi(
     const familyPath = `${base}/families/${encodeURIComponent(original.family_id)}`;
     if (url.pathname === "/app/api/v1/meta")
       return respond(metaEnvelope({ viewer: "alice", generationId: fixture.generation_id }));
+    if (url.pathname === "/app/api/v1/collaboration/me") {
+      const meta = metaEnvelope({ viewer: "alice", generationId: fixture.generation_id });
+      const envelope: Schemas["Envelope_CollaborationMe_"] = {
+        serving: { ...meta.serving, generation_id: null },
+        data: {
+          available: false,
+          mode: "legacy",
+          username: meta.data.viewer,
+          role: null,
+          revision: null,
+          state_sha256: null,
+          can_manage_users: false,
+          can_research: false,
+          can_read_audit: false,
+          message: "协作权限尚未启用。",
+        },
+      };
+      return respond(envelope);
+    }
     if (url.pathname === `${base}/capabilities`) return respond(fixture.capabilities);
     if (url.pathname === `${base}/mine`)
       return respond({ ...fixture.mine, data: { ...fixture.mine.data, items: items() } });
@@ -204,7 +223,10 @@ test("完整结果、热图、两份对比、备注迟回执和一次解封", as
   const chartBox = await nav.boundingBox();
   expect(chartBox?.width).toBeGreaterThan(250);
   expect(chartBox?.height).toBeGreaterThan(100);
-  await drawer.locator("details summary").click();
+  await drawer
+    .locator("details summary")
+    .filter({ hasText: /^逐日净值$/ })
+    .click();
   await expect(drawer.getByRole("table", { name: "实验1逐日净值" })).toBeVisible();
   await expect(drawer.getByLabel("热图横轴").getByRole("option")).toHaveText([
     "最多持仓",

@@ -54,6 +54,25 @@ async function fixture(page: Page, baseURL: string | undefined, uncertain = fals
     const json = (data: unknown) => route.fulfill({ json: paperEnvelope(data, generation) });
     if (path === "/app/api/v1/meta")
       return route.fulfill({ json: metaEnvelope({ generationId: generation, viewer }) });
+    if (request.method() === "GET" && path === "/app/api/v1/collaboration/me") {
+      const meta = metaEnvelope({ generationId: generation, viewer });
+      const envelope: Schemas["Envelope_CollaborationMe_"] = {
+        serving: { ...meta.serving, generation_id: null },
+        data: {
+          available: false,
+          mode: "legacy",
+          username: meta.data.viewer,
+          role: null,
+          revision: null,
+          state_sha256: null,
+          can_manage_users: false,
+          can_research: false,
+          can_read_audit: false,
+          message: "协作权限尚未启用。",
+        },
+      };
+      return route.fulfill({ json: envelope });
+    }
     if (path === "/app/api/v1/health") return json({ available: false, units: [] });
     if (request.method() === "POST") {
       expect(request.headers()["x-rquant-csrf"]).toBe("1");

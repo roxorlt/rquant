@@ -64,9 +64,12 @@ for (const width of [1440, 390]) {
         expect(receiptTextOverhang).toBeLessThanOrEqual(0);
       }
       await expect(page.getByText("可向前翻看历史")).toHaveCount(0);
-      await entries.first().locator(".monitor-event-time .tip-anchor").hover();
+      const time = entries.first().locator(".monitor-event-time .tip-anchor");
+      if (width === 390) await time.tap();
+      else await time.hover();
       await expect(page.getByRole("tooltip", { name: /2026-09-24/ })).toBeVisible();
-      await page.mouse.move(5, 70);
+      if (width === 390) await time.tap();
+      else await page.mouse.move(5, 70);
       await expect(page.getByRole("tooltip", { name: /2026-09-24/ })).toHaveCount(0);
       await expect(timeline.getByRole("button", { name: "确认" })).toHaveCount(0);
       await expectNoHorizontalOverflow(page, "monitor");
@@ -128,7 +131,9 @@ for (const width of [1440, 390]) {
       const plus = section.getByRole("article", { name: "PushPlus" });
       await expect(deer).toContainText("95.0%");
       await expect(plus).toContainText("近 7 日无提交记录");
-      await deer.locator(".monitor-channel-main .tip-anchor").focus();
+      const submission = deer.locator(".monitor-channel-main .tip-anchor");
+      if (width === 390) await submission.tap();
+      else await submission.focus();
       await expect(page.getByRole("tooltip")).toContainText("不代表手机送达");
       await expectNoHorizontalOverflow(page, "channel status");
       for (const card of [deer, plus]) {

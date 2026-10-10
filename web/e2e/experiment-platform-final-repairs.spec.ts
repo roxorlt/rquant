@@ -48,6 +48,25 @@ async function api(
     const reply = (json: unknown) => route.fulfill({ status: 200, json });
     if (url.pathname === "/app/api/v1/meta")
       return reply(metaEnvelope({ viewer: "alice", generationId: fixture.generation_id }));
+    if (url.pathname === "/app/api/v1/collaboration/me") {
+      const meta = metaEnvelope({ viewer: "alice", generationId: fixture.generation_id });
+      const envelope: Schemas["Envelope_CollaborationMe_"] = {
+        serving: { ...meta.serving, generation_id: null },
+        data: {
+          available: false,
+          mode: "legacy",
+          username: meta.data.viewer,
+          role: null,
+          revision: null,
+          state_sha256: null,
+          can_manage_users: false,
+          can_research: false,
+          can_read_audit: false,
+          message: "协作权限尚未启用。",
+        },
+      };
+      return reply(envelope);
+    }
     if (url.pathname === `${base}/capabilities`) {
       if (denial) {
         deniedReads += 1;

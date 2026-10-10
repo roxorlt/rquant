@@ -1129,6 +1129,7 @@ def build_web_fixture(
     scenario: str,
     *,
     sequence: int = 0,
+    built_at: datetime | None = None,
     event_projections: tuple[ServingProjectionPayload, ...] | None = None,
     lab_jobs: tuple[ServingLabJobRecord, ...] = (),
     paper_accounts: tuple[PaperAccountSnapshot, ...] | None = None,
@@ -1154,7 +1155,7 @@ def build_web_fixture(
         raise ValueError(f"unknown web fixture scenario: {scenario}")
     if type(sequence) is not int or sequence < 0:
         raise ValueError("sequence must be a non-negative integer")
-    built_at = fixture_built_at(sequence)
+    built_at = fixture_built_at(sequence) if built_at is None else built_at
     generations = _generation_ids(scenario, sequence)
     if strategy_catalog_projections:
         if {item.table_name for item in strategy_catalog_projections} != {

@@ -75,7 +75,7 @@ def test_private_archive_submit_lookup_and_actor_allowlist(tmp_path: Path) -> No
         expected_head=FactorHeadRef(version=1, content_sha256=saved.content_sha256),
     )
     web_uid = os.geteuid() + 1
-    socket_root = Path(tempfile.mkdtemp(prefix="fa-", dir="/private/tmp"))
+    socket_root = Path(tempfile.mkdtemp(prefix="fa-", dir=tempfile.gettempdir()))
     os.chown(socket_root, os.geteuid(), os.getegid())
     socket_root.chmod(0o710)
     socket_path = socket_root / "factor.sock"
@@ -192,7 +192,7 @@ def test_private_save_requires_independent_enablement_and_original_draft(
             verified_registry_instance_id=identity.instance_id,
         )
     web_uid = os.geteuid() + 1
-    socket_root = Path(tempfile.mkdtemp(prefix="fs-", dir="/private/tmp"))
+    socket_root = Path(tempfile.mkdtemp(prefix="fs-", dir=tempfile.gettempdir()))
     os.chown(socket_root, os.geteuid(), os.getegid())
     socket_root.chmod(0o710)
     server = build_factor_definition_admission_server(

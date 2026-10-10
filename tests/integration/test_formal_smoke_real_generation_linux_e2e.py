@@ -77,7 +77,10 @@ def test_checkout_b_executes_real_generation_a_and_publishes_bound_artifacts(
             timeout_seconds=90,
         )
 
-    assert invocation.exit_code == 0, invocation.stderr
+    assert invocation.exit_code == 0, (
+        f"{invocation.stderr}\n"
+        f"attested_file_count={len(json.loads(generation.package.attestation_bytes)['files'])}"
+    )
     result = json.loads(invocation.stdout)
     receipt = FormalSmokeExecutionReceipt.model_validate(result["execution_receipt"])
     evidence = receipt.code_trust_evidence

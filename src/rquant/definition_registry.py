@@ -2285,8 +2285,10 @@ class ImmutableDefinitionRegistry:
         if limit < 1:
             raise DefinitionIntegrityError("definition directory limit is invalid")
         names: list[str] = []
+        scan_fd = -1
         try:
-            with os.scandir(directory_fd) as entries:
+            scan_fd = os.open(".", _DIRECTORY_FLAGS, dir_fd=directory_fd)
+            with os.scandir(scan_fd) as entries:
                 for entry in entries:
                     if len(names) == limit:
                         raise DefinitionIntegrityError(overflow_message)
@@ -2295,6 +2297,9 @@ class ImmutableDefinitionRegistry:
             raise
         except OSError as exc:
             raise DefinitionIntegrityError("definition directory cannot be listed safely") from exc
+        finally:
+            if scan_fd >= 0:
+                os.close(scan_fd)
         names.sort()
         if any(name in {"", ".", ".."} for name in names):
             raise DefinitionIntegrityError("definition path contains an invalid name")

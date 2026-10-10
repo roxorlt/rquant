@@ -41,6 +41,11 @@ REPORT_TABLES = {
 }
 
 
+@pytest.fixture(autouse=True)
+def _fresh_observed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(f"{__name__}.OBSERVED", datetime.now(UTC) + timedelta(minutes=5))
+
+
 def _production_report_file(tmp_path: Path) -> Path:
     report = _report(
         _database(tmp_path / "daily.duckdb"),
