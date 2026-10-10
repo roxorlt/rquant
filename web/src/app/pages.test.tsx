@@ -50,6 +50,7 @@ const BODIES: Record<string, unknown> = {
   "portfolio-backtests": { runs: [] },
   alerts: { items: [] },
   paper: { accounts: [] },
+  factors: { factors: [] },
   "data-center": {
     datasets: [
       {
@@ -99,6 +100,7 @@ describe("MVP pages render from the API", () => {
     ["/monitor", "没有告警"],
     ["/paper", "没有模拟账户"],
     ["/data", "股票日线"],
+    ["/factor", "还没有因子检验结果"],
   ])("%s", async (path, text) => {
     stubApi();
     renderApp(path);

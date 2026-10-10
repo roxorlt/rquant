@@ -89,6 +89,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/factors": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 因子检验列表 */
+        get: operations["factors_api_v1_factors_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/factors/{factor_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 因子检验详情 */
+        get: operations["factor_detail_api_v1_factors__factor_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/health": {
         parameters: {
             query?: never;
@@ -563,6 +597,13 @@ export interface components {
             /** Table Name */
             table_name: string;
         };
+        /** DecayPoint */
+        DecayPoint: {
+            /** Horizon */
+            horizon: number;
+            /** Mean Ic */
+            mean_ic: number | null;
+        };
         /** Envelope[AlertsData] */
         Envelope_AlertsData_: {
             data: components["schemas"]["AlertsData"];
@@ -581,6 +622,16 @@ export interface components {
         /** Envelope[DataCenterData] */
         Envelope_DataCenterData_: {
             data: components["schemas"]["DataCenterData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[FactorDetailData] */
+        Envelope_FactorDetailData_: {
+            data: components["schemas"]["FactorDetailData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[FactorListData] */
+        Envelope_FactorListData_: {
+            data: components["schemas"]["FactorListData"];
             serving: components["schemas"]["ServingMeta"];
         };
         /** Envelope[HealthData] */
@@ -633,6 +684,70 @@ export interface components {
             data: components["schemas"]["ScreenData"];
             serving: components["schemas"]["ServingMeta"];
         };
+        /** FactorDetailData */
+        FactorDetailData: {
+            factor: components["schemas"]["FactorSummary"];
+            result: components["schemas"]["FactorTestResult"];
+        };
+        /** FactorListData */
+        FactorListData: {
+            /** Factors */
+            factors: components["schemas"]["FactorSummary"][];
+        };
+        /** FactorSummary */
+        FactorSummary: {
+            /** Days */
+            days: number;
+            /**
+             * End
+             * Format: date
+             */
+            end: string;
+            /** Expression */
+            expression: string;
+            /** Factor Id */
+            factor_id: string;
+            /** Horizon */
+            horizon: number;
+            /** Ic Ir */
+            ic_ir: number | null;
+            /** Long Short */
+            long_short: number | null;
+            /** Mean Ic */
+            mean_ic: number | null;
+            /** Name */
+            name: string;
+            /**
+             * Start
+             * Format: date
+             */
+            start: string;
+        };
+        /** FactorTestResult */
+        FactorTestResult: {
+            /** Coverage */
+            coverage: number;
+            /** Days */
+            days: number;
+            /** Decay */
+            decay: components["schemas"]["DecayPoint"][];
+            /** Horizon */
+            horizon: number;
+            /** Ic Ir */
+            ic_ir: number | null;
+            /** Ic Series */
+            ic_series: components["schemas"]["IcPoint"][];
+            /** Long Short */
+            long_short: number | null;
+            /** Mean Ic */
+            mean_ic: number | null;
+            /** Positive Ratio */
+            positive_ratio: number | null;
+            /** Quantiles */
+            quantiles: components["schemas"]["QuantileReturn"][];
+            /** T Stat */
+            t_stat: number | null;
+        };
         /** FreshnessItem */
         FreshnessItem: {
             /** Key */
@@ -670,6 +785,16 @@ export interface components {
             quantity: number;
             /** Unrealized Pnl */
             unrealized_pnl: number;
+        };
+        /** IcPoint */
+        IcPoint: {
+            /**
+             * Date
+             * Format: date
+             */
+            date: string;
+            /** Ic */
+            ic: number;
         };
         /** IndustryExposure */
         IndustryExposure: {
@@ -919,6 +1044,13 @@ export interface components {
             /** Title */
             title: string;
         };
+        /** QuantileReturn */
+        QuantileReturn: {
+            /** Mean Return */
+            mean_return: number;
+            /** Quantile */
+            quantile: number;
+        };
         /** SavePoolRequest */
         SavePoolRequest: {
             /**
@@ -1162,6 +1294,57 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_DataCenterData_"];
+                };
+            };
+        };
+    };
+    factors_api_v1_factors_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_FactorListData_"];
+                };
+            };
+        };
+    };
+    factor_detail_api_v1_factors__factor_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                factor_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_FactorDetailData_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };

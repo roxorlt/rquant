@@ -17,6 +17,7 @@ from rquant.backtest.exposure import industry_exposure
 from rquant.backtest.store import list_runs, read_run
 from rquant.data_catalog.audit import read_report
 from rquant.data_catalog.models import CatalogDocument
+from rquant.factor.store import list_factors, read_factor
 from rquant.web import page_control
 from rquant.web.backtest_perf import backtest_perf, perf_from_returns
 from rquant.web.models import (
@@ -32,6 +33,9 @@ from rquant.web.models import (
     CommandReceipt,
     DataCenterData,
     Envelope,
+    FactorDetailData,
+    FactorListData,
+    FactorSummary,
     FreshnessItem,
     HealthData,
     HoldingItem,
@@ -334,6 +338,29 @@ def _benchmark_rows(source: Source, code: str) -> list[dict[str, Any]]:
         if not table_missing(exc):
             raise
         return []
+
+
+def _factor_summary(run: Any) -> FactorSummary:
+    r = run.result
+    return FactorSummary(factor_id=run.factor_id, name=run.name, expression=run.expression,
+                         start=run.start, end=run.end, horizon=r.horizon, days=r.days,
+                         mean_ic=r.mean_ic, ic_ir=r.ic_ir, long_short=r.long_short)
+
+
+@router.get("/factors", response_model=Envelope[FactorListData], summary="因子检验列表")
+def factors(request: Request, source: SourceDep) -> Envelope[FactorListData]:
+    runs = list_factors(_research_root(request))[:200]
+    return _envelope(source, FactorListData(factors=[_factor_summary(r) for r in runs]))
+
+
+@router.get("/factors/{factor_id}", response_model=Envelope[FactorDetailData],
+            summary="因子检验详情")
+def factor_detail(factor_id: str, request: Request,
+                  source: SourceDep) -> Envelope[FactorDetailData]:
+    run = read_factor(factor_id, _research_root(request))
+    if run is None:
+        raise HTTPException(404, "factor not found")
+    return _envelope(source, FactorDetailData(factor=_factor_summary(run), result=run.result))
 
 
 _CATALOG = Path(__file__).resolve().parents[1] / "data_catalog" / "catalog-v1.json"

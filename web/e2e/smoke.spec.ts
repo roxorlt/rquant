@@ -49,3 +49,10 @@ test("data center shows the catalog and coverage", async ({ page }) => {
   await expect(page.getByText("缺 1 天")).toBeVisible();
   await expect(page.getByLabel("字段")).toBeVisible();
 });
+
+test("factor page shows IC and quantiles", async ({ page }) => {
+  await page.goto("./#/factor");
+  await page.getByText("演示动量因子").click();
+  await expect(page.getByLabel("因子检验指标")).toBeVisible();
+  await expect(page.getByRole("table", { name: "IC 衰减" })).toBeVisible();
+});
