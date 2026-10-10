@@ -29,6 +29,11 @@ export function Topbar({ meta, failed }: { meta: MetaEnvelope | undefined; faile
           <span className="gdot" aria-hidden="true" />
           {text}
         </span>
+        {meta?.data.notice ? (
+          <span className="gen-tag" data-state="stale" role="status">
+            {meta.data.notice}
+          </span>
+        ) : null}
       </div>
       <button
         className="icon-btn theme-btn"

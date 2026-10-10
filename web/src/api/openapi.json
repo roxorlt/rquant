@@ -951,6 +951,17 @@
           "generation": {
             "$ref": "#/components/schemas/ServingMeta"
           },
+          "notice": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Notice"
+          },
           "version": {
             "title": "Version",
             "type": "string"

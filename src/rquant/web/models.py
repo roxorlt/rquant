@@ -27,6 +27,8 @@ class MetaData(BaseModel):
     app: str = "rQuant"
     version: str
     generation: ServingMeta
+    #: deploy-time banner (env ``RQUANT_WEB_NOTICE``), e.g. "回放数据 2026-09-25"
+    notice: str | None = None
 
 
 class Kpi(BaseModel):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from collections.abc import Callable
 from datetime import date
 from typing import Annotated, Any, TypeVar
@@ -83,7 +84,12 @@ def meta(request: Request, source: SourceDep) -> Envelope[MetaData]:
     generation_id, built_at = source.generation()
     gen = ServingMeta(state="ready", generation_id=generation_id, generated_at=built_at)
     return Envelope[MetaData](
-        data=MetaData(version=request.app.version, generation=gen), serving=gen
+        data=MetaData(
+            version=request.app.version,
+            generation=gen,
+            notice=os.environ.get("RQUANT_WEB_NOTICE") or None,
+        ),
+        serving=gen,
     )
 
 

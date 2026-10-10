@@ -474,6 +474,8 @@ export interface components {
              */
             app: string;
             generation: components["schemas"]["ServingMeta"];
+            /** Notice */
+            notice?: string | null;
             /** Version */
             version: string;
         };

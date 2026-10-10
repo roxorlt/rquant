@@ -114,3 +114,14 @@ def test_alert_ack_state_is_read_back() -> None:
     items = {i["alert_id"]: i for i in client.get("/api/v1/alerts").json()["data"]["items"]}
     assert items[first["alert_id"]]["acked_by"] == "owner"
     assert items[first["alert_id"]]["acked_at"] is not None
+
+
+def test_meta_carries_deploy_notice(monkeypatch) -> None:
+    from fastapi.testclient import TestClient
+
+    from rquant.web.app import create_app
+    from rquant.web.source import FixtureSource
+
+    monkeypatch.setenv("RQUANT_WEB_NOTICE", "回放数据 2026-09-25")
+    body = TestClient(create_app(FixtureSource(), dist=None)).get("/api/v1/meta").json()
+    assert body["data"]["notice"] == "回放数据 2026-09-25"
