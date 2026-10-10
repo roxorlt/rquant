@@ -3,6 +3,15 @@ import type { IconName } from "./pages";
 
 /** Navigation icons, 24×24 stroke paths drawn for the approved prototype. */
 const NAV_ICONS: Record<IconName, ReactNode> = {
+  tasks: (
+    <>
+      <circle cx="12" cy="12" r="8.5" />
+      <path d="M12 7.5V12l3 2" />
+    </>
+  ),
+  query: (
+    <path d="M4 6c0-1.7 3.6-3 8-3s8 1.3 8 3-3.6 3-8 3-8-1.3-8-3zM4 6v12c0 1.7 3.6 3 8 3M20 6v5M15 17.5a2.5 2.5 0 1 0 5 0 2.5 2.5 0 1 0-5 0M19.5 19.5L22 22" />
+  ),
   strategies: <path d="M12 3l9 5-9 5-9-5zM3 13l9 5 9-5M3 17.5l9 5 9-5" />,
   experiments: (
     <path d="M9 3h6M10 3v6l-5.5 9.5A1.5 1.5 0 0 0 5.8 21h12.4a1.5 1.5 0 0 0 1.3-2.5L14 9V3M7.5 15h9" />

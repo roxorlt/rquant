@@ -55,6 +55,9 @@ def main(argv: list[str] | None = None) -> None:
             return f"1. 演示解读：总收益 {total}，最大回撤 {drawdown}。"
 
         app.state.llm = (demo_llm, "demo")
+        from rquant.web.tasks import demo_runner
+
+        app.state.task_runner = demo_runner
     uvicorn.run(app, host=args.host, port=args.port)
 
 

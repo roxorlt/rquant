@@ -175,6 +175,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/fundamentals": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 财务指标 */
+        get: operations["fundamentals_api_v1_fundamentals_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/health": {
         parameters: {
             query?: never;
@@ -383,6 +400,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/query": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 只读查询 */
+        post: operations["run_query_api_v1_query_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/query/tables": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 可查询的表 */
+        get: operations["query_tables_api_v1_query_tables_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/screen": {
         parameters: {
             query?: never;
@@ -409,6 +460,40 @@ export interface paths {
         };
         /** 策略与版本 */
         get: operations["strategies_api_v1_strategies_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tasks": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 任务与调度（只读） */
+        get: operations["tasks_api_v1_tasks_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tasks/{unit}/log": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 任务日志 */
+        get: operations["task_log_api_v1_tasks__unit__log_get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -939,6 +1024,11 @@ export interface components {
             data: components["schemas"]["PortfolioRunListData"];
             serving: components["schemas"]["ServingMeta"];
         };
+        /** Envelope[QueryResult] */
+        Envelope_QueryResult_: {
+            data: components["schemas"]["QueryResult"];
+            serving: components["schemas"]["ServingMeta"];
+        };
         /** Envelope[ScreenData] */
         Envelope_ScreenData_: {
             data: components["schemas"]["ScreenData"];
@@ -947,6 +1037,28 @@ export interface components {
         /** Envelope[StrategyListData] */
         Envelope_StrategyListData_: {
             data: components["schemas"]["StrategyListData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[TaskLog] */
+        Envelope_TaskLog_: {
+            data: components["schemas"]["TaskLog"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[Union[FundamentalsDoc, NoneType]] */
+        Envelope_Union_FundamentalsDoc__NoneType__: {
+            data: components["schemas"]["FundamentalsDoc"] | null;
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[list[TaskRow]] */
+        Envelope_list_TaskRow__: {
+            /** Data */
+            data: components["schemas"]["TaskRow"][];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[list[str]] */
+        Envelope_list_str__: {
+            /** Data */
+            data: string[];
             serving: components["schemas"]["ServingMeta"];
         };
         /** Explanation */
@@ -1067,6 +1179,33 @@ export interface components {
             label: string;
             /** Value */
             value: string | null;
+        };
+        /** FundamentalRow */
+        FundamentalRow: {
+            /** Ann Date */
+            ann_date?: string | null;
+            /** Code */
+            code: string;
+            /** End Date */
+            end_date: string;
+            /** Values */
+            values: {
+                [key: string]: number | null;
+            };
+        };
+        /** FundamentalsDoc */
+        FundamentalsDoc: {
+            /**
+             * Fetched At
+             * Format: date-time
+             */
+            fetched_at: string;
+            /** Fields */
+            fields: {
+                [key: string]: string;
+            };
+            /** Rows */
+            rows: components["schemas"]["FundamentalRow"][];
         };
         /** HTTPValidationError */
         HTTPValidationError: {
@@ -1412,6 +1551,20 @@ export interface components {
             /** Quantile */
             quantile: number;
         };
+        /** QueryRequest */
+        QueryRequest: {
+            /** Sql */
+            sql: string;
+        };
+        /** QueryResult */
+        QueryResult: {
+            /** Columns */
+            columns: string[];
+            /** Rows */
+            rows: unknown[][];
+            /** Truncated */
+            truncated: boolean;
+        };
         /** SavePoolRequest */
         SavePoolRequest: {
             /**
@@ -1529,6 +1682,32 @@ export interface components {
             version: number;
             /** Versions */
             versions: number;
+        };
+        /** TaskLog */
+        TaskLog: {
+            /** Error */
+            error?: string | null;
+            /** Lines */
+            lines: string[];
+            /** Unit */
+            unit: string;
+        };
+        /** TaskRow */
+        TaskRow: {
+            /** Active */
+            active: string;
+            /** Description */
+            description: string;
+            /** Kind */
+            kind: string;
+            /** Last Run */
+            last_run?: string | null;
+            /** Next Run */
+            next_run?: string | null;
+            /** Sub */
+            sub: string;
+            /** Unit */
+            unit: string;
         };
         /** TrackingPoint */
         TrackingPoint: {
@@ -1871,6 +2050,26 @@ export interface operations {
             };
         };
     };
+    fundamentals_api_v1_fundamentals_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_Union_FundamentalsDoc__NoneType__"];
+                };
+            };
+        };
+    };
     health_api_v1_health_get: {
         parameters: {
             query?: never;
@@ -2194,6 +2393,59 @@ export interface operations {
             };
         };
     };
+    run_query_api_v1_query_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["QueryRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_QueryResult_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    query_tables_api_v1_query_tables_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_list_str__"];
+                };
+            };
+        };
+    };
     screen_api_v1_screen_get: {
         parameters: {
             query?: {
@@ -2242,6 +2494,59 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Envelope_StrategyListData_"];
+                };
+            };
+        };
+    };
+    tasks_api_v1_tasks_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_list_TaskRow__"];
+                };
+            };
+        };
+    };
+    task_log_api_v1_tasks__unit__log_get: {
+        parameters: {
+            query?: {
+                lines?: number;
+            };
+            header?: never;
+            path: {
+                unit: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_TaskLog_"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };

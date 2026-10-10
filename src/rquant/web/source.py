@@ -262,3 +262,17 @@ def write_demo_research(root: Path) -> None:
     tdx = "C>MA(C,5) AND C>REF(C,1)"
     save_condition("演示条件：站上5日线且上涨", translate(tdx), tdx,
                    screen(panel, translate(tdx)), root=root)
+
+    from rquant.fundamentals import FundamentalRow
+    from rquant.fundamentals import save as save_fundamentals
+
+    save_fundamentals(root, [
+        FundamentalRow(code="600519.SH", end_date="20250630", ann_date="20250809",
+                       values={"roe": 18.9, "grossprofit_margin": 91.3, "netprofit_margin": 52.6,
+                               "netprofit_yoy": 8.9, "or_yoy": 9.2, "debt_to_assets": 15.4,
+                               "eps": 36.18, "bps": 186.2}),
+        FundamentalRow(code="000001.SZ", end_date="20250630", ann_date="20250822",
+                       values={"roe": 5.2, "grossprofit_margin": None, "netprofit_margin": 33.1,
+                               "netprofit_yoy": -3.9, "or_yoy": -10.0, "debt_to_assets": 91.2,
+                               "eps": 1.18, "bps": 23.1}),
+    ])

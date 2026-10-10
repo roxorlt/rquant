@@ -94,3 +94,25 @@ test("health page shows the six layers", async ({ page }) => {
   const layers = page.getByRole("list", { name: "分层健康" });
   await expect(layers.getByRole("listitem")).toHaveCount(6);
 });
+
+test("tasks page lists units and shows a log", async ({ page }) => {
+  await page.goto("./#/tasks");
+  await page.getByText("rquant-daily.service").click();
+  await expect(page.getByText("ingest ok rows=5412")).toBeVisible();
+});
+
+test("query page runs a read-only select", async ({ page }) => {
+  await page.goto("./#/query");
+  await page.getByRole("button", { name: "运行" }).click();
+  await expect(
+    page.getByRole("table", { name: "查询结果" }).or(page.getByRole("grid", { name: "查询结果" })),
+  ).toContainText("600519.SH");
+  await page.getByLabel("SQL").fill("delete from stock_basic");
+  await page.getByRole("button", { name: "运行" }).click();
+  await expect(page.getByRole("alert")).toContainText("只允许");
+});
+
+test("data center shows fundamentals", async ({ page }) => {
+  await page.goto("./#/data");
+  await expect(page.getByText("财务指标 · 2")).toBeVisible();
+});

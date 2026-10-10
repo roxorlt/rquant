@@ -1254,3 +1254,21 @@
   padding-inline: 8px;
   font-size: 13px;
 }
+.log-view {
+  max-height: 420px;
+  overflow: auto;
+  font: 12px / 1.5 var(--font-mono);
+  white-space: pre-wrap;
+  background: var(--sunken);
+  padding: 10px;
+  border-radius: 6px;
+}
+.sql-input {
+  width: 100%;
+  font: 13px / 1.5 var(--font-mono);
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  padding: 8px;
+  background: var(--surface);
+  color: var(--ink);
+}

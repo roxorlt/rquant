@@ -1725,6 +1725,22 @@
         "title": "Envelope[PortfolioRunListData]",
         "type": "object"
       },
+      "Envelope_QueryResult_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/QueryResult"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[QueryResult]",
+        "type": "object"
+      },
       "Envelope_ScreenData_": {
         "properties": {
           "data": {
@@ -1755,6 +1771,85 @@
           "serving"
         ],
         "title": "Envelope[StrategyListData]",
+        "type": "object"
+      },
+      "Envelope_TaskLog_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/TaskLog"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[TaskLog]",
+        "type": "object"
+      },
+      "Envelope_Union_FundamentalsDoc__NoneType__": {
+        "properties": {
+          "data": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FundamentalsDoc"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[Union[FundamentalsDoc, NoneType]]",
+        "type": "object"
+      },
+      "Envelope_list_TaskRow__": {
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/TaskRow"
+            },
+            "title": "Data",
+            "type": "array"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[list[TaskRow]]",
+        "type": "object"
+      },
+      "Envelope_list_str__": {
+        "properties": {
+          "data": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Data",
+            "type": "array"
+          },
+          "serving": {
+            "$ref": "#/components/schemas/ServingMeta"
+          }
+        },
+        "required": [
+          "data",
+          "serving"
+        ],
+        "title": "Envelope[list[str]]",
         "type": "object"
       },
       "Explanation": {
@@ -2148,6 +2243,80 @@
           "value"
         ],
         "title": "FreshnessItem",
+        "type": "object"
+      },
+      "FundamentalRow": {
+        "properties": {
+          "ann_date": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ann Date"
+          },
+          "code": {
+            "title": "Code",
+            "type": "string"
+          },
+          "end_date": {
+            "title": "End Date",
+            "type": "string"
+          },
+          "values": {
+            "additionalProperties": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "title": "Values",
+            "type": "object"
+          }
+        },
+        "required": [
+          "code",
+          "end_date",
+          "values"
+        ],
+        "title": "FundamentalRow",
+        "type": "object"
+      },
+      "FundamentalsDoc": {
+        "properties": {
+          "fetched_at": {
+            "format": "date-time",
+            "title": "Fetched At",
+            "type": "string"
+          },
+          "fields": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Fields",
+            "type": "object"
+          },
+          "rows": {
+            "items": {
+              "$ref": "#/components/schemas/FundamentalRow"
+            },
+            "title": "Rows",
+            "type": "array"
+          }
+        },
+        "required": [
+          "fetched_at",
+          "fields",
+          "rows"
+        ],
+        "title": "FundamentalsDoc",
         "type": "object"
       },
       "HTTPValidationError": {
@@ -3173,6 +3342,49 @@
         "title": "QuantileReturn",
         "type": "object"
       },
+      "QueryRequest": {
+        "properties": {
+          "sql": {
+            "title": "Sql",
+            "type": "string"
+          }
+        },
+        "required": [
+          "sql"
+        ],
+        "title": "QueryRequest",
+        "type": "object"
+      },
+      "QueryResult": {
+        "properties": {
+          "columns": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Columns",
+            "type": "array"
+          },
+          "rows": {
+            "items": {
+              "items": {},
+              "type": "array"
+            },
+            "title": "Rows",
+            "type": "array"
+          },
+          "truncated": {
+            "title": "Truncated",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "columns",
+          "rows",
+          "truncated"
+        ],
+        "title": "QueryResult",
+        "type": "object"
+      },
       "SavePoolRequest": {
         "properties": {
           "description": {
@@ -3539,6 +3751,93 @@
           "note"
         ],
         "title": "StrategyRow",
+        "type": "object"
+      },
+      "TaskLog": {
+        "properties": {
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "lines": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Lines",
+            "type": "array"
+          },
+          "unit": {
+            "title": "Unit",
+            "type": "string"
+          }
+        },
+        "required": [
+          "unit",
+          "lines"
+        ],
+        "title": "TaskLog",
+        "type": "object"
+      },
+      "TaskRow": {
+        "properties": {
+          "active": {
+            "title": "Active",
+            "type": "string"
+          },
+          "description": {
+            "title": "Description",
+            "type": "string"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "last_run": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Run"
+          },
+          "next_run": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Run"
+          },
+          "sub": {
+            "title": "Sub",
+            "type": "string"
+          },
+          "unit": {
+            "title": "Unit",
+            "type": "string"
+          }
+        },
+        "required": [
+          "unit",
+          "kind",
+          "active",
+          "sub",
+          "description"
+        ],
+        "title": "TaskRow",
         "type": "object"
       },
       "TrackingPoint": {
@@ -4013,6 +4312,24 @@
         "summary": "通达信公式翻译（只校验，不执行）"
       }
     },
+    "/api/v1/fundamentals": {
+      "get": {
+        "operationId": "fundamentals_api_v1_fundamentals_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_Union_FundamentalsDoc__NoneType__"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "财务指标"
+      }
+    },
     "/api/v1/health": {
       "get": {
         "operationId": "health_api_v1_health_get",
@@ -4391,6 +4708,62 @@
         "summary": "AI 解读回测（数字逐个核对）"
       }
     },
+    "/api/v1/query": {
+      "post": {
+        "operationId": "run_query_api_v1_query_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/QueryRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_QueryResult_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "只读查询"
+      }
+    },
+    "/api/v1/query/tables": {
+      "get": {
+        "operationId": "query_tables_api_v1_query_tables_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_list_str__"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "可查询的表"
+      }
+    },
     "/api/v1/screen": {
       "get": {
         "operationId": "screen_api_v1_screen_get",
@@ -4470,6 +4843,73 @@
           }
         },
         "summary": "策略与版本"
+      }
+    },
+    "/api/v1/tasks": {
+      "get": {
+        "operationId": "tasks_api_v1_tasks_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_list_TaskRow__"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "任务与调度（只读）"
+      }
+    },
+    "/api/v1/tasks/{unit}/log": {
+      "get": {
+        "operationId": "task_log_api_v1_tasks__unit__log_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "unit",
+            "required": true,
+            "schema": {
+              "title": "Unit",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "lines",
+            "required": false,
+            "schema": {
+              "default": 200,
+              "title": "Lines",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_TaskLog_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "任务日志"
       }
     },
     "/api/v1/watchlist": {
