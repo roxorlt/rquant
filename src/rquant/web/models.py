@@ -168,9 +168,41 @@ class BacktestListData(BaseModel):
     runs: list[BacktestRun]
 
 
+class NavPoint(BaseModel):
+    date: date
+    nav: float
+    drawdown: float
+
+
+class MonthlyReturn(BaseModel):
+    year: int
+    month: int
+    ret: float
+
+
+class BacktestPerf(BaseModel):
+    """Ratios are fractions (0.12 = 12%); ``method`` says how NAV was derived."""
+
+    method: str
+    days: int
+    total_return: float | None
+    annualized_return: float | None
+    annualized_volatility: float | None
+    sharpe: float | None
+    sortino: float | None
+    calmar: float | None
+    max_drawdown: float | None
+    max_drawdown_days: int | None
+    win_rate: float | None
+    payoff_ratio: float | None
+    nav: list[NavPoint]
+    monthly: list[MonthlyReturn]
+
+
 class BacktestDetailData(BaseModel):
     run: BacktestRun
     trades: list[BacktestTrade]
+    perf: BacktestPerf | None = None
 
 
 class AlertItem(BaseModel):

@@ -177,6 +177,16 @@
       },
       "BacktestDetailData": {
         "properties": {
+          "perf": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BacktestPerf"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "run": {
             "$ref": "#/components/schemas/BacktestRun"
           },
@@ -209,6 +219,161 @@
           "runs"
         ],
         "title": "BacktestListData",
+        "type": "object"
+      },
+      "BacktestPerf": {
+        "description": "Ratios are fractions (0.12 = 12%); ``method`` says how NAV was derived.",
+        "properties": {
+          "annualized_return": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Annualized Return"
+          },
+          "annualized_volatility": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Annualized Volatility"
+          },
+          "calmar": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Calmar"
+          },
+          "days": {
+            "title": "Days",
+            "type": "integer"
+          },
+          "max_drawdown": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Drawdown"
+          },
+          "max_drawdown_days": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Drawdown Days"
+          },
+          "method": {
+            "title": "Method",
+            "type": "string"
+          },
+          "monthly": {
+            "items": {
+              "$ref": "#/components/schemas/MonthlyReturn"
+            },
+            "title": "Monthly",
+            "type": "array"
+          },
+          "nav": {
+            "items": {
+              "$ref": "#/components/schemas/NavPoint"
+            },
+            "title": "Nav",
+            "type": "array"
+          },
+          "payoff_ratio": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Payoff Ratio"
+          },
+          "sharpe": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sharpe"
+          },
+          "sortino": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sortino"
+          },
+          "total_return": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Total Return"
+          },
+          "win_rate": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Win Rate"
+          }
+        },
+        "required": [
+          "method",
+          "days",
+          "total_return",
+          "annualized_return",
+          "annualized_volatility",
+          "sharpe",
+          "sortino",
+          "calmar",
+          "max_drawdown",
+          "max_drawdown_days",
+          "win_rate",
+          "payoff_ratio",
+          "nav",
+          "monthly"
+        ],
+        "title": "BacktestPerf",
         "type": "object"
       },
       "BacktestRun": {
@@ -972,6 +1137,53 @@
           "generation"
         ],
         "title": "MetaData",
+        "type": "object"
+      },
+      "MonthlyReturn": {
+        "properties": {
+          "month": {
+            "title": "Month",
+            "type": "integer"
+          },
+          "ret": {
+            "title": "Ret",
+            "type": "number"
+          },
+          "year": {
+            "title": "Year",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "year",
+          "month",
+          "ret"
+        ],
+        "title": "MonthlyReturn",
+        "type": "object"
+      },
+      "NavPoint": {
+        "properties": {
+          "date": {
+            "format": "date",
+            "title": "Date",
+            "type": "string"
+          },
+          "drawdown": {
+            "title": "Drawdown",
+            "type": "number"
+          },
+          "nav": {
+            "title": "Nav",
+            "type": "number"
+          }
+        },
+        "required": [
+          "date",
+          "nav",
+          "drawdown"
+        ],
+        "title": "NavPoint",
         "type": "object"
       },
       "OverviewData": {

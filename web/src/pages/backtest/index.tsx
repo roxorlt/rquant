@@ -5,47 +5,51 @@ import { formatShanghaiDateTime } from "@/format/time";
 import { DataTable } from "@/table/DataTable";
 import { ChangeText, PageHeader, Panel } from "@/ui";
 import { QueryView } from "../shared";
+import { PerfPanel } from "./Perf";
 
 function Trades({ runId }: { runId: string }) {
   const query = useBacktestDetail(runId);
   return (
     <QueryView query={query}>
       {(data) => (
-        <Panel title={`逐笔交易 · ${data.trades.length}`} flush>
-          <DataTable
-            label="逐笔交易"
-            rows={data.trades}
-            rowKey={(row) => row.trade_id}
-            height={420}
-            columns={[
-              { id: "date", header: "信号日", value: (row) => row.signal_date ?? null },
-              { id: "code", header: "代码", value: (row) => row.code },
-              { id: "name", header: "名称", value: (row) => row.name ?? null },
-              {
-                id: "entry",
-                header: "买入",
-                value: (row) => row.entry_time ?? null,
-                cell: (row) =>
-                  `${row.entry_time ? formatShanghaiDateTime(row.entry_time) : "—"} @ ${formatPrice(row.entry_price)}`,
-              },
-              {
-                id: "exit",
-                header: "卖出",
-                value: (row) => row.exit_time ?? null,
-                cell: (row) =>
-                  `${row.exit_time ? formatShanghaiDateTime(row.exit_time) : "—"} @ ${formatPrice(row.exit_price)}`,
-              },
-              { id: "reason", header: "原因", value: (row) => row.exit_reason ?? null },
-              {
-                id: "ret",
-                header: "收益",
-                numeric: true,
-                value: (row) => row.ret_pct ?? null,
-                cell: (row) => <ChangeText value={row.ret_pct ?? null} />,
-              },
-            ]}
-          />
-        </Panel>
+        <>
+          {data.perf ? <PerfPanel perf={data.perf} /> : null}
+          <Panel title={`逐笔交易 · ${data.trades.length}`} flush>
+            <DataTable
+              label="逐笔交易"
+              rows={data.trades}
+              rowKey={(row) => row.trade_id}
+              height={420}
+              columns={[
+                { id: "date", header: "信号日", value: (row) => row.signal_date ?? null },
+                { id: "code", header: "代码", value: (row) => row.code },
+                { id: "name", header: "名称", value: (row) => row.name ?? null },
+                {
+                  id: "entry",
+                  header: "买入",
+                  value: (row) => row.entry_time ?? null,
+                  cell: (row) =>
+                    `${row.entry_time ? formatShanghaiDateTime(row.entry_time) : "—"} @ ${formatPrice(row.entry_price)}`,
+                },
+                {
+                  id: "exit",
+                  header: "卖出",
+                  value: (row) => row.exit_time ?? null,
+                  cell: (row) =>
+                    `${row.exit_time ? formatShanghaiDateTime(row.exit_time) : "—"} @ ${formatPrice(row.exit_price)}`,
+                },
+                { id: "reason", header: "原因", value: (row) => row.exit_reason ?? null },
+                {
+                  id: "ret",
+                  header: "收益",
+                  numeric: true,
+                  value: (row) => row.ret_pct ?? null,
+                  cell: (row) => <ChangeText value={row.ret_pct ?? null} />,
+                },
+              ]}
+            />
+          </Panel>
+        </>
       )}
     </QueryView>
   );
