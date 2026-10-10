@@ -47,6 +47,14 @@ def main(argv: list[str] | None = None) -> None:
             return {"command_id": payload["command_id"], "status": "succeeded"}
 
         app.state.page_control_transport = transport
+
+        def demo_llm(messages: list[dict]) -> str:  # no network in demo mode
+            lines = messages[1]["content"].splitlines()[1:]
+            facts = dict(line[2:].split("：", 1) for line in lines)
+            total, drawdown = facts.get("总收益", "—"), facts.get("最大回撤", "—")
+            return f"1. 演示解读：总收益 {total}，最大回撤 {drawdown}。"
+
+        app.state.llm = (demo_llm, "demo")
     uvicorn.run(app, host=args.host, port=args.port)
 
 

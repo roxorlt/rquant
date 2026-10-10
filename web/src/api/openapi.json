@@ -1741,6 +1741,40 @@
         "title": "Envelope[StrategyListData]",
         "type": "object"
       },
+      "Explanation": {
+        "properties": {
+          "facts": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Facts",
+            "type": "object"
+          },
+          "model": {
+            "title": "Model",
+            "type": "string"
+          },
+          "text": {
+            "title": "Text",
+            "type": "string"
+          },
+          "unverified": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Unverified",
+            "type": "array"
+          }
+        },
+        "required": [
+          "text",
+          "facts",
+          "unverified",
+          "model"
+        ],
+        "title": "Explanation",
+        "type": "object"
+      },
       "FactorDetailData": {
         "properties": {
           "factor": {
@@ -4147,6 +4181,45 @@
           }
         },
         "summary": "回测自助抽样区间"
+      }
+    },
+    "/api/v1/portfolio-backtests/{run_id}/explain": {
+      "post": {
+        "operationId": "portfolio_explain_api_v1_portfolio_backtests__run_id__explain_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Explanation"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "AI 解读回测（数字逐个核对）"
       }
     },
     "/api/v1/screen": {

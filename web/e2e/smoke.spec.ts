@@ -39,6 +39,8 @@ test("a portfolio backtest shows orders and performance", async ({ page }) => {
   await expect(page.getByLabel("组合回测委托")).toBeVisible();
   await expect(page.getByText("组合回测逐日净值")).toBeVisible();
   await expect(page.getByLabel("过拟合指标")).toBeVisible();
+  await page.getByRole("button", { name: "生成解读" }).click();
+  await expect(page.getByText("数字已全部核对")).toBeVisible();
   await expect(page.getByRole("table", { name: "行业暴露" })).toContainText("白酒");
   await page.getByRole("button", { name: "加入对比" }).click();
   await expect(page.getByText("再选一条回测")).toBeVisible();
