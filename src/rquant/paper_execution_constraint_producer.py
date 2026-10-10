@@ -3,17 +3,19 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
 from types import MappingProxyType
 from typing import Annotated, Self
 from zoneinfo import ZoneInfo
 
+import pandas as pd
 from pydantic import Field, StringConstraints, field_validator, model_validator
 
-from rquant.live_contracts import BatchQualityStatus, LiveChannel
-from rquant.live_spool import LiveBatchSpool
+from rquant.live_contracts import BatchEnvelope, BatchQualityStatus, LiveChannel
+from rquant.live_spool import LiveBatchRecord, LiveBatchSpool
 from rquant.market_minute_gateway import MarketMinuteGateway
 from rquant.paper_execution_constraints import (
     PaperExecutionConstraintBatch,
@@ -51,6 +53,16 @@ class PaperExecutionConstraintEvidenceError(RuntimeError):
     """Required point-in-time evidence is absent, stale, or internally inconsistent."""
 
 
+class PaperExecutionConstraintNoEvidenceError(PaperExecutionConstraintEvidenceError):
+    """No requested code has a same-day minute at observed_at, so there is nothing to publish.
+
+    Until #307 one such code refused the constraints of every other code; now such a code is
+    left out and counted, and only a request in which *every* code is left out raises this.
+    The runtime step reports it as an idle round, not a failure: the authority keeps its last
+    generation, whose intervals have expired, so nothing is tradable.
+    """
+
+
 class PaperExecutionConstraintProductionRequest(RuntimeContractModel):
     """One explicit point-in-time production request."""
 
@@ -80,6 +92,20 @@ class PaperExecutionConstraintPublication(RuntimeContractModel):
 
     batch: PaperExecutionConstraintBatch
     pointer: PaperExecutionConstraintPointer
+
+
+class PaperExecutionConstraintCoverage(RuntimeContractModel):
+    """Which requested codes are not tradable at observed_at, and why (#307).
+
+    `stale_codes` have records, but none covering observed_at: the lunch break, the minutes
+    after the close, or a code whose newest minute is not in the latest batch. Their
+    intervals are published as they always were and have expired, so the broker refuses them
+    ("constraint has expired"). `codes_without_evidence` have no same-day minute at all and
+    no record. Neither fails the round any more.
+    """
+
+    stale_codes: tuple[str, ...] = ()
+    codes_without_evidence: tuple[str, ...] = ()
 
 
 class _MinuteEvidence(RuntimeContractModel):
@@ -144,8 +170,45 @@ class _RequestReferences:
         )
 
 
+@dataclass(frozen=True)
+class _BatchMinuteEvidence:
+    """One visible market-minute batch's newest same-day minute of every code in it (#302).
+
+    Request-independent: the rows of every code, reduced exactly as the request loop
+    reduces the rows of a requested code. A batch in which some row would refuse (an
+    invalid time or close, a minute later than the batch) is not reduced at all (`clean`
+    false): it is scanned with the request's codes every time, so it refuses exactly when
+    and as it did before.
+    """
+
+    envelope: BatchEnvelope
+    clean: bool
+    by_code: Mapping[str, _MinuteEvidence]
+
+
+@dataclass(frozen=True)
+class _Production:
+    """The last successful production, reused while nothing it was built from has moved."""
+
+    key: tuple[object, ...]
+    batch: PaperExecutionConstraintBatch
+    last_record_by_code: Mapping[str, PaperExecutionConstraintSnapshot]
+    codes_without_evidence: tuple[str, ...]
+    publication: PaperExecutionConstraintPublication | None
+
+
 class PaperExecutionConstraintProducer:
-    """Build and atomically publish broker constraints without future evidence."""
+    """Build and atomically publish broker constraints without future evidence.
+
+    The producer keeps, for the trade date it last served, what the visible minute batches
+    and the reference lookups already told it (#302): each batch is decoded once, each
+    (code, minute) reference state and constraint record is built once, and a round whose
+    inputs -- visible batch manifests, requested codes, reference generation, sequence --
+    are exactly the last round's publishes the very batch it published then. Every refusal
+    is the one the full rebuild gives, because nothing that can refuse is remembered: a
+    batch or record that fails is built again on the next round. A new process, or a new
+    trade date, starts from nothing.
+    """
 
     def __init__(
         self,
@@ -171,11 +234,22 @@ class PaperExecutionConstraintProducer:
         self.publisher = publisher
         self.producer_commit = producer_commit
         self.quote_ttl = quote_ttl
+        self._cache_trade_date: date | None = None
+        self._batch_evidence: dict[int, _BatchMinuteEvidence] = {}
+        self._reference_states: dict[tuple[str, str, datetime, datetime], _ReferenceState] = {}
+        self._records: dict[tuple[object, ...], PaperExecutionConstraintSnapshot] = {}
+        self._last: _Production | None = None
 
     def produce(
         self,
         request: PaperExecutionConstraintProductionRequest,
     ) -> PaperExecutionConstraintPublication:
+        return self.produce_with_coverage(request)[0]
+
+    def produce_with_coverage(
+        self,
+        request: PaperExecutionConstraintProductionRequest,
+    ) -> tuple[PaperExecutionConstraintPublication, PaperExecutionConstraintCoverage]:
         validated = PaperExecutionConstraintProductionRequest.model_validate(request)
         observed_at = normalize_aware_utc(validated.observed_at)
         manifest = self.reference_registry.generation(validated.reference_generation_id)
@@ -183,7 +257,62 @@ class PaperExecutionConstraintProducer:
             raise PaperExecutionConstraintEvidenceError(
                 "reference generation is future evidence at observed_at"
             )
+        if self._cache_trade_date != validated.trade_date:
+            self._batch_evidence.clear()
+            self._reference_states.clear()
+            self._records.clear()
+            self._last = None
+            self._cache_trade_date = validated.trade_date
+        visible = self._visible_batches(observed_at=observed_at)
+        key: tuple[object, ...] = (
+            validated.trade_date,
+            validated.ts_codes,
+            validated.reference_generation_id,
+            manifest.published_at,
+            validated.sequence,
+            tuple(record.envelope for record in visible),
+        )
+        last = self._last
+        if last is None or last.key != key:
+            last = self._build(
+                validated,
+                visible=visible,
+                observed_at=observed_at,
+                reference_published_at=manifest.published_at,
+                key=key,
+            )
+        pointer = self.publisher.publish(last.batch)
+        publication = last.publication
+        if publication is None or publication.pointer != pointer:
+            publication = PaperExecutionConstraintPublication(batch=last.batch, pointer=pointer)
+        self._last = _Production(
+            key=last.key,
+            batch=last.batch,
+            last_record_by_code=last.last_record_by_code,
+            codes_without_evidence=last.codes_without_evidence,
+            publication=publication,
+        )
+        stale = tuple(
+            ts_code
+            for ts_code, record in last.last_record_by_code.items()
+            if not record.available_at <= observed_at < record.expires_at
+        )
+        return publication, PaperExecutionConstraintCoverage(
+            stale_codes=stale,
+            codes_without_evidence=last.codes_without_evidence,
+        )
+
+    def _build(
+        self,
+        validated: PaperExecutionConstraintProductionRequest,
+        *,
+        visible: tuple[LiveBatchRecord, ...],
+        observed_at: datetime,
+        reference_published_at: datetime,
+        key: tuple[object, ...],
+    ) -> _Production:
         minute_evidence = self._visible_minutes(
+            visible,
             ts_codes=validated.ts_codes,
             trade_date=validated.trade_date,
             observed_at=observed_at,
@@ -194,22 +323,27 @@ class PaperExecutionConstraintProducer:
             generation_id=validated.reference_generation_id,
         )
         records: list[PaperExecutionConstraintSnapshot] = []
+        last_record_by_code: dict[str, PaperExecutionConstraintSnapshot] = {}
+        without_evidence: list[str] = []
         for ts_code in validated.ts_codes:
             code_evidence = minute_evidence.get(ts_code, ())
             if not code_evidence:
-                raise PaperExecutionConstraintEvidenceError(
-                    f"{ts_code} has no visible minute evidence at observed_at"
-                )
-            records.extend(
-                self._records_for_code(
-                    ts_code=ts_code,
-                    trade_date=validated.trade_date,
-                    evidence=code_evidence,
-                    observed_at=observed_at,
-                    references=references,
-                    reference_generation_id=validated.reference_generation_id,
-                    reference_published_at=manifest.published_at,
-                )
+                #: #307: left out and counted -- it has no interval, so it is not tradable
+                without_evidence.append(ts_code)
+                continue
+            code_records = self._records_for_code(
+                ts_code=ts_code,
+                trade_date=validated.trade_date,
+                evidence=code_evidence,
+                references=references,
+                reference_generation_id=validated.reference_generation_id,
+                reference_published_at=reference_published_at,
+            )
+            records.extend(code_records)
+            last_record_by_code[ts_code] = code_records[-1]
+        if not records:
+            raise PaperExecutionConstraintNoEvidenceError(
+                "no requested code has visible same-day minute evidence at observed_at"
             )
         batch_payload: dict[str, object] = {
             "schema_version": 1,
@@ -220,16 +354,15 @@ class PaperExecutionConstraintProducer:
         batch = PaperExecutionConstraintBatch.model_validate(
             {**batch_payload, "content_hash": canonical_sha256(batch_payload)}
         )
-        pointer = self.publisher.publish(batch)
-        return PaperExecutionConstraintPublication(batch=batch, pointer=pointer)
+        return _Production(
+            key=key,
+            batch=batch,
+            last_record_by_code=MappingProxyType(last_record_by_code),
+            codes_without_evidence=tuple(without_evidence),
+            publication=None,
+        )
 
-    def _visible_minutes(
-        self,
-        *,
-        ts_codes: tuple[str, ...],
-        trade_date: date,
-        observed_at: datetime,
-    ) -> Mapping[str, tuple[_MinuteEvidence, ...]]:
+    def _visible_batches(self, *, observed_at: datetime) -> tuple[LiveBatchRecord, ...]:
         visible_batches = tuple(
             record
             for record in self.minute_spool.list_after(
@@ -247,42 +380,36 @@ class PaperExecutionConstraintProducer:
             raise PaperExecutionConstraintEvidenceError(
                 f"latest visible market-minute batch is {latest.quality_status.value}"
             )
+        return visible_batches
 
+    def _visible_minutes(
+        self,
+        visible_batches: tuple[LiveBatchRecord, ...],
+        *,
+        ts_codes: tuple[str, ...],
+        trade_date: date,
+        observed_at: datetime,
+    ) -> Mapping[str, tuple[_MinuteEvidence, ...]]:
         requested = set(ts_codes)
         by_identity: dict[tuple[str, datetime], _MinuteEvidence] = {}
         for record in visible_batches:
             envelope = record.envelope
             if envelope.quality_status is not BatchQualityStatus.PUBLISHED:
                 continue
-            frame = MarketMinuteGateway.decode_payload(self.minute_spool.read_payload(record))
-            required = {"ts_code", "trade_time", "close"}
-            if not required.issubset(frame.columns):
-                raise PaperExecutionConstraintEvidenceError(
-                    "market-minute payload is missing required columns"
+            batch = self._batch_minute_evidence(record, trade_date=trade_date)
+            if batch.clean:
+                candidates: Iterable[_MinuteEvidence] = (
+                    batch.by_code[ts_code] for ts_code in requested & batch.by_code.keys()
                 )
-            for row in frame.loc[:, ["ts_code", "trade_time", "close"]].itertuples(index=False):
-                ts_code = str(row.ts_code)
-                if ts_code not in requested:
-                    continue
-                trade_time = _as_utc_datetime(row.trade_time, name="minute trade_time")
-                if trade_time > envelope.available_at:
-                    raise PaperExecutionConstraintEvidenceError(
-                        "minute event time is future relative to its batch availability"
-                    )
-                if trade_time > observed_at:
-                    continue
-                if trade_time.astimezone(_SHANGHAI).date() != trade_date:
-                    continue
-                close = _finite_float(row.close, name="minute close")
-                candidate = _MinuteEvidence(
-                    ts_code=ts_code,
-                    trade_time=trade_time,
-                    available_at=envelope.available_at,
-                    close=close,
-                    source_snapshot_id=envelope.identity_sha256,
-                    source_sequence=envelope.sequence,
+            else:
+                candidates = self._scan_batch(
+                    record,
+                    requested=requested,
+                    trade_date=trade_date,
+                    observed_at=observed_at,
                 )
-                key = (ts_code, envelope.available_at)
+            for candidate in candidates:
+                key = (candidate.ts_code, envelope.available_at)
                 previous = by_identity.get(key)
                 if previous is None or (
                     candidate.trade_time,
@@ -298,13 +425,108 @@ class PaperExecutionConstraintProducer:
             grouped[evidence.ts_code].append(evidence)
         return MappingProxyType({key: tuple(value) for key, value in grouped.items()})
 
+    def _batch_frame(self, record: LiveBatchRecord) -> pd.DataFrame:
+        frame = MarketMinuteGateway.decode_payload(self.minute_spool.read_payload(record))
+        required = {"ts_code", "trade_time", "close"}
+        if not required.issubset(frame.columns):
+            raise PaperExecutionConstraintEvidenceError(
+                "market-minute payload is missing required columns"
+            )
+        return frame
+
+    def _batch_minute_evidence(
+        self,
+        record: LiveBatchRecord,
+        *,
+        trade_date: date,
+    ) -> _BatchMinuteEvidence:
+        envelope = record.envelope
+        cached = self._batch_evidence.get(envelope.sequence)
+        if cached is not None and (cached.envelope is envelope or cached.envelope == envelope):
+            return cached
+        frame = self._batch_frame(record)
+        source_snapshot_id = envelope.identity_sha256
+        by_code: dict[str, _MinuteEvidence] = {}
+        clean = True
+        for row in frame.loc[:, ["ts_code", "trade_time", "close"]].itertuples(index=False):
+            ts_code = str(row.ts_code)
+            try:
+                trade_time = _as_utc_datetime(row.trade_time, name="minute trade_time")
+                if trade_time > envelope.available_at:
+                    clean = False
+                    break
+                #: the request loop's `trade_time > observed_at` skip cannot fire here: the
+                #: batch is visible, so available_at <= observed_at, and trade_time is not
+                #: later than available_at
+                if trade_time.astimezone(_SHANGHAI).date() != trade_date:
+                    continue
+                close = _finite_float(row.close, name="minute close")
+            except PaperExecutionConstraintEvidenceError:
+                clean = False
+                break
+            previous = by_code.get(ts_code)
+            if previous is None or trade_time > previous.trade_time:
+                by_code[ts_code] = _MinuteEvidence(
+                    ts_code=ts_code,
+                    trade_time=trade_time,
+                    available_at=envelope.available_at,
+                    close=close,
+                    source_snapshot_id=source_snapshot_id,
+                    source_sequence=envelope.sequence,
+                )
+        evidence = _BatchMinuteEvidence(
+            envelope=envelope,
+            clean=clean,
+            by_code=MappingProxyType(by_code if clean else {}),
+        )
+        self._batch_evidence[envelope.sequence] = evidence
+        return evidence
+
+    def _scan_batch(
+        self,
+        record: LiveBatchRecord,
+        *,
+        requested: set[str],
+        trade_date: date,
+        observed_at: datetime,
+    ) -> tuple[_MinuteEvidence, ...]:
+        """The request loop of before #302, for a batch with a row that may refuse."""
+
+        envelope = record.envelope
+        frame = self._batch_frame(record)
+        found: list[_MinuteEvidence] = []
+        for row in frame.loc[:, ["ts_code", "trade_time", "close"]].itertuples(index=False):
+            ts_code = str(row.ts_code)
+            if ts_code not in requested:
+                continue
+            trade_time = _as_utc_datetime(row.trade_time, name="minute trade_time")
+            if trade_time > envelope.available_at:
+                raise PaperExecutionConstraintEvidenceError(
+                    "minute event time is future relative to its batch availability"
+                )
+            if trade_time > observed_at:
+                continue
+            if trade_time.astimezone(_SHANGHAI).date() != trade_date:
+                continue
+            close = _finite_float(row.close, name="minute close")
+            found.append(
+                _MinuteEvidence(
+                    ts_code=ts_code,
+                    trade_time=trade_time,
+                    available_at=envelope.available_at,
+                    close=close,
+                    source_snapshot_id=envelope.identity_sha256,
+                    source_sequence=envelope.sequence,
+                )
+            )
+        return tuple(found)
+
     def _records_for_code(
         self,
         *,
         ts_code: str,
         trade_date: date,
         evidence: tuple[_MinuteEvidence, ...],
-        observed_at: datetime,
         references: _RequestReferences,
         reference_generation_id: str,
         reference_published_at: datetime,
@@ -314,18 +536,6 @@ class PaperExecutionConstraintProducer:
             if reference_published_at > minute.available_at:
                 raise PaperExecutionConstraintEvidenceError(
                     "reference generation was not visible when minute evidence arrived"
-                )
-            state = self._reference_state(
-                references=references,
-                ts_code=ts_code,
-                event_time=minute.trade_time,
-                decision_time=minute.available_at,
-                generation_id=reference_generation_id,
-            )
-            close = Decimal(str(minute.close))
-            if close < state.limit_down_price or close > state.limit_up_price:
-                raise PaperExecutionConstraintEvidenceError(
-                    f"{ts_code} minute close is outside the visible price limit boundary"
                 )
             next_available = (
                 evidence[index + 1].available_at
@@ -337,6 +547,33 @@ class PaperExecutionConstraintProducer:
                 minute.available_at + self.quote_ttl,
                 _end_of_trade_date(trade_date),
             )
+            record_key: tuple[object, ...] = (
+                ts_code,
+                trade_date,
+                minute.trade_time,
+                minute.available_at,
+                minute.close,
+                minute.source_snapshot_id,
+                minute.source_sequence,
+                expires_at,
+                reference_generation_id,
+            )
+            cached = self._records.get(record_key)
+            if cached is not None:
+                records.append(cached)
+                continue
+            state = self._cached_reference_state(
+                references=references,
+                ts_code=ts_code,
+                event_time=minute.trade_time,
+                decision_time=minute.available_at,
+                generation_id=reference_generation_id,
+            )
+            close = Decimal(str(minute.close))
+            if close < state.limit_down_price or close > state.limit_up_price:
+                raise PaperExecutionConstraintEvidenceError(
+                    f"{ts_code} minute close is outside the visible price limit boundary"
+                )
             if expires_at <= minute.available_at:
                 raise PaperExecutionConstraintEvidenceError(
                     f"{ts_code} minute evidence has no positive validity interval"
@@ -358,19 +595,37 @@ class PaperExecutionConstraintProducer:
                 },
                 "producer_commit": self.producer_commit,
             }
-            records.append(
-                PaperExecutionConstraintSnapshot.model_validate(
-                    {
-                        **snapshot_payload,
-                        "content_hash": canonical_sha256(snapshot_payload),
-                    }
-                )
+            snapshot = PaperExecutionConstraintSnapshot.model_validate(
+                {
+                    **snapshot_payload,
+                    "content_hash": canonical_sha256(snapshot_payload),
+                }
             )
-        if not records or not (records[-1].available_at <= observed_at < records[-1].expires_at):
-            raise PaperExecutionConstraintEvidenceError(
-                f"{ts_code} latest visible minute evidence is stale at observed_at"
-            )
+            self._records[record_key] = snapshot
+            records.append(snapshot)
         return tuple(records)
+
+    def _cached_reference_state(
+        self,
+        *,
+        references: _RequestReferences,
+        ts_code: str,
+        event_time: datetime,
+        decision_time: datetime,
+        generation_id: str,
+    ) -> _ReferenceState:
+        state_key = (generation_id, ts_code, event_time, decision_time)
+        state = self._reference_states.get(state_key)
+        if state is None:
+            state = self._reference_state(
+                references=references,
+                ts_code=ts_code,
+                event_time=event_time,
+                decision_time=decision_time,
+                generation_id=generation_id,
+            )
+            self._reference_states[state_key] = state
+        return state
 
     def _reference_state(
         self,
@@ -527,7 +782,9 @@ def _end_of_trade_date(trade_date: date) -> datetime:
 
 
 __all__ = [
+    "PaperExecutionConstraintCoverage",
     "PaperExecutionConstraintEvidenceError",
+    "PaperExecutionConstraintNoEvidenceError",
     "PaperExecutionConstraintProducer",
     "PaperExecutionConstraintProductionRequest",
     "PaperExecutionConstraintPublication",

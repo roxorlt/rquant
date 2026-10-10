@@ -9,8 +9,10 @@ import os
 import secrets
 import stat
 import threading
+import time
 from collections.abc import Callable, Mapping
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
 from types import MappingProxyType
@@ -49,6 +51,23 @@ class PaperExecutionConstraintUnavailableError(RuntimeError):
 
 class PaperExecutionConstraintIntegrityError(RuntimeError):
     """The authority path, pointer, or immutable content failed verification."""
+
+
+class PaperExecutionConstraintReadRaceError(PaperExecutionConstraintIntegrityError):
+    """Something the reader checks changed between the start and the end of one read.
+
+    The publisher's own atomic replace does exactly that (a temporary file and a rename in
+    `current.json`'s directory, a link in `generations/`), and so does any entry created or
+    removed in an ancestor directory -- which on the host includes `data/`, where the
+    read-only replica is swapped in every five minutes. `PaperExecutionConstraintAuthority`
+    reads again, a bounded number of times; a change that persists is still refused, with
+    this same error.
+    """
+
+
+#: attempts of one authority read, and the pause between them (#307's broker errors)
+_READ_RACE_ATTEMPTS = 3
+_READ_RACE_RETRY_DELAY_SECONDS = 0.05
 
 
 class _StrictContractModel(RuntimeContractModel):
@@ -189,8 +208,27 @@ class PaperExecutionConstraintDecision(_StrictContractModel):
         return dict(value)
 
 
+@dataclass(frozen=True)
+class _ConfirmedPublication:
+    """What this publisher last found (or made) current, and how to recognise it again."""
+
+    batch: PaperExecutionConstraintBatch
+    pointer: PaperExecutionConstraintPointer
+    pointer_bytes: bytes
+    generation_stat: os.stat_result
+
+
 class PaperExecutionConstraintPublisher:
-    """Single-writer publisher for atomic current plus retained generations."""
+    """Single-writer publisher for atomic current plus retained generations.
+
+    It remembers the generation it last published or found current (#302). While
+    `current.json` still holds exactly those bytes and the generation file is still the
+    inode it wrote or verified (`_same_regular_file`: identity, size, mtime, ctime, one
+    link), that generation is not read back and re-parsed to be compared again -- which
+    for a day of records is megabytes per call -- and publishing the very batch object it
+    confirmed returns its pointer without re-validating the batch. Any other state takes
+    the full path, unchanged.
+    """
 
     def __init__(
         self,
@@ -207,6 +245,95 @@ class PaperExecutionConstraintPublisher:
         if not callable(self.clock):
             raise TypeError("clock must be callable")
         self.max_bytes = _require_max_bytes(max_bytes)
+        self._confirmed: _ConfirmedPublication | None = None
+
+    def _confirmed_current_locked(
+        self,
+        *,
+        root_fd: int,
+        generations_fd: int,
+    ) -> _ConfirmedPublication | None:
+        confirmed = self._confirmed
+        if confirmed is None:
+            return None
+        pointer_bytes = _read_regular_file_at(
+            root_fd,
+            "current.json",
+            max_bytes=self.max_bytes,
+            label="current pointer",
+            missing_unavailable=False,
+            optional=True,
+        )
+        if pointer_bytes != confirmed.pointer_bytes:
+            return None
+        try:
+            generation_stat = os.stat(
+                f"{confirmed.pointer.batch_hash}.json",
+                dir_fd=generations_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return None
+        if not _same_regular_file(generation_stat, confirmed.generation_stat):
+            return None
+        return confirmed
+
+    def _confirm(
+        self,
+        *,
+        generations_fd: int,
+        batch: PaperExecutionConstraintBatch,
+        pointer: PaperExecutionConstraintPointer,
+        pointer_bytes: bytes,
+    ) -> None:
+        try:
+            generation_stat = os.stat(
+                f"{pointer.batch_hash}.json",
+                dir_fd=generations_fd,
+                follow_symlinks=False,
+            )
+        except OSError:
+            self._confirmed = None
+            return
+        self._confirmed = _ConfirmedPublication(
+            batch=batch,
+            pointer=pointer,
+            pointer_bytes=pointer_bytes,
+            generation_stat=generation_stat,
+        )
+
+    def _publish_confirmed(
+        self,
+        batch: PaperExecutionConstraintBatch,
+    ) -> PaperExecutionConstraintPointer | None:
+        """The pointer of `batch`, when it is the very object this publisher confirmed and
+        the authority still holds it; `None` sends the caller down the full path."""
+
+        chain = _open_or_create_root(self.root)
+        root_fd = chain[-1][0]
+        generations_fd = -1
+        lock_fd = -1
+        try:
+            generations_fd = _open_or_create_child_directory(root_fd, "generations")
+            lock_fd = _open_publish_lock(root_fd)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            confirmed = self._confirmed_current_locked(
+                root_fd=root_fd,
+                generations_fd=generations_fd,
+            )
+            if confirmed is None or confirmed.batch is not batch:
+                return None
+            return confirmed.pointer
+        finally:
+            if lock_fd >= 0:
+                with suppress(OSError):
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                with suppress(OSError):
+                    os.close(lock_fd)
+            with suppress(OSError):
+                if generations_fd >= 0:
+                    os.close(generations_fd)
+            _close_directory_chain(chain)
 
     def publish(
         self,
@@ -214,6 +341,12 @@ class PaperExecutionConstraintPublisher:
     ) -> PaperExecutionConstraintPointer:
         if not isinstance(batch, PaperExecutionConstraintBatch):
             raise TypeError("batch must be PaperExecutionConstraintBatch")
+        confirmed = self._confirmed
+        if confirmed is not None and confirmed.batch is batch:
+            pointer = self._publish_confirmed(batch)
+            if pointer is not None:
+                return pointer
+        submitted = batch
         batch = PaperExecutionConstraintBatch.model_validate(batch)
         if batch.producer_commit != self.producer_commit:
             raise PaperExecutionConstraintIntegrityError(
@@ -234,10 +367,22 @@ class PaperExecutionConstraintPublisher:
             generations_fd = _open_or_create_child_directory(root_fd, "generations")
             lock_fd = _open_publish_lock(root_fd)
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
-            current = _load_current_for_publisher(
+            confirmed_current = self._confirmed_current_locked(
                 root_fd=root_fd,
                 generations_fd=generations_fd,
-                max_bytes=self.max_bytes,
+            )
+            current = (
+                _load_current_for_publisher(
+                    root_fd=root_fd,
+                    generations_fd=generations_fd,
+                    max_bytes=self.max_bytes,
+                )
+                if confirmed_current is None
+                else (
+                    confirmed_current.pointer,
+                    confirmed_current.batch,
+                    confirmed_current.pointer_bytes,
+                )
             )
             if current is not None:
                 current_pointer, current_batch, current_pointer_bytes = current
@@ -250,6 +395,12 @@ class PaperExecutionConstraintPublisher:
                         raise PaperExecutionConstraintIntegrityError(
                             "idempotent current pointer bytes conflict"
                         )
+                    self._confirm(
+                        generations_fd=generations_fd,
+                        batch=submitted,
+                        pointer=current_pointer,
+                        pointer_bytes=current_pointer_bytes,
+                    )
                     return current_pointer
                 if batch.sequence < current_pointer.sequence:
                     raise PaperExecutionConstraintIntegrityError(
@@ -286,7 +437,14 @@ class PaperExecutionConstraintPublisher:
                     current_pointer=current[0],
                     next_pointer=pointer,
                 )
+            self._confirmed = None
             _replace_current_pointer(root_fd, pointer_bytes)
+            self._confirm(
+                generations_fd=generations_fd,
+                batch=submitted,
+                pointer=pointer,
+                pointer_bytes=pointer_bytes,
+            )
             return pointer
         finally:
             if lock_fd >= 0:
@@ -390,6 +548,20 @@ class PaperExecutionConstraintAuthority:
         observed_at: datetime,
     ) -> tuple[PaperExecutionConstraintBatch, PaperExecutionConstraintPointer]:
         observed = _normalize_observed_at(observed_at)
+        for attempt in range(1, _READ_RACE_ATTEMPTS + 1):
+            try:
+                return self._load_generation_once(observed=observed)
+            except PaperExecutionConstraintReadRaceError:
+                if attempt == _READ_RACE_ATTEMPTS:
+                    raise
+                time.sleep(_READ_RACE_RETRY_DELAY_SECONDS)
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    def _load_generation_once(
+        self,
+        *,
+        observed: datetime,
+    ) -> tuple[PaperExecutionConstraintBatch, PaperExecutionConstraintPointer]:
         try:
             chain = _open_existing_directory_chain(self.root)
         except FileNotFoundError as exc:
@@ -455,7 +627,7 @@ class PaperExecutionConstraintAuthority:
                 missing_unavailable=True,
             )
             if current_after != pointer_bytes:
-                raise PaperExecutionConstraintIntegrityError(
+                raise PaperExecutionConstraintReadRaceError(
                     "current pointer changed while reading generation"
                 )
             _verify_directory_chain(chain)
@@ -811,6 +983,9 @@ def _read_regular_file_at(
         before = os.fstat(descriptor)
         at_path_before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
         if not _same_regular_file(before, at_path_before):
+            if (before.st_dev, before.st_ino) != (at_path_before.st_dev, at_path_before.st_ino):
+                #: the name was replaced between the open and the stat: a publication
+                raise PaperExecutionConstraintReadRaceError(f"{label} identity is unsafe")
             raise PaperExecutionConstraintIntegrityError(f"{label} identity is unsafe")
         if before.st_size > max_bytes:
             raise PaperExecutionConstraintIntegrityError(f"{label} exceeds configured size limit")
@@ -831,7 +1006,7 @@ def _read_regular_file_at(
             after,
             at_path_after,
         ):
-            raise PaperExecutionConstraintIntegrityError(f"{label} changed while being read")
+            raise PaperExecutionConstraintReadRaceError(f"{label} changed while being read")
         return payload
     except FileNotFoundError as exc:
         if optional:
@@ -857,7 +1032,7 @@ def _verify_directory_chain(chain: list[DirectoryEntry]) -> None:
     for index, (directory_fd, name, initial) in enumerate(chain):
         current = os.fstat(directory_fd)
         if not _same_observation(initial, current) or not stat.S_ISDIR(current.st_mode):
-            raise PaperExecutionConstraintIntegrityError(
+            raise PaperExecutionConstraintReadRaceError(
                 "authority directory changed while being read"
             )
         if index == 0:
@@ -866,7 +1041,7 @@ def _verify_directory_chain(chain: list[DirectoryEntry]) -> None:
         assert name is not None
         at_path = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         if not _same_directory(current, at_path):
-            raise PaperExecutionConstraintIntegrityError(
+            raise PaperExecutionConstraintReadRaceError(
                 "authority directory changed while being read"
             )
 
@@ -992,6 +1167,7 @@ __all__ = [
     "PaperExecutionConstraintIntegrityError",
     "PaperExecutionConstraintPointer",
     "PaperExecutionConstraintPublisher",
+    "PaperExecutionConstraintReadRaceError",
     "PaperExecutionConstraintSnapshot",
     "PaperExecutionConstraintUnavailableError",
 ]

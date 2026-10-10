@@ -254,6 +254,29 @@ def _normalize_frame(
     ).reset_index(drop=True)
 
 
+class NormalizedHistoricalMinutes:
+    """One immutable historical minute frame, normalized once for every live batch (#302).
+
+    `_normalize_frame` converts every timestamp in Python, about 9 us a row: a 20-session
+    history of 100 codes is 480k rows, 4 s, and `feature_live` paid it on every batch. The
+    frame given here is never mutated (normalization copies it); normalization runs on the
+    first batch, where it always ran, and a frame that fails it is not remembered, so every
+    batch refuses exactly as before. The per-code split only replaces the scan of the whole
+    history once per code with the rows of that code, in the same order.
+    """
+
+    def __init__(self, frame: pd.DataFrame) -> None:
+        self._frame = frame
+        self._normalized: tuple[pd.DataFrame, dict[str, pd.DataFrame]] | None = None
+
+    def normalized(self) -> tuple[pd.DataFrame, dict[str, pd.DataFrame]]:
+        if self._normalized is None:
+            historical = _normalize_frame(self._frame, label="historical_minutes")
+            by_code = {str(code): rows for code, rows in historical.groupby("ts_code", sort=False)}
+            self._normalized = (historical, by_code)
+        return self._normalized
+
+
 def _median(values: pd.Series) -> float | None:
     if values.empty:
         return None
@@ -330,10 +353,17 @@ def _history_for_code(
     ts_code: str,
     decision_date: date,
     lookback_sessions: int,
+    history_by_code: dict[str, pd.DataFrame] | None = None,
 ) -> pd.DataFrame:
-    eligible = historical[
-        (historical["ts_code"] == ts_code) & (historical["_trade_date"] < decision_date)
-    ]
+    if history_by_code is None:
+        eligible = historical[
+            (historical["ts_code"] == ts_code) & (historical["_trade_date"] < decision_date)
+        ]
+    else:
+        code_rows = history_by_code.get(ts_code)
+        if code_rows is None:
+            code_rows = historical.iloc[0:0]
+        eligible = code_rows[code_rows["_trade_date"] < decision_date]
     dates = sorted(eligible["_trade_date"].unique(), reverse=True)[:lookback_sessions]
     return eligible[eligible["_trade_date"].isin(dates)]
 
@@ -346,6 +376,7 @@ def _compute_code_row(
     decision_date: date,
     lookback_sessions: int,
     opening_acceleration_block_minutes: int,
+    history_by_code: dict[str, pd.DataFrame] | None = None,
 ) -> tuple[dict[str, object], dict[str, str | None]]:
     rows = current[current["ts_code"] == ts_code].sort_values("_utc_time", kind="stable")
     latest = rows.iloc[-1]
@@ -361,6 +392,7 @@ def _compute_code_row(
         ts_code=ts_code,
         decision_date=decision_date,
         lookback_sessions=lookback_sessions,
+        history_by_code=history_by_code,
     )
     history_to_clock = history[history["_clock_minute"] <= feature_minute]
     same_clock = history[history["_clock_minute"] == feature_minute]
@@ -530,7 +562,7 @@ def _field_statuses(
 
 def _semantic_compute(
     current_minutes: pd.DataFrame,
-    historical_minutes: pd.DataFrame,
+    historical_minutes: pd.DataFrame | NormalizedHistoricalMinutes,
     *,
     mode: FeatureComputationMode,
     decision_time: datetime,
@@ -555,7 +587,11 @@ def _semantic_compute(
         label="current_minutes",
         visible_through=decision_utc,
     )
-    historical = _normalize_frame(historical_minutes, label="historical_minutes")
+    history_by_code: dict[str, pd.DataFrame] | None = None
+    if isinstance(historical_minutes, NormalizedHistoricalMinutes):
+        historical, history_by_code = historical_minutes.normalized()
+    else:
+        historical = _normalize_frame(historical_minutes, label="historical_minutes")
     decision_date = decision_local.date()
     if (current["_trade_date"] < decision_date).any():
         raise IntradayFeatureValidationError(
@@ -599,6 +635,7 @@ def _semantic_compute(
             decision_date=decision_date,
             lookback_sessions=config.lookback_sessions,
             opening_acceleration_block_minutes=config.opening_acceleration_block_minutes,
+            history_by_code=history_by_code,
         )
         rows.append(row)
         reasons.append(row_reasons)
@@ -655,7 +692,7 @@ def _semantic_compute(
 
 def live_compute(
     current_minutes: pd.DataFrame,
-    historical_minutes: pd.DataFrame,
+    historical_minutes: pd.DataFrame | NormalizedHistoricalMinutes,
     *,
     decision_time: datetime,
     input_available_at: datetime,

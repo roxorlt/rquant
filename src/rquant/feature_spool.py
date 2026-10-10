@@ -104,7 +104,40 @@ class FeatureSpoolIntegrityError(RuntimeError):
     pass
 
 
+#: `(st_dev, st_ino, st_mode, st_size, st_mtime_ns, st_ctime_ns)` of one file. Every write
+#: in this spool is a temporary file renamed over the name, so a changed file is a new inode;
+#: an in-place rewrite changes `st_ctime_ns`, which user space cannot set back.
+FileIdentity = tuple[int, int, int, int, int, int]
+
+
+def _file_identity(observed: os.stat_result) -> FileIdentity:
+    return (
+        observed.st_dev,
+        observed.st_ino,
+        observed.st_mode,
+        observed.st_size,
+        observed.st_mtime_ns,
+        observed.st_ctime_ns,
+    )
+
+
+def _path_identity(path: Path) -> FileIdentity | None:
+    try:
+        return _file_identity(os.stat(path, follow_symlinks=False))
+    except OSError:
+        return None
+
+
 def _read_bounded_file(path: Path, *, label: str, maximum_bytes: int) -> bytes:
+    return _read_bounded_file_with_identity(path, label=label, maximum_bytes=maximum_bytes)[0]
+
+
+def _read_bounded_file_with_identity(
+    path: Path,
+    *,
+    label: str,
+    maximum_bytes: int,
+) -> tuple[bytes, FileIdentity]:
     descriptor = -1
     try:
         descriptor = os.open(
@@ -135,7 +168,7 @@ def _read_bounded_file(path: Path, *, label: str, maximum_bytes: int) -> bytes:
         or after.st_ctime_ns != before.st_ctime_ns
     ):
         raise FeatureSpoolIntegrityError(f"{label} changed while it was read")
-    return payload
+    return payload, _file_identity(before)
 
 
 def _canonical_model_bytes(model: RuntimeContractModel) -> bytes:
@@ -149,7 +182,16 @@ def _canonical_model_bytes(model: RuntimeContractModel) -> bytes:
 
 
 def _read_control_model(path: Path, model: type[ModelT], *, label: str) -> ModelT:
-    payload = _read_bounded_file(
+    return _read_control_model_with_identity(path, model, label=label)[0]
+
+
+def _read_control_model_with_identity(
+    path: Path,
+    model: type[ModelT],
+    *,
+    label: str,
+) -> tuple[ModelT, FileIdentity]:
+    payload, identity = _read_bounded_file_with_identity(
         path,
         label=label,
         maximum_bytes=_MAX_CONTROL_JSON_BYTES,
@@ -170,7 +212,7 @@ def _read_control_model(path: Path, model: type[ModelT], *, label: str) -> Model
         raise FeatureSpoolIntegrityError(f"{label} is invalid") from exc
     if _canonical_model_bytes(validated) != payload:
         raise FeatureSpoolIntegrityError(f"{label} is not canonical JSON")
-    return validated
+    return validated, identity
 
 
 class FeatureCurrentPointer(RuntimeContractModel):
@@ -386,6 +428,11 @@ class FeatureBatchSpool:
                 f"producer root: {self.cursor_root}"
             )
         self._thread_lock = RLock()
+        #: manifest file name -> (identity of the bytes validated, their `sequence`). A
+        #: manifest outside the requested range whose file is still that identity has
+        #: nothing new to say, so `list_after` checks it with one `lstat` instead of reading
+        #: and validating it again; the whole directory is still walked on every call.
+        self._validated_manifests: dict[str, tuple[FileIdentity, int]] = {}
         self._ensure_private_directories()
         self._source_identity = self._initialize_source_identity()
 
@@ -833,11 +880,19 @@ class FeatureBatchSpool:
         read_through = through if limit is None else min(through, sequence + limit)
         records: list[FeatureBatchRecord] = []
         for path in sorted(self.batch_root.glob("*.json")):
-            envelope = _read_control_model(
+            validated = self._validated_manifests.get(path.name)
+            if (
+                validated is not None
+                and not sequence < validated[1] <= read_through
+                and _path_identity(path) == validated[0]
+            ):
+                continue
+            envelope, identity = _read_control_model_with_identity(
                 path,
                 FeatureBatchEnvelope,
                 label=f"feature manifest {path.name}",
             )
+            self._validated_manifests[path.name] = (identity, envelope.sequence)
             if sequence < envelope.sequence <= read_through:
                 records.append(
                     FeatureBatchRecord(

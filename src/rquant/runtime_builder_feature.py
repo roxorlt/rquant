@@ -14,9 +14,13 @@ from typing import Annotated, Literal
 import pandas as pd
 from pydantic import Field, StrictInt, StrictStr, StringConstraints, field_validator
 
-from rquant.feature_live_service import FeatureLiveBatchSummary, run_feature_live_batch
+from rquant.feature_live_service import (
+    FeatureLiveBatchSummary,
+    FeatureLiveInputCache,
+    run_feature_live_batch,
+)
 from rquant.feature_spool import FeatureBatchSpool
-from rquant.intraday_feature_engine import IntradayFeatureConfig
+from rquant.intraday_feature_engine import IntradayFeatureConfig, NormalizedHistoricalMinutes
 from rquant.live_contracts import LiveChannel
 from rquant.live_spool import LiveBatchSpool
 from rquant.runtime_contracts import RuntimeContractModel
@@ -150,17 +154,23 @@ def feature_live_builder(*, clock: Callable[[], datetime]) -> RuntimeServiceBuil
         )
         feature_spool = FeatureBatchSpool(settings.feature_spool_root)
         config = settings.feature_config.bind_to_manifest(manifest)
+        #: kept for the life of the process, so that a round reads and decodes only the
+        #: minute batches that are new and the history is normalized once, not per batch
+        #: (#302); a restart rebuilds both from the spool and the sealed snapshot
+        history = NormalizedHistoricalMinutes(historical_minutes)
+        input_cache = FeatureLiveInputCache()
 
         def step() -> RuntimeStepResult:
             summary = run_feature_live_batch(
                 raw_spool=raw_spool,
                 feature_spool=feature_spool,
-                historical_minutes=historical_minutes,
+                historical_minutes=history,
                 historical_snapshot_id=settings.historical_snapshot_id,
                 config=config,
                 observed_at=clock(),
                 limit=settings.limit,
                 consumer_id=settings.consumer_id,
+                input_cache=input_cache,
             )
             return _runtime_result(summary, feature_spool=feature_spool)
 
