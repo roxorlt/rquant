@@ -42,3 +42,10 @@ test("a portfolio backtest shows orders and performance", async ({ page }) => {
   await page.getByRole("button", { name: "加入对比" }).click();
   await expect(page.getByText("再选一条回测")).toBeVisible();
 });
+
+test("data center shows the catalog and coverage", async ({ page }) => {
+  await page.goto("./#/data");
+  await page.getByText("股票日线").first().click();
+  await expect(page.getByText("缺 1 天")).toBeVisible();
+  await expect(page.getByLabel("字段")).toBeVisible();
+});

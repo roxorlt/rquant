@@ -72,6 +72,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/data-center": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 数据中心 */
+        get: operations["data_center_api_v1_data_center_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/health": {
         parameters: {
             query?: never;
@@ -314,6 +331,28 @@ export interface components {
             /** Items */
             items: components["schemas"]["AlertItem"][];
         };
+        /** AuditReport */
+        AuditReport: {
+            /** Datasets */
+            datasets: components["schemas"]["DatasetCoverage"][];
+            /**
+             * Generated At
+             * Format: date-time
+             */
+            generated_at: string;
+            /** Open Days */
+            open_days: number;
+            /**
+             * Window End
+             * Format: date
+             */
+            window_end: string;
+            /**
+             * Window Start
+             * Format: date
+             */
+            window_start: string;
+        };
         /** BacktestDetailData */
         BacktestDetailData: {
             perf?: components["schemas"]["BacktestPerf"] | null;
@@ -447,6 +486,51 @@ export interface components {
             /** System */
             system: string;
         };
+        /** CatalogDataset */
+        CatalogDataset: {
+            /** Category */
+            category: string;
+            /** Dataset Id */
+            dataset_id: string;
+            /** Fields */
+            fields: components["schemas"]["CatalogField"][];
+            /** Name */
+            name: string;
+            /** Primary Key */
+            primary_key: string[];
+            /** Purpose */
+            purpose: string;
+            /**
+             * Sample Available
+             * @default false
+             */
+            sample_available: boolean;
+            /** Schema Available */
+            schema_available: boolean;
+            /** Sources */
+            sources: string[];
+            /** Table Name */
+            table_name: string;
+            /** Update Note */
+            update_note: string;
+            /** Visibility Note */
+            visibility_note: string;
+        };
+        /** CatalogField */
+        CatalogField: {
+            /** Data Type */
+            data_type: string;
+            /** Description */
+            description: string;
+            /** Is Primary Key */
+            is_primary_key: boolean;
+            /** Key */
+            key: string;
+            /** Name */
+            name: string;
+            /** Unit */
+            unit: string | null;
+        };
         /** CommandReceipt */
         CommandReceipt: {
             /** Command Id */
@@ -455,6 +539,29 @@ export interface components {
             detail?: string | null;
             /** Status */
             status: string;
+        };
+        /** DataCenterData */
+        DataCenterData: {
+            audit: components["schemas"]["AuditReport"] | null;
+            /** Datasets */
+            datasets: components["schemas"]["CatalogDataset"][];
+        };
+        /** DatasetCoverage */
+        DatasetCoverage: {
+            /** Dataset Id */
+            dataset_id: string;
+            /** Error */
+            error?: string | null;
+            /** Latest Date */
+            latest_date: string | null;
+            /** Missing Open Days */
+            missing_open_days: string[];
+            /** Required On Open Day */
+            required_on_open_day: boolean;
+            /** Rows In Window */
+            rows_in_window: number;
+            /** Table Name */
+            table_name: string;
         };
         /** Envelope[AlertsData] */
         Envelope_AlertsData_: {
@@ -469,6 +576,11 @@ export interface components {
         /** Envelope[BacktestListData] */
         Envelope_BacktestListData_: {
             data: components["schemas"]["BacktestListData"];
+            serving: components["schemas"]["ServingMeta"];
+        };
+        /** Envelope[DataCenterData] */
+        Envelope_DataCenterData_: {
+            data: components["schemas"]["DataCenterData"];
             serving: components["schemas"]["ServingMeta"];
         };
         /** Envelope[HealthData] */
@@ -1030,6 +1142,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    data_center_api_v1_data_center_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Envelope_DataCenterData_"];
                 };
             };
         };

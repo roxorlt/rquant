@@ -7,6 +7,7 @@ import json
 import os
 from collections.abc import Callable
 from datetime import date
+from pathlib import Path
 from typing import Annotated, Any, TypeVar
 
 import pandas as pd
@@ -14,6 +15,8 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 
 from rquant.backtest.exposure import industry_exposure
 from rquant.backtest.store import list_runs, read_run
+from rquant.data_catalog.audit import read_report
+from rquant.data_catalog.models import CatalogDocument
 from rquant.web import page_control
 from rquant.web.backtest_perf import backtest_perf, perf_from_returns
 from rquant.web.models import (
@@ -27,6 +30,7 @@ from rquant.web.models import (
     BacktestTrade,
     BoardItem,
     CommandReceipt,
+    DataCenterData,
     Envelope,
     FreshnessItem,
     HealthData,
@@ -330,6 +334,16 @@ def _benchmark_rows(source: Source, code: str) -> list[dict[str, Any]]:
         if not table_missing(exc):
             raise
         return []
+
+
+_CATALOG = Path(__file__).resolve().parents[1] / "data_catalog" / "catalog-v1.json"
+
+
+@router.get("/data-center", response_model=Envelope[DataCenterData], summary="数据中心")
+def data_center(request: Request, source: SourceDep) -> Envelope[DataCenterData]:
+    catalog = CatalogDocument.model_validate_json(_CATALOG.read_text(encoding="utf-8"))
+    return _envelope(source, DataCenterData(datasets=catalog.datasets,
+                                            audit=read_report(_research_root(request))))
 
 
 @router.get("/alerts", response_model=Envelope[AlertsData], summary="告警时间线")

@@ -41,6 +41,9 @@ const NAV_ICONS: Record<IconName, ReactNode> = {
     </>
   ),
   health: <path d="M3 12h4l2.5-6.5 5 13 2.5-6.5h4" />,
+  data: (
+    <path d="M4 6c0-1.7 3.6-3 8-3s8 1.3 8 3v12c0 1.7-3.6 3-8 3s-8-1.3-8-3zM4 6c0 1.7 3.6 3 8 3s8-1.3 8-3M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3" />
+  ),
 };
 
 function Svg({ size = 16, children }: { size?: number; children: ReactNode }) {

@@ -50,6 +50,25 @@ const BODIES: Record<string, unknown> = {
   "portfolio-backtests": { runs: [] },
   alerts: { items: [] },
   paper: { accounts: [] },
+  "data-center": {
+    datasets: [
+      {
+        dataset_id: "daily_bar",
+        table_name: "daily_bar",
+        name: "股票日线",
+        purpose: "看日线",
+        category: "行情",
+        sources: ["Tushare Pro"],
+        update_note: "",
+        visibility_note: "",
+        primary_key: [],
+        schema_available: true,
+        sample_available: false,
+        fields: [],
+      },
+    ],
+    audit: null,
+  },
 };
 
 function stubApi() {
@@ -79,6 +98,7 @@ describe("MVP pages render from the API", () => {
     ["/backtest", "还没有已发布的回测"],
     ["/monitor", "没有告警"],
     ["/paper", "没有模拟账户"],
+    ["/data", "股票日线"],
   ])("%s", async (path, text) => {
     stubApi();
     renderApp(path);

@@ -156,3 +156,18 @@ def test_portfolio_compare_and_overfit_block(tmp_path) -> None:
     assert detail["overfit"]["trials"] == 1
     both = client.get(f"/api/v1/portfolio-backtests/compare?a={run_id}&b={run_id}").json()
     assert both["data"]["a"]["run"]["run_id"] == both["data"]["b"]["run"]["run_id"]
+
+
+def test_data_center_lists_catalog_and_audit(tmp_path) -> None:
+    from fastapi.testclient import TestClient
+
+    from rquant.web.app import create_app
+    from rquant.web.source import FixtureSource, write_demo_research
+
+    client = TestClient(create_app(FixtureSource(), dist=None, research_root=tmp_path))
+    data = client.get("/api/v1/data-center").json()["data"]
+    assert any(d["dataset_id"] == "daily_bar" for d in data["datasets"])
+    assert data["audit"] is None
+    write_demo_research(tmp_path)
+    audit = client.get("/api/v1/data-center").json()["data"]["audit"]
+    assert audit["datasets"][0]["missing_open_days"]
